@@ -130,11 +130,15 @@ fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
 #[derive(Default)]
 pub struct SessionDatabase {
     torrents: HashMap<TorrentId, ManagedTorrentHandle>,
+    // Rings as a torrent is added: a magnet's torrent enters the session
+    // once its metadata is received.
+    added: Arc<Notify>,
 }
 
 impl SessionDatabase {
     fn add_torrent(&mut self, torrent: ManagedTorrentHandle, id: TorrentId) {
         self.torrents.insert(id, torrent);
+        self.added.notify_waiters();
     }
 }
 
@@ -2641,7 +2645,13 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
 
     fn wait_until_completed(&self) -> BoxFuture<'_, ()> {
         async move {
+            // A magnet still receiving its metadata isn't in the session
+            // yet: it is looked for again as each torrent is added
+            // (libtorrent waits on `metadata_received_alert`).
+            let added = self.session.db.read().added.clone();
             loop {
+                let mut next_added = std::pin::pin!(added.notified());
+                next_added.as_mut().enable();
                 if let Some(mt) = self.torrent() {
                     // The torrent finishes its selection; it completes only if
                     // that makes it a seed. An error, or a selection that
@@ -2652,8 +2662,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
                     }
                     return;
                 }
-                // A magnet still resolving its metadata isn't in the session yet.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                next_added.await;
             }
         }
         .boxed()
@@ -3152,6 +3161,104 @@ mod tests {
         // Seeding from the start: no `completed`, and nothing to wait for.
         assert!(!stats.finished_during_run);
         assert!(info.wait_until_completed().now_or_never().is_some());
+        session.stop().await;
+    }
+
+    // A one-piece torrent of a file in a new directory, and a session
+    // reaching no network, the torrent not added to it.
+    async fn unadded(name: &str) -> (TempDir, Bytes, std::sync::Arc<Session>) {
+        let dir =
+            crate::tests::test_util::create_default_random_dir_with_torrents(1, 16384, Some(name));
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(16384),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (dir, torrent, session)
+    }
+
+    // libtorrent waits for a magnet's metadata on `metadata_received_alert`:
+    // the announce's wait for completion finds the torrent as it enters the
+    // session, not on a later look.
+    #[tokio::test]
+    async fn a_magnets_completion_wait_finds_its_torrent_as_it_is_added() {
+        use crate::tracker::TorrentStatsProvider;
+        use futures::FutureExt;
+        let (dir, torrent, session) = unadded("magnet_wait").await;
+        let info_hashes = crate::core::torrent_metainfo::torrent_from_bytes(&torrent)
+            .unwrap()
+            .info_hashes;
+        let info = super::PeerRxTorrentInfo {
+            info_hashes,
+            session: session.clone(),
+            torrent: Default::default(),
+        };
+        let mut wait = info.wait_until_completed();
+        assert!((&mut wait).now_or_never().is_none());
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_completed().await.unwrap();
+        assert!(wait.now_or_never().is_some());
+        session.stop().await;
+    }
+
+    // A torrent's wait for completion follows its state: a torrent removed
+    // while it downloads ends the wait.
+    #[tokio::test]
+    async fn a_completion_wait_ends_when_its_torrent_is_deleted() {
+        use futures::FutureExt;
+        let (_dir, torrent, session) = unadded("deleted_wait").await;
+        let empty = TempDir::with_prefix("deleted_wait_out").unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(empty.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        assert!(handle.live().is_some());
+
+        let mut wait = handle.wait_until_completed();
+        assert!((&mut wait).now_or_never().is_none());
+        session.delete(handle.id().into(), false).await.unwrap();
+        assert!(wait.await.is_err());
         session.stop().await;
     }
 

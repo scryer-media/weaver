@@ -15,6 +15,7 @@ pub mod utils;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -40,6 +41,7 @@ pub use live::*;
 use parking_lot::RwLock;
 
 use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -548,7 +550,18 @@ impl ManagedTorrent {
     }
 
     pub(crate) fn with_state_mut<R>(&self, f: impl FnOnce(&mut ManagedTorrentState) -> R) -> R {
-        f(&mut self.locked.write().state)
+        let mut g = self.locked.write();
+        let r = f(&mut g.state);
+        self.state_change_notify.notify_waiters();
+        r
+    }
+
+    // The torrent's next change of state from now on. The wait is enabled
+    // here, so a change between this call and its await is not missed.
+    fn next_state_change(&self) -> Pin<Box<Notified<'_>>> {
+        let mut changed = Box::pin(self.state_change_notify.notified());
+        changed.as_mut().enable();
+        changed
     }
 
     pub(crate) fn with_chunk_tracker<R>(
@@ -913,8 +926,8 @@ impl ManagedTorrent {
     #[inline(never)]
     pub fn wait_until_initialized(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
-            // TODO: rewrite, this polling is horrible
             loop {
+                let changed = self.next_state_change();
                 let done = self.with_state(|s| match s {
                     ManagedTorrentState::Initializing(_) => Ok(false),
                     ManagedTorrentState::Error(e) => bail!("{:?}", e),
@@ -924,11 +937,7 @@ impl ManagedTorrent {
                 if done {
                     return Ok(());
                 }
-                let _ = timeout(
-                    Duration::from_millis(100),
-                    self.state_change_notify.notified(),
-                )
-                .await;
+                changed.await;
             }
         }
         .boxed()
@@ -937,8 +946,11 @@ impl ManagedTorrent {
     #[inline(never)]
     pub fn wait_until_completed(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
-            // TODO: rewrite, this polling is horrible
-            let live = loop {
+            // A run completes the torrent, or the state changes and is read
+            // again: a paused torrent waits for the next run, a failed or
+            // removed one ends the wait.
+            loop {
+                let changed = self.next_state_change();
                 let live = self.with_state(|s| match s {
                     ManagedTorrentState::Initializing(_) | ManagedTorrentState::Paused(_) => {
                         Ok(None)
@@ -947,14 +959,14 @@ impl ManagedTorrent {
                     ManagedTorrentState::Error(e) => bail!("{:?}", e),
                     ManagedTorrentState::None => bail!("bug: torrent state is None"),
                 })?;
-                if let Some(live) = live {
-                    break live;
+                match live {
+                    Some(live) => tokio::select! {
+                        _ = live.wait_until_completed() => return Ok(()),
+                        _ = changed => {}
+                    },
+                    None => changed.await,
                 }
-                let _ = timeout(Duration::from_secs(1), self.state_change_notify.notified()).await;
-            };
-
-            live.wait_until_completed().await;
-            Ok(())
+            }
         }
         .boxed()
     }

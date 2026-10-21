@@ -7,6 +7,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Instant,
 };
 
@@ -501,6 +502,9 @@ pub struct RoutingTable {
     id: Id20,
     size: usize,
     buckets: BucketTree,
+    // Rings as a node enters the table.
+    #[serde(skip)]
+    entered: Arc<tokio::sync::Notify>,
 }
 
 impl RoutingTable {
@@ -511,7 +515,12 @@ impl RoutingTable {
             id,
             buckets: BucketTree::new(max_size.unwrap_or(Self::DEFAULT_MAX_SIZE)),
             size: 0,
+            entered: Default::default(),
         }
+    }
+    /// Rings each time a node enters the table.
+    pub fn entered(&self) -> Arc<tokio::sync::Notify> {
+        self.entered.clone()
     }
     pub fn id(&self) -> Id20 {
         self.id
@@ -555,6 +564,7 @@ impl RoutingTable {
         };
         if replaced {
             self.size += 1;
+            self.entered.notify_waiters();
         }
         res
     }

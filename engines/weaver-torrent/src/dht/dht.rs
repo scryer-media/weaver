@@ -487,16 +487,20 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
     // ends (libtorrent `torrent::start_announcing` asks
     // `session_impl::prioritize_dht` for a search at once, and
     // `session_impl::on_dht_announce` gives every torrent its
-    // `torrent::dht_announce` once a `dht_announce_interval`).
+    // `torrent::dht_announce` once a `dht_announce_interval`). A search due
+    // while the table is empty starts as the first node enters it.
     fn request_peers_forever(self: Arc<Self>, is_v4: bool) -> tokio::task::JoinHandle<()> {
         spawn::<Error>(
             debug_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
             "get_peers",
             async move {
+                let entered = self.table(is_v4).read().entered();
                 loop {
+                    let mut next_entered = std::pin::pin!(entered.notified());
+                    next_entered.as_mut().enable();
                     let seeds = self.closest_known(is_v4);
                     if seeds.is_empty() {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        next_entered.await;
                         continue;
                     }
                     let outcome = self.search(seeds.into_iter()).await?;
@@ -507,13 +511,16 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
         )
     }
 
-    fn closest_known(&self, is_v4: bool) -> Vec<(Option<Id20>, SocketAddr)> {
-        let table = if is_v4 {
+    fn table(&self, is_v4: bool) -> &RwLock<RoutingTable> {
+        if is_v4 {
             &self.dht.routing_table_v4
         } else {
             &self.dht.routing_table_v6
-        };
-        table
+        }
+    }
+
+    fn closest_known(&self, is_v4: bool) -> Vec<(Option<Id20>, SocketAddr)> {
+        self.table(is_v4)
             .read()
             .sorted_by_distance_from(self.info_hash, now())
             .iter()
@@ -2258,6 +2265,36 @@ mod tests {
             announced,
             (0..=2).map(|n| (DHT_ANNOUNCE_INTERVAL * n, 8)).collect()
         );
+    }
+
+    // A search due while the routing table is empty starts as the first node
+    // enters it, not at a later look at the table.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_search_starts_as_the_first_node_enters_the_table() {
+        use crate::core::hash_id::Id20;
+
+        let (dht, mut sent) = fixture_dht();
+        let req = std::sync::Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            Id20::new([0x22; 20]),
+            Some(6881),
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        let task = req.request_peers_forever(true);
+        tokio::time::advance(Duration::from_millis(10_500)).await;
+        assert!(sent.try_recv().is_err());
+
+        let entered = tokio::time::Instant::now();
+        dht.routing_table_v4
+            .write()
+            .add_node(Id20::new([1; 20]), SocketAddr::from(([10, 0, 1, 1], 6881)));
+        let request = sent.recv().await.unwrap();
+        assert!(matches!(
+            request.message.kind,
+            MessageKind::GetPeersRequest(_)
+        ));
+        assert_eq!(tokio::time::Instant::now(), entered);
+        task.abort();
     }
 
     // libtorrent `find_data::done` / `announce_fun`: nothing is announced while
