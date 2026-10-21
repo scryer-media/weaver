@@ -6,8 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    net::{Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    str::FromStr,
+    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
         atomic::{AtomicU16, Ordering},
@@ -18,7 +17,7 @@ use std::{
 
 use crate::bencode::ByteBufOwned;
 use crate::dht::{
-    Error, INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
+    DHT_ANNOUNCE_INTERVAL, Error, INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
     bprotocol::{
         self, AnnouncePeer, CompactNodeInfo, CompactNodeInfoOwned, ErrorDescription,
         FindNodeRequest, GetPeersRequest, Message, MessageKind, Node, PingRequest, Response, Want,
@@ -128,6 +127,8 @@ struct Candidate {
     id: Option<Id20>,
     addr: SocketAddr,
     state: CandidateState,
+    // The write token it answered with, if any.
+    token: Option<ByteBufOwned>,
 }
 
 // The nodes one search knows of, closest to its target first, the ones without
@@ -168,6 +169,7 @@ impl Candidates {
                 id,
                 addr,
                 state: CandidateState::Fresh,
+                token: None,
             },
         );
         self.list.truncate(SEARCH_CANDIDATES);
@@ -195,6 +197,46 @@ impl Candidates {
             c.state = state;
         }
     }
+
+    fn give_token(&mut self, addr: SocketAddr, token: Option<ByteBufOwned>) {
+        if let Some(c) = self.list.iter_mut().find(|c| c.addr == addr) {
+            c.token = token;
+        }
+    }
+
+    // The k closest nodes that answered with a write token: the ones a search
+    // for peers announces to when it ends (libtorrent `find_data::done`, which
+    // walks its results closest first and keeps up to a bucket of the live ones
+    // holding a token).
+    fn token_holders(&self) -> impl Iterator<Item = (SocketAddr, &ByteBufOwned)> {
+        self.list
+            .iter()
+            .filter(|c| c.state == CandidateState::Answered)
+            .filter_map(|c| Some((c.addr, c.token.as_ref()?)))
+            .take(SEARCH_K)
+    }
+}
+
+// Whether a search should not ask `node`, named by the node at `source`: an
+// address nothing can be sent to (port 0, unspecified, multicast, broadcast,
+// the reserved 0/8 and 240/4), or a local one named by a remote node, which
+// can only point us inside our own network (libtorrent `aux::is_global` for
+// the first, and the rule `ut_pex.cpp` applies to PEX peers, a local address
+// only from a local source, for the second).
+fn is_martian(node: SocketAddr, source: SocketAddr) -> bool {
+    use crate::torrent_state::live::peers::holepunch::is_local;
+    let unusable = node.port() == 0
+        || match node.ip().to_canonical() {
+            IpAddr::V4(a) => {
+                a.is_unspecified()
+                    || a.is_multicast()
+                    || a.is_broadcast()
+                    || a.octets()[0] == 0
+                    || a.octets()[0] >= 240
+            }
+            IpAddr::V6(a) => a.is_unspecified() || a.is_multicast(),
+        };
+    unusable || (is_local(node.ip()) && !is_local(source.ip()))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -264,12 +306,13 @@ trait RecursiveRequestCallbacks: Sized + Send + Sync + 'static {
         addr: SocketAddr,
         resp: &crate::dht::Result<ResponseOrError>,
     );
+    fn on_search_end(&self, _req: &RecursiveRequest<Self>, _candidates: &Candidates) {}
 }
 
 struct RecursiveRequestCallbacksGetPeers {
-    // Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap()
-    min_distance_to_announce: Id20,
     announce_port: Option<u16>,
+    // When a search last announced us.
+    announced: parking_lot::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
@@ -277,44 +320,41 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
 
     fn on_request_end(
         &self,
-        req: &RecursiveRequest<Self>,
-        target_node: Id20,
-        addr: SocketAddr,
-        resp: &crate::dht::Result<ResponseOrError>,
+        _: &RecursiveRequest<Self>,
+        _: Id20,
+        _: SocketAddr,
+        _: &crate::dht::Result<ResponseOrError>,
     ) {
-        let announce_port = match self.announce_port {
-            Some(a) => a,
-            None => return,
+    }
+
+    // Every DHT_ANNOUNCE_INTERVAL, the search that ends announces us to the k
+    // closest nodes that gave it a token (libtorrent `node::announce`, whose
+    // get_peers traversal ends in `announce_fun`).
+    fn on_search_end(&self, req: &RecursiveRequest<Self>, candidates: &Candidates) {
+        let Some(port) = self.announce_port else {
+            return;
         };
-        let resp = match resp {
-            Ok(ResponseOrError::Response(resp)) => resp,
-            _ => return,
-        };
-        let token = match &resp.token {
-            Some(token) => token,
-            None => return,
-        };
-        if req.info_hash.distance(&target_node) > self.min_distance_to_announce {
-            trace!(
-                "not announcing, {:?} is too far from {:?}",
-                target_node, req.info_hash
-            );
+        let now = tokio::time::Instant::now();
+        let mut announced = self.announced.lock();
+        if announced.is_some_and(|at| now < at + DHT_ANNOUNCE_INTERVAL) {
             return;
         }
-        let (tid, message) = req.dht.create_request(
-            Request::Announce {
-                info_hash: req.info_hash,
-                token: token.clone(),
-                port: announce_port,
-            },
-            addr,
-        );
-
-        let _ = req.dht.worker_sender.send(WorkerSendRequest {
-            our_tid: Some(tid),
-            message,
-            addr,
-        });
+        for (addr, token) in candidates.token_holders() {
+            let (tid, message) = req.dht.create_request(
+                Request::Announce {
+                    info_hash: req.info_hash,
+                    token: token.clone(),
+                    port,
+                },
+                addr,
+            );
+            let _ = req.dht.worker_sender.send(WorkerSendRequest {
+                our_tid: Some(tid),
+                message,
+                addr,
+            });
+            *announced = Some(now);
+        }
     }
 }
 
@@ -446,17 +486,15 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
             dht,
             peer_tx,
             callbacks: RecursiveRequestCallbacksGetPeers {
-                min_distance_to_announce: Id20::from_str(
-                    "0000ffffffffffffffffffffffffffffffffffff",
-                )
-                .unwrap(),
                 announce_port,
+                announced: parking_lot::Mutex::new(None),
             },
         }
     }
 
     // One search at a time, from the closest nodes of the routing table, again
-    // every minute, or sooner while the table is short of nodes.
+    // every minute, or sooner while the table is short of nodes. A search
+    // announces us when it ends, every DHT_ANNOUNCE_INTERVAL.
     fn request_peers_forever(self: Arc<Self>, is_v4: bool) -> tokio::task::JoinHandle<()> {
         spawn::<Error>(
             debug_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
@@ -500,7 +538,8 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
     // Walk towards the target from `seeds`: ask the closest candidates not asked
     // yet, at most SEARCH_BRANCHING at a time, and offer the nodes each answer
     // names as new candidates. A node that fails or does not answer in time is
-    // marked failed and skipped. The search ends when nothing is in flight and
+    // marked failed and skipped. A node named at an address it cannot be
+    // reached at is not offered. The search ends when nothing is in flight and
     // no candidate is left to ask.
     async fn search(
         &self,
@@ -526,6 +565,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
                 );
             }
             let Some((addr, answer)) = in_flight.next().await else {
+                self.callbacks.on_search_end(self, &candidates);
                 return Ok(outcome);
             };
             let response = match answer {
@@ -539,6 +579,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
             };
             outcome.answered += 1;
             candidates.settle(addr, CandidateState::Answered);
+            candidates.give_token(addr, response.token);
             for peer in response.values.into_iter().flatten() {
                 self.peer_tx.send(peer.0).ok().ok_or(Error::ReceiverDead)?;
             }
@@ -552,7 +593,8 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
                         .iter()
                         .flat_map(|n| n.iter().map(|n| n.as_socketaddr())),
                 )
-                .filter(|node| addr.is_ipv4() == node.addr.is_ipv4());
+                .filter(|node| addr.is_ipv4() == node.addr.is_ipv4())
+                .filter(|node| !is_martian(node.addr, addr));
             for node in nodes {
                 candidates.offer(Some(node.id), node.addr);
             }
@@ -905,7 +947,7 @@ impl DhtState {
                         nodes6,
                         values: Some(compact_peer_info),
                         token: Some(ByteBufOwned::from(
-                            &self.peer_store.gen_token_for(req.id, addr)[..],
+                            &self.peer_store.gen_token_for(req.info_hash, addr)[..],
                         )),
                     }),
                 };
@@ -2138,5 +2180,236 @@ mod tests {
         // Once it lapses the source is answered again.
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(ping(flooder));
+    }
+
+    // Answers `request`, a get_peers a search sent, as the node `id`, with
+    // `token`, naming `nodes`.
+    fn answer(
+        dht: &std::sync::Arc<DhtState>,
+        request: &super::WorkerSendRequest,
+        id: crate::core::hash_id::Id20,
+        token: Option<&[u8]>,
+        nodes: &[(crate::core::hash_id::Id20, std::net::SocketAddrV4)],
+    ) {
+        assert!(matches!(
+            request.message.kind,
+            MessageKind::GetPeersRequest(_)
+        ));
+        let nodes = (!nodes.is_empty()).then(|| {
+            bprotocol::CompactNodeInfoOwned::new_from_iter(
+                nodes.iter().map(|&(id, addr)| bprotocol::Node { id, addr }),
+            )
+        });
+        dht.on_received_message(
+            bprotocol::Message {
+                transaction_id: request.message.transaction_id.clone(),
+                version: None,
+                ip: None,
+                kind: MessageKind::Response(bprotocol::Response {
+                    id,
+                    nodes,
+                    token: token.map(ByteBufOwned::from),
+                    ..Default::default()
+                }),
+            },
+            request.addr,
+        )
+        .unwrap();
+    }
+
+    // libtorrent `dht_announce_interval`: searches go on every minute, and one
+    // in fifteen minutes ends in an announce.
+    #[tokio::test(start_paused = true)]
+    async fn test_peers_are_searched_every_minute_and_announced_every_fifteen() {
+        use crate::core::hash_id::Id20;
+        use crate::dht::{DHT_ANNOUNCE_INTERVAL, REQUERY_INTERVAL};
+        use std::collections::BTreeMap;
+
+        let (dht, mut sent) = fixture_dht();
+        for i in 0..8u8 {
+            dht.routing_table_v4
+                .write()
+                .add_node(Id20::new([i; 20]), SocketAddr::from(([10, 0, i, 1], 6881)));
+        }
+        let req = std::sync::Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            Id20::new([0x22; 20]),
+            Some(6881),
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        let start = tokio::time::Instant::now();
+        let task = req.request_peers_forever(true);
+
+        // Requests sent at each moment, until the first past half an hour.
+        let mut searched = BTreeMap::<Duration, usize>::new();
+        let mut announced = BTreeMap::<Duration, usize>::new();
+        loop {
+            let request = sent.recv().await.unwrap();
+            let at = tokio::time::Instant::now() - start;
+            if at > 2 * DHT_ANNOUNCE_INTERVAL {
+                break;
+            }
+            match &request.message.kind {
+                MessageKind::GetPeersRequest(_) => {
+                    *searched.entry(at).or_default() += 1;
+                    answer(&dht, &request, Id20::new([0x33; 20]), Some(b"t"), &[]);
+                }
+                MessageKind::AnnouncePeer(_) => *announced.entry(at).or_default() += 1,
+                kind => panic!("unexpected {kind:?}"),
+            }
+        }
+        task.abort();
+
+        assert_eq!(
+            searched,
+            (0..=30).map(|n| (REQUERY_INTERVAL * n, 8)).collect()
+        );
+        assert_eq!(
+            announced,
+            (0..=2).map(|n| (DHT_ANNOUNCE_INTERVAL * n, 8)).collect()
+        );
+    }
+
+    // libtorrent `find_data::done` / `announce_fun`: nothing is announced while
+    // the search runs; at its end, the k closest nodes that answered with a
+    // token are announced to, with their token.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_search_announces_to_the_k_closest_token_holders_when_it_ends() {
+        use crate::core::hash_id::Id20;
+        use std::{collections::BTreeMap, net::IpAddr, task::Poll};
+
+        let (dht, mut sent) = fixture_dht();
+        let info_hash = Id20::new([0x22; 20]);
+        // Node i is i + 1 from the info-hash, at 10.0.i.1.
+        let node = |i: u8| {
+            let mut id = [0x22; 20];
+            id[19] ^= i + 1;
+            (Id20::new(id), SocketAddr::from(([10, 0, i, 1], 6881)))
+        };
+        let index = |addr: SocketAddr| match addr.ip() {
+            IpAddr::V4(a) => a.octets()[2],
+            IpAddr::V6(_) => unreachable!(),
+        };
+        // Nodes 1 and 3 answer without a token.
+        let token = |i: u8| (i != 1 && i != 3).then_some([i]);
+        let req = super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            Some(6881),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let mut search = std::pin::pin!(req.search((0..14).map(|i| {
+            let (id, addr) = node(i);
+            (Some(id), addr)
+        })));
+
+        let mut asked = Vec::new();
+        loop {
+            if let Poll::Ready(outcome) = futures::poll!(search.as_mut()) {
+                outcome.unwrap();
+                break;
+            }
+            // Only get_peers go out while it runs.
+            while let Ok(request) = sent.try_recv() {
+                let i = index(request.addr);
+                asked.push(i);
+                answer(
+                    &dht,
+                    &request,
+                    node(i).0,
+                    token(i).as_ref().map(|t| &t[..]),
+                    &[],
+                );
+            }
+        }
+        asked.sort();
+        // 10 and 11 answered with a token too, but eight token holders are
+        // closer.
+        assert_eq!(asked, (0..12).collect::<Vec<_>>());
+
+        let mut announced = BTreeMap::new();
+        while let Ok(request) = sent.try_recv() {
+            let MessageKind::AnnouncePeer(a) = request.message.kind else {
+                panic!("not an announce: {:?}", request.message.kind);
+            };
+            assert_eq!((a.info_hash, a.port), (info_hash, 6881));
+            announced.insert(index(request.addr), a.token.as_ref().to_vec());
+        }
+        assert_eq!(
+            announced,
+            [0, 2, 4, 5, 6, 7, 8, 9]
+                .into_iter()
+                .map(|i| (i, vec![i]))
+                .collect()
+        );
+    }
+
+    // A remote node naming a local address, or anyone naming an address
+    // nothing can be sent to, is not followed; a local node naming a local
+    // address is (libtorrent `aux::is_global`, `aux::is_local`, and the rule
+    // `ut_pex.cpp` applies to PEX peers).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_search_asks_no_node_named_at_an_unreachable_or_foreign_local_address() {
+        use crate::core::hash_id::Id20;
+        use std::{
+            collections::HashSet,
+            net::{Ipv4Addr, SocketAddrV4},
+            task::Poll,
+        };
+
+        let (dht, mut sent) = fixture_dht();
+        let id = |n: u8| Id20::new([n; 20]);
+        let v4 = |ip: [u8; 4], port: u16| SocketAddrV4::new(Ipv4Addr::from(ip), port);
+        let public = SocketAddr::from(([5, 6, 7, 8], 6881));
+        let local = SocketAddr::from(([10, 2, 0, 1], 6881));
+        let named_by_public: Vec<_> = [
+            v4([127, 0, 0, 1], 6881),
+            v4([10, 1, 0, 1], 6881),
+            v4([192, 168, 1, 1], 6881),
+            v4([169, 254, 1, 1], 6881),
+            v4([100, 64, 0, 1], 6881),
+            v4([224, 0, 0, 1], 6881),
+            v4([0, 1, 2, 3], 6881),
+            v4([240, 0, 0, 1], 6881),
+            v4([255, 255, 255, 255], 6881),
+            v4([5, 6, 9, 9], 0),
+            v4([5, 6, 10, 10], 6881),
+        ]
+        .into_iter()
+        .zip(0x40..)
+        .map(|(addr, n)| (id(n), addr))
+        .collect();
+        let named_by_local = [(id(0x60), v4([10, 3, 0, 1], 6881))];
+
+        let req = get_peers_search(&dht);
+        let mut search = std::pin::pin!(
+            req.search([(Some(id(0x30)), public), (Some(id(0x31)), local)].into_iter())
+        );
+        let mut asked = HashSet::new();
+        loop {
+            if let Poll::Ready(outcome) = futures::poll!(search.as_mut()) {
+                outcome.unwrap();
+                break;
+            }
+            while let Ok(request) = sent.try_recv() {
+                asked.insert(request.addr);
+                let nodes: &[_] = match request.addr {
+                    a if a == public => &named_by_public,
+                    a if a == local => &named_by_local,
+                    _ => &[],
+                };
+                answer(&dht, &request, id(0x50), None, nodes);
+            }
+        }
+
+        assert_eq!(
+            asked,
+            HashSet::from([
+                public,
+                local,
+                SocketAddr::from(([5, 6, 10, 10], 6881)),
+                SocketAddr::from(([10, 3, 0, 1], 6881)),
+            ])
+        );
     }
 }

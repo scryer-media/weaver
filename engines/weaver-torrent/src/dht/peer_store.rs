@@ -6,20 +6,21 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::{
-    collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     time::Duration,
 };
 
 use crate::bencode::ByteBufOwned;
 use crate::core::{compact_ip::CompactSocketAddr, hash_id::Id20};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::Rng;
 use tokio::time::Instant;
 use tracing::trace;
 
 use crate::dht::bprotocol::{AnnouncePeer, Want};
+use crate::sha1w::{ISha1, Sha1};
 
 // How long a peer announced to us is kept after its last announce. libtorrent's
 // peers re-announce every 30 minutes and its store drops a peer one and a half
@@ -32,11 +33,62 @@ pub(crate) const MAX_INFO_HASHES: usize = 2000;
 // How often expired peers are swept out: libtorrent ticks its store every two
 // minutes.
 pub(crate) const PEER_PURGE_INTERVAL: Duration = Duration::from_secs(2 * 60);
+// How often the secret write tokens are derived from is replaced: libtorrent's
+// `dht_tracker` key refresh, every five minutes.
+pub(crate) const WRITE_KEY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-struct StoredToken {
-    token: [u8; 4],
-    node_id: Id20,
-    addr: SocketAddr,
+// The secrets write tokens are derived from: the current one, and the one it
+// replaced, so a token lives one to two intervals (libtorrent `node::m_secret`,
+// `node::new_write_key`).
+struct WriteKeys {
+    current: [u8; 4],
+    previous: [u8; 4],
+    replaced: Instant,
+}
+
+impl WriteKeys {
+    fn new(now: Instant) -> Self {
+        Self {
+            current: random_key(),
+            previous: random_key(),
+            replaced: now,
+        }
+    }
+
+    // The two secrets as of `now`: one replaced for each interval gone by
+    // since the last time.
+    fn at(&mut self, now: Instant) -> [[u8; 4]; 2] {
+        if now >= self.replaced + 2 * WRITE_KEY_INTERVAL {
+            // Both have lapsed, and with them every token derived from them.
+            *self = Self::new(now);
+        } else if now >= self.replaced + WRITE_KEY_INTERVAL {
+            self.previous = self.current;
+            self.current = random_key();
+            self.replaced += WRITE_KEY_INTERVAL;
+        }
+        [self.current, self.previous]
+    }
+}
+
+fn random_key() -> [u8; 4] {
+    let mut key = [0u8; 4];
+    rand::rng().fill_bytes(&mut key);
+    key
+}
+
+// The token the requester at `ip` presents to announce for `info_hash`: the
+// first four bytes of a hash of its address, the secret and the info-hash
+// (libtorrent `node::generate_token`).
+fn token(ip: IpAddr, key: &[u8; 4], info_hash: &Id20) -> [u8; 4] {
+    let mut h = Sha1::new();
+    match ip {
+        IpAddr::V4(ip) => h.update(&ip.octets()),
+        IpAddr::V6(ip) => h.update(&ip.octets()),
+    }
+    h.update(key);
+    h.update(&info_hash.0);
+    let hash = h.finish();
+    [hash[0], hash[1], hash[2], hash[3]]
 }
 
 struct StoredPeer {
@@ -54,9 +106,8 @@ impl StoredPeer {
 // gone within PEER_LIFETIME anyway.
 pub struct PeerStore {
     pub(crate) self_id: Id20,
-    max_remembered_tokens: u32,
     max_distance: Id20,
-    tokens: RwLock<VecDeque<StoredToken>>,
+    write_keys: Mutex<WriteKeys>,
     swarms: RwLock<HashMap<Id20, Vec<StoredPeer>>>,
 }
 
@@ -64,26 +115,25 @@ impl PeerStore {
     pub fn new(self_id: Id20) -> Self {
         Self {
             self_id,
-            max_remembered_tokens: 1000,
             max_distance: Id20::from_str("00000fffffffffffffffffffffffffffffffffff").unwrap(),
-            tokens: RwLock::new(VecDeque::new()),
+            write_keys: Mutex::new(WriteKeys::new(Instant::now())),
             swarms: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn gen_token_for(&self, node_id: Id20, addr: SocketAddr) -> [u8; 4] {
-        let mut token = [0u8; 4];
-        rand::rng().fill_bytes(&mut token);
-        let mut tokens = self.tokens.write();
-        tokens.push_back(StoredToken {
-            token,
-            addr,
-            node_id,
-        });
-        if tokens.len() > self.max_remembered_tokens as usize {
-            tokens.pop_front();
-        }
-        token
+    // The token the requester at `addr` presents to announce for
+    // `info_hash`. Nothing is kept: it is derived again to check it.
+    pub fn gen_token_for(&self, info_hash: Id20, addr: SocketAddr) -> [u8; 4] {
+        let [current, _] = self.write_keys.lock().at(Instant::now());
+        token(addr.ip(), &current, &info_hash)
+    }
+
+    // Whether `presented` is a token we gave the requester at `addr`'s IP for
+    // `info_hash`, from either secret (libtorrent `node::verify_token`).
+    pub(crate) fn verify_token(&self, presented: &[u8], info_hash: Id20, addr: SocketAddr) -> bool {
+        let keys = self.write_keys.lock().at(Instant::now());
+        keys.iter()
+            .any(|key| token(addr.ip(), key, &info_hash)[..] == *presented)
     }
 
     pub fn store_peer(&self, announce: &AnnouncePeer<ByteBufOwned>, mut addr: SocketAddr) -> bool {
@@ -94,10 +144,8 @@ impl PeerStore {
             trace!("peer store: info_hash too far to store");
             return false;
         }
-        if !self.tokens.read().iter().any(|t| {
-            t.token[..] == announce.token.as_ref()[..] && t.addr == addr && t.node_id == announce.id
-        }) {
-            trace!("peer store: can't find this token / addr combination");
+        if !self.verify_token(announce.token.as_ref(), announce.info_hash, addr) {
+            trace!("peer store: not a token we gave this address for this info_hash");
             return false;
         }
 
@@ -198,7 +246,7 @@ mod tests {
     // `from` announces itself for `info_hash` with a token the store gave it.
     fn announce(store: &PeerStore, info_hash: Id20, from: SocketAddr) -> bool {
         let node_id = Id20::new([0x33; 20]);
-        let token = store.gen_token_for(node_id, from);
+        let token = store.gen_token_for(info_hash, from);
         store.store_peer(
             &AnnouncePeer {
                 id: node_id,
@@ -258,5 +306,49 @@ mod tests {
         }
         let kept: HashSet<Id20> = store.swarms.read().keys().copied().collect();
         assert_eq!(kept, (11..=flood).map(near_info_hash).collect());
+    }
+
+    // libtorrent `node::generate_token` / `verify_token` / `new_write_key`:
+    // a token is good from the requester's IP for the info-hash it was given
+    // for, under the secret it was made with or the one after it, and nothing
+    // is kept to check it.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_write_token_is_tied_to_the_ip_and_info_hash_and_lives_two_key_intervals() {
+        use super::WRITE_KEY_INTERVAL;
+
+        let store = store();
+        let info_hash = near_info_hash(1);
+        let from = source(1);
+        let token = store.gen_token_for(info_hash, from);
+        let good = |info_hash, addr| store.verify_token(&token, info_hash, addr);
+
+        let other_port = SocketAddr::new(from.ip(), from.port() + 1);
+        assert!(good(info_hash, from));
+        assert!(good(info_hash, other_port));
+        assert!(!good(info_hash, source(2)));
+        assert!(!good(near_info_hash(2), from));
+
+        // Any number of tokens handed out leaves the first one good.
+        for n in 2..2000 {
+            store.gen_token_for(info_hash, source(n));
+        }
+        assert!(good(info_hash, from));
+
+        tokio::time::advance(WRITE_KEY_INTERVAL).await;
+        assert!(good(info_hash, from));
+        tokio::time::advance(WRITE_KEY_INTERVAL).await;
+        assert!(!good(info_hash, from));
+        assert!(!store.store_peer(
+            &AnnouncePeer {
+                id: Id20::new([0x33; 20]),
+                implied_port: 1,
+                info_hash,
+                port: 0,
+                token: ByteBufOwned::from(&token[..]),
+            },
+            from,
+        ));
+        // A fresh one is good again.
+        assert!(announce(&store, info_hash, from));
     }
 }
