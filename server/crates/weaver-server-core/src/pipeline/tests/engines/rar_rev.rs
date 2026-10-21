@@ -154,7 +154,7 @@ async fn rar_rev_rebuilds_one_absent_rar4_volume_from_its_recovery_volume() {
             .collect();
     let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
     let rev = Post::plain(
-        "silver.horizon.rev",
+        "silver.horizon1.rev",
         single_recovery_volume_for_rar4_set(&bytes),
     );
     let scenario = Scenario::new(posted(volumes, &[2], vec![rev]));

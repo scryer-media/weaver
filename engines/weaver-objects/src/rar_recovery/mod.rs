@@ -352,18 +352,28 @@ impl Object for RarRecovery {
 
 impl Recovery for RarRecovery {
     // The data volumes the set's naming puts in the set, one member per
-    // index; the first a name gives an index keeps it.
+    // index; the first a name gives an index keeps it. The set is the one
+    // with the longest name the first recovery volume's name covers: a set
+    // called `set2` owns `set21.rev` ahead of one called `set`.
     fn bind(&mut self, namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {
-        let Some(stem) = self.stem.clone() else {
+        let Some(rev) = self.revs.first().filter(|_| self.stem.is_some()) else {
             return;
         };
+        let stem = namespace
+            .members()
+            .filter(|member| member.bound_to != Some(self.id))
+            .filter_map(|member| naming::parse(&member.name))
+            .map(|volume| volume.stem().to_owned())
+            .filter(|stem| naming::recovery_covers(&rev.name, stem))
+            .max_by_key(String::len);
         let mut bound = BTreeMap::new();
         let mut names = BTreeMap::new();
         for member in namespace
             .members()
             .filter(|member| member.bound_to != Some(self.id))
         {
-            let Some(volume) = naming::parse(&member.name).filter(|name| name.stem() == stem)
+            let Some(volume) =
+                naming::parse(&member.name).filter(|name| Some(name.stem()) == stem.as_deref())
             else {
                 continue;
             };

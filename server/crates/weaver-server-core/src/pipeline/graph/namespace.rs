@@ -1538,7 +1538,7 @@ fn held_volume(member: MemberId) -> VolumeIndex {
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
-    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
 }
 
 fn index(offset: u64) -> usize {

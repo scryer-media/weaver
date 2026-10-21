@@ -11,7 +11,7 @@ aws-lc-rs = { workspace = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
 bzip2 = { workspace = true }
-crc-fast = { workspace = true }
+crc-turbo = { workspace = true }
 flate2 = { workspace = true }
 lzma-turbo = { workspace = true }
 par2-rs = { workspace = true }

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-crc-fast = { workspace = true }
+crc-turbo = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

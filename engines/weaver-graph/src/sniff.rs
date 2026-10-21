@@ -194,7 +194,7 @@ fn sevenz_header_looks_valid(header: &[u8], _known_file_len: Option<u64>) -> boo
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
-    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
 }
 
 // POSIX writes "ustar\0", GNU writes "ustar " before its own version.

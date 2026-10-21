@@ -1120,7 +1120,7 @@ fn strip_member_crcs(archive: &[u8], member: &[u8]) -> Vec<u8> {
     const K_CRC: u8 = 0x0A;
 
     let crc32 =
-        |bytes: &[u8]| crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32;
+        |bytes: &[u8]| crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32;
 
     let mut start = [0u8; 32];
     start.copy_from_slice(&archive[..32]);

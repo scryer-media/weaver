@@ -192,6 +192,7 @@ impl Pipeline {
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
         let (direct_barrier_done_tx, direct_barrier_done_rx) = mpsc::channel(32);
         let (direct_placement_done_tx, direct_placement_done_rx) = mpsc::channel(64);
+        let (segment_write_done_tx, segment_write_done_rx) = mpsc::channel(64);
         let (direct_rearm_done_tx, direct_rearm_done_rx) = mpsc::channel(32);
         let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
@@ -447,6 +448,7 @@ impl Pipeline {
             download_lanes_under_cap_since: None,
             last_download_lanes_under_cap_log_at: None,
             write_buffered_bytes: 0,
+            write_inflight_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
             uu_spooled_segments: 0,
@@ -519,6 +521,11 @@ impl Pipeline {
             next_direct_placement_flight_id: 0,
             direct_placement_done_tx,
             direct_placement_done_rx,
+            segment_writes: HashMap::new(),
+            orphaned_segment_writes: HashMap::new(),
+            next_segment_write_id: 0,
+            segment_write_done_tx,
+            segment_write_done_rx,
             #[cfg(test)]
             direct_placement_hold: None,
             #[cfg(test)]
@@ -857,6 +864,7 @@ impl Pipeline {
         // is being deleted.
         self.direct_store.clear_job(job_id);
         self.drop_direct_placements_for_job(job_id);
+        self.drop_segment_writes_for_job(job_id);
         self.forget_direct_tolerated_work(job_id);
         self.forget_par2_analysis_work(job_id);
         self.forget_direct_demotion_work(job_id);
@@ -1272,6 +1280,9 @@ impl Pipeline {
                     }
                     Some(done) = self.direct_placement_done_rx.recv() => {
                         self.handle_direct_placement_done(done).await;
+                    }
+                    Some(done) = self.segment_write_done_rx.recv() => {
+                        self.handle_segment_write_done(done).await;
                     }
                     Some(done) = self.direct_rearm_done_rx.recv() => {
                         self.handle_direct_rearm_done(done).await;
@@ -1821,6 +1832,9 @@ impl Pipeline {
         // conventional backlog the flush below writes out.
         self.settle_all_direct_placements().await;
         self.flush_quiescent_write_backlog().await;
+        // Every batch the drain and the flush handed to the disk owner is
+        // still writing, off this task; its commit is joined here the same way.
+        self.settle_all_segment_writes().await;
 
         if self.active_downloads > 0
             || !self.active_decodes_by_job.is_empty()
@@ -2179,11 +2193,15 @@ impl DiskWriteOwnerPool {
         sync_index_for_path(path, self.senders.len())
     }
 
-    async fn write_batch(
+    // Queues a batch on its owner thread and hands back its answer. An owner
+    // that has stopped answers at once, with everything unwritten.
+    fn submit_batch(
         &self,
         path: std::path::PathBuf,
         segments: Vec<(u64, BufferedDecodedSegment)>,
-    ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    ) -> tokio::sync::oneshot::Receiver<
+        Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
+    > {
         let queued_at = Instant::now();
         crate::runtime::perf_probe::record_value("download.disk_write.owner.submitted", 1);
         let (response, response_rx) = tokio::sync::oneshot::channel();
@@ -2196,26 +2214,38 @@ impl DiskWriteOwnerPool {
         };
 
         if let Err(error) = self.senders[sender_index].send(command) {
-            let DiskWriteCommand::Batch { segments, .. } = error.0 else {
+            let DiskWriteCommand::Batch {
+                segments, response, ..
+            } = error.0
+            else {
                 unreachable!("disk write batch send returned a different command");
             };
-            return Err(SegmentWriteBatchError {
+            let _ = response.send(Err(SegmentWriteBatchError {
                 source: std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "disk write owner thread stopped",
                 ),
                 written: Vec::new(),
                 unwritten: segments,
-            });
+            }));
         }
+        response_rx
+    }
 
-        response_rx.await.unwrap_or_else(|error| {
-            Err(SegmentWriteBatchError {
-                source: std::io::Error::other(error),
-                written: Vec::new(),
-                unwritten: Vec::new(),
+    async fn write_batch(
+        &self,
+        path: std::path::PathBuf,
+        segments: Vec<(u64, BufferedDecodedSegment)>,
+    ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+        self.submit_batch(path, segments)
+            .await
+            .unwrap_or_else(|error| {
+                Err(SegmentWriteBatchError {
+                    source: std::io::Error::other(error),
+                    written: Vec::new(),
+                    unwritten: Vec::new(),
+                })
             })
-        })
     }
 
     // Queues one destination's sub-batch and hands back its completion. Split
@@ -3038,15 +3068,16 @@ pub(crate) async fn sync_direct_destinations(
     results
 }
 
-pub(crate) async fn write_segments_to_disk(
+// Hands a batch to its disk owner thread and returns at once; the answer
+// comes back on the receiver. The pipeline task never waits on it: a ticket
+// lands the commit when the done message arrives (`decode::landing`).
+pub(crate) fn submit_segments_to_disk(
     path: &std::path::Path,
     segments: Vec<(u64, BufferedDecodedSegment)>,
-) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
-    let path = path.to_owned();
-    let started = Instant::now();
-    let result = disk_write_owner_pool().write_batch(path, segments).await;
-    crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
-    result
+) -> tokio::sync::oneshot::Receiver<
+    Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
+> {
+    disk_write_owner_pool().submit_batch(path.to_owned(), segments)
 }
 
 pub(crate) fn compute_write_backlog_budget_bytes(

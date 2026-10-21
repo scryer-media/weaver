@@ -50,9 +50,14 @@
 //    Inside the chosen job its completion-critical heap is drained ahead of
 //    its ordinary heap. No other job's critical work displaces the hot job's
 //    ordinary work.
-// 6. **Soft byte pressure** narrows the field to the hot job alone and
-//    clamps the handout to a single article; there is no spill while memory
-//    is draining.
+// 6. **Soft byte pressure** clamps every handout to a single article and
+//    changes nothing else: the hot job still comes first, and a hot job
+//    blocked on the asking server still passes it down the walk. Pressure
+//    shapes how deep a lane fetches, never whether a server with servable
+//    work is sent away empty. Only hard pressure, a whole-link gate, does
+//    that. A hot job whose own buffered bytes raised the pressure, waiting on
+//    articles a clause holds back on every server, would otherwise idle the
+//    whole link against a backlog nothing was left running to drain.
 // 7. **A lane holds its share of a job, not a fixed runway.** An article
 //    handed to a lane has left the queue, and that lane fetches what it holds
 //    one after another on one socket. A runway sized per lane alone lets the
@@ -186,10 +191,13 @@ impl Pipeline {
             return Handout::Yield(reason);
         }
 
-        // Soft pressure keeps the hot job moving and nothing else, one
-        // article at a time, until the decode and write backlogs drain.
-        let soft_pressure = pressure.state == DownloadPressureState::Soft;
-        let want = if soft_pressure { want.min(1) } else { want };
+        // Soft pressure keeps the link moving one article at a time per
+        // handout until the decode and write backlogs drain.
+        let want = if pressure.state == DownloadPressureState::Soft {
+            want.min(1)
+        } else {
+            want
+        };
         if want == 0 {
             return Handout::Idle;
         }
@@ -203,12 +211,6 @@ impl Pipeline {
             ShareTaken::Works(works) => return self.record_handout(HandoutKind::Hot, works),
             ShareTaken::Saturated(wake) => return Handout::Saturated(wake),
             ShareTaken::Blocked(blocked) => self.note_hot_blocked(blocked),
-        }
-
-        if soft_pressure {
-            // A deliberate gate, not an unexplained idle slot: the guard
-            // counter deliberately does not fire here.
-            return Handout::Idle;
         }
 
         if let Some(in_flight) = spill_in_flight

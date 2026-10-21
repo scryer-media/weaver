@@ -106,16 +106,33 @@ pub(crate) fn sibling(reference: &str, index: u32) -> Option<String> {
     }
 }
 
-// The set a recovery volume's name covers: `name.part1.rev` and `name.rev`
-// both cover the volumes of `name`, lower-cased as `parse` gives it.
+// The set a recovery volume's name covers, as far as the name alone says:
+// `name.part1.rev` covers the volumes of `name`, and an old-numbered set's
+// `name1.rev` does too, its number written straight after the set's name.
+// Where the set's own name ends in digits the name alone cannot tell, so
+// `covers` settles it against the data volumes' names.
 pub(crate) fn recovery_stem(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".rev")?;
     let stem = match stem.rfind(".part") {
         Some(at) if stem[at + 5..].parse::<u32>().is_ok() => &stem[..at],
-        _ => stem,
+        _ => stem.trim_end_matches(|ch: char| ch.is_ascii_digit()),
     };
     (!stem.is_empty()).then(|| stem.to_owned())
+}
+
+// Whether the recovery volume `name` is one of the set called `stem`: the
+// set's name, then `.part` and a number, or the number alone.
+pub(crate) fn recovery_covers(name: &str, stem: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let Some(rest) = lower
+        .strip_suffix(".rev")
+        .and_then(|whole| whole.strip_prefix(stem))
+    else {
+        return false;
+    };
+    let number = rest.strip_prefix(".part").unwrap_or(rest);
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -144,8 +161,16 @@ mod tests {
             recovery_stem("Archive.part1.rev").as_deref(),
             Some("archive")
         );
+        assert_eq!(recovery_stem("archive1.rev").as_deref(), Some("archive"));
         assert_eq!(recovery_stem("archive.rev").as_deref(), Some("archive"));
         assert_eq!(recovery_stem("archive.rar"), None);
+        assert!(recovery_covers("Archive.part1.rev", "archive"));
+        assert!(recovery_covers("archive1.rev", "archive"));
+        assert!(recovery_covers("set21.rev", "set2"));
+        assert!(recovery_covers("set21.rev", "set"));
+        assert!(!recovery_covers("archive.rev", "archive"));
+        assert!(!recovery_covers("archive1.rev", "archive1"));
+        assert!(!recovery_covers("other1.rev", "archive"));
         assert_eq!(
             parse("archive.part2.rar").unwrap().stem(),
             parse("archive.r00").unwrap().stem()

@@ -711,7 +711,7 @@ fn copy_run<R: Read + Seek, W: Write + Seek>(
             error: error.to_string(),
         })?;
 
-    let mut run_crc = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    let mut run_crc = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
     let mut cursor = start;
     while cursor < end {
         let want = ((end - cursor) as usize).min(buffer.len());

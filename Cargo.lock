@@ -1304,10 +1304,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
-name = "crc-fast"
-version = "1.10.0"
+name = "crc-turbo"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+checksum = "fe9845f8267cd17ae1edacec5cd2bc0f8b891d1946db64d929209170fcf7e9b8"
 dependencies = [
  "digest 0.10.7",
  "spin 0.10.1",
@@ -2955,12 +2955,12 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53fb40ce177d0fd92480e8a17b469ee3688cc9f64c615b6457635a661398bde6"
+checksum = "3af35044209c991b5cafb0821392f36b3b3eb3bdd5411c21562716705139a621"
 dependencies = [
  "aws-lc-rs",
- "crc-fast",
+ "crc-turbo",
 ]
 
 [[package]]
@@ -3392,13 +3392,13 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.11"
+version = "0.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d01a571c77652bdf9675ec44917467bc311d1da12a3c6a644d166657170aaa7d"
+checksum = "5f79a1a5151a773c595f156d322236c3689404d622e5a85dc3188a06503529fc"
 dependencies = [
  "bytes",
  "cap-std",
- "crc-fast",
+ "crc-turbo",
  "libc",
  "md-5",
  "memmap2",
@@ -3410,13 +3410,13 @@ dependencies = [
 
 [[package]]
 name = "par3-rs"
-version = "0.7.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfd8139dda96647351865190d2722f0977cee9b96c409b4b67fb52093981a314"
+checksum = "65be08f04a17afc247c1fed6c5eee3ce0c20411792f244ce2d1dd13dde4c1ba4"
 dependencies = [
  "blake3",
  "cap-std",
- "crc-fast",
+ "crc-turbo",
  "libc",
  "rayon",
  "reedsolomon-rs",
@@ -4296,9 +4296,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4594,9 +4594,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.1"
+version = "0.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dd107b58f5db033006234ef50d51eb99a9b7ef0f4a90a463a911023bda06436"
+checksum = "110c472f8f3db3fb0f3a41d9e288e36bb754f3dc0475a6c549d7754cdca62bed"
 dependencies = [
  "aws-lc-rs",
  "brotli 9.0.0",
@@ -5764,13 +5764,13 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.12.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96deecfdf76128669eb50516caf4956f3b0a246e463e8732c9dccdcf4142b17"
+checksum = "f2821acdbd624de10b9d9fed6a959dfe7e911087f01e4b20449ecc6ee8ddfb47"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
- "crc-fast",
+ "crc-turbo",
  "filetime",
  "libc",
  "memchr",
@@ -5979,7 +5979,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "application-updater",
  "async-graphql",
@@ -6039,10 +6039,10 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "bytes",
- "crc-fast",
+ "crc-turbo",
  "rmp-serde",
  "serde",
  "thiserror 2.0.21",
@@ -6050,14 +6050,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6086,7 +6086,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "blake3",
  "quick-xml",
@@ -6099,13 +6099,13 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "aws-lc-rs",
  "brotli 8.0.4",
  "bytes",
  "bzip2",
- "crc-fast",
+ "crc-turbo",
  "flate2",
  "lzma-turbo",
  "par2-rs",
@@ -6124,7 +6124,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6155,7 +6155,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6173,7 +6173,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "chrono",
- "crc-fast",
+ "crc-turbo",
  "criterion",
  "crossbeam-queue",
  "filetime",
@@ -6232,7 +6232,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6255,10 +6255,10 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.16.2"
+version = "0.16.3"
 dependencies = [
  "cc",
- "crc-fast",
+ "crc-turbo",
  "criterion",
  "libloading",
  "memchr",
@@ -6288,18 +6288,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

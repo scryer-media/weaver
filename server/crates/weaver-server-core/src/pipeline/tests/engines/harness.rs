@@ -19,7 +19,7 @@ use weaver_model::files::FileRole;
 use super::super::{
     debug_job_state, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
     pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
-    settle_direct_demotion_work, settle_direct_verification_read,
+    settle_direct_demotion_work, settle_direct_verification_read, settle_segment_write_work,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -1061,8 +1061,10 @@ async fn serve_from(
             },
         )
         .await;
-    // What the select loop would pick up after the article: the read-back
-    // a set's last article submits, and a demotion's handback.
+    // What the select loop would pick up after the article: its write
+    // landing, the read-back a set's last article submits, and a demotion's
+    // handback.
+    settle_segment_write_work(pipeline).await;
     settle_direct_verification_read(pipeline, job).await;
     settle_direct_demotion_work(pipeline).await;
 }

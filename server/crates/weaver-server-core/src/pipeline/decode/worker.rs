@@ -18,7 +18,7 @@ const UU_SPOOL_FILE_PREFIX: &str = "part-";
 const DUPLICATE_ARRIVAL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
-enum SegmentHashMode {
+pub(super) enum SegmentHashMode {
     UpdateNow,
     DeferRange,
 }
@@ -42,6 +42,18 @@ impl OutOfOrderPersistReason {
             Self::QuiescentFlush => "download.write_buffer.out_of_order.quiescent_flush",
             Self::DirectUnpack => "download.write_buffer.out_of_order.direct_unpack",
             Self::HandedBackVolume => "download.write_buffer.out_of_order.handed_back_volume",
+        }
+    }
+
+    // Names the write in the job failure a failed batch becomes.
+    fn failure_context(self) -> &'static str {
+        match self {
+            Self::PerFileMaxPending | Self::DirectUnpack => {
+                "failed to relieve per-file write backlog"
+            }
+            Self::GlobalWriteBacklog => "failed to relieve global write backlog",
+            Self::QuiescentFlush => "failed to flush quiescent buffered segment",
+            Self::HandedBackVolume => "failed to relieve a handed-back volume's write backlog",
         }
     }
 }
@@ -82,7 +94,7 @@ pub(in crate::pipeline) struct SegmentWriteError {
 }
 
 impl SegmentWriteError {
-    fn new(file_id: NzbFileId, source: io::Error) -> Self {
+    pub(super) fn new(file_id: NzbFileId, source: io::Error) -> Self {
         Self { file_id, source }
     }
 }
@@ -891,6 +903,8 @@ impl Pipeline {
             // A routed article whose destination write is still out has not
             // been committed yet; its placement's landing re-runs this check.
             && !self.has_direct_placements(job_id)
+            // Likewise a decoded batch out to the disk owner.
+            && !self.has_pending_segment_writes(job_id)
     }
 
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
@@ -1183,7 +1197,8 @@ impl Pipeline {
                 "flushing quiescent write backlog"
             );
 
-            let mut flushed_segments = 0usize;
+            // The batches land off this task; the last landing schedules the
+            // job's completion check.
             for file_id in file_ids {
                 loop {
                     let batch = self
@@ -1198,31 +1213,13 @@ impl Pipeline {
                         self.remove_empty_write_buffer(file_id);
                         break;
                     }
-                    let batch_len = batch.len();
-
-                    if let Err(error) = self
-                        .persist_out_of_order_segments(
-                            file_id,
-                            batch,
-                            OutOfOrderPersistReason::QuiescentFlush,
-                        )
-                        .await
-                    {
-                        self.fail_job_for_disk_write(
-                            error,
-                            "failed to flush quiescent buffered segment",
-                        );
-                        break;
-                    }
-                    flushed_segments += batch_len;
+                    self.persist_out_of_order_segments(
+                        file_id,
+                        batch,
+                        OutOfOrderPersistReason::QuiescentFlush,
+                    )
+                    .await;
                 }
-            }
-
-            if flushed_segments > 0 {
-                self.schedule_job_completion_check_if_download_pipeline_drained(
-                    job_id,
-                    "quiescent_write_backlog_drained",
-                );
             }
         }
     }
@@ -2034,15 +2031,13 @@ impl Pipeline {
                     // after reconstruction has stopped owning the file.
                     self.write_buffer_for_article(file_id, segment_id.segment_number, file_offset)
                         .insert(file_offset, segment);
-                } else if let Err(error) = self
-                    .persist_out_of_order_segments(
+                } else {
+                    self.persist_out_of_order_segments(
                         file_id,
                         vec![(file_offset, segment)],
                         OutOfOrderPersistReason::QuiescentFlush,
                     )
-                    .await
-                {
-                    self.fail_job_for_disk_write(error, "damaged article write failed");
+                    .await;
                 }
                 return;
             }
@@ -2411,22 +2406,9 @@ impl Pipeline {
             ready
         };
 
-        if let Err(error) = self.persist_ready_segments(file_id, ready.0, ready.1).await {
-            self.fail_job_for_disk_write(
-                error,
-                "disk write failed for sequential decoded segments",
-            );
-            return;
-        }
-
-        if let Err(error) = self.enforce_file_write_backlog(file_id).await {
-            self.fail_job_for_disk_write(error, "failed to relieve per-file write backlog");
-            return;
-        }
-
-        if let Err(error) = self.relieve_global_write_backlog().await {
-            self.fail_job_for_disk_write(error, "failed to relieve global write backlog");
-        }
+        self.persist_ready_segments(file_id, ready.0, ready.1).await;
+        self.enforce_file_write_backlog(file_id).await;
+        self.relieve_global_write_backlog().await;
     }
 
     // Retain the file's first [`crate::pipeline::PAR2_HASH_16K_BYTES`] decoded
@@ -3223,7 +3205,11 @@ impl Pipeline {
         filename
     }
 
-    fn fail_job_for_disk_write(&mut self, error: SegmentWriteError, context: &'static str) {
+    pub(super) fn fail_job_for_disk_write(
+        &mut self,
+        error: SegmentWriteError,
+        context: &'static str,
+    ) {
         let job_id = error.file_id.job_id;
         let out_of_space = crate::operations::is_out_of_space(&error.source);
         let message = if out_of_space {
@@ -3259,8 +3245,9 @@ impl Pipeline {
         }
     }
 
-    // Reconcile damage at handoff, after any demotion reset. Protect both
-    // durable ownership and accepted writes still waiting in this batch/buffer.
+    // Reconcile damage at handoff, after any demotion reset. Protect durable
+    // ownership, accepted writes still waiting in this batch/buffer, and
+    // accepted writes out to the disk owner.
     fn prepare_damaged_writes(
         &self,
         file_id: NzbFileId,
@@ -3278,6 +3265,13 @@ impl Pipeline {
             .and_then(|state| state.assembly.file(file_id))
             .into_iter()
             .flat_map(|file| file.protected_write_ranges())
+            .chain(
+                self.segment_writes
+                    .get(&file_id)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|ticket| ticket.clean_ranges.iter().copied()),
+            )
             .collect();
         let accepted = batch
             .iter()
@@ -3323,15 +3317,18 @@ impl Pipeline {
         }
     }
 
+    // Hands the file's contiguous run to the disk owner. The commit, the
+    // durable floor and the direct-unpack note follow when it lands
+    // (`decode::landing`); nothing here waits on the disk.
     pub(in crate::pipeline) async fn persist_ready_segments(
         &mut self,
         file_id: NzbFileId,
         ready: Vec<(u64, BufferedDecodedSegment)>,
         contiguous_end_after_ready: u64,
-    ) -> Result<(), SegmentWriteError> {
+    ) {
         if ready.is_empty() {
             self.remove_empty_write_buffer(file_id);
-            return Ok(());
+            return;
         }
         // Bytes are leaving the reorder stage for a conventional file. THIS is
         // the moment the file stops being bindable to an identity set — not
@@ -3346,81 +3343,40 @@ impl Pipeline {
             let released_bytes = ready.iter().map(|(_, segment)| segment.len_bytes()).sum();
             self.release_write_buffered(released_bytes, ready.len());
             self.remove_empty_write_buffer(file_id);
-            return Ok(());
+            return;
         };
 
-        let write_start = Instant::now();
-        let ready_bytes = ready.iter().map(|(_, segment)| segment.len_bytes()).sum();
-        let ready_count = ready.len();
         crate::runtime::perf_probe::record_value(
             "download.persist_ready_segments.batch_count",
-            ready_count as u64,
+            ready.len() as u64,
         );
         crate::runtime::perf_probe::record_value(
             "download.persist_ready_segments.batch_bytes",
-            ready_bytes as u64,
+            ready
+                .iter()
+                .map(|(_, segment)| segment.len_bytes())
+                .sum::<usize>() as u64,
         );
         self.invalidate_par3_source_write(file_id);
         let mut ready = ready;
         self.prepare_damaged_writes(file_id, &mut ready);
-        let write_result = write_segments_to_disk(&file_path, ready).await;
-        self.release_write_buffered(ready_bytes, ready_count);
-
-        let (written, write_error) = match write_result {
-            Ok(written) => (written, None),
-            Err(error) => {
-                let source = error.source;
-                let written = error.written;
-                drop(error.unwritten);
-                (written, Some(source))
-            }
-        };
-
-        for (offset, segment) in written {
-            crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
-            self.commit_persisted_segment(
-                offset,
-                segment,
-                &filename,
-                &file_path,
-                SegmentHashMode::UpdateNow,
-            )
-            .await;
-        }
-        if let Some(source) = write_error {
-            return Err(SegmentWriteError::new(file_id, source));
-        }
-        self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
-        // The write syscalls above returned, so bytes `0..contiguous_end` are
-        // on disk and a direct-unpack chase may read them. Costs one `is_empty`
-        // when nothing is being chased, which is the overwhelmingly common
-        // case and the reason this is a call rather than a check inlined here.
-        self.direct_unpack_note_commit(file_id, &filename, contiguous_end_after_ready, false);
-        // Hot-path safe: `write_start.elapsed()` is the single clock read this
-        // path already performs for the `disk_write_latency_us` gauge, and the
-        // histogram observes exactly that same span so the two agree. The
-        // observation itself is three `Relaxed` `fetch_add`s.
-        let write_elapsed = write_start.elapsed();
-        let write_us = write_elapsed.as_micros() as u64;
-        self.metrics
-            .disk_write_latency_us
-            .store(write_us, Ordering::Relaxed);
-        self.metrics
-            .pipeline_histograms
-            .observe_disk_write(write_elapsed);
-
-        self.remove_empty_write_buffer(file_id);
-        Ok(())
+        self.submit_segment_write(
+            file_id,
+            filename,
+            file_path,
+            ready,
+            SegmentWriteKind::Ready {
+                contiguous_end: contiguous_end_after_ready,
+            },
+            "disk write failed for sequential decoded segments",
+        );
     }
 
-    async fn enforce_file_write_backlog(
-        &mut self,
-        file_id: NzbFileId,
-    ) -> Result<(), SegmentWriteError> {
+    async fn enforce_file_write_backlog(&mut self, file_id: NzbFileId) {
         // Same hold as the sequential drain: an out-of-order flush commits
         // too, and would complete the assembly over the sweep's image.
         if self.demotion_sweep_owns_file(file_id) {
-            return Ok(());
+            return;
         }
         // A prospective chase must not force an identity candidate to leak
         // before its prefix arrives. Normal memory-pressure eviction still
@@ -3433,17 +3389,17 @@ impl Pipeline {
         loop {
             let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
-                    return Ok(());
+                    return;
                 };
                 if !direct_unpack && !write_buf.exceeds_max_pending() {
-                    return Ok(());
+                    return;
                 }
                 write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
             };
 
             if batch.is_empty() {
                 self.remove_empty_write_buffer(file_id);
-                return Ok(());
+                return;
             }
             self.persist_out_of_order_segments(
                 file_id,
@@ -3454,7 +3410,7 @@ impl Pipeline {
                     OutOfOrderPersistReason::PerFileMaxPending
                 },
             )
-            .await?;
+            .await;
         }
     }
 
@@ -3468,39 +3424,36 @@ impl Pipeline {
     // for, and a file resting in "accepted but not durable" is exactly what
     // leaves the materialization gate holding an owner nothing clears. So its
     // buffer is emptied, not trimmed.
-    async fn drain_file_write_buffer(
-        &mut self,
-        file_id: NzbFileId,
-    ) -> Result<(), SegmentWriteError> {
+    async fn drain_file_write_buffer(&mut self, file_id: NzbFileId) {
         // Same hold as every other flush: the sweep owns the image while it
         // runs, and committing over it would complete the assembly against
         // bytes the sweep is still rewriting.
         if self.demotion_sweep_owns_file(file_id) {
-            return Ok(());
+            return;
         }
         loop {
             let batch = {
                 let Some(write_buf) = self.write_buffers.get_mut(&file_id) else {
-                    return Ok(());
+                    return;
                 };
                 write_buf.take_oldest_buffered_batch(OUT_OF_ORDER_DISK_WRITE_BATCH_SEGMENTS)
             };
             if batch.is_empty() {
                 self.remove_empty_write_buffer(file_id);
-                return Ok(());
+                return;
             }
             self.persist_out_of_order_segments(
                 file_id,
                 batch,
                 OutOfOrderPersistReason::HandedBackVolume,
             )
-            .await?;
+            .await;
         }
     }
 
-    async fn relieve_global_write_backlog(&mut self) -> Result<(), SegmentWriteError> {
+    async fn relieve_global_write_backlog(&mut self) {
         self.relieve_global_write_backlog_to(self.write_backlog_budget_bytes)
-            .await
+            .await;
     }
 
     // Spill the write backlog off the hard-pressure latch without waiting
@@ -3519,10 +3472,9 @@ impl Pipeline {
         }
         let (_, _, write_soft, _) = self.download_pressure_limits();
         let target = usize::try_from(write_soft.saturating_sub(1)).unwrap_or(usize::MAX);
-        if let Err(error) = self.relieve_global_write_backlog_to(target).await {
-            self.fail_job_for_disk_write(error, "failed to relieve latched write backlog");
-            return;
-        }
+        self.relieve_global_write_backlog_to(target).await;
+        // Bytes out to the disk owner still count; the landing that releases
+        // them runs this again.
         if self.refresh_download_pressure().state != DownloadPressureState::Hard {
             self.download_dispatch_wake = true;
         }
@@ -3537,23 +3489,20 @@ impl Pipeline {
     // on their queued work lifts here too, so dispatch is owed a pass.
     pub(crate) async fn relieve_handed_back_write_backlog(&mut self, volume_files: &[NzbFileId]) {
         for file_id in volume_files {
-            if let Err(error) = self.drain_file_write_buffer(*file_id).await {
-                self.fail_job_for_disk_write(
-                    error,
-                    "failed to relieve a handed-back volume's write backlog",
-                );
-                return;
-            }
+            self.drain_file_write_buffer(*file_id).await;
         }
         self.relieve_latched_write_backlog().await;
         self.download_dispatch_wake = true;
     }
 
-    async fn relieve_global_write_backlog_to(
-        &mut self,
-        target_bytes: usize,
-    ) -> Result<(), SegmentWriteError> {
-        while self.write_buffered_bytes > target_bytes {
+    // Only what is parked can be moved: bytes already out to the disk owner
+    // leave the backlog when they land.
+    async fn relieve_global_write_backlog_to(&mut self, target_bytes: usize) {
+        while self
+            .write_buffered_bytes
+            .saturating_sub(self.write_inflight_bytes)
+            > target_bytes
+        {
             let candidate_file = self
                 .write_buffers
                 .iter()
@@ -3584,21 +3533,21 @@ impl Pipeline {
                 batch,
                 OutOfOrderPersistReason::GlobalWriteBacklog,
             )
-            .await?;
+            .await;
         }
-
-        Ok(())
     }
 
+    // Hands parked bytes to the disk owner where they fall. The commit
+    // follows when the batch lands; nothing here waits on the disk.
     async fn persist_out_of_order_segments(
         &mut self,
         file_id: NzbFileId,
         segments: Vec<(u64, BufferedDecodedSegment)>,
         reason: OutOfOrderPersistReason,
-    ) -> Result<(), SegmentWriteError> {
+    ) {
         if segments.is_empty() {
             self.remove_empty_write_buffer(file_id);
-            return Ok(());
+            return;
         }
         // The pressure escape writes parked bytes to disk out of order, which
         // is exactly as final as the sequential drain: the file can no longer
@@ -3629,64 +3578,32 @@ impl Pipeline {
         else {
             self.release_write_buffered(segment_bytes, segment_count);
             self.remove_empty_write_buffer(file_id);
-            return Ok(());
+            return;
         };
 
-        let write_start = Instant::now();
         self.invalidate_par3_source_write(file_id);
         let mut segments = segments;
         self.prepare_damaged_writes(file_id, &mut segments);
-        let write_result = write_segments_to_disk(&file_path, segments).await;
-        // Hot-path safe: reuses the `write_start` this path already keeps for
-        // the `disk_write_latency_us` gauge, so the histogram costs no extra
-        // clock read — only the three `Relaxed` `fetch_add`s inside `observe`.
-        // The last-write gauge is left untouched for compatibility.
-        let write_elapsed = write_start.elapsed();
-        let write_us = write_elapsed.as_micros() as u64;
-        self.metrics
-            .disk_write_latency_us
-            .store(write_us, Ordering::Relaxed);
-        self.metrics
-            .pipeline_histograms
-            .observe_disk_write(write_elapsed);
-        self.release_write_buffered(segment_bytes, segment_count);
-        let (written, write_error) = match write_result {
-            Ok(written) => (written, None),
-            Err(error) => {
-                let source = error.source;
-                let written = error.written;
-                drop(error.unwritten);
-                (written, Some(source))
+        // Marked now, not at the landing: an article arriving meanwhile that
+        // makes these offsets contiguous must find them accounted for, or the
+        // file's run would stop at bytes already on their way to disk. A
+        // batch that fails fails the job, so the mark never outlives its
+        // truth.
+        if let Some(write_buf) = self.write_buffers.get_mut(&file_id) {
+            for (offset, segment) in &segments {
+                if segment.damaged_source.is_none() {
+                    write_buf.mark_persisted(*offset, segment.len_bytes());
+                }
             }
-        };
-
-        for (offset, segment) in written {
-            crate::e2e_failpoint::maybe_trip("download.after_disk_write_before_commit");
-            let segment_bytes = segment.len_bytes();
-
-            if segment.damaged_source.is_none()
-                && let Some(write_buf) = self.write_buffers.get_mut(&file_id)
-            {
-                write_buf.mark_persisted(offset, segment_bytes);
-            }
-            self.metrics
-                .direct_write_evictions
-                .fetch_add(1, Ordering::Relaxed);
-
-            self.commit_persisted_segment(
-                offset,
-                segment,
-                &filename,
-                &file_path,
-                SegmentHashMode::DeferRange,
-            )
-            .await;
         }
-        if let Some(source) = write_error {
-            return Err(SegmentWriteError::new(file_id, source));
-        }
-        self.remove_empty_write_buffer(file_id);
-        Ok(())
+        self.submit_segment_write(
+            file_id,
+            filename,
+            file_path,
+            segments,
+            SegmentWriteKind::OutOfOrder,
+            reason.failure_context(),
+        );
     }
 
     // The file's write reorder buffer, created on demand and positioned for
@@ -3725,7 +3642,7 @@ impl Pipeline {
         write_buf
     }
 
-    fn remove_empty_write_buffer(&mut self, file_id: NzbFileId) {
+    pub(super) fn remove_empty_write_buffer(&mut self, file_id: NzbFileId) {
         let should_remove = self
             .write_buffers
             .get(&file_id)
@@ -3749,7 +3666,7 @@ impl Pipeline {
         }
     }
 
-    async fn commit_persisted_segment(
+    pub(super) async fn commit_persisted_segment(
         &mut self,
         file_offset: u64,
         segment: BufferedDecodedSegment,
@@ -4515,7 +4432,7 @@ fn checksum_completed_file(path: &std::path::Path) -> io::Result<CompletedFileCh
     let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.file_hash.reread");
     let mut file = File::open(path)?;
     let mut md5 = par2_rs::checksum::FileHashState::new();
-    let mut crc32 = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    let mut crc32 = crc_turbo::Digest::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc);
     let mut buffer = [0u8; 256 * 1024];
     loop {
         let bytes_read = file.read(&mut buffer)?;

@@ -16,7 +16,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.2"
+version = "0.16.3"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 bytes = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false }
 async-graphql = { version = "7.2", default-features = false, features = ["chrono"] }
-crc-fast = { version = "1.10", default-features = false, features = ["std"] }
+crc-turbo = { version = "1.11", default-features = false, features = ["std"] }
 md-5 = { version = "0.11", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 blake2s_simd = { version = "1.0", default-features = false, features = ["std"] }
@@ -78,8 +78,8 @@ filetime = { version = "0.2.29", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 zstd = { version = "0.13", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sevenz-turbo = { version = "0.29.1", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
-lzma-turbo = { version = "0.10.1", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
+sevenz-turbo = { version = "0.29.2", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+lzma-turbo = { version = "0.10.2", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 semver = { version = "1.0", default-features = false, features = ["serde", "std"] }
 httpdate = { version = "1.0", default-features = false }
@@ -117,7 +117,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.10.11", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.10.13", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -131,7 +131,9 @@ par2-rs = { version = "=0.10.11", default-features = false, features = ["crypto-
 # and does not forward it.
 # 0.7.1 moves the damaged file aside before installing a repair that keeps a
 # backup, rather than renaming the rebuilt file over it.
-par3-rs = { version = "=0.7.1", default-features = false }
+# 0.8 drops RAR PAR-inside (`inside::rar5`, `RarCipher`), which weaver never
+# used; the ZIP and 7z `inside` it does use are unchanged.
+par3-rs = { version = "=0.8.1", default-features = false }
 # 0.7 is a contract, not just a floor: `RarVolumeFacts::volume_number` is
 # `Option<u32>` there, and volume-facts registration keys on "the header
 # stated a number" versus "the format states none" — a distinction 0.5.x
@@ -156,7 +158,11 @@ par3-rs = { version = "=0.7.1", default-features = false }
 # adds an x86-64-v3 clone of the RAR5 fast symbol loop, picked at runtime.
 # 0.11.2 reads a stored member of 8 MiB or more ahead of its writes on a thread
 # of its own, and decrypts an encrypted one on another.
-unrar-rs = { version = "0.12.0", default-features = false, features = ["crypto-aws-lc"] }
+# 0.13 zeroizes `MemberCipherKey` on drop and drops its `Copy`, so the direct
+# router clones a member's key where it hands one on.
+# 0.14.1, with par2-rs 0.10.13, hashes through crc-turbo and drops crc-fast and
+# the `RARPAR_CRC32_VPCLMUL` override; `CRC_TURBO_TIER` pins the tier instead.
+unrar-rs = { version = "0.14.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
@@ -183,7 +189,7 @@ overflow-checks = true
 [profile.test.package.weaver-yenc]
 opt-level = 3
 
-[profile.test.package.crc-fast]
+[profile.test.package.crc-turbo]
 opt-level = 3
 
 # PAR3 selects its grouped GF(2^16) kernel at build time. Optimise its

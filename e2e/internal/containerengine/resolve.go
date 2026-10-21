@@ -250,6 +250,7 @@ func Current() *Engine {
 	currentMu.Lock()
 	defer currentMu.Unlock()
 	if current == nil {
+		pinHostPlatform()
 		system := HostSystem()
 		current = Select(system)
 		if current.Kind == Podman {
@@ -271,10 +272,20 @@ func Use(engine *Engine) {
 	current = engine
 	currentMu.Unlock()
 	_ = os.Setenv(EnvVar, string(engine.Kind))
+	pinHostPlatform()
 	if engine.Kind == Podman {
 		// `podman compose` otherwise prefixes every run with a provider
 		// notice on stderr, which would pollute captured combined output.
 		_ = os.Setenv("PODMAN_COMPOSE_WARNING_LOGS", "false")
+	}
+}
+
+// pinHostPlatform makes HostPlatform the default of every Compose build,
+// pull and run this process and its children start. An operator's own
+// DOCKER_DEFAULT_PLATFORM stands.
+func pinHostPlatform() {
+	if os.Getenv("DOCKER_DEFAULT_PLATFORM") == "" {
+		_ = os.Setenv("DOCKER_DEFAULT_PLATFORM", HostPlatform())
 	}
 }
 
