@@ -151,6 +151,16 @@ impl TorrentsMutation {
         Ok(true)
     }
 
+    /// Move the torrent's directory under `path`; it goes on from there.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_torrent_location(&self, ctx: &Context<'_>, id: u64, path: String) -> Result<bool> {
+        service(ctx)?
+            .set_location(JobId(id), path)
+            .await
+            .map_err(action_error)?;
+        Ok(true)
+    }
+
     #[graphql(guard = "ControlGuard")]
     async fn set_torrent_category(
         &self,

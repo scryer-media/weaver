@@ -2317,3 +2317,61 @@ async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
     again.stop().await;
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
 }
+
+// qBittorrent `TorrentImpl::setSavePath`: the torrent's directory moves
+// under the new path and the torrent goes on from there; the record follows
+// the move, a move to where it already is does nothing, and a relative path
+// is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_moves_under_another_directory_and_its_record_follows() {
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let stored = |rig: &Rig| {
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .storage_dir
+            .unwrap()
+    };
+    let from = stored(&rig);
+    assert!(Path::new(&from).is_dir());
+
+    let elsewhere = rig.dir.path().join("elsewhere");
+    let location = elsewhere.to_str().unwrap().to_owned();
+    rig.service
+        .set_location(job_id, location.clone())
+        .await
+        .unwrap();
+    let to = stored(&rig);
+    assert_eq!(Path::new(&to), elsewhere.join("set"));
+    assert!(Path::new(&to).is_dir());
+    assert!(!Path::new(&from).exists());
+    assert!(
+        rig.service
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .unwrap()
+            .moving
+            .is_none()
+    );
+
+    rig.service.set_location(job_id, location).await.unwrap();
+    assert_eq!(stored(&rig), to);
+    assert!(matches!(
+        rig.service
+            .set_location(job_id, "elsewhere".to_owned())
+            .await,
+        Err(ActionError::Invalid(_))
+    ));
+    assert_eq!(stored(&rig), to);
+}

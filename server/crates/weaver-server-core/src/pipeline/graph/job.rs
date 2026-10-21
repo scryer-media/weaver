@@ -10,6 +10,7 @@
 mod loans;
 mod passwords;
 mod pieces;
+mod relocate;
 mod repair;
 pub(crate) mod restore;
 mod runs;
@@ -30,6 +31,7 @@ use self::passwords::Passwords;
 use super::Engine;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
+use super::leaf::LeafError;
 use super::limits::Caps;
 use super::namespace::{NamespaceWriter, SetState, WriteError};
 use super::root::phase::{self, RootPhase};
@@ -112,6 +114,10 @@ pub(crate) struct GraphJob<R: Root = ArticleRoot> {
     reported: Option<RootPhase>,
     // The checkpoint waiting for the database, if one is.
     pending: Pending,
+    // Where the job's directory is to move, until it has.
+    moving: Option<PathBuf>,
+    // The move's outcome, until it is taken.
+    relocated: Option<Result<PathBuf, LeafError>>,
 }
 
 // A root member as the post lists it.
@@ -224,6 +230,8 @@ impl<R: Root> GraphJob<R> {
             passwords: Passwords::default(),
             reported: None,
             pending: Pending::default(),
+            moving: None,
+            relocated: None,
         }
     }
 
@@ -245,7 +253,6 @@ impl<R: Root> GraphJob<R> {
 
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
-    #[cfg(test)]
     pub(crate) fn awaits_mail(&self) -> bool {
         self.runs.live() || self.loans.out()
     }

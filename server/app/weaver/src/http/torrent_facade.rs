@@ -520,8 +520,23 @@ async fn handle(
         ("torrents", "createCategory") => create_category(&ctx, &params).await,
         ("torrents", "setShareLimits") => set_share_limits(&ctx, &params).await,
         ("torrents", "topPrio") => text(StatusCode::CONFLICT, "queueing is off"),
+        ("torrents", "setLocation") => {
+            let Some(location) = params
+                .get("location")
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+            else {
+                return text(StatusCode::BAD_REQUEST, "Save path cannot be empty");
+            };
+            each(&ctx, &params, move |torrents, view| {
+                let location = location.clone();
+                async move { torrents.set_location(view.job_id, location).await }
+            })
+            .await
+        }
         // Tags are not kept; recheck and reannounce have no service action.
-        ("torrents", "setLocation" | "addTags" | "removeTags" | "recheck" | "reannounce") => ok(),
+        ("torrents", "addTags" | "removeTags" | "recheck" | "reannounce") => ok(),
         ("torrents", "tags") | ("log", "main") => axum::Json(json!([])).into_response(),
         ("sync", "maindata") => maindata(&ctx).await,
         ("transfer", "info") => {
@@ -583,6 +598,7 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
         TorrentState::Seeding if view.upload_bps > 0 => "uploading",
         TorrentState::Seeding => "stalledUP",
         TorrentState::Paused => side("stoppedDL", "stoppedUP"),
+        TorrentState::Moving => "moving",
         // A stop with any reason but its met goal is a failure.
         TorrentState::Stopped => match view.detail.as_deref() {
             None | Some(status::GOAL_MET) => side("stoppedDL", "stoppedUP"),

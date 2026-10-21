@@ -119,6 +119,8 @@ pub struct Observed {
     /// Why unpacking refused the torrent's output, while that stands.
     pub failed: Option<String>,
     pub held: Option<Held>,
+    /// Its directory is being moved; it goes on from the new one.
+    pub moving: bool,
 }
 
 /// The state and the reason behind it, when there is one to give.
@@ -145,6 +147,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
     }
     if !seen.has_metadata {
         return (TorrentState::FetchingMetadata, None);
+    }
+    if seen.moving {
+        return (TorrentState::Moving, None);
     }
     if seen.queued {
         return (TorrentState::Queued, None);
@@ -402,7 +407,37 @@ mod tests {
             paused_by: None,
             failed: None,
             held: None,
+            moving: false,
         }
+    }
+
+    // A torrent whose directory is on the move says so, whatever its
+    // session is doing.
+    #[test]
+    fn a_moving_torrent_shows_as_moving() {
+        let moving = |engine| Observed {
+            moving: true,
+            ..seen(engine)
+        };
+        assert_eq!(
+            project(&moving(Engine::Live {
+                finished: false,
+                peers: 3,
+                upload_mode: false
+            })),
+            (TorrentState::Moving, None)
+        );
+        assert_eq!(
+            project(&moving(Engine::Checking)),
+            (TorrentState::Moving, None)
+        );
+        assert_eq!(
+            project(&Observed {
+                intent: TorrentIntent::Paused,
+                ..moving(Engine::Paused { finished: false })
+            }),
+            (TorrentState::Paused, None)
+        );
     }
 
     #[test]

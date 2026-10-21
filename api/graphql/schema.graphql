@@ -2042,6 +2042,10 @@ type MutationRoot {
 	"""
 	resumeTorrents: Boolean!
 	setTorrentForced(id: Int!, forced: Boolean!): Boolean!
+	"""
+	Move the torrent's directory under `path`; it goes on from there.
+	"""
+	setTorrentLocation(id: Int!, path: String!): Boolean!
 	setTorrentCategory(id: Int!, category: String): Boolean!
 	"""
 	The torrent's own seeding policy; null returns it to its category's
@@ -4986,6 +4990,7 @@ enum TorrentState {
 	SEEDING
 	PAUSED
 	STOPPED
+	MOVING
 }
 
 input TorrentTestInput {

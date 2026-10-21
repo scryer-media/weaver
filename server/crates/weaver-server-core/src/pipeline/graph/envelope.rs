@@ -33,7 +33,6 @@ pub(crate) struct Envelopes {
 // One node's envelopes, shared with the run that reads them.
 #[derive(Debug)]
 pub(crate) struct Shelf {
-    dir: PathBuf,
     node: NodeId,
     state: Mutex<Shelved>,
     changed: Condvar,
@@ -41,6 +40,9 @@ pub(crate) struct Shelf {
 
 #[derive(Debug, Default)]
 pub(crate) struct Shelved {
+    // The job's directory, where the envelope files are kept; it moves with
+    // the job.
+    dir: PathBuf,
     pub(crate) kept: BTreeMap<u32, Kept>,
     // The volumes bound to the object, by index, and whether any more can
     // join. An index orders them; a gap is not a volume.
@@ -85,9 +87,11 @@ impl Envelopes {
         let dir = &self.working_dir;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
             Arc::new(Shelf {
-                dir: dir.clone(),
                 node,
-                state: Mutex::default(),
+                state: Mutex::new(Shelved {
+                    dir: dir.clone(),
+                    ..Shelved::default()
+                }),
                 changed: Condvar::new(),
             })
         }))
@@ -195,6 +199,28 @@ impl Envelopes {
         }
         Ok(())
     }
+
+    // Let go of every envelope file's handle ahead of the directory moving.
+    pub(crate) fn release(&self) {
+        for shelf in self.shelves.values() {
+            for kept in shelf.lock().kept.values_mut() {
+                kept.leaf.release();
+            }
+        }
+    }
+
+    // The job's directory moved from `from` to `to`: every shelf and every
+    // envelope file on it follows.
+    pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
+        self.working_dir = to.to_path_buf();
+        for shelf in self.shelves.values() {
+            let mut state = shelf.lock();
+            state.dir = to.to_path_buf();
+            for kept in state.kept.values_mut() {
+                kept.leaf.relocate(from, to);
+            }
+        }
+    }
 }
 
 // A job that goes away stops every run reading its envelopes, so no thread
@@ -234,7 +260,7 @@ impl Shelf {
     ) -> Result<&'a mut Kept, LeafError> {
         if !state.kept.contains_key(&envelope) {
             let name = format!(".weaver-chunks/graph-envelope-{}-{envelope}", self.node.0);
-            let mut leaf = Leaf::at(&self.dir, &name)?;
+            let mut leaf = Leaf::at(&state.dir, &name)?;
             leaf.truncate()?;
             state.kept.insert(
                 envelope,

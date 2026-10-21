@@ -1186,11 +1186,48 @@ async fn categories_are_created_listed_and_assigned() {
         )
         .await;
     assert_eq!(unknown.status, StatusCode::CONFLICT);
+}
+
+// qBittorrent `TorrentsController::setLocationAction`: the torrent moves
+// under the location and is listed there; an empty location is a bad
+// request, and one no directory can be made under is a conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_location_moves_the_torrent_under_the_location() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let elsewhere = rig._dir.path().join("elsewhere");
+    let moved = rig
+        .post(
+            "/api/v2/torrents/setLocation",
+            &format!("hashes=all&location={}", elsewhere.to_string_lossy()),
+        )
+        .await;
+    assert_eq!(moved.status, StatusCode::OK);
+    let listed = rig.torrents().await;
+    let content = PathBuf::from(listed[0]["content_path"].as_str().unwrap());
+    assert!(content.starts_with(&elsewhere));
+    assert!(content.parent().unwrap().is_dir());
+
+    let empty = rig
+        .post("/api/v2/torrents/setLocation", "hashes=all&location=%20")
+        .await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST);
+    let file = rig._dir.path().join("a-file");
+    std::fs::write(&file, b"").unwrap();
+    let unmakeable = rig
+        .post(
+            "/api/v2/torrents/setLocation",
+            &format!(
+                "hashes=all&location={}",
+                file.join("under").to_string_lossy()
+            ),
+        )
+        .await;
+    assert_eq!(unmakeable.status, StatusCode::CONFLICT);
+    let listed = rig.torrents().await;
     assert_eq!(
-        rig.post("/api/v2/torrents/setLocation", "hashes=all&location=/x")
-            .await
-            .status,
-        StatusCode::OK
+        PathBuf::from(listed[0]["content_path"].as_str().unwrap()),
+        content
     );
 }
 

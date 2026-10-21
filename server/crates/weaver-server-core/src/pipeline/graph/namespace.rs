@@ -181,6 +181,35 @@ impl NamespaceWriter {
             .map(|(member, leaf)| (*member, leaf.path()))
     }
 
+    // The directory the job writes under.
+    pub(crate) fn working_dir(&self) -> &Path {
+        &self.working_dir
+    }
+
+    // Let go of every open file ahead of the directory moving: members,
+    // holds scratch and envelopes alike. Each is opened again where it then
+    // is by the next write.
+    pub(crate) fn release(&mut self) {
+        for files in self.files.values_mut() {
+            for leaf in files.leaves.values_mut().chain(files.scratch.as_mut()) {
+                leaf.release();
+            }
+        }
+        self.envelopes.release();
+    }
+
+    // The job's directory moved from `from` to `to`: every path the writer
+    // holds follows, so nothing of the job points under `from` any more.
+    pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
+        self.working_dir = to.to_path_buf();
+        for files in self.files.values_mut() {
+            for leaf in files.leaves.values_mut().chain(files.scratch.as_mut()) {
+                leaf.relocate(from, to);
+            }
+        }
+        self.envelopes.relocate(from, to);
+    }
+
     // Why the member is a leaf, when an object or the holds budgets refused
     // to own it.
     pub(crate) fn refused(&self, node: NodeId, member: MemberId) -> Option<Why> {

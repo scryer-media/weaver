@@ -408,6 +408,22 @@ impl Database {
         })
     }
 
+    // The directory a torrent's files now live under. Returns whether the
+    // torrent exists.
+    pub fn set_torrent_storage_dir(&self, job_id: JobId, dir: &str) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Text(dir.to_owned()), SqlArg::I64(stored(job_id.0)?)];
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET storage_dir = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
     // The peers and bans a torrent begins its next start with, written
     // beside its checkpoint. Returns whether the torrent exists.
     pub fn save_torrent_peers(
