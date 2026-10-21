@@ -11,6 +11,7 @@ use crate::buffers::ByteBuf;
 use crate::buffers::ByteBufOwned;
 use crate::buffers::ByteBufT;
 use crate::core::constants::CHUNK_SIZE;
+use bytes::Bytes;
 use serde::Deserialize;
 use serde_derive::Serialize;
 use std::io::Cursor;
@@ -36,6 +37,31 @@ impl<ByteBuf: ByteBufT> UtMetadataData<ByteBuf> {
             data_0: data,
             data_1: Default::default(),
         }
+    }
+}
+
+impl UtMetadataData<ByteBufOwned> {
+    /// The data message answering a peer's request for piece `piece` of
+    /// `metadata`. A piece index names one of the 16 KiB pieces of the
+    /// metadata, so an index at or past the piece count is out of bounds.
+    /// Metadata too long for the protocol's u32 `total_size` has no pieces to
+    /// offer, the same rule the extended handshake applies to `metadata_size`.
+    pub fn piece_of(metadata: &Bytes, piece: u32) -> Result<Self, MessageDeserializeError> {
+        let total_size = u32::try_from(metadata.len()).unwrap_or(0);
+        let total_pieces = total_size.div_ceil(CHUNK_SIZE);
+        if piece >= total_pieces {
+            return Err(MessageDeserializeError::UtMetadataPieceOutOfBounds {
+                total_pieces,
+                received_piece: piece,
+            });
+        }
+        let start = piece as usize * CHUNK_SIZE as usize;
+        let end = metadata.len().min(start + CHUNK_SIZE as usize);
+        Ok(Self::from_bytes(
+            piece,
+            total_size,
+            ByteBufOwned(metadata.slice(start..end)),
+        ))
     }
 }
 
@@ -227,6 +253,7 @@ impl<'a> UtMetadata<ByteBuf<'a>> {
 mod tests {
     use crate::buffers::ByteBuf;
     use crate::core::constants::CHUNK_SIZE;
+    use bytes::Bytes;
 
     use crate::peer_protocol::{MessageDeserializeError, extended::ut_metadata::UtMetadataData};
 
@@ -333,6 +360,47 @@ mod tests {
             ),
             "{:?}",
             err
+        );
+    }
+
+    #[test]
+    fn a_metadata_request_past_the_last_piece_is_out_of_bounds() {
+        // Two pieces, the second short: the case where index == count used to
+        // slice past the end.
+        let metadata = Bytes::from(vec![7u8; CHUNK_SIZE as usize + 5]);
+
+        for piece in [2, 3, u32::MAX / CHUNK_SIZE + 1, u32::MAX] {
+            let err = UtMetadataData::piece_of(&metadata, piece).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    MessageDeserializeError::UtMetadataPieceOutOfBounds {
+                        total_pieces: 2,
+                        received_piece,
+                    } if received_piece == piece
+                ),
+                "{err:?}"
+            );
+        }
+
+        let last = UtMetadataData::piece_of(&metadata, 1).unwrap();
+        assert_eq!(last.data_0.0.len(), 5);
+        let first = UtMetadataData::piece_of(&metadata, 0).unwrap();
+        assert_eq!(first.data_0.0.len(), CHUNK_SIZE as usize);
+    }
+
+    #[test]
+    fn metadata_we_do_not_hold_has_no_pieces() {
+        let err = UtMetadataData::piece_of(&Bytes::new(), 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MessageDeserializeError::UtMetadataPieceOutOfBounds {
+                    total_pieces: 0,
+                    received_piece: 0,
+                }
+            ),
+            "{err:?}"
         );
     }
 }

@@ -5,6 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
@@ -43,13 +44,16 @@ pub struct TrackerComms {
     stats: Box<dyn TorrentStatsProvider>,
     force_tracker_interval: Option<Duration>,
     tx: Sender,
-    // This MUST be set as trackers don't work with 0 port.
+    /// The `port` every announce carries (see [`announced_port`]).
     announce_port: u16,
     reqwest_client: reqwest::Client,
     udp_client: UdpTrackerClient,
     key: u32,
     // Per tier, the tracker that accepted `started` and so is owed `stopped`.
     started: Mutex<Vec<Option<SupportedTracker>>>,
+    // The `tracker id` each HTTP tracker last gave, sent back on every later
+    // announce to it.
+    tracker_ids: Mutex<HashMap<Url, Vec<u8>>>,
     status: TrackerStatus,
 }
 
@@ -62,11 +66,21 @@ pub enum TrackerCommsStatsState {
     Live,
 }
 
+/// The counters an announce reports (BEP 3), all for the current run: the
+/// tracker task of a run sends `started` first, so "since `started`" and
+/// "during this run" are the same span.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TrackerCommsStats {
+    /// Payload bytes sent to peers during this run.
     pub uploaded_bytes: u64,
+    /// Bytes of the pieces downloaded during this run that passed their hash
+    /// check. Pieces the torrent already had when the run began are not
+    /// counted, and neither is a piece that failed its check.
     pub downloaded_bytes: u64,
-    pub total_bytes: u64,
+    /// Bytes of the selected files still to download, 0 once they are all
+    /// here. None while the torrent's size is unknown (a magnet still
+    /// resolving its metadata).
+    pub left_bytes: Option<u64>,
     pub torrent_state: TrackerCommsStatsState,
     /// The torrent was incomplete when its current run began and has every
     /// wanted piece now. Each tracker hears `completed` (BEP 3) once for such a
@@ -75,17 +89,15 @@ pub struct TrackerCommsStats {
 }
 
 impl TrackerCommsStats {
-    pub fn get_left_to_download_bytes(&self) -> u64 {
-        let total = self.total_bytes;
-        let down = self.downloaded_bytes;
-        if total >= down {
-            return total - down;
-        }
-        0
+    /// `left` as announced. An unknown size is announced as one block still
+    /// to come, so the announce never reads as a seed's.
+    pub fn announced_left(&self) -> u64 {
+        const UNKNOWN_LEFT: u64 = 16 * 1024;
+        self.left_bytes.unwrap_or(UNKNOWN_LEFT)
     }
 
     pub fn is_completed(&self) -> bool {
-        self.downloaded_bytes >= self.total_bytes
+        self.left_bytes == Some(0)
     }
 }
 
@@ -543,6 +555,23 @@ async fn udp_tracker_to_socket_addrs(
     Ok(res)
 }
 
+/// The `port` of an announce: the port peers reach this session on, or 1
+/// when it accepts no connections. An announce has no way to say "not
+/// reachable", and some trackers refuse port 0, so a session without a
+/// listener names port 1, which no peer is listening on.
+fn announced_port(listen_port: Option<u16>) -> u16 {
+    listen_port.unwrap_or(1)
+}
+
+/// How many peers an announce asks for: none with `stopped`, since the run
+/// is over, otherwise libtorrent's default.
+fn numwant(event: Option<TrackerRequestEvent>) -> u32 {
+    match event {
+        Some(TrackerRequestEvent::Stopped) => 0,
+        _ => 200,
+    }
+}
+
 fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -569,7 +598,7 @@ impl TrackerComms {
         trackers: HashSet<Url>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        announce_port: u16,
+        listen_port: Option<u16>,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
     ) -> Option<TrackerTask> {
@@ -579,7 +608,7 @@ impl TrackerComms {
             trackers.into_iter().map(|t| vec![t]).collect(),
             stats,
             force_interval,
-            announce_port,
+            listen_port,
             reqwest_client,
             udp_client,
             StoppedAnnounces::default(),
@@ -594,7 +623,8 @@ impl TrackerComms {
     /// finishes during this run (see [`TrackerCommsStats::finished_during_run`]),
     /// and `stopped` when the returned stream is dropped. `stopped` is bounded
     /// and tracked by `stopped`. Each regular announce is recorded in the
-    /// returned [`TrackerStatus`].
+    /// returned [`TrackerStatus`]. `listen_port` is the port peers reach this
+    /// session on, None when it accepts no connections.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_tiers(
         info_hash: Id20,
@@ -602,7 +632,7 @@ impl TrackerComms {
         tiers: Vec<Vec<Url>>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
-        announce_port: u16,
+        listen_port: Option<u16>,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
@@ -642,11 +672,12 @@ impl TrackerComms {
             stats,
             force_tracker_interval: force_interval,
             tx,
-            announce_port,
+            announce_port: announced_port(listen_port),
             reqwest_client,
             udp_client,
             key: rand::random(),
             started: Mutex::new(vec![None; tiers.len()]),
+            tracker_ids: Default::default(),
             status: status.clone(),
         });
         let stop_on_drop = StopOnDrop {
@@ -773,20 +804,21 @@ impl TrackerComms {
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
+        let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.peer_id,
             port: self.announce_port,
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
-            left: stats.get_left_to_download_bytes(),
+            left: stats.announced_left(),
             compact: true,
             no_peer_id: false,
             event,
             ip: None,
-            numwant: None,
+            numwant: numwant(event),
             key: Some(self.key),
-            trackerid: None,
+            trackerid: trackerid.as_deref(),
         };
 
         let mut url = tracker_url.clone();
@@ -817,6 +849,11 @@ impl TrackerComms {
                     e.into_kind()
                 })?
                 .0;
+        if let Some(id) = &response.tracker_id {
+            self.tracker_ids
+                .lock()
+                .insert(tracker_url.clone(), id.as_ref().to_vec());
+        }
 
         Ok(Announced {
             peers: response.iter_peers().collect(),
@@ -878,10 +915,11 @@ impl TrackerComms {
             info_hash: self.info_hash,
             peer_id: self.peer_id,
             downloaded: stats.downloaded_bytes,
-            left: stats.get_left_to_download_bytes(),
+            left: stats.announced_left(),
             uploaded: stats.uploaded_bytes,
             event: udp_event(event),
             key: self.key,
+            num_want: numwant(event),
             port: self.announce_port,
         };
 
@@ -972,11 +1010,11 @@ mod tests {
         assert_eq!(tier.current(), &http("a"));
     }
 
-    fn live(downloaded: u64, total: u64, finished_during_run: bool) -> TrackerCommsStats {
+    fn live(downloaded: u64, left: u64, finished_during_run: bool) -> TrackerCommsStats {
         TrackerCommsStats {
             uploaded_bytes: 0,
             downloaded_bytes: downloaded,
-            total_bytes: total,
+            left_bytes: Some(left),
             torrent_state: TrackerCommsStatsState::Live,
             finished_during_run,
         }
@@ -985,7 +1023,7 @@ mod tests {
     #[test]
     fn test_completed_is_sent_once_after_finishing_during_the_run() {
         let mut state = AnnounceState::default();
-        let downloading = live(10, 100, false);
+        let downloading = live(10, 90, false);
         assert_eq!(
             state.next_event(&downloading),
             Some(TrackerRequestEvent::Started)
@@ -994,7 +1032,7 @@ mod tests {
         assert_eq!(state.next_event(&downloading), None);
         assert!(state.awaits_completion(&downloading));
 
-        let finished = live(100, 100, true);
+        let finished = live(100, 0, true);
         assert!(state.awaits_completion(&finished));
         assert_eq!(
             state.next_event(&finished),
@@ -1009,7 +1047,7 @@ mod tests {
     fn test_completed_is_retried_until_accepted() {
         let mut state = AnnounceState::default();
         state.on_accepted(Some(TrackerRequestEvent::Started));
-        let finished = live(100, 100, true);
+        let finished = live(100, 0, true);
         // The completed announce failed: nothing was accepted.
         assert_eq!(
             state.next_event(&finished),
@@ -1024,7 +1062,7 @@ mod tests {
     #[test]
     fn test_no_completed_for_a_torrent_complete_from_the_start() {
         let mut state = AnnounceState::default();
-        let seeding = live(100, 100, false);
+        let seeding = live(0, 0, false);
         assert_eq!(
             state.next_event(&seeding),
             Some(TrackerRequestEvent::Started)
@@ -1039,6 +1077,16 @@ mod tests {
         let state = AnnounceState::default();
         // A magnet still resolving its metadata: nothing is known yet.
         assert!(state.awaits_completion(&TrackerCommsStats::default()));
+    }
+
+    #[test]
+    fn test_unknown_size_never_announces_as_complete() {
+        let unknown = TrackerCommsStats::default();
+        assert!(!unknown.is_completed());
+        assert_eq!(unknown.announced_left(), 16 * 1024);
+        let done = live(0, 0, false);
+        assert!(done.is_completed());
+        assert_eq!(done.announced_left(), 0);
     }
 
     #[test]
@@ -1166,7 +1214,7 @@ mod tests {
         .unwrap();
 
         let stats = Arc::new(ManualStats {
-            stats: Mutex::new(live(10, 100, false)),
+            stats: Mutex::new(live(0, 90, false)),
             completed: tokio::sync::watch::channel(false).0,
         });
         let token = CancellationToken::new();
@@ -1181,7 +1229,7 @@ mod tests {
             vec![vec![tracker]],
             Box::new(stats.clone()),
             None,
-            6881,
+            Some(6881),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),
@@ -1201,11 +1249,12 @@ mod tests {
 
         let q = announce!();
         assert_eq!(query_param(&q, "event"), Some("started"));
+        assert_eq!(query_param(&q, "downloaded"), Some("0"));
         assert_eq!(query_param(&q, "left"), Some("90"));
 
         *stats.stats.lock() = TrackerCommsStats {
             uploaded_bytes: 7,
-            ..live(100, 100, true)
+            ..live(90, 0, true)
         };
         stats.completed.send_replace(true);
         let q = announce!();
@@ -1215,14 +1264,79 @@ mod tests {
         *stats.stats.lock() = TrackerCommsStats {
             uploaded_bytes: 42,
             torrent_state: TrackerCommsStatsState::Paused,
-            ..live(100, 100, false)
+            ..live(90, 0, false)
         };
         drop(peers);
         let q = next_announce(&listener).await;
         assert_eq!(query_param(&q, "event"), Some("stopped"));
         assert_eq!(query_param(&q, "uploaded"), Some("42"));
-        assert_eq!(query_param(&q, "downloaded"), Some("100"));
+        assert_eq!(query_param(&q, "downloaded"), Some("90"));
         assert_eq!(query_param(&q, "left"), Some("0"));
+
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_tracker_id_is_sent_back_and_stopped_wants_no_peers() {
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(live(0, 90, false)),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let stopped = StoppedAnnounces::default();
+        let mut peers = TrackerComms::start_with_tiers(
+            Id20::new([1; 20]),
+            Id20::new([2; 20]),
+            vec![vec![url]],
+            Box::new(stats.clone()),
+            None,
+            Some(6881),
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            udp_client,
+            stopped.clone(),
+        )
+        .unwrap()
+        .peers;
+
+        // Drive the peer stream while the tracker answers with `body`.
+        macro_rules! announce {
+            ($body:expr) => {
+                tokio::select! {
+                    _ = peers.next() => panic!("the tracker sent no peers"),
+                    q = async {
+                        let (conn, q) = read_announce(&listener).await;
+                        respond(conn, $body).await;
+                        q
+                    } => q,
+                }
+            };
+        }
+
+        let q = announce!("d8:intervali1800e5:peers0:10:tracker id3:t-1e");
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        assert_eq!(query_param(&q, "numwant"), Some("200"));
+        assert_eq!(query_param(&q, "trackerid"), None);
+
+        // The next announce carries the id back; an answer without one keeps it.
+        *stats.stats.lock() = live(90, 0, true);
+        stats.completed.send_replace(true);
+        let q = announce!("d8:intervali1800e5:peers0:e");
+        assert_eq!(query_param(&q, "event"), Some("completed"));
+        assert_eq!(query_param(&q, "numwant"), Some("200"));
+        assert_eq!(query_param(&q, "trackerid"), Some("t-1"));
+
+        // `stopped` asks for no peers, and still names the id.
+        drop(peers);
+        let q = next_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        assert_eq!(query_param(&q, "numwant"), Some("0"));
+        assert_eq!(query_param(&q, "trackerid"), Some("t-1"));
 
         stopped.wait_idle().await;
         token.cancel();
@@ -1242,7 +1356,7 @@ mod tests {
             vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]],
             Box::new(()),
             None,
-            6881,
+            Some(6881),
             reqwest::Client::new(),
             udp_client,
             stopped.clone(),
@@ -1282,7 +1396,7 @@ mod tests {
             tiers,
             Box::new(()),
             None,
-            6881,
+            Some(6881),
             reqwest::Client::builder().no_proxy().build().unwrap(),
             udp_client,
             stopped.clone(),

@@ -333,6 +333,19 @@ impl ChunkTracker {
         }
     }
 
+    /// The chunks of `piece` not yet received.
+    pub fn iter_missing_chunks(
+        &self,
+        piece: ValidPieceIndex,
+    ) -> impl Iterator<Item = ChunkInfo> + '_ {
+        self.lengths.iter_chunk_infos(piece).filter(|chunk| {
+            !self
+                .chunk_status
+                .get(chunk.absolute_index as usize)
+                .is_some_and(|received| *received)
+        })
+    }
+
     pub fn is_chunk_ready_to_upload(&self, chunk: &ChunkInfo) -> bool {
         self.have
             .as_slice()
