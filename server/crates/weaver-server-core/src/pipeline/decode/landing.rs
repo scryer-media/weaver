@@ -183,11 +183,16 @@ impl Pipeline {
         // end in, which the commits above made; the parts held behind them
         // may now be laid.
         self.release_settled_unanchored_runs().await;
-        if let SegmentWriteKind::Ready { contiguous_end } = ticket.kind {
-            self.note_file_progress_floor(file_id, contiguous_end, false);
-            // Bytes `0..contiguous_end` are on disk, so a direct-unpack chase
-            // may read them.
-            self.direct_unpack_note_commit(file_id, &ticket.filename, contiguous_end, false);
+        // Arming reads the batch whole: every segment committed, and a file
+        // it completed already placed by its headers.
+        match ticket.kind {
+            SegmentWriteKind::Ready { contiguous_end } => {
+                self.note_file_progress_floor(file_id, contiguous_end, false);
+                // Bytes `0..contiguous_end` are on disk, so a direct-unpack
+                // chase may read them, and a waiting single may arm off them.
+                self.direct_unpack_note_commit(file_id, &ticket.filename, contiguous_end, false);
+            }
+            SegmentWriteKind::OutOfOrder => self.direct_unpack_note_out_of_order_landing(file_id),
         }
         self.remove_empty_write_buffer(file_id);
     }

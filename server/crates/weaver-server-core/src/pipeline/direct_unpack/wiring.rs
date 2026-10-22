@@ -72,6 +72,10 @@ use crate::pipeline::{ExtractionError, FullSetExtractionOutcome};
 // small enough that a park never sits on a mostly-empty buffer.
 const CHASE_BUFFER_BYTES: usize = 128 * 1024;
 
+// How much of a RAR part's landed opening the chase reads for its main
+// and first file headers.
+const RAR_OPENING_HEADER_BYTES: u64 = 64 * 1024;
+
 #[derive(Clone, Copy)]
 enum ChaseFormat {
     SevenZip { end_header_bytes: u64 },
@@ -1000,18 +1004,20 @@ impl Pipeline {
         if parts.is_empty() || parts.keys().copied().ne(0..parts.len() as u32) {
             return Err("RAR volume roster is empty or noncontiguous".into());
         }
-        if self
-            .rar_sets
-            .get(&(job_id, set_name.to_string()))
-            .is_some_and(|set| {
-                set.facts.get(&0).is_some_and(|facts| {
-                    facts.volume_number.is_some_and(|number| number != 0)
-                        || facts
-                            .members
-                            .iter()
-                            .min_by_key(|member| member.order)
-                            .is_some_and(|member| member.split_before)
-                }) || set.facts.iter().any(|(index, facts)| {
+        let set = self.rar_sets.get(&(job_id, set_name.to_string()));
+        // The part a chase opens is placed by its own headers: the facts its
+        // completion registered, or else the opening headers its landed
+        // bytes carry. A volume that only finishes later is read here as
+        // soon as its opening lands, never left to its name.
+        let first_opens_elsewhere = match set.and_then(|set| set.facts.get(&0)) {
+            Some(facts) => rar_facts_continue_a_volume(facts),
+            None => self
+                .rar_landed_opening_facts(job_id, &parts[&0])
+                .is_some_and(|facts| rar_facts_continue_a_volume(&facts)),
+        };
+        if first_opens_elsewhere
+            || set.is_some_and(|set| {
+                set.facts.iter().any(|(index, facts)| {
                     facts.more_volumes && !parts.contains_key(&index.saturating_add(1))
                 })
             })
@@ -1019,6 +1025,29 @@ impl Pipeline {
             return Err("RAR header requires a continuation not yet placed".into());
         }
         Ok(parts.into_values().collect())
+    }
+
+    // The headers a RAR part's landed opening carries, read from disk over
+    // the committed bytes only, so a hole past them is never parsed.
+    fn rar_landed_opening_facts(
+        &self,
+        job_id: JobId,
+        path: &std::path::Path,
+    ) -> Option<unrar_rs::RarVolumeFacts> {
+        use std::io::Read;
+        let file_id = self.direct_unpack_file_id_for_part(job_id, path)?;
+        let file = self.jobs.get(&job_id)?.assembly.file(file_id)?;
+        let landed =
+            committed_opening_len(file, RAR_OPENING_HEADER_BYTES).min(RAR_OPENING_HEADER_BYTES);
+        let mut opening = Vec::with_capacity(landed as usize);
+        std::fs::File::open(path)
+            .ok()?
+            .take(landed)
+            .read_to_end(&mut opening)
+            .ok()?;
+        unrar_rs::RarArchive::parse_volume_facts_walk(std::io::Cursor::new(opening), None)
+            .ok()
+            .map(|walk| walk.facts)
     }
 
     // Arm a set over an explicit ordered part list.
@@ -1576,10 +1605,13 @@ impl Pipeline {
 
     // Try to arm a single 7z or ZIP from its committed metadata.
     //
-    // Rides the commit path rather than the completion path: waiting for
+    // Rides the write landing rather than the completion path: waiting for
     // completion would mean waiting for the whole archive, which is exactly the
-    // overlap this exists to win. The candidate is retired from the pending set
-    // on any outcome that settles it — armed, refused, or no longer supported.
+    // overlap this exists to win. It runs once a landed batch is committed
+    // whole, never between its segments, so a RAR volume the batch completed
+    // is placed by its headers before a chase can arm on its name. The
+    // candidate is retired from the pending set on any outcome that settles
+    // it — armed, refused, or no longer supported.
     fn try_arm_single_archive(&mut self, file_id: crate::jobs::ids::NzbFileId, floor: u64) {
         if floor < SIGNATURE_HEADER_LEN {
             return;
@@ -2248,7 +2280,6 @@ impl Pipeline {
                 8 * 1024 * 1024,
             );
         }
-        self.try_arm_single_archive(file_id, SIGNATURE_HEADER_LEN);
         if let Some((set, index)) = self
             .direct_unpack
             .watermark_targets
@@ -2258,6 +2289,17 @@ impl Pipeline {
             && let Some(end) = offset.checked_add(len)
         {
             armed.coverage.note_committed_range(*index, offset, end);
+        }
+    }
+
+    // A landed out-of-order batch. Parked bytes can carry what a waiting
+    // single's arm needs, a ZIP's final article among them.
+    pub(in crate::pipeline) fn direct_unpack_note_out_of_order_landing(
+        &mut self,
+        file_id: crate::jobs::ids::NzbFileId,
+    ) {
+        if self.direct_unpack.pending_single_arm.contains(&file_id) {
+            self.try_arm_single_archive(file_id, SIGNATURE_HEADER_LEN);
         }
     }
 
@@ -4171,17 +4213,33 @@ fn sanitize_set_dir_name(set_name: &str) -> String {
     }
 }
 
+// Whether a RAR volume's headers say it continues an earlier volume: a
+// stated position past the first, or a first member split from before it.
+fn rar_facts_continue_a_volume(facts: &unrar_rs::RarVolumeFacts) -> bool {
+    facts.volume_number.is_some_and(|number| number != 0)
+        || facts
+            .members
+            .iter()
+            .min_by_key(|member| member.order)
+            .is_some_and(|member| member.split_before)
+}
+
 // How many of a file's opening bytes its committed articles cover, walking
 // ordinals from zero while each placement starts where the last one ended.
 // An opening article can be shorter than a header the next one completes.
-// Stops once `wanted` bytes are covered.
+// Stops once `wanted` bytes are covered. A demotion handback's rebuilt
+// article counts: its bytes are on disk, which is all a chase reads, even
+// though they carry no streamed checksum evidence.
 fn committed_opening_len(file: &crate::jobs::assembly::FileAssembly, wanted: u64) -> u64 {
     let mut end = 0u64;
     for segment in 0..file.total_segments() {
         if end >= wanted {
             break;
         }
-        match file.placement_of(segment) {
+        match file
+            .placement_of(segment)
+            .or_else(|| file.reconstructed_placement_of(segment))
+        {
             Some((offset, len)) if offset == end && file.has_segment(segment) => {
                 end = end.saturating_add(u64::from(len));
             }
