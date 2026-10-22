@@ -300,6 +300,21 @@ export function DownloadsPage() {
       ? countLabel(t, `next.downloads.bulk.${kind}`, total)
       : t(`next.downloads.bulk.${kind}Partial`, { done: total - refused, total, refused });
 
+  /**
+   * Settle a bulk action once every group has answered: the ids it carried
+   * out leave the selection, the rest stay ticked, and the report says how
+   * many went through. A request error is named only when nothing did.
+   */
+  const settleBulk = (kind: BulkReport, ids: number[], done: Set<number>, error?: { message: string }) => {
+    setPicked((current) => new Set([...current].filter((id) => !done.has(id))));
+    setReport(
+      error && done.size === 0
+        ? t("next.downloads.bulk.failed", { message: error.message })
+        : bulkReport(kind, ids.length, ids.length - done.size),
+    );
+    refreshQueue();
+  };
+
   const runOnPicked = async (
     kind: BulkReport,
     definition: Omit<Parameters<typeof executeAliasedIdMutation>[0], "client" | "ids">,
@@ -308,14 +323,8 @@ export function DownloadsPage() {
     setBulkBusy(true);
     const result = await executeAliasedIdMutation<boolean>({ client, ids, ...definition });
     setBulkBusy(false);
-    if (result.error) {
-      setReport(t("next.downloads.bulk.failed", { message: result.error.message }));
-      return;
-    }
-    const refused = ids.filter((_id, index) => result.data?.[`${definition.aliasPrefix}${index}`] !== true);
-    setPicked(new Set());
-    setReport(bulkReport(kind, ids.length, refused.length));
-    refreshQueue();
+    const done = new Set(ids.filter((_id, index) => result.data[`${definition.aliasPrefix}${index}`] === true));
+    settleBulk(kind, ids, done, result.error);
   };
 
   const pausePicked = () =>
@@ -346,25 +355,25 @@ export function DownloadsPage() {
     setRemovedIds((current) => new Set([...current, ...ids]));
     setSelectedId((current) => (current !== null && ids.includes(current) ? null : current));
     const cancelled = new Set<number>();
+    let error: { message: string } | undefined;
     for (let start = 0; start < ids.length; start += ALIASED_GROUP_SIZE) {
       const result = await client
         .mutation<{ cancelJobs: { id: number; cancelled: boolean }[] }>(CANCEL_JOBS_MUTATION, {
           ids: ids.slice(start, start + ALIASED_GROUP_SIZE),
         })
         .toPromise();
+      error ??= result.error;
       for (const row of result.data?.cancelJobs ?? []) {
         if (row.cancelled) cancelled.add(row.id);
       }
     }
-    const failed = ids.filter((id) => !cancelled.has(id));
-    if (failed.length > 0) {
-      setRemovedIds((current) => new Set([...current].filter((id) => !failed.includes(id))));
+    const failed = new Set(ids.filter((id) => !cancelled.has(id)));
+    if (failed.size > 0) {
+      setRemovedIds((current) => new Set([...current].filter((id) => !failed.has(id))));
     }
     setBulkBusy(false);
     setConfirmCancel(false);
-    setPicked(new Set());
-    setReport(bulkReport("cancelled", ids.length, failed.length));
-    refreshQueue();
+    settleBulk("cancelled", ids, cancelled, error);
   };
 
   const priorityOptions = [
