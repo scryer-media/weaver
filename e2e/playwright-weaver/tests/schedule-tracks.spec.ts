@@ -717,6 +717,9 @@ test("O03 an operator speed limit replaces the scheduled one until the next spee
       await rules.create({ actionType: "speed_limit", time: "10:00", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 3 * MiB }] });
       await rules.create({ actionType: "speed_limit", time: "10:30", speedLimits: [{ kind: "GLOBAL", id: null, bytesPerSec: 5 * MiB }] });
       setClock(at(day, 10, 0));
+      // Yesterday's replay can also report 3 MiB. Witness evaluation at the
+      // new clock before overriding today's occurrence.
+      await witnessTick(request, "watch");
       await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === 3 * MiB, "O03 scheduled limit at 10:00");
       await graphql(request, "mutation($bytes: Int!) { setSpeedLimit(bytesPerSec: $bytes) }", { bytes: operator });
       const replaced = await waitQueue(request, state => state.downloadBlock.scheduledSpeedLimit === 0, "O03 the operator's limit replaces the scheduled one");

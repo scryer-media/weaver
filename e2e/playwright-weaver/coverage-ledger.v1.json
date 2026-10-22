@@ -187,6 +187,11 @@
       "rationale": "Sanctioned setup helpers use this legacy alias only to seed history; cancelQueueItem owns the product assertion."
     },
     {
+      "name": "cancelJobs",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "api-metrics"
+    },
+    {
       "name": "cancelQueueItem",
       "owner": "duplicate-and-queue-policy",
       "oracle": "api-metrics"

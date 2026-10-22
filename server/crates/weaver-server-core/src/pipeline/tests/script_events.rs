@@ -642,3 +642,85 @@ async fn a_new_job_starts_at_once_when_nothing_blocks_on_its_arrival() {
     pipeline.raise_added_script_event(job_id);
     assert!(!pipeline.held_for_added_scripts(job_id));
 }
+
+#[tokio::test]
+async fn file_only_scripts_hold_the_pre_move_barrier_without_downloaded_subscriber() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let scripts = pipeline
+        .db
+        .initialize_post_processing_script_directory(temp.path(), None)
+        .unwrap();
+    std::fs::write(
+        scripts.join("queue.sh"),
+        "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n",
+    )
+    .unwrap();
+    pipeline
+        .db
+        .save_post_processing_settings(&PostProcessingSettings {
+            execution_enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+    pipeline
+        .db
+        .create_script_instance(queue_instance(QueueEvent::FileDownloaded))
+        .unwrap();
+    let job_id = JobId(9164);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("file-only-barrier", &[]),
+    )
+    .await;
+    let context = pipeline
+        .queue_script_context(job_id, QueueEvent::FileDownloaded)
+        .unwrap();
+    let run_id = pipeline
+        .db
+        .enqueue_script_event(&context, 1)
+        .unwrap()
+        .unwrap();
+    // A claimed run cannot be superseded or executed by the worker. The test
+    // releases it explicitly, independent of thread scheduling or script speed.
+    let datastore = pipeline.db.datastore();
+    let claimed_run = run_id.clone();
+    pipeline
+        .db
+        .run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "test_claim_file_script", |tx| {
+                let claimed_run = claimed_run.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE script_event_queue SET state = 'started' WHERE run_id = {}",
+                        &[SqlArg::Text(claimed_run)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .unwrap();
+    let downloaded = pipeline
+        .queue_script_context(job_id, QueueEvent::NzbDownloaded)
+        .unwrap();
+    let admission = pipeline
+        .db
+        .admit_queue_script_event(downloaded, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(admission.is_none(), "no NZB_DOWNLOADED subscriber");
+    let barrier =
+        Pipeline::wait_for_download_queue_scripts(&pipeline.db, job_id, admission.as_deref());
+    tokio::pin!(barrier);
+    tokio::select! {
+        biased;
+        result = &mut barrier => panic!("move barrier crossed an unfinished file event: {result:?}"),
+        () = std::future::ready(()) => {},
+    }
+    pipeline.db.finish_script_event_for_test(&run_id).unwrap();
+    barrier.await.unwrap();
+}
