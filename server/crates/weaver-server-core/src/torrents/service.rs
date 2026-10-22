@@ -3241,10 +3241,13 @@ impl TorrentService {
 
     // A torrent whose route changed moves to the new route's session, and
     // one whose peer terms changed goes through its session again; one
-    // whose route went down is held, and comes back when it is up.
+    // whose route went down is held, and comes back when it is up. A
+    // session the settings would now open otherwise opens again under them,
+    // its torrents with it.
     async fn follow_routes(&self) {
         let settings = self.settings();
         let rules = self.rules();
+        let outdated = self.inner.sessions.outdated().await;
         let mut reattach = Vec::new();
         let mut down: BTreeMap<RouteKey, String> = BTreeMap::new();
         let mut unresolved = Vec::new();
@@ -3269,6 +3272,7 @@ impl TorrentService {
                             torrent.route = Some(plan.key);
                             torrent.held = Some(Held::RouteDown(reason.clone()));
                         } else if torrent.route.as_ref() != Some(&plan.key)
+                            || outdated.contains(&plan.key)
                             || torrent
                                 .attached
                                 .as_ref()
@@ -3285,6 +3289,9 @@ impl TorrentService {
                     }
                 }
             }
+        }
+        for key in &outdated {
+            self.inner.sessions.drop_route(key).await;
         }
         for (key, reason) in down {
             self.inner.sessions.hold(&key, reason).await;

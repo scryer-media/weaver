@@ -152,10 +152,16 @@ impl Routes for FakeRoutes {
 pub(crate) fn env(root: &Path) -> SessionEnv {
     SessionEnv {
         root: root.to_path_buf(),
-        base_port: 0,
-        announce_port: None,
-        upnp: false,
         identity: IDENTITY,
+    }
+}
+
+// The torrent settings with the host choosing each listen port, so a test
+// takes no fixed port.
+fn any_port() -> TorrentConfig {
+    TorrentConfig {
+        base_port: 0,
+        ..TorrentConfig::default()
     }
 }
 
@@ -205,6 +211,7 @@ async fn a_route_keeps_its_port_until_it_is_gone() {
     routes.route(TorrentScope::Category(5), 2);
     let db = Database::open_in_memory().unwrap();
     let sessions = Sessions::new(routes.clone(), env(dir.path()), db.clone());
+    sessions.set_config(any_port());
     let first = routes.plan(TorrentScope::Default).unwrap();
     let second = routes.plan(TorrentScope::Category(5)).unwrap();
     sessions.session(&first).await.unwrap();
@@ -248,10 +255,16 @@ fn a_route_without_a_slot_listens_on_the_first_slots_port() {
     let db = Database::open_in_memory().unwrap();
     let first = RouteKey::of(0, &EgressBinding::System, &ladder(1));
     let second = RouteKey::of(0, &EgressBinding::System, &ladder(2));
-    assert_eq!(listen_port(&db, 6881, &second).unwrap(), 6881);
+    let torrent = TorrentConfig::default();
+    assert_eq!(listen_port(&db, &torrent, &second).unwrap(), Some(6881));
     port_slot(&db, &first).unwrap();
     port_slot(&db, &second).unwrap();
-    assert_eq!(listen_port(&db, 6881, &second).unwrap(), 6882);
+    assert_eq!(listen_port(&db, &torrent, &second).unwrap(), Some(6882));
+    let last = TorrentConfig {
+        base_port: u16::MAX,
+        ..torrent
+    };
+    assert_eq!(listen_port(&db, &last, &second).unwrap(), None);
 }
 
 // A port a gateway mapped to a route is what its session announces, over
@@ -263,9 +276,11 @@ async fn a_route_announces_the_port_mapped_to_it() {
     routes.route(TorrentScope::Default, 1);
     loopback_leg(&routes);
     let db = Database::open_in_memory().unwrap();
-    let mut env = env(dir.path());
-    env.announce_port = Some(51_413);
-    let sessions = Sessions::new(routes.clone(), env, db.clone());
+    let sessions = Sessions::new(routes.clone(), env(dir.path()), db.clone());
+    sessions.set_config(TorrentConfig {
+        announce_port: Some(51_413),
+        ..any_port()
+    });
     let plan = routes.plan(TorrentScope::Default).unwrap();
 
     let session = sessions.session(&plan).await.unwrap();
@@ -304,6 +319,7 @@ async fn a_route_shows_where_it_listens_and_how_its_ports_are_mapped() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
+    sessions.set_config(any_port());
     let plan = routes.plan(TorrentScope::Default).unwrap();
     let session = sessions.session(&plan).await.unwrap();
 
@@ -415,6 +431,7 @@ async fn a_route_listens_for_ssl_peers_while_turned_on() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
+    sessions.set_config(any_port());
     let plan = routes.plan(TorrentScope::Default).unwrap();
 
     let session = sessions.session(&plan).await.unwrap();
@@ -425,7 +442,7 @@ async fn a_route_listens_for_ssl_peers_while_turned_on() {
     sessions.set_config(TorrentConfig {
         ssl_enabled: true,
         ssl_port: Some(0),
-        ..TorrentConfig::default()
+        ..any_port()
     });
     sessions.settled().await;
     sessions.drop_route(&plan.key).await;
@@ -863,9 +880,12 @@ fn leg(kind: LegKind) -> OpenLeg {
 #[test]
 fn session_options_follow_the_leg() {
     let dir = tempfile::tempdir().unwrap();
-    let mut env = env(dir.path());
-    env.upnp = true;
-    env.announce_port = Some(51413);
+    let env = env(dir.path());
+    let torrent = TorrentConfig {
+        upnp: true,
+        announce_port: Some(51413),
+        ..TorrentConfig::default()
+    };
 
     let system = session_options(
         &env,
@@ -873,7 +893,7 @@ fn session_options_follow_the_leg() {
         6881,
         dir.path(),
         100,
-        &TorrentConfig::default(),
+        &torrent,
         IpFilter::default(),
     );
     assert!(system.dht.is_some());
@@ -894,7 +914,7 @@ fn session_options_follow_the_leg() {
         6881,
         dir.path(),
         100,
-        &TorrentConfig::default(),
+        &torrent,
         IpFilter::default(),
     );
     assert!(interface.dht.is_some());
@@ -1256,18 +1276,25 @@ impl SocketFactory for LoggedDht {
 async fn a_closed_route_lets_go_of_its_dht_socket_before_it_opens_again() {
     let dir = tempfile::tempdir().unwrap();
     let routes = Arc::new(FakeRoutes::default());
-    let mut env = env(dir.path());
-    env.base_port = 40_000;
+    let base_port = 40_000;
     let log = Arc::new(Mutex::new(Vec::new()));
     let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
     routes.set_leg(
         kind,
         Arc::new(LoggedDht {
-            port: env.base_port,
+            port: base_port,
             log: Arc::clone(&log),
         }),
     );
-    let sessions = Sessions::new(routes.clone(), env, Database::open_in_memory().unwrap());
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(TorrentConfig {
+        base_port,
+        ..any_port()
+    });
     let plan = routes.plan(TorrentScope::Default).unwrap();
 
     let before = sessions.session(&plan).await.unwrap();
@@ -1330,4 +1357,208 @@ fn a_route_runs_on_its_first_leg_that_is_up() {
     let (home, _) = first_up(&legs, down(&[])).unwrap();
     assert_ne!(key(away), key(home));
     assert_eq!(first_up(&[], down(&[])), None);
+}
+
+// A leg whose sockets reach no one and bind nothing on the host: its
+// listener holds the address asked for, so a session on it shows the port
+// the settings give without taking that port.
+pub(crate) struct Unbound;
+
+impl SocketFactory for Unbound {
+    fn connect_tcp<'a>(
+        &'a self,
+        _: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(async { Err(io::Error::from(io::ErrorKind::Unsupported)) })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        Box::pin(async move { Ok(Box::new(Quiet(addr)) as Box<dyn StreamListener>) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move { Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>) })
+    }
+
+    fn resolver(&self) -> Option<Arc<dyn weaver_torrent::network::Resolver>> {
+        Some(Arc::new(NoNames))
+    }
+}
+
+// Routes on a loopback leg that listens through `Unbound`.
+pub(crate) fn unbound_leg(routes: &FakeRoutes) {
+    routes.set_leg(
+        LegKind::SourceAddress("127.0.0.1".parse().unwrap()),
+        Arc::new(Unbound),
+    );
+}
+
+fn unbound_sessions(dir: &Path, torrent: TorrentConfig) -> (Arc<FakeRoutes>, Sessions) {
+    let routes = Arc::new(FakeRoutes::default());
+    unbound_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(torrent);
+    (routes, sessions)
+}
+
+// A listen port given while a route is open is the port it opens on again:
+// the open session is outdated until it does, and its next session listens
+// there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_listen_port_reopens_the_route_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = TorrentConfig {
+        base_port: 40_000,
+        ..TorrentConfig::default()
+    };
+    let (routes, sessions) = unbound_sessions(dir.path(), first.clone());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let before = sessions.session(&plan).await.unwrap();
+    let view = sessions.view(&plan.key).await.unwrap();
+    assert_eq!(view.listen.map(|listen| listen.port()), Some(40_000));
+    assert!(sessions.outdated().await.is_empty());
+
+    sessions.set_config(TorrentConfig {
+        base_port: 41_000,
+        ..first
+    });
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    let after = sessions.session(&plan).await.unwrap();
+    assert!(!Arc::ptr_eq(&before, &after));
+    let view = sessions.view(&plan.key).await.unwrap();
+    assert_eq!(view.port, Some(41_000));
+    assert_eq!(view.listen.map(|listen| listen.port()), Some(41_000));
+    assert_eq!(view.listen, after.listen_addr());
+    assert!(sessions.outdated().await.is_empty());
+    sessions.stop_all().await;
+}
+
+// An announce port given while a route is open is the one its next session
+// announces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_announce_port_reaches_the_next_announce() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = TorrentConfig {
+        announce_port: Some(51_413),
+        ..TorrentConfig::default()
+    };
+    let (routes, sessions) = unbound_sessions(dir.path(), first.clone());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let session = sessions.session(&plan).await.unwrap();
+    assert_eq!(session.announce_port(), Some(51_413));
+
+    sessions.set_config(TorrentConfig {
+        announce_port: Some(51_414),
+        ..first
+    });
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    let session = sessions.session(&plan).await.unwrap();
+    assert_eq!(session.announce_port(), Some(51_414));
+
+    sessions.set_config(TorrentConfig::default());
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    let session = sessions.session(&plan).await.unwrap();
+    assert_eq!(session.announce_port(), None);
+    sessions.stop_all().await;
+}
+
+// Settings that change nothing a session opens with leave it open.
+#[tokio::test(flavor = "multi_thread")]
+async fn other_settings_leave_the_session_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (routes, sessions) = unbound_sessions(dir.path(), TorrentConfig::default());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let session = sessions.session(&plan).await.unwrap();
+
+    sessions.set_config(TorrentConfig {
+        connection_speed: speed(9),
+        max_peers_total: 12,
+        ..TorrentConfig::default()
+    });
+    sessions.settled().await;
+    assert!(sessions.outdated().await.is_empty());
+    assert!(Arc::ptr_eq(
+        &session,
+        &sessions.session(&plan).await.unwrap()
+    ));
+    assert!(!session.cancellation_token().is_cancelled());
+    sessions.stop_all().await;
+}
+
+// Port mapping is what a session opens with on a leg that maps its port,
+// and nothing on one that does not.
+#[test]
+fn port_mapping_is_what_a_mapping_leg_opens_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env(dir.path());
+    let off = TorrentConfig {
+        upnp: false,
+        ..TorrentConfig::default()
+    };
+    let on = TorrentConfig {
+        upnp: true,
+        ..off.clone()
+    };
+    let opening =
+        |torrent: &TorrentConfig, kind: LegKind| Opening::of(&env, torrent, kind.shape(None));
+    assert!(opening(&on, LegKind::System).upnp);
+    assert!(!opening(&off, LegKind::System).upnp);
+    assert_ne!(
+        opening(&off, LegKind::System),
+        opening(&on, LegKind::System)
+    );
+    let address = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
+    assert_eq!(opening(&off, address.clone()), opening(&on, address));
+    assert_eq!(
+        opening(&off, LegKind::Ladder),
+        opening(&on, LegKind::Ladder)
+    );
+}
+
+// A session directory given while a route is open is where its next
+// session keeps its state.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_session_directory_reopens_the_route_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let (routes, sessions) = unbound_sessions(dir.path(), TorrentConfig::default());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    sessions.session(&plan).await.unwrap();
+    assert!(dir.path().join(plan.key.as_str()).is_dir());
+
+    let elsewhere = dir.path().join("elsewhere");
+    sessions.set_config(TorrentConfig {
+        session_dir: Some(elsewhere.clone()),
+        ..TorrentConfig::default()
+    });
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    sessions.session(&plan).await.unwrap();
+    assert!(elsewhere.join(plan.key.as_str()).is_dir());
+    assert!(sessions.outdated().await.is_empty());
+    sessions.stop_all().await;
 }

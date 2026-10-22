@@ -84,9 +84,6 @@ async fn rig() -> Rig {
         Arc::new(Offline),
         SessionEnv {
             root: dir.path().join("sessions"),
-            base_port: 0,
-            announce_port: None,
-            upnp: false,
             identity: IDENTITY,
         },
         db.clone(),

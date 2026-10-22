@@ -260,31 +260,55 @@ impl Routes for NetworkRoutes {
     }
 }
 
-/// What every session shares.
+/// What every session shares while the process runs. The rest of what a
+/// session opens with is the torrent settings', read as they stand.
 #[derive(Clone, Debug)]
 pub struct SessionEnv {
-    /// Each session keeps its state in a directory of its own under here.
+    /// Each session keeps its state in a directory of its own under here,
+    /// unless the settings name another.
     pub root: PathBuf,
-    pub base_port: u16,
-    pub announce_port: Option<u16>,
-    pub upnp: bool,
     pub identity: ClientIdentity,
 }
 
 impl SessionEnv {
-    /// The sessions the settings ask for, under the data directory unless
-    /// they name a directory of their own.
+    /// The sessions of a server, under its data directory.
     pub fn of(config: &crate::settings::Config) -> Self {
-        let torrent = &config.torrent;
         Self {
-            root: torrent
-                .session_dir
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(&config.data_dir).join("torrents")),
-            base_port: torrent.base_port,
-            announce_port: torrent.announce_port,
-            upnp: torrent.upnp,
+            root: PathBuf::from(&config.data_dir).join("torrents"),
             identity: crate::torrents::identity::IDENTITY,
+        }
+    }
+
+    /// Where the sessions keep their state under `torrent`.
+    fn root_of(&self, torrent: &TorrentConfig) -> PathBuf {
+        torrent
+            .session_dir
+            .clone()
+            .unwrap_or_else(|| self.root.clone())
+    }
+}
+
+/// What a session on a leg of `shape` takes from the settings when it opens
+/// and cannot take while open: where it keeps its state, the port it binds,
+/// the port it announces and whether it maps its port. Settings that now
+/// give another re-open it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Opening {
+    shape: Shape,
+    root: PathBuf,
+    base_port: Option<u16>,
+    announce_port: Option<u16>,
+    upnp: bool,
+}
+
+impl Opening {
+    fn of(env: &SessionEnv, torrent: &TorrentConfig, shape: Shape) -> Self {
+        Self {
+            shape,
+            root: env.root_of(torrent),
+            base_port: (shape.listen || shape.dht).then_some(torrent.base_port),
+            announce_port: torrent.announce_port.filter(|_| shape.listen),
+            upnp: shape.listen && shape.upnp && torrent.upnp,
         }
     }
 }
@@ -385,8 +409,8 @@ pub fn session_options(
         listen: shape.listen.then(|| ListenerOptions {
             mode,
             listen_addr: SocketAddr::new(listen_ip, port),
-            enable_upnp_port_forwarding: shape.upnp && env.upnp,
-            announce_port: env.announce_port,
+            enable_upnp_port_forwarding: shape.upnp && torrent.upnp,
+            announce_port: torrent.announce_port,
             ..ListenerOptions::default()
         }),
         // Peers are dialed by the session's own sockets or by the leg's
@@ -436,6 +460,7 @@ enum Slot {
         port: u16,
         kind: LegKind,
         mappings: PortMappings,
+        opening: Opening,
     },
     Held {
         reason: String,
@@ -553,7 +578,8 @@ impl Sessions {
     /// load holds them closed. The transports, the DHT's bootstrap nodes,
     /// the stopped announce timeout and connections per address are a
     /// session's from when it opens, so each takes them when its route next
-    /// opens.
+    /// opens. A session whose ports, port mapping or directory they change
+    /// is `outdated` until it opens again.
     pub fn set_config(&self, config: TorrentConfig) {
         let mut configured = self.configured();
         configured.torrent = config;
@@ -712,7 +738,7 @@ impl Sessions {
         let peers = self.config().max_peers_total as usize;
         let mappings = PortMappings::default();
         match self.build(plan, port_slot, peers, &mappings).await {
-            Ok((session, leg, port)) => {
+            Ok((session, leg, port, opening)) => {
                 self.rates.add(&session);
                 self.configured().add(&session);
                 slots.insert(
@@ -723,6 +749,7 @@ impl Sessions {
                         port,
                         kind: plan.kind.clone(),
                         mappings,
+                        opening,
                     },
                 );
                 Ok(session)
@@ -746,22 +773,16 @@ impl Sessions {
         slot: Result<(u16, Option<u16>), String>,
         peers: usize,
         mappings: &PortMappings,
-    ) -> Result<(Arc<Session>, Option<Arc<TorrentLeg>>, u16), String> {
+    ) -> Result<(Arc<Session>, Option<Arc<TorrentLeg>>, u16, Opening), String> {
         let (slot, mapped) = slot?;
-        let port = self
-            .env
-            .base_port
-            .checked_add(slot)
-            .ok_or("no listen port is left for this route")?;
-        let dir = self.env.root.join(plan.key.as_str());
+        let mut torrent = self.config();
+        let port = slot_port(&torrent, slot).ok_or("no listen port is left for this route")?;
+        let dir = self.env.root_of(&torrent).join(plan.key.as_str());
         std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
         let leg = self.routes.open(plan, peers).await?;
+        let opening = Opening::of(&self.env, &torrent, leg.shape);
         // A port a gateway mapped to the route is the one it announces.
-        let env = SessionEnv {
-            announce_port: mapped.or(self.env.announce_port),
-            ..self.env.clone()
-        };
-        let torrent = self.config();
+        torrent.announce_port = mapped.or(torrent.announce_port);
         let ip_filter = self.ip_filter(&torrent).await?;
         let ssl_port = if torrent.ssl_enabled {
             let base = self.ssl_base_port(torrent.ssl_port).await?;
@@ -774,7 +795,7 @@ impl Sessions {
         };
         let mut options = SessionOptions {
             port_map_events: Some(mappings.follow()),
-            ..session_options(&env, &leg, port, &dir, peers, &torrent, ip_filter)
+            ..session_options(&self.env, &leg, port, &dir, peers, &torrent, ip_filter)
         };
         // SSL torrents' peers come to a port of the route's own beside its
         // peer port.
@@ -783,8 +804,28 @@ impl Sessions {
         }
         Session::new_with_opts(dir.join("output"), options)
             .await
-            .map(|session| (session, leg.leg, port))
+            .map(|session| (session, leg.leg, port, opening))
             .map_err(|error| format!("{error:#}"))
+    }
+
+    /// The routes whose open session the settings as they stand would open
+    /// otherwise: binding or announcing another port, mapping it or not, or
+    /// keeping its state elsewhere. Each opens again, under the settings,
+    /// once it is dropped.
+    pub async fn outdated(&self) -> BTreeSet<RouteKey> {
+        let torrent = self.config();
+        let slots = self.slots.lock().await;
+        slots
+            .iter()
+            .filter_map(|(key, slot)| match slot {
+                Slot::Open { opening, .. }
+                    if *opening != Opening::of(&self.env, &torrent, opening.shape) =>
+                {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Close `key`'s session and hold it closed for `reason`.
@@ -1051,11 +1092,21 @@ fn save_slots(db: &Database, slots: &BTreeMap<String, u16>) -> Result<(), StateE
     db.set_setting(SLOTS_KEY, &value)
 }
 
-/// The port the route's session listens on: its slot's, or the first
-/// slot's while it has none.
-pub fn listen_port(db: &Database, base_port: u16, key: &RouteKey) -> Result<u16, StateError> {
+/// The port a route on port slot `slot` listens on under `torrent`, while
+/// one is left.
+pub fn slot_port(torrent: &TorrentConfig, slot: u16) -> Option<u16> {
+    torrent.base_port.checked_add(slot)
+}
+
+/// The port the route's session listens on under `torrent`: its slot's, or
+/// the first slot's while it has none.
+pub fn listen_port(
+    db: &Database,
+    torrent: &TorrentConfig,
+    key: &RouteKey,
+) -> Result<Option<u16>, StateError> {
     let slot = load_slots(db)?.get(key.as_str()).copied().unwrap_or(0);
-    Ok(base_port.saturating_add(slot))
+    Ok(slot_port(torrent, slot))
 }
 
 /// The route's port slot, kept across restarts: the lowest free one the

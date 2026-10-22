@@ -227,9 +227,6 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
             Arc::new(Offline),
             SessionEnv {
                 root: dir.path().join("sessions"),
-                base_port: 0,
-                announce_port: None,
-                upnp: false,
                 identity: IDENTITY,
             },
             db.clone(),

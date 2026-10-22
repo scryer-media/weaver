@@ -13,7 +13,7 @@ use crate::post_processing::model::PostProcessingSettings;
 use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::TrackerStatus;
 use crate::torrents::sessions::Routes;
-use crate::torrents::sessions::tests::{FakeRoutes, env};
+use crate::torrents::sessions::tests::{FakeRoutes, env, unbound_leg};
 use crate::torrents::status::ROUTE_DOWN_FETCHING;
 use crate::torrents::storage::PieceStorage;
 
@@ -769,6 +769,66 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
         rig.db.get_torrent(job_id).unwrap().unwrap().category_id,
         Some(1)
     );
+}
+
+// The session a torrent runs in, while it runs in one.
+async fn session_of(service: &TorrentService, job_id: JobId) -> Arc<Session> {
+    let live = service.inner.live.lock().await;
+    Arc::clone(&live[&job_id].attached.as_ref().unwrap().session)
+}
+
+// A listen port given while a torrent runs reopens its route there at the
+// next tick, the torrent going through the new session; settings that change
+// nothing a session opens with leave it be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_listen_port_reopens_the_torrents_route_on_it() {
+    let rig = rig(set_clock());
+    unbound_leg(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let listening = || async {
+        let views = rig.service.inner.sessions.views().await;
+        assert_eq!(views.len(), 1);
+        views[0].listen.map(|listen| listen.port())
+    };
+    let before = session_of(&rig.service, job_id).await;
+    assert_eq!(listening().await, Some(6881));
+
+    let mut settings = rig.service.settings();
+    settings.torrent.max_peers_total = 12;
+    rig.service.set_settings(settings.clone()).await;
+    rig.service.tick().await;
+    assert!(Arc::ptr_eq(
+        &before,
+        &session_of(&rig.service, job_id).await
+    ));
+
+    settings.torrent.base_port = 41_000;
+    rig.service.set_settings(settings).await;
+    rig.service.tick().await;
+    let after = session_of(&rig.service, job_id).await;
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert!(before.cancellation_token().is_cancelled());
+    assert_eq!(listening().await, Some(41_000));
+    assert_eq!(
+        after.listen_addr().map(|listen| listen.port()),
+        Some(41_000)
+    );
+    assert!(
+        after
+            .get(TorrentIdOrHash::Id(
+                handle_of(&rig.service, job_id).await.id()
+            ))
+            .is_some()
+    );
+    rig.service.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

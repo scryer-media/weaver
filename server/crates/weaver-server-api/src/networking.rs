@@ -874,19 +874,21 @@ async fn test_via_torrent(
     use weaver_server_core::torrents::sessions;
     let leg = route.legs.first().ok_or("the route has no leg")?;
     let key = sessions::leg_key(&runtime.network, leg.egress_id, &leg.path);
-    let base_port = ctx
+    // The settings the route's session opens under.
+    let torrent = ctx
         .data::<weaver_server_core::settings::SharedConfig>()?
         .read()
         .await
         .torrent
-        .base_port;
+        .clone();
     let db = ctx.data::<Database>()?.clone();
     let internal_port = {
         let (db, key) = (db.clone(), key.clone());
         spawn_blocking_db("network.test_via_torrent", move || {
-            sessions::listen_port(&db, base_port, &key)
+            sessions::listen_port(&db, &torrent, &key)
         })
         .await?
+        .ok_or("no listen port is left for this route")?
     };
     // Tests point the test torrent at a loopback source.
     let source = ctx
