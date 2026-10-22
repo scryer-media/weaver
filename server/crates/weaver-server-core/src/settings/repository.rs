@@ -4,7 +4,7 @@
 use crate::StateError;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
-use crate::settings::model::{Client, TrackerRule};
+use crate::settings::model::{Client, TorrentEncryption, TrackerRule, TrackerUploadLimit};
 
 #[cfg(test)]
 use crate::categories::CategoryConfig;
@@ -13,8 +13,7 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str =
-    "id, host_pattern, seeding, never_pause, unpack, client, torrent_route";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, discovery, encryption, upload_limit, forced";
 
 fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
     let seeding = row
@@ -42,6 +41,26 @@ fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
             })
             .transpose()?,
         torrent_route: row.bool("torrent_route")?,
+        discovery: row.opt_bool("discovery")?,
+        encryption: row
+            .opt_text("encryption")?
+            .map(|encryption| {
+                TorrentEncryption::parse(&encryption).ok_or_else(|| {
+                    StateError::Database(format!(
+                        "tracker rule encryption {encryption} is not known"
+                    ))
+                })
+            })
+            .transpose()?,
+        upload_limit: row
+            .opt_text("upload_limit")?
+            .map(|limit| {
+                TrackerUploadLimit::parse(&limit).ok_or_else(|| {
+                    StateError::Database(format!("tracker rule upload limit {limit} is not valid"))
+                })
+            })
+            .transpose()?,
+        forced: row.bool("forced")?,
     })
 }
 
@@ -59,6 +78,13 @@ fn tracker_rule_args(rule: &TrackerRule) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptBool(rule.unpack),
         SqlArg::OptText(rule.client.map(|client| client.as_str().to_owned())),
         SqlArg::Bool(rule.torrent_route),
+        SqlArg::OptBool(rule.discovery),
+        SqlArg::OptText(
+            rule.encryption
+                .map(|encryption| encryption.as_str().to_owned()),
+        ),
+        SqlArg::OptText(rule.upload_limit.map(TrackerUploadLimit::to_text)),
+        SqlArg::Bool(rule.forced),
     ])
 }
 
@@ -106,7 +132,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -127,7 +153,8 @@ impl Database {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE tracker_rules
-                    SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {}, updated_at_ms = {}
+                    SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
+                        discovery = {}, encryption = {}, upload_limit = {}, forced = {}, updated_at_ms = {}
                   WHERE id = {}",
                 &args,
             )

@@ -139,12 +139,14 @@ impl StreamConnector {
         })
     }
 
+    /// The session's encryption, which a connection is made under unless
+    /// its torrent names its own.
     pub fn encryption(&self) -> EncryptionPolicy {
         self.encryption
     }
 
     /// Connect to a peer over `transports` and send it our BitTorrent
-    /// `handshake`, inside the encrypted handshake when the policy says so.
+    /// `handshake`, inside the encrypted handshake when `policy` says so.
     /// Under [`EncryptionPolicy::Prefer`] `encrypt` says which, asked once the
     /// transport is open (libtorrent `bt_peer_connection::on_connected`
     /// chooses there, so a peer we never reach is never asked). An encrypted
@@ -157,6 +159,7 @@ impl StreamConnector {
         &self,
         addr: SocketAddr,
         transports: Transports,
+        policy: EncryptionPolicy,
         info_hash: &Id20,
         handshake: &[u8],
         encrypt: impl FnOnce() -> bool,
@@ -178,7 +181,7 @@ impl StreamConnector {
         let (meter, r, mut w) = Meter::wrap(r, w);
 
         let stats = &self.stats.encryption;
-        let encrypted = match self.encryption {
+        let encrypted = match policy {
             EncryptionPolicy::Disabled => false,
             EncryptionPolicy::Prefer => encrypt(),
             EncryptionPolicy::Require => true,
@@ -195,7 +198,7 @@ impl StreamConnector {
         }
 
         stats.attempts(1);
-        let offer = mse::outgoing_offer(self.encryption);
+        let offer = mse::outgoing_offer(policy);
         let established = with_timeout("encryption handshake", rw_timeout, async {
             Ok(mse::initiate(r, w, info_hash, offer, handshake).await?)
         })
@@ -487,6 +490,7 @@ mod tests {
             .connect_and_send_handshake(
                 (Ipv4Addr::LOCALHOST, 6881).into(),
                 Transports::Any,
+                connector.encryption(),
                 &Id20::new([7; 20]),
                 HANDSHAKE,
                 encrypt,

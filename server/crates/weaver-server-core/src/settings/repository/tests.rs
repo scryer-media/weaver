@@ -432,7 +432,7 @@ fn clearing_the_global_seeding_policy_removes_it() {
 #[test]
 fn tracker_rules_crud() {
     use crate::settings::model::TrackerRule;
-    use crate::settings::{SeedingAction, SeedingPolicy};
+    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption, TrackerUploadLimit};
 
     let db = Database::open_in_memory().unwrap();
     assert!(db.list_tracker_rules().unwrap().is_empty());
@@ -452,6 +452,10 @@ fn tracker_rules_crud() {
                 unpack: Some(false),
                 client: Some(Client::QBittorrent),
                 torrent_route: true,
+                discovery: Some(false),
+                encryption: Some(TorrentEncryption::Prefer),
+                upload_limit: Some(TrackerUploadLimit::Unlimited),
+                forced: true,
             },
             1,
         )
@@ -466,6 +470,10 @@ fn tracker_rules_crud() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
             },
             2,
         )
@@ -494,6 +502,10 @@ fn tracker_rules_crud() {
         unpack: Some(true),
         client: Some(Client::Transmission),
         torrent_route: false,
+        discovery: Some(true),
+        encryption: Some(TorrentEncryption::Require),
+        upload_limit: Some(TrackerUploadLimit::Bps(4_096)),
+        forced: false,
         ..first.clone()
     };
     assert!(db.update_tracker_rule(&changed, 4).unwrap());

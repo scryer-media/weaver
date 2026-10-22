@@ -553,6 +553,65 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
     assert!(!rig.execute(&save("", "DELUGE")).await.errors.is_empty());
 }
 
+// A tracker rule keeps its torrents' discovery, encryption, upload cap and
+// forced start; absent inherits, and an upload cap without bytes per second
+// is unlimited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
+    let rig = rig().await;
+    let fields = "id discovery encryption uploadLimit { bps } forced";
+    let save = |id: &str, terms: &str| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{
+                hostPattern: "*.example-tracker.test", client: QBITTORRENT, {terms}
+            }}) {{ {fields} }} }}"#
+        )
+    };
+
+    let response = rig
+        .execute(&save(
+            "",
+            "discovery: false, encryption: PREFER, uploadLimit: { bps: null }, forced: true",
+        ))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let saved = response.data.into_json().unwrap();
+    let id = saved["saveTrackerRule"][0]["id"].as_u64().unwrap();
+    assert_eq!(
+        saved["saveTrackerRule"][0],
+        serde_json::json!({
+            "id": id, "discovery": false, "encryption": "PREFER",
+            "uploadLimit": { "bps": null }, "forced": true,
+        })
+    );
+
+    for (terms, read) in [
+        (
+            "discovery: true, encryption: REQUIRE, uploadLimit: { bps: 4096 }",
+            serde_json::json!({
+                "id": id, "discovery": true, "encryption": "REQUIRE",
+                "uploadLimit": { "bps": 4096 }, "forced": false,
+            }),
+        ),
+        (
+            "",
+            serde_json::json!({
+                "id": id, "discovery": null, "encryption": null,
+                "uploadLimit": null, "forced": false,
+            }),
+        ),
+    ] {
+        let response = rig.execute(&save(&format!("id: {id},"), terms)).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let response = rig
+            .execute(&format!("{{ trackerRules {{ {fields} }} }}"))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let rules = response.data.into_json().unwrap();
+        assert_eq!(rules["trackerRules"], serde_json::json!([read]));
+    }
+}
+
 // A tracker rule keeps whether its torrents route through their own
 // consumer, and absent is off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

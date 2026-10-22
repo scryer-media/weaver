@@ -303,10 +303,17 @@ fn binds(ip: IpAddr) -> bool {
 
 /// How the session treats peer encryption.
 fn apply_encryption(options: &mut SessionOptions, policy: TorrentEncryption) {
-    options.encryption = match policy {
+    options.encryption = encryption_policy(policy);
+}
+
+/// The engine's policy for `policy`, a session's or a torrent's.
+pub(crate) const fn encryption_policy(
+    policy: TorrentEncryption,
+) -> weaver_torrent::EncryptionPolicy {
+    match policy {
         TorrentEncryption::Prefer => weaver_torrent::EncryptionPolicy::Prefer,
         TorrentEncryption::Require => weaver_torrent::EncryptionPolicy::Require,
-    };
+    }
 }
 
 /// How a session takes and reaches peers: the transports `torrent` asks

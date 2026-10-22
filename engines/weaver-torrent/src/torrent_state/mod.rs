@@ -161,6 +161,8 @@ pub(crate) struct ManagedTorrentOptions {
     /// Every live run picks through this one flag, so a change reaches the
     /// running peers and outlives pause/unpause.
     pub sequential: AtomicBool,
+    /// [`AddTorrentOptions::trackers_only`](crate::AddTorrentOptions::trackers_only).
+    pub trackers_only: bool,
 }
 
 impl ManagedTorrentOptions {
@@ -441,6 +443,23 @@ impl ManagedTorrent {
     /// The resolved on-disk folder this torrent's files are written under.
     pub fn output_folder(&self) -> &Path {
         &self.shared.options.output_folder
+    }
+
+    /// Whether the torrent takes peers from its trackers alone (see
+    /// [`AddTorrentOptions::trackers_only`](crate::AddTorrentOptions::trackers_only)):
+    /// its metainfo marks it private, or it was added so.
+    pub fn takes_peers_from_trackers_only(&self) -> bool {
+        crate::session::trackers_only(
+            self.with_metadata(|m| m.info.info().private)
+                .unwrap_or(false),
+            self.shared.options.trackers_only,
+        )
+    }
+
+    /// The encryption the torrent's connections are made under, over the
+    /// session's; `None` is the session's.
+    pub fn encryption(&self) -> Option<crate::EncryptionPolicy> {
+        self.shared.options.peer_opts.encryption
     }
 
     pub fn with_metadata<R>(
@@ -951,10 +970,7 @@ impl ManagedTorrent {
         else {
             return;
         };
-        let private = self
-            .with_metadata(|m| m.info.info().private)
-            .unwrap_or(false);
-        status.replace(session.announce_tiers(tiers, private));
+        status.replace(session.announce_tiers(tiers, self.takes_peers_from_trackers_only()));
     }
 
     /// Adds `tiers` after the torrent's last tier, a tracker it has already

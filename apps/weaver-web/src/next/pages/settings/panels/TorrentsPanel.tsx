@@ -16,7 +16,7 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
 import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
+import { NumberField, SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
@@ -52,6 +52,17 @@ interface TrackerRule {
   /** Null names the torrents as Weaver. */
   client: TorrentClient | null;
   torrentRoute: boolean;
+  /** Null inherits; false holds the rule's torrents to their trackers for peers. */
+  discovery: boolean | null;
+  /** Null inherits the global encryption. */
+  encryption: TorrentEncryption | null;
+  /** Null inherits the seeding policy's cap; a null rate is unlimited. */
+  uploadLimit: TrackerUploadLimit | null;
+  forced: boolean;
+}
+
+interface TrackerUploadLimit {
+  bps: number | null;
 }
 
 type TorrentClient = "WEAVER" | "QBITTORRENT" | "TRANSMISSION";
@@ -69,6 +80,10 @@ interface TrackerRuleForm {
   unpack: boolean | null;
   client: TorrentClient | null;
   torrentRoute: boolean;
+  discovery: boolean | null;
+  encryption: TorrentEncryption | null;
+  uploadLimit: TrackerUploadLimit | null;
+  forced: boolean;
 }
 
 const NEW_TRACKER_RULE: TrackerRuleForm = {
@@ -78,7 +93,65 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   unpack: null,
   client: null,
   torrentRoute: false,
+  discovery: null,
+  encryption: null,
+  uploadLimit: null,
+  forced: false,
 };
+
+/** A rule's upload cap as its editor picks it: inherited, unlimited, or a rate of its own. */
+type UploadLimitChoice = "inherit" | "unlimited" | "cap";
+
+const uploadLimitChoice = (limit: TrackerUploadLimit | null): UploadLimitChoice =>
+  limit === null ? "inherit" : limit.bps === null ? "unlimited" : "cap";
+
+/** The rate a rule's cap opens at when it is first given one. */
+const DEFAULT_RULE_UPLOAD_BPS = 10 * 1024 * 1024;
+
+/** A rule's upload cap: inherited, unlimited, or a rate in MB/s. */
+function UploadLimitControl({
+  t,
+  value,
+  onChange,
+}: {
+  t: Translate;
+  value: TrackerUploadLimit | null;
+  onChange: (next: TrackerUploadLimit | null) => void;
+}) {
+  const [last, setLast] = useState(value?.bps ?? DEFAULT_RULE_UPLOAD_BPS);
+  const label = t("next.torrents.trackerRuleUploadLimit");
+  return (
+    <div className="flex items-center gap-[10px]">
+      <Segmented<UploadLimitChoice>
+        label={label}
+        value={uploadLimitChoice(value)}
+        options={[
+          { value: "inherit", label: t("next.torrents.unpackInherit") },
+          { value: "unlimited", label: t("next.networking.unlimited") },
+          { value: "cap", label: t("next.torrents.trackerRuleUploadCap") },
+        ]}
+        onChange={(choice) =>
+          onChange(choice === "inherit" ? null : choice === "unlimited" ? { bps: null } : { bps: last })
+        }
+      />
+      {value?.bps != null ? (
+        <NumberField
+          label={label}
+          value={Math.round((value.bps / (1024 * 1024)) * 10) / 10}
+          min={0}
+          step={0.1}
+          precision={1}
+          suffix="MB/s"
+          onChange={(next) => {
+            const bps = Math.round(Math.max(0, next) * 1024 * 1024);
+            setLast(bps);
+            onChange({ bps });
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
 
 /** A rule's goals in one line, as its row shows them. */
 function goalsText(t: Translate, policy: SeedingPolicy | null): string {
@@ -247,6 +320,10 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           unpack: rule.unpack,
           client: rule.client,
           torrentRoute: rule.torrentRoute,
+          discovery: rule.discovery,
+          encryption: rule.encryption,
+          uploadLimit: rule.uploadLimit,
+          forced: rule.forced,
         }
       : NEW_TRACKER_RULE;
     setForm(start);
@@ -266,6 +343,10 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         unpack: form.unpack,
         client: form.client,
         torrentRoute: form.torrentRoute,
+        discovery: form.discovery,
+        encryption: form.encryption,
+        uploadLimit: form.uploadLimit,
+        forced: form.forced,
       },
     });
     setBusy(false);
@@ -418,6 +499,61 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                       ) : null}
                     </div>
                   ),
+                },
+              },
+              {
+                id: "discovery",
+                label: t("next.torrents.trackerRuleDiscovery"),
+                keywords: "dht pex lsd peer discovery private",
+                control: {
+                  kind: "segmented",
+                  value: unpackChoice(form.discovery),
+                  options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
+                  onChange: (choice) => setForm((current) => ({ ...current, discovery: unpackOf(choice) })),
+                },
+              },
+              {
+                id: "encryption",
+                label: t("next.torrents.encryption"),
+                keywords: "encryption mse pe",
+                control: {
+                  kind: "segmented",
+                  value: form.encryption ?? "inherit",
+                  options: [
+                    { value: "inherit", label: t("next.torrents.unpackInherit") },
+                    ...ENCRYPTIONS.map((option) => ({ ...option, label: t(option.label) })),
+                  ],
+                  onChange: (encryption) =>
+                    setForm((current) => ({
+                      ...current,
+                      encryption: encryption === "inherit" ? null : (encryption as TorrentEncryption),
+                    })),
+                },
+              },
+              {
+                id: "uploadLimit",
+                label: t("next.torrents.trackerRuleUploadLimit"),
+                keywords: "upload speed limit rate",
+                control: {
+                  kind: "custom",
+                  control: (
+                    <UploadLimitControl
+                      key={opening}
+                      t={t}
+                      value={form.uploadLimit}
+                      onChange={(uploadLimit) => setForm((current) => ({ ...current, uploadLimit }))}
+                    />
+                  ),
+                },
+              },
+              {
+                id: "forced",
+                label: t("next.torrents.trackerRuleForced"),
+                keywords: "forced queue start",
+                control: {
+                  kind: "toggle",
+                  value: form.forced,
+                  onChange: (forced) => setForm((current) => ({ ...current, forced })),
                 },
               },
               {

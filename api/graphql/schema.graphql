@@ -5331,6 +5331,25 @@ type TrackerRule {
 	Whether its torrents route through their own consumer.
 	"""
 	torrentRoute: Boolean!
+	"""
+	Whether its torrents look for peers beyond their trackers; absent
+	inherits.
+	"""
+	discovery: Boolean
+	"""
+	The encryption its torrents' connections are made under; absent
+	inherits.
+	"""
+	encryption: TorrentEncryption
+	"""
+	The upload cap its torrents take in place of their category's and
+	the global seeding policy's; absent inherits.
+	"""
+	uploadLimit: TrackerUploadLimit
+	"""
+	Whether a torrent admitted under it starts forced.
+	"""
+	forced: Boolean!
 }
 
 input TrackerRuleInput {
@@ -5340,6 +5359,10 @@ input TrackerRuleInput {
 	unpack: Boolean
 	client: TorrentClient
 	torrentRoute: Boolean! = false
+	discovery: Boolean
+	encryption: TorrentEncryption
+	uploadLimit: TrackerUploadLimitInput
+	forced: Boolean! = false
 }
 
 enum TrackerStatus {
@@ -5349,6 +5372,20 @@ enum TrackerStatus {
 	TRACKER_ERROR
 	UNREACHABLE
 	DISABLED
+}
+
+"""
+A tracker rule's upload cap: bytes per second, or absent for unlimited.
+"""
+type TrackerUploadLimit {
+	bps: Int
+}
+
+"""
+A tracker rule's upload cap: bytes per second, or absent for unlimited.
+"""
+input TrackerUploadLimitInput {
+	bps: Int
 }
 
 """

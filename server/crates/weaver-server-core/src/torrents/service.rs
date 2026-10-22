@@ -20,7 +20,8 @@ use weaver_torrent::core::{Id20, Id32, InfoHashes};
 use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
-    ManagedTorrent, ResumePeers, Session, TorrentVersion, TrackerAnnounce, torrent_from_bytes,
+    ManagedTorrent, PeerConnectionOptions, ResumePeers, Session, TorrentVersion, TrackerAnnounce,
+    torrent_from_bytes,
 };
 
 use crate::SchedulerError;
@@ -52,12 +53,15 @@ use crate::pipeline::graph::status::RepairSlots;
 use crate::proxies::TorrentScope;
 use crate::settings::model::{TrackerRule, tracker_rule_for};
 use crate::settings::{
-    Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, resolve_seeding_policy,
+    Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption,
+    TrackerUploadLimit, resolve_seeding_policy,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::rate::limit_kind;
-use crate::torrents::sessions::{NetworkRoutes, RouteKey, SessionEnv, SessionError, Sessions};
+use crate::torrents::sessions::{
+    NetworkRoutes, RouteKey, SessionEnv, SessionError, Sessions, encryption_policy,
+};
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
@@ -178,6 +182,34 @@ impl TorrentSettings {
     }
 }
 
+// What a torrent's session holds its peers to under its tracker rule:
+// whether it takes them from its trackers alone, and the encryption its
+// connections are made under over the session's. A change of either takes
+// the torrent through its session again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PeerTerms {
+    trackers_only: bool,
+    encryption: Option<TorrentEncryption>,
+}
+
+impl PeerTerms {
+    fn of(rule: Option<&TrackerRule>) -> Self {
+        rule.map_or_else(Self::default, |rule| Self {
+            trackers_only: rule.trackers_only(),
+            encryption: rule.encryption,
+        })
+    }
+
+    // `options` under these terms.
+    fn apply(self, options: &mut AddTorrentOptions) {
+        options.trackers_only = self.trackers_only;
+        options.peer_opts = self.encryption.map(|encryption| PeerConnectionOptions {
+            encryption: Some(encryption_policy(encryption)),
+            ..Default::default()
+        });
+    }
+}
+
 // The tracker rule of id `id`, while it stands.
 fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
     let id = id?;
@@ -193,12 +225,26 @@ fn identity_of(rule: Option<&TrackerRule>) -> Identity {
         .identity()
 }
 
-// The limits `record`'s session holds it to: its own, and on upload its
-// seeding policy's cap where that is tighter. Each is a channel the
-// torrent's peers draw from beside the session's, as each peer class over a
-// libtorrent peer is (`bandwidth_manager::request_bandwidth`).
-fn ratelimits_of(record: &TorrentRecord, policy: Option<SeedingPolicy>) -> LimitsConfig {
-    let cap = policy.and_then(|policy| policy.max_upload_bps);
+// The limits `record`'s session holds it to: its own, and on upload a cap
+// where that is tighter: its own policy's, else its tracker rule's upload
+// limit, else the cap its seeding policy resolves to. A rule's `Unlimited`
+// leaves its category's and the global policy's caps out. Each is a channel
+// the torrent's peers draw from beside the session's, as each peer class
+// over a libtorrent peer is (`bandwidth_manager::request_bandwidth`).
+fn ratelimits_of(
+    record: &TorrentRecord,
+    policy: Option<SeedingPolicy>,
+    rule: Option<&TrackerRule>,
+) -> LimitsConfig {
+    let cap = record
+        .policy_override
+        .and_then(|policy| policy.max_upload_bps)
+        .map(Some)
+        .or_else(|| {
+            rule.and_then(|rule| rule.upload_limit)
+                .map(TrackerUploadLimit::bps)
+        })
+        .unwrap_or_else(|| policy.and_then(|policy| policy.max_upload_bps));
     LimitsConfig {
         upload_bps: limit_kind(record.upload_limit).tighter(limit_kind(cap)),
         download_bps: limit_kind(record.download_limit),
@@ -678,6 +724,8 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
 struct Attached {
     session: Arc<Session>,
     handle: Arc<ManagedTorrent>,
+    // The terms the session took it under.
+    terms: PeerTerms,
 }
 
 // What the service keeps of each torrent while it lives.
@@ -1896,9 +1944,10 @@ impl TorrentService {
                 );
                 let mut torrent = self.insert(record, &trackers)?;
                 let identity = identity_of(torrent.rule(&rules));
+                let terms = PeerTerms::of(torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
-                self.spawn_resolve(job_id, session, uri, None, identity);
+                self.spawn_resolve(job_id, session, uri, None, identity, terms);
                 self.publish().await;
                 Ok(job_id)
             }
@@ -1997,8 +2046,17 @@ impl TorrentService {
     }
 
     // Keep `record` with its trackers: a torrent new to the database, under
-    // the rule its trackers match.
-    fn insert(&self, record: TorrentRecord, trackers: &[TrackerEntry]) -> Result<Live, AddError> {
+    // the rule its trackers match, and forced when that rule admits its
+    // torrents so.
+    fn insert(
+        &self,
+        mut record: TorrentRecord,
+        trackers: &[TrackerEntry],
+    ) -> Result<Live, AddError> {
+        let rules = self.rules();
+        let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
+        record.forced |= rule.is_some_and(|rule| rule.forced);
+        let rule_id = rule.map(|rule| rule.id);
         match self.inner.db.insert_torrent(&record, trackers) {
             Ok(TorrentInsert::Inserted) => {
                 let now = self.inner.clock.now_ms();
@@ -2008,7 +2066,7 @@ impl TorrentService {
                     ResumePeers::default(),
                     now,
                 );
-                torrent.rule_id = self.rule_id(trackers);
+                torrent.rule_id = rule_id;
                 Ok(torrent)
             }
             Ok(TorrentInsert::Duplicate(existing)) => Err(AddError::Duplicate(existing)),
@@ -2024,19 +2082,19 @@ impl TorrentService {
         uri: String,
         trackers: Option<Vec<String>>,
         identity: Identity,
+        terms: PeerTerms,
     ) {
         let service = self.clone();
         self.keep(tokio::spawn(async move {
+            let mut options = AddTorrentOptions {
+                list_only: true,
+                trackers,
+                identity: Some(identity),
+                ..Default::default()
+            };
+            terms.apply(&mut options);
             let listed = session
-                .add_torrent(
-                    AddTorrent::from_url(uri),
-                    Some(AddTorrentOptions {
-                        list_only: true,
-                        trackers,
-                        identity: Some(identity),
-                        ..Default::default()
-                    }),
-                )
+                .add_torrent(AddTorrent::from_url(uri), Some(options))
                 .await;
             let bytes = match listed {
                 Ok(AddTorrentResponse::ListOnly(listed)) => listed.torrent_bytes,
@@ -2156,7 +2214,14 @@ impl TorrentService {
             .into_iter()
             .map(|tracker| tracker.url)
             .collect();
-        self.spawn_resolve(job_id, session, uri, Some(trackers), identity_of(rule));
+        self.spawn_resolve(
+            job_id,
+            session,
+            uri,
+            Some(trackers),
+            identity_of(rule),
+            PeerTerms::of(rule),
+        );
     }
 
     // Put a torrent in its route's session, or hold it while the route is
@@ -2165,7 +2230,20 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
-        let (scope, bytes, layout, intake, dir, paused, ratelimits, have, identity, picking, saved) = {
+        let (
+            scope,
+            bytes,
+            layout,
+            intake,
+            dir,
+            paused,
+            ratelimits,
+            have,
+            identity,
+            terms,
+            picking,
+            saved,
+        ) = {
             let live = self.inner.live.lock().await;
             let Some(torrent) = live.get(&job_id) else {
                 return;
@@ -2182,7 +2260,11 @@ impl TorrentService {
                 return;
             };
             let rule = torrent.rule(&rules);
-            let ratelimits = ratelimits_of(&torrent.record, settings.policy(&torrent.record, rule));
+            let ratelimits = ratelimits_of(
+                &torrent.record,
+                settings.policy(&torrent.record, rule),
+                rule,
+            );
             (
                 settings.scope(torrent.record.category_id, rule),
                 bytes,
@@ -2198,6 +2280,7 @@ impl TorrentService {
                 ratelimits,
                 job.with(|job| initial_have(job)),
                 identity_of(rule),
+                PeerTerms::of(rule),
                 (
                     fetch_levels(torrent, job),
                     torrent.record.sequential,
@@ -2251,6 +2334,7 @@ impl TorrentService {
             first_last_piece_first: picking.2,
             ..Default::default()
         };
+        terms.apply(&mut options);
         apply_initial_have(&mut options, have);
         let added = session
             .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
@@ -2282,7 +2366,11 @@ impl TorrentService {
                 if !since.is_empty() {
                     handle.ban_peers(&since);
                 }
-                torrent.attached = Some(Attached { session, handle });
+                torrent.attached = Some(Attached {
+                    session,
+                    handle,
+                    terms,
+                });
                 torrent.route = Some(plan.key);
                 torrent.held = None;
                 torrent.seen = Seen::default();
@@ -3099,7 +3187,8 @@ impl TorrentService {
         elapsed
     }
 
-    // A torrent whose route changed moves to the new route's session; one
+    // A torrent whose route changed moves to the new route's session, and
+    // one whose peer terms changed goes through its session again; one
     // whose route went down is held, and comes back when it is up.
     async fn follow_routes(&self) {
         let settings = self.settings();
@@ -3116,7 +3205,9 @@ impl TorrentService {
                     }
                     continue;
                 }
-                let scope = settings.scope(torrent.record.category_id, torrent.rule(&rules));
+                let rule = torrent.rule(&rules);
+                let scope = settings.scope(torrent.record.category_id, rule);
+                let terms = PeerTerms::of(rule);
                 match self.inner.sessions.routes().plan(scope) {
                     Ok(plan) => {
                         if let Some(reason) = &plan.down {
@@ -3126,7 +3217,10 @@ impl TorrentService {
                             torrent.route = Some(plan.key);
                             torrent.held = Some(Held::RouteDown(reason.clone()));
                         } else if torrent.route.as_ref() != Some(&plan.key)
-                            || torrent.attached.is_none()
+                            || torrent
+                                .attached
+                                .as_ref()
+                                .is_none_or(|attached| attached.terms != terms)
                         {
                             self.detach(torrent).await;
                             torrent.held = None;
@@ -3275,9 +3369,11 @@ impl TorrentService {
             let Some(attached) = &torrent.attached else {
                 continue;
             };
+            let rule = torrent.rule(&rules);
             let limits = ratelimits_of(
                 &torrent.record,
-                settings.policy(&torrent.record, torrent.rule(&rules)),
+                settings.policy(&torrent.record, rule),
+                rule,
             );
             if attached.handle.ratelimits() != limits {
                 attached.handle.set_ratelimits(limits);

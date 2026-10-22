@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::{Instrument, trace, trace_span};
 
-use crate::mse::Encryption;
+use crate::mse::{Encryption, EncryptionPolicy};
 use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
@@ -149,6 +149,11 @@ pub struct PeerConnectionOptions {
     /// one at a stream's read position after a seek, is requested only after
     /// those, so a smaller window makes streams react faster to seeks.
     pub max_request_window: Option<usize>,
+
+    /// The encryption every connection of the torrent is made and kept
+    /// under, over the session's.
+    #[serde(default)]
+    pub encryption: Option<EncryptionPolicy>,
 }
 
 /// libtorrent `settings_pack::handshake_timeout`: a peer that has not
@@ -165,6 +170,12 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_READ_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl PeerConnectionOptions {
+    /// The encryption a connection is made and kept under: these options',
+    /// else the session's `session`.
+    pub(crate) fn encryption_under(&self, session: EncryptionPolicy) -> EncryptionPolicy {
+        self.encryption.unwrap_or(session)
+    }
+
     pub(crate) fn handshake_timeout(&self) -> Duration {
         self.handshake_timeout.unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT)
     }
@@ -446,6 +457,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connect_and_send_handshake(
                 self.addr,
                 self.transports,
+                self.options.encryption_under(self.connector.encryption()),
                 &greeting,
                 &write_buf[..hsz],
                 || self.handler.encrypt_outgoing(),
@@ -1157,6 +1169,7 @@ mod tests {
             keep_alive_interval: None,
             handshake_timeout: Some(Duration::from_millis(2500)),
             max_request_window: None,
+            encryption: None,
         };
         assert_eq!(
             serde_json::to_value(options).unwrap(),
@@ -1166,6 +1179,7 @@ mod tests {
                 "keep_alive_interval": null,
                 "handshake_timeout": 3,
                 "max_request_window": null,
+                "encryption": null,
             })
         );
         let parsed: PeerConnectionOptions =

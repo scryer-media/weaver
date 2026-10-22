@@ -1237,6 +1237,36 @@ pub struct TrackerRule {
     pub client: Option<TorrentClientGql>,
     /// Whether its torrents route through their own consumer.
     pub torrent_route: bool,
+    /// Whether its torrents look for peers beyond their trackers; absent
+    /// inherits.
+    pub discovery: Option<bool>,
+    /// The encryption its torrents' connections are made under; absent
+    /// inherits.
+    pub encryption: Option<TorrentEncryptionGql>,
+    /// The upload cap its torrents take in place of their category's and
+    /// the global seeding policy's; absent inherits.
+    pub upload_limit: Option<TrackerUploadLimitGql>,
+    /// Whether a torrent admitted under it starts forced.
+    pub forced: bool,
+}
+
+/// A tracker rule's upload cap: bytes per second, or absent for unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SimpleObject, InputObject)]
+#[graphql(name = "TrackerUploadLimit", input_name = "TrackerUploadLimitInput")]
+pub struct TrackerUploadLimitGql {
+    pub bps: Option<u64>,
+}
+
+impl From<weaver_server_core::settings::TrackerUploadLimit> for TrackerUploadLimitGql {
+    fn from(limit: weaver_server_core::settings::TrackerUploadLimit) -> Self {
+        Self { bps: limit.bps() }
+    }
+}
+
+impl From<TrackerUploadLimitGql> for weaver_server_core::settings::TrackerUploadLimit {
+    fn from(limit: TrackerUploadLimitGql) -> Self {
+        limit.bps.map_or(Self::Unlimited, Self::Bps)
+    }
 }
 
 impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
@@ -1249,6 +1279,10 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             unpack: rule.unpack,
             client: rule.client.map(Into::into),
             torrent_route: rule.torrent_route,
+            discovery: rule.discovery,
+            encryption: rule.encryption.map(Into::into),
+            upload_limit: rule.upload_limit.map(Into::into),
+            forced: rule.forced,
         }
     }
 }
@@ -1263,6 +1297,11 @@ pub struct TrackerRuleInput {
     pub client: Option<TorrentClientGql>,
     #[graphql(default)]
     pub torrent_route: bool,
+    pub discovery: Option<bool>,
+    pub encryption: Option<TorrentEncryptionGql>,
+    pub upload_limit: Option<TrackerUploadLimitGql>,
+    #[graphql(default)]
+    pub forced: bool,
 }
 
 impl TrackerRuleInput {
@@ -1271,10 +1310,9 @@ impl TrackerRuleInput {
         id: u32,
     ) -> async_graphql::Result<weaver_server_core::settings::model::TrackerRule> {
         use weaver_server_core::settings::model::TrackerRule;
-        Ok(TrackerRule {
+        TrackerRule {
             id,
-            host_pattern: TrackerRule::pattern(&self.host_pattern)
-                .map_err(async_graphql::Error::new)?,
+            host_pattern: self.host_pattern,
             seeding: self
                 .seeding
                 .map(SeedingPolicyInput::into_policy)
@@ -1283,7 +1321,13 @@ impl TrackerRuleInput {
             unpack: self.unpack,
             client: self.client.map(Into::into),
             torrent_route: self.torrent_route,
-        })
+            discovery: self.discovery,
+            encryption: self.encryption.map(Into::into),
+            upload_limit: self.upload_limit.map(Into::into),
+            forced: self.forced,
+        }
+        .checked()
+        .map_err(async_graphql::Error::new)
     }
 }
 

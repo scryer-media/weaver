@@ -61,6 +61,16 @@ pub enum EncryptionPolicy {
 }
 
 impl EncryptionPolicy {
+    /// Whether a connection whose handshake went as `encryption` is one
+    /// this policy keeps.
+    pub fn allows(self, encryption: Encryption) -> bool {
+        match self {
+            EncryptionPolicy::Disabled => encryption == Encryption::None,
+            EncryptionPolicy::Prefer => true,
+            EncryptionPolicy::Require => encryption == Encryption::Rc4,
+        }
+    }
+
     /// The crypto methods this policy allows after the encrypted handshake.
     fn methods(self) -> u32 {
         match self {
@@ -405,9 +415,8 @@ pub(crate) async fn initiate(
 pub(crate) async fn respond(
     mut reader: BoxAsyncReadVectored,
     mut writer: BoxAsyncWrite,
-    allowed: u32,
     allow_plaintext_handshake: bool,
-    info_hashes: impl FnOnce() -> Vec<Id20>,
+    policies: &[(Id20, EncryptionPolicy)],
 ) -> Result<Established, MseError> {
     let mut wire = Wire {
         r: &mut reader,
@@ -452,10 +461,12 @@ pub(crate) async fn respond(
         .await?;
     wire.fill(pos + 20, "reading the torrent hash").await?;
     let req3 = hash(&[b"req3", &s]);
-    let skey = info_hashes()
-        .into_iter()
-        .find(|ih| xor20(hash(&[b"req2", &ih.0]), req3)[..] == wire.buf[pos..pos + 20])
+    let (skey, policy) = policies
+        .iter()
+        .copied()
+        .find(|(ih, _)| xor20(hash(&[b"req2", &ih.0]), req3)[..] == wire.buf[pos..pos + 20])
         .ok_or(MseError::UnknownInfoHash)?;
+    let allowed = policy.methods();
     pos += 20;
 
     let keys = Keys::derive(&s, &skey);
@@ -501,27 +512,29 @@ pub(crate) async fn respond(
     Ok(establish(reader, writer, ia, rest, selected, dec, enc))
 }
 
-/// Upgrade an accepted connection in place according to `policy`. With
-/// `Disabled` this does nothing: no byte is read and no wrapper is added.
+/// Upgrade an accepted connection in place under the session's `policy`
+/// and `policies`, each torrent's hash with its own: an encrypted handshake
+/// selects a method its torrent's policy allows, and a plaintext one passes
+/// while any of them takes plaintext, to be judged by its torrent once its
+/// BitTorrent handshake names it. When every one is `Disabled` this does
+/// nothing: no byte is read and no wrapper is added.
 pub(crate) async fn upgrade_incoming(
     policy: EncryptionPolicy,
     reader: &mut BoxAsyncReadVectored,
     writer: &mut BoxAsyncWrite,
     timeout: Duration,
-    info_hashes: impl FnOnce() -> Vec<Id20>,
+    policies: &[(Id20, EncryptionPolicy)],
 ) -> Result<Encryption, MseError> {
-    if policy == EncryptionPolicy::Disabled {
+    let every = || std::iter::once(policy).chain(policies.iter().map(|(_, p)| *p));
+    if every().all(|p| p == EncryptionPolicy::Disabled) {
         return Ok(Encryption::None);
     }
     let r = std::mem::replace(reader, Box::new(tokio::io::empty().into_vectored_compat()));
     let w = std::mem::replace(writer, Box::new(tokio::io::sink()));
-    let allow_plaintext = policy == EncryptionPolicy::Prefer;
-    let established = tokio::time::timeout(
-        timeout,
-        respond(r, w, policy.methods(), allow_plaintext, info_hashes),
-    )
-    .await
-    .map_err(|_| MseError::Timeout)??;
+    let allow_plaintext = every().any(|p| p != EncryptionPolicy::Require);
+    let established = tokio::time::timeout(timeout, respond(r, w, allow_plaintext, policies))
+        .await
+        .map_err(|_| MseError::Timeout)??;
     *reader = established.reader;
     *writer = established.writer;
     Ok(established.encryption)

@@ -15,7 +15,8 @@ use anyhow::Context;
 use tempfile::TempDir;
 
 use crate::{
-    AddTorrent, AddTorrentOptions, EncryptionPolicy, Error, MseError, Session, SessionOptions,
+    AddTorrent, AddTorrentOptions, EncryptionPolicy, Error, MseError, PeerConnectionOptions,
+    Session, SessionOptions,
     storage::StorageFactory,
     stream_connect::{EncryptionStatsSnapshot, Transports},
     tests::{
@@ -70,6 +71,17 @@ async fn download_from(
     seeder: SocketAddr,
     encryption: EncryptionPolicy,
 ) -> anyhow::Result<Downloader> {
+    download_under(t, seeder, encryption, None).await
+}
+
+/// [`download_from`], the torrent's connections under `torrent` over the
+/// session's `encryption`.
+async fn download_under(
+    t: &TestTorrent,
+    seeder: SocketAddr,
+    encryption: EncryptionPolicy,
+    torrent: Option<EncryptionPolicy>,
+) -> anyhow::Result<Downloader> {
     let out = TempDir::with_prefix("test_mse_out")?;
     let session = Session::new_with_opts(out.path().into(), opts(false, encryption)).await?;
     let storage = MemoryStorageFactory::default();
@@ -79,6 +91,10 @@ async fn download_from(
             Some(AddTorrentOptions {
                 storage_factory: Some(storage.clone_box()),
                 initial_peers: Some(vec![seeder]),
+                peer_opts: Some(PeerConnectionOptions {
+                    encryption: torrent,
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
         )
@@ -162,6 +178,7 @@ async fn test_require_downloader_against_disabled_seeder_is_refused() -> anyhow:
         .connect_and_send_handshake(
             seeder_addr,
             Transports::Any,
+            d.session.connector.encryption(),
             &info_hash,
             &hs[..len],
             || unreachable!("encryption is required, so nothing is asked"),
@@ -198,5 +215,31 @@ async fn test_prefer_downloader_tries_plaintext_against_disabled_seeder() -> any
     assert_eq!(stats.rc4, 0, "{stats:?}");
     assert!(stats.failures >= 1, "{stats:?}");
     assert!(stats.plaintext >= 1, "{stats:?}");
+    Ok(())
+}
+
+// A torrent's own encryption is the one its connections are made under,
+// over the session's: one that requires it downloads encrypted in a session
+// that would send plaintext.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_require_torrent_in_disabled_session_downloads_encrypted() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_mse_torrent_require", FILE_SIZE, PIECE_LENGTH).await?;
+    let (_seeder, seeder_addr) = seed(&t, EncryptionPolicy::Prefer).await?;
+    let d = download_under(
+        &t,
+        seeder_addr,
+        EncryptionPolicy::Disabled,
+        Some(EncryptionPolicy::Require),
+    )
+    .await?;
+    d.handle.wait_until_completed().await?;
+    assert!(
+        d.storage.log.file_contents(0) == t.content,
+        "content differs"
+    );
+    let stats = encryption_stats(&d.session);
+    assert!(stats.rc4 >= 1, "{stats:?}");
+    assert_eq!(stats.plaintext, 0, "{stats:?}");
     Ok(())
 }

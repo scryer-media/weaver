@@ -3516,6 +3516,32 @@ async fn a_session_without_pex_does_not_advertise_it_nor_take_peers_from_it() {
     assert!(!h.knows("10.0.0.1:6881"));
 }
 
+// A torrent added to take peers from its trackers alone, though its
+// metainfo does not mark it private, neither advertises peer exchange nor
+// takes peers from it, as a private torrent does not.
+#[tokio::test]
+async fn a_torrent_that_takes_peers_from_trackers_only_does_not_speak_pex() {
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        trackers_only: true,
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "pex_trackers_only",
+        PIECES,
+        0x00,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let advertised = h.advertised(&peer);
+    assert!(advertised.ut_pex.is_none());
+
+    peer.send_pex(&pex(&["10.0.0.1:6881"], &[])).await.unwrap();
+    assert!(!h.knows("10.0.0.1:6881"));
+}
+
 /// A handshake from a peer, with the DHT bit when `dht` holds.
 fn handshake(dht: bool) -> Handshake {
     Handshake::new(Id20::default(), Id20::new([9; 20])).offering_dht(dht)

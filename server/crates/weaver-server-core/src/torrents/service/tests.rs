@@ -2277,6 +2277,10 @@ async fn a_tracker_rules_client_names_its_torrents() {
                 unpack: None,
                 client: Some(Client::QBittorrent),
                 torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
             },
             EPOCH_MS,
         )
@@ -2352,6 +2356,10 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
             },
             EPOCH_MS,
         )
@@ -2577,6 +2585,10 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         unpack: None,
         client: None,
         torrent_route: false,
+        discovery: None,
+        encryption: None,
+        upload_limit: None,
+        forced: false,
     }];
     let mut settings = TorrentSettings {
         complete_dir: PathBuf::from("/complete"),
@@ -2631,6 +2643,10 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         unpack: None,
         client: None,
         torrent_route: true,
+        discovery: None,
+        encryption: None,
+        upload_limit: None,
+        forced: false,
     };
 
     for category in [Some(1), Some(2), None] {
@@ -2666,6 +2682,10 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
                 unpack: None,
                 client: None,
                 torrent_route: true,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
             },
             EPOCH_MS,
         )
@@ -2701,6 +2721,10 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
         .update_tracker_rule(
             &TrackerRule {
                 torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
                 ..rule
             },
             EPOCH_MS,
@@ -3225,6 +3249,98 @@ async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
         .await
         .unwrap();
     assert_eq!(handle.ratelimits().upload_bps, bps(1_000_000));
+    rig.service.stop().await;
+}
+
+// A tracker rule's terms reach its torrents: one admitted under it starts
+// forced, takes peers from its trackers alone, makes its connections under
+// the rule's encryption and uploads under the rule's limit in place of the
+// global seeding cap. A change of the rule reaches the running torrent at
+// the next tick, through its session again; a torrent under no rule keeps
+// the global terms throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
+    use crate::settings::{TorrentEncryption, TrackerUploadLimit};
+    use weaver_torrent::EncryptionPolicy;
+    use weaver_torrent::limits::LimitKind;
+
+    let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let mut settings = rig.service.settings();
+    settings.seeding = Some(SeedingPolicy {
+        max_upload_bps: Some(2_000),
+        ..SeedingPolicy::default()
+    });
+    rig.service.set_settings(settings).await;
+    let rule = rig
+        .db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.example-tracker.test".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: false,
+                discovery: Some(false),
+                encryption: Some(TorrentEncryption::Prefer),
+                upload_limit: Some(TrackerUploadLimit::Unlimited),
+                forced: true,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    // Paused, so nothing announces.
+    let paused = |metainfo| AddRequest {
+        paused: true,
+        ..request(AddSource::Metainfo(metainfo))
+    };
+    let ruled = rig
+        .service
+        .add(paused(announcing(
+            &plain("ruled", 1),
+            "http://tracker.example-tracker.test/announce",
+        )))
+        .await
+        .unwrap();
+    let unruled = rig.service.add(paused(plain("unruled", 2))).await.unwrap();
+
+    assert!(rig.service.torrent(ruled).await.unwrap().forced);
+    assert!(rig.db.get_torrent(ruled).unwrap().unwrap().forced);
+    assert!(!rig.service.torrent(unruled).await.unwrap().forced);
+    let handle = handle_of(&rig.service, ruled).await;
+    assert!(handle.takes_peers_from_trackers_only());
+    assert_eq!(handle.encryption(), Some(EncryptionPolicy::Prefer));
+    assert_eq!(handle.ratelimits().upload_bps, LimitKind::Unlimited);
+    let other = handle_of(&rig.service, unruled).await;
+    assert!(!other.takes_peers_from_trackers_only());
+    assert_eq!(other.encryption(), None);
+    assert_eq!(other.ratelimits().upload_bps, bps(2_000));
+
+    rig.db
+        .update_tracker_rule(
+            &TrackerRule {
+                discovery: None,
+                encryption: Some(TorrentEncryption::Require),
+                upload_limit: Some(TrackerUploadLimit::Bps(1_000)),
+                ..rule
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    rig.service.tick().await;
+    let again = handle_of(&rig.service, ruled).await;
+    assert!(!Arc::ptr_eq(&handle, &again));
+    assert!(!again.takes_peers_from_trackers_only());
+    assert_eq!(again.encryption(), Some(EncryptionPolicy::Require));
+    assert_eq!(again.ratelimits().upload_bps, bps(1_000));
+    assert!(Arc::ptr_eq(&other, &handle_of(&rig.service, unruled).await));
+    assert_eq!(other.ratelimits().upload_bps, bps(2_000));
     rig.service.stop().await;
 }
 

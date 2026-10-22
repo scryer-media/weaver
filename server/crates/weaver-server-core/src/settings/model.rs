@@ -455,6 +455,52 @@ pub struct TrackerRule {
     // The rule's torrents route through `torrent:tracker:<id>` instead of
     // their category's route or `torrent:default`.
     pub torrent_route: bool,
+    // Whether its torrents look for peers beyond their trackers: on the
+    // DHT, the local network and by peer exchange. `Some(false)` holds
+    // them to their trackers as a private torrent is held; `None` inherits.
+    pub discovery: Option<bool>,
+    // The encryption its torrents' connections are made under, over the
+    // global one; `None` inherits.
+    pub encryption: Option<TorrentEncryption>,
+    // The upload cap its torrents take in place of their category's and the
+    // global seeding policy's; `None` inherits.
+    pub upload_limit: Option<TrackerUploadLimit>,
+    // Whether a torrent admitted under it starts forced, past the queue.
+    pub forced: bool,
+}
+
+// A tracker rule's upload cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerUploadLimit {
+    // No cap from the category's or the global seeding policy.
+    Unlimited,
+    // A cap of the rule's own, in bytes per second.
+    Bps(u64),
+}
+
+impl TrackerUploadLimit {
+    // The cap in bytes per second; `None` is none.
+    pub const fn bps(self) -> Option<u64> {
+        match self {
+            Self::Unlimited => None,
+            Self::Bps(bps) => Some(bps),
+        }
+    }
+
+    // As a rule keeps it: `unlimited`, or the bytes per second.
+    pub fn to_text(self) -> String {
+        match self {
+            Self::Unlimited => "unlimited".to_owned(),
+            Self::Bps(bps) => bps.to_string(),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unlimited" => Some(Self::Unlimited),
+            bps => bps.parse().ok().map(Self::Bps),
+        }
+    }
 }
 
 // A client a torrent may name itself as, for the trackers that admit only
@@ -502,6 +548,18 @@ impl Client {
 }
 
 impl TrackerRule {
+    // The rule as it is kept, its pattern as `pattern` keeps it; an error
+    // when the pattern names no host.
+    pub fn checked(mut self) -> Result<Self, String> {
+        self.host_pattern = Self::pattern(&self.host_pattern)?;
+        Ok(self)
+    }
+
+    // Whether its torrents take peers from their trackers alone.
+    pub fn trackers_only(&self) -> bool {
+        self.discovery == Some(false)
+    }
+
     // The pattern as a rule keeps it: trimmed and lower case, without a
     // trailing dot. An error when it names no host.
     pub fn pattern(pattern: &str) -> Result<String, String> {
@@ -1074,6 +1132,10 @@ mod tests {
             unpack: None,
             client: None,
             torrent_route: false,
+            discovery: None,
+            encryption: None,
+            upload_limit: None,
+            forced: false,
         }
     }
 

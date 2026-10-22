@@ -641,6 +641,12 @@ pub struct AddTorrentOptions {
     /// `torrent_flags::super_seeding`). Off by default.
     #[serde(default)]
     pub super_seeding: bool,
+    /// Take peers from the torrent's trackers alone, as a private torrent
+    /// does (BEP 27) whatever its metainfo says: no DHT, local discovery or
+    /// peer exchange, and none of the session's trackers beside its own.
+    /// Off by default; a private torrent is held to it either way.
+    #[serde(default)]
+    pub trackers_only: bool,
 }
 
 const fn v1_hashes_disabled_by_default() -> bool {
@@ -677,6 +683,7 @@ impl Default for AddTorrentOptions {
             identity: None,
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
+            trackers_only: false,
         }
     }
 }
@@ -1152,16 +1159,25 @@ fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<url::Url>>> {
     })
 }
 
+/// Whether a torrent takes peers from its trackers alone: its metainfo
+/// marks it `private` (BEP 27), or it was added
+/// [`trackers_only`](AddTorrentOptions::trackers_only). Such a torrent
+/// neither looks for peers on the DHT, the local network or by peer
+/// exchange, nor announces to any tracker but its own.
+pub(crate) const fn trackers_only(private: bool, added_trackers_only: bool) -> bool {
+    private || added_trackers_only
+}
+
 /// The tiers a torrent announces to: its own tiers in order, then each of
-/// `extra` as a tier of its own, unless the torrent is private. A private
-/// torrent (BEP 27) talks only to the trackers it came with. A tracker listed
-/// more than once keeps its first place, and empty tiers are dropped.
+/// `extra` as a tier of its own, unless the torrent takes peers from its
+/// own trackers only. A tracker listed more than once keeps its first
+/// place, and empty tiers are dropped.
 fn merge_tracker_tiers(
     own: Vec<Vec<url::Url>>,
     extra: impl IntoIterator<Item = url::Url>,
-    private: bool,
+    trackers_only: bool,
 ) -> Vec<Vec<url::Url>> {
-    let extra = (!private).then(|| extra.into_iter().map(|t| vec![t]));
+    let extra = (!trackers_only).then(|| extra.into_iter().map(|t| vec![t]));
     crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
 }
 
@@ -1616,19 +1632,30 @@ impl Session {
         // and a plaintext one passed through (or refused); with it disabled
         // the halves are left as they are. A method is settled only when the
         // encryption handshake ran.
+        // Each connection is kept under its torrent's encryption: an
+        // encrypted one names its torrent in the encryption handshake, a
+        // plaintext one only in its BitTorrent handshake.
+        let session_policy = self.connector.encryption();
+        let policies: Vec<(Id20, crate::mse::EncryptionPolicy)> = self
+            .db
+            .read()
+            .torrents
+            .values()
+            .flat_map(|t| {
+                let policy = t
+                    .shared()
+                    .options
+                    .peer_opts
+                    .encryption_under(session_policy);
+                t.info_hashes().ids20().map(move |hash| (hash, policy))
+            })
+            .collect();
         let encryption = crate::mse::upgrade_incoming(
-            self.connector.encryption(),
+            session_policy,
             &mut reader,
             &mut writer,
             handshake_timeout,
-            || {
-                self.db
-                    .read()
-                    .torrents
-                    .values()
-                    .flat_map(|t| t.info_hashes().ids20())
-                    .collect()
-            },
+            &policies,
         )
         .await
         .context("error in the encryption handshake")?;
@@ -1650,6 +1677,14 @@ impl Session {
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
         if h.peer_id == torrent.shared().peer_id {
             bail!("seems like we are connecting to ourselves, ignoring");
+        }
+        let policy = torrent
+            .shared()
+            .options
+            .peer_opts
+            .encryption_under(session_policy);
+        if !policy.allows(encryption) {
+            bail!("torrent {id} keeps no {encryption:?} connection under {policy:?}");
         }
 
         let live = torrent
@@ -1866,6 +1901,7 @@ impl Session {
             max_request_window: other
                 .max_request_window
                 .or(self.peer_opts.max_request_window),
+            encryption: other.encryption.or(self.peer_opts.encryption),
         }
     }
 
@@ -2130,7 +2166,7 @@ impl Session {
                             .iter()
                             .flatten()
                             .filter_map(|t| url::Url::parse(t).ok()),
-                        torrent.meta.info.data.private,
+                        trackers_only(torrent.meta.info.data.private, opts.trackers_only),
                     );
 
                     InternalAddResult {
@@ -2219,7 +2255,7 @@ impl Session {
                 !opts.paused && !opts.list_only,
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
-                private,
+                trackers_only(private, opts.trackers_only),
                 dht_announce.subscribe(),
             )
         };
@@ -2244,8 +2280,7 @@ impl Session {
                     (metadata, peer_rx, peer_list)
                 }
                 None => {
-                    if self.dht.is_none()
-                        && self.lsd.is_none()
+                    if (opts.trackers_only || (self.dht.is_none() && self.lsd.is_none()))
                         && tracker_tiers.is_empty()
                         && opts.initial_peers.as_ref().is_none_or(Vec::is_empty)
                     {
@@ -2255,6 +2290,7 @@ impl Session {
                     }
                     // Whether the torrent is private is known only once its
                     // metadata arrives.
+                    let fetched_trackers_only = trackers_only(false, opts.trackers_only);
                     let PeerSource { peers, trackers } = make_peer_rx(false).context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
@@ -2270,7 +2306,11 @@ impl Session {
                         .await?;
 
                     seen_peers = resolved_magnet.seen_peers;
-                    let peer_rx = if resolved_magnet.metadata.info.info().private {
+                    let peer_rx = if trackers_only(
+                        resolved_magnet.metadata.info.info().private,
+                        opts.trackers_only,
+                    ) != fetched_trackers_only
+                    {
                         // A private torrent takes peers only from its own
                         // trackers from here on (BEP 27): drop the discovery
                         // used to fetch the metadata.
@@ -2406,6 +2446,7 @@ impl Session {
                     disable_v1_hashes: opts.disable_v1_hashes,
                     super_seeding: opts.super_seeding,
                     sequential: opts.sequential.into(),
+                    trackers_only: opts.trackers_only,
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
@@ -2581,7 +2622,6 @@ impl Session {
         t: &ManagedTorrentHandle,
         announce: bool,
     ) -> Option<PeerSource> {
-        let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hashes(),
             &t.shared().identity(),
@@ -2589,22 +2629,22 @@ impl Session {
             announce,
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
-            is_private,
+            t.takes_peers_from_trackers_only(),
             t.shared().dht_announce.subscribe(),
         )
     }
 
     /// The tiers a torrent announces to: its own, then the session's trackers
-    /// unless the torrent is private.
+    /// unless it takes peers from its own trackers only.
     pub(crate) fn announce_tiers(
         &self,
         tracker_tiers: Vec<Vec<url::Url>>,
-        is_private: bool,
+        trackers_only: bool,
     ) -> Vec<Vec<url::Url>> {
         if self.disable_trackers {
             return Vec::new();
         }
-        merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), is_private)
+        merge_tracker_tiers(tracker_tiers, self.trackers.iter().cloned(), trackers_only)
     }
 
     /// Whether the session may reach `ip`, whoever is there: a peer, a web
@@ -2664,10 +2704,10 @@ impl Session {
         announce: bool,
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
-        is_private: bool,
+        trackers_only: bool,
         dht_announce: tokio::sync::watch::Receiver<()>,
     ) -> Option<PeerSource> {
-        let dht_rx = if is_private {
+        let dht_rx = if trackers_only {
             None
         } else {
             self.dht.as_ref().map(|dht| {
@@ -2691,7 +2731,7 @@ impl Session {
         // streams, the LSD by registering here (libtorrent
         // `torrent::start_announcing` runs only after `files_checked`, never
         // while paused).
-        let lsd_rx = if is_private {
+        let lsd_rx = if trackers_only {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
@@ -2722,13 +2762,14 @@ impl Session {
                 TrackerComms::start_with_tiers(
                     info_hashes,
                     identity.clone(),
-                    self.announce_tiers(tracker_tiers, is_private),
+                    self.announce_tiers(tracker_tiers, trackers_only),
                     Box::new(tracker_rx_stats),
                     force_tracker_interval,
                     self.announce_port.subscribe(),
-                    // Only a private torrent tells its trackers our addresses
-                    // (libtorrent `torrent::build_tracker_request`).
-                    if is_private {
+                    // Only a torrent that takes peers from its trackers alone
+                    // tells them our addresses (libtorrent
+                    // `torrent::build_tracker_request`, for a private one).
+                    if trackers_only {
                         self.own_ips.clone()
                     } else {
                         Arc::new(Vec::new)
@@ -3482,7 +3523,7 @@ mod tests {
         .await
         .unwrap();
 
-        let add = |name: &'static str, private: bool| {
+        let add = |name: &'static str, private: bool, trackers_only: bool| {
             let session = session.clone();
             let output_folder = dir.path().join(name).to_str().unwrap().to_owned();
             async move {
@@ -3493,6 +3534,7 @@ mod tests {
                             paused: true,
                             output_folder: Some(output_folder),
                             trackers: Some(vec!["http://added.test/announce".to_owned()]),
+                            trackers_only,
                             ..Default::default()
                         }),
                     )
@@ -3503,14 +3545,29 @@ mod tests {
             }
         };
 
-        let private = add("private", true).await;
+        let private = add("private", true, false).await;
+        assert!(private.takes_peers_from_trackers_only());
         assert_eq!(private.shared().tracker_tiers(), own_tiers());
         assert_eq!(
             session.announce_tiers(private.shared().tracker_tiers(), true),
             own_tiers()
         );
 
-        let public = add("public", false).await;
+        // A torrent its metainfo does not mark private, added to take peers
+        // from its trackers alone, is held to the same.
+        let trackers_only = add("trackers_only", false, true).await;
+        assert!(trackers_only.takes_peers_from_trackers_only());
+        assert_eq!(trackers_only.shared().tracker_tiers(), own_tiers());
+        assert_eq!(
+            session.announce_tiers(
+                trackers_only.shared().tracker_tiers(),
+                trackers_only.takes_peers_from_trackers_only()
+            ),
+            own_tiers()
+        );
+
+        let public = add("public", false, false).await;
+        assert!(!public.takes_peers_from_trackers_only());
         let with_added = tiers(&[
             &["http://a1.test/announce", "udp://a2.test:6969/announce"],
             &["http://b1.test/announce"],
@@ -3991,6 +4048,90 @@ mod tests {
         answer.len() == 68
             && &answer[1..20] == b"BitTorrent protocol"
             && answer[28..48] == handle.info_hash().0
+    }
+
+    // Each incoming connection is kept under its torrent's encryption, the
+    // session's when the torrent names none: a plaintext one reaches a
+    // torrent that prefers encryption in a session that requires it, and is
+    // refused by a torrent that requires it in a session that prefers it.
+    #[tokio::test]
+    async fn an_incoming_plaintext_connection_is_judged_by_its_torrents_encryption() {
+        use crate::{mse::EncryptionPolicy, peer_connection::PeerConnectionOptions};
+        for (session_policy, torrent_policy, kept) in [
+            (EncryptionPolicy::Prefer, None, true),
+            (
+                EncryptionPolicy::Prefer,
+                Some(EncryptionPolicy::Require),
+                false,
+            ),
+            (EncryptionPolicy::Require, None, false),
+            (
+                EncryptionPolicy::Require,
+                Some(EncryptionPolicy::Prefer),
+                true,
+            ),
+        ] {
+            let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+                1,
+                16384,
+                Some("torrent_encryption"),
+            );
+            let torrent = crate::create_torrent(
+                dir.path(),
+                crate::CreateTorrentOptions {
+                    piece_length: Some(16384),
+                    ..Default::default()
+                },
+                &crate::spawn_utils::BlockingSpawner::new(1),
+            )
+            .await
+            .unwrap()
+            .as_bytes()
+            .unwrap();
+            let session = Session::new_with_opts(
+                dir.path().into(),
+                SessionOptions {
+                    dht: None,
+                    persistence: None,
+                    disable_trackers: true,
+                    disable_local_service_discovery: true,
+                    encryption: session_policy,
+                    listen: Some(crate::ListenerOptions {
+                        mode: crate::ListenerMode::TcpOnly,
+                        listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(torrent),
+                    Some(AddTorrentOptions {
+                        output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                        overwrite: true,
+                        peer_opts: Some(PeerConnectionOptions {
+                            encryption: torrent_policy,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_handle()
+                .unwrap();
+            handle.wait_until_completed().await.unwrap();
+            let answer = answer(&session, &handle).await;
+            assert_eq!(
+                is_handshake_for(&answer, &handle),
+                kept,
+                "{session_policy:?} {torrent_policy:?}"
+            );
+            session.stop().await;
+        }
     }
 
     #[tokio::test]

@@ -1094,3 +1094,20 @@ kind = "sql"
 file = "migrations/0085_torrent_lean_resume/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 86
+description = "a tracker rule sets its torrents' peer discovery, encryption, upload cap and forced start"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_tracker_rule_privacy/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_tracker_rule_privacy/postgres.sql"
+engine = "postgres"
+scope = "all"

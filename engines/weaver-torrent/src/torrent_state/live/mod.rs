@@ -260,7 +260,8 @@ pub struct TorrentStateLive {
     upload_turns: tokio::sync::mpsc::UnboundedSender<PeerHandle>,
 
     // Whether the torrent speaks ut_pex: advertises it, sends it and reads
-    // it. Not on a private torrent, nor in a session without it (libtorrent
+    // it. Not on a torrent that takes peers from its trackers alone, nor in
+    // a session without it (libtorrent
     // `ut_pex_plugin::new_connection`, `session::add_extension`).
     pex: bool,
 
@@ -392,7 +393,11 @@ impl TorrentStateLive {
                 .map(|_| RwLock::new(()))
                 .collect(),
             upload_turns,
-            pex: !session.disable_pex && !paused.metadata.info.info().private,
+            pex: !session.disable_pex
+                && !crate::session::trackers_only(
+                    paused.metadata.info.info().private,
+                    paused.shared.options.trackers_only,
+                ),
             super_seeding,
             // What a handshake of this run's first connections says.
             told_upload_only: AtomicBool::new(finished_at_start && !super_seeding),

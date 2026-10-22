@@ -1461,6 +1461,12 @@ const TRACKER_RULE_FIELDS = `
     unpack
     client
     torrentRoute
+    discovery
+    encryption
+    uploadLimit {
+      bps
+    }
+    forced
   }
   ${SEEDING_POLICY_FIELDS}
 `;

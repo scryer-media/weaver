@@ -102,13 +102,15 @@ async fn run_pair(
     initiator_hash: Id20,
     offer: u32,
     session_hashes: Vec<Id20>,
-    allowed: u32,
+    policy: EncryptionPolicy,
 ) -> Pair {
+    let policies: Vec<(Id20, EncryptionPolicy)> =
+        session_hashes.into_iter().map(|ih| (ih, policy)).collect();
     let ((ar, aw), (br, bw)) = pipe();
     let ia = bt_handshake(initiator_hash, 1);
     let (initiator, responder) = tokio::join!(
         initiate(ar, aw, &initiator_hash, offer, &ia),
-        respond(br, bw, allowed, true, || session_hashes),
+        respond(br, bw, true, &policies),
     );
     Pair {
         initiator,
@@ -160,7 +162,7 @@ async fn test_handshake_completes_and_carries_the_bt_handshake() {
         ih,
         CRYPTO_RC4 | CRYPTO_PLAINTEXT,
         vec![other, ih],
-        CRYPTO_RC4,
+        EncryptionPolicy::Require,
     )
     .await;
     let a = pair.initiator.unwrap();
@@ -173,13 +175,7 @@ async fn test_handshake_completes_and_carries_the_bt_handshake() {
 #[tokio::test]
 async fn test_header_only_encryption_when_the_responder_selects_plaintext() {
     let ih = Id20::new([7; 20]);
-    let pair = run_pair(
-        ih,
-        CRYPTO_RC4 | CRYPTO_PLAINTEXT,
-        vec![ih],
-        CRYPTO_PLAINTEXT,
-    )
-    .await;
+    let pair = run_pair(ih, CRYPTO_PLAINTEXT, vec![ih], EncryptionPolicy::Prefer).await;
     let a = pair.initiator.unwrap();
     let b = pair.responder.unwrap();
     assert_eq!(a.encryption, Encryption::HeaderOnly);
@@ -193,7 +189,7 @@ async fn test_wrong_info_hash_fails_to_synchronise() {
         Id20::new([7; 20]),
         CRYPTO_RC4,
         vec![Id20::new([8; 20]), Id20::new([9; 20])],
-        CRYPTO_RC4,
+        EncryptionPolicy::Require,
     )
     .await;
     assert!(
@@ -212,7 +208,7 @@ async fn test_wrong_info_hash_fails_to_synchronise() {
 #[tokio::test]
 async fn test_no_common_method_is_refused() {
     let ih = Id20::new([7; 20]);
-    let pair = run_pair(ih, CRYPTO_PLAINTEXT, vec![ih], CRYPTO_RC4).await;
+    let pair = run_pair(ih, CRYPTO_PLAINTEXT, vec![ih], EncryptionPolicy::Require).await;
     assert!(
         matches!(
             pair.responder,
@@ -240,7 +236,14 @@ async fn plaintext_against(
     let ih = Id20::new([7; 20]);
     let ((ar, mut aw), (mut reader, mut writer)) = pipe();
     aw.write_all(&bt_handshake(ih, 1)).await.unwrap();
-    let res = upgrade_incoming(policy, &mut reader, &mut writer, Duration::MAX, || vec![ih]).await;
+    let res = upgrade_incoming(
+        policy,
+        &mut reader,
+        &mut writer,
+        Duration::MAX,
+        &[(ih, policy)],
+    )
+    .await;
     (res, reader, (ar, aw))
 }
 
@@ -274,9 +277,10 @@ async fn test_prefer_and_require_responders_accept_encrypted() {
         let ia = bt_handshake(ih, 1);
         let mut reader = br;
         let mut writer = bw;
+        let policies = [(ih, policy)];
         let (a, b) = tokio::join!(
             initiate(ar, aw, &ih, outgoing_offer(EncryptionPolicy::Require), &ia),
-            upgrade_incoming(policy, &mut reader, &mut writer, Duration::MAX, || vec![ih]),
+            upgrade_incoming(policy, &mut reader, &mut writer, Duration::MAX, &policies),
         );
         assert_eq!(b.unwrap(), Encryption::Rc4);
         let b = Established {
