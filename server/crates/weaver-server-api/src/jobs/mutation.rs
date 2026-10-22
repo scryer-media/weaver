@@ -591,7 +591,7 @@ impl JobsMutation {
     ) -> Result<Vec<HistoryItem>> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let db = ctx.data::<Database>()?.clone();
-        delete_history_ids(handle, ids, delete_files).await?;
+        delete_history_ids(handle, ids, delete_files).await.result?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Delete all completed/failed/cancelled jobs from history.
@@ -622,7 +622,9 @@ impl JobsMutation {
                 })
                 .map(|info| info.job_id.0),
         );
-        delete_history_ids(handle, ids, delete_files).await?;
+        // The jobs listed above, in batches: a refused id never holds back the
+        // rest, and a job that reaches history after the listing stays.
+        delete_history_ids(handle, ids, delete_files).await.result?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Update category and/or priority for one or more jobs.
@@ -857,13 +859,15 @@ impl JobsMutation {
     ) -> Result<HistoryCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
-        map_scheduler_result(delete_history_ids(handle, ids.iter().copied(), delete_files).await)?;
-        for id in &ids {
+        let outcome = delete_history_ids(handle, ids.iter().copied(), delete_files).await;
+        // Every id that is gone says so, refusal or not, so no client keeps
+        // a row the server has already deleted.
+        for id in outcome.deleted {
             replay
                 .append(PersistedQueueEvent {
                     occurred_at_ms: chrono::Utc::now().timestamp_millis(),
                     kind: QueueEventKind::ItemRemoved,
-                    item_id: Some(*id),
+                    item_id: Some(id),
                     item: None,
                     state: None,
                     previous_state: None,
@@ -872,6 +876,7 @@ impl JobsMutation {
                 })
                 .await;
         }
+        map_scheduler_result(outcome.result)?;
         Ok(HistoryCommandResult {
             success: true,
             removed_ids: ids,
@@ -965,29 +970,50 @@ fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
     }
 }
 
+// What deleting a run of history ids did: every id whose record is gone,
+// whatever else was refused, and the first refusal once every batch has run.
+struct HistoryIdsDeleted {
+    deleted: Vec<u64>,
+    result: std::result::Result<(), SchedulerError>,
+}
+
 // Deletes `ids` from history through the pipeline, one command per
-// `HISTORY_DELETE_BATCH_SIZE` ids, and fails with the first refusal once
-// every batch has run.
+// `HISTORY_DELETE_BATCH_SIZE` ids. A refusal never holds back the other ids,
+// and the ids a refused run did delete are still reported as deleted.
 async fn delete_history_ids(
     handle: &SchedulerHandle,
     ids: impl IntoIterator<Item = u64>,
     delete_files: bool,
-) -> std::result::Result<(), SchedulerError> {
+) -> HistoryIdsDeleted {
     let ids = ids
         .into_iter()
         .map(JobId)
         .collect::<std::collections::BTreeSet<_>>();
     let ids = ids.into_iter().collect::<Vec<_>>();
+    let mut deleted = Vec::new();
     let mut first_refusal = None;
     for batch in ids.chunks(weaver_server_core::HISTORY_DELETE_BATCH_SIZE) {
-        let outcome = handle
+        match handle
             .delete_history_batch(batch.iter().copied().collect(), delete_files)
-            .await?;
-        if first_refusal.is_none() {
-            first_refusal = outcome.refused.into_values().next();
+            .await
+        {
+            Ok(outcome) => {
+                deleted.extend(outcome.deleted.keys().map(|job_id| job_id.0));
+                if first_refusal.is_none() {
+                    first_refusal = outcome.refused.into_values().next();
+                }
+            }
+            // The pipeline is gone: no later batch can run either.
+            Err(error) => {
+                first_refusal.get_or_insert(error);
+                break;
+            }
         }
     }
-    first_refusal.map_or(Ok(()), Err)
+    HistoryIdsDeleted {
+        deleted,
+        result: first_refusal.map_or(Ok(()), Err),
+    }
 }
 
 fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Result<T> {

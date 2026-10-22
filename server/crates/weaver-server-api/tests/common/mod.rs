@@ -846,6 +846,19 @@ fn spawn_test_scheduler(
                 } => {
                     let mut outcome = weaver_server_core::HistoryDeleteBatchOutcome::default();
                     for job_id in job_ids {
+                        // As the pipeline does: a live job that has not
+                        // finished is refused, and the rest go ahead.
+                        if jobs.get(&job_id).is_some_and(|state| {
+                            !matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
+                        }) {
+                            outcome.refused.insert(
+                                job_id,
+                                weaver_server_core::SchedulerError::Conflict(
+                                    "cannot delete active job — cancel it first".into(),
+                                ),
+                            );
+                            continue;
+                        }
                         if delete_files
                             && let Some(output_dir) = db
                                 .get_job_history(job_id.0)
