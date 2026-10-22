@@ -373,6 +373,10 @@ pub struct ManagedTorrentShared {
 
     /// The torrent's web seeds, kept across its runs.
     pub(crate) web_seeds: Arc<live::web_seed::WebSeeds>,
+
+    /// An SSL torrent's CA and our identity under it; `None` for any other
+    /// torrent.
+    pub(crate) ssl: Option<Arc<crate::ssl::SslTorrent>>,
 }
 
 /// Transfer counters of one live run of a torrent, as its tracker announces
@@ -454,6 +458,22 @@ impl ManagedTorrent {
                 .unwrap_or(false),
             self.shared.options.trackers_only,
         )
+    }
+
+    /// Whether the torrent is an SSL torrent: its metainfo names the CA its
+    /// peers are issued under, and every connection it makes or takes is TLS
+    /// under it.
+    pub fn is_ssl(&self) -> bool {
+        self.shared.ssl.is_some()
+    }
+
+    /// An SSL torrent with no identity of ours under its CA: it connects to
+    /// no peer and announces nowhere until one is given.
+    pub fn needs_certificate(&self) -> bool {
+        self.shared
+            .ssl
+            .as_ref()
+            .is_some_and(|ssl| !ssl.has_identity())
     }
 
     /// The encryption the torrent's connections are made under, over the
@@ -900,6 +920,15 @@ impl ManagedTorrent {
                         return Ok(());
                     }
                     g.auto_scrape = None;
+                    // An SSL torrent goes live only with an identity to
+                    // present; until it has one it waits here, asking no
+                    // peer and no tracker.
+                    if t.needs_certificate() {
+                        return Ok(());
+                    }
+                    // A run handed no peer source takes the one the session
+                    // makes for it now, as it starts.
+                    let peer_rx = peer_rx.or_else(|| session.peer_source_managed_torrent(t, true));
                     let paused = g.state.take().assert_paused();
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
@@ -1113,6 +1142,26 @@ impl ManagedTorrent {
         Ok(())
     }
 
+    /// A running SSL torrent left without an identity stops its run and
+    /// waits for one, as it was asked to run: its connections close and its
+    /// announces stop.
+    pub(crate) fn wait_for_certificate(&self) -> anyhow::Result<()> {
+        let mut g = self.locked.write();
+        if let ManagedTorrentState::Live(live) = &g.state {
+            let paused = live.pause()?;
+            g.state = ManagedTorrentState::Paused(paused);
+            self.state_change_notify.notify_waiters();
+        }
+        Ok(())
+    }
+
+    /// Whether the torrent waits for an identity to start: an SSL torrent
+    /// without one, checked and asked to run.
+    pub(crate) fn waits_for_certificate(&self) -> bool {
+        let g = self.locked.read();
+        self.is_ssl() && !g.paused && matches!(g.state, ManagedTorrentState::Paused(_))
+    }
+
     /// Pause the torrent if it's live.
     pub(crate) fn pause(&self) -> anyhow::Result<()> {
         let mut g = self.locked.write();
@@ -1169,7 +1218,11 @@ impl ManagedTorrent {
                     resp.progress_bytes = i.checked_bytes.load(Ordering::Relaxed);
                 }
                 ManagedTorrentState::Paused(p) => {
-                    resp.state = S::Paused;
+                    resp.state = if !g.paused && self.needs_certificate() {
+                        S::NeedsCertificate
+                    } else {
+                        S::Paused
+                    };
                     let hns = p.hns();
                     resp.total_bytes = hns.total();
                     resp.progress_bytes = hns.progress();

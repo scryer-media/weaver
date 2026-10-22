@@ -207,9 +207,13 @@ export function DownloadInspector({
         <div className="flex flex-none flex-col gap-[9px] border-b border-wv-hairline px-5 py-[18px]">
           <Field
             label={t("table.status")}
-            value={
-              detail ? `${statusLabel(progress.status)} — ${detail}` : statusLabel(progress.status)
-            }
+            value={[
+              statusLabel(progress.status),
+              torrent?.state === "NEEDS_CERTIFICATE" ? t("next.torrent.needsCertificate") : null,
+              detail,
+            ]
+              .filter((part) => part)
+              .join(" — ")}
           />
           <EditField label={t("table.category")}>
             <Select

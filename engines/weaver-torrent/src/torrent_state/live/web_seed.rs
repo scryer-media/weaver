@@ -1505,13 +1505,16 @@ mod tests {
     }
 
     impl HttpClients for Wired {
-        fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        fn builder(
+            &self,
+            target: Option<HttpTarget<'_>>,
+        ) -> anyhow::Result<reqwest::ClientBuilder> {
             let at = [self.at.ip()];
             let target = target.map(|t| {
                 self.built.lock().extend(t.addrs);
                 HttpTarget { addrs: &at, ..t }
             });
-            Ok(crate::core::net::for_target(builder(), target).build()?)
+            Ok(crate::core::net::for_target(builder(), target))
         }
     }
 

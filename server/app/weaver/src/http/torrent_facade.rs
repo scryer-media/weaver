@@ -648,7 +648,7 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
         TorrentState::CheckingFiles => side("checkingDL", "checkingUP"),
         TorrentState::Downloading if view.forced => "forcedDL",
         TorrentState::Downloading => "downloading",
-        TorrentState::Stalled => side("stalledDL", "stalledUP"),
+        TorrentState::Stalled | TorrentState::NeedsCertificate => side("stalledDL", "stalledUP"),
         TorrentState::Seeding if view.forced => "forcedUP",
         TorrentState::Seeding if view.upload_bps > 0 => "uploading",
         TorrentState::Seeding => "stalledUP",

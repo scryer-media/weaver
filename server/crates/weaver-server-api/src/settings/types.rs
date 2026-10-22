@@ -1248,6 +1248,19 @@ pub struct TrackerRule {
     pub upload_limit: Option<TrackerUploadLimitGql>,
     /// Whether a torrent admitted under it starts forced.
     pub forced: bool,
+    /// Whether it holds a certificate for its SSL torrents.
+    pub has_ssl: bool,
+    /// The certificate's subject.
+    pub ssl_subject: Option<String>,
+    /// When the certificate expires, in milliseconds since the epoch.
+    pub ssl_not_after: Option<i64>,
+}
+
+/// The certificate and private key a tracker issued, each PEM.
+#[derive(Debug, Clone, InputObject)]
+pub struct TrackerCertificateInput {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
 }
 
 /// A tracker rule's upload cap: bytes per second, or absent for unlimited.
@@ -1271,6 +1284,7 @@ impl From<TrackerUploadLimitGql> for weaver_server_core::settings::TrackerUpload
 
 impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
     fn from(rule: weaver_server_core::settings::model::TrackerRule) -> Self {
+        let summary = rule.ssl.as_ref().and_then(|ssl| ssl.summary());
         Self {
             id: rule.id,
             host_pattern: rule.host_pattern,
@@ -1283,6 +1297,9 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             encryption: rule.encryption.map(Into::into),
             upload_limit: rule.upload_limit.map(Into::into),
             forced: rule.forced,
+            has_ssl: rule.ssl.is_some(),
+            ssl_subject: summary.as_ref().map(|summary| summary.subject.clone()),
+            ssl_not_after: summary.map(|summary| summary.not_after_ms),
         }
     }
 }
@@ -1302,6 +1319,8 @@ pub struct TrackerRuleInput {
     pub upload_limit: Option<TrackerUploadLimitGql>,
     #[graphql(default)]
     pub forced: bool,
+    /// Absent keeps the rule's certificate; null clears it.
+    pub ssl: MaybeUndefined<TrackerCertificateInput>,
 }
 
 impl TrackerRuleInput {
@@ -1309,7 +1328,7 @@ impl TrackerRuleInput {
         self,
         id: u32,
     ) -> async_graphql::Result<weaver_server_core::settings::model::TrackerRule> {
-        use weaver_server_core::settings::model::TrackerRule;
+        use weaver_server_core::settings::model::{TrackerCertificate, TrackerRule};
         TrackerRule {
             id,
             host_pattern: self.host_pattern,
@@ -1325,6 +1344,10 @@ impl TrackerRuleInput {
             encryption: self.encryption.map(Into::into),
             upload_limit: self.upload_limit.map(Into::into),
             forced: self.forced,
+            ssl: self.ssl.take().map(|ssl| TrackerCertificate {
+                certificate_pem: ssl.certificate_pem,
+                private_key_pem: ssl.private_key_pem,
+            }),
         }
         .checked()
         .map_err(async_graphql::Error::new)
@@ -1446,6 +1469,11 @@ pub struct TorrentSettings {
     pub banned_ips: Vec<String>,
     pub block_privileged_ports: bool,
     pub filter_trackers: bool,
+    /// Whether SSL torrents' peers are taken, on a port of their own.
+    pub ssl_enabled: bool,
+    /// The first route's SSL port; each further route takes the next.
+    /// Absent, one is chosen at random and kept.
+    pub ssl_port: Option<u16>,
 }
 
 impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
@@ -1475,6 +1503,8 @@ impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
             banned_ips: value.banned_ips.clone(),
             block_privileged_ports: value.block_privileged_ports,
             filter_trackers: value.filter_trackers,
+            ssl_enabled: value.ssl_enabled,
+            ssl_port: value.ssl_port,
         }
     }
 }
@@ -1506,6 +1536,9 @@ pub struct TorrentSettingsInput {
     pub banned_ips: Option<Vec<String>>,
     pub block_privileged_ports: Option<bool>,
     pub filter_trackers: Option<bool>,
+    pub ssl_enabled: Option<bool>,
+    /// Null leaves the port to be chosen at random and kept.
+    pub ssl_port: MaybeUndefined<u16>,
 }
 
 impl TorrentSettingsInput {
@@ -1579,6 +1612,12 @@ impl TorrentSettingsInput {
         }
         if let Some(filter) = self.filter_trackers {
             torrent.filter_trackers = filter;
+        }
+        if let Some(enabled) = self.ssl_enabled {
+            torrent.ssl_enabled = enabled;
+        }
+        if !self.ssl_port.is_undefined() {
+            torrent.ssl_port = self.ssl_port.value().copied();
         }
     }
 }

@@ -861,7 +861,8 @@ impl TorrentStateLive {
             state.shared.spawner.clone(),
             state.shared.connector.clone(),
         )
-        .over(transports);
+        .over(transports)
+        .under(state.shared.ssl.clone());
         let requester = aframe!(
             handler
                 .task_peer_chunk_requester()
@@ -2319,12 +2320,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // port `session_impl::listen_port` gives: the one mapped on the
         // gateway, else the one we listen on).
         if !self.incoming {
-            handshake.p = self
-                .state
-                .shared
+            let shared = &self.state.shared;
+            handshake.p = shared
                 .session
                 .upgrade()
-                .and_then(|session| session.announce_port())
+                .and_then(|session| session.announce_port_of(shared.ssl.is_some()))
                 .map(u32::from);
         }
 

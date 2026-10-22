@@ -3,8 +3,11 @@
 
 use crate::StateError;
 use crate::persistence::Database;
+use crate::persistence::encryption::{EncryptionKey, decrypt_value, encrypt_value, is_encrypted};
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
-use crate::settings::model::{Client, TorrentEncryption, TrackerRule, TrackerUploadLimit};
+use crate::settings::model::{
+    Client, TorrentEncryption, TrackerCertificate, TrackerRule, TrackerUploadLimit,
+};
 
 #[cfg(test)]
 use crate::categories::CategoryConfig;
@@ -13,9 +16,12 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, discovery, encryption, upload_limit, forced";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, discovery, encryption, upload_limit, forced, ssl_certificate, ssl_private_key";
 
-fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
+fn tracker_rule_from_row(
+    row: &SqlRow,
+    key: Option<&EncryptionKey>,
+) -> Result<TrackerRule, StateError> {
     let seeding = row
         .opt_text("seeding")?
         .map(|json| {
@@ -61,11 +67,42 @@ fn tracker_rule_from_row(row: &SqlRow) -> Result<TrackerRule, StateError> {
             })
             .transpose()?,
         forced: row.bool("forced")?,
+        ssl: match (
+            row.opt_text("ssl_certificate")?,
+            row.opt_text("ssl_private_key")?,
+        ) {
+            (Some(certificate_pem), Some(sealed)) => Some(TrackerCertificate {
+                certificate_pem,
+                private_key_pem: open_private_key(key, &sealed)?,
+            }),
+            _ => None,
+        },
     })
 }
 
+// A rule's private key as it is kept: sealed with the database's key.
+fn seal_private_key(key: Option<&EncryptionKey>, pem: &str) -> Result<String, StateError> {
+    let key = key.ok_or_else(|| StateError::Conflict("encryption key required".into()))?;
+    encrypt_value(key, pem)
+        .map_err(|_| StateError::Conflict("could not encrypt the SSL private key".into()))
+}
+
+fn open_private_key(key: Option<&EncryptionKey>, sealed: &str) -> Result<String, StateError> {
+    let key = key.ok_or_else(|| StateError::Conflict("encryption key required".into()))?;
+    if !is_encrypted(sealed) {
+        return Err(StateError::Conflict(
+            "a tracker rule's SSL private key is not encrypted".into(),
+        ));
+    }
+    decrypt_value(key, sealed)
+        .map_err(|_| StateError::Conflict("could not decrypt the SSL private key".into()))
+}
+
 // The rule's columns after its id, in `TRACKER_RULE_COLUMNS` order.
-fn tracker_rule_args(rule: &TrackerRule) -> Result<Vec<SqlArg>, StateError> {
+fn tracker_rule_args(
+    rule: &TrackerRule,
+    key: Option<&EncryptionKey>,
+) -> Result<Vec<SqlArg>, StateError> {
     let seeding = rule
         .seeding
         .map(|policy| serde_json::to_string(&policy))
@@ -85,12 +122,20 @@ fn tracker_rule_args(rule: &TrackerRule) -> Result<Vec<SqlArg>, StateError> {
         ),
         SqlArg::OptText(rule.upload_limit.map(TrackerUploadLimit::to_text)),
         SqlArg::Bool(rule.forced),
+        SqlArg::OptText(rule.ssl.as_ref().map(|ssl| ssl.certificate_pem.clone())),
+        SqlArg::OptText(
+            rule.ssl
+                .as_ref()
+                .map(|ssl| seal_private_key(key, &ssl.private_key_pem))
+                .transpose()?,
+        ),
     ])
 }
 
 impl Database {
     pub fn list_tracker_rules(&self) -> Result<Vec<TrackerRule>, StateError> {
         let datastore = self.datastore();
+        let key = self.encryption_key().cloned();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
@@ -98,7 +143,9 @@ impl Database {
                 &[],
             )
             .await?;
-            rows.iter().map(tracker_rule_from_row).collect()
+            rows.iter()
+                .map(|row| tracker_rule_from_row(row, key.as_ref()))
+                .collect()
         })
     }
 
@@ -109,7 +156,7 @@ impl Database {
         now_ms: i64,
     ) -> Result<TrackerRule, StateError> {
         let datastore = self.datastore();
-        let args = tracker_rule_args(rule)?;
+        let args = tracker_rule_args(rule, self.encryption_key())?;
         let rule = rule.clone();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "insert_tracker_rule", |tx| {
@@ -132,7 +179,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -147,14 +194,15 @@ impl Database {
     // Returns whether the rule exists.
     pub fn update_tracker_rule(&self, rule: &TrackerRule, now_ms: i64) -> Result<bool, StateError> {
         let datastore = self.datastore();
-        let mut args = tracker_rule_args(rule)?;
+        let mut args = tracker_rule_args(rule, self.encryption_key())?;
         args.extend([SqlArg::I64(now_ms), SqlArg::I64(i64::from(rule.id))]);
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
                 "UPDATE tracker_rules
                     SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
-                        discovery = {}, encryption = {}, upload_limit = {}, forced = {}, updated_at_ms = {}
+                        discovery = {}, encryption = {}, upload_limit = {}, forced = {},
+                        ssl_certificate = {}, ssl_private_key = {}, updated_at_ms = {}
                   WHERE id = {}",
                 &args,
             )

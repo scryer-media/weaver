@@ -434,21 +434,24 @@ impl<F> HttpClients for LegClients<F>
 where
     F: Fn() -> Result<reqwest::ClientBuilder, String> + Send + Sync + 'static,
 {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a torrent session's client, built for its leg"
-    )]
-    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+    fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder> {
         let builder = (self.0)().map_err(anyhow::Error::msg)?;
-        let builder = match target {
+        Ok(match target {
             None => builder,
             // A leg that dials the host itself dials it at the checked
             // address; a ladder leg's bridge is handed the name, and its
             // exit reaches it.
             Some(target) => crate::proxies::pinned(builder, target.host, target.port, target.addrs)
                 .redirect(reqwest::redirect::Policy::none()),
-        };
-        Ok(builder.build()?)
+        })
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a torrent session's client, built for its leg"
+    )]
+    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        Ok(self.builder(target)?.build()?)
     }
 }
 

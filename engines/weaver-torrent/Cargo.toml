@@ -48,6 +48,7 @@ quick-xml = { workspace = true, features = ["serialize"] }
 rand = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
+rustls-pki-types = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
@@ -55,6 +56,7 @@ serde_urlencoded = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["io", "rt"] }
 tracing = { workspace = true, features = ["attributes"] }
@@ -68,6 +70,8 @@ windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System
 [dev-dependencies]
 # The e2e tests lift the open-file limit.
 nix = { workspace = true, features = ["resource", "uio"] }
+# A CA and the identities issued under it, for SSL torrent tests.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 tempfile = { workspace = true }
 # `test-util` for the paused clock: the request timeout, DHT and connect rate
 # tests advance it past a deadline instead of waiting for one.

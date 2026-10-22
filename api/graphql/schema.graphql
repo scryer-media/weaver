@@ -5276,6 +5276,15 @@ type TorrentSettings {
 	bannedIps: [String!]!
 	blockPrivilegedPorts: Boolean!
 	filterTrackers: Boolean!
+	"""
+	Whether SSL torrents' peers are taken, on a port of their own.
+	"""
+	sslEnabled: Boolean!
+	"""
+	The first route's SSL port; each further route takes the next.
+	Absent, one is chosen at random and kept.
+	"""
+	sslPort: Int
 }
 
 input TorrentSettingsInput {
@@ -5312,6 +5321,11 @@ input TorrentSettingsInput {
 	bannedIps: [String!]
 	blockPrivilegedPorts: Boolean
 	filterTrackers: Boolean
+	sslEnabled: Boolean
+	"""
+	Null leaves the port to be chosen at random and kept.
+	"""
+	sslPort: Int
 }
 
 enum TorrentState {
@@ -5324,6 +5338,7 @@ enum TorrentState {
 	PAUSED
 	STOPPED
 	MOVING
+	NEEDS_CERTIFICATE
 }
 
 input TorrentTestInput {
@@ -5383,6 +5398,14 @@ enum TorrentVersion {
 }
 
 """
+The certificate and private key a tracker issued, each PEM.
+"""
+input TrackerCertificateInput {
+	certificatePem: String!
+	privateKeyPem: String!
+}
+
+"""
 Seeding goals for the torrents announcing to a host, and whether the
 schedule's pause leaves them seeding until their goal is met.
 """
@@ -5429,6 +5452,18 @@ type TrackerRule {
 	Whether a torrent admitted under it starts forced.
 	"""
 	forced: Boolean!
+	"""
+	Whether it holds a certificate for its SSL torrents.
+	"""
+	hasSsl: Boolean!
+	"""
+	The certificate's subject.
+	"""
+	sslSubject: String
+	"""
+	When the certificate expires, in milliseconds since the epoch.
+	"""
+	sslNotAfter: Int
 }
 
 input TrackerRuleInput {
@@ -5442,6 +5477,10 @@ input TrackerRuleInput {
 	encryption: TorrentEncryption
 	uploadLimit: TrackerUploadLimitInput
 	forced: Boolean! = false
+	"""
+	Absent keeps the rule's certificate; null clears it.
+	"""
+	ssl: TrackerCertificateInput
 }
 
 enum TrackerStatus {

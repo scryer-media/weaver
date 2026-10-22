@@ -53,6 +53,9 @@ pub enum TorrentState {
     Stopped,
     // Its directory is on the way to another, where it goes on.
     Moving,
+    // An SSL torrent with no certificate from its tracker rule: it connects
+    // to no peer and announces nowhere.
+    NeedsCertificate,
 }
 
 impl TorrentState {
@@ -67,6 +70,7 @@ impl TorrentState {
             Self::Paused => "paused",
             Self::Stopped => "stopped",
             Self::Moving => "moving",
+            Self::NeedsCertificate => "needs_certificate",
         }
     }
 
@@ -81,6 +85,7 @@ impl TorrentState {
             "paused" => Some(Self::Paused),
             "stopped" => Some(Self::Stopped),
             "moving" => Some(Self::Moving),
+            "needs_certificate" => Some(Self::NeedsCertificate),
             _ => None,
         }
     }

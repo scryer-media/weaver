@@ -23,7 +23,18 @@ use crate::{
     vectored_traits::AsyncReadVectored,
 };
 
+/// A listener's sockets, and the address they took.
+pub(crate) struct Listening {
+    pub tcp_socket: Option<TcpListener>,
+    pub custom_tcp_socket: Option<Box<dyn StreamListener>>,
+    pub utp_socket: Option<UtpSocket>,
+    pub addr: SocketAddr,
+}
+
 pub(crate) struct ListenResult {
+    /// The SSL listener: SSL torrents' peers connect to it, TLS from their
+    /// first byte.
+    pub ssl: Option<Listening>,
     pub tcp_socket: Option<TcpListener>,
     /// The TCP listener created by a `SocketFactory`, used instead of `tcp_socket`.
     pub custom_tcp_socket: Option<Box<dyn StreamListener>>,
@@ -70,6 +81,10 @@ pub struct ListenerOptions {
     pub announce_port: Option<u16>,
     pub ipv4_only: bool,
     pub max_pending_incoming_handshake_checks: usize,
+    /// The port of the SSL listener, on the listen address, over the same
+    /// transports; 0 takes any free port. `None` opens none, and SSL
+    /// torrents then take no incoming connection.
+    pub ssl_listen_port: Option<u16>,
 }
 
 impl Default for ListenerOptions {
@@ -83,6 +98,7 @@ impl Default for ListenerOptions {
             announce_port: None,
             ipv4_only: false,
             max_pending_incoming_handshake_checks: DEFAULT_MAX_PENDING_INCOMING_HANDSHAKE_CHECKS,
+            ssl_listen_port: None,
         }
     }
 }
@@ -100,7 +116,7 @@ impl ListenerOptions {
         utp_opts.parent_span = parent_span;
         utp_opts.dont_wait_for_lastack = true;
 
-        let mut listen_addr = if self.ipv4_only {
+        let listen_addr = if self.ipv4_only {
             if self.listen_addr.is_ipv6() && self.listen_addr.ip().is_unspecified() {
                 // Force to IPv4 unspecified if IPv6 unspecified was requested but we are v4 only
                 SocketAddr::from(([0, 0, 0, 0], self.listen_addr.port()))
@@ -111,75 +127,37 @@ impl ListenerOptions {
             self.listen_addr
         };
 
-        let mut custom_tcp_socket = None;
-        let tcp_socket = if let (true, Some(factory)) = (self.mode.tcp_enabled(), socket_factory) {
-            let listener = factory
-                .listen_tcp(listen_addr)
-                .await
-                .context("error starting TCP listener")?;
-            listen_addr = listener.local_addr();
-            info!(
-                "Listening on TCP {:?} for incoming peer connections",
-                listen_addr
-            );
-            custom_tcp_socket = Some(listener);
-            None
-        } else if self.mode.tcp_enabled() {
-            let listener = TcpListener::bind_tcp(
-                listen_addr,
-                BindOpts {
-                    request_dualstack: !self.ipv4_only,
-                    reuseport: false,
-                    device: bind_device,
-                },
-            )
-            .context("error starting TCP listener")?;
-            listen_addr = listener.bind_addr();
-            info!(
-                "Listening on TCP {:?} for incoming peer connections",
-                listen_addr
-            );
-            Some(listener)
-        } else {
-            None
-        };
+        let bound = bind(
+            self.mode,
+            listen_addr,
+            self.ipv4_only,
+            utp_opts.clone(),
+            bind_device,
+            socket_factory,
+        )
+        .await?;
+        let listen_addr = bound.addr;
+        let (tcp_socket, custom_tcp_socket, utp_socket) =
+            (bound.tcp_socket, bound.custom_tcp_socket, bound.utp_socket);
 
-        let utp_socket = if self.mode.utp_enabled() {
-            let bind_result: Result<UtpSocket, Box<dyn std::error::Error + Send + Sync>> =
-                match socket_factory {
-                    Some(factory) => bind_custom_utp(factory.as_ref(), listen_addr, utp_opts)
-                        .await
-                        .map_err(Into::into),
-                    None => UtpSocketUdp::new_udp_with_opts(
-                        listen_addr,
-                        utp_opts,
-                        UtpSocketUdpOpts { bind_device },
-                    )
-                    .await
-                    .map(UtpSocket::Udp)
-                    .map_err(Into::into),
-                };
-            match bind_result {
-                Ok(sock) => {
-                    listen_addr = sock.bind_addr();
-                    info!(
-                        "Listening on UDP {:?} for incoming uTP peer connections",
-                        listen_addr
-                    );
-                    Some(sock)
-                }
-                Err(e) if tcp_socket.is_some() || custom_tcp_socket.is_some() => {
-                    // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
-                    tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
-                    None
-                }
-                Err(e) => {
-                    return Err(anyhow::Error::from_boxed(e));
-                }
-            }
-        } else {
-            None
+        let ssl = match self.ssl_listen_port {
+            Some(port) => Some(
+                bind(
+                    self.mode,
+                    SocketAddr::new(listen_addr.ip(), port),
+                    self.ipv4_only,
+                    utp_opts,
+                    bind_device,
+                    socket_factory,
+                )
+                .await
+                .context("error starting the SSL listener")?,
+            ),
+            None => None,
         };
+        if let Some(ssl) = &ssl {
+            info!(addr = ?ssl.addr, "Listening for SSL torrents' peers");
+        }
 
         let announce_port = if let Some(p) = self.announce_port {
             Some(p)
@@ -189,6 +167,7 @@ impl ListenerOptions {
             Some(listen_addr.port())
         };
         Ok(ListenResult {
+            ssl,
             tcp_socket,
             custom_tcp_socket,
             utp_socket,
@@ -198,6 +177,94 @@ impl ListenerOptions {
             max_pending_incoming_handshake_checks: self.max_pending_incoming_handshake_checks,
         })
     }
+}
+
+// A listener's sockets on `listen_addr`, as `mode` says; a port of 0 takes
+// TCP's free port, and uTP binds the port TCP took.
+async fn bind(
+    mode: ListenerMode,
+    mut listen_addr: SocketAddr,
+    ipv4_only: bool,
+    utp_opts: librqbit_utp::SocketOpts,
+    bind_device: Option<&BindDevice>,
+    socket_factory: Option<&Arc<dyn SocketFactory>>,
+) -> anyhow::Result<Listening> {
+    let mut custom_tcp_socket = None;
+    let tcp_socket = if let (true, Some(factory)) = (mode.tcp_enabled(), socket_factory) {
+        let listener = factory
+            .listen_tcp(listen_addr)
+            .await
+            .context("error starting TCP listener")?;
+        listen_addr = listener.local_addr();
+        info!(
+            "Listening on TCP {:?} for incoming peer connections",
+            listen_addr
+        );
+        custom_tcp_socket = Some(listener);
+        None
+    } else if mode.tcp_enabled() {
+        let listener = TcpListener::bind_tcp(
+            listen_addr,
+            BindOpts {
+                request_dualstack: !ipv4_only,
+                reuseport: false,
+                device: bind_device,
+            },
+        )
+        .context("error starting TCP listener")?;
+        listen_addr = listener.bind_addr();
+        info!(
+            "Listening on TCP {:?} for incoming peer connections",
+            listen_addr
+        );
+        Some(listener)
+    } else {
+        None
+    };
+
+    let utp_socket = if mode.utp_enabled() {
+        let bind_result: Result<UtpSocket, Box<dyn std::error::Error + Send + Sync>> =
+            match socket_factory {
+                Some(factory) => bind_custom_utp(factory.as_ref(), listen_addr, utp_opts)
+                    .await
+                    .map_err(Into::into),
+                None => UtpSocketUdp::new_udp_with_opts(
+                    listen_addr,
+                    utp_opts,
+                    UtpSocketUdpOpts { bind_device },
+                )
+                .await
+                .map(UtpSocket::Udp)
+                .map_err(Into::into),
+            };
+        match bind_result {
+            Ok(sock) => {
+                listen_addr = sock.bind_addr();
+                info!(
+                    "Listening on UDP {:?} for incoming uTP peer connections",
+                    listen_addr
+                );
+                Some(sock)
+            }
+            Err(e) if tcp_socket.is_some() || custom_tcp_socket.is_some() => {
+                // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
+                tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
+                None
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from_boxed(e));
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(Listening {
+        tcp_socket,
+        custom_tcp_socket,
+        utp_socket,
+        addr: listen_addr,
+    })
 }
 
 async fn bind_custom_utp(

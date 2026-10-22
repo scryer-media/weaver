@@ -448,6 +448,7 @@ async fn seeded() -> Seeded {
             name: None,
             trackers: Vec::new(),
             piece_length: Some(1024),
+            ssl_cert: None,
         },
         &BlockingSpawner::new(1),
     )

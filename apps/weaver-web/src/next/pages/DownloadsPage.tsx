@@ -899,7 +899,9 @@ const QueueGroup = memo(function QueueGroup({
           onPause={onPause}
           onCancel={onCancel}
           held={heldOf(job)}
-          hold={holdOf(job)}
+          hold={
+            torrents.get(job.id)?.state === "NEEDS_CERTIFICATE" ? t("next.torrent.needsCertificate") : holdOf(job)
+          }
           seeding={seedingOf(torrents.get(job.id))}
           seedingColumn={seedingColumn}
           statusTitle={

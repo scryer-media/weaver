@@ -26,6 +26,7 @@ pub enum TorrentStateGql {
     Paused,
     Stopped,
     Moving,
+    NeedsCertificate,
 }
 
 impl From<TorrentState> for TorrentStateGql {
@@ -40,6 +41,7 @@ impl From<TorrentState> for TorrentStateGql {
             TorrentState::Paused => Self::Paused,
             TorrentState::Stopped => Self::Stopped,
             TorrentState::Moving => Self::Moving,
+            TorrentState::NeedsCertificate => Self::NeedsCertificate,
         }
     }
 }

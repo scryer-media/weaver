@@ -120,6 +120,8 @@ fn config_roundtrip() {
             banned_ips: vec!["10.0.0.0 - 10.0.0.255".to_owned(), "2001:db8::1".to_owned()],
             block_privileged_ports: true,
             filter_trackers: true,
+            ssl_enabled: true,
+            ssl_port: Some(4_433),
         },
         data_dir: "/tmp/weaver".to_string(),
         hardware_profile: None,
@@ -456,6 +458,7 @@ fn tracker_rules_crud() {
                 encryption: Some(TorrentEncryption::Prefer),
                 upload_limit: Some(TrackerUploadLimit::Unlimited),
                 forced: true,
+                ssl: None,
             },
             1,
         )
@@ -474,6 +477,7 @@ fn tracker_rules_crud() {
                 encryption: None,
                 upload_limit: None,
                 forced: false,
+                ssl: None,
             },
             2,
         )
@@ -512,4 +516,73 @@ fn tracker_rules_crud() {
     assert!(db.delete_tracker_rule(second.id).unwrap());
     assert!(!db.delete_tracker_rule(second.id).unwrap());
     assert_eq!(db.list_tracker_rules().unwrap(), [changed]);
+}
+
+// A rule's certificate comes back as it was kept, its private key sealed in
+// the database; clearing it clears both.
+#[test]
+fn a_tracker_rules_private_key_is_encrypted_at_rest() {
+    use crate::persistence::encryption::is_encrypted;
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    use crate::settings::model::TrackerRule;
+
+    let db = Database::open_in_memory().unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let params = rcgen::CertificateParams::new(vec!["user-1".to_owned()]).unwrap();
+    let issued = crate::settings::model::TrackerCertificate {
+        certificate_pem: params.self_signed(&key).unwrap().pem(),
+        private_key_pem: key.serialize_pem(),
+    };
+    let kept = db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "tracker.example".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
+                ssl: Some(issued.clone()),
+            },
+            1,
+        )
+        .unwrap();
+    assert_eq!(db.list_tracker_rules().unwrap(), [kept.clone()]);
+    assert_eq!(kept.ssl.as_ref(), Some(&issued));
+
+    let stored = |column: &'static str| {
+        let datastore = db.datastore();
+        let sql = match column {
+            "cert" => "SELECT ssl_certificate AS value FROM tracker_rules WHERE id = {}",
+            _ => "SELECT ssl_private_key AS value FROM tracker_rules WHERE id = {}",
+        };
+        let args = vec![SqlArg::I64(i64::from(kept.id))];
+        db.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(datastore.read_exec(), sql, &args)
+                .await?
+                .expect("the rule's row");
+            row.opt_text("value")
+        })
+        .unwrap()
+    };
+    let key = stored("key").unwrap();
+    assert!(is_encrypted(&key));
+    assert!(!key.contains("PRIVATE KEY"));
+    assert_eq!(
+        stored("cert").as_deref(),
+        Some(issued.certificate_pem.as_str())
+    );
+
+    let cleared = TrackerRule {
+        ssl: None,
+        ..kept.clone()
+    };
+    assert!(db.update_tracker_rule(&cleared, 2).unwrap());
+    assert_eq!(db.list_tracker_rules().unwrap(), [cleared]);
+    assert_eq!((stored("cert"), stored("key")), (None, None));
 }

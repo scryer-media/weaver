@@ -444,6 +444,15 @@ pub struct TorrentMetaV1Info<BufType> {
 
     #[serde(skip_serializing_if = "is_false", default)]
     pub private: bool,
+
+    /// The CA certificate (PEM) every peer of an SSL torrent is issued
+    /// under. Its presence is what makes a torrent an SSL torrent.
+    #[serde(
+        rename = "ssl-cert",
+        default = "none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ssl_cert: Option<BufType>,
 }
 
 #[derive(Clone, Copy)]
@@ -1205,6 +1214,7 @@ where
             sha1: self.sha1.clone_to_owned(within_buffer),
             symlink_path: self.symlink_path.clone_to_owned(within_buffer),
             private: self.private,
+            ssl_cert: self.ssl_cert.clone_to_owned(within_buffer),
         }
     }
 }
@@ -2082,5 +2092,34 @@ mod tests {
         let mut written = Vec::new();
         crate::bencode::bencode_serialize_to_writer(&t, &mut written).unwrap();
         assert_eq!(written, bytes);
+    }
+
+    #[test]
+    fn an_ssl_torrents_ca_is_inside_its_info_hash() {
+        use crate::sha1w::ISha1;
+        let pem = b"-----BEGIN CERTIFICATE-----\nMA==\n-----END CERTIFICATE-----\n";
+        let mut info = b"d6:lengthi5e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        info.extend_from_slice(&[7u8; 20]);
+        info.extend_from_slice(format!("8:ssl-cert{}:", pem.len()).as_bytes());
+        info.extend_from_slice(pem);
+        info.push(b'e');
+        let mut bytes = b"d4:info".to_vec();
+        bytes.extend_from_slice(&info);
+        bytes.push(b'e');
+
+        let t = torrent_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            t.info.data.ssl_cert.as_ref().map(|c| c.as_ref()),
+            Some(&pem[..])
+        );
+        let mut sha1 = crate::sha1w::Sha1::new();
+        sha1.update(&info);
+        assert_eq!(t.info_hash, Id20::new(sha1.finish()));
+
+        // Written back, the info is the bytes it was read from, so the hash
+        // it is known by still covers the CA.
+        let mut written = Vec::new();
+        crate::bencode::bencode_serialize_to_writer(&t.info.data, &mut written).unwrap();
+        assert_eq!(written, info);
     }
 }

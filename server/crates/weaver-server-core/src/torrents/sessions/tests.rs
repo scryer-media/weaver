@@ -392,6 +392,50 @@ async fn a_route_that_could_not_listen_shows_why() {
     sessions.stop_all().await;
 }
 
+// The SSL port chosen while the settings name none is chosen once, outside
+// the privileged ports and the ephemeral range, and kept.
+#[test]
+fn the_chosen_ssl_port_is_kept() {
+    let db = Database::open_in_memory().unwrap();
+    let chosen = chosen_ssl_port(&db).unwrap();
+    assert!((10_000..50_000).contains(&chosen));
+    assert_eq!(chosen_ssl_port(&db).unwrap(), chosen);
+}
+
+// A route's session takes SSL torrents' peers on a listener of its own
+// while the settings turn it on, and has none while they do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_listens_for_ssl_peers_while_turned_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.route(TorrentScope::Default, 1);
+    loopback_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+
+    let session = sessions.session(&plan).await.unwrap();
+    assert!(session.listen_addr().is_some());
+    assert_eq!(session.ssl_listen_addr(), None);
+
+    // Port 0 asks the host for one, so the test takes no fixed port.
+    sessions.set_config(TorrentConfig {
+        ssl_enabled: true,
+        ssl_port: Some(0),
+        ..TorrentConfig::default()
+    });
+    sessions.settled().await;
+    sessions.drop_route(&plan.key).await;
+    let session = sessions.session(&plan).await.unwrap();
+    let ssl = session.ssl_listen_addr().expect("an SSL listener");
+    assert_ne!(ssl.port(), 0);
+    assert_ne!(Some(ssl), session.listen_addr());
+    sessions.stop_all().await;
+}
+
 #[test]
 fn a_host_without_ipv6_listens_on_every_ipv4_address() {
     assert_eq!(

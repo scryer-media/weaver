@@ -44,6 +44,7 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 
 const SLOTS_KEY: &str = "torrent.session_slots";
 const MAPPED_KEY: &str = "torrent.mapped_ports";
+const CHOSEN_SSL_PORT_KEY: &str = "torrent.chosen_ssl_port";
 
 /// A resolved route's identity: the leg it dials over.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -602,6 +603,22 @@ impl Sessions {
             .ok_or_else(|| "the blocklist did not load".to_owned())
     }
 
+    // The first route's SSL port, the settings' or the one chosen for them,
+    // read or chosen off the async threads.
+    async fn ssl_base_port(&self, configured: Option<u16>) -> Result<u16, String> {
+        if let Some(port) = configured {
+            return Ok(port);
+        }
+        let (db, table) = (self.db.clone(), Arc::clone(&self.port_slots));
+        tokio::task::spawn_blocking(move || {
+            let _table = table.lock().unwrap_or_else(PoisonError::into_inner);
+            chosen_ssl_port(&db)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+    }
+
     // The route's port slot, read or taken off the async threads, and the
     // port a gateway mapped to it.
     async fn port_slot(&self, key: &RouteKey) -> Result<(u16, Option<u16>), String> {
@@ -746,10 +763,24 @@ impl Sessions {
         };
         let torrent = self.config();
         let ip_filter = self.ip_filter(&torrent).await?;
-        let options = SessionOptions {
+        let ssl_port = if torrent.ssl_enabled {
+            let base = self.ssl_base_port(torrent.ssl_port).await?;
+            let port = base
+                .checked_add(slot)
+                .ok_or("no SSL listen port is left for this route")?;
+            Some(port)
+        } else {
+            None
+        };
+        let mut options = SessionOptions {
             port_map_events: Some(mappings.follow()),
             ..session_options(&env, &leg, port, &dir, peers, &torrent, ip_filter)
         };
+        // SSL torrents' peers come to a port of the route's own beside its
+        // peer port.
+        if let Some(listen) = options.listen.as_mut() {
+            listen.ssl_listen_port = ssl_port;
+        }
         Session::new_with_opts(dir.join("output"), options)
             .await
             .map(|session| (session, leg.leg, port))
@@ -1040,6 +1071,23 @@ pub fn port_slot(db: &Database, key: &RouteKey) -> Result<u16, StateError> {
     slots.insert(key.as_str().to_owned(), slot);
     save_slots(db, &slots)?;
     Ok(slot)
+}
+
+/// The SSL port chosen while the settings name none: at random the first
+/// time, above the privileged ports and below the ephemeral range, then
+/// kept, so peers find it again.
+pub fn chosen_ssl_port(db: &Database) -> Result<u16, StateError> {
+    if let Some(port) = db
+        .get_setting(CHOSEN_SSL_PORT_KEY)?
+        .and_then(|value| value.parse().ok())
+    {
+        return Ok(port);
+    }
+    let mut bytes = [0u8; 2];
+    getrandom::fill(&mut bytes).map_err(|error| StateError::Database(error.to_string()))?;
+    let port = 10_000 + u16::from_le_bytes(bytes) % 40_000;
+    db.set_setting(CHOSEN_SSL_PORT_KEY, &port.to_string())?;
+    Ok(port)
 }
 
 fn load_mapped(db: &Database) -> Result<BTreeMap<String, u16>, StateError> {

@@ -22,8 +22,18 @@ use crate::{
     mse::{self, Encryption, EncryptionPolicy},
     network::{SocketFactory, UtpSocket},
     peer_connection::with_timeout,
+    ssl::SslTorrent,
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
 };
+
+/// What a connection to a peer is made under once its stream is open.
+#[derive(Clone, Copy)]
+pub(crate) enum Guard<'a> {
+    /// Message stream encryption, as the policy says.
+    Mse(EncryptionPolicy),
+    /// TLS under an SSL torrent's CA, with our identity under it.
+    Tls(&'a SslTorrent),
+}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum ConnectionKind {
@@ -146,7 +156,8 @@ impl StreamConnector {
     }
 
     /// Connect to a peer over `transports` and send it our BitTorrent
-    /// `handshake`, inside the encrypted handshake when `policy` says so.
+    /// `handshake`: inside TLS under [`Guard::Tls`], else inside the
+    /// encrypted handshake when the [`Guard::Mse`] policy says so.
     /// Under [`EncryptionPolicy::Prefer`] `encrypt` says which, asked once the
     /// transport is open (libtorrent `bt_peer_connection::on_connected`
     /// chooses there, so a peer we never reach is never asked). An encrypted
@@ -159,7 +170,7 @@ impl StreamConnector {
         &self,
         addr: SocketAddr,
         transports: Transports,
-        policy: EncryptionPolicy,
+        guard: Guard<'_>,
         info_hash: &Id20,
         handshake: &[u8],
         encrypt: impl FnOnce() -> bool,
@@ -179,6 +190,26 @@ impl StreamConnector {
         )
         .await?;
         let (meter, r, mut w) = Meter::wrap(r, w);
+
+        let policy = match guard {
+            Guard::Mse(policy) => policy,
+            Guard::Tls(ssl) => {
+                let (r, mut w) = with_timeout("TLS handshake", rw_timeout, async {
+                    ssl.connect(r, w)
+                        .await
+                        .map_err(|e| Error::Anyhow(anyhow::Error::from(e).context("TLS handshake")))
+                })
+                .await
+                .inspect_err(|e| debug!(?addr, "TLS handshake failed: {e:#}"))?;
+                with_timeout(
+                    "writing",
+                    rw_timeout,
+                    w.write_all(handshake).map_err(Error::WriteHandshake),
+                )
+                .await?;
+                return Ok((kind, r, w, meter, Encryption::None));
+            }
+        };
 
         let stats = &self.stats.encryption;
         let encrypted = match policy {
@@ -490,7 +521,7 @@ mod tests {
             .connect_and_send_handshake(
                 (Ipv4Addr::LOCALHOST, 6881).into(),
                 Transports::Any,
-                connector.encryption(),
+                Guard::Mse(connector.encryption()),
                 &Id20::new([7; 20]),
                 HANDSHAKE,
                 encrypt,

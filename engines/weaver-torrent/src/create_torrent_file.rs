@@ -26,6 +26,9 @@ pub struct CreateTorrentOptions<'a> {
     pub name: Option<&'a str>,
     pub trackers: Vec<String>,
     pub piece_length: Option<u32>,
+    /// The CA (PEM) whose certificates the torrent's peers present: set, the
+    /// torrent is an SSL torrent.
+    pub ssl_cert: Option<&'a [u8]>,
 }
 
 fn walk_dir_find_paths(dir: &Path, out: &mut Vec<Cow<'_, Path>>) -> anyhow::Result<()> {
@@ -183,6 +186,7 @@ async fn create_torrent_raw<'a>(
             sha1: None,
             symlink_path: None,
             private: false,
+            ssl_cert: options.ssl_cert.map(|pem| pem.to_vec().into()),
         },
         output_folder,
     })

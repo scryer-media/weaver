@@ -467,6 +467,63 @@ pub struct TrackerRule {
     pub upload_limit: Option<TrackerUploadLimit>,
     // Whether a torrent admitted under it starts forced, past the queue.
     pub forced: bool,
+    // The identity the tracker issued for its SSL torrents, presented to
+    // their peers and in their HTTPS announces; `None` leaves an SSL torrent
+    // under the rule waiting for one.
+    pub ssl: Option<TrackerCertificate>,
+}
+
+// An identity a tracker issued: a certificate chain and its private key,
+// both PEM.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrackerCertificate {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+}
+
+impl std::fmt::Debug for TrackerCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackerCertificate")
+            .field("certificate_pem", &self.certificate_pem)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TrackerCertificate {
+    // The identity its torrents present; an error when either PEM does not
+    // parse or the key is not the certificate's.
+    pub fn identity(&self) -> Result<weaver_torrent::SslIdentity, String> {
+        let identity = weaver_torrent::SslIdentity::from_pem(
+            self.certificate_pem.as_bytes(),
+            self.private_key_pem.as_bytes(),
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        identity.check().map_err(|error| format!("{error:#}"))?;
+        Ok(identity)
+    }
+
+    // The subject and the end of the validity of its first certificate, the
+    // one its torrents present.
+    pub fn summary(&self) -> Option<CertificateSummary> {
+        let identity = weaver_torrent::SslIdentity::from_pem(
+            self.certificate_pem.as_bytes(),
+            self.private_key_pem.as_bytes(),
+        )
+        .ok()?;
+        let (_, cert) =
+            x509_parser::parse_x509_certificate(identity.certificate_chain.first()?).ok()?;
+        Some(CertificateSummary {
+            subject: cert.subject().to_string(),
+            not_after_ms: cert.validity().not_after.timestamp().saturating_mul(1000),
+        })
+    }
+}
+
+// What a certificate says of whom it names and until when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateSummary {
+    pub subject: String,
+    pub not_after_ms: i64,
 }
 
 // A tracker rule's upload cap.
@@ -552,6 +609,10 @@ impl TrackerRule {
     // when the pattern names no host.
     pub fn checked(mut self) -> Result<Self, String> {
         self.host_pattern = Self::pattern(&self.host_pattern)?;
+        if let Some(ssl) = &self.ssl {
+            ssl.identity()
+                .map_err(|error| format!("the SSL certificate is refused: {error}"))?;
+        }
         Ok(self)
     }
 
@@ -677,6 +738,12 @@ pub struct TorrentConfig {
     // Whether trackers are held to the blocklist and banned addresses
     // (libtorrent `apply_ip_filter_to_trackers`).
     pub filter_trackers: bool,
+    // Whether SSL torrents' peers are taken, on a listener of their own.
+    pub ssl_enabled: bool,
+    // The first route's SSL listen port; each further route listens on the
+    // next port its slot names. Absent, the sessions choose one at random
+    // and keep it.
+    pub ssl_port: Option<u16>,
 }
 
 impl TorrentConfig {
@@ -793,6 +860,8 @@ impl Default for TorrentConfig {
             banned_ips: Vec::new(),
             block_privileged_ports: false,
             filter_trackers: false,
+            ssl_enabled: false,
+            ssl_port: None,
         }
     }
 }
@@ -1136,7 +1205,66 @@ mod tests {
             encryption: None,
             upload_limit: None,
             forced: false,
+            ssl: None,
         }
+    }
+
+    // A certificate for `subject` until the start of 2031, and its key.
+    fn tracker_certificate(subject: &str) -> TrackerCertificate {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, subject);
+        params.not_after = rcgen::date_time_ymd(2031, 1, 1);
+        TrackerCertificate {
+            certificate_pem: params.self_signed(&key).unwrap().pem(),
+            private_key_pem: key.serialize_pem(),
+        }
+    }
+
+    // A rule keeps a certificate whose key is its own, and says whom it
+    // names and until when; a PEM that does not parse, or a key of another
+    // certificate, is refused.
+    #[test]
+    fn a_rules_certificate_is_checked_against_its_key() {
+        let issued = tracker_certificate("user-1");
+        let with = |ssl: TrackerCertificate| {
+            TrackerRule {
+                ssl: Some(ssl),
+                ..rule(0, "tracker.example")
+            }
+            .checked()
+        };
+        assert_eq!(with(issued.clone()).unwrap().ssl.as_ref(), Some(&issued));
+        let summary = issued.summary().unwrap();
+        assert_eq!(summary.subject, "CN=user-1");
+        assert_eq!(summary.not_after_ms, 1_924_992_000_000);
+
+        let other = tracker_certificate("user-2");
+        let refused = [
+            TrackerCertificate {
+                private_key_pem: other.private_key_pem.clone(),
+                ..issued.clone()
+            },
+            TrackerCertificate {
+                certificate_pem: "not a certificate".to_owned(),
+                ..issued.clone()
+            },
+            TrackerCertificate {
+                private_key_pem: "not a key".to_owned(),
+                ..issued.clone()
+            },
+        ];
+        for ssl in refused {
+            let error = with(ssl).unwrap_err();
+            assert!(
+                error.starts_with("the SSL certificate is refused"),
+                "{error}"
+            );
+        }
+        // The key never shows in what is logged.
+        assert!(!format!("{issued:?}").contains(&issued.private_key_pem));
     }
 
     // Each row's prefix, User-Agent and `v` name one version, encoded as
@@ -1339,6 +1467,8 @@ name = "tv"
             banned_ips: vec!["192.0.2.7".to_owned(), "10.0.0.0 - 10.0.0.255".to_owned()],
             block_privileged_ports: true,
             filter_trackers: true,
+            ssl_enabled: true,
+            ssl_port: Some(4_433),
         };
 
         let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();

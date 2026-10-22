@@ -110,6 +110,7 @@ impl TorrentFixture {
                 name: None,
                 trackers: vec![format!("http://{addr}/announce")],
                 piece_length: Some(PIECE_LEN),
+                ssl_cert: None,
             },
             &BlockingSpawner::new(1),
         )

@@ -1427,6 +1427,8 @@ const TORRENT_SETTINGS_FIELDS = `
       bannedIps
       blockPrivilegedPorts
       filterTrackers
+      sslEnabled
+      sslPort
     }
   }
   ${SEEDING_POLICY_FIELDS}
@@ -1467,6 +1469,9 @@ const TRACKER_RULE_FIELDS = `
       bps
     }
     forced
+    hasSsl
+    sslSubject
+    sslNotAfter
   }
   ${SEEDING_POLICY_FIELDS}
 `;

@@ -63,6 +63,8 @@ tokio = { workspace = true }
 # Named for `rustls` itself: the upgrade downloader and the Sigstore trust-root
 # refresh both need the process default crypto provider installed.
 tokio-rustls = { workspace = true }
+# The subject and the end of validity of a tracker rule's SSL certificate.
+x509-parser = { version = "0.18", default-features = false }
 toml = { workspace = true }
 rayon = { workspace = true, default-features = false }
 libc = { workspace = true }
@@ -135,6 +137,8 @@ application-updater = { git = "https://github.com/scryer-media/application-updat
 # graph through reqwest, named here only so the test can build one.
 url = "2"
 lzma-turbo = { workspace = true, features = ["enc"] }
+# A tracker rule's certificate and keys, made in-test.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 
 [[bench]]
 name = "infrastructure_retry"

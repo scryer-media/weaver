@@ -2281,6 +2281,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
                 encryption: None,
                 upload_limit: None,
                 forced: false,
+                ssl: None,
             },
             EPOCH_MS,
         )
@@ -2360,6 +2361,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 encryption: None,
                 upload_limit: None,
                 forced: false,
+                ssl: None,
             },
             EPOCH_MS,
         )
@@ -2589,6 +2591,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         encryption: None,
         upload_limit: None,
         forced: false,
+        ssl: None,
     }];
     let mut settings = TorrentSettings {
         complete_dir: PathBuf::from("/complete"),
@@ -2647,6 +2650,7 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         encryption: None,
         upload_limit: None,
         forced: false,
+        ssl: None,
     };
 
     for category in [Some(1), Some(2), None] {
@@ -2686,6 +2690,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
                 encryption: None,
                 upload_limit: None,
                 forced: false,
+                ssl: None,
             },
             EPOCH_MS,
         )
@@ -3289,6 +3294,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
                 encryption: Some(TorrentEncryption::Prefer),
                 upload_limit: Some(TrackerUploadLimit::Unlimited),
                 forced: true,
+                ssl: None,
             },
             EPOCH_MS,
         )

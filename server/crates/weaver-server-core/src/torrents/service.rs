@@ -20,8 +20,8 @@ use weaver_torrent::core::{Id20, Id32, InfoHashes};
 use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
-    ManagedTorrent, PeerConnectionOptions, ResumePeers, Session, TorrentVersion, TrackerAnnounce,
-    torrent_from_bytes,
+    ManagedTorrent, PeerConnectionOptions, ResumePeers, Session, SslIdentity, TorrentVersion,
+    TrackerAnnounce, torrent_from_bytes,
 };
 
 use crate::SchedulerError;
@@ -51,7 +51,7 @@ use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::PieceLayout;
 use crate::pipeline::graph::status::RepairSlots;
 use crate::proxies::TorrentScope;
-use crate::settings::model::{TrackerRule, tracker_rule_for};
+use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{
     Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption,
     TrackerUploadLimit, resolve_seeding_policy,
@@ -208,6 +208,25 @@ impl PeerTerms {
             ..Default::default()
         });
     }
+}
+
+// The certificate an SSL torrent under `rule` presents; `None` leaves it
+// waiting for one.
+fn certificate_of(rule: Option<&TrackerRule>) -> Option<TrackerCertificate> {
+    rule.and_then(|rule| rule.ssl.clone())
+}
+
+// The engine's identity for `ssl`. A rule keeps only a certificate its key
+// matches; one that no longer parses leaves the torrent waiting, as none
+// does.
+fn ssl_identity(ssl: Option<&TrackerCertificate>) -> Option<SslIdentity> {
+    ssl.and_then(|ssl| match ssl.identity() {
+        Ok(identity) => Some(identity),
+        Err(error) => {
+            tracing::warn!(error = %error, "a tracker rule's SSL certificate is refused");
+            None
+        }
+    })
 }
 
 // The tracker rule of id `id`, while it stands.
@@ -737,6 +756,8 @@ struct Attached {
     handle: Arc<ManagedTorrent>,
     // The terms the session took it under.
     terms: PeerTerms,
+    // The certificate an SSL torrent was given from its rule.
+    ssl: Option<TrackerCertificate>,
 }
 
 // What the service keeps of each torrent while it lives.
@@ -1270,6 +1291,7 @@ impl TorrentService {
     /// torrent's trackers against them again, and apply what that changes.
     pub async fn reload_tracker_rules(&self) -> Result<(), String> {
         self.load_rules()?;
+        let rules = self.rules();
         {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
@@ -1280,6 +1302,21 @@ impl TorrentService {
                     .list_torrent_trackers(job_id)
                     .map_err(state_error)?;
                 torrent.rule_id = self.rule_id(&trackers);
+                // An SSL torrent takes its rule's certificate as it stands:
+                // its new connections and announces present it.
+                let ssl = certificate_of(torrent.rule(&rules));
+                if let Some(attached) = torrent.attached.as_mut()
+                    && attached.handle.is_ssl()
+                    && attached.ssl != ssl
+                {
+                    if let Err(error) = attached
+                        .session
+                        .set_ssl_identity(&attached.handle, ssl_identity(ssl.as_ref()))
+                    {
+                        tracing::warn!(job_id = job_id.0, error = %error, "an SSL torrent kept its certificate");
+                    }
+                    attached.ssl = ssl;
+                }
             }
         }
         self.apply_queue().await;
@@ -2252,6 +2289,7 @@ impl TorrentService {
             have,
             identity,
             terms,
+            ssl,
             picking,
             saved,
         ) = {
@@ -2292,6 +2330,7 @@ impl TorrentService {
                 job.with(|job| initial_have(job)),
                 identity_of(rule),
                 PeerTerms::of(rule),
+                certificate_of(rule),
                 (
                     fetch_levels(torrent, job),
                     torrent.record.sequential,
@@ -2346,6 +2385,7 @@ impl TorrentService {
             ..Default::default()
         };
         terms.apply(&mut options);
+        options.ssl_identity = ssl_identity(ssl.as_ref());
         apply_initial_have(&mut options, have);
         let added = session
             .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
@@ -2381,6 +2421,7 @@ impl TorrentService {
                     session,
                     handle,
                     terms,
+                    ssl,
                 });
                 torrent.route = Some(plan.key);
                 torrent.held = None;
@@ -3815,6 +3856,8 @@ fn job_status(view: &TorrentView) -> JobStatus {
         TorrentState::Seeding => JobStatus::Seeding,
         TorrentState::Paused => JobStatus::Paused,
         TorrentState::Moving => JobStatus::Moving,
+        // It waits for a certificate, held where it is.
+        TorrentState::NeedsCertificate => JobStatus::Stalled,
         // A stop with any reason but its met goal is a failure.
         TorrentState::Stopped => match view.detail.as_deref() {
             None | Some(status::GOAL_MET) if view.completed_at_ms.is_some() => JobStatus::Complete,

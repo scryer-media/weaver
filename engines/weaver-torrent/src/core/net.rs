@@ -138,12 +138,18 @@ pub struct HttpTarget<'a> {
 
 /// Builds the session's HTTP clients.
 pub trait HttpClients: Send + Sync + 'static {
-    /// With no target, the client for requests it resolves and redirects
-    /// itself: HTTP trackers, metainfo, the block and allow lists. With a
-    /// target, a client that reaches `target.host` at `target.addrs` and
-    /// nowhere else, and follows no redirect; through a proxy that is handed
-    /// the name, the proxy reaches it.
-    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client>;
+    /// With no target, the builder of the client for requests it resolves
+    /// and redirects itself: HTTP trackers, metainfo, the block and allow
+    /// lists. With a target, of a client that reaches `target.host` at
+    /// `target.addrs` and nowhere else, and follows no redirect; through a
+    /// proxy that is handed the name, the proxy reaches it. An SSL torrent's
+    /// announces add its TLS identity to it.
+    fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder>;
+
+    /// The client [`Self::builder`] gives.
+    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        Ok(self.builder(target)?.build()?)
+    }
 }
 
 /// The clients a builder makes, each held to its target.
@@ -151,8 +157,8 @@ impl<F> HttpClients for F
 where
     F: Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
 {
-    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
-        Ok(for_target(self(), target).build()?)
+    fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder> {
+        Ok(for_target(self(), target))
     }
 }
 

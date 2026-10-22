@@ -612,6 +612,76 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     }
 }
 
+// A tracker rule keeps the certificate its SSL torrents present: read back
+// as whom it names and until when, never its key; an input naming none
+// keeps it, null clears it, and a key of another certificate is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rule_keeps_its_ssl_certificate() {
+    let rig = rig().await;
+    let issue = |subject: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, subject);
+        params.not_after = rcgen::date_time_ymd(2031, 1, 1);
+        (params.self_signed(&key).unwrap().pem(), key.serialize_pem())
+    };
+    let ssl = |(cert, key): &(String, String)| {
+        format!(
+            "ssl: {{ certificatePem: {}, privateKeyPem: {} }}",
+            serde_json::to_string(cert).unwrap(),
+            serde_json::to_string(key).unwrap()
+        )
+    };
+    let fields = "id hasSsl sslSubject sslNotAfter";
+    let save = |id: &str, ssl: &str| {
+        format!(
+            r#"mutation {{ saveTrackerRule({id} input: {{
+                hostPattern: "ssl-tracker.test", forced: true, {ssl}
+            }}) {{ {fields} }} }}"#
+        )
+    };
+
+    let issued = issue("user-1");
+    let response = rig.execute(&save("", &ssl(&issued))).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let saved = response.data.into_json().unwrap();
+    let id = saved["saveTrackerRule"][0]["id"].as_u64().unwrap();
+    let held = serde_json::json!({
+        "id": id, "hasSsl": true, "sslSubject": "CN=user-1",
+        "sslNotAfter": 1_924_992_000_000_i64,
+    });
+    assert_eq!(saved["saveTrackerRule"][0], held);
+
+    // Another certificate's key is refused, and the rule keeps its own.
+    let other = issue("user-2");
+    let mismatched = (issued.0.clone(), other.1.clone());
+    let refused = rig
+        .execute(&save(&format!("id: {id},"), &ssl(&mismatched)))
+        .await;
+    assert!(!refused.errors.is_empty());
+
+    for (given, read) in [
+        ("", held.clone()),
+        (
+            "ssl: null",
+            serde_json::json!({
+                "id": id, "hasSsl": false, "sslSubject": null, "sslNotAfter": null,
+            }),
+        ),
+    ] {
+        let response = rig.execute(&save(&format!("id: {id},"), given)).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let response = rig
+            .execute(&format!("{{ trackerRules {{ {fields} }} }}"))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let rules = response.data.into_json().unwrap();
+        assert_eq!(rules["trackerRules"], serde_json::json!([read]));
+    }
+}
+
 // A tracker rule keeps whether its torrents route through their own
 // consumer, and absent is off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

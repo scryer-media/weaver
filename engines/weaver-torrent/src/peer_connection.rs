@@ -39,7 +39,8 @@ use crate::mse::{Encryption, EncryptionPolicy};
 use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
-    stream_connect::{StreamConnector, Transports},
+    ssl::SslTorrent,
+    stream_connect::{Guard, StreamConnector, Transports},
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
 };
 
@@ -231,6 +232,8 @@ pub(crate) struct PeerConnection<H> {
     connector: Arc<StreamConnector>,
     // What an outgoing connection may go over.
     transports: Transports,
+    // An SSL torrent's: an outgoing connection is TLS under its CA.
+    ssl: Option<Arc<SslTorrent>>,
 }
 
 pub(crate) async fn with_timeout<T>(
@@ -361,12 +364,19 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             options: options.unwrap_or_default(),
             connector,
             transports: Transports::Any,
+            ssl: None,
         }
     }
 
     /// The outgoing connection goes over `transports`.
     pub fn over(self, transports: Transports) -> Self {
         Self { transports, ..self }
+    }
+
+    /// The outgoing connection is TLS under `ssl`'s CA when the torrent is
+    /// an SSL torrent; the encryption policy is not read then.
+    pub fn under(self, ssl: Option<Arc<SslTorrent>>) -> Self {
+        Self { ssl, ..self }
     }
 
     // By the time this is called:
@@ -457,7 +467,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             .connect_and_send_handshake(
                 self.addr,
                 self.transports,
-                self.options.encryption_under(self.connector.encryption()),
+                match &self.ssl {
+                    Some(ssl) => Guard::Tls(ssl),
+                    None => Guard::Mse(self.options.encryption_under(self.connector.encryption())),
+                },
                 &greeting,
                 &write_buf[..hsz],
                 || self.handler.encrypt_outgoing(),

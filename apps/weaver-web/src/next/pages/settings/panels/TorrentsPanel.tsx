@@ -60,6 +60,11 @@ interface TrackerRule {
   /** Null inherits the seeding policy's cap; a null rate is unlimited. */
   uploadLimit: TrackerUploadLimit | null;
   forced: boolean;
+  /** Whether it holds a certificate for its SSL torrents; the key is never read back. */
+  hasSsl: boolean;
+  sslSubject: string | null;
+  /** Milliseconds since the epoch. */
+  sslNotAfter: number | null;
 }
 
 interface TrackerUploadLimit {
@@ -85,6 +90,11 @@ interface TrackerRuleForm {
   encryption: TorrentEncryption | null;
   uploadLimit: TrackerUploadLimit | null;
   forced: boolean;
+  /** A certificate and key pasted to replace the rule's; both blank keeps it. */
+  certificatePem: string;
+  privateKeyPem: string;
+  /** The rule's certificate is to be cleared. */
+  sslCleared: boolean;
 }
 
 const NEW_TRACKER_RULE: TrackerRuleForm = {
@@ -98,7 +108,18 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   encryption: null,
   uploadLimit: null,
   forced: false,
+  certificatePem: "",
+  privateKeyPem: "",
+  sslCleared: false,
 };
+
+/** The certificate a rule's save sends: pasted, cleared, or left out to keep the rule's. */
+function sslInput(form: TrackerRuleForm) {
+  if (form.certificatePem.trim() !== "" || form.privateKeyPem.trim() !== "") {
+    return { ssl: { certificatePem: form.certificatePem, privateKeyPem: form.privateKeyPem } };
+  }
+  return form.sslCleared ? { ssl: null } : {};
+}
 
 /** A rule's upload cap as its editor picks it: inherited, unlimited, or a rate of its own. */
 type UploadLimitChoice = "inherit" | "unlimited" | "cap";
@@ -425,6 +446,9 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           encryption: rule.encryption,
           uploadLimit: rule.uploadLimit,
           forced: rule.forced,
+          certificatePem: "",
+          privateKeyPem: "",
+          sslCleared: false,
         }
       : NEW_TRACKER_RULE;
     setForm(start);
@@ -448,6 +472,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         encryption: form.encryption,
         uploadLimit: form.uploadLimit,
         forced: form.forced,
+        ...sslInput(form),
       },
     });
     setBusy(false);
@@ -657,6 +682,69 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   onChange: (forced) => setForm((current) => ({ ...current, forced })),
                 },
               },
+              ...(editing?.hasSsl && !form.sslCleared
+                ? [
+                    {
+                      id: "sslHeld",
+                      label: t("next.torrents.trackerRuleCertificate"),
+                      keywords: "ssl certificate tls",
+                      control: {
+                        kind: "custom" as const,
+                        control: (
+                          <div className="flex min-w-0 items-center gap-[10px]">
+                            <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
+                              {[
+                                editing.sslSubject,
+                                editing.sslNotAfter === null
+                                  ? null
+                                  : new Date(editing.sslNotAfter).toLocaleDateString(),
+                              ]
+                                .filter((part) => part)
+                                .join(" · ")}
+                            </span>
+                            <SecondaryButton
+                              onClick={() =>
+                                setForm((current) => ({
+                                  ...current,
+                                  certificatePem: "",
+                                  privateKeyPem: "",
+                                  sslCleared: true,
+                                }))
+                              }
+                            >
+                              {t("next.torrents.trackerRuleCertificateClear")}
+                            </SecondaryButton>
+                          </div>
+                        ),
+                      },
+                    },
+                  ]
+                : ([] as FieldSpec[])),
+              {
+                id: "certificatePem",
+                label: t("next.torrents.trackerRuleCertificatePem"),
+                keywords: "ssl certificate tls pem",
+                control: {
+                  kind: "textarea",
+                  rows: 4,
+                  placeholder: "-----BEGIN CERTIFICATE-----",
+                  value: form.certificatePem,
+                  onChange: (certificatePem) => setForm((current) => ({ ...current, certificatePem })),
+                },
+              },
+              {
+                id: "privateKeyPem",
+                label: t("next.torrents.trackerRulePrivateKey"),
+                keywords: "ssl private key tls pem",
+                control: {
+                  kind: "textarea",
+                  rows: 4,
+                  secret: true,
+                  placeholder: "-----BEGIN PRIVATE KEY-----",
+                  value: form.privateKeyPem,
+                  onChange: (privateKeyPem) => setForm((current) => ({ ...current, privateKeyPem })),
+                },
+              },
               {
                 id: "ownSeeding",
                 label: t("next.categories.ownSeeding"),
@@ -719,6 +807,9 @@ interface TorrentConnection {
   bannedIps: string[];
   blockPrivilegedPorts: boolean;
   filterTrackers: boolean;
+  sslEnabled: boolean;
+  /** Null while the sessions choose one at random and keep it. */
+  sslPort: number | null;
 }
 
 interface TorrentForm {
@@ -747,7 +838,12 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   bannedIps: [],
   blockPrivilegedPorts: false,
   filterTrackers: false,
+  sslEnabled: false,
+  sslPort: null,
 };
+
+/** The SSL port an operator's own starts from. */
+const DEFAULT_SSL_PORT = 4433;
 
 const PEER_PROTOCOLS: { value: TorrentPeerProtocol; label: string }[] = [
   { value: "TCP", label: "next.torrents.peerProtocolTcp" },
@@ -812,7 +908,11 @@ export function TorrentsPanel() {
       if (!values || !source) {
         return;
       }
-      if (!validPort(values.torrent.basePort) || !validPort(values.torrent.announcePort)) {
+      if (
+        !validPort(values.torrent.basePort) ||
+        !validPort(values.torrent.announcePort) ||
+        !validPort(values.torrent.sslPort)
+      ) {
         setError(t("next.torrents.portInvalid"));
         return;
       }
@@ -896,6 +996,33 @@ export function TorrentsPanel() {
                     onChange={(announcePort) =>
                       patchTorrent({ announcePort: announcePort === null ? null : Math.round(announcePort) })
                     }
+                  />
+                ),
+              },
+            },
+            {
+              id: "sslEnabled",
+              label: t("next.torrents.sslEnabled"),
+              keywords: "ssl tls torrents listen",
+              control: {
+                kind: "toggle",
+                value: values.torrent.sslEnabled,
+                onChange: (sslEnabled) => patchTorrent({ sslEnabled }),
+              },
+            },
+            {
+              id: "sslPort",
+              label: t("next.torrents.sslPort"),
+              keywords: "ssl tls port listen",
+              control: {
+                kind: "custom",
+                control: (
+                  <GoalControl
+                    label={t("next.torrents.sslPort")}
+                    value={values.torrent.sslPort}
+                    fallback={DEFAULT_SSL_PORT}
+                    offLabel={t("next.torrents.sslPortRandom")}
+                    onChange={(sslPort) => patchTorrent({ sslPort: sslPort === null ? null : Math.round(sslPort) })}
                   />
                 ),
               },

@@ -37,6 +37,7 @@ use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
 use crate::meter::Meter;
 use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
 use crate::peer_protocol::Handshake;
+use crate::ssl::{SslHttpClients, SslIdentity, SslTorrent};
 use crate::torrent_state::live::{
     choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     web_seed::WebSeeds,
@@ -267,6 +268,10 @@ pub struct Session {
     identity: Identity,
     announce_port: Arc<AnnouncePort>,
     listen_addr: Option<SocketAddr>,
+    // The port SSL torrents announce: the SSL listener's, while the session
+    // announces a port at all.
+    ssl_port: tokio::sync::watch::Sender<Option<u16>>,
+    ssl_listen_addr: Option<SocketAddr>,
     // Our address as the internet sees it, one for each family.
     pub(crate) external_ips: Arc<ExternalIps>,
     // Our own addresses a private torrent's HTTP announces name.
@@ -647,6 +652,12 @@ pub struct AddTorrentOptions {
     /// Off by default; a private torrent is held to it either way.
     #[serde(default)]
     pub trackers_only: bool,
+    /// Our identity under an SSL torrent's CA, presented to its peers and
+    /// its HTTPS trackers (see [`Session::set_ssl_identity`]). An SSL
+    /// torrent added without one connects to no peer and announces nowhere
+    /// until one is set. Not read for any other torrent.
+    #[serde(skip)]
+    pub ssl_identity: Option<SslIdentity>,
 }
 
 const fn v1_hashes_disabled_by_default() -> bool {
@@ -684,6 +695,7 @@ impl Default for AddTorrentOptions {
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
             trackers_only: false,
+            ssl_identity: None,
         }
     }
 }
@@ -1443,6 +1455,17 @@ impl Session {
                     listen_result.as_ref().and_then(|l| l.announce_port),
                 )),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
+                ssl_port: tokio::sync::watch::channel(
+                    listen_result
+                        .as_ref()
+                        .and_then(|l| l.ssl.as_ref().zip(l.announce_port))
+                        .map(|(ssl, _)| ssl.addr.port()),
+                )
+                .0,
+                ssl_listen_addr: listen_result
+                    .as_ref()
+                    .and_then(|l| l.ssl.as_ref())
+                    .map(|ssl| ssl.addr),
                 own_ips: own_ips(
                     listen_result.as_ref().map(|l| l.addr),
                     opts.socket_factory.is_some(),
@@ -1492,50 +1515,16 @@ impl Session {
 
             if let Some(mut listen) = listen_result {
                 let protocols = listening_protocols(&listen);
-                if let Some(tcp) = listen.tcp_socket.take() {
-                    let max_pending_incoming_handshake_checks =
-                        listen.max_pending_incoming_handshake_checks;
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "tcp_listen", addr = ?listen.addr),
-                        "tcp_listen",
-                        {
-                            let this = session.clone();
-                            async move {
-                                this.task_listener(tcp, max_pending_incoming_handshake_checks)
-                                    .await
-                            }
-                        },
-                    );
-                }
-                if let Some(tcp) = listen.custom_tcp_socket.take() {
-                    let max_pending_incoming_handshake_checks =
-                        listen.max_pending_incoming_handshake_checks;
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "tcp_listen", addr = ?listen.addr),
-                        "tcp_listen",
-                        {
-                            let this = session.clone();
-                            async move {
-                                this.task_listener(tcp, max_pending_incoming_handshake_checks)
-                                    .await
-                            }
-                        },
-                    );
-                }
-                if let Some(utp) = listen.utp_socket.take() {
-                    let max_pending_incoming_handshake_checks =
-                        listen.max_pending_incoming_handshake_checks;
-                    session.spawn(
-                        debug_span!(parent: session.rs(), "utp_listen", addr = ?listen.addr),
-                        "utp_listen",
-                        {
-                            let this = session.clone();
-                            async move {
-                                this.task_listener(utp, max_pending_incoming_handshake_checks)
-                                    .await
-                            }
-                        },
-                    );
+                let max = listen.max_pending_incoming_handshake_checks;
+                let plain = crate::listen::Listening {
+                    tcp_socket: listen.tcp_socket.take(),
+                    custom_tcp_socket: listen.custom_tcp_socket.take(),
+                    utp_socket: listen.utp_socket.take(),
+                    addr: listen.addr,
+                };
+                session.spawn_listeners(plain, false, max);
+                if let Some(ssl) = listen.ssl.take() {
+                    session.spawn_listeners(ssl, true, max);
                 }
                 if listen.enable_upnp_port_forwarding
                     && let Some(announce_port) = listen.announce_port
@@ -1606,6 +1595,7 @@ impl Session {
         self: Arc<Self>,
         addr: SocketAddr,
         kind: ConnectionKind,
+        tls: bool,
         reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
@@ -1634,37 +1624,72 @@ impl Session {
         // it greets, and is charged to it once the connection is its own.
         let (meter, mut reader, mut writer) = Meter::wrap(reader, writer);
 
-        // With encryption enabled, an encrypted connection is unwrapped here
-        // and a plaintext one passed through (or refused); with it disabled
-        // the halves are left as they are. A method is settled only when the
-        // encryption handshake ran.
-        // Each connection is kept under its torrent's encryption: an
-        // encrypted one names its torrent in the encryption handshake, a
-        // plaintext one only in its BitTorrent handshake.
-        let session_policy = self.connector.encryption();
-        let policies: Vec<(Id20, crate::mse::EncryptionPolicy)> = self
-            .db
-            .read()
-            .torrents
-            .values()
-            .flat_map(|t| {
-                let policy = t
-                    .shared()
-                    .options
-                    .peer_opts
-                    .encryption_under(session_policy);
-                t.info_hashes().ids20().map(move |hash| (hash, policy))
+        // A connection on the SSL listener is TLS from its first byte, under
+        // the torrent its SNI names: that torrent's CA checks the peer's
+        // chain and our identity under it answers. No encryption handshake
+        // runs inside it.
+        let (encryption, named) = if tls {
+            let (r, w, named) = tokio::time::timeout(handshake_timeout, async {
+                let incoming = crate::ssl::Incoming::start(reader, writer)
+                    .await
+                    .context("not a TLS connection")?;
+                let sni = incoming
+                    .server_name()
+                    .context("the TLS connection names no torrent")?;
+                let (id, config) = self
+                    .db
+                    .read()
+                    .torrents
+                    .iter()
+                    .find_map(|(id, t)| {
+                        let ssl = t.shared().ssl.as_ref()?;
+                        ssl.answers_to(&sni).then(|| (*id, ssl.server_config()))
+                    })
+                    .with_context(|| format!("no SSL torrent is named {sni}"))?;
+                let config =
+                    config.with_context(|| format!("torrent {id} has no identity to present"))?;
+                let (r, w) = incoming.accept(config).await.context("TLS handshake")?;
+                anyhow::Ok((r, w, id))
             })
-            .collect();
-        let encryption = crate::mse::upgrade_incoming(
-            session_policy,
-            &mut reader,
-            &mut writer,
-            handshake_timeout,
-            &policies,
-        )
-        .await
-        .context("error in the encryption handshake")?;
+            .await
+            .context("TLS handshake timed out")??;
+            reader = r;
+            writer = w;
+            (crate::mse::Encryption::None, Some(named))
+        } else {
+            // With encryption enabled, an encrypted connection is unwrapped here
+            // and a plaintext one passed through (or refused); with it disabled
+            // the halves are left as they are. A method is settled only when the
+            // encryption handshake ran.
+            // Each connection is kept under its torrent's encryption: an
+            // encrypted one names its torrent in the encryption handshake, a
+            // plaintext one only in its BitTorrent handshake.
+            let session_policy = self.connector.encryption();
+            let policies: Vec<(Id20, crate::mse::EncryptionPolicy)> = self
+                .db
+                .read()
+                .torrents
+                .values()
+                .flat_map(|t| {
+                    let policy = t
+                        .shared()
+                        .options
+                        .peer_opts
+                        .encryption_under(session_policy);
+                    t.info_hashes().ids20().map(move |hash| (hash, policy))
+                })
+                .collect();
+            let encryption = crate::mse::upgrade_incoming(
+                session_policy,
+                &mut reader,
+                &mut writer,
+                handshake_timeout,
+                &policies,
+            )
+            .await
+            .context("error in the encryption handshake")?;
+            (encryption, None)
+        };
 
         let mut read_buf = ReadBuf::new();
         let h = read_buf
@@ -1684,13 +1709,26 @@ impl Session {
         if h.peer_id == torrent.shared().peer_id {
             bail!("seems like we are connecting to ourselves, ignoring");
         }
-        let policy = torrent
-            .shared()
-            .options
-            .peer_opts
-            .encryption_under(session_policy);
-        if !policy.allows(encryption) {
-            bail!("torrent {id} keeps no {encryption:?} connection under {policy:?}");
+        // An SSL torrent takes a connection only through TLS under its own
+        // CA, and a TLS connection only greets the torrent it named.
+        match named {
+            Some(named) if named != id => {
+                bail!("the TLS connection named torrent {named} and greets torrent {id}")
+            }
+            Some(_) => {}
+            None if torrent.is_ssl() => {
+                bail!("torrent {id} is an SSL torrent and takes no plain connection")
+            }
+            None => {
+                let policy = torrent
+                    .shared()
+                    .options
+                    .peer_opts
+                    .encryption_under(self.connector.encryption());
+                if !policy.allows(encryption) {
+                    bail!("torrent {id} keeps no {encryption:?} connection under {policy:?}");
+                }
+            }
         }
 
         let live = torrent
@@ -1713,9 +1751,53 @@ impl Session {
         ))
     }
 
+    /// Accepts on a listener's sockets; `tls` says it is the SSL listener.
+    fn spawn_listeners(
+        self: &Arc<Self>,
+        listening: crate::listen::Listening,
+        tls: bool,
+        max_pending_incoming_handshake_checks: usize,
+    ) {
+        let addr = listening.addr;
+        if let Some(tcp) = listening.tcp_socket {
+            let this = self.clone();
+            self.spawn(
+                debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
+                "tcp_listen",
+                async move {
+                    this.task_listener(tcp, tls, max_pending_incoming_handshake_checks)
+                        .await
+                },
+            );
+        }
+        if let Some(tcp) = listening.custom_tcp_socket {
+            let this = self.clone();
+            self.spawn(
+                debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
+                "tcp_listen",
+                async move {
+                    this.task_listener(tcp, tls, max_pending_incoming_handshake_checks)
+                        .await
+                },
+            );
+        }
+        if let Some(utp) = listening.utp_socket {
+            let this = self.clone();
+            self.spawn(
+                debug_span!(parent: self.rs(), "utp_listen", ?addr, tls),
+                "utp_listen",
+                async move {
+                    this.task_listener(utp, tls, max_pending_incoming_handshake_checks)
+                        .await
+                },
+            );
+        }
+    }
+
     async fn task_listener<A: Accept>(
         self: Arc<Self>,
         l: A,
+        tls: bool,
         max_pending_incoming_handshake_checks: usize,
     ) -> anyhow::Result<()> {
         let mut futs = FuturesUnordered::new();
@@ -1737,7 +1819,7 @@ impl Session {
                             };
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                session.check_incoming_connection(addr, A::KIND, tls, Box::new(read), Box::new(write))
                                     .map_ok(|(live, checked)| (live, checked, slot))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
@@ -2268,6 +2350,7 @@ impl Session {
                 opts.initial_peers.clone().unwrap_or_default(),
                 trackers_only(private, opts.trackers_only),
                 dht_announce.subscribe(),
+                None,
             )
         };
 
@@ -2284,8 +2367,10 @@ impl Session {
         let (metadata, peer_rx, peer_list) = {
             match metadata {
                 Some(metadata) => {
+                    // An SSL torrent's peers are found as it goes live, under
+                    // its identity.
                     let mut peer_rx = None;
-                    if !opts.paused && !opts.list_only {
+                    if !opts.paused && !opts.list_only && metadata.info.info().ssl_cert.is_none() {
                         peer_rx = make_peer_rx(metadata.info.info().private);
                     }
                     (metadata, peer_rx, peer_list)
@@ -2317,7 +2402,12 @@ impl Session {
                         .await?;
 
                     seen_peers = resolved_magnet.seen_peers;
-                    let peer_rx = if trackers_only(
+                    let peer_rx = if resolved_magnet.metadata.info.info().ssl_cert.is_some() {
+                        // The metadata came over plain connections; an SSL
+                        // torrent's own are TLS, found as it goes live.
+                        drop(resolved_magnet.peer_rx);
+                        None
+                    } else if trackers_only(
                         resolved_magnet.metadata.info.info().private,
                         opts.trackers_only,
                     ) != fetched_trackers_only
@@ -2344,6 +2434,17 @@ impl Session {
         // A magnet link names some of the hashes; the metadata has them all.
         let info_hashes = metadata.info_hashes;
         let info_hash = info_hashes.best();
+
+        let ssl = match metadata.info.info().ssl_cert.as_ref() {
+            Some(ca) => {
+                let ssl = SslTorrent::new(ca.as_ref(), info_hashes)
+                    .context("the torrent's SSL certificate")?;
+                ssl.set_identity(opts.ssl_identity.take())
+                    .context("the torrent's SSL identity")?;
+                Some(Arc::new(ssl))
+            }
+            None => None,
+        };
 
         let only_files = compute_only_files(
             &metadata.info,
@@ -2466,6 +2567,7 @@ impl Session {
                 user_agent: identity.user_agent.clone(),
                 last_run: Default::default(),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
+                ssl,
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(
@@ -2628,7 +2730,7 @@ impl Session {
             .map(|s| s.peers)
     }
 
-    fn peer_source_managed_torrent(
+    pub(crate) fn peer_source_managed_torrent(
         self: &Arc<Self>,
         t: &ManagedTorrentHandle,
         announce: bool,
@@ -2642,6 +2744,7 @@ impl Session {
             t.shared().options.initial_peers.clone(),
             t.takes_peers_from_trackers_only(),
             t.shared().dht_announce.subscribe(),
+            t.shared().ssl.as_ref(),
         )
     }
 
@@ -2717,7 +2820,18 @@ impl Session {
         initial_peers: Vec<SocketAddr>,
         trackers_only: bool,
         dht_announce: tokio::sync::watch::Receiver<()>,
+        ssl: Option<&Arc<SslTorrent>>,
     ) -> Option<PeerSource> {
+        // An SSL torrent with no identity asks no one for peers.
+        if ssl.is_some_and(|ssl| !ssl.has_identity()) {
+            return None;
+        }
+        // The port the torrent's peers are told to reach it at: an SSL
+        // torrent's is the SSL listener's.
+        let port = || match ssl {
+            Some(_) => self.ssl_port.subscribe(),
+            None => self.announce_port.subscribe(),
+        };
         let dht_rx = if trackers_only {
             None
         } else {
@@ -2727,7 +2841,7 @@ impl Session {
                         dht.clone(),
                         info_hash,
                         if announce {
-                            self.announce_port.subscribe()
+                            port()
                         } else {
                             tokio::sync::watch::channel(None).1
                         },
@@ -2747,10 +2861,12 @@ impl Session {
         } else {
             self.lsd.as_ref().map(|lsd| {
                 // Local peers reach the listen port itself.
-                let port = if announce {
-                    self.announce_port.configured
-                } else {
+                let port = if !announce {
                     None
+                } else if ssl.is_some() {
+                    *self.ssl_port.borrow()
+                } else {
+                    self.announce_port.configured
                 };
                 futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
                     let lsd = lsd.clone();
@@ -2776,7 +2892,7 @@ impl Session {
                     self.announce_tiers(tracker_tiers, trackers_only),
                     Box::new(tracker_rx_stats),
                     force_tracker_interval,
-                    self.announce_port.subscribe(),
+                    port(),
                     // Only a torrent that takes peers from its trackers alone
                     // tells them our addresses (libtorrent
                     // `torrent::build_tracker_request`, for a private one).
@@ -2785,7 +2901,13 @@ impl Session {
                     } else {
                         Arc::new(Vec::new)
                     },
-                    self.http_clients.clone(),
+                    match ssl {
+                        Some(ssl) => Arc::new(SslHttpClients {
+                            inner: self.http_clients.clone(),
+                            ssl: ssl.clone(),
+                        }),
+                        None => self.http_clients.clone(),
+                    },
                     self.reachable(),
                     self.udp_tracker_client.clone(),
                     self.stopped_announces.clone(),
@@ -2897,6 +3019,47 @@ impl Session {
     /// gateway, else the configured one.
     pub fn announce_port(&self) -> Option<u16> {
         self.announce_port.get()
+    }
+
+    /// The address the SSL listener took, when the session listens for SSL
+    /// torrents' peers.
+    pub fn ssl_listen_addr(&self) -> Option<SocketAddr> {
+        self.ssl_listen_addr
+    }
+
+    /// The port a torrent's peers are told to reach it at: the SSL
+    /// listener's for an SSL torrent, else [`Self::announce_port`].
+    pub(crate) fn announce_port_of(&self, ssl: bool) -> Option<u16> {
+        if ssl {
+            *self.ssl_port.borrow()
+        } else {
+            self.announce_port()
+        }
+    }
+
+    /// Our identity under an SSL torrent's CA becomes `identity`: new
+    /// connections and announces present it, running ones keep theirs. A
+    /// torrent that waits for one starts; one left without one stops its
+    /// run and waits. Refused for a torrent that is not an SSL torrent, and
+    /// for a key that is not the certificate's.
+    pub fn set_ssl_identity(
+        self: &Arc<Self>,
+        handle: &ManagedTorrentHandle,
+        identity: Option<SslIdentity>,
+    ) -> anyhow::Result<()> {
+        let ssl = handle
+            .shared()
+            .ssl
+            .as_ref()
+            .context("the torrent is not an SSL torrent")?;
+        ssl.set_identity(identity)?;
+        if !ssl.has_identity() {
+            return handle.wait_for_certificate();
+        }
+        if handle.waits_for_certificate() {
+            handle.start(None, false)?;
+        }
+        Ok(())
     }
 
     async fn resolve_magnet(
@@ -3078,7 +3241,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         let torrent_state = match mt.stats().state {
             TS::Initializing { .. } => S::Initializing,
             TS::Live => S::Live,
-            TS::Paused => S::Paused,
+            TS::Paused | TS::NeedsCertificate => S::Paused,
             TS::Error => S::None,
         };
         // The running run's counters; once it has ended (its pieces are gone
@@ -4587,6 +4750,7 @@ mod tests {
                 .check_incoming_connection(
                     "127.0.0.1:6881".parse().unwrap(),
                     ConnectionKind::Tcp,
+                    false,
                     reader,
                     writer,
                 )
@@ -4711,7 +4875,13 @@ mod tests {
         let (reader, writer) = halves(ours);
         session
             .clone()
-            .check_incoming_connection(addr.parse().unwrap(), ConnectionKind::Tcp, reader, writer)
+            .check_incoming_connection(
+                addr.parse().unwrap(),
+                ConnectionKind::Tcp,
+                false,
+                reader,
+                writer,
+            )
             .now_or_never()
             .map(|checked| format!("{:#}", checked.err().unwrap()))
     }

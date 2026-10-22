@@ -723,6 +723,7 @@ fn a_tracker_rule_with_its_own_route_is_a_consumer() {
         encryption: None,
         upload_limit: None,
         forced: false,
+        ssl: None,
     };
     let routed = db
         .insert_tracker_rule(&rule("*.routed.test", true), 1)

@@ -338,6 +338,11 @@ impl Database {
             &torrent.allow_multiple_connections_per_ip.to_string(),
         )?;
         self.set_setting("torrent.peer_protocol", torrent.peer_protocol.as_str())?;
+        self.set_setting("torrent.ssl_enabled", &torrent.ssl_enabled.to_string())?;
+        match torrent.ssl_port {
+            Some(port) => self.set_setting("torrent.ssl_port", &port.to_string())?,
+            None => self.delete_setting("torrent.ssl_port")?,
+        }
         self.set_setting("torrent.dht_bootstrap_nodes", &torrent.dht_bootstrap_nodes)?;
         match torrent.blocklist.as_deref() {
             Some(blocklist) => self.set_setting("torrent.blocklist", blocklist)?,
@@ -609,6 +614,9 @@ fn torrent_config_from_settings(
             .unwrap_or(defaults.block_privileged_ports),
         filter_trackers: parsed_setting(settings, "torrent.filter_trackers")
             .unwrap_or(defaults.filter_trackers),
+        ssl_enabled: parsed_setting(settings, "torrent.ssl_enabled")
+            .unwrap_or(defaults.ssl_enabled),
+        ssl_port: parsed_setting(settings, "torrent.ssl_port"),
     }
 }
 

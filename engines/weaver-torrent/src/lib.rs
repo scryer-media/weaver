@@ -61,6 +61,7 @@ mod session_persistence;
 pub mod session_stats;
 pub mod sha1w;
 pub mod spawn_utils;
+mod ssl;
 
 pub mod storage;
 mod stream_connect;
@@ -92,6 +93,7 @@ pub use session::{
     ListOnlyResponse, SUPPORTED_SCHEMES, Session, SessionLimits, SessionOptions,
     SessionPersistenceConfig,
 };
+pub use ssl::SslIdentity;
 pub use stream_connect::{ConnectionKind, ConnectionOptions};
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,

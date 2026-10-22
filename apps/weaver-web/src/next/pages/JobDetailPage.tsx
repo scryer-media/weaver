@@ -435,7 +435,14 @@ function JobDetailContent() {
             <h1 className="min-w-0 truncate font-wv-title text-[15px] font-semibold tracking-[-0.01em]">
               {job.displayTitle || job.name}
             </h1>
-            <StateChip label={statusLabel(progress.status)} tone={failed ? "bad" : "ok"} />
+            <StateChip
+              label={
+                torrent?.state === "NEEDS_CERTIFICATE"
+                  ? t("next.torrent.needsCertificate")
+                  : statusLabel(progress.status)
+              }
+              tone={failed ? "bad" : "ok"}
+            />
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             {isTorrent ? null : (

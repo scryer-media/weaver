@@ -39,6 +39,8 @@ pub enum Engine {
     Paused {
         finished: bool,
     },
+    /// An SSL torrent with no identity to present: it runs nowhere.
+    NeedsCertificate,
     Error(String),
 }
 
@@ -57,6 +59,7 @@ impl Engine {
             TorrentStatsState::Paused => Self::Paused {
                 finished: stats.finished,
             },
+            TorrentStatsState::NeedsCertificate => Self::NeedsCertificate,
             TorrentStatsState::Error => Self::Error(
                 stats
                     .error
@@ -175,6 +178,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         Engine::Live { peers: 0, .. } => (TorrentState::Stalled, None),
         Engine::Live { .. } => (TorrentState::Downloading, None),
         Engine::Paused { .. } => (TorrentState::Paused, None),
+        Engine::NeedsCertificate => (TorrentState::NeedsCertificate, None),
         Engine::Error(error) => (TorrentState::Stopped, Some(error.clone())),
     }
 }
@@ -438,6 +442,30 @@ mod tests {
             held: None,
             moving: false,
         }
+    }
+
+    // An SSL torrent with no certificate to present says so, complete or
+    // not, until its rule gives one; asked to stop, it stops.
+    #[test]
+    fn an_ssl_torrent_without_a_certificate_needs_one() {
+        assert_eq!(
+            project(&seen(Engine::NeedsCertificate)),
+            (TorrentState::NeedsCertificate, None)
+        );
+        assert_eq!(
+            project(&Observed {
+                complete: true,
+                ..seen(Engine::NeedsCertificate)
+            }),
+            (TorrentState::NeedsCertificate, None)
+        );
+        assert_eq!(
+            project(&Observed {
+                intent: TorrentIntent::Paused,
+                ..seen(Engine::NeedsCertificate)
+            }),
+            (TorrentState::Paused, None)
+        );
     }
 
     // A torrent whose directory is on the move says so, whatever its

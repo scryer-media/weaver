@@ -65,6 +65,9 @@ pub enum TorrentStatsState {
     },
     Live,
     Paused,
+    /// An SSL torrent asked to run, waiting for an identity under its CA.
+    #[serde(rename = "needs_certificate")]
+    NeedsCertificate,
     Error,
 }
 
@@ -74,6 +77,7 @@ impl std::fmt::Display for TorrentStatsState {
             TorrentStatsState::Initializing { .. } => f.write_str("initializing"),
             TorrentStatsState::Live => f.write_str("live"),
             TorrentStatsState::Paused => f.write_str("paused"),
+            TorrentStatsState::NeedsCertificate => f.write_str("needs certificate"),
             TorrentStatsState::Error => f.write_str("error"),
         }
     }

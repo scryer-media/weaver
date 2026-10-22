@@ -18,7 +18,7 @@ use crate::{
     AddTorrent, AddTorrentOptions, EncryptionPolicy, Error, MseError, PeerConnectionOptions,
     Session, SessionOptions,
     storage::StorageFactory,
-    stream_connect::{EncryptionStatsSnapshot, Transports},
+    stream_connect::{EncryptionStatsSnapshot, Guard, Transports},
     tests::{
         embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
         test_util::setup_test_logging,
@@ -178,7 +178,7 @@ async fn test_require_downloader_against_disabled_seeder_is_refused() -> anyhow:
         .connect_and_send_handshake(
             seeder_addr,
             Transports::Any,
-            d.session.connector.encryption(),
+            Guard::Mse(d.session.connector.encryption()),
             &info_hash,
             &hs[..len],
             || unreachable!("encryption is required, so nothing is asked"),

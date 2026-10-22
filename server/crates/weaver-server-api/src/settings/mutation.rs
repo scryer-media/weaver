@@ -571,11 +571,19 @@ impl SettingsMutation {
         id: Option<u32>,
         input: crate::settings::types::TrackerRuleInput,
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
-        let rule = input.into_rule(id.unwrap_or(0))?;
+        // An input naming no certificate keeps the rule's.
+        let keeps_ssl = input.ssl.is_undefined();
+        let mut rule = input.into_rule(id.unwrap_or(0))?;
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
         let rules = tokio::task::spawn_blocking(move || {
             let rules = db.list_tracker_rules()?;
+            if keeps_ssl {
+                rule.ssl = rules
+                    .iter()
+                    .find(|other| Some(other.id) == id)
+                    .and_then(|other| other.ssl.clone());
+            }
             if rules
                 .iter()
                 .any(|other| other.host_pattern == rule.host_pattern && Some(other.id) != id)

@@ -1001,3 +1001,45 @@ async fn banned_addresses_and_filter_switches_default_off_then_persist() {
     assert_no_errors(&cleared);
     assert!(h.db.load_config().unwrap().torrent.banned_ips.is_empty());
 }
+
+// SSL torrents' listener is off until turned on and names no port until
+// one is given; a port given is kept, and null leaves the choice to the
+// sessions again.
+#[tokio::test]
+async fn the_ssl_listener_keeps_its_port() {
+    let h = TestHarness::new().await;
+    const FIELDS: &str = "sslEnabled sslPort";
+    let defaults = h
+        .execute(&format!("{{ settings {{ torrent {{ {FIELDS} }} }} }}"))
+        .await;
+    assert_no_errors(&defaults);
+    assert_eq!(
+        response_data(&defaults)["settings"]["torrent"],
+        serde_json::json!({ "sslEnabled": false, "sslPort": null })
+    );
+
+    let saved = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                sslEnabled: true, sslPort: 44330
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&saved);
+    assert_eq!(
+        response_data(&saved)["updateSettings"]["torrent"],
+        serde_json::json!({ "sslEnabled": true, "sslPort": 44330 })
+    );
+    let stored = h.db.load_config().unwrap().torrent;
+    assert!(stored.ssl_enabled);
+    assert_eq!(stored.ssl_port, Some(44_330));
+    assert_eq!(stored, h.config.read().await.torrent);
+
+    let cleared = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{ sslPort: null }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&cleared);
+    assert_eq!(h.db.load_config().unwrap().torrent.ssl_port, None);
+}

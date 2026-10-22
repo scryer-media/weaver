@@ -1111,3 +1111,20 @@ kind = "sql"
 file = "migrations/0086_tracker_rule_privacy/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 87
+description = "a tracker rule holds the identity its SSL torrents present"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_tracker_rule_ssl/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_tracker_rule_ssl/postgres.sql"
+engine = "postgres"
+scope = "all"

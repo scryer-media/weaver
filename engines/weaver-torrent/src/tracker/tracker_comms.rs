@@ -3477,7 +3477,10 @@ mod tests {
     }
 
     impl HttpClients for Pinned {
-        fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        fn builder(
+            &self,
+            target: Option<HttpTarget<'_>>,
+        ) -> anyhow::Result<reqwest::ClientBuilder> {
             if let Some(t) = &target {
                 self.built
                     .lock()
@@ -3486,7 +3489,7 @@ mod tests {
             let builder = reqwest::Client::builder()
                 .no_proxy()
                 .dns_resolver(Arc::new(NoNames));
-            Ok(crate::core::net::for_target(builder, target).build()?)
+            Ok(crate::core::net::for_target(builder, target))
         }
     }
 
