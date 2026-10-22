@@ -399,6 +399,8 @@ impl Pipeline {
             added_script_holds: HashSet::new(),
             script_data_dir: data_dir.clone(),
             pending_history_deletions: HashSet::new(),
+            pending_cancellations: HashMap::new(),
+            cancel_generation: 0,
             terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
             scheduled_pause: false,
@@ -1281,6 +1283,9 @@ impl Pipeline {
                         match event {
                             TerminalPostProcessingEvent::HistoryDeleteDone(done) => {
                                 self.handle_history_delete_done(done);
+                            }
+                            TerminalPostProcessingEvent::CancelJobsDone(done) => {
+                                self.handle_cancel_jobs_done(done);
                             }
                             TerminalPostProcessingEvent::QueueAdmitted(job_id) => {
                                 self.handle_queue_scripts_admitted(job_id);

@@ -1881,6 +1881,42 @@ fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
     spec
 }
 
+// Sends one cancel command and returns its outcome. A batch that queued an
+// archive answers only from the done event its archive commit sends, which
+// this drives; a batch refused whole answers on the command's own turn.
+async fn cancel_jobs_command(
+    pipeline: &mut Pipeline,
+    job_ids: std::collections::BTreeSet<JobId>,
+    origin: crate::jobs::handle::CancellationOrigin,
+) -> crate::CancelJobsOutcome {
+    let (reply, mut done) = tokio::sync::oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::CancelJobs {
+            job_ids,
+            origin,
+            reply,
+        })
+        .await;
+    if let Ok(outcome) = done.try_recv() {
+        return outcome;
+    }
+    finish_cancel_jobs(pipeline).await;
+    done.await.unwrap()
+}
+
+// Hands the actor the done event of the one batched cancel in flight.
+async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
+    match pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    {
+        TerminalPostProcessingEvent::CancelJobsDone(done) => pipeline.handle_cancel_jobs_done(done),
+        _ => panic!("expected the cancel's archive done event"),
+    }
+}
+
 // Sends one single-id cancel command and returns that id's result, which
 // arrives once the cancelled job's history row has committed.
 async fn cancel_one_job(
@@ -1888,15 +1924,10 @@ async fn cancel_one_job(
     job_id: JobId,
     origin: crate::jobs::handle::CancellationOrigin,
 ) -> Result<(), crate::SchedulerError> {
-    let (reply, done) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJobs {
-            job_ids: std::collections::BTreeSet::from([job_id]),
-            origin,
-            reply,
-        })
-        .await;
-    done.await.unwrap().remove(&job_id).unwrap()
+    cancel_jobs_command(pipeline, std::collections::BTreeSet::from([job_id]), origin)
+        .await
+        .remove(&job_id)
+        .unwrap()
 }
 
 async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {

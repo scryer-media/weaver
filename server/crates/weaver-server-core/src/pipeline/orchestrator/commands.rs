@@ -798,7 +798,7 @@ fn apply_history_update(
 }
 
 // What a cancelled job's directory cleanup waits for and removes, carried
-// from the actor's turn to the task that runs once its archive commits.
+// from the cancel's turn to the turn that handles its archive commit.
 struct CancelledJobCleanup {
     job_id: JobId,
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
@@ -807,13 +807,25 @@ struct CancelledJobCleanup {
     staging_dir: Option<PathBuf>,
 }
 
+// A batched cancel's archive outcome, carried back to the actor once the
+// archive write has answered: the ids it covered and the batch generation
+// they were recorded under in `pending_cancellations`.
+pub(crate) struct CancelJobsDone {
+    generation: u64,
+    cleanups: Vec<CancelledJobCleanup>,
+    // The ids whose archive failed and why; an error means the writer closed
+    // before answering.
+    archived: Result<BTreeMap<JobId, String>, oneshot::error::RecvError>,
+    keep_files: bool,
+    results: crate::CancelJobsOutcome,
+    reply: oneshot::Sender<crate::CancelJobsOutcome>,
+}
+
 impl Pipeline {
-    // The actor's whole share of a batched cancel: the safety checks, the
-    // cancel signals, each job's history row and its runtime purge, all in
-    // memory, then one archive write for the batch and one snapshot. The
-    // reply, each `JobCancelled` and each directory cleanup wait in a spawned
-    // task for that archive to commit, so a caller's answer is durable while
-    // the actor never waits.
+    // The actor's share of a batched cancel: the safety checks, the cancel
+    // signals and each job's history row, then one archive write for the
+    // batch. Every job stays live, and in the snapshot, until its archive
+    // commits; the done event that follows removes the archived ones.
     pub(super) fn start_cancel_jobs(
         &mut self,
         job_ids: BTreeSet<JobId>,
@@ -856,56 +868,91 @@ impl Pipeline {
                 return;
             }
         };
-        for cleanup in &mut cleanups {
-            if let Some(state) = self.purge_cancelled_job_runtime(cleanup.job_id) {
-                cleanup.working_dir = state.working_dir;
-                cleanup.staging_dir = state.staging_dir;
-            }
+        self.cancel_generation += 1;
+        let generation = self.cancel_generation;
+        for cleanup in &cleanups {
+            self.pending_cancellations.insert(cleanup.job_id, generation);
         }
-        // Same boundary as a job that completed or failed: the cancelled
-        // jobs' article pages are free and unwanted, so hand them back rather
-        // than holding a job-sized working set until the purge clock runs out.
-        crate::runtime::thread_release::release_job_completion_memory();
-        self.publish_snapshot();
-
         let keep_files = matches!(
             origin,
             crate::jobs::handle::CancellationOrigin::UserKeepingFiles
         );
-        let event_tx = self.event_tx.clone();
-        let cleanup_db = self.db.clone();
+        let completed = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
-            let failed = committed.await;
-            for cleanup in cleanups {
-                let job_id = cleanup.job_id;
-                let result = match &failed {
-                    Ok(failed) => match failed.get(&job_id) {
-                        Some(error) => {
-                            tracing::error!(job_id = job_id.0, %error, "failed to durably archive cancelled job");
-                            results.insert(
-                                job_id,
-                                Err(crate::SchedulerError::State(crate::StateError::Database(
-                                    format!("failed to archive cancelled job: {error}"),
-                                ))),
-                            );
-                            continue;
-                        }
-                        None => Ok(()),
-                    },
-                    // The writer closed before answering: publish anyway, as
-                    // every terminal event does, but promise nothing durable.
-                    Err(_) => Err(crate::SchedulerError::ChannelClosed),
-                };
-                let _ = event_tx.send(PipelineEvent::JobCancelled { job_id });
-                // A cancel that keeps the files schedules nothing.
-                if result.is_ok() && !keep_files {
-                    let cleanup_db = cleanup_db.clone();
-                    tokio::spawn(Self::cleanup_cancelled_job(cleanup_db, cleanup));
-                }
-                results.insert(job_id, result);
-            }
-            let _ = reply.send(results);
+            let archived = committed.await;
+            let _ = completed
+                .send(TerminalPostProcessingEvent::CancelJobsDone(CancelJobsDone {
+                    generation,
+                    cleanups,
+                    archived,
+                    keep_files,
+                    results,
+                    reply,
+                }))
+                .await;
         });
+    }
+
+    // The archive has answered. Each id it committed leaves memory and the
+    // snapshot, with one `JobCancelled`; an id whose archive failed, or every
+    // id when the writer closed first, stays live and its result says why.
+    pub(in crate::pipeline) fn handle_cancel_jobs_done(&mut self, done: CancelJobsDone) {
+        let CancelJobsDone {
+            generation,
+            cleanups,
+            archived,
+            keep_files,
+            mut results,
+            reply,
+        } = done;
+        let mut cancelled = Vec::new();
+        for mut cleanup in cleanups {
+            let job_id = cleanup.job_id;
+            if self.pending_cancellations.get(&job_id) != Some(&generation) {
+                continue;
+            }
+            self.pending_cancellations.remove(&job_id);
+            let failure = match &archived {
+                Ok(failed) => failed.get(&job_id).map(|error| {
+                    tracing::error!(job_id = job_id.0, %error, "failed to durably archive cancelled job");
+                    crate::SchedulerError::State(crate::StateError::Database(format!(
+                        "failed to archive cancelled job: {error}"
+                    )))
+                }),
+                Err(_) => Some(crate::SchedulerError::ChannelClosed),
+            };
+            if let Some(error) = failure {
+                // Live again: whatever the job finished while it waited is
+                // judged now.
+                self.schedule_job_completion_check(job_id);
+                results.insert(job_id, Err(error));
+                continue;
+            }
+            if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
+                cleanup.working_dir = state.working_dir;
+                cleanup.staging_dir = state.staging_dir;
+            }
+            results.insert(job_id, Ok(()));
+            cancelled.push(cleanup);
+        }
+        if !cancelled.is_empty() {
+            // Same boundary as a job that completed or failed: the cancelled
+            // jobs' article pages are free and unwanted, so hand them back
+            // rather than holding a job-sized working set until the purge
+            // clock runs out.
+            crate::runtime::thread_release::release_job_completion_memory();
+            self.publish_snapshot();
+        }
+        for cleanup in cancelled {
+            let _ = self.event_tx.send(PipelineEvent::JobCancelled {
+                job_id: cleanup.job_id,
+            });
+            // A cancel that keeps the files schedules nothing.
+            if !keep_files {
+                tokio::spawn(Self::cleanup_cancelled_job(self.db.clone(), cleanup));
+            }
+        }
+        let _ = reply.send(results);
     }
 
     // Refuses a cancel the job's state does not allow, or else sends every
@@ -935,6 +982,11 @@ impl Pipeline {
         if self.inflight_moves.contains(&job_id) {
             return Err(crate::SchedulerError::Conflict(
                 "cancel is not supported while the final move is running".to_string(),
+            ));
+        }
+        if self.pending_cancellations.contains_key(&job_id) {
+            return Err(crate::SchedulerError::Conflict(
+                "cancellation is still running".to_string(),
             ));
         }
         if !self.jobs.contains_key(&job_id) {
@@ -1041,7 +1093,7 @@ impl Pipeline {
         ))
     }
 
-    // Drops a cancelled job's runtime state once its archive is queued.
+    // Drops a cancelled job's runtime state once its archive has committed.
     fn purge_cancelled_job_runtime(&mut self, job_id: JobId) -> Option<JobState> {
         let state = self.jobs.remove(&job_id)?;
         self.retire_stalled_download_lanes(job_id);

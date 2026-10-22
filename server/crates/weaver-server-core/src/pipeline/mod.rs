@@ -1768,6 +1768,7 @@ pub(super) struct MoveToCompleteDone {
 
 pub(super) enum TerminalPostProcessingEvent {
     HistoryDeleteDone(orchestrator::HistoryDeleteDone),
+    CancelJobsDone(orchestrator::CancelJobsDone),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
     AddedScriptsDone(JobId, Result<(), crate::StateError>),
@@ -2894,6 +2895,10 @@ pub struct Pipeline {
     pub(super) added_script_holds: HashSet<JobId>,
     pub(super) script_data_dir: PathBuf,
     pub(super) pending_history_deletions: HashSet<JobId>,
+    // Jobs whose batched cancel has queued its archive and waits for it to
+    // commit, with the batch's generation. The job stays live until then.
+    pub(super) pending_cancellations: HashMap<JobId, u64>,
+    pub(super) cancel_generation: u64,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     // Cooperative cancellation tokens for PAR2 verification and repair work.

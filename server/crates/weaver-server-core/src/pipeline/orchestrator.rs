@@ -10,6 +10,7 @@ mod runtime;
 mod scripts;
 mod state;
 
+pub(crate) use commands::CancelJobsDone;
 pub(crate) use history::{FinishedJobs, HistoryDeleteDone};
 pub(super) use runtime::timestamp_secs;
 pub(crate) use runtime::{
