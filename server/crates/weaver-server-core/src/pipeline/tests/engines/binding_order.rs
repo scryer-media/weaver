@@ -239,13 +239,21 @@ fn rev_posts() -> Vec<Post> {
 }
 
 // The `.rev` binds after every volume arrived, one of them damaged, and
-// rebuilds that volume as when it bound first.
+// rebuilds that volume as when it bound first. Bound first, only its head
+// comes ahead of the volumes: the rest waits until the set comes up short,
+// behind every volume.
 #[tokio::test]
 async fn a_rev_bound_after_its_volumes_arrived_one_damaged_rebuilds_as_when_it_binds_first() {
     let scenario = || Scenario::new(rev_posts()).damaged(1, 1);
     let first = served_in(scenario(), &[4, 0, 1, 2, 3]).await;
     let last = served_in(scenario(), &[0, 1, 2, 3, 4]).await;
-    assert!(came_before(&first, 4, 0) && came_before(&last, 3, 4));
+    let rest_behind_the_volumes = |served: &Restarted| {
+        let volumes = served.order.iter().rposition(|(file, _)| *file != 4);
+        let rest = served.order.iter().position(|article| *article == (4, 1));
+        matches!((volumes, rest), (Some(volumes), Some(rest)) if volumes < rest)
+    };
+    assert_eq!(first.order[0], (4, 0));
+    assert!(rest_behind_the_volumes(&first) && came_before(&last, 3, 4));
     assert!(last.files[&delivered("beacon.bin")] == rev_body());
     assert_alike(&first, &last);
 }
