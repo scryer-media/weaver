@@ -1503,11 +1503,11 @@ mod tests {
     // Makes `job_id`'s cleanup fail after its record is gone: a script still
     // running holds the cleanup at the script-stop barrier, and the directory
     // is handed to another job before the barrier lifts.
-    async fn fail_cleanup_after_record_delete(
+    async fn fail_cleanup_after_record_delete<T>(
         rig: &Rig,
         job_id: u64,
         output_dir: &std::path::Path,
-        running: impl Drop,
+        running: T,
     ) {
         let db = rig.db.clone();
         weaver_server_core::post_processing::events::wait_for_test_script_change(&db, || {

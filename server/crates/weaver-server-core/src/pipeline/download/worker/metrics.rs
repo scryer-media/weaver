@@ -77,9 +77,17 @@ impl Pipeline {
         now: Instant,
     ) -> Option<Instant> {
         let stalled = self.download_scheduler_eligible_jobs();
-        if stalled.is_empty() {
-            return None;
+        let waits = self.explained_dispatch_waits(now);
+        let mut earliest: Option<Instant> = None;
+        for job_id in stalled {
+            let wait = *waits.get(&job_id)?;
+            earliest = Some(earliest.map_or(wait, |current| current.min(wait)));
         }
+        earliest
+    }
+
+    // A wait protects its own job even when another eligible job is wedged.
+    fn explained_dispatch_waits(&self, now: Instant) -> HashMap<JobId, Instant> {
         let mut retry_deadlines: HashMap<JobId, Instant> = HashMap::new();
         for (deadline, retry) in self.infrastructure_retries.iter_with_deadlines() {
             let Some(deadline) = deadline.map(tokio::time::Instant::into_std) else {
@@ -90,8 +98,8 @@ impl Pipeline {
                 .and_modify(|earliest| *earliest = (*earliest).min(deadline))
                 .or_insert(deadline);
         }
-        let mut earliest: Option<Instant> = None;
-        for job_id in stalled {
+        let mut waits = HashMap::new();
+        for job_id in self.download_scheduler_eligible_jobs() {
             let job_wait = [
                 self.propagation_ready_at
                     .get(&job_id)
@@ -105,10 +113,12 @@ impl Pipeline {
             .into_iter()
             .flatten()
             .filter(|deadline| *deadline > now)
-            .min()?;
-            earliest = Some(earliest.map_or(job_wait, |current| current.min(job_wait)));
+            .min();
+            if let Some(wait) = job_wait {
+                waits.insert(job_id, wait);
+            }
         }
-        earliest
+        waits
     }
 
     // The servers a new download lane could be sent to right now, asked the
@@ -205,6 +215,7 @@ impl Pipeline {
         if let Some(wait_ends) = self.earliest_explained_dispatch_wait(now) {
             if let Some(watch) = self.download_dispatch_stall.as_mut() {
                 watch.since = watch.since.max(wait_ends);
+                watch.kick = None;
             }
             return false;
         }
@@ -231,6 +242,7 @@ impl Pipeline {
                     .map(|(_, bytes)| bytes)
                     .unwrap_or_default();
                 self.release_download_dispatch_stall(
+                    now,
                     stalled_for,
                     kicked,
                     pressure,
@@ -243,7 +255,7 @@ impl Pipeline {
         }
     }
 
-    // Clears every dispatch-side hold the scheduler keeps: parked
+    // Clears dispatch-side holds only for unexplained jobs: parked
     // infrastructure retries go back to their jobs' queues, the stalled
     // jobs' durable-lead and propagation deadlines, the rotation hints on
     // their queued articles and the soft-pressure delay are dropped. What
@@ -257,8 +269,13 @@ impl Pipeline {
         max_connections: usize,
         eligible_count: usize,
     ) {
-        let stalled = self.download_scheduler_eligible_jobs();
-        let requeued_retries = self.wake_all_infrastructure_retries();
+        let waits = self.explained_dispatch_waits(now);
+        let stalled = self
+            .download_scheduler_eligible_jobs()
+            .into_iter()
+            .filter(|job_id| !waits.contains_key(job_id))
+            .collect::<HashSet<_>>();
+        let requeued_retries = self.wake_infrastructure_retries_for_jobs(&stalled);
         let mut rotation_hints_cleared = 0;
         for job_id in &stalled {
             self.download_restart_durable_lead_retry_after
@@ -277,7 +294,11 @@ impl Pipeline {
         self.metrics
             .download_dispatch_stall_kicks
             .fetch_add(1, Ordering::Relaxed);
-        let stalled = self.download_scheduler_eligible_jobs();
+        let stalled = self
+            .download_scheduler_eligible_jobs()
+            .into_iter()
+            .filter(|job_id| stalled.contains(job_id))
+            .collect::<Vec<_>>();
         let downloaded_bytes = stalled
             .iter()
             .filter_map(|job_id| {
@@ -307,15 +328,18 @@ impl Pipeline {
     // missing and its completion check decides what it becomes.
     fn release_download_dispatch_stall(
         &mut self,
+        now: Instant,
         stalled_for: Duration,
         downloaded_bytes_at_kick: HashMap<JobId, u64>,
         pressure: DownloadPressure,
         max_connections: usize,
         eligible_count: usize,
     ) {
+        let waits = self.explained_dispatch_waits(now);
         let released = self
             .download_scheduler_eligible_jobs()
             .into_iter()
+            .filter(|job_id| !waits.contains_key(job_id))
             .filter(|job_id| {
                 downloaded_bytes_at_kick
                     .get(job_id)

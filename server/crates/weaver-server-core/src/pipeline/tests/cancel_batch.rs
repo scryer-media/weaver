@@ -251,3 +251,113 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
         "cancelled"
     );
 }
+
+#[tokio::test]
+async fn failed_user_cancel_restores_repair_after_db_recovers() {
+    use crate::pipeline::completion::finalize::check::run_file_descriptor_bounded_par2_repair;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(41906);
+    insert_queued_jobs(&mut pipeline, &[job_id]).await;
+    let old_token = pipeline.par2_cancellation_token(job_id);
+    let set = build_repairable_par2_set("payload.bin", b"complete", 4, 2);
+    let set_id = set.recovery_set_id;
+    let session_dir = tempfile::tempdir().unwrap();
+    let mut options =
+        par2_rs::Par2RepairSessionOptions::new(session_dir.path().to_path_buf(), Vec::new());
+    options.file_set = Some(set);
+    options.cancel = Some(old_token.clone());
+    let session = par2_rs::Par2RepairSession::open(options).unwrap();
+    pipeline
+        .ensure_par2_runtime(job_id)
+        .ensure_set_runtime(set_id)
+        .session = Some(session);
+    pipeline.par2_analysis_in_flight.insert(
+        job_id,
+        Par2AnalysisWork {
+            work_id: 77,
+            recovery_set_id: set_id,
+            submitted_at: Instant::now(),
+        },
+    );
+    pipeline
+        .metrics
+        .verify_active
+        .fetch_add(1, Ordering::Relaxed);
+    fail_history_insert_for(&pipeline, job_id).await;
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    // The reply records the intent; a failed archive restores the live row.
+    let outcome = handle
+        .cancel_jobs([job_id].into_iter().collect(), CancellationOrigin::User)
+        .await
+        .unwrap();
+    assert!(outcome[&job_id].is_ok());
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    assert!(handle.get_job(job_id).is_ok());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+    assert!(pipeline.jobs.contains_key(&job_id));
+    let datastore = pipeline.db.datastore();
+    SqlRuntime::run_in_transaction(&datastore, "verification_clear_archive_fault", |tx| {
+        Box::pin(async move {
+            tx.execute("DROP TRIGGER reject_cancel_archive", &[])
+                .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        old_token.is_cancelled(),
+        "the original worker stays cancelled"
+    );
+    assert!(!pipeline.shared_state.is_job_cancellation_requested(job_id));
+    assert!(
+        pipeline
+            .par2_runtime(job_id)
+            .unwrap()
+            .set_runtime(set_id)
+            .unwrap()
+            .session
+            .is_none()
+    );
+    assert!(!pipeline.par2_analysis_in_flight.contains_key(&job_id));
+    assert_eq!(pipeline.metrics.verify_active.load(Ordering::Relaxed), 0);
+    pipeline
+        .handle_par2_analysis_done(Par2AnalysisWorkDone {
+            job_id,
+            work_id: 77,
+            recovery_set_id: set_id,
+            outcome:
+                crate::pipeline::completion::finalize::check::Par2AnalysisTicketOutcome::TaskFailed(
+                    "old cancelled worker".into(),
+                ),
+        })
+        .await;
+    assert!(!pipeline.par2_analysis_results.contains_key(&job_id));
+
+    let token = pipeline.par2_cancellation_token(job_id);
+    assert!(!token.is_cancelled());
+    let repaired_dir = tempfile::tempdir().unwrap();
+    let outcome = run_file_descriptor_bounded_par2_repair(
+        repaired_dir.path().to_path_buf(),
+        build_repairable_par2_set("payload.bin", b"complete", 4, 2),
+        HashMap::new(),
+        Vec::new(),
+        64 * 1024 * 1024,
+        token.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcome.status, par2_rs::Par2RepairStatus::Repaired);
+    assert_eq!(
+        std::fs::read(repaired_dir.path().join("payload.bin")).unwrap(),
+        b"complete"
+    );
+    assert!(pipeline.shared_state.cancel_active_job_work(job_id));
+    assert!(
+        token.is_cancelled(),
+        "subsequent cancellation still reaches new work"
+    );
+}

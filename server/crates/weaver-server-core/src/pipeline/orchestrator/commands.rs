@@ -409,9 +409,28 @@ impl Pipeline {
             crate::pipeline::queue::Change::changed(())
         });
         for &job_id in ids {
+            self.restore_after_failed_cancellation(job_id);
             self.report_job(job_id);
-            self.schedule_job_completion_check(job_id);
         }
+    }
+
+    // The archive did not commit, so future work belongs to a live job again.
+    // Tokens already handed to workers stay cancelled. Discard their read-only
+    // analysis tickets and retained sessions so neither a late verdict nor a
+    // cached session can reintroduce the cancelled token into the next pass.
+    fn restore_after_failed_cancellation(&mut self, job_id: JobId) {
+        self.forget_par2_analysis_work(job_id);
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.scan_budget = None;
+            for set in runtime.sets.values_mut() {
+                set.session = None;
+                set.session_last_used = None;
+                set.session_evidence_file_ids.clear();
+            }
+        }
+        self.par2_cancellations.remove(&job_id);
+        self.shared_state.clear_job_cancellations(job_id);
+        self.schedule_job_completion_check(job_id);
     }
 
     // Send cancellation signals and prepare history for an accepted intent.
@@ -437,6 +456,8 @@ impl Pipeline {
         }
         self.db.cancel_event_scripts(job_id.0);
         if origin.is_user() {
+            // Reassert after any earlier failed cancellation withdrew its signal.
+            self.shared_state.cancel_active_job_work(job_id);
             self.raise_queue_script_event(
                 job_id,
                 crate::post_processing::model::QueueEvent::NzbDeleted,

@@ -1609,6 +1609,17 @@ impl Pipeline {
         self.requeue_infrastructure_retry_batch(ready)
     }
 
+    pub(in crate::pipeline) fn wake_infrastructure_retries_for_jobs(
+        &mut self,
+        jobs: &std::collections::HashSet<JobId>,
+    ) -> usize {
+        let ready = self
+            .infrastructure_retries
+            .wake_where(|retry| jobs.contains(&retry.work.segment_id.file_id.job_id));
+        self.update_parked_infrastructure_metric();
+        self.requeue_infrastructure_retry_batch(ready)
+    }
+
     fn requeue_due_infrastructure_retries(&mut self) -> usize {
         let ready = self
             .infrastructure_retries

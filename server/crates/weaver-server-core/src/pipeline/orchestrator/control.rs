@@ -252,6 +252,7 @@ impl Pipeline {
         }
         let globals = self.shared_state.queue.read(|inner| inner.globals.clone());
         if globals.paused != self.global_paused || globals.scheduled_pause != self.scheduled_pause {
+            self.download_dispatch_stall = None;
             if globals.paused {
                 self.demand_direct_store_barriers_for_pause(None).await;
             }

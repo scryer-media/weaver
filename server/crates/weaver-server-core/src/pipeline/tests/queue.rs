@@ -570,7 +570,6 @@ async fn held_segment_write_leaves_other_jobs_commands_answered() {
     );
     let handle = &harness.handle;
     let mut events = handle.subscribe_events();
-    let mut revisions = handle.subscribe_job_changes();
     let a = JobId(9101);
     let b = JobId(9102);
     handle
