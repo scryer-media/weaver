@@ -15,9 +15,12 @@ use std::io::Cursor;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
 use weaver_graph::Why;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, try_run};
+use super::harness::{
+    ARTICLE, Outcome, Post, Scenario, assert_fails_leaving, par2_set, payload, run, try_run,
+};
 use super::restart::run_restarting;
 use super::streams::tar;
+use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::lines::Lines;
@@ -406,8 +409,9 @@ async fn under_graph(scenario: &Scenario, expect: Graph) -> Outcome {
 }
 
 enum Classic {
-    // The job stops moving at this status.
-    Stalls(JobStatus),
+    // The job fails as this kind with an error that starts so, leaving
+    // exactly these paths under the complete folder.
+    FailsAs(HistoryFailureKind, &'static str, &'static [&'static str]),
     // The job fails with an error that starts so.
     Fails(&'static str),
     // The job completes with exactly these files.
@@ -415,19 +419,19 @@ enum Classic {
 }
 
 async fn under_classic(scenario: &Scenario, expect: Classic) {
-    let result = try_run(scenario, Engine::Classic).await;
-    match (expect, result) {
-        (Classic::Stalls(status), Err(stall)) => {
-            assert_eq!(stall.status, Some(status), "classic: {}", stall.state)
+    let outcome = run(scenario, Engine::Classic).await;
+    match expect {
+        Classic::FailsAs(kind, error, left) => {
+            assert_fails_leaving(&outcome, kind, error, left);
         }
-        (Classic::Fails(prefix), Ok(outcome)) => {
+        Classic::Fails(prefix) => {
             let error = match &outcome.status {
                 Some(JobStatus::Failed { error }) => error.clone(),
                 other => panic!("classic: {other:?}, not a failure"),
             };
             assert!(error.starts_with(prefix), "classic: {error}");
         }
-        (Classic::Completes(files), Ok(outcome)) => {
+        Classic::Completes(files) => {
             assert_eq!(
                 outcome.status,
                 Some(JobStatus::Complete),
@@ -446,8 +450,6 @@ async fn under_classic(scenario: &Scenario, expect: Classic) {
                 "classic"
             );
         }
-        (_, Err(stall)) => panic!("classic stalled at {:?}: {}", stall.status, stall.state),
-        (_, Ok(outcome)) => panic!("classic: {:?} {:?}", outcome.status, outcome.files.keys()),
     }
 }
 
@@ -471,8 +473,10 @@ const QUILL: &str = "name=quill.bin from=quill.bin depth=0 whole=true";
 
 // Encrypted, content only: the headers read, the bytes do not.
 
+// Classic fails the job as Repair, not Password, delivering nothing, not
+// even the plain file.
 #[tokio::test]
-async fn an_encrypted_rar_with_no_password_beside_a_plain_file_ends_partial_with_the_archive_withheld_under_graph_and_stalls_downloading_under_classic()
+async fn an_encrypted_rar_with_no_password_beside_a_plain_file_ends_partial_with_the_archive_withheld_under_graph_and_fails_as_repair_under_classic()
  {
     let volumes = encrypted(2, 5);
     let scenario = Scenario::new(beside(posts(&volumes)));
@@ -497,11 +501,20 @@ async fn an_encrypted_rar_with_no_password_beside_a_plain_file_ends_partial_with
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Downloading)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "no retryable work remains for incomplete RAR sets",
+            &[],
+        ),
+    )
+    .await;
 }
 
+// Classic fails the job as Repair, not Password, delivering nothing.
 #[tokio::test]
-async fn an_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume_withheld_under_graph_and_stalls_extracting_under_classic()
+async fn an_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume_withheld_under_graph_and_fails_as_repair_under_classic()
  {
     let volumes = encrypted(1, 5);
     let scenario = Scenario::new(beside(nest(&volumes)));
@@ -520,13 +533,22 @@ async fn an_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume_withh
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Extracting)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "no retryable work remains for incomplete RAR sets",
+            &[],
+        ),
+    )
+    .await;
 }
 
 // The set's volumes, met one after another inside the outer member, belong
 // to one object as they do at the root.
+// Classic fails the job as Repair, not Password, delivering nothing.
 #[tokio::test]
-async fn an_encrypted_two_volume_rar_inside_a_stored_rar_withholds_both_volumes_encrypted_under_graph_and_stalls_extracting_under_classic()
+async fn an_encrypted_two_volume_rar_inside_a_stored_rar_withholds_both_volumes_encrypted_under_graph_and_fails_as_repair_under_classic()
  {
     let volumes = encrypted(2, 5);
     let scenario = Scenario::new(beside(nest(&volumes)));
@@ -551,7 +573,15 @@ async fn an_encrypted_two_volume_rar_inside_a_stored_rar_withholds_both_volumes_
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Extracting)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "no retryable work remains for incomplete RAR sets",
+            &[],
+        ),
+    )
+    .await;
 }
 
 // Encrypted headers: nothing names the members.
@@ -694,6 +724,7 @@ async fn an_lzma2_7z_inside_a_stored_rar_is_refused_compressed_and_delivered_who
 
 // The store refuses the member compressed; the engine it goes to cannot
 // decode it, and the volume is delivered damaged as it stands.
+// Classic fails the job as Repair, delivering nothing.
 #[tokio::test]
 async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_damaged_unrepairable_after_the_store_refuses_it_compressed()
  {
@@ -720,11 +751,20 @@ async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Downloading)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "no retryable work remains for incomplete RAR sets",
+            &[],
+        ),
+    )
+    .await;
 }
 
 // One level down the same member is delivered the same way, its volume
 // damaged at depth 1.
+// Classic fails the job as Repair, delivering nothing.
 #[tokio::test]
 async fn a_rar_inside_a_stored_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_damaged_unrepairable()
  {
@@ -751,11 +791,21 @@ async fn a_rar_inside_a_stored_rar_whose_member_names_a_method_its_bytes_do_not_
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Extracting)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "no retryable work remains for incomplete RAR sets",
+            &[],
+        ),
+    )
+    .await;
 }
 
+// Classic rejects the link and fails the whole job as Unpack, delivering
+// nothing.
 #[tokio::test]
-async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_file_under_graph_and_stalls_downloading_under_classic()
+async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_file_under_graph_and_rejects_the_job_under_classic()
  {
     let scenario = Scenario::new(beside(posts(&symlink_rar())));
     under_graph(
@@ -773,11 +823,21 @@ async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_fi
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Downloading)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Unpack,
+            "WEAVER_EXTRACTION_REJECTED[unsupported_entry]",
+            &[],
+        ),
+    )
+    .await;
 }
 
+// Classic rejects the link and fails the whole job as Unpack, delivering
+// nothing.
 #[tokio::test]
-async fn a_rar_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_refuses_the_link_not_a_file_under_graph_and_stalls_extracting_under_classic()
+async fn a_rar_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_refuses_the_link_not_a_file_under_graph_and_rejects_the_job_under_classic()
  {
     let scenario = Scenario::new(beside(nest(&symlink_rar())));
     under_graph(
@@ -795,7 +855,15 @@ async fn a_rar_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_refus
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Extracting)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Unpack,
+            "WEAVER_EXTRACTION_REJECTED[unsupported_entry]",
+            &[],
+        ),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -852,8 +920,9 @@ async fn a_7z_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_drops_
 
 // A directory entry is placed, not refused: it is listed among the whole
 // deliveries under its own name.
+// Classic delivers the file in its directory too, and completes.
 #[tokio::test]
-async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the_directory_whole_under_graph_and_stalls_downloading_under_classic()
+async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the_directory_whole_under_graph_and_delivers_the_file_under_classic()
  {
     let scenario = Scenario::new(beside(posts(&directory_rar())));
     under_graph(
@@ -875,11 +944,16 @@ async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Downloading)).await;
+    under_classic(
+        &scenario,
+        Classic::Completes(&["gallery/beacon.bin", "quill.bin"]),
+    )
+    .await;
 }
 
+// Classic delivers the file in its directory too, and completes.
 #[tokio::test]
-async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_the_file_and_lists_the_directory_whole_under_graph_and_stalls_extracting_under_classic()
+async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_the_file_and_lists_the_directory_whole_under_graph_and_delivers_the_file_under_classic()
  {
     let scenario = Scenario::new(beside(nest(&directory_rar())));
     under_graph(
@@ -901,7 +975,11 @@ async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_th
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Extracting)).await;
+    under_classic(
+        &scenario,
+        Classic::Completes(&["gallery/beacon.bin", "quill.bin"]),
+    )
+    .await;
 }
 
 // First bytes lost: what would name the members never came, so the volumes
@@ -1240,8 +1318,10 @@ async fn a_7z_inside_a_stored_rar_whose_entry_path_climbs_out_is_refused_unsuppo
 
 // Unmapped: every volume is in, and the object never placed what it named.
 
+// Classic fails the job as Repair on the missing volume, leaving the
+// member it staged from the first volume in its unpack folder.
 #[tokio::test]
-async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_under_graph_and_stalls_downloading_under_classic()
+async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_under_graph_and_fails_missing_a_volume_under_classic()
  {
     let mut volumes = store(3);
     volumes.pop();
@@ -1267,11 +1347,21 @@ async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_un
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Downloading)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "missing RAR volume after recovery settled",
+            &[".weaver-direct-unpack/93001/silver.horizon.0/beacon.bin"],
+        ),
+    )
+    .await;
 }
 
+// Classic fails the job on the missing volume, as Unpack two deep where
+// the root row fails as Repair, delivering nothing.
 #[tokio::test]
-async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_under_graph_and_stalls_extracting_under_classic()
+async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_under_graph_and_fails_missing_a_volume_under_classic()
  {
     let mut volumes = store(3);
     volumes.pop();
@@ -1297,7 +1387,15 @@ async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Extracting)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Unpack,
+            "missing RAR volume after recovery settled",
+            &[],
+        ),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1574,6 +1672,7 @@ fn three_one_withheld() -> Scenario {
     Scenario::new(posted)
 }
 
+// Classic fails the whole job as Repair, delivering neither whole member.
 #[tokio::test]
 async fn a_job_of_three_members_one_withheld_ends_partial_with_two_delivered() {
     let scenario = three_one_withheld();
@@ -1596,9 +1695,19 @@ async fn a_job_of_three_members_one_withheld_ends_partial_with_two_delivered() {
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Downloading)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "no retryable work remains for incomplete RAR sets",
+            &[],
+        ),
+    )
+    .await;
 }
 
+// Classic fails the job as Repair, leaving each set's staged member in its
+// unpack folder.
 #[tokio::test]
 async fn a_job_of_three_members_all_withheld_fails() {
     let posted: Vec<Post> = [("lantern.rar", 5), ("quill.rar", 6), ("ember.rar", 7)]
@@ -1631,7 +1740,19 @@ async fn a_job_of_three_members_all_withheld_fails() {
         },
     )
     .await;
-    under_classic(&scenario, Classic::Stalls(JobStatus::Downloading)).await;
+    under_classic(
+        &scenario,
+        Classic::FailsAs(
+            HistoryFailureKind::Repair,
+            "no retryable work remains for incomplete RAR sets",
+            &[
+                ".weaver-direct-unpack/93001/ember.2/beacon.bin",
+                ".weaver-direct-unpack/93001/lantern.0/beacon.bin",
+                ".weaver-direct-unpack/93001/quill.1/beacon.bin",
+            ],
+        ),
+    )
+    .await;
 }
 
 // An encrypted archive withheld, a damaged one delivered as it stands, and

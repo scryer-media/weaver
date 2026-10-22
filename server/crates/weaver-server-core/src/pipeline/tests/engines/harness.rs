@@ -617,6 +617,31 @@ pub(super) struct Stall {
     pub(super) state: String,
 }
 
+// A run that failed as `kind` with an error that starts `error`, leaving
+// exactly `left` under the complete folder.
+pub(super) fn assert_fails_leaving(
+    outcome: &Outcome,
+    kind: HistoryFailureKind,
+    error: &str,
+    left: &[&str],
+) {
+    match &outcome.status {
+        Some(JobStatus::Failed { error: said }) => assert!(
+            said.starts_with(error),
+            "{}: failed saying {said}",
+            outcome.engine
+        ),
+        other => panic!("{}: {other:?}, not a failure", outcome.engine),
+    }
+    assert_eq!(outcome.failure_kind, Some(kind), "{}: kind", outcome.engine);
+    assert_eq!(
+        outcome.files.keys().map(String::as_str).collect::<Vec<_>>(),
+        left,
+        "{}: left under the complete folder",
+        outcome.engine
+    );
+}
+
 pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
     try_run(scenario, engine).await.unwrap_or_else(|stall| {
         panic!(
@@ -740,12 +765,13 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             pipeline.receive_retry_work(retry);
             continue;
         }
-        // Classic's extraction runs out on a task too, and says it is done
-        // the same way.
+        // Classic's extraction runs out on a task too, a whole set's or a
+        // RAR member worker's, and says it is done the same way.
         if pipeline
             .inflight_extractions
             .get(&JOB)
             .is_some_and(|sets| !sets.is_empty())
+            || pipeline.has_active_rar_workers(JOB)
         {
             let done = pipeline
                 .extract_done_rx
@@ -753,6 +779,36 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
                 .await
                 .expect("an extraction in flight reports");
             pipeline.handle_extraction_done(done).await;
+            continue;
+        }
+        // Classic works out a RAR set's plan off the actor too, and the
+        // orchestrator hears it back on its own channel.
+        if pipeline
+            .rar_refresh_state
+            .iter()
+            .any(|((job, _), refresh)| *job == JOB && refresh.in_flight.is_some())
+        {
+            let done = pipeline
+                .rar_refresh_done_rx
+                .recv()
+                .await
+                .expect("a RAR refresh in flight reports");
+            pipeline.handle_rar_refresh_done(done).await;
+            continue;
+        }
+        // A RAR plan or extraction classic put off for want of capacity is
+        // tried again when its retry comes back, as the orchestrator hears it.
+        if pipeline
+            .pending_rar_capacity_retries
+            .iter()
+            .any(|(job, _, _)| *job == JOB)
+        {
+            let retry = pipeline
+                .rar_capacity_retry_rx
+                .recv()
+                .await
+                .expect("a scheduled RAR retry is sent");
+            pipeline.handle_rar_capacity_retry(retry).await;
             continue;
         }
         let after = fingerprint(&pipeline, &requests);

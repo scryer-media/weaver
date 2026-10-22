@@ -24,8 +24,8 @@ use weaver_graph::recovery::RepairOutcome;
 use super::caps::{FLOOR, assert_refused, limits, zeros_zstd};
 use super::depth::stored as sevenz_stored;
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, kinds, par2_set, par3_set, payload, run, run_both,
-    try_run,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fails_leaving, kinds, par2_set, par3_set,
+    payload, run, run_both,
 };
 use super::rar::posts as rar_posts;
 use super::rar_rev::{body as rev_body, rar5_revs};
@@ -298,8 +298,8 @@ async fn entries_counted_across_levels_fail_the_job_naming_entries_under_graph()
 
 // An LZMA2 7z two deep beside a plain file: the store gives it up
 // compressed and the engine delivers its members, restarted after every
-// article, from what is on disk. Classic stalls extracting the stored RAR
-// that holds it.
+// article, from what is on disk. Classic extracts it two deep and delivers
+// the same members.
 #[tokio::test]
 async fn an_lzma2_7z_two_deep_handed_to_the_engine_restarted_after_every_article_delivers_its_members()
  {
@@ -320,12 +320,16 @@ async fn an_lzma2_7z_two_deep_handed_to_the_engine_restarted_after_every_article
         assert!(graph.files[&delivered(name)] == bytes, "{name}");
     }
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    let classic = try_run(&scenario, Engine::Classic).await;
+    let classic = run(&scenario, Engine::Classic).await;
     assert!(
-        classic
-            .as_ref()
-            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
-        "classic stalls extracting the RAR two deep"
+        classic.completed(),
+        "{:?} {:?}",
+        classic.status,
+        classic.failure
+    );
+    assert!(
+        classic.files == graph.files,
+        "classic delivers what the graph does"
     );
     restart_row(scenario).await;
 }
@@ -449,7 +453,7 @@ async fn a_rar5_volume_two_deep_is_repaired_from_its_own_recovery_record_under_g
 }
 
 // An AES zip two deep, opened on the job's password by the engine's run.
-// Classic stalls extracting the RAR two deep.
+// Classic opens it on the same password and delivers the same members.
 #[tokio::test]
 async fn an_aes_zip_two_deep_delivers_its_members_under_graph() {
     let enciphered = zip_stored().with_aes_encryption(::zip::AesMode::Aes256, SECRET);
@@ -472,20 +476,25 @@ async fn an_aes_zip_two_deep_delivers_its_members_under_graph() {
         ["rar_store", "sevenz_store", "zip", "zip_engine"]
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    let classic = try_run(&scenario, Engine::Classic).await;
+    let classic = run(&scenario, Engine::Classic).await;
     assert!(
-        classic
-            .as_ref()
-            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
-        "classic stalls extracting the RAR two deep"
+        classic.completed(),
+        "{:?} {:?}",
+        classic.status,
+        classic.failure
+    );
+    assert!(
+        classic.files == graph.files,
+        "classic delivers what the graph does"
     );
 }
 
 // `quill.bin` one deep and two deep in stored RARs, served in order: the one
 // in `level.rar` is announced first and holds the name until the shallower
 // one is announced, which takes it; the holder moves to `quill (1).bin`
-// with its file, and nothing is written over. Classic stalls extracting the
-// RAR two deep.
+// with its file, and nothing is written over. Classic completes delivering
+// one `quill.bin` holding the deeper file's bytes: the shallower file is
+// lost.
 #[tokio::test]
 async fn one_name_one_and_two_deep_goes_to_the_shallower_and_the_deeper_holder_moves_under_graph() {
     let shallow = payload(3 * ARTICLE + 1, 102);
@@ -496,7 +505,7 @@ async fn one_name_one_and_two_deep_goes_to_the_shallower_and_the_deeper_holder_m
     ]);
     let scenario = Scenario::new(vec![Post::plain("lantern.rar", outer)]);
     let graph = run(&scenario, Engine::Graph).await;
-    let classic = try_run(&scenario, Engine::Classic).await;
+    let classic = run(&scenario, Engine::Classic).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -509,10 +518,18 @@ async fn one_name_one_and_two_deep_goes_to_the_shallower_and_the_deeper_holder_m
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
     assert!(
-        classic
-            .as_ref()
-            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
-        "classic stalls extracting the RAR two deep"
+        classic.completed(),
+        "{:?} {:?}",
+        classic.status,
+        classic.failure
+    );
+    assert_eq!(
+        classic.files.keys().cloned().collect::<Vec<_>>(),
+        [delivered("quill.bin")]
+    );
+    assert!(
+        classic.files[&delivered("quill.bin")] == deeper,
+        "classic: quill.bin holds the deeper file"
     );
 }
 
@@ -643,7 +660,8 @@ async fn a_par2_index_two_deep_lost_before_its_packets_were_walked_comes_again_a
 // A stored RAR5 set of four volumes two deep, its second never posted,
 // beside the `.rev` that rebuilds it: the set is rebuilt at depth and the
 // member delivered whole. The `.rev` is delivered beside it, as recovery
-// files below the root are. Classic stalls extracting the RAR two deep.
+// files below the root are. Classic does not rebuild the set two deep: it
+// fails the job as Unpack on the absent volume, delivering nothing.
 #[tokio::test]
 async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph() {
     let body = rev_body();
@@ -678,12 +696,11 @@ async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph
         kinds(&graph)
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    let classic = try_run(&scenario, Engine::Classic).await;
-    assert!(
-        classic
-            .as_ref()
-            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
-        "classic stalls extracting the RAR two deep"
+    assert_fails_leaving(
+        &run(&scenario, Engine::Classic).await,
+        HistoryFailureKind::Unpack,
+        "missing archive part 'silver.horizon.part02.rar'",
+        &[],
     );
 }
 
@@ -692,7 +709,8 @@ async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph
 // engine, which asks, and nothing answers. The job ends as the locked RAR
 // at the root does, partial on its password with the archive withheld and
 // delivered as posted, and the members above it and beside it delivered.
-// Classic stalls extracting the RAR two deep.
+// Classic reads the enciphered RAR as damage: it fails the job as Repair on
+// a CRC failure, not on the password, delivering nothing.
 #[tokio::test]
 async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_the_members_above_it_delivered_under_graph()
  {
@@ -738,12 +756,11 @@ async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_
         vec![("cinder.rar".to_owned(), Why::EncryptedHeader)]
     );
     assert!(kinds(&graph).contains(&"rar_engine"), "{:?}", kinds(&graph));
-    let classic = try_run(&scenario, Engine::Classic).await;
-    assert!(
-        classic
-            .as_ref()
-            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
-        "classic stalls extracting the RAR two deep"
+    assert_fails_leaving(
+        &run(&scenario, Engine::Classic).await,
+        HistoryFailureKind::Repair,
+        "extraction CRC failures with no PAR2 data",
+        &[],
     );
 }
 
@@ -863,8 +880,8 @@ async fn a_rar_set_two_deep_served_last_article_first_delivers_as_at_the_root_un
 // it withholds the archive, its folders shut. Two deep, inside `level.rar`
 // beside `beacon.bin` with `candle.bin` one deep, the job ends as it does at
 // the root: partial on the password, the archive withheld and delivered as
-// posted, and the members above it and beside it delivered. Classic stalls
-// extracting the RAR two deep.
+// posted, and the members above it and beside it delivered. Classic fails
+// the job on the password, delivering nothing.
 #[tokio::test]
 async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_root_with_the_members_above_it_delivered_under_graph()
  {
@@ -921,12 +938,11 @@ async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_
         "candle.bin"
     );
     assert!(graph.files[&delivered("cinder.7z")] == locked, "cinder.7z");
-    let classic = try_run(&scenario, Engine::Classic).await;
-    assert!(
-        classic
-            .as_ref()
-            .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
-        "classic stalls extracting the RAR two deep"
+    assert_fails_leaving(
+        &run(&scenario, Engine::Classic).await,
+        HistoryFailureKind::Password,
+        "WEAVER_PASSWORD_REQUIRED",
+        &[],
     );
 }
 
@@ -1010,7 +1026,7 @@ async fn a_par2_set_two_deep_crashed_before_its_repair_landed_repairs_and_delive
 // side in `level.rar` in `lantern.7z`, once as stored 7zs and once as stored
 // RAR5 volumes: each job is Complete with the members once, the second
 // archive's bytes no file of their own, and nothing asked for twice.
-// Classic stalls extracting the RAR two deep.
+// Classic delivers the same members for each.
 #[tokio::test]
 async fn the_repost_rule_holds_two_deep_for_a_7z_and_a_rar5_posted_again_under_another_name() {
     let members = sevenz_members();
@@ -1044,12 +1060,16 @@ async fn the_repost_rule_holds_two_deep_for_a_7z_and_a_rar5_posted_again_under_a
             "{ext}: {:?}",
             graph.refetched()
         );
-        let classic = try_run(&scenario, Engine::Classic).await;
+        let classic = run(&scenario, Engine::Classic).await;
         assert!(
-            classic
-                .as_ref()
-                .is_err_and(|stall| stall.status == Some(JobStatus::Extracting)),
-            "{ext}: classic stalls extracting the RAR two deep"
+            classic.completed(),
+            "{ext}: {:?} {:?}",
+            classic.status,
+            classic.failure
+        );
+        assert!(
+            classic.files == graph.files,
+            "{ext}: classic delivers what the graph does"
         );
     }
 }

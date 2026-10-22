@@ -14,8 +14,8 @@ use std::io::Write;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, finished, one_block_article, par2_set,
-    par2_volumes, payload, recovery_blocks, run, serve, try_run,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, assert_fails_leaving, finished,
+    one_block_article, par2_set, par2_volumes, payload, recovery_blocks, run, serve,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
@@ -86,6 +86,17 @@ fn find(haystack: &[u8], needle: &[u8]) -> usize {
 // Every member delivered at its name with its bytes, and no article asked
 // for twice.
 fn assert_members(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
+    assert_members_delivered(outcome, members);
+    assert_eq!(
+        outcome.refetched(),
+        Vec::new(),
+        "{}: refetched",
+        outcome.engine
+    );
+}
+
+// Every member delivered at its name with its bytes, and nothing else.
+fn assert_members_delivered(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
     assert!(
         outcome.completed(),
         "{}: {:?} {:?}",
@@ -110,26 +121,6 @@ fn assert_members(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
             "{}: {name} bytes",
             outcome.engine
         );
-    }
-    assert_eq!(
-        outcome.refetched(),
-        Vec::new(),
-        "{}: refetched",
-        outcome.engine
-    );
-}
-
-// A run that sat at `status` with nothing left to do.
-fn assert_stalled(result: Result<Outcome, Stall>, engine: Engine, status: JobStatus) {
-    match result {
-        Err(stall) => {
-            assert_eq!(stall.engine, engine);
-            assert_eq!(stall.status, Some(status), "{engine}: {}", stall.state);
-        }
-        Ok(outcome) => panic!(
-            "{engine} finished {:?} {:?}, expected a stall at {status:?}",
-            outcome.status, outcome.failure
-        ),
     }
 }
 
@@ -268,9 +259,9 @@ async fn two_stores_share_the_window_volume_by_volume() {
 // Row 3. A damaged article in the second volume: the PAR2 object's recovery
 // seek is promoted over every store bid, so the recovery volume that holds
 // enough blocks comes whole before the store's remaining volumes, and the
-// others are only sampled. Classic leaves the job at Downloading: it holds
-// the store's damage for an unpack that a store fed in order never asks
-// for, where the graph repairs as soon as the blocks are in.
+// others are only sampled. Classic repairs from PAR2 once the download is
+// in and delivers every member, asking for some articles twice; the graph
+// repairs as soon as the blocks are in.
 #[tokio::test]
 async fn a_recovery_seek_is_promoted_over_every_store_bid() {
     let members = members(3, 61);
@@ -295,17 +286,13 @@ async fn a_recovery_seek_is_promoted_over_every_store_bid() {
         last(&graph, 7) < last(&graph, 5),
         "the recovery volume comes whole before the store's last volume"
     );
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Downloading,
-    );
+    assert_members_delivered(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 4a. A recovery article lost in the first recovery volume: the seek is
 // lost there, but the blocks beyond the lost article still come, and the
-// next volume makes up the shortfall. Classic stalls at Downloading, as in
-// row 3.
+// next volume makes up the shortfall. Classic repairs and delivers every
+// member, as in row 3.
 #[tokio::test]
 async fn a_lost_recovery_article_is_made_up_from_the_next_volume() {
     let members = members(3, 71);
@@ -321,18 +308,13 @@ async fn a_lost_recovery_article_is_made_up_from_the_next_volume() {
         vec![Some(RepairOutcome::Repaired { slices: 1 })]
     );
     assert_eq!(graph.graph().blocks_reachable, 2);
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Downloading,
-    );
+    assert_members_delivered(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 4b. The only recovery block lost: nothing can make it up, so the
 // graph rules the repair impossible at once and asks for nothing again.
-// Classic leaves the job at Downloading: its RAR set never takes in the
-// damaged second volume, holding it for a repair that cannot come, where
-// the graph delivers what the repair did not need.
+// Classic fails the whole job as Repair with nothing delivered, where the
+// graph delivers what the repair did not need.
 #[tokio::test]
 async fn a_lost_recovery_article_nothing_makes_up_fails_the_repair() {
     let members = members(3, 81);
@@ -359,15 +341,17 @@ async fn a_lost_recovery_article_nothing_makes_up_fails_the_repair() {
             reachable: 0
         })]
     );
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Downloading,
+    assert_fails_leaving(
+        &run(&scenario, Engine::Classic).await,
+        HistoryFailureKind::Repair,
+        "PAR2 recovery failed for 1 set(s): silver.horizon.par2",
+        &[],
     );
 }
 
 // Row 4c. A recovery article lost in the one volume that holds the blocks:
 // the block it carried is gone, and the volume's next block repairs.
+// Classic repairs too and delivers every member.
 #[tokio::test]
 async fn a_lost_recovery_article_is_made_up_from_the_same_volume() {
     let members = members(3, 75);
@@ -382,8 +366,7 @@ async fn a_lost_recovery_article_is_made_up_from_the_same_volume() {
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 1 })]
     );
-    let classic = try_run(&scenario, Engine::Classic).await;
-    assert_stalled(classic, Engine::Classic, JobStatus::Downloading);
+    assert_members_delivered(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 5. A data article lost with no recovery: the loss reaches the store
@@ -434,8 +417,8 @@ async fn a_lost_data_article_without_recovery_delivers_the_volumes_as_posted() {
 
 // Row 6a. A store posted inside an xz stream: the stream cannot seek, so
 // every bid is answered Unseekable and the store reads in stream order.
-// Classic leaves the job at Extracting: it has no reader for a store inside
-// a stream.
+// Classic decodes the stream, extracts the volume, and delivers every
+// member with no article asked for twice.
 #[tokio::test]
 async fn a_store_read_out_of_a_stream_reads_in_stream_order() {
     let members = members(3, 101);
@@ -443,11 +426,7 @@ async fn a_store_read_out_of_a_stream_reads_in_stream_order() {
     let scenario = Scenario::new(vec![Post::plain("silver.horizon.rar.xz", xz(&volume.1))]);
     let graph = run(&scenario, Engine::Graph).await;
     assert_members(&graph, &members);
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Extracting,
-    );
+    assert_members(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 6b. A PAR2 set stored beside a damaged member in one RAR volume: the
@@ -503,17 +482,23 @@ async fn a_par2_set_in_a_plain_store_repairs_the_member_beside_it() {
 
 // The same volume inside an xz stream: the store reads it as the stream
 // decodes it, and the set repairs exactly as in the plain twin. Classic
-// leaves the job at Extracting, as in row 6a.
+// decodes the stream and extracts the volume as in the plain twin: ember.bin
+// as stored, damaged, beside the two PAR2 files, and completes.
 #[tokio::test]
 async fn a_par2_set_in_a_store_in_a_stream_repairs_the_member_beside_it() {
-    let (scenario, body, _) =
+    let (scenario, body, bad) =
         par2_in_a_store(|bytes| Post::plain("silver.horizon.rar.xz", xz(&bytes))).await;
     let graph = run(&scenario, Engine::Graph).await;
     assert_repaired_in_store(&graph, &body, 11);
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Extracting,
+    let classic = run(&scenario, Engine::Classic).await;
+    assert!(classic.completed(), "{:?}", classic.failure);
+    assert_eq!(
+        classic.files.keys().cloned().collect::<Vec<_>>(),
+        ["ember.bin", "ember.par2", "ember.vol0+2.par2"].map(|name| format!("{FOLDER}/{name}"))
+    );
+    assert!(
+        classic.files[&format!("{FOLDER}/ember.bin")] == bad,
+        "classic: ember.bin as stored"
     );
 }
 

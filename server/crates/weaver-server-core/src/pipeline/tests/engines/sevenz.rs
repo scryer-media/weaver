@@ -20,7 +20,7 @@ use crate::pipeline::tests::direct_store::multi_member_store_set;
 
 use super::harness::{
     ARTICLE, Claim, JOB, Outcome, Post, Scenario, admit, assert_same, collect, kinds, par2_set,
-    par2_volumes_sliced, payload, run, run_both, run_unprompted, try_run,
+    par2_volumes_sliced, payload, run, run_both, run_unprompted,
 };
 use super::refused_then_repaired::{drive_to_finish, serve_posts};
 use crate::pipeline::tests::{job_status_for_assert, retire_pipeline_database};
@@ -211,7 +211,7 @@ async fn a_split_7z_under_hash_names_inside_a_stored_rar_named_by_par2_last_deli
         .collect();
     let outer = multi_member_store_set(&named, 1).remove(0).1;
     let scenario = Scenario::new(vec![Post::plain("lantern.rar", outer)]);
-    let classic = try_run(&scenario, Engine::Classic).await.unwrap();
+    let classic = run(&scenario, Engine::Classic).await;
     assert!(
         matches!(classic.status, Some(JobStatus::Failed { .. })),
         "{:?}",

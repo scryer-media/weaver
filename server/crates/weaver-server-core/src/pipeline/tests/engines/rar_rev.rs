@@ -9,8 +9,9 @@
 use sha2::Digest;
 use weaver_graph::recovery::RepairOutcome;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run, try_run};
-use super::rar::{assert_classic_stalls, delivered, posts};
+use super::harness::{ARTICLE, Outcome, Post, Scenario, assert_fails_leaving, payload, run};
+use super::rar::{delivered, posts};
+use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::scenarios::{HeaderCheck, header_encrypted_store_set};
@@ -98,11 +99,27 @@ fn rar5_set(absent: &[usize], revs: usize) -> (Vec<u8>, Scenario) {
     (body, Scenario::new(posted(volumes, absent, revs)))
 }
 
-// Classic waits on the volume no article carries and never settles, as it
-// does for any RAR set with a hole; the graph rules on it.
-async fn run_each(scenario: &Scenario) -> Outcome {
-    assert_classic_stalls(try_run(scenario, Engine::Classic).await);
-    run(scenario, Engine::Graph).await
+// Classic rebuilds the absent volumes from the `.rev` files and delivers
+// the member, and delivers the spent `.rev` files beside it.
+fn assert_classic_rebuilt(classic: &Outcome, body: &[u8], revs: &[&str]) {
+    assert!(
+        classic.completed(),
+        "{:?} {:?}",
+        classic.status,
+        classic.failure
+    );
+    let mut names: Vec<String> = revs.iter().map(|name| delivered(name)).collect();
+    names.push(delivered(MEMBER));
+    names.sort();
+    assert_eq!(
+        classic.files.keys().cloned().collect::<Vec<_>>(),
+        names,
+        "classic: delivered names"
+    );
+    assert!(
+        classic.files[&delivered(MEMBER)] == body,
+        "classic: member bytes"
+    );
 }
 
 // The member alone, every byte as written, after one ruling that rebuilt
@@ -135,13 +152,21 @@ fn assert_rebuilt(outcome: &Outcome, body: &[u8], volumes: u64) {
 #[tokio::test]
 async fn rar_rev_rebuilds_one_absent_rar5_volume_from_one_recovery_volume() {
     let (body, scenario) = rar5_set(&[1], 1);
-    assert_rebuilt(&run_each(&scenario).await, &body, 1);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_classic_rebuilt(&classic, &body, &["silver.horizon.part1.rev"]);
+    assert_rebuilt(&run(&scenario, Engine::Graph).await, &body, 1);
 }
 
 #[tokio::test]
 async fn rar_rev_rebuilds_two_absent_rar5_volumes_from_two_recovery_volumes() {
     let (body, scenario) = rar5_set(&[1, 3], 2);
-    assert_rebuilt(&run_each(&scenario).await, &body, 2);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_classic_rebuilt(
+        &classic,
+        &body,
+        &["silver.horizon.part1.rev", "silver.horizon.part2.rev"],
+    );
+    assert_rebuilt(&run(&scenario, Engine::Graph).await, &body, 2);
 }
 
 #[tokio::test]
@@ -158,7 +183,9 @@ async fn rar_rev_rebuilds_one_absent_rar4_volume_from_its_recovery_volume() {
         single_recovery_volume_for_rar4_set(&bytes),
     );
     let scenario = Scenario::new(posted(volumes, &[2], vec![rev]));
-    assert_rebuilt(&run_each(&scenario).await, &body, 1);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_classic_rebuilt(&classic, &body, &["silver.horizon1.rev"]);
+    assert_rebuilt(&run(&scenario, Engine::Graph).await, &body, 1);
 }
 
 // A RAR3 recovery volume as RAR writes it beside volumes whose end headers
@@ -241,13 +268,27 @@ async fn rar_rev_rebuilds_two_absent_header_encrypted_volumes() {
     let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
     let revs = rar5_revs("silver.horizon", &bytes, 2);
     let scenario = Scenario::new(posted(volumes, &[1, 2], revs)).password(SECRET);
-    assert_rebuilt(&run_each(&scenario).await, &body, 2);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_classic_rebuilt(
+        &classic,
+        &body,
+        &["silver.horizon.part1.rev", "silver.horizon.part2.rev"],
+    );
+    assert_rebuilt(&run(&scenario, Engine::Graph).await, &body, 2);
 }
 
+// Classic fails the job as Repair on the first absent volume, with
+// nothing delivered.
 #[tokio::test]
 async fn rar_rev_short_of_recovery_volumes_fails_the_job_and_delivers_nothing() {
     let (_, scenario) = rar5_set(&[1, 2], 1);
-    let graph = run_each(&scenario).await;
+    assert_fails_leaving(
+        &run(&scenario, Engine::Classic).await,
+        HistoryFailureKind::Repair,
+        "missing archive part 'silver.horizon.part02.rar'",
+        &[],
+    );
+    let graph = run(&scenario, Engine::Graph).await;
     assert!(
         matches!(graph.status, Some(JobStatus::Failed { .. })),
         "{:?} {:?}",

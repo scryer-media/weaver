@@ -6,9 +6,10 @@
 // engine and reads its members out of a run over the growing files.
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, payload, run, run_both, try_run,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fails_leaving, assert_same, kinds, payload,
+    run, run_both,
 };
-use super::rar::{assert_classic_stalls, delivered, posts, with_par2};
+use super::rar::{delivered, posts, with_par2};
 use crate::history::failure_kind::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
@@ -149,11 +150,11 @@ async fn the_encrypted_five_volume_set_with_its_password_up_front_delivers_under
 
 // The password reaches the store only as a candidate the job offers once
 // the store asks, as rar.rs's two-volume candidate row has it for a stored
-// set. Divergence: classic never settles.
+// set. Classic opens it with the candidate too and delivers the member.
 #[tokio::test]
 async fn the_encrypted_five_volume_set_opened_by_a_password_candidate_delivers_under_graph() {
     let scenario = video(posts(video_set())).global_password(VIDEO_SECRET);
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    assert_video(&run(&scenario, Engine::Classic).await);
     let graph = run(&scenario, Engine::Graph).await;
     assert_video(&graph);
     assert_eq!(kinds(&graph), ["rar_store"]);
@@ -164,14 +165,14 @@ async fn the_encrypted_five_volume_set_opened_by_a_password_candidate_delivers_u
 
 // A wrong candidate and then the right one: the store refutes the first by
 // the member's password check and asks again, and each candidate is offered
-// once. Divergence: classic never settles.
+// once. Classic finds the right one too and delivers the member.
 #[tokio::test]
 async fn the_encrypted_five_volume_set_tries_a_wrong_candidate_once_then_the_right_one_under_graph()
 {
     let scenario = video(posts(video_set()))
         .global_password("cinder-wrong-guess")
         .global_password(VIDEO_SECRET);
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    assert_video(&run(&scenario, Engine::Classic).await);
     let graph = run(&scenario, Engine::Graph).await;
     assert_video(&graph);
     assert_eq!(kinds(&graph), ["rar_store"]);
@@ -217,11 +218,12 @@ fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
 
 // No password and no candidate: the store asks, nothing answers, and once
 // the whole set is in it gives the volumes back withheld. Divergence:
-// classic never settles.
+// classic fails it as Repair, not Password, once it has asked for every
+// article twice.
 #[tokio::test]
 async fn the_encrypted_five_volume_set_with_no_password_fails_naming_the_password_under_graph() {
     let scenario = video(posts(video_set()));
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    assert_classic_fails_as_repair_after_asking_twice(&run(&scenario, Engine::Classic).await);
     let graph = run(&scenario, Engine::Graph).await;
     assert_needs_password(&graph, &video_set());
     assert_eq!(kinds(&graph), ["rar_store"]);
@@ -255,16 +257,33 @@ async fn a_header_encrypted_set_with_no_password_fails_naming_the_password_under
 
 // A wrong candidate only: offered once, refuted by the member's password
 // check, and with none left the store gives the volumes back withheld, in
-// the same words. Divergence: classic never settles.
+// the same words. Divergence: classic fails it as Repair, not Password,
+// once it has asked for every article twice.
 #[tokio::test]
 async fn the_encrypted_five_volume_set_with_only_a_wrong_candidate_fails_naming_the_password_under_graph()
  {
     let scenario = video(posts(video_set())).global_password("cinder-wrong-guess");
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    assert_classic_fails_as_repair_after_asking_twice(&run(&scenario, Engine::Classic).await);
     let graph = run(&scenario, Engine::Graph).await;
     assert_needs_password(&graph, &video_set());
     let offered: Vec<_> = graph.graph().offered.values().copied().collect();
     assert_eq!(offered, [1], "one try for the one candidate");
+}
+
+// Classic on the encrypted set nothing opens: every article asked for
+// twice, then the job failed as Repair with nothing delivered.
+fn assert_classic_fails_as_repair_after_asking_twice(classic: &Outcome) {
+    assert_fails_leaving(
+        classic,
+        HistoryFailureKind::Repair,
+        "no retryable work remains for incomplete RAR sets",
+        &[],
+    );
+    assert!(
+        classic.requests.values().all(|count| *count == 2),
+        "{:?}",
+        classic.requests
+    );
 }
 
 // The first article of each volume, in the order it was asked for.
@@ -434,13 +453,14 @@ async fn the_swapped_set_beside_an_index_whose_four_recovery_volumes_are_gone_de
 // it in the stream and delivers the member, as posted, with no refetch.
 // The set rewrites the one slice that was bad and vouches for the rest of
 // the damaged article, so no mark of damage is left on clip.part3.rar or
-// the member and the job is Complete. Divergence: classic never settles.
+// the member and the job is Complete. Classic repairs it from PAR2 and
+// delivers the member.
 #[tokio::test]
 async fn the_encrypted_set_damaged_mid_volume_beside_par2_is_repaired_in_the_stream_under_graph() {
     let scenario = video(with_par2(video_set()))
         .password(VIDEO_SECRET)
         .damaged(2, 10);
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    assert_video(&run(&scenario, Engine::Classic).await);
     let graph = run(&scenario, Engine::Graph).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
@@ -512,11 +532,12 @@ fn mixed_with_par2() -> Scenario {
 }
 
 // The compressed member's article damaged, PAR2 beside: repaired in the
-// stream before the engine reads it. Divergence: classic never settles.
+// stream before the engine reads it. Classic repairs it from PAR2 and
+// delivers the three members.
 #[tokio::test]
 async fn the_compressed_member_damaged_beside_par2_is_repaired_in_the_stream_under_graph() {
     let scenario = mixed_with_par2().damaged(0, COMPRESSED_ARTICLE);
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    assert_mixed_members(&run(&scenario, Engine::Classic).await);
     let graph = run(&scenario, Engine::Graph).await;
     assert_mixed_members(&graph);
     assert_engine_ran(&graph);
@@ -601,14 +622,24 @@ async fn the_compressed_member_damaged_without_par2_delivers_the_members_it_clos
 
 // A solid RARLAB archive in 1 MiB articles: the store cannot stream a
 // solid member, so the graph hands the volume to the engine, which
-// delivers the three members with no refetch. Divergence: classic never
-// settles on either solid fixture under the harness, in 1 MiB or 64 KiB
-// articles.
+// delivers the three members with no refetch. Classic plans the solid set,
+// extracts it, and delivers the same three members.
 async fn solid_row(path: &str) -> Outcome {
     let scenario =
         Scenario::new(vec![Post::plain("solid.rar", rar5_fixture_bytes(path))]).framed(1 << 20);
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert!(
+        classic.completed(),
+        "{:?} {:?}",
+        classic.status,
+        classic.failure
+    );
+    assert!(!classic.requests.is_empty(), "classic asks for the set");
     let graph = run(&scenario, Engine::Graph).await;
+    assert!(
+        classic.files == graph.files,
+        "classic delivers what the graph does"
+    );
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -685,12 +716,24 @@ fn assert_hands_back_the_volume(graph: &Outcome) {
 
 // Nothing of the payload is whole and the engine's verdict marks the whole
 // volume damaged, so no byte of it is delivery evidence: the job fails and
-// nothing moves to the complete directory. Divergence: classic never
-// settles on the solid fixture under the harness.
+// nothing moves to the complete directory. Classic asks for every article
+// twice, then fails the job as Repair on the member's CRC with nothing
+// delivered.
 #[tokio::test]
 async fn a_compressed_rar5_member_corrupted_without_par2_hands_back_its_volume_under_graph() {
     let scenario = corrupted_solid_scenario().framed(1 << 20);
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_fails_leaving(
+        &classic,
+        HistoryFailureKind::Repair,
+        "extraction CRC failures with no PAR2 data",
+        &[],
+    );
+    assert!(
+        classic.requests.values().all(|count| *count == 2),
+        "{:?}",
+        classic.requests
+    );
     let graph = run(&scenario, Engine::Graph).await;
     assert_hands_back_the_volume(&graph);
     assert!(
