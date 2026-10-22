@@ -778,6 +778,7 @@ enum DbWriteCommand {
     // whose archive failed and why.
     ArchiveJobs {
         jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
         committed: oneshot::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
     },
     InsertJobEvents {
@@ -875,7 +876,7 @@ async fn execute_write_command(
             committed,
         } => {
             let writer = writer.clone();
-            tokio::task::spawn_blocking(move || {
+            let archived = tokio::task::spawn_blocking(move || {
                 // Capture the cache generation *before* the archive
                 // read so a concurrent history-delete that bumps the
                 // generation makes the conditional insert a no-op,
@@ -895,23 +896,35 @@ async fn execute_write_command(
                             error = %error,
                             "failed to archive job on database writer path"
                         );
+                        return false;
                     }
                 }
+                true
             })
-            .await
-            .ok();
-            if let Some(committed) = committed {
+            .await;
+            if matches!(archived, Ok(true))
+                && let Some(committed) = committed
+            {
                 let _ = committed.send(());
             }
         }
-        DbWriteCommand::ArchiveJobs { jobs, committed } => {
+        DbWriteCommand::ArchiveJobs {
+            jobs,
+            failure_kind,
+            committed,
+        } => {
             let writer = writer.clone();
             let failed = tokio::task::spawn_blocking(move || {
                 let mut failed = BTreeMap::new();
                 for (job_id, history) in jobs {
                     // Taken before each archive read, as for one archive.
                     let observed_generation = writer.job_history_cache_generation();
-                    match writer.archive_job_with_terminal_cause(job_id, &history, None, None) {
+                    match writer.archive_job_with_terminal_cause(
+                        job_id,
+                        &history,
+                        None,
+                        failure_kind,
+                    ) {
                         Ok(Some(row)) => writer.cache_job_history_at(row, observed_generation),
                         Ok(None) => {}
                         Err(error) => {
@@ -1510,11 +1523,13 @@ impl Database {
     pub(crate) fn try_queue_archive_jobs(
         &self,
         jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
     ) -> Result<oneshot::Receiver<BTreeMap<crate::jobs::ids::JobId, String>>, StateError> {
         let (committed_tx, committed_rx) = oneshot::channel();
         self.try_send_with_retry(
             DbWriteCommand::ArchiveJobs {
                 jobs,
+                failure_kind,
                 committed: committed_tx,
             },
             "archive",

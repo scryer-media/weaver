@@ -549,6 +549,8 @@ metric_families! {
         "Decoded bytes attributed to each category. Category is empty when the job has none.");
 
     // ---- pipeline stage histograms ----------------------------------------------------
+    TURN_DURATION = ("weaver_pipeline_turn_duration_seconds", Histogram, [],
+        "Pipeline turn duration, including awaited work and excluding the idle event wait.");
     DISK_WRITE_DURATION = ("weaver_pipeline_disk_write_duration_seconds", Histogram, [],
         "Time spent in individual disk write calls.");
     DECODE_TASK_DURATION = ("weaver_pipeline_decode_task_duration_seconds", Histogram, [],

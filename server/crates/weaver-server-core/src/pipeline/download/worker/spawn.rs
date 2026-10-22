@@ -101,6 +101,10 @@ impl Pipeline {
             exclude_servers,
         } = work;
         let raw_size = raw.len() as u64;
+        let counters = self
+            .shared_state
+            .queue
+            .job_counters(segment_id.file_id.job_id);
         let metrics = Arc::clone(&self.metrics);
         metrics.note_decode_task_started(raw_size);
         let queued_at = Instant::now();
@@ -174,6 +178,9 @@ impl Pipeline {
                         // Block evidence needs a known starting offset. An
                         // article whose own begin was unusable has none.
                         let offset_known = decode_result.metadata.file_offset_is_known();
+                        if let Some(counters) = &counters {
+                            counters.record_decoded(decoded.len_bytes() as u64);
+                        }
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,
@@ -254,6 +261,9 @@ impl Pipeline {
                         // Block evidence needs a known starting offset. An
                         // article whose own begin was unusable has none.
                         let offset_known = decode_result.metadata.file_offset_is_known();
+                        if let Some(counters) = &counters {
+                            counters.record_decoded(output.len() as u64);
+                        }
                         let _ = tx.blocking_send(DecodeDone::Success {
                             result: DecodeResult {
                                 segment_id,

@@ -4,14 +4,15 @@
 use super::*;
 
 mod commands;
+mod control;
 mod hardware_profile;
 mod history;
+mod report;
 mod runtime;
 mod scripts;
 mod state;
 
-pub(crate) use commands::CancelJobsDone;
-pub(crate) use history::{FinishedJobs, HistoryDeleteDone};
+pub(super) use commands::CancelJobsDone;
 pub(super) use runtime::timestamp_secs;
 pub(crate) use runtime::{
     DirectWriteBatches, close_cached_write_handles_under, is_terminal_status,

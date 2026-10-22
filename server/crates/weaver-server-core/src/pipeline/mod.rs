@@ -18,9 +18,12 @@ mod infrastructure_retry;
 pub(crate) mod integrity;
 mod orchestrator;
 mod progress;
+pub mod queue;
 mod repair;
 mod server_attribution;
 mod support_facts;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub(crate) use orchestrator::{
     close_cached_write_handles_under, release_cached_write_handle,
@@ -45,7 +48,6 @@ use tracing::{debug, error, info, warn};
 use crate::ActiveFileProgress;
 #[cfg(test)]
 use crate::RestoreJobRequest;
-use crate::bandwidth::service::BandwidthLedgerRuntime;
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::ExtractionReadiness;
 #[cfg(test)]
@@ -53,14 +55,14 @@ use crate::jobs::assembly::JobAssembly;
 use crate::jobs::assembly::write_buffer::{BufferedChunk, WriteReorderBuffer};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
-use crate::jobs::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
+use crate::jobs::{JobPhase, PhaseAttemptCounters, PhaseCounters};
 use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
     DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork, JobInfo, JobSpec,
-    JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner, SchedulerCommand,
-    SchedulerError, SharedPipelineState, TokenBucket,
+    JobState, JobStatus, NntpRuntimeActivation, PipelineMetrics, RuntimeTuner, SharedPipelineState,
+    TokenBucket,
 };
 #[cfg(test)]
 use par2_rs::checksum;
@@ -227,6 +229,28 @@ pub(crate) struct ArchivePasswordHarvest {
 }
 
 impl Pipeline {
+    // Consumption boundaries may follow an await in the same actor turn. Read
+    // a recorded override there even when it has not reached the runtime spec.
+    pub(crate) fn job_password_at_boundary(
+        &self,
+        job_id: JobId,
+        fallback: Option<&str>,
+    ) -> Option<String> {
+        self.shared_state.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .find(|row| row.id == job_id)
+                .and_then(|row| row.intents.update.as_ref())
+                .and_then(|update| match &update.password {
+                    crate::jobs::FieldUpdate::Unchanged => None,
+                    crate::jobs::FieldUpdate::Clear => Some(None),
+                    crate::jobs::FieldUpdate::Set(password) => Some(Some(password.clone())),
+                })
+                .unwrap_or_else(|| fallback.map(str::to_owned))
+        })
+    }
+
     // The one place a job's archive-password candidate list is built. Every
     // consumer takes it from here: the direct store's `-hp` and `-mhe` header
     // admission, the restart seam, archive probe and topology, finalize and
@@ -244,7 +268,10 @@ impl Pipeline {
         job_id: JobId,
     ) -> ArchivePasswordHarvest {
         let state = self.jobs.get(&job_id);
-        let spec_password = state.and_then(|state| state.spec.password.as_deref());
+        let spec_password = self.job_password_at_boundary(
+            job_id,
+            state.and_then(|state| state.spec.password.as_deref()),
+        );
         let (carried, mut complete) =
             match state.and_then(|state| state.nzb_password_candidates.get()) {
                 Some(cached) => (cached.clone(), true),
@@ -272,7 +299,11 @@ impl Pipeline {
         };
 
         ArchivePasswordHarvest {
-            candidates: assemble_archive_password_candidates(spec_password, &carried, &global),
+            candidates: assemble_archive_password_candidates(
+                spec_password.as_deref(),
+                &carried,
+                &global,
+            ),
             complete,
         }
     }
@@ -1767,13 +1798,12 @@ pub(super) struct MoveToCompleteDone {
 }
 
 pub(super) enum TerminalPostProcessingEvent {
-    HistoryDeleteDone(orchestrator::HistoryDeleteDone),
-    CancelJobsDone(orchestrator::CancelJobsDone),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
     AddedScriptsDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
+    CancelJobsDone(orchestrator::CancelJobsDone),
 }
 
 pub(super) struct TerminalPostProcessingDone {
@@ -2550,8 +2580,7 @@ pub(in crate::pipeline) struct TerminalReconciliation {
 // The pipeline engine. Owns the scheduler loop and drives work through
 // download → decode → commit → verify → repair → extract stages.
 pub struct Pipeline {
-    // Receives commands from SchedulerHandle.
-    pub(super) cmd_rx: mpsc::Receiver<SchedulerCommand>,
+    _control_runtime: queue::RuntimeGuard,
     // Broadcasts pipeline events to subscribers (API, journal, etc).
     pub(super) event_tx: broadcast::Sender<PipelineEvent>,
     // NNTP client for fetching articles.
@@ -2894,11 +2923,6 @@ pub struct Pipeline {
     // arrival.
     pub(super) added_script_holds: HashSet<JobId>,
     pub(super) script_data_dir: PathBuf,
-    pub(super) pending_history_deletions: HashSet<JobId>,
-    // Jobs whose batched cancel has queued its archive and waits for it to
-    // commit, with the batch's generation. The job stays live until then.
-    pub(super) pending_cancellations: HashMap<JobId, u64>,
-    pub(super) cancel_generation: u64,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     // Cooperative cancellation tokens for PAR2 verification and repair work.
@@ -3002,12 +3026,12 @@ pub struct Pipeline {
     pub(super) direct_demotion_done_rx: mpsc::Receiver<DirectDemotionWorkDone>,
     // Whether all downloads are globally paused.
     pub(super) global_paused: bool,
+    pub(super) applied_speed_test_pause: bool,
+    pub(super) applied_random_read_iops: Option<f64>,
     // Whether the active global pause came from a bandwidth schedule rather
     // than an operator action. Only meaningful while `global_paused` is true;
     // it selects the Scheduled vs ManualPause download-block presentation.
     pub(super) scheduled_pause: bool,
-    // The per-minute download ledger behind the bandwidth graph.
-    pub(crate) bandwidth_ledger: BandwidthLedgerRuntime,
     // Estimated bytes charged to the speed limiter for in-flight downloads.
     pub(crate) rate_limit_reservations: HashMap<SegmentId, u64>,
     // Persisted/general speed limit restored when no schedule speed action is active.
@@ -3030,17 +3054,6 @@ pub struct Pipeline {
     pub(super) download_pressure_hard_stall_started_at: Option<Instant>,
     // Next time soft byte pressure may issue a replacement article.
     pub(super) download_pressure_soft_dispatch_after: Option<Instant>,
-    // When the job snapshot was last rebuilt and published.
-    pub(super) snapshot_published_at: Option<Instant>,
-    // Whether a debounced snapshot publish is owed once the window reopens.
-    pub(super) snapshot_publish_pending: bool,
-    // Whether anything the job snapshot shows may have changed since it was
-    // last published. A turn woken only by a periodic tick leaves it clear,
-    // so an idle pipeline never rebuilds the snapshot.
-    pub(super) snapshot_dirty: bool,
-    // Whether the footprint gauges were last taken before the most recent
-    // state change, so the next tick must take them again.
-    pub(super) footprint_metrics_stale: bool,
     // Whether the last dispatch pass was held back by a gate that lifts with
     // time alone (a schedule window, the rate limiter, a download quota,
     // byte pressure) or found eligible work it could not place, so the idle
@@ -3075,8 +3088,6 @@ pub struct Pipeline {
     // epoch-millisecond timestamp for clients. The dispatch gate and run-loop
     // sleep use the monotonic deadline, so eligibility wakes without polling.
     pub(super) propagation_ready_at: HashMap<JobId, (Instant, i64)>,
-    // Last visible holds, used to notify subscribers after publishing a snapshot.
-    pub(super) published_propagation_holds: HashMap<JobId, i64>,
     // Configured minimum post age, updated through the scheduler command channel.
     pub(super) propagation_delay: Duration,
     #[cfg(test)]
@@ -3247,10 +3258,6 @@ pub struct Pipeline {
     pub(super) inflight_extractions: HashMap<JobId, HashSet<String>>,
     // Transient byte-progress state for active user-visible phases.
     pub(super) phase_progress: HashMap<(JobId, JobPhase), progress::JobPhaseRuntime>,
-    // Last sampled phase-progress snapshots projected into JobInfo.
-    pub(super) phase_progress_snapshots: HashMap<JobId, Vec<JobPhaseProgress>>,
-    // Per-job queue-event coalescing state for sampled phase progress.
-    pub(super) phase_publish_state: HashMap<JobId, progress::PhasePublishState>,
     // Cached per-job retention exclusions (pool server indices whose
     // retention window is older than the job). TTL'd; cleared on NNTP
     // client rebuilds and job removal.
@@ -3370,8 +3377,6 @@ pub struct Pipeline {
     pub(in crate::pipeline) jobs_with_verification_outcome: HashSet<JobId>,
     // Promoted PAR2 recovery segments that can no longer be fetched or decoded.
     pub(super) unavailable_promoted_recovery_segments: HashSet<SegmentId>,
-    // Finished jobs (Complete/Failed) from recovery — surfaced in list/get queries.
-    pub(super) finished_jobs: orchestrator::FinishedJobs,
     // Shared state for control plane reads (API handlers read without channel round-trip).
     pub(super) shared_state: SharedPipelineState,
     // SQLite database for durable history.
@@ -3411,4 +3416,4 @@ pub struct Pipeline {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

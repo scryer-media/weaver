@@ -50,6 +50,7 @@ impl Pipeline {
                 return Some(ready_at);
             }
             self.propagation_ready_at.remove(&job_id);
+            self.emit_job_event(PipelineEvent::PhaseProgressUpdated { job_id });
             return None;
         }
 
@@ -75,6 +76,7 @@ impl Pipeline {
             chrono::Utc::now().timestamp_millis() + remaining.as_millis() as i64;
         self.propagation_ready_at
             .insert(job_id, (ready_at, retry_at_epoch_ms));
+        self.emit_job_event(PipelineEvent::PhaseProgressUpdated { job_id });
         // Once per job, because the gate is consulted on every dispatch pass.
         info!(
             job_id = job_id.0,

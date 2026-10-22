@@ -21,6 +21,118 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn password_harvest_reads_recorded_overrides_before_the_next_actor_turn() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(45190);
+    let mut spec = standalone_job_spec("Password boundary", &[("payload.bin".into(), 100)]);
+    spec.password = Some("old-key".into());
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .update_job(
+            job_id,
+            crate::JobUpdate {
+                password: crate::jobs::FieldUpdate::Set("new-key".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pipeline.jobs[&job_id].spec.password.as_deref(),
+        Some("old-key")
+    );
+    assert_eq!(
+        pipeline.primary_archive_password_for_job(job_id).as_deref(),
+        Some("new-key")
+    );
+    assert_eq!(
+        pipeline.archive_password_candidates_for_set(job_id, "fixture")[0].value(),
+        "new-key"
+    );
+    // Restore passes a spec before the actor owns a JobState; that fallback
+    // must also yield to the row's recorded intent.
+    assert_eq!(
+        pipeline
+            .job_password_at_boundary(job_id, Some("restore-key"))
+            .as_deref(),
+        Some("new-key")
+    );
+
+    handle
+        .update_job(
+            job_id,
+            crate::JobUpdate {
+                password: crate::jobs::FieldUpdate::Clear,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pipeline.jobs[&job_id].spec.password.as_deref(),
+        Some("old-key")
+    );
+    assert!(pipeline.primary_archive_password_for_job(job_id).is_none());
+    assert!(
+        pipeline
+            .job_password_at_boundary(job_id, Some("restore-key"))
+            .is_none()
+    );
+    assert_eq!(
+        pipeline
+            .job_password_at_boundary(JobId(45191), Some("fallback-key"))
+            .as_deref(),
+        Some("fallback-key")
+    );
+}
+
+#[tokio::test]
+async fn direct_set_admission_uses_a_recorded_password_without_an_actor_turn() {
+    let payload: Vec<u8> = (0..800u32).map(|index| (index % 191) as u8).collect();
+    let volumes = encrypted_store_set(
+        "payload.bin",
+        &payload,
+        2,
+        "boundary-key",
+        Some("boundary-key"),
+        false,
+    );
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let job_id = JobId(45192);
+    let mut spec = direct_store_job_spec("Password boundary", &volumes);
+    spec.password = Some("old-key".into());
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .update_job(
+            job_id,
+            crate::JobUpdate {
+                password: crate::jobs::FieldUpdate::Set("boundary-key".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("admitted direct set");
+    assert!(
+        !set.is_demoted(),
+        "the recorded password must pass the header's password check: {set:?}"
+    );
+    assert_eq!(
+        pipeline.jobs[&job_id].spec.password.as_deref(),
+        Some("old-key")
+    );
+}
+
+#[tokio::test]
 async fn an_encrypted_rar4_store_set_routes_plaintext_and_matches_the_conventional_extractor() {
     // The differential spine, over RAR4. 3000 is not a multiple of 16, so the
     // member carries 8 bytes of tail padding — the AES-128 final block decrypts
@@ -1777,13 +1889,19 @@ async fn a_header_encrypted_set_keys_from_a_password_supplied_after_its_harvest_
         "and the ring must still be collecting candidates"
     );
 
-    // The operator supplies it, mid-download.
-    pipeline
-        .jobs
-        .get_mut(&job_id)
-        .expect("the job is still active")
-        .spec
-        .password = Some("moonlit-harbour".to_string());
+    // The reply records it while this actor turn still has the old spec.
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .update_job(
+            job_id,
+            crate::JobUpdate {
+                password: crate::jobs::FieldUpdate::Set("moonlit-harbour".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(pipeline.jobs[&job_id].spec.password.is_none());
 
     for file_index in 0..volumes.len() as u32 {
         submit_volume_article(&mut pipeline, job_id, &volumes, file_index, 0).await;

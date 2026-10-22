@@ -75,9 +75,7 @@ impl Pipeline {
                     JobStatus::Extracting,
                     Some("extracting"),
                 );
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::ExtractionReady { job_id });
+                self.emit_job_event(PipelineEvent::ExtractionReady { job_id });
             }
             return;
         }
@@ -419,10 +417,15 @@ impl Pipeline {
     // CRC failures occur, recovery files are promoted for download and repair
     // runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
-        // A job whose cancel waits on its archive does not advance: the
-        // archive's done event either removes it or hands it back live, and
-        // a handed-back job is checked again then.
-        if self.pending_cancellations.contains_key(&job_id) {
+        // A retiring job does not advance: its archive's done event either
+        // removes it or hands it back live, and a handed-back job is checked
+        // again then.
+        if self.shared_state.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .any(|row| row.id == job_id && row.report.retiring)
+        }) {
             return;
         }
         if self.shared_state.is_post_processing_paused() {
@@ -1530,7 +1533,7 @@ impl Pipeline {
                         );
                         // The job's event log is where this verdict is kept;
                         // the line above is detail.
-                        let _ = self.event_tx.send(PipelineEvent::JobVerificationComplete {
+                        self.emit_job_event(PipelineEvent::JobVerificationComplete {
                             job_id,
                             passed: true,
                         });
@@ -2437,7 +2440,7 @@ impl Pipeline {
                                 );
                             }
                             self.emit_job_verification_started(job_id);
-                            let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
+                            self.emit_job_event(PipelineEvent::VerificationStarted {
                                 file_id: NzbFileId {
                                     job_id,
                                     file_index: 0,
@@ -2479,7 +2482,7 @@ impl Pipeline {
                                 );
                             }
                             self.emit_job_verification_started(job_id);
-                            let _ = self.event_tx.send(PipelineEvent::VerificationStarted {
+                            self.emit_job_event(PipelineEvent::VerificationStarted {
                                 file_id: NzbFileId {
                                     job_id,
                                     file_index: 0,
@@ -3301,9 +3304,7 @@ impl Pipeline {
                 self.metrics.job_lifecycle.note_extraction(
                     crate::operations::instrumentation::StageOutcomeKind::Complete,
                 );
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::ExtractionComplete { job_id });
+                self.emit_job_event(PipelineEvent::ExtractionComplete { job_id });
 
                 // Move extracted files to complete directory.
                 if let Err(error) = self.start_move_to_complete(job_id).await {

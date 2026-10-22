@@ -336,23 +336,27 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     );
     assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
 
-    let (reply, recv) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
-        .await;
-    recv.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_all()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.global_paused);
+    pipeline.db.flush_write_queue().await.unwrap();
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
         Some("true")
     );
 
-    let (reply, recv) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumeAll { reply })
-        .await;
-    recv.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_all()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(!pipeline.global_paused);
+    pipeline.db.flush_write_queue().await.unwrap();
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
         Some("false")

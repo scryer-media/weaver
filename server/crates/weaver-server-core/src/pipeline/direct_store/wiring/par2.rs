@@ -608,6 +608,7 @@ impl Pipeline {
                             (
                                 segment_id,
                                 DownloadWork {
+                                    counters: None,
                                     segment_id,
                                     message_id: crate::jobs::ids::MessageId::new(
                                         &segment.message_id,
@@ -3123,7 +3124,7 @@ impl Pipeline {
         // refusal past this point sends no terminal — the demotion hands the
         // job to the conventional repairer, whose own pair records how the
         // repair actually ended.
-        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
+        self.emit_job_event(PipelineEvent::RepairStarted { job_id });
 
         let working_dir = self
             .jobs
@@ -3243,7 +3244,7 @@ impl Pipeline {
             crate::operations::instrumentation::StageOutcomeKind::Complete,
             outcome.recovery_blocks_used as u64,
         );
-        let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+        self.emit_job_event(PipelineEvent::RepairComplete {
             job_id,
             slices_repaired: u32::try_from(outcome.recovery_blocks_used).unwrap_or(u32::MAX),
         });

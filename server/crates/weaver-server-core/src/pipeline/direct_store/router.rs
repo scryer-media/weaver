@@ -3479,6 +3479,13 @@ impl DirectSetRouter {
         &self.plan
     }
 
+    pub(crate) fn relocate_working_dir(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        self.plan.working_dir = new.to_path_buf();
+        if let Ok(relative) = self.scratch.path.strip_prefix(old) {
+            self.scratch.path = new.join(relative);
+        }
+    }
+
     // Records one identity binding on the plan. The router keeps no per-volume
     // state ahead of a volume's first bytes — every internal map is guarded by
     // `plan.volumes.contains_key` and fills lazily — so growing the mapping

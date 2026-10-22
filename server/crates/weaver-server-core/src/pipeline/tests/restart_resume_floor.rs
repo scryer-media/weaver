@@ -300,6 +300,7 @@ async fn an_advancing_floor_brings_a_resumed_job_back_within_the_restart_lead() 
     let limit = Pipeline::restart_durable_lead_limit_bytes();
 
     let work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id,
             segment_number: 4,

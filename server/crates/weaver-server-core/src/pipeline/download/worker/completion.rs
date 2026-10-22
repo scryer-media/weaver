@@ -132,6 +132,7 @@ impl Pipeline {
             return false;
         };
         let work = DownloadWork {
+            counters: None,
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -221,6 +222,7 @@ impl Pipeline {
             .iter()
             .find(|seg| seg.ordinal == segment_id.segment_number)?;
         Some(DownloadWork {
+            counters: None,
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -422,9 +424,6 @@ impl Pipeline {
                 Err(_) => 0,
             };
             self.rate_limiter.consume(bytes);
-            if let Err(error) = self.record_download_bandwidth_usage(bytes) {
-                error!(%error, "failed to account for retired lane transport usage");
-            }
             return false;
         }
         if result.release_connection_slot
@@ -514,15 +513,6 @@ impl Pipeline {
             Err(_) => None,
         };
         self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
-        if let Some(raw_bytes) = actual_raw_bytes
-            && let Err(error) = self.record_download_bandwidth_usage(raw_bytes)
-        {
-            error!(
-                error = %error,
-                segment = %result.segment_id,
-                "failed to record download bandwidth usage"
-            );
-        }
         true
     }
 
@@ -1348,6 +1338,7 @@ impl Pipeline {
                         {
                             let priority = file_spec.role.download_priority();
                             let work = DownloadWork {
+                                counters: None,
                                 segment_id: seg_id,
                                 message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
                                 groups: std::sync::Arc::from(file_spec.groups.as_slice()),

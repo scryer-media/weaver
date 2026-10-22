@@ -41,29 +41,6 @@ use weaver_server_core::{
 #[derive(Default)]
 pub(crate) struct JobsMutation;
 
-fn upsert_metadata_entry(metadata: &mut Vec<(String, String)>, key: &str, value: String) {
-    let canonical_key = key.to_string();
-    let mut updated = Vec::with_capacity(metadata.len() + 1);
-    let mut replaced = false;
-
-    for (existing_key, existing_value) in metadata.drain(..) {
-        if existing_key.eq_ignore_ascii_case(key) {
-            if !replaced {
-                updated.push((canonical_key.clone(), value.clone()));
-                replaced = true;
-            }
-        } else {
-            updated.push((existing_key, existing_value));
-        }
-    }
-
-    if !replaced {
-        updated.push((canonical_key, value));
-    }
-
-    *metadata = updated;
-}
-
 #[Object]
 impl JobsMutation {
     /// Analyze an NZB without submitting it. Reads nothing and changes
@@ -661,9 +638,9 @@ impl JobsMutation {
         for &id in &ids {
             let mut update = base_update.clone();
             if let Some(priority) = normalized_priority.as_ref() {
-                let mut metadata = map_scheduler_result(handle.get_job(JobId(id)))?.metadata;
-                upsert_metadata_entry(&mut metadata, PRIORITY_ATTRIBUTE_KEY, priority.clone());
-                update.metadata = FieldUpdate::Set(metadata);
+                update
+                    .metadata_edits
+                    .push((PRIORITY_ATTRIBUTE_KEY.to_string(), Some(priority.clone())));
             }
             handle.update_job(JobId(id), update.clone()).await?;
         }
@@ -1449,58 +1426,156 @@ async fn persist_operator_speed_limit(ctx: &Context<'_>, bytes_per_sec: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{broadcast, mpsc};
-    use weaver_server_core::jobs::handle::SharedPipelineState;
-    use weaver_server_core::operations::metrics::PipelineMetrics;
-    use weaver_server_core::{HistoryDeleteBatchOutcome, SchedulerCommand};
+    use std::sync::Arc;
+    use weaver_server_core::JobHistoryRow;
 
-    #[tokio::test]
-    async fn a_record_deleted_before_its_cleanup_failed_is_announced_and_its_error_returned() {
-        let (command_tx, mut commands) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let replay = crate::jobs::replay::QueueEventReplay::new(8);
-        let scheduler = tokio::spawn(async move {
-            let SchedulerCommand::DeleteHistory { job_ids, reply, .. } =
-                commands.recv().await.unwrap()
-            else {
-                panic!("expected history delete command");
-            };
-            assert_eq!(job_ids, [JobId(31), JobId(32), JobId(33)].into());
-            // 31's record went in the delete transaction and its directory
-            // then failed to come off disk; 32 went cleanly; 33 is live.
-            let mut outcome = HistoryDeleteBatchOutcome::default();
-            outcome.deleted.insert(
-                JobId(31),
-                Err(SchedulerError::Io(std::io::Error::other(
-                    "synthetic directory removal failure",
-                ))),
-            );
-            outcome.deleted.insert(JobId(32), Ok(Default::default()));
-            outcome.refused.insert(
-                JobId(33),
-                SchedulerError::Conflict("cannot delete active job — cancel it first".into()),
-            );
-            reply.send(Ok(outcome)).unwrap();
-        });
+    // A history row whose output directory is `output_dir`, a working
+    // directory the pipeline owns.
+    fn history_row(job_id: u64, output_dir: &std::path::Path) -> JobHistoryRow {
+        JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("job-{job_id}"),
+            status: "failed".to_string(),
+            error_message: None,
+            total_bytes: 1,
+            downloaded_bytes: 1,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: Some(output_dir.display().to_string()),
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+            server_attribution: None,
+        }
+    }
 
-        let result = delete_history_ids(&handle, &replay, [31, 32, 33], false).await;
-        scheduler.await.unwrap();
+    struct Rig {
+        db: Database,
+        handle: SchedulerHandle,
+        intermediate_dir: std::path::PathBuf,
+        _pipeline: weaver_server_core::Pipeline,
+        _root: tempfile::TempDir,
+    }
 
-        let removed: Vec<u64> = replay
+    // An idle pipeline whose Queue answers history deletes without a turn.
+    async fn idle_rig() -> Rig {
+        let db = Database::open_in_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let intermediate_dir = root.path().join("intermediate");
+        let mut settings = db.load_config().unwrap();
+        settings.data_dir = root.path().display().to_string();
+        settings.intermediate_dir = Some(intermediate_dir.display().to_string());
+        settings.complete_dir = Some(root.path().join("complete").display().to_string());
+        let config = Arc::new(tokio::sync::RwLock::new(settings));
+        let (pipeline, handle, _) =
+            weaver_server_core::pipeline::test_support::idle_pipeline(db.clone(), config).await;
+        Rig {
+            db,
+            handle,
+            intermediate_dir,
+            _pipeline: pipeline,
+            _root: root,
+        }
+    }
+
+    // A history row for `job_id` whose working directory is on disk with its
+    // marker, so the delete's cleanup has a directory to remove.
+    async fn history_with_working_dir(rig: &Rig, job_id: u64) -> std::path::PathBuf {
+        let output_dir = rig.intermediate_dir.join(format!("history-{job_id}"));
+        tokio::fs::create_dir_all(&output_dir).await.unwrap();
+        tokio::fs::write(
+            weaver_server_core::jobs::working_dir::working_dir_marker_path(&output_dir),
+            [],
+        )
+        .await
+        .unwrap();
+        rig.db
+            .insert_job_history(&history_row(job_id, &output_dir))
+            .unwrap();
+        output_dir
+    }
+
+    // Makes `job_id`'s cleanup fail after its record is gone: a script still
+    // running holds the cleanup at the script-stop barrier, and the directory
+    // is handed to another job before the barrier lifts.
+    async fn fail_cleanup_after_record_delete(
+        rig: &Rig,
+        job_id: u64,
+        output_dir: &std::path::Path,
+        running: impl Drop,
+    ) {
+        let db = rig.db.clone();
+        weaver_server_core::post_processing::events::wait_for_test_script_change(&db, || {
+            db.get_job_history(job_id).unwrap().is_none()
+        })
+        .await;
+        tokio::fs::write(
+            weaver_server_core::jobs::working_dir::working_dir_marker_path(output_dir),
+            format!("weaver-job-v1:{}:{}\n", 99_999, "0".repeat(64)),
+        )
+        .await
+        .unwrap();
+        drop(running);
+    }
+
+    async fn removed_ids(replay: &crate::jobs::replay::QueueEventReplay) -> Vec<u64> {
+        replay
             .replay_after(None)
             .await
             .unwrap()
             .into_iter()
             .filter(|notification| notification.event.kind == QueueEventKind::ItemRemoved)
             .filter_map(|notification| notification.event.item_id)
-            .collect();
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_record_deleted_before_its_cleanup_failed_is_announced_and_its_error_returned() {
+        let rig = idle_rig().await;
+        // 31's record goes in the delete transaction and its directory then
+        // fails to come off disk; 32 goes cleanly; 33 is live.
+        let failing_dir = history_with_working_dir(&rig, 31).await;
+        history_with_working_dir(&rig, 32).await;
+        rig.handle
+            .add_job(
+                JobId(33),
+                weaver_server_core::JobSpec {
+                    name: "Active fixture".into(),
+                    password: None,
+                    category: None,
+                    metadata: vec![],
+                    files: vec![],
+                    total_bytes: 0,
+                },
+                std::path::PathBuf::from("fixture.nzb"),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let running = weaver_server_core::post_processing::events::hold_test_event_run(
+            &rig.db,
+            31,
+            "history-cleanup-barrier",
+        );
+        let replay = crate::jobs::replay::QueueEventReplay::new(8);
+
+        let delete = {
+            let handle = rig.handle.clone();
+            let replay = replay.clone();
+            tokio::spawn(
+                async move { delete_history_ids(&handle, &replay, [31, 32, 33], false).await },
+            )
+        };
+        fail_cleanup_after_record_delete(&rig, 31, &failing_dir, running).await;
+        let result = delete.await.unwrap();
+
         assert_eq!(
-            removed,
+            removed_ids(&replay).await,
             vec![31, 32],
             "every record that is gone is announced removed, whatever its cleanup did"
         );
@@ -1508,52 +1583,37 @@ mod tests {
             result.is_err(),
             "a refusal or a failed cleanup is still the caller's error"
         );
+        assert!(rig.db.get_job_history(31).unwrap().is_none());
+        assert!(rig.db.get_job_history(32).unwrap().is_none());
+        assert!(failing_dir.exists());
     }
 
     #[tokio::test]
     async fn a_failed_history_cleanup_alone_is_the_callers_error() {
-        let (command_tx, mut commands) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        let rig = idle_rig().await;
+        let failing_dir = history_with_working_dir(&rig, 41).await;
+        let running = weaver_server_core::post_processing::events::hold_test_event_run(
+            &rig.db,
+            41,
+            "history-cleanup-barrier",
         );
         let replay = crate::jobs::replay::QueueEventReplay::new(8);
-        let scheduler = tokio::spawn(async move {
-            let SchedulerCommand::DeleteHistory { reply, .. } = commands.recv().await.unwrap()
-            else {
-                panic!("expected history delete command");
-            };
-            let mut outcome = HistoryDeleteBatchOutcome::default();
-            outcome.deleted.insert(
-                JobId(41),
-                Err(SchedulerError::Io(std::io::Error::other(
-                    "synthetic directory removal failure",
-                ))),
-            );
-            reply.send(Ok(outcome)).unwrap();
-        });
 
-        let error = delete_history_ids(&handle, &replay, [41], false)
-            .await
-            .unwrap_err();
-        scheduler.await.unwrap();
+        let delete = {
+            let handle = rig.handle.clone();
+            let replay = replay.clone();
+            tokio::spawn(async move { delete_history_ids(&handle, &replay, [41], false).await })
+        };
+        fail_cleanup_after_record_delete(&rig, 41, &failing_dir, running).await;
+        let error = delete.await.unwrap().unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("synthetic directory removal failure"),
-            "{error}"
+        assert!(error.to_string().contains("no longer belongs"), "{error}");
+        assert_eq!(
+            removed_ids(&replay).await,
+            vec![41],
+            "the record is gone, so the id is announced removed"
         );
-        let removed: Vec<u64> = replay
-            .replay_after(None)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|notification| notification.event.kind == QueueEventKind::ItemRemoved)
-            .filter_map(|notification| notification.event.item_id)
-            .collect();
-        assert_eq!(removed, vec![41]);
+        assert!(rig.db.get_job_history(41).unwrap().is_none());
+        assert!(failing_dir.exists());
     }
 }

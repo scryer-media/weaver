@@ -87,6 +87,8 @@ async fn a_delivery_rename_reaches_the_finished_job_with_its_full_name() {
         job_id,
         minimal_job_state(job_id, job_name, working_dir.clone()),
     );
+    pipeline.job_order.push(job_id);
+    pipeline.report_all_for_test();
 
     pipeline.start_move_to_complete(job_id).await.unwrap();
     let done = pipeline.move_done_rx.recv().await.unwrap();
@@ -95,8 +97,9 @@ async fn a_delivery_rename_reaches_the_finished_job_with_its_full_name() {
 
     assert!(dest.join("Silver Horizon_ Part 2.mkv").is_file());
     let finished = pipeline
-        .finished_jobs
-        .iter()
+        .finished_jobs()
+        .await
+        .into_iter()
         .find(|job| job.job_id == job_id)
         .unwrap();
     assert_eq!(

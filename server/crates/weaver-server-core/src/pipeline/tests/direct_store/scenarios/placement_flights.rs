@@ -370,11 +370,11 @@ async fn a_held_placement_write_leaves_the_pipeline_serving_and_commits_when_it_
     // What the select loop does with a pause, barrier demand included. Were
     // the pipeline task awaiting the held write, neither call would return.
     pipeline.demand_direct_store_barriers_for_pause(None).await;
-    let (reply, paused) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
-        .await;
-    paused.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_all()
+        .await
+        .unwrap();
 
     // The set's next article routes too, and queues behind the held one.
     route_article(&mut pipeline, job_id, &volumes, 0, 1).await;
@@ -592,11 +592,11 @@ async fn a_completed_volumes_trailing_region_lands_through_the_lane_while_the_pi
     // The pipeline keeps serving while it writes: a pause, barrier demand
     // included, answers.
     pipeline.demand_direct_store_barriers_for_pause(None).await;
-    let (reply, paused) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
-        .await;
-    paused.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_all()
+        .await
+        .unwrap();
     assert!(pipeline.direct_set_has_pending_volume_tail(job_id, 0));
 
     tail_hold.add_permits(1);
@@ -1071,4 +1071,101 @@ async fn a_par3_refresh_while_a_placement_is_writing_does_not_miss_its_bytes() {
 #[tokio::test]
 async fn a_par3_refresh_before_a_landed_placement_is_applied_does_not_miss_its_bytes() {
     par3_refresh_across_a_held_placement(JobId(41811), true).await;
+}
+
+#[tokio::test]
+async fn held_writer_keeps_control_plane_and_counters_live_then_completes() {
+    let root = TempDir::new().unwrap();
+    let a = JobId(41820);
+    let b = JobId(41821);
+    let volumes = fixture();
+    let (mut pipeline, _, hold) = held_pipeline(&root, a, &volumes).await;
+    for file in 0..volumes.len() {
+        for ordinal in 0..ARTICLES {
+            route_article(&mut pipeline, a, &volumes, file as u32, ordinal as u32).await;
+        }
+    }
+    assert!(pipeline.has_direct_placements(a));
+    pipeline.report_all_for_test();
+    let db = pipeline.db.clone();
+    let shared = pipeline.shared_state.clone();
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), shared.clone());
+    let mut events = handle.subscribe_events();
+    let mut revisions = handle.subscribe_job_changes();
+    let counters = shared.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .find(|row| row.id == a)
+            .unwrap()
+            .counters
+            .clone()
+    });
+    let task = tokio::spawn(async move { pipeline.run().await });
+    let watermark = handle.job_revision();
+    handle
+        .add_job(
+            b,
+            segmented_job_spec("other job", "payload.bin", &[100]),
+            PathBuf::from("other-job.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+    assert!(handle.job_revision() > watermark);
+    let watermark = handle.job_revision();
+    handle.pause_job(b).await.unwrap();
+    assert!(handle.job_revision() > watermark);
+    loop {
+        revisions.mark_unchanged();
+        if handle
+            .get_job(b)
+            .is_ok_and(|job| job.status == JobStatus::Paused)
+        {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    // The lane-owned atomics remain writable while the destination is held.
+    let wire = shared.queue.counters.bandwidth.total() + 4096;
+    counters.downloaded.fetch_add(4096, Ordering::Relaxed);
+    shared.queue.counters.bandwidth.record(4096);
+    loop {
+        revisions.mark_unchanged();
+        if handle.get_metrics().bytes_downloaded >= wire {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    let watermark = handle.job_revision();
+    handle.cancel_job(b).await.unwrap();
+    assert!(handle.job_revision() > watermark);
+    assert!(handle.get_job(b).is_err());
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == b)
+    {
+    }
+    assert!(db.get_job_history(b.0).unwrap().is_some());
+    handle.delete_history(b, false).await.unwrap();
+    assert!(db.get_job_history(b.0).unwrap().is_none());
+    assert!(
+        handle
+            .get_job(a)
+            .is_ok_and(|job| job.status != JobStatus::Complete)
+    );
+    assert!(
+        shared
+            .metrics()
+            .pipeline_histograms
+            .turn_duration
+            .snapshot()
+            .count
+            > 0
+    );
+    hold.add_permits(volumes.len() * ARTICLES);
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCompleted { job_id, .. } if job_id == a)
+    {
+    }
+    assert_eq!(handle.get_job(a).unwrap().status, JobStatus::Complete);
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
 }

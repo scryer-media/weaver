@@ -408,6 +408,8 @@ async fn jobs_filter_by_paused_status() {
     let pause_query = format!("mutation {{ pauseJob(id: {id_a}) }}");
     let pause_resp = h.execute(&pause_query).await;
     assert_no_errors(&pause_resp);
+    h.wait_for_job_status(id_a, weaver_server_core::JobStatus::Paused)
+        .await;
 
     let resp = h.execute("{ jobs(status: [PAUSED]) { id } }").await;
     assert_no_errors(&resp);
@@ -426,6 +428,8 @@ async fn jobs_filter_multiple_statuses() {
     let pause_query = format!("mutation {{ pauseJob(id: {id_paused}) }}");
     let pause_resp = h.execute(&pause_query).await;
     assert_no_errors(&pause_resp);
+    h.wait_for_job_status(id_paused, weaver_server_core::JobStatus::Paused)
+        .await;
 
     let resp = h.execute("{ jobs(status: [QUEUED, PAUSED]) { id } }").await;
     assert_no_errors(&resp);
@@ -538,6 +542,8 @@ async fn jobs_filter_status_and_category() {
     let pause_query = format!("mutation {{ pauseJob(id: {id_paused}) }}");
     let pause_resp = h.execute(&pause_query).await;
     assert_no_errors(&pause_resp);
+    h.wait_for_job_status(id_paused, weaver_server_core::JobStatus::Paused)
+        .await;
 
     let resp = h
         .execute(r#"{ jobs(status: [QUEUED], category: "tv") { id } }"#)
@@ -604,6 +610,68 @@ async fn job_nonexistent_returns_null() {
 // ---------------------------------------------------------------------------
 // History Page
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn history_facades_wait_for_queue_retirement_after_a_terminal_archive() {
+    use weaver_server_core::{JobId, JobStatus};
+
+    let h = TestHarness::new().await;
+    let template_id = h.submit_test_nzb("retirement-template").await;
+    let mut job = h.handle.get_job(JobId(template_id)).unwrap();
+    let id = JobId(900_001);
+    job.job_id = id;
+    let mut row = sample_history_row(id.0, "retiring-history", "complete", 1_700_000_001);
+    row.output_dir = None;
+    row.nzb_path = None;
+    h.insert_history_row(&row);
+    let query = format!(
+        "{{ historyItem(id: {}) {{ id }} historyItems {{ id }} historyItemsCount
+             historyPage(input: {{ pageIndex: 0, pageSize: 25 }}) {{ totalCount items {{ id }} }} }}",
+        id.0
+    );
+
+    // This fixture holds queue membership independently of the runtime, just as
+    // an archive committed before its retirement acknowledgement is consumed.
+    for status in [
+        JobStatus::Complete,
+        JobStatus::Failed {
+            error: "fixture failure".into(),
+        },
+        JobStatus::Queued,
+    ] {
+        let cancelled = status == JobStatus::Queued;
+        job.status = status;
+        h.shared_state.publish_jobs(vec![job.clone()]);
+        if cancelled {
+            h.handle.cancel_job(id).await.unwrap();
+            assert!(h.handle.get_job(id).is_err());
+        }
+        let response = h.execute(&query).await;
+        assert_no_errors(&response);
+        let data = response_data(&response);
+        assert!(data["historyItem"].is_null());
+        assert!(data["historyItems"].as_array().unwrap().is_empty());
+        assert_eq!(data["historyItemsCount"].as_u64(), Some(0));
+        assert_eq!(data["historyPage"]["totalCount"].as_u64(), Some(0));
+        assert!(data["historyPage"]["items"].as_array().unwrap().is_empty());
+    }
+
+    h.shared_state.publish_jobs(vec![]);
+    let response = h.execute(&query).await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    assert_eq!(data["historyItem"]["id"].as_u64(), Some(id.0));
+    assert_eq!(data["historyItemsCount"].as_u64(), Some(1));
+    assert_eq!(data["historyPage"]["totalCount"].as_u64(), Some(1));
+    let deleted = h
+        .execute(&format!(
+            "mutation {{ deleteHistory(id: {}) {{ id }} }}",
+            id.0
+        ))
+        .await;
+    assert_no_errors(&deleted);
+    assert!(h.db.get_job_history(id.0).unwrap().is_none());
+}
 
 #[tokio::test]
 async fn history_page_supports_search_counts_and_sorting() {
@@ -1069,6 +1137,8 @@ async fn control_scope_deletes_completed_files_through_every_history_mutation() 
             let output_dir = output_root.path().join(format!("job-{id}"));
             std::fs::create_dir(&output_dir).unwrap();
             std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
+            weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir)
+                .unwrap();
             let mut row =
                 sample_history_row(id, &format!("history-{id}"), "complete", 100 + id as i64);
             row.output_dir = Some(output_dir.to_string_lossy().to_string());
@@ -1139,6 +1209,7 @@ async fn admin_scope_deletes_completed_output_through_the_direct_path() {
     let output_dir = output_root.path().join("completed-job");
     std::fs::create_dir(&output_dir).unwrap();
     std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
+    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir).unwrap();
     let mut row = sample_history_row(1, "admin-direct", "complete", 101);
     row.output_dir = Some(output_dir.to_string_lossy().to_string());
     h.insert_history_row(&row);
@@ -1163,6 +1234,7 @@ async fn authorized_durable_file_delete_removes_completed_output() {
     std::fs::create_dir(&output_dir).unwrap();
     std::fs::write(output_dir.join("payload.bin"), b"delete me").unwrap();
     let mut row = sample_history_row(1, "durable-local", "complete", 101);
+    weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir).unwrap();
     row.output_dir = Some(output_dir.to_string_lossy().to_string());
     h.insert_history_row(&row);
 
@@ -1558,7 +1630,7 @@ async fn job_has_all_fields() {
     assert!(job["progress"].as_f64().is_some());
     assert!(job["health"].as_u64().is_some());
     assert!(job["createdAt"].as_f64().is_some());
-    // outputDir and error should be null for a freshly submitted job.
-    assert!(job["outputDir"].is_null());
+    // Admission creates the working directory before returning the row.
+    assert!(std::path::Path::new(job["outputDir"].as_str().unwrap()).is_dir());
     assert!(job["error"].is_null());
 }

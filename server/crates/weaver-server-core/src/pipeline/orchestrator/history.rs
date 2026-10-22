@@ -1,362 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::collections::{BTreeMap, HashMap};
-
 use super::*;
 
-// The finished jobs the pipeline keeps in memory, newest first, with the
-// shared copy the job snapshot publishes.
-//
-// History is most of a long-running snapshot and changes only when a job
-// finishes or a row is deleted, so the published copy is built once per
-// change and shared by every snapshot until the next one. Any mutable access
-// drops it, so it can never be stale.
-#[derive(Debug, Default)]
-pub(crate) struct FinishedJobs {
-    jobs: Vec<JobInfo>,
-    shared: Option<Arc<[JobInfo]>>,
-}
-
-impl FinishedJobs {
-    // The rows as an immutable shared slice, built on first use after a
-    // change.
-    pub(crate) fn shared(&mut self) -> Arc<[JobInfo]> {
-        let jobs = &self.jobs;
-        Arc::clone(
-            self.shared
-                .get_or_insert_with(|| Arc::from(jobs.as_slice())),
-        )
-    }
-}
-
-impl std::ops::Deref for FinishedJobs {
-    type Target = Vec<JobInfo>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.jobs
-    }
-}
-
-impl std::ops::DerefMut for FinishedJobs {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.shared = None;
-        &mut self.jobs
-    }
-}
-
-impl From<Vec<JobInfo>> for FinishedJobs {
-    fn from(jobs: Vec<JobInfo>) -> Self {
-        Self { jobs, shared: None }
-    }
-}
-
-impl FromIterator<JobInfo> for FinishedJobs {
-    fn from_iter<I: IntoIterator<Item = JobInfo>>(iter: I) -> Self {
-        Self::from(iter.into_iter().collect::<Vec<_>>())
-    }
-}
-
-impl<'a> IntoIterator for &'a FinishedJobs {
-    type Item = &'a JobInfo;
-    type IntoIter = std::slice::Iter<'a, JobInfo>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.jobs.iter()
-    }
-}
-
-// One job's working directories a history delete will remove, and the ones
-// it will leave on disk because their ownership marker no longer matches.
-#[derive(Debug, Default)]
-struct JobCleanupDirs {
-    owned: BTreeSet<PathBuf>,
-    left_in_place: Vec<PathBuf>,
-}
-
-// A history delete batch as the actor hands it to its cleanup task: the ids
-// it accepted and the in-memory facts it read for them on its own turn.
-#[derive(Debug, Default)]
-struct HistoryDeleteBatch {
-    job_ids: BTreeSet<JobId>,
-    delete_files: bool,
-    // A terminal in-memory job's working directory under the intermediate
-    // root.
-    working_dirs: BTreeMap<JobId, PathBuf>,
-    // The output directory the runtime knows for an id, which wins over the
-    // history row's when `delete_files` is set.
-    output_dirs: BTreeMap<JobId, PathBuf>,
-    // Ids the actor refused before the batch left its turn.
-    refused: BTreeMap<JobId, crate::SchedulerError>,
-}
-
-type HistoryDeleteReply =
-    oneshot::Sender<Result<crate::HistoryDeleteBatchOutcome, crate::SchedulerError>>;
-
-pub(crate) struct HistoryDeleteDone {
-    // Every id the batch held in `pending_history_deletions`.
-    job_ids: BTreeSet<JobId>,
-    // The ids whose history rows the delete transaction removed; their
-    // runtime state goes too.
-    removed: BTreeSet<JobId>,
-    result: Result<crate::HistoryDeleteBatchOutcome, crate::SchedulerError>,
-    reply: HistoryDeleteReply,
-}
-
-async fn retry_script_stop_wait<F, W>(job_id: JobId, mut wait: W) -> Result<(), crate::StateError>
-where
-    F: std::future::Future<Output = Result<(), crate::StateError>>,
-    W: FnMut() -> F,
-{
-    for attempt in 0..7 {
-        match wait().await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                if attempt == 6 {
-                    return Err(crate::StateError::Conflict(format!(
-                        "could not confirm scripts stopped for job {} after seven attempts: {error}",
-                        job_id.0
-                    )));
-                }
-                warn!(job_id = job_id.0, %error, "could not confirm scripts stopped; retrying history cleanup barrier");
-                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-            }
-        }
-    }
-    unreachable!("the last attempt returns its error")
-}
-
-impl JobCleanupDirs {
-    async fn admit(
-        &mut self,
-        intermediate_dir: &std::path::Path,
-        job_id: JobId,
-        path: PathBuf,
-    ) -> Result<(), crate::SchedulerError> {
-        match crate::jobs::working_dir::prepare_history_working_dir(intermediate_dir, &path, job_id)
-            .await?
-        {
-            crate::jobs::working_dir::HistoryWorkingDir::Owned => {
-                self.owned.insert(path);
-            }
-            crate::jobs::working_dir::HistoryWorkingDir::LeftInPlace => {
-                if !self.left_in_place.contains(&path) {
-                    self.left_in_place.push(path);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // Removes every owned directory, and returns every directory left on
-    // disk: the ones already set aside plus any whose marker stopped matching
-    // between the two looks.
-    async fn remove(
-        self,
-        intermediate_dir: &std::path::Path,
-        job_id: JobId,
-    ) -> Result<Vec<PathBuf>, crate::SchedulerError> {
-        let mut left_in_place = self.left_in_place;
-        for dir in self.owned {
-            // Failed jobs never pass through the finalize close, so drop any
-            // cached write handles before their dirs (and paths) are freed
-            // for reuse.
-            crate::pipeline::close_cached_write_handles_under(&dir).await;
-            let root = intermediate_dir.to_path_buf();
-            let target = dir.clone();
-            let removal = tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::remove_job_working_dir(&root, &target, job_id)
-            })
-            .await
-            .map_err(|error| crate::SchedulerError::Io(std::io::Error::other(error)))?;
-            match removal {
-                Ok(crate::jobs::working_dir::HistoryWorkingDir::Owned) => {
-                    info!(dir = %dir.display(), "removed historical intermediate directory");
-                }
-                Ok(crate::jobs::working_dir::HistoryWorkingDir::LeftInPlace) => {
-                    left_in_place.push(dir);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(crate::SchedulerError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "failed to remove historical intermediate directory '{}': {error}",
-                            dir.display()
-                        ),
-                    )));
-                }
-            }
-        }
-        Ok(left_in_place)
-    }
-}
-
-// A directory a history delete may remove: a direct child of the
-// intermediate root, never the root itself or anything deeper.
-fn cleanupable_history_output_dir(
-    intermediate_dir: &std::path::Path,
-    output_dir: &std::path::Path,
-) -> Option<PathBuf> {
-    output_dir
-        .strip_prefix(intermediate_dir)
-        .ok()
-        .filter(|suffix| {
-            let mut components = suffix.components();
-            matches!(components.next(), Some(std::path::Component::Normal(_)))
-                && components.next().is_none()
-        })
-        .map(|_| output_dir.to_path_buf())
-}
-
 impl Pipeline {
-    // The actor's whole share of a history delete: in-memory checks and
-    // bookkeeping only. Every database and filesystem step runs in the
-    // spawned cleanup task, which reports back through `HistoryDeleteDone`.
-    pub(super) fn start_history_delete(
-        &mut self,
-        job_ids: BTreeSet<JobId>,
-        delete_files: bool,
-        reply: HistoryDeleteReply,
-    ) {
-        let finished_output_dirs: HashMap<JobId, &str> = if delete_files {
-            self.finished_jobs
-                .iter()
-                .filter_map(|job| job.output_dir.as_deref().map(|dir| (job.job_id, dir)))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-        let mut batch = HistoryDeleteBatch {
-            delete_files,
-            ..HistoryDeleteBatch::default()
-        };
-        for job_id in job_ids {
-            if self.pending_history_deletions.contains(&job_id) {
-                batch.refused.insert(
-                    job_id,
-                    crate::SchedulerError::Conflict("history deletion is still running".into()),
-                );
-                continue;
-            }
-            let state = self.jobs.get(&job_id);
-            if state.is_some_and(|state| !is_terminal_status(&state.status)) {
-                batch.refused.insert(
-                    job_id,
-                    crate::SchedulerError::Conflict(
-                        "cannot delete active job — cancel it first".into(),
-                    ),
-                );
-                continue;
-            }
-            if let Some(state) = state
-                && let Some(path) =
-                    cleanupable_history_output_dir(&self.intermediate_dir, &state.working_dir)
-            {
-                batch.working_dirs.insert(job_id, path);
-            }
-            if delete_files {
-                let output_dir = finished_output_dirs
-                    .get(&job_id)
-                    .map(PathBuf::from)
-                    .or_else(|| state.map(|state| state.working_dir.clone()));
-                if let Some(output_dir) = output_dir {
-                    batch.output_dirs.insert(job_id, output_dir);
-                }
-            }
-            batch.job_ids.insert(job_id);
-        }
-        if batch.job_ids.is_empty() {
-            let _ = reply.send(Ok(crate::HistoryDeleteBatchOutcome {
-                deleted: BTreeMap::new(),
-                refused: batch.refused,
-            }));
-            return;
-        }
-
-        self.pending_history_deletions
-            .extend(batch.job_ids.iter().copied());
-        for job_id in &batch.job_ids {
-            self.db.cancel_event_scripts(job_id.0);
-        }
-        let db = self.db.clone();
-        let intermediate_dir = self.intermediate_dir.clone();
-        let completed = self.terminal_post_processing_done_tx.clone();
-        tokio::spawn(async move {
-            let job_ids = batch.job_ids.clone();
-            let (removed, result) = run_history_delete(&db, &intermediate_dir, batch).await;
-            let _ = completed
-                .send(TerminalPostProcessingEvent::HistoryDeleteDone(
-                    HistoryDeleteDone {
-                        job_ids,
-                        removed,
-                        result,
-                        reply,
-                    },
-                ))
-                .await;
-        });
-    }
-
-    pub(in crate::pipeline) fn handle_history_delete_done(&mut self, done: HistoryDeleteDone) {
-        for job_id in &done.job_ids {
-            self.pending_history_deletions.remove(job_id);
-        }
-        for job_id in &done.removed {
-            if self
-                .jobs
-                .get(job_id)
-                .is_some_and(|state| is_terminal_status(&state.status))
-            {
-                self.purge_terminal_job_runtime(*job_id);
-            }
-        }
-        if !done.removed.is_empty() {
-            self.finished_jobs
-                .retain(|job| !done.removed.contains(&job.job_id));
-            self.publish_snapshot();
-        }
-        let _ = done.reply.send(done.result);
-    }
-
-    async fn cleanup_owned_output_dir(dir: Option<&std::path::Path>) {
-        let Some(dir) = dir else { return };
-        match tokio::fs::symlink_metadata(dir).await {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => {
-                warn!(dir = %dir.display(), error = %error, "could not inspect complete output directory before cleanup");
-                return;
-            }
-            Ok(_) => {}
-        }
-        let ownership_path = dir.to_path_buf();
-        let owned = tokio::task::spawn_blocking(move || {
-            crate::jobs::working_dir::is_weaver_owned_output_dir(&ownership_path)
-        })
-        .await
-        .unwrap_or(false);
-        if !owned {
-            warn!(
-                dir = %dir.display(),
-                "refusing recursive cleanup of an output directory without a valid Weaver ownership marker"
-            );
-            return;
-        }
-        match tokio::fs::remove_dir_all(dir).await {
-            Ok(()) => {
-                debug!(dir = %dir.display(), "removed complete output directory");
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn!(
-                    dir = %dir.display(),
-                    error = %error,
-                    "failed to remove complete output directory"
-                );
-            }
-        }
-    }
-
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.queue_scripts_completed.remove(&job_id);
         self.added_script_holds.remove(&job_id);
@@ -406,11 +53,6 @@ impl Pipeline {
         self.update_queue_metrics();
     }
 
-    pub(crate) fn enforce_finished_jobs_runtime_cap(&mut self) {
-        self.finished_jobs
-            .truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
-    }
-
     // Archive the job's history row and publish `terminal_event` once that
     // archive has committed. Terminal events are routed through here so every
     // caller keeps the same guarantee: a subscriber that observes the event can
@@ -420,6 +62,37 @@ impl Pipeline {
         job_id: JobId,
         terminal_event: Option<PipelineEvent>,
     ) {
+        if !self.jobs.get(&job_id).is_some_and(|state| {
+            matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
+        }) {
+            return;
+        }
+        // Freeze acceptance before taking the terminal fields. An intent
+        // recorded before this lock belongs to this run's terminal result.
+        // A row already retiring is a cancel whose archive is in flight; its
+        // done event decides the job.
+        let cancelled = self.shared_state.queue.write(|inner| {
+            let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) else {
+                return crate::pipeline::queue::Change::unchanged(None);
+            };
+            if row.report.retiring {
+                return crate::pipeline::queue::Change::unchanged(Some(None));
+            }
+            if let Some(origin) = row.intents.cancelled {
+                return crate::pipeline::queue::Change::unchanged(Some(Some(origin)));
+            }
+            row.report.retiring = true;
+            crate::pipeline::queue::Change::changed(None)
+        });
+        match cancelled {
+            Some(Some(origin)) => {
+                self.start_cancel_jobs(BTreeSet::from([job_id]), origin);
+                return;
+            }
+            Some(None) => return,
+            None => {}
+        }
+        self.apply_pending_job_update(job_id);
         // Taken before the long immutable borrow below, and before the runtime
         // that produced them is purged. A completed job carries the claim
         // census's verdict; a failed one falls through to its own counters,
@@ -433,7 +106,6 @@ impl Pipeline {
         let state = match self.jobs.get(&job_id) {
             Some(s) => s,
             None => {
-                self.publish_terminal_event(terminal_event);
                 return;
             }
         };
@@ -442,7 +114,6 @@ impl Pipeline {
             JobStatus::Complete => ("complete".to_string(), None),
             JobStatus::Failed { error } => ("failed".to_string(), Some(error.clone())),
             _ => {
-                self.publish_terminal_event(terminal_event);
                 return;
             }
         };
@@ -507,51 +178,46 @@ impl Pipeline {
             server_attribution: state.server_attribution.to_storage_json(),
         };
 
-        self.finished_jobs.retain(|j| j.job_id != job_id);
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
             state.assembly.optional_recovery_bytes();
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
-        self.finished_jobs.insert(
-            0,
-            JobInfo {
-                job_id,
-                job_hash: Some(state.job_hash),
-                name: state.spec.name.clone(),
-                error: if let JobStatus::Failed { error } = &state.status {
-                    Some(error.clone())
-                } else {
-                    None
-                },
-                download_wait_reason: None,
-                download_retry_at_epoch_ms: None,
-                status: state.status.clone(),
-                download_state,
-                finalizing_download: false,
-                fetching_repair_data: false,
-                post_state,
-                run_state,
-                progress: Self::effective_progress(state),
-                total_bytes: total,
-                downloaded_bytes: Self::effective_downloaded_bytes(state),
-                optional_recovery_bytes,
-                optional_recovery_downloaded_bytes,
-                phase_progress: Vec::new(),
-                failed_bytes,
-                health,
-                terminal_discards,
-                total_files: state.assembly.total_file_count() as u32,
-                completed_files: state.assembly.complete_file_count() as u32,
-                remaining_par_files: 0,
-                password: state.spec.password.clone(),
-                category: state.spec.category.clone(),
-                metadata: state.spec.metadata.clone(),
-                output_dir: Some(state.working_dir.display().to_string()),
-                server_attribution: state.server_attribution.contributions().to_vec(),
-                created_at_epoch_ms: state.created_at_epoch_ms,
+        let finished = JobInfo {
+            job_id,
+            job_hash: Some(state.job_hash),
+            name: state.spec.name.clone(),
+            error: if let JobStatus::Failed { error } = &state.status {
+                Some(error.clone())
+            } else {
+                None
             },
-        );
-        self.enforce_finished_jobs_runtime_cap();
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
+            status: state.status.clone(),
+            download_state,
+            finalizing_download: false,
+            fetching_repair_data: false,
+            post_state,
+            run_state,
+            progress: Self::effective_progress(state),
+            total_bytes: total,
+            downloaded_bytes: Self::effective_downloaded_bytes(state),
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
+            phase_progress: Vec::new(),
+            failed_bytes,
+            health,
+            terminal_discards,
+            total_files: state.assembly.total_file_count() as u32,
+            completed_files: state.assembly.complete_file_count() as u32,
+            remaining_par_files: 0,
+            password: state.spec.password.clone(),
+            category: state.spec.category.clone(),
+            metadata: state.spec.metadata.clone(),
+            output_dir: Some(state.working_dir.display().to_string()),
+            server_attribution: state.server_attribution.contributions().to_vec(),
+            created_at_epoch_ms: state.created_at_epoch_ms,
+        };
 
         let typed_terminal_cause = if completed {
             Some(crate::jobs::SemanticTerminalCause::Success)
@@ -580,7 +246,12 @@ impl Pipeline {
             Ok(archived) => archived,
             Err(e) => {
                 tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
-                self.publish_terminal_event(terminal_event);
+                self.shared_state.queue.write(|inner| {
+                    if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) {
+                        row.report.retiring = false;
+                    }
+                    crate::pipeline::queue::Change::changed(())
+                });
                 return;
             }
         };
@@ -592,233 +263,58 @@ impl Pipeline {
         // Purge and republish before arming the deferred event: the runtime
         // snapshot must already list the job as finished when a subscriber
         // reacts, or the history facade rejects the lookup as a still-live job.
+        self.shared_state.queue.write(|inner| {
+            let row = if let Some(index) = inner.jobs.iter().position(|row| row.id == job_id) {
+                &mut inner.jobs[index]
+            } else {
+                inner
+                    .jobs
+                    .push(crate::pipeline::queue::JobRow::new(finished.clone()));
+                inner.jobs.last_mut().expect("retiring job")
+            };
+            row.report.job = finished.clone();
+            row.report.retiring = true;
+            crate::pipeline::queue::Change::changed(())
+        });
         self.purge_terminal_job_runtime(job_id);
-        self.publish_snapshot();
-        self.publish_terminal_event_after_archive(archived, terminal_event);
-    }
-
-    fn publish_terminal_event(&self, terminal_event: Option<PipelineEvent>) {
-        if let Some(event) = terminal_event {
-            let _ = self.event_tx.send(event);
-        }
+        self.publish_terminal_event_after_archive(job_id, Some(finished), archived, terminal_event);
     }
 
     // Hold the terminal event until the history archive has committed, so the
-    // row is queryable the moment the event is observed. A dropped signal (the
-    // writer queue closed at shutdown) still publishes: losing a terminal event
-    // is worse than publishing one ahead of its row.
+    // row is queryable the moment the event is observed. A lost acknowledgement
+    // retains the queue row for recovery and never publishes a false completion.
     fn publish_terminal_event_after_archive(
         &self,
+        job_id: JobId,
+        finished: Option<JobInfo>,
         archived: oneshot::Receiver<()>,
         terminal_event: Option<PipelineEvent>,
     ) {
-        let Some(event) = terminal_event else {
-            return;
-        };
         let event_tx = self.event_tx.clone();
+        let queue = self.shared_state.queue.clone();
         tokio::spawn(async move {
-            let _ = archived.await;
-            let _ = event_tx.send(event);
-        });
-    }
-}
-
-// The off-actor half of a history delete batch. In order: one read of the
-// batch's history rows, the marker judgement of every directory, one delete
-// transaction for every row, then per job the script-stopped barrier and only
-// after it the job's directories. Returns the ids whose rows the transaction
-// removed, and the batch outcome.
-async fn run_history_delete(
-    db: &crate::Database,
-    intermediate_dir: &std::path::Path,
-    batch: HistoryDeleteBatch,
-) -> (
-    BTreeSet<JobId>,
-    Result<crate::HistoryDeleteBatchOutcome, crate::SchedulerError>,
-) {
-    let HistoryDeleteBatch {
-        job_ids,
-        delete_files,
-        mut working_dirs,
-        mut output_dirs,
-        mut refused,
-    } = batch;
-    let ids = job_ids.iter().copied().collect::<Vec<_>>();
-    let lookup_db = db.clone();
-    let rows = match tokio::task::spawn_blocking(move || {
-        let _probe =
-            crate::runtime::perf_probe::scope("db.list_job_history_output_dirs.history_delete");
-        lookup_db.list_job_history_output_dirs(&ids)
-    })
-    .await
-    {
-        Ok(Ok(rows)) => rows,
-        Ok(Err(error)) => return (BTreeSet::new(), Err(crate::SchedulerError::State(error))),
-        Err(error) => {
-            return (
-                BTreeSet::new(),
-                Err(crate::SchedulerError::Internal(format!(
-                    "failed to join history lookup task: {error}"
-                ))),
-            );
-        }
-    };
-
-    let mut cleanup = BTreeMap::new();
-    let mut delete_ids = Vec::with_capacity(job_ids.len());
-    for job_id in job_ids {
-        let recorded = rows.get(&job_id).cloned().flatten().map(PathBuf::from);
-        let mut dirs = JobCleanupDirs::default();
-        let candidates = working_dirs.remove(&job_id).into_iter().chain(
-            recorded
-                .as_deref()
-                .and_then(|dir| cleanupable_history_output_dir(intermediate_dir, dir)),
-        );
-        let mut admitted = Ok(());
-        for path in candidates {
-            admitted = dirs.admit(intermediate_dir, job_id, path).await;
-            if admitted.is_err() {
-                break;
+            if archived.await.is_err() {
+                tracing::error!(job_id = job_id.0, "history archive completion was lost");
+                return;
             }
-        }
-        if let Err(error) = admitted {
-            refused.insert(job_id, error);
-            output_dirs.remove(&job_id);
-            continue;
-        }
-        if delete_files {
-            if let Some(dir) = recorded {
-                output_dirs.entry(job_id).or_insert(dir);
-            }
-        } else {
-            output_dirs.remove(&job_id);
-        }
-        cleanup.insert(job_id, dirs);
-        delete_ids.push(job_id);
-    }
-
-    let delete_db = db.clone();
-    let delete_set = delete_ids.clone();
-    match tokio::task::spawn_blocking(move || {
-        delete_db.delete_job_histories_and_forget_duplicate_identities(&delete_set)
-    })
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(crate::StateError::Conflict(message))) => {
-            return (
-                BTreeSet::new(),
-                Err(crate::SchedulerError::Conflict(message)),
-            );
-        }
-        Ok(Err(error)) => {
-            return (
-                BTreeSet::new(),
-                Err(crate::SchedulerError::Internal(format!(
-                    "failed to delete history bundles: {error}"
-                ))),
-            );
-        }
-        Err(error) => {
-            return (
-                BTreeSet::new(),
-                Err(crate::SchedulerError::Internal(format!(
-                    "failed to join history delete task: {error}"
-                ))),
-            );
-        }
-    }
-
-    // Every accepted id's record is gone now, including an id that had no
-    // row: its runtime state goes with the rest.
-    let removed = delete_ids.iter().copied().collect::<BTreeSet<_>>();
-    let mut deleted = BTreeMap::new();
-    for (job_id, dirs) in cleanup {
-        if let Err(error) = retry_script_stop_wait(job_id, || {
-            crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
-        })
-        .await
-        {
-            deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
-            continue;
-        }
-        match dirs.remove(intermediate_dir, job_id).await {
-            Ok(left_in_place) => {
-                Pipeline::cleanup_owned_output_dir(output_dirs.get(&job_id).map(PathBuf::as_path))
-                    .await;
-                deleted.insert(job_id, Ok(crate::HistoryDeleteOutcome { left_in_place }));
-            }
-            Err(error) => {
-                deleted.insert(job_id, Err(error));
-            }
-        }
-    }
-    (
-        removed,
-        Ok(crate::HistoryDeleteBatchOutcome { deleted, refused }),
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn history_cleanup_surfaces_persistent_failure_after_bounded_backoff() {
-        let mut attempts = Vec::new();
-        let error = retry_script_stop_wait(JobId(42), || {
-            attempts.push(tokio::time::Instant::now());
-            std::future::ready(Err(crate::StateError::Database(
-                "fixture unavailable".into(),
-            )))
-        })
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("after seven attempts"));
-        assert_eq!(attempts.len(), 7);
-        let gaps: Vec<_> = attempts.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        assert_eq!(gaps, [1, 2, 4, 8, 16, 32].map(Duration::from_secs));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn history_cleanup_retries_uncertain_wait_and_still_waits_for_active_script() {
-        let db = crate::Database::open_in_memory().unwrap();
-        let job_id = JobId(41);
-        let active =
-            crate::post_processing::events::hold_test_event_run(&db, job_id.0, "cleanup-retry");
-        let (failed, failure_seen) = oneshot::channel();
-        let (retried, retry_seen) = oneshot::channel();
-        let cleanup = tokio::spawn(async move {
-            let mut failed = Some(failed);
-            let mut retried = Some(retried);
-            retry_script_stop_wait(job_id, || {
-                let failed = failed.take();
-                let retried = if failed.is_none() {
-                    retried.take()
-                } else {
-                    None
-                };
-                let db = db.clone();
-                async move {
-                    if let Some(failed) = failed {
-                        let _ = failed.send(());
-                        return Err(crate::StateError::Database(
-                            "injected transient read failure".into(),
-                        ));
-                    }
-                    let _ = retried.unwrap().send(());
-                    crate::post_processing::events::wait_for_job_events_stopped(&db, job_id.0).await
+            queue.write(|inner| {
+                inner.jobs.retain(|row| row.id != job_id);
+                if let Some(job) = finished {
+                    let mut history: Vec<_> = queue
+                        .history()
+                        .iter()
+                        .filter(|job| job.job_id != job_id)
+                        .cloned()
+                        .collect();
+                    history.insert(0, job);
+                    history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
+                    queue.replace_history(inner, history.into());
                 }
-            })
-            .await
-            .unwrap();
+                if let Some(event) = terminal_event {
+                    let _ = event_tx.send(event);
+                }
+                crate::pipeline::queue::Change::changed(())
+            });
         });
-        failure_seen.await.unwrap();
-        assert!(!cleanup.is_finished());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        retry_seen.await.unwrap();
-        assert!(!cleanup.is_finished());
-        drop(active);
-        cleanup.await.unwrap();
     }
 }

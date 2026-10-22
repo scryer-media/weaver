@@ -969,6 +969,7 @@ fn absent_instrumentation_omits_its_families() {
 
     // Pipeline histograms present, but the two optional stages unmeasured.
     let pipeline = instr::PipelineHistogramsSnapshot {
+        turn_duration: sample_histogram(),
         disk_write_duration: sample_histogram(),
         decode_task_duration: None,
         extract_member_duration: None,

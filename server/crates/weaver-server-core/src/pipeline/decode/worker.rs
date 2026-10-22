@@ -975,6 +975,7 @@ impl Pipeline {
                 segment_id,
                 retry_count + 1,
                 DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -1284,6 +1285,7 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) && self.job_decode_stage_drained(job_id) {
             self.maybe_finish_download_pass(job_id);
         }
+        self.report_job(job_id);
     }
 
     // Handle a decode failure by re-queuing the segment for re-download.
@@ -1408,6 +1410,7 @@ impl Pipeline {
                     .find(|s| s.ordinal == segment_id.segment_number)
             {
                 let work = DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -2957,6 +2960,7 @@ impl Pipeline {
         };
 
         let work = DownloadWork {
+            counters: None,
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -3675,6 +3679,17 @@ impl Pipeline {
         hash_mode: SegmentHashMode,
     ) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.commit_persisted_segment");
+        // Every segment the disk write answered for passes here once, so the
+        // job's placed bytes move with the write itself.
+        if let Some(counters) = self
+            .shared_state
+            .queue
+            .job_counters(segment.segment_id.file_id.job_id)
+        {
+            counters
+                .placed
+                .fetch_add(segment.len_bytes() as u64, Ordering::Relaxed);
+        }
         if let Some(unresolved) = segment.damaged_source.as_ref() {
             let source = &unresolved.source;
             let status = unresolved.status;
@@ -4278,7 +4293,7 @@ impl Pipeline {
                         crate::post_processing::model::QueueEvent::FileDownloaded,
                         None,
                     );
-                    let _ = self.event_tx.send(PipelineEvent::FileComplete {
+                    self.emit_job_event(PipelineEvent::FileComplete {
                         file_id,
                         filename: filename.to_string(),
                         total_bytes,

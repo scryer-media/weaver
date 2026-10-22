@@ -1519,9 +1519,7 @@ impl Pipeline {
         self.metrics
             .job_lifecycle
             .note_extraction(crate::operations::instrumentation::StageOutcomeKind::Complete);
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::ExtractionComplete { job_id });
+        self.emit_job_event(PipelineEvent::ExtractionComplete { job_id });
 
         if let Err(error) = self.start_move_to_complete(job_id).await {
             self.fail_job(job_id, error);
@@ -1971,6 +1969,7 @@ impl Pipeline {
                         .segments
                         .iter()
                         .map(|segment| DownloadWork {
+                            counters: None,
                             segment_id: SegmentId {
                                 file_id,
                                 segment_number: segment.ordinal,
