@@ -4,6 +4,7 @@
 // The graph's observability lines as a test hears them: every INFO event on
 // this thread under the graph's target, rendered as the log writes it, the
 // message then each field as `key=value` in the order the line names them.
+// Any other target's lines at one level are heard the same way.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
@@ -12,13 +13,26 @@ use tracing::subscriber::DefaultGuard;
 
 const TARGET: &str = "weaver_server_core::pipeline::graph";
 
-#[derive(Clone, Default)]
-pub(crate) struct Lines(Arc<Mutex<Vec<String>>>);
+#[derive(Clone)]
+pub(crate) struct Lines {
+    heard: Arc<Mutex<Vec<String>>>,
+    target: &'static str,
+    level: tracing::Level,
+}
 
 impl Lines {
     // Hear the graph's lines until the guard drops.
     pub(crate) fn capture() -> (Self, DefaultGuard) {
-        let lines = Self::default();
+        Self::capture_at(TARGET, tracing::Level::INFO)
+    }
+
+    // Hear the lines at `level` under `target` until the guard drops.
+    pub(crate) fn capture_at(target: &'static str, level: tracing::Level) -> (Self, DefaultGuard) {
+        let lines = Self {
+            heard: Arc::default(),
+            target,
+            level,
+        };
         let guard = tracing::subscriber::set_default(lines.clone());
         (lines, guard)
     }
@@ -26,7 +40,7 @@ impl Lines {
     // Every line heard with this message, as written.
     pub(crate) fn of(&self, message: &str) -> Vec<String> {
         let prefix = format!("{message} ");
-        self.0
+        self.heard
             .lock()
             .unwrap()
             .iter()
@@ -38,7 +52,7 @@ impl Lines {
 
 impl tracing::Subscriber for Lines {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.target().starts_with(TARGET) && *metadata.level() == tracing::Level::INFO
+        metadata.target().starts_with(self.target) && *metadata.level() == self.level
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -62,7 +76,7 @@ impl tracing::Subscriber for Lines {
         }
         let mut fields = Fields::default();
         event.record(&mut fields);
-        self.0
+        self.heard
             .lock()
             .unwrap()
             .push(format!("{}{}", fields.message, fields.fields));

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A member an object claimed after it had been decided a leaf: a volume that
-// came before the one that built its object, or one whose front only said
-// what it is once a repair rewrote it. Its bytes went to its own file, so
-// they go down to its object again from there, each run with the
-// provenance it arrived with, by the one write path, exactly as the bytes
-// held for an undecided member go down once it is bound. The file is no
-// delivery of its own after that, unless the object is a recovery object,
-// whose volumes live in their files.
+// A member an object claimed after its bytes went to its own file: one whose
+// front had not yet said what it is, a volume that came before the one that
+// built its object, or one whose front only said what it is once a repair
+// rewrote it. Its bytes go down to its object from that file, each run with
+// the provenance it arrived with, by the one write path. The file is no
+// delivery of its own after that, and its bytes no longer count against the
+// job's output, unless the object is a recovery object, whose volumes live
+// in their files.
 
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Effect, MemberId, NodeId, Provenance, Tree};
@@ -37,6 +37,11 @@ impl NamespaceWriter {
         // member has now: a run that has that owner give the member up hands
         // it on, and the hand-off carries the whole file to whatever holds
         // the member next, so this replay is done.
+        let handed = self
+            .files_mut(node)
+            .handed
+            .remove(&member)
+            .unwrap_or_default();
         if !self
             .files
             .get(&node)
@@ -72,6 +77,16 @@ impl NamespaceWriter {
                 at = run.range.end;
                 continue;
             }
+            // What the claiming delivery carried is the claimer's already.
+            if let Some(past) = handed.iter().find(|range| range.contains(start)) {
+                at = past.end;
+                continue;
+            }
+            let end = handed
+                .iter()
+                .map(|range| range.start)
+                .filter(|from| *from > start)
+                .fold(end, u64::min);
             let chunk = ByteRange::new(start, end.min(start.saturating_add(READ_BACK)));
             at = chunk.end;
             let mut bytes = Vec::new();
@@ -104,6 +119,7 @@ impl NamespaceWriter {
             files.refused.remove(&member);
             if let Some(leaf) = files.leaves.remove(&member) {
                 leaf.remove()?;
+                self.caps.forget(tree, node, member);
             }
         }
         Ok(())

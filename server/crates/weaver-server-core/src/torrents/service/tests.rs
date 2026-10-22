@@ -3781,3 +3781,182 @@ async fn a_reannounce_reaches_the_tracker_now() {
     );
     rig.service.stop().await;
 }
+
+// A torrent of two files where only the second is fetched: the first's
+// front is never in hand, while its last bytes come in the piece that
+// starts the second, so they are verified before anything says what the
+// first file is.
+const SPLIT_PIECE: usize = 16_384;
+
+struct PartlyFetched {
+    rig: Rig,
+    job_id: JobId,
+    seeding: Arc<Session>,
+    _seeds: tempfile::TempDir,
+    sizes: [u64; 2],
+    sent: u64,
+}
+
+async fn partly_fetched() -> PartlyFetched {
+    use FilePriority::*;
+    let first: Vec<u8> = (0..(3 * SPLIT_PIECE + SPLIT_PIECE / 2) as u32)
+        .map(|at| (at % 251) as u8)
+        .collect();
+    let second: Vec<u8> = (0..(SPLIT_PIECE / 2 + 2 * SPLIT_PIECE) as u32)
+        .map(|at| (at % 241) as u8 ^ 0x5a)
+        .collect();
+    let files = [
+        ("set/a.bin", first.as_slice()),
+        ("set/b.bin", second.as_slice()),
+    ];
+    let private = metainfo("set", &files, SPLIT_PIECE, true);
+
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let bytes = announcing(&private, &tracker(peer).await);
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(bytes))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(0, Ignored)])
+        .await
+        .unwrap();
+    rig.service.resume(job_id).await.unwrap();
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    // Pieces 3, 4 and 5: the second file whole, and the first file's last
+    // half piece with it.
+    assert_eq!(job_have(&rig.service, job_id).await, 3);
+    let sent = uploaded(&seeding);
+    PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        _seeds: seeds,
+        sizes: [first.len() as u64, second.len() as u64],
+        sent,
+    }
+}
+
+// The restart of a partly fetched torrent: it has every piece it had, and
+// once the first file is wanted it fetches that file's three missing pieces
+// and nothing else.
+async fn resumes_with_its_pieces(fetched: PartlyFetched) {
+    use FilePriority::*;
+    let PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        sizes,
+        sent,
+        ..
+    } = fetched;
+    // What the server's recovery clears before anything starts.
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let handle = handle_of(&again, job_id).await;
+    handle.wait_until_completed().await.unwrap();
+    assert_eq!(job_have(&again, job_id).await, 3);
+    assert_eq!(uploaded(&seeding), sent);
+
+    again
+        .set_file_priorities(job_id, &[(0, Normal)])
+        .await
+        .unwrap();
+    handle.wait_until_completed().await.unwrap();
+    assert_eq!(job_have(&again, job_id).await, 6);
+    assert_eq!(again.torrent(job_id).await.unwrap().file_have, sizes);
+    assert_eq!(uploaded(&seeding) - sent, 3 * SPLIT_PIECE as u64);
+    again.stop().await;
+    seeding.stop().await;
+}
+
+// A verified piece is durable: a torrent stopped part-way restarts with
+// every piece it had, a piece no file had yet said what it was included,
+// and fetches only the pieces it lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_stopped_part_way_restarts_with_its_pieces() {
+    let fetched = partly_fetched().await;
+    fetched.rig.service.stop().await;
+    resumes_with_its_pieces(fetched).await;
+}
+
+// As a clean stop, a crash: the checkpoint the last tick wrote is all the
+// restart has, and it has every piece the torrent had by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_that_crashed_part_way_restarts_with_its_pieces() {
+    let fetched = partly_fetched().await;
+    let written = fetched.rig.service.written();
+    let before = written.borrow().checkpoints;
+    fetched.rig.service.tick().await;
+    assert!(written.borrow().checkpoints > before);
+    // The process ends here: its sessions go with it, and nothing else is
+    // written.
+    fetched.rig.service.inner.sessions.stop_all().await;
+    resumes_with_its_pieces(fetched).await;
+}
+
+// A checkpoint that does not restore says so, naming the job and why, and
+// the torrent starts fresh rather than not at all.
+#[tokio::test]
+async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service.inner.signal.mark(job_id);
+    rig.service.tick().await;
+    rig.service.stop().await;
+    assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
+    let datastore = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE graph_nodes SET facts = {} WHERE job_id = {} AND node_id = 0",
+                &[SqlArg::Bytes(vec![0xff; 4]), SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let heard = lines.of("a torrent's checkpoint did not restore; it starts fresh");
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].contains(&format!(" job_id={} error=", job_id.0)),
+        "{heard:?}"
+    );
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.pieces.unwrap().have, 0);
+    again.stop().await;
+}

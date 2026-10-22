@@ -463,15 +463,20 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
 }
 
 #[tokio::test]
-async fn dropping_a_graph_job_gives_its_holds_back() {
+async fn an_article_before_the_first_is_on_disk_and_nothing_is_held() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_006);
-    let posts = [Post::plain("lantern.bin", payload(2 * ARTICLE, 7))];
-    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let data = payload(2 * ARTICLE, 7);
+    let posts = [Post::plain("lantern.bin", data.clone())];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
     // The second article before the first: nothing knows yet what the
-    // member is, so its bytes are held.
+    // member is, and its bytes are in its file all the same.
     decode(&mut pipeline, job_id, &posts, 0, 1, true).await;
-    assert_eq!(pipeline.graph_holds.usage().resident, ARTICLE as u64);
+    assert_eq!(pipeline.graph_holds.usage().resident, 0);
+    assert_eq!(
+        read(&working_dir.join("lantern.bin"))[ARTICLE..],
+        data[ARTICLE..]
+    );
     pipeline.graph_jobs.remove(&job_id);
     assert_eq!(pipeline.graph_holds.usage().resident, 0);
     assert_eq!(pipeline.graph_holds.usage().namespaces, 0);

@@ -781,3 +781,48 @@ fn a_failed_move_leaves_the_job_where_it_was() {
     );
     assert!(!to.exists());
 }
+
+// A torrent's pieces come in any order: those that arrive before the piece
+// carrying a file's front, which says what the file is, are on disk in the
+// file all the same. The checkpoint restores every one of them, nothing is
+// fetched again, and the pieces still to come complete the file.
+#[test]
+fn pieces_before_a_files_front_restore_from_its_file() {
+    let layout = Arc::new(PieceLayout::new(PIECE, vec![file("a.bin", 5000)]).unwrap());
+    let bytes: Vec<u8> = (0..5000u32).map(|at| (at % 251) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    for piece in [1, 3] {
+        job.verified(
+            shares_of(&layout, &bytes, piece),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    assert_eq!(job.have().iter_ones().collect::<Vec<_>>(), vec![1, 3]);
+    assert!(job.in_memory().is_empty());
+
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    drop(job);
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
+            .unwrap();
+    assert!(restored.refetched.is_empty());
+    assert_eq!(
+        restored.job.have().iter_ones().collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+
+    let mut job = restored.job;
+    for piece in [0, 2, 4] {
+        job.verified(
+            shares_of(&layout, &bytes, piece),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    assert!(job.have().all());
+    assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), bytes);
+}

@@ -10,9 +10,11 @@
 //
 // What becomes of a delivery depends only on what its member is:
 //
-//   undecided   its first bytes have not said what it is; the bytes are held,
-//               and replayed once it is decided. A breach of the holds
-//               budgets decides it a leaf on the spot, and nothing pauses.
+//   undecided   its first bytes have not said what it is; the bytes are
+//               written to its own file at their offset, as a leaf's are,
+//               so what arrived is on disk whatever order it came in. An
+//               object that claims it takes them from that file, which then
+//               goes.
 //   a leaf      the bytes are written to its file at their offset, damaged
 //               or not; the namespace's coverage is the record of which.
 //   bound       the bytes go down the tree to the object that owns it, and
@@ -95,6 +97,10 @@ struct Files {
     scratch: Option<Leaf>,
     // Why a member is a leaf when something refused to own it.
     refused: BTreeMap<MemberId, Why>,
+    // What the delivery that claimed a member from its file carried
+    // straight to the claimer: the file has it too, and does not send it
+    // down to that claimer again.
+    handed: BTreeMap<MemberId, Vec<ByteRange>>,
 }
 
 impl Files {
@@ -104,6 +110,7 @@ impl Files {
             holds: HoldLedger::new(namespace, accountant),
             scratch: None,
             refused: BTreeMap::new(),
+            handed: BTreeMap::new(),
         }
     }
 }
@@ -403,6 +410,7 @@ impl NamespaceWriter {
                 _ => None,
             })
             .collect();
+        self.handed(tree, &effects)?;
         for effect in effects {
             self.apply(tree, builder, segments, effect, out)?;
         }
@@ -411,6 +419,44 @@ impl NamespaceWriter {
         }
         for (node, copy) in folded {
             self.fold_over(tree, builder, segments, (node, copy), out)?;
+        }
+        Ok(())
+    }
+
+    // The delivery that claimed a member already in its own file carried
+    // its bytes to the claimer straight: the bytes the tree hands the
+    // claimer after the claim, as the member's or, for a posting folded
+    // into another, as that one's. They go to the file as well, which holds
+    // every byte the member arrived with whoever owns it next, and the file
+    // hands this claimer only the rest.
+    fn handed(&mut self, tree: &Tree, effects: &[Effect]) -> Result<(), WriteError> {
+        let mut claimed: Vec<(NodeId, MemberId, MemberId)> = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::Bound { node, member, .. } => claimed.push((*node, *member, *member)),
+                Effect::Folded { node, copy, into } => claimed.push((*node, *copy, *into)),
+                Effect::Reached {
+                    node,
+                    member,
+                    offset,
+                    bytes,
+                    ..
+                } => {
+                    for (at, of, via) in claimed.clone() {
+                        let in_file = self
+                            .files
+                            .get(&at)
+                            .is_some_and(|files| files.leaves.contains_key(&of));
+                        if (at, via) != (*node, *member) || !in_file {
+                            continue;
+                        }
+                        self.write_file(tree, at, of, *offset, bytes)?;
+                        let range = ByteRange::at(*offset, bytes.len() as u64);
+                        self.files_mut(at).handed.entry(of).or_default().push(range);
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -806,7 +852,7 @@ impl NamespaceWriter {
                     bytes: bytes.clone(),
                     provenance: *provenance,
                 };
-                return self.write_leaf(tree, builder, segments, arrival, out);
+                return self.write_leaf(tree, arrival);
             }
             Effect::Reached {
                 node,
@@ -960,49 +1006,15 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    fn write_leaf(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        arrival: Arrival,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
+    // Bytes for a member no object owns go to its own file, decided or
+    // not: a verified byte is on disk once it arrives, so a restart reads
+    // back everything the coverage says arrived. What was held for it
+    // before, from an object that gave it back, goes first, so the bytes
+    // that arrived after it win where they overlap.
+    fn write_leaf(&mut self, tree: &Tree, arrival: Arrival) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
-        if tree.is_undecided(node, member) {
-            return self.hold(tree, builder, segments, arrival, out);
-        }
         self.release_to_leaf(tree, node, member)?;
         self.write_file(tree, node, member, arrival.offset, &arrival.bytes)
-    }
-
-    // Hold bytes whose member is not yet decided. A breach settles it: the
-    // object that takes it is handed everything held and the new bytes; a
-    // leaf has them go to its file.
-    fn hold(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        arrival: Arrival,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
-        let (node, member) = (arrival.node, arrival.member);
-        if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
-            if let Some(owner) = self.settle(tree, builder, segments, node, member, out)? {
-                let mut effects = Vec::new();
-                self.capture(tree, builder, owner, &arrival, &mut effects)?;
-                return self.apply_each(tree, builder, segments, effects, out);
-            }
-            self.refuse(tree, node, member, Why::HoldsBreached);
-            self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
-            out.push(Effect::Refused {
-                node,
-                member,
-                why: Why::HoldsBreached,
-            });
-        }
-        Ok(())
     }
 
     // Hold bytes of the member in its namespace's ledger, paging to scratch
@@ -1058,7 +1070,7 @@ impl NamespaceWriter {
     // the bytes that arrived after it win where they overlap.
     fn release_to_leaf(
         &mut self,
-        tree: &mut Tree,
+        tree: &Tree,
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {

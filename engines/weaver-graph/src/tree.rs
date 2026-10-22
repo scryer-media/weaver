@@ -1008,7 +1008,7 @@ impl Tree {
     }
 
     // Whether the member's first bytes have not yet decided its owner. Its
-    // bytes have nowhere final to go, so the owner holds them.
+    // bytes are its own file's until an object claims it.
     pub fn is_undecided(&self, node: NodeId, member: MemberId) -> bool {
         self.nodes
             .get(&node)

@@ -241,11 +241,11 @@ fn a_restored_job_gives_the_session_the_pieces_it_has() {
     .unwrap();
     let have = initial_have(&restored.job).unwrap();
     assert_eq!(have.len(), 5);
-    // Piece 4 waited in memory behind piece 3, so the checkpoint left it out
-    // and it is fetched again.
-    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 1, 2]);
+    // Piece 4 came before piece 3, which carries the front of c's file: it
+    // is in c's file all the same, so the restart has it.
+    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
     // Piece 0 is the high bit of the first byte.
-    assert_eq!(have.as_raw_slice()[0], 0b1110_0000);
+    assert_eq!(have.as_raw_slice()[0], 0b1110_1000);
 }
 
 #[test]

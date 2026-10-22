@@ -48,7 +48,7 @@ use crate::pipeline::graph::job::{GraphJob, Storage};
 use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::root::pieces::PieceLayout;
+use crate::pipeline::graph::root::pieces::{PieceLayout, PieceRoot};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::proxies::TorrentScope;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
@@ -1770,6 +1770,49 @@ impl TorrentService {
         }
     }
 
+    // The torrent's job as its checkpoint left it, or none when it has no
+    // checkpoint. A checkpoint that does not restore is said, with why, and
+    // the torrent starts as a new one.
+    fn restored(
+        &self,
+        job_id: JobId,
+        dir: PathBuf,
+        layout: &Arc<PieceLayout>,
+        unpack: bool,
+    ) -> Option<GraphJob<PieceRoot>> {
+        let rows = match self.inner.db.load_graph_checkpoint(job_id) {
+            Ok(rows) => rows?,
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint could not be read; it starts fresh");
+                return None;
+            }
+        };
+        let restored = checkpoint::snapshot(&rows)
+            .map_err(|error| error.to_string())
+            .and_then(|snapshot| {
+                GraphJob::restore_torrent(
+                    &snapshot,
+                    Arc::clone(layout),
+                    job_id.0,
+                    self.storage(dir, layout, unpack),
+                    self.inner.env.slots,
+                )
+                .map_err(|error| error.to_string())
+            });
+        match restored {
+            Ok(restored) => {
+                // The database holds these rows: the next checkpoint writes
+                // only what changes from them.
+                restored.job.pending().written(rows);
+                Some(restored.job)
+            }
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint did not restore; it starts fresh");
+                None
+            }
+        }
+    }
+
     // The job of a torrent with metainfo, from its checkpoint when it has one.
     fn job(
         &self,
@@ -1779,29 +1822,8 @@ impl TorrentService {
         unpack: bool,
     ) -> (Arc<TorrentJob>, Arc<Intake>) {
         let slots = self.inner.env.slots;
-        let restored = self
-            .inner
-            .db
-            .load_graph_checkpoint(job_id)
-            .ok()
-            .flatten()
-            .and_then(|rows| {
-                let snapshot = checkpoint::snapshot(&rows).ok()?;
-                let restored = GraphJob::restore_torrent(
-                    &snapshot,
-                    Arc::clone(layout),
-                    job_id.0,
-                    self.storage(dir.clone(), layout, unpack),
-                    slots,
-                )
-                .ok()?;
-                // The database holds these rows: the next checkpoint writes
-                // only what changes from them.
-                restored.job.pending().written(rows);
-                Some(restored)
-            });
-        let job = match restored {
-            Some(restored) => restored.job,
+        let job = match self.restored(job_id, dir.clone(), layout, unpack) {
+            Some(job) => job,
             None => GraphJob::for_torrent(
                 job_id.0,
                 Arc::clone(layout),
