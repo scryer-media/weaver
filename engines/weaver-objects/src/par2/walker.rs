@@ -86,11 +86,20 @@ impl Walker {
         self.streamed.as_ref().map_or(self.next, |open| open.at)
     }
 
-    // Whether the packet being read past the front is a recovery packet.
+    // Whether the packet at the front is a recovery packet: the one being
+    // read past it, or one whose header alone has arrived. A volume's first
+    // article may hold no more than that header, and it says as much.
     pub(super) fn reading_recovery(&self) -> bool {
-        self.streamed
-            .as_ref()
-            .is_some_and(|open| matches!(open.header.packet_type, PacketType::RecoverySlice))
+        let header = match &self.streamed {
+            Some(open) => Some(open.header.packet_type),
+            None => self
+                .held
+                .get(&self.next)
+                .filter(|front| front.len() >= HEADER_SIZE && &front[..8] == MAGIC)
+                .and_then(|front| PacketHeader::parse(front, self.next).ok())
+                .map(|header| header.packet_type),
+        };
+        matches!(header, Some(PacketType::RecoverySlice))
     }
 
     pub(super) fn lost(&self) -> &[ByteRange] {

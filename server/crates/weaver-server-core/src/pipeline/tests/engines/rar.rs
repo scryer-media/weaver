@@ -415,14 +415,17 @@ fn a_graph_job_held_after_its_repair_holds_no_other_job() {
     runtime.shutdown_background();
 }
 
-// Recovery a graph job has not asked for is not parked work: dispatch
-// schedules no completion check for it the way it does for classic's
-// parked queue, whose check is what unparks it.
+// Recovery a graph job has deferred is not work a completion check
+// unparks: dispatch schedules no check for it the way it does for
+// classic's parked queue, whose check is what unparks it. A graph job's
+// recovery queue holds what its objects deferred, so the recovery volume's
+// head arrives first and its PAR2 object defers the rest.
 #[tokio::test]
 async fn dispatch_schedules_no_parked_recovery_check_for_a_graph_job() {
     let scenario = Scenario::new(with_par2(single_member_store_set(MEMBER, &body(), 1)));
     for engine in [Engine::Classic, Engine::Graph] {
         let (_temp_dir, mut pipeline, _) = admit(&scenario, engine).await;
+        serve_job(&mut pipeline, JOB, &scenario, (2, 0)).await;
         let state = pipeline.jobs.get_mut(&JOB).unwrap();
         while state.download_queue.pop().is_some() {}
         assert!(
