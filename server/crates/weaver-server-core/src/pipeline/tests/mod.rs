@@ -185,7 +185,6 @@ impl TestHarness {
         )
         .await
         .unwrap();
-        // This rig drives the classic engine.
         let pipeline_task = tokio::spawn(async move {
             pipeline.run().await;
         });
@@ -600,8 +599,6 @@ async fn new_direct_pipeline_on_machine(
     )
     .await
     .unwrap();
-    // This rig drives the classic engine by hand; a graph test says so when
-    // it admits through the switch.
 
     (pipeline, intermediate_dir, complete_dir)
 }
@@ -2429,10 +2426,6 @@ async fn submit_decoded_segment_declaring(
     // used to find already reached lands on the check the ticket re-arms —
     // settled first, because that verdict can be the demotion the sweep below
     // then hands back.
-    //
-    // A conventional article's write is a ticket of its own, landed here the
-    // same way.
-    settle_segment_write_work(pipeline).await;
     settle_direct_verification_read(pipeline, file_id.job_id).await;
     settle_direct_demotion_work(pipeline).await;
 }
@@ -2501,7 +2494,6 @@ async fn settle_queued_decode(
             },
         })
         .await;
-    settle_segment_write_work(pipeline).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
@@ -2536,26 +2528,6 @@ async fn settle_direct_placement_work(pipeline: &mut Pipeline) {
     }
 }
 
-// Drives every decoded batch out to the disk owner to its commit, the way
-// the orchestrator's select loop would: the write runs on an owner thread,
-// and the commit waits for the done message.
-//
-// It waits on the messages themselves, with no deadline.
-async fn settle_segment_write_work(pipeline: &mut Pipeline) {
-    while pipeline
-        .segment_writes
-        .values()
-        .any(|tickets| !tickets.is_empty())
-    {
-        let done = pipeline
-            .segment_write_done_rx
-            .recv()
-            .await
-            .expect("the segment write channel should stay open");
-        pipeline.handle_segment_write_done(done).await;
-    }
-}
-
 // Drives every outstanding demotion reconstruction ticket to its handler, the
 // way the orchestrator's select loop would.
 //
@@ -2571,9 +2543,6 @@ async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
             .await
             .expect("the demotion completion channel should stay open");
         pipeline.handle_direct_demotion_done(done).await;
-        // A handback writes the articles the sweep unblocked: a ticket of
-        // its own, landed here the same way.
-        settle_segment_write_work(pipeline).await;
     }
 }
 
@@ -2635,7 +2604,6 @@ async fn submit_decoded_segment_from_server(
             },
         )
         .await;
-    settle_segment_write_work(pipeline).await;
     settle_direct_placement_work(pipeline).await;
 }
 
@@ -3092,7 +3060,6 @@ async fn park_direct_verification_verdict(pipeline: &mut Pipeline, job_id: JobId
 }
 
 async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
-    settle_segment_write_work(pipeline).await;
     settle_direct_post_repair_work(pipeline).await;
 
     settle_inflight_moves(pipeline).await;
@@ -3162,7 +3129,6 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
             )
         });
         pipeline.handle_decode_done(done).await;
-        settle_segment_write_work(pipeline).await;
         settle_direct_placement_work(pipeline).await;
         settle_inflight_moves(pipeline).await;
     }

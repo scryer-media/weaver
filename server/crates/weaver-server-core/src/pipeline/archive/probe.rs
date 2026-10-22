@@ -273,17 +273,14 @@ impl Pipeline {
 
         match self.classified_role_for_file(job_id, file) {
             FileRole::RarVolume { .. } => {
+                // Before the topology: a volume completing can make the set
+                // ready, and the completion check that follows must already
+                // see any gate the volume's recovery verdicts raise.
+                self.publish_completed_part_to_chase(job_id, file_id);
                 self.try_update_archive_topology(job_id, file_id).await;
                 // After it: grouping reads the facts the topology update just
                 // registered for this volume.
                 self.group_nameless_rar_volumes(job_id).await;
-                // After both: publishing can arm the set's chase, which reads
-                // the volume where its headers placed it, never where its name
-                // did. Still before any completion check: the topology update
-                // only queues the refresh that can make the set ready, and the
-                // check that follows must already see any gate the volume's
-                // recovery verdicts raise.
-                self.publish_completed_part_to_chase(job_id, file_id);
             }
             FileRole::SevenZipArchive
             | FileRole::SevenZipSplit { .. }

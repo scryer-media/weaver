@@ -2255,9 +2255,6 @@ impl Pipeline {
         // but not yet recorded on its file: its volume reads as short until
         // the placement lands, and the landing re-runs the drain sequence.
         let has_direct_placements = self.has_direct_placements(job_id);
-        // A decoded batch out to the disk owner is not on its file yet; the
-        // landing re-runs this check.
-        let has_segment_writes = self.has_pending_segment_writes(job_id);
 
         has_queued_work
             || has_inflight_downloads
@@ -2268,7 +2265,6 @@ impl Pipeline {
             || has_buffered_segments
             || has_file_crc_recovery
             || has_direct_placements
-            || has_segment_writes
     }
 
     fn promoted_recovery_pipeline_state(&self, job_id: JobId) -> PromotedRecoveryPipelineState {
