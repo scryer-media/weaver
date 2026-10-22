@@ -17,6 +17,25 @@ async fn finish_history_delete(pipeline: &mut Pipeline) {
     }
 }
 
+// Sends one batched history delete, drives its completion, and returns the
+// batch outcome.
+async fn delete_history_batch(
+    pipeline: &mut Pipeline,
+    job_ids: &[JobId],
+    delete_files: bool,
+) -> crate::HistoryDeleteBatchOutcome {
+    let (reply, recv) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::DeleteHistory {
+            job_ids: job_ids.iter().copied().collect(),
+            delete_files,
+            reply,
+        })
+        .await;
+    finish_history_delete(pipeline).await;
+    recv.await.unwrap().unwrap()
+}
+
 async fn retained_placement_fixture(
     temp: &tempfile::TempDir,
 ) -> (Pipeline, RestoreJobRequest, PathBuf) {
@@ -319,15 +338,13 @@ async fn blocked_restore_recovered_on_startup_stays_paused_and_cancel_clears_gat
     let (mut restored, _, _) = new_direct_pipeline(&temp).await;
     restored.restore_job(request).await.unwrap();
     assert!(restored.blocked_restores.contains_key(&job_id));
-    let (reply, done) = oneshot::channel();
-    restored
-        .handle_command(SchedulerCommand::CancelJob {
-            job_id,
-            origin: crate::jobs::handle::CancellationOrigin::User,
-            reply,
-        })
-        .await;
-    done.await.unwrap().unwrap();
+    let done = cancel_one_job(
+        &mut restored,
+        job_id,
+        crate::jobs::handle::CancellationOrigin::User,
+    )
+    .await;
+    done.unwrap();
     assert!(!restored.blocked_restores.contains_key(&job_id));
     assert!(!restored.jobs.contains_key(&job_id));
 }
@@ -760,16 +777,8 @@ async fn delete_history_removes_intermediate_output_dir() {
         ))
         .unwrap();
 
-    let (reply, recv) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::DeleteHistory {
-            job_id,
-            delete_files: false,
-            reply,
-        })
-        .await;
-    finish_history_delete(&mut pipeline).await;
-    recv.await.unwrap().unwrap();
+    let outcome = delete_history_batch(&mut pipeline, &[job_id], false).await;
+    assert!(outcome.refused.is_empty());
 
     assert!(!output_dir.exists());
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
@@ -804,20 +813,97 @@ async fn delete_history_with_a_stale_marker_removes_the_row_and_keeps_the_dir() 
         ))
         .unwrap();
 
+    let outcome = delete_history_batch(&mut pipeline, &[job_id], false).await;
+
+    assert_eq!(
+        outcome.deleted[&job_id].as_ref().unwrap().left_in_place,
+        vec![output_dir.clone()]
+    );
+    assert!(output_dir.join("leftover.bin").exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_history_reports_a_failed_cleanup_as_deleted_with_its_error() {
+    // The record goes in the delete transaction; the directory only after the
+    // job's scripts have stopped. A cleanup that fails in between must not
+    // pass for a record that survived: the id is deleted, and its error rides
+    // with it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let failing = JobId(30026);
+    let clean = JobId(30027);
+    let mut dirs = BTreeMap::new();
+    for (job_id, name) in [
+        (failing, "history-cleanup-fails"),
+        (clean, "history-cleanup-ok"),
+    ] {
+        let output_dir = intermediate_dir.join(name);
+        tokio::fs::create_dir_all(&output_dir).await.unwrap();
+        tokio::fs::write(
+            crate::jobs::working_dir::working_dir_marker_path(&output_dir),
+            [],
+        )
+        .await
+        .unwrap();
+        pipeline
+            .db
+            .insert_job_history(&history_row_with_output_dir(
+                job_id,
+                name,
+                "failed",
+                output_dir.clone(),
+            ))
+            .unwrap();
+        dirs.insert(job_id, output_dir);
+    }
+    // A script still running for the failing job holds its cleanup at the
+    // script-stop barrier, after its record is gone and before its directory
+    // goes.
+    let running = crate::post_processing::events::hold_test_event_run(
+        &pipeline.db,
+        failing.0,
+        "history-cleanup-barrier",
+    );
+
     let (reply, recv) = oneshot::channel();
     pipeline
         .handle_command(SchedulerCommand::DeleteHistory {
-            job_id,
+            job_ids: [failing, clean].into_iter().collect(),
             delete_files: false,
             reply,
         })
         .await;
+    let db = pipeline.db.clone();
+    crate::post_processing::events::wait_for_test_script_change(&db, || {
+        db.get_job_history(failing.0).unwrap().is_none()
+    })
+    .await;
+    // The directory now names another job, so its removal is refused.
+    tokio::fs::write(
+        crate::jobs::working_dir::working_dir_marker_path(&dirs[&failing]),
+        format!("weaver-job-v1:{}:{}\n", 99_999, "0".repeat(64)),
+    )
+    .await
+    .unwrap();
+    drop(running);
     finish_history_delete(&mut pipeline).await;
     let outcome = recv.await.unwrap().unwrap();
 
-    assert_eq!(outcome.left_in_place, vec![output_dir.clone()]);
-    assert!(output_dir.join("leftover.bin").exists());
-    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+    assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
+    let error = outcome.deleted[&failing]
+        .as_ref()
+        .expect_err("the failing id's cleanup error is reported");
+    assert!(
+        error.to_string().contains("no longer belongs"),
+        "unexpected cleanup error: {error}"
+    );
+    assert!(outcome.deleted[&clean].is_ok());
+    for job_id in [failing, clean] {
+        assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+    }
+    assert!(dirs[&failing].exists());
+    assert!(!dirs[&clean].exists());
 }
 
 #[tokio::test]
@@ -837,16 +923,8 @@ async fn delete_history_removes_db_only_history_row() {
     let row = history_row_with_output_dir(job_id, "History DB NZB", "failed", output_dir);
     pipeline.db.insert_job_history(&row).unwrap();
 
-    let (reply, recv) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::DeleteHistory {
-            job_id,
-            delete_files: false,
-            reply,
-        })
-        .await;
-    finish_history_delete(&mut pipeline).await;
-    recv.await.unwrap().unwrap();
+    let outcome = delete_history_batch(&mut pipeline, &[job_id], false).await;
+    assert!(outcome.refused.is_empty());
 
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
 }
@@ -879,33 +957,34 @@ async fn history_deletion_waits_for_scripts_without_blocking_commands() {
             job_id.0,
             "deletion-barrier",
         );
-        let (one_reply, mut one_recv) = oneshot::channel();
-        let (all_reply, mut all_recv) = oneshot::channel();
-        let command = if delete_all {
-            SchedulerCommand::DeleteAllHistory {
-                delete_files: false,
-                reply: all_reply,
-            }
-        } else {
-            SchedulerCommand::DeleteHistory {
-                job_id,
-                delete_files: false,
-                reply: one_reply,
-            }
-        };
-        pipeline.handle_command(command).await;
-        assert!(output_dir.exists());
+        // The batch form also carries a second, script-free history row.
+        let other_job = JobId(30027);
+        let mut job_ids = BTreeSet::from([job_id]);
         if delete_all {
-            assert!(matches!(
-                all_recv.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
-        } else {
-            assert!(matches!(
-                one_recv.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
+            pipeline
+                .db
+                .insert_job_history(&history_row_with_output_dir(
+                    other_job,
+                    "Script-free Delete",
+                    "failed",
+                    intermediate_dir.join("script-free-delete-job"),
+                ))
+                .unwrap();
+            job_ids.insert(other_job);
         }
+        let (reply, mut delete_recv) = oneshot::channel();
+        pipeline
+            .handle_command(SchedulerCommand::DeleteHistory {
+                job_ids,
+                delete_files: false,
+                reply,
+            })
+            .await;
+        assert!(output_dir.exists());
+        assert!(matches!(
+            delete_recv.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         let (reply, recv) = oneshot::channel();
         pipeline
             .handle_command(SchedulerCommand::PipelineDiagnostics { reply })
@@ -945,11 +1024,10 @@ async fn history_deletion_waits_for_scripts_without_blocking_commands() {
         pipeline.jobs.get_mut(&newer_job).unwrap().status = JobStatus::Complete;
         drop(running);
         finish_history_delete(&mut pipeline).await;
-        if delete_all {
-            all_recv.await.unwrap().unwrap();
-        } else {
-            one_recv.await.unwrap().unwrap();
-        }
+        let outcome = delete_recv.await.unwrap().unwrap();
+        assert!(outcome.refused.is_empty());
+        assert!(outcome.deleted.contains_key(&job_id));
+        assert_eq!(outcome.deleted.contains_key(&other_job), delete_all);
         assert!(!output_dir.exists());
         assert!(pipeline.jobs.contains_key(&newer_job));
         assert!(pipeline.pending_history_deletions.is_empty());
@@ -957,7 +1035,7 @@ async fn history_deletion_waits_for_scripts_without_blocking_commands() {
 }
 
 #[tokio::test]
-async fn delete_all_history_keeps_complete_output_dir() {
+async fn delete_history_batch_keeps_complete_output_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let failed_job_id = JobId(30021);
@@ -1001,15 +1079,9 @@ async fn delete_all_history_keeps_complete_output_dir() {
         ))
         .unwrap();
 
-    let (reply, recv) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::DeleteAllHistory {
-            delete_files: false,
-            reply,
-        })
-        .await;
-    finish_history_delete(&mut pipeline).await;
-    recv.await.unwrap().unwrap();
+    let outcome =
+        delete_history_batch(&mut pipeline, &[failed_job_id, complete_job_id], false).await;
+    assert!(outcome.refused.is_empty());
 
     assert!(!failed_output_dir.exists());
     assert!(complete_output_dir.exists());
@@ -1457,15 +1529,13 @@ async fn parking_a_job_keeps_its_working_dir() {
     let spec = standalone_job_spec("Parked Job", &[("parked.mkv".to_string(), 123)]);
     let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     std::fs::write(working_dir.join("parked.part"), b"kept").unwrap();
-    let (reply, done) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJob {
-            job_id,
-            origin: crate::jobs::handle::CancellationOrigin::UserKeepingFiles,
-            reply,
-        })
-        .await;
-    done.await.unwrap().unwrap();
+    let done = cancel_one_job(
+        &mut pipeline,
+        job_id,
+        crate::jobs::handle::CancellationOrigin::UserKeepingFiles,
+    )
+    .await;
+    done.unwrap();
     assert!(!pipeline.jobs.contains_key(&job_id));
     assert_eq!(
         pipeline

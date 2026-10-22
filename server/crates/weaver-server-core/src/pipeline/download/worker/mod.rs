@@ -160,6 +160,46 @@ const DOWNLOAD_RESTART_DURABLE_LEAD_RETRY_DELAY: Duration = Duration::from_milli
 const BODY_LANE_UNAVAILABLE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BODY_SERVER_BLOCKED_RECHECK_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+// How long a dispatch stall nothing explains may last before the watchdog
+// kicks it: every dispatch-side hold on the stalled jobs is cleared and a
+// pass runs against the result.
+pub(in crate::pipeline) const DOWNLOAD_DISPATCH_STALL_KICK_AFTER: Duration =
+    Duration::from_secs(2 * 60);
+// How long after a kick that moved none of the stalled jobs' bytes the
+// watchdog releases them: their queued articles are booked missing, as for
+// work no server can serve, and each job goes on to its completion check.
+pub(in crate::pipeline) const DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER: Duration =
+    Duration::from_secs(10 * 60);
+
+// The environment variable that switches the stall watchdog's escalations.
+// Recovery is on unless it says `0`, `false` or `off`.
+pub(crate) const DOWNLOAD_STALL_RECOVERY_ENV: &str = "WEAVER_DOWNLOAD_STALL_RECOVERY";
+
+// Whether the stall watchdog escalates, from the value of
+// [`DOWNLOAD_STALL_RECOVERY_ENV`]. On by default: absent, empty, or any value
+// other than `0`, `false` or `off` (case-insensitive) enables it.
+pub(crate) fn download_stall_recovery_from_env_value(value: Option<String>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let value = value.trim();
+    !(value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off"))
+}
+
+// A download dispatch stall the watchdog is timing: queued work, dispatch
+// running, and no article completing anywhere.
+#[derive(Debug, Clone)]
+pub(crate) struct DispatchStallWatch {
+    // When the stall began counting: first seen, or when the last timed
+    // wait that explained it ends.
+    pub(in crate::pipeline) since: Instant,
+    // The completed-article count when the watch started. Any article
+    // downloaded after that ends the stall.
+    pub(in crate::pipeline) segments_downloaded: u64,
+    // When the stall was kicked, and each stalled job's downloaded bytes at
+    // that moment. A job whose bytes moved since is not released.
+    pub(in crate::pipeline) kick: Option<(Instant, HashMap<JobId, u64>)>,
+}
 
 // How many retries inside one stall-log window, with nothing downloaded in
 // the same window, read as a retry storm rather than as ordinary churn. A
@@ -282,6 +322,16 @@ impl Pipeline {
                 None => idle_by_server.keys().copied().collect(),
             },
         };
+        // The fill servers this pass may send work to, for the rotation
+        // hint: a hinted article stays off its server only while one of
+        // these could take it instead. Unknown when the pass never ranked.
+        self.download_pass_fill_servers = ranked_this_pass.as_ref().map(|order| {
+            order
+                .iter()
+                .copied()
+                .filter(|server| !backfill_flags.get(*server).copied().unwrap_or(false))
+                .collect()
+        });
         let groups = self.nntp.pool().server_groups().to_vec();
         Self::order_dispatch_candidates(&mut servers, &groups, backfill_flags, &idle_by_server);
         // The backfill tier comes last, and only for what the fill tier has
@@ -492,7 +542,12 @@ impl Pipeline {
     // There are no per-server leases and no lane caps; soft byte pressure
     // limits the pass to a single article from the hot job.
     pub(crate) fn dispatch_downloads(&mut self) {
-        let now = Instant::now();
+        self.dispatch_downloads_at(Instant::now());
+    }
+
+    // One dispatch pass at `now`, the instant the pass's timers and the stall
+    // watchdog measure against.
+    pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
         self.download_dispatch_wake = false;
         // Every early return below except an operator pause is a gate that
         // can lift with no event to announce it, so the pass is retried on
@@ -743,6 +798,9 @@ impl Pipeline {
 
         let eligible_count = eligible.len();
         if eligible.is_empty() {
+            // Nothing dispatch would serve: no stall to time, and a stall
+            // timed before stays behind, not carried to the next job.
+            self.download_dispatch_stall = None;
             self.update_queue_metrics();
             return;
         }
@@ -754,18 +812,27 @@ impl Pipeline {
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
         {
-            match self.dispatch_one_download_lane(
+            let attempt = self.dispatch_one_download_lane(
                 pressure,
                 &mut sent_this_pass,
                 &mut headroom_at_pass_start,
                 &mut ranked_this_pass,
-            ) {
+            );
+            // Handouts outside a dispatch attempt rank the servers themselves.
+            self.download_pass_fill_servers = None;
+            match attempt {
                 DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => return,
             }
         }
         if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
+            if self.watch_download_dispatch_stall(now, pressure, max, eligible_count) {
+                // The kick cleared the holds this pass ran against; the
+                // next pass runs against what is left, now.
+                self.dispatch_downloads_at(now);
+                return;
+            }
             self.log_download_dispatch_liveness_stall(now, pressure, max, eligible_count);
         }
         self.log_download_retry_storm(now);

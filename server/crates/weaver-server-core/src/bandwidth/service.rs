@@ -72,11 +72,17 @@ impl BandwidthLedgerRuntime {
         self.metering_suspended = !enabled;
     }
 
+    // Queues the delete of buckets past retention, once per minute. It goes
+    // on the ordered writer queue rather than running here: a prune lost to a
+    // crash is redone by the next one, and nothing reads the ledger back
+    // before the writer has run it.
     pub(crate) fn prune_if_due(&mut self, db: &crate::Database) -> Result<(), crate::StateError> {
         let now_secs = crate::e2e_clock::unix_seconds();
         let prune_cutoff = now_secs.div_euclid(60) - BANDWIDTH_LEDGER_RETENTION_DAYS * 24 * 60;
         if self.last_pruned_bucket_epoch_minute != Some(prune_cutoff) {
-            db.prune_bandwidth_usage_before(prune_cutoff)?;
+            db.try_queue_write("bandwidth_usage_prune", move |db| {
+                db.prune_bandwidth_usage_before(prune_cutoff).map(|_| ())
+            })?;
             self.last_pruned_bucket_epoch_minute = Some(prune_cutoff);
         }
         Ok(())
@@ -96,6 +102,10 @@ impl BandwidthLedgerRuntime {
         Ok(())
     }
 
+    // Hands the pending minutes to the ordered writer queue. The caller is
+    // the per-article download path, so the write itself never runs here; a
+    // batch lost to a crash only shortens the usage graph, and the queue's
+    // order keeps the shutdown flush behind every batch handed over before it.
     pub(crate) fn flush_pending_usage(
         &mut self,
         db: &crate::Database,
@@ -103,17 +113,20 @@ impl BandwidthLedgerRuntime {
         if self.pending_usage_by_minute.is_empty() {
             return Ok(());
         }
-        let started = std::time::Instant::now();
         let entries = self
             .pending_usage_by_minute
             .iter()
             .map(|((bucket, metered), bytes)| (*bucket, *metered, *bytes))
             .collect::<Vec<_>>();
-        db.add_metered_bandwidth_usage_minutes(&entries)?;
+        db.try_queue_write("bandwidth_usage_flush", move |db| {
+            let started = std::time::Instant::now();
+            let result = db.add_metered_bandwidth_usage_minutes(&entries);
+            crate::runtime::perf_probe::record("bandwidth.flush_pending_usage", started.elapsed());
+            result
+        })?;
         self.pending_usage_by_minute.clear();
         self.pending_usage_bytes = 0;
         self.pending_usage_started_at = None;
-        crate::runtime::perf_probe::record("bandwidth.flush_pending_usage", started.elapsed());
         Ok(())
     }
 

@@ -375,13 +375,19 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     };
                     let _ = reply.send(result);
                 }
-                SchedulerCommand::CancelJob { job_id, reply, .. } => {
-                    let result = if jobs.remove(&job_id).is_some() {
-                        Ok(())
-                    } else {
-                        Err(SchedulerError::JobNotFound(job_id))
-                    };
-                    let _ = reply.send(result);
+                SchedulerCommand::CancelJobs { job_ids, reply, .. } => {
+                    let results = job_ids
+                        .into_iter()
+                        .map(|job_id| {
+                            let result = if jobs.remove(&job_id).is_some() {
+                                Ok(())
+                            } else {
+                                Err(SchedulerError::JobNotFound(job_id))
+                            };
+                            (job_id, result)
+                        })
+                        .collect();
+                    let _ = reply.send(results);
                 }
                 SchedulerCommand::PauseAll { reply } => {
                     shared_state.set_paused(true);
@@ -475,11 +481,14 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     jobs.insert(job_id, state);
                     let _ = reply.send(Ok(()));
                 }
-                SchedulerCommand::DeleteHistory { reply, .. } => {
-                    let _ = reply.send(Ok(Default::default()));
-                }
-                SchedulerCommand::DeleteAllHistory { reply, .. } => {
-                    let _ = reply.send(Ok(()));
+                SchedulerCommand::DeleteHistory { job_ids, reply, .. } => {
+                    let _ = reply.send(Ok(crate::HistoryDeleteBatchOutcome {
+                        deleted: job_ids
+                            .into_iter()
+                            .map(|job_id| (job_id, Ok(Default::default())))
+                            .collect(),
+                        refused: Default::default(),
+                    }));
                 }
                 SchedulerCommand::ReprocessJob {
                     job_id,

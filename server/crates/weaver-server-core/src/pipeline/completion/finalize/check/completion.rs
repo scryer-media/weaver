@@ -419,6 +419,12 @@ impl Pipeline {
     // CRC failures occur, recovery files are promoted for download and repair
     // runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        // A job whose cancel waits on its archive does not advance: the
+        // archive's done event either removes it or hands it back live, and
+        // a handed-back job is checked again then.
+        if self.pending_cancellations.contains_key(&job_id) {
+            return;
+        }
         if self.shared_state.is_post_processing_paused() {
             self.deferred_post_processing.insert(job_id);
             return;

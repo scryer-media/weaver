@@ -1193,6 +1193,75 @@ async fn delete_history_nonexistent() {
     assert_no_errors(&resp);
 }
 
+// The kinds of the in-memory queue events recorded for one item.
+async fn item_event_kinds(h: &TestHarness, item_id: u64) -> Vec<String> {
+    let resp = h
+        .execute(&format!(
+            "{{ historyEvents(itemId: {item_id}) {{ kind itemId }} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    response_data(&resp)["historyEvents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn remove_history_items_announces_every_removed_id_before_a_refusal() {
+    let h = TestHarness::new_without_history_delete_worker().await;
+    let removed = 41_001;
+    h.insert_history_row(&sample_history_row(removed, "removed", "complete", 100));
+    let active = h.submit_test_nzb("still-active").await;
+
+    let resp = h
+        .execute(&format!(
+            "mutation {{ removeHistoryItems(ids: [{removed}, {active}]) {{ success }} }}"
+        ))
+        .await;
+
+    // The refusal still surfaces, and the id that was deleted says so.
+    assert_has_errors(&resp);
+    assert!(h.db.get_job_history(removed).unwrap().is_none());
+    assert_eq!(item_event_kinds(&h, removed).await, vec!["ITEM_REMOVED"]);
+    assert!(
+        !item_event_kinds(&h, active)
+            .await
+            .iter()
+            .any(|kind| kind == "ITEM_REMOVED")
+    );
+}
+
+#[tokio::test]
+async fn delete_all_history_deletes_every_listed_row_across_batches() {
+    let h = TestHarness::new_without_history_delete_worker().await;
+    // More rows than one batch holds, so the listing goes in several.
+    let rows = weaver_server_core::HISTORY_DELETE_BATCH_SIZE as u64 + 1;
+    for id in 1..=rows {
+        h.insert_history_row(&sample_history_row(
+            42_000 + id,
+            &format!("history-{id}"),
+            "complete",
+            100 + id as i64,
+        ));
+    }
+    // A live job that has not finished is not history, so delete-all neither
+    // lists nor refuses it.
+    let active = h.submit_test_nzb("delete-all-active").await;
+
+    let resp = h.execute("mutation { deleteAllHistory { id } }").await;
+
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert!(data["deleteAllHistory"].as_array().unwrap().is_empty());
+    for id in 1..=rows {
+        assert!(h.db.get_job_history(42_000 + id).unwrap().is_none());
+    }
+    assert!(h.handle.get_job(weaver_server_core::JobId(active)).is_ok());
+}
+
 #[tokio::test]
 async fn delete_all_history_when_empty() {
     let h = TestHarness::new().await;

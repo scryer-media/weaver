@@ -185,8 +185,31 @@ test("duplicate policy produces block, pause, and force decisions without pipeli
     )).markDuplicateGood,
   ).toBeFalsy();
 
+  // Batch cancellation must return one result per requested ID, including a
+  // missing ID between two real jobs, and leave an unrelated job untouched.
+  const missingId = 999_999_999;
+  const batch = await graphql<{
+    cancelJobs: Array<{ id: number; cancelled: boolean; errorCode: string | null }>;
+  }>(request, `mutation WeaverE2ECancelBatch($ids: [Int!]!) {
+    cancelJobs(ids: $ids) { id cancelled errorCode }
+  }`, { ids: [queued[0], missingId, queued[1]] });
+  expect(batch.cancelJobs).toHaveLength(3);
+  expect(batch.cancelJobs).toEqual(expect.arrayContaining([
+    { id: queued[0], cancelled: true, errorCode: null },
+    { id: missingId, cancelled: false, errorCode: "NOT_FOUND" },
+    { id: queued[1], cancelled: true, errorCode: null },
+  ]));
+  await expect.poll(async () => {
+    const result = await graphql<{ queueItems: Array<{ id: number }> }>(
+      request, "query WeaverE2EQueueAfterBatch { queueItems { id } }",
+    );
+    const ids = result.queueItems.map(item => item.id);
+    return { firstGone: !ids.includes(queued[0]), secondGone: !ids.includes(queued[1]), otherPresent: ids.includes(queued[2]) };
+  }, { message: "batch cancellation removes exactly the selected probes", timeout: 0 })
+    .toEqual({ firstGone: true, secondGone: true, otherPresent: true });
+
   for (const jobId of [
-    ...queued,
+    ...queued.slice(2),
     replacement.markDuplicateBad.jobId,
   ].filter((value): value is number => value != null)) {
     expect(

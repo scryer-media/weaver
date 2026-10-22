@@ -2155,9 +2155,13 @@ impl Pipeline {
         absent
     }
 
-    // Whether a job currently owns live download-stage work for queue presentation.
-    // Queued articles and delayed retries deliberately do not count: they are the
-    // scheduler's backlog, not current transfer activity.
+    // Whether a job currently owns live download-stage work. It feeds two
+    // things: `list_jobs` showing a job whose download state reads Complete as
+    // still Downloading while transfers finish, and the download phase rate
+    // in the progress samples, which only counts while transfers are live.
+    // Queued articles and delayed retries deliberately do not count: they are
+    // the scheduler's backlog, not current transfer activity, and a started
+    // job with only backlog still lists as Downloading on its own state.
     pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
         self.active_download_connections_by_job
             .get(&job_id)
@@ -2255,9 +2259,6 @@ impl Pipeline {
         // but not yet recorded on its file: its volume reads as short until
         // the placement lands, and the landing re-runs the drain sequence.
         let has_direct_placements = self.has_direct_placements(job_id);
-        // A decoded batch out to the disk owner is not on its file yet; the
-        // landing re-runs this check.
-        let has_segment_writes = self.has_pending_segment_writes(job_id);
 
         has_queued_work
             || has_inflight_downloads
@@ -2268,7 +2269,6 @@ impl Pipeline {
             || has_buffered_segments
             || has_file_crc_recovery
             || has_direct_placements
-            || has_segment_writes
     }
 
     fn promoted_recovery_pipeline_state(&self, job_id: JobId) -> PromotedRecoveryPipelineState {

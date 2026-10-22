@@ -235,3 +235,39 @@ async fn graphql_query_depth_is_limited() {
         resp.errors
     );
 }
+
+// The web client sends a bulk action as groups of aliased fields, at most
+// this many per request (`ALIASED_GROUP_SIZE` in the web client's
+// aliased-mutations module). Each aliased scalar field costs one.
+const WEB_ALIASED_GROUP_SIZE: usize = 200;
+
+#[tokio::test]
+async fn a_bulk_action_group_fits_the_complexity_limit() {
+    let schema = apply_graphql_query_guards(Schema::build(
+        weaver_server_api::QueryRoot::default(),
+        weaver_server_api::MutationRoot::default(),
+        weaver_server_api::SubscriptionRoot::default(),
+    ))
+    .finish();
+    let variables = (0..WEB_ALIASED_GROUP_SIZE)
+        .map(|index| format!("$id{index}: Int!"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fields = (0..WEB_ALIASED_GROUP_SIZE)
+        .map(|index| format!("updateJob{index}: updateJobs(ids: [$id{index}], category: $category, priority: $priority)"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let query = format!(
+        "mutation UpdateSelectedJobs({variables}, $category: String, $priority: String) {{ {fields} }}"
+    );
+
+    let resp = schema.execute(&query).await;
+
+    assert!(
+        resp.errors
+            .iter()
+            .all(|error| !error.message.contains("Query is too complex")),
+        "a group of {WEB_ALIASED_GROUP_SIZE} aliased fields is refused as too complex: {:?}",
+        resp.errors
+    );
+}

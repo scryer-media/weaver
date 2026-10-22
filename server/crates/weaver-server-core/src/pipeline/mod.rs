@@ -22,15 +22,13 @@ mod repair;
 mod server_attribution;
 mod support_facts;
 
-use orchestrator::{
-    SegmentWriteBatchError, is_terminal_status, submit_segments_to_disk, write_segment_to_disk,
-};
 pub(crate) use orchestrator::{
     close_cached_write_handles_under, release_cached_write_handle,
     remove_file_after_cached_write_handle,
 };
 #[cfg(test)]
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
+use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1496,46 +1494,6 @@ pub(super) struct DirectPlacementDone {
     pub(super) flight_id: u64,
 }
 
-// A decoded batch out to the disk owner, off the pipeline task, with the
-// commit it owes once the owner answers. See `decode::landing`.
-pub(super) struct SegmentWriteTicket {
-    pub(super) id: u64,
-    pub(super) filename: String,
-    pub(super) file_path: std::path::PathBuf,
-    pub(super) kind: SegmentWriteKind,
-    // Names the write in the job failure a failed batch becomes.
-    pub(super) context: &'static str,
-    pub(super) bytes: usize,
-    pub(super) count: usize,
-    // The batch's clean ranges: accepted bytes a damaged write must not
-    // cover while they are neither buffered nor committed.
-    pub(super) clean_ranges: Vec<(u64, u64)>,
-    pub(super) started: Instant,
-    // The owner's answer. It is sent before the done message, so a landing
-    // never waits on it.
-    pub(super) outcome: oneshot::Receiver<SegmentWriteOutcome>,
-    // Its done message arrived. A file's tickets land in submission order,
-    // so an answered ticket waits behind one still writing.
-    pub(super) answered: bool,
-}
-
-pub(super) type SegmentWriteOutcome =
-    Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>;
-
-#[derive(Clone, Copy, Debug)]
-pub(super) enum SegmentWriteKind {
-    // The file's contiguous run: its durable floor moves to `contiguous_end`
-    // once these bytes are on disk.
-    Ready { contiguous_end: u64 },
-    // Parked bytes written where they fall, to relieve memory.
-    OutOfOrder,
-}
-
-pub(super) struct SegmentWriteDone {
-    pub(super) file_id: NzbFileId,
-    pub(super) ticket: u64,
-}
-
 // The re-read of a set's restart-seeded coverage, detached from the actor.
 //
 // Restart restores a set's floors from its checkpoint but not the bytes'
@@ -1810,6 +1768,7 @@ pub(super) struct MoveToCompleteDone {
 
 pub(super) enum TerminalPostProcessingEvent {
     HistoryDeleteDone(orchestrator::HistoryDeleteDone),
+    CancelJobsDone(orchestrator::CancelJobsDone),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
     AddedScriptsDone(JobId, Result<(), crate::StateError>),
@@ -2936,6 +2895,10 @@ pub struct Pipeline {
     pub(super) added_script_holds: HashSet<JobId>,
     pub(super) script_data_dir: PathBuf,
     pub(super) pending_history_deletions: HashSet<JobId>,
+    // Jobs whose batched cancel has queued its archive and waits for it to
+    // commit, with the batch's generation. The job stays live until then.
+    pub(super) pending_cancellations: HashMap<JobId, u64>,
+    pub(super) cancel_generation: u64,
     pub(super) terminal_post_processing_cancellations:
         HashMap<JobId, tokio::sync::watch::Sender<bool>>,
     // Cooperative cancellation tokens for PAR2 verification and repair work.
@@ -2998,17 +2961,6 @@ pub struct Pipeline {
     pub(super) next_direct_placement_flight_id: u64,
     pub(super) direct_placement_done_tx: mpsc::Sender<DirectPlacementDone>,
     pub(super) direct_placement_done_rx: mpsc::Receiver<DirectPlacementDone>,
-    // Decoded batches out to the disk owner, per file in submission order;
-    // see [`SegmentWriteTicket`].
-    pub(super) segment_writes: HashMap<NzbFileId, VecDeque<SegmentWriteTicket>>,
-    // A removed job's batches still out to the disk owner, by ticket: the
-    // owner holds their bytes until it answers, so they stay charged until
-    // then.
-    pub(super) orphaned_segment_writes: HashMap<u64, (usize, usize)>,
-    // Monotonic; stamps each ticket and its done message.
-    pub(super) next_segment_write_id: u64,
-    pub(super) segment_write_done_tx: mpsc::Sender<SegmentWriteDone>,
-    pub(super) segment_write_done_rx: mpsc::Receiver<SegmentWriteDone>,
     // Holds every placement task at its first step until a permit is added,
     // so a test can keep a destination write open for as long as it likes.
     #[cfg(test)]
@@ -3131,6 +3083,15 @@ pub struct Pipeline {
     pub(super) propagation_delay_forced: Option<Duration>,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    // The dispatch stall the watchdog is timing toward a kick or a release.
+    pub(super) download_dispatch_stall: Option<download::DispatchStallWatch>,
+    // The available fill servers of the dispatch attempt running now, in
+    // its order; `None` outside one. Read by the rotation hint, which keeps
+    // an article off its hinted server only while one of these could take it.
+    pub(super) download_pass_fill_servers: Option<Vec<usize>>,
+    // Whether the stall watchdog escalates (kick, then release). Read once
+    // from `WEAVER_DOWNLOAD_STALL_RECOVERY` at construction; on by default.
+    pub(super) download_stall_recovery: bool,
     // Retry-storm window: when it opened, and the retry and download counts
     // it opened with. A pipeline that retries without ever finishing an
     // article is as stalled as one with no active downloads, but it looks
@@ -3158,9 +3119,6 @@ pub struct Pipeline {
     pub(super) last_download_lanes_under_cap_log_at: Option<Instant>,
     // Current in-memory decoded backlog retained for sequential write ordering.
     pub(super) write_buffered_bytes: usize,
-    // The part of `write_buffered_bytes` out to the disk owner rather than
-    // parked. Relief has nothing to move there; the landing releases it.
-    pub(super) write_inflight_bytes: usize,
     // Current in-memory decoded segment count retained for sequential write ordering.
     pub(super) write_buffered_segments: usize,
     // Disk-backed uuencode parts waiting for their missing prefix.
