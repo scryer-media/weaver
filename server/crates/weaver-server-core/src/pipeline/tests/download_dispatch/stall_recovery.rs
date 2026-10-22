@@ -396,3 +396,228 @@ fn stall_recovery_is_on_unless_the_variable_says_0_false_or_off() {
         assert!(!parse(Some(disabled.to_string())), "{disabled}");
     }
 }
+
+// Regression fixtures use real dispatch gates and nonzero capacity. Aging
+// the watch tests the release decision, not elapsed provider retry history.
+async fn verification_pipeline(temp: &tempfile::TempDir, two_servers: bool) -> Pipeline {
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        temp,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        1,
+    )
+    .await;
+    let mut config = weaver_nntp::client::NntpClientConfig::single(
+        weaver_nntp::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: refusing_harness_server_port(),
+            tls: false,
+            ..Default::default()
+        },
+        1,
+    );
+    if two_servers {
+        config.servers.push(weaver_nntp::ServerPoolConfig::new(
+            weaver_nntp::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: refusing_harness_server_port(),
+                tls: false,
+                ..Default::default()
+            },
+        ));
+    }
+    pipeline.nntp = Arc::new(weaver_nntp::NntpClient::new(config));
+    pipeline
+}
+
+fn verification_run_real_kick(pipeline: &mut Pipeline) {
+    let now = Instant::now();
+    pipeline.download_dispatch_stall = Some(crate::pipeline::download::DispatchStallWatch {
+        since: now - DOWNLOAD_DISPATCH_STALL_KICK_AFTER - Duration::from_secs(1),
+        segments_downloaded: pipeline.metrics.segments_downloaded.load(Ordering::Relaxed),
+        kick: None,
+    });
+    pipeline.dispatch_downloads();
+    assert_eq!(kicks(pipeline), 1);
+    assert_eq!(releases(pipeline), 0);
+    assert!(
+        pipeline
+            .download_dispatch_stall
+            .as_ref()
+            .unwrap()
+            .kick
+            .is_some()
+    );
+}
+
+fn verification_old_kick(pipeline: &mut Pipeline, jobs: &[JobId]) {
+    let now = Instant::now();
+    pipeline.download_dispatch_stall = Some(crate::pipeline::download::DispatchStallWatch {
+        since: now - DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER - Duration::from_secs(1),
+        segments_downloaded: pipeline.metrics.segments_downloaded.load(Ordering::Relaxed),
+        kick: Some((
+            now - DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER - Duration::from_secs(1),
+            jobs.iter()
+                .map(|id| (*id, pipeline.jobs[id].downloaded_bytes))
+                .collect(),
+        )),
+    });
+}
+
+async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline, job_id: JobId) {
+    let queue = &mut pipeline.jobs.get_mut(&job_id).unwrap().download_queue;
+    let mut works = queue.drain_all();
+    for work in &mut works {
+        work.exclude_servers = vec![0];
+    }
+    for work in works {
+        queue.push(work);
+    }
+    // A genuine auth rejection uses the unmodified production five-minute
+    // backoff. The watchdog can have an older history than this latest rejection.
+    pipeline
+        .nntp
+        .pool()
+        .health()
+        .lock()
+        .await
+        .record_failure(1, true);
+    assert_eq!(
+        pipeline
+            .nntp
+            .blocking_body_server_order(&[])
+            .unwrap()
+            .iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>(),
+        vec![0]
+    );
+    assert!(
+        pipeline
+            .nntp
+            .blocking_body_server_order(&[0])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn mixed_stall_kick_preserves_another_jobs_propagation_hold() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let wedged = JobId(41902);
+    let waiting = JobId(41903);
+    insert_stalled_job(&mut pipeline, wedged, 3).await;
+    let mut spec = segmented_job_spec("Propagating", "payload.bin", &[512, 512, 512]);
+    let posted = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    for file in &mut spec.files {
+        file.posted_at_epoch = Some(posted);
+    }
+    insert_active_job(&mut pipeline, waiting, spec).await;
+    pipeline.propagation_delay = Duration::from_secs(3600);
+    verification_exclude_healthy_and_cool_remaining(&mut pipeline, wedged).await;
+    let hold = pipeline.propagation_hold_until(waiting).unwrap();
+    verification_run_real_kick(&mut pipeline);
+    assert_eq!(pipeline.propagation_ready_at[&waiting].0, hold);
+    let kicked = &pipeline
+        .download_dispatch_stall
+        .as_ref()
+        .unwrap()
+        .kick
+        .as_ref()
+        .unwrap()
+        .1;
+    assert!(kicked.contains_key(&wedged));
+    assert!(!kicked.contains_key(&waiting));
+    assert_eq!(pipeline.jobs[&waiting].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn mixed_stall_release_rechecks_each_jobs_current_wait() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let wedged = JobId(41912);
+    let waiting = JobId(41913);
+    insert_stalled_job(&mut pipeline, wedged, 3).await;
+    insert_stalled_job(&mut pipeline, waiting, 3).await;
+    verification_exclude_healthy_and_cool_remaining(&mut pipeline, wedged).await;
+    // Both jobs belonged to the earlier kick; one now has a valid wait.
+    verification_old_kick(&mut pipeline, &[wedged, waiting]);
+    let hold = Instant::now() + Duration::from_secs(3600);
+    pipeline.propagation_delay = Duration::from_secs(3600);
+    pipeline.propagation_ready_at.insert(waiting, (hold, 0));
+    pipeline.dispatch_downloads();
+    assert_eq!(releases(&pipeline), 1);
+    assert_eq!(
+        pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
+        3
+    );
+    assert_eq!(pipeline.jobs[&waiting].download_queue.len(), 3);
+    assert_eq!(pipeline.jobs[&waiting].failed_bytes, 0);
+    assert_eq!(pipeline.propagation_ready_at[&waiting].0, hold);
+}
+
+#[tokio::test]
+async fn operator_pause_and_resume_discard_pre_pause_stall_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41914);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    verification_exclude_healthy_and_cool_remaining(&mut pipeline, job).await;
+    verification_old_kick(&mut pipeline, &[job]);
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::PauseAll { reply })
+        .await;
+    done.await.unwrap();
+    assert!(pipeline.download_dispatch_stall.is_none());
+    pipeline.dispatch_downloads();
+    assert!(pipeline.download_dispatch_stall.is_none());
+    let (reply, done) = oneshot::channel();
+    pipeline
+        .handle_command(SchedulerCommand::ResumeAll { reply })
+        .await;
+    done.await.unwrap();
+    pipeline.dispatch_downloads();
+    assert_eq!(releases(&pipeline), 0);
+    assert_eq!(kicks(&pipeline), 0);
+    assert!(
+        pipeline
+            .download_dispatch_stall
+            .as_ref()
+            .unwrap()
+            .kick
+            .is_none()
+    );
+    assert_eq!(pipeline.jobs[&job].download_queue.len(), 3);
+}
+
+#[tokio::test]
+async fn a_valid_wait_after_kick_restarts_the_recovery_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut pipeline = verification_pipeline(&temp, true).await;
+    let job = JobId(41915);
+    insert_stalled_job(&mut pipeline, job, 3).await;
+    verification_exclude_healthy_and_cool_remaining(&mut pipeline, job).await;
+    verification_old_kick(&mut pipeline, &[job]);
+    pipeline.propagation_delay = Duration::from_secs(3600);
+    let ready_at = Instant::now() + Duration::from_secs(3600);
+    pipeline.propagation_ready_at.insert(job, (ready_at, 0));
+    pipeline.dispatch_downloads();
+    let watch = pipeline.download_dispatch_stall.as_ref().unwrap();
+    assert!(watch.kick.is_none());
+    assert_eq!(watch.since, ready_at);
+    assert_eq!(releases(&pipeline), 0);
+    assert_eq!(pipeline.jobs[&job].download_queue.len(), 3);
+}

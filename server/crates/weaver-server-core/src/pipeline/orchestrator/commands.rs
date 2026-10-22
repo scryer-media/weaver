@@ -234,6 +234,7 @@ impl Pipeline {
                 let _ = reply.send(());
             }
             SchedulerCommand::PauseAll { reply } => {
+                self.download_dispatch_stall = None;
                 self.global_paused = true;
                 self.scheduled_pause = false;
                 self.download_restart_durable_lead_retry_after.clear();
@@ -252,6 +253,7 @@ impl Pipeline {
                 let _ = reply.send(());
             }
             SchedulerCommand::ResumeAll { reply } => {
+                self.download_dispatch_stall = None;
                 self.global_paused = false;
                 self.scheduled_pause = false;
                 self.shared_state.set_paused(false);
@@ -857,6 +859,7 @@ impl Pipeline {
                 // recoverable rather than reported cancelled.
                 tracing::error!(error = %error, "failed to queue cancelled job archives");
                 for cleanup in cleanups {
+                    self.restore_after_failed_cancellation(cleanup.job_id);
                     results.insert(
                         cleanup.job_id,
                         Err(crate::SchedulerError::State(crate::StateError::Database(
@@ -925,9 +928,7 @@ impl Pipeline {
                 Err(_) => Some(crate::SchedulerError::ChannelClosed),
             };
             if let Some(error) = failure {
-                // Live again: whatever the job finished while it waited is
-                // judged now.
-                self.schedule_job_completion_check(job_id);
+                self.restore_after_failed_cancellation(job_id);
                 results.insert(job_id, Err(error));
                 continue;
             }
@@ -956,6 +957,25 @@ impl Pipeline {
             }
         }
         let _ = reply.send(results);
+    }
+
+    // The archive did not commit, so future work belongs to a live job again.
+    // Tokens already handed to workers stay cancelled. Discard their read-only
+    // analysis tickets and retained sessions so neither a late verdict nor a
+    // cached session can reintroduce the cancelled token into the next pass.
+    fn restore_after_failed_cancellation(&mut self, job_id: JobId) {
+        self.forget_par2_analysis_work(job_id);
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            runtime.scan_budget = None;
+            for set in runtime.sets.values_mut() {
+                set.session = None;
+                set.session_last_used = None;
+                set.session_evidence_file_ids.clear();
+            }
+        }
+        self.par2_cancellations.remove(&job_id);
+        self.shared_state.clear_job_cancellations(job_id);
+        self.schedule_job_completion_check(job_id);
     }
 
     // Refuses a cancel the job's state does not allow, or else sends every
@@ -997,6 +1017,9 @@ impl Pipeline {
         }
         self.db.cancel_event_scripts(job_id.0);
         if origin.is_user() {
+            // Reassert at actor admission: a preceding failed cancellation may
+            // have rolled back the handle's early cancellation signal.
+            self.shared_state.cancel_active_job_work(job_id);
             self.raise_queue_script_event(
                 job_id,
                 crate::post_processing::model::QueueEvent::NzbDeleted,
