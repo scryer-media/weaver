@@ -111,8 +111,10 @@ impl Queue {
                     continue;
                 }
                 let mut phases = Vec::with_capacity(row.phases.len());
-                let downloading =
-                    row.info(&inner.globals).download_state == crate::DownloadState::Downloading;
+                // The download phase samples only while something moves bytes:
+                // a started download between lanes keeps its lane-less state
+                // but shows no phase and no rate.
+                let downloading = row.download_activity();
                 for (&phase, sample) in &mut row.phases {
                     let download = phase == JobPhase::Downloading;
                     if download && !downloading {

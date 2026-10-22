@@ -101,6 +101,20 @@ impl Pipeline {
                 Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
+        let download_stall_recovery = download::download_stall_recovery_from_env_value(
+            std::env::var(download::DOWNLOAD_STALL_RECOVERY_ENV).ok(),
+        );
+        info!(
+            download_stall_recovery,
+            env = download::DOWNLOAD_STALL_RECOVERY_ENV,
+            "download dispatch stall recovery {} (on by default; {}=0, false or off disables it)",
+            if download_stall_recovery {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            download::DOWNLOAD_STALL_RECOVERY_ENV,
+        );
         let profile_tuning = hardware_profile.tuning(&profile);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
@@ -425,6 +439,9 @@ impl Pipeline {
             #[cfg(test)]
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
+            download_dispatch_stall: None,
+            download_stall_recovery,
+            download_pass_fill_servers: None,
             download_retry_storm_window: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),

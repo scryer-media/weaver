@@ -3121,7 +3121,7 @@ async fn list_jobs_keeps_legacy_idle_post_state_for_waiting_rar_phase() {
     assert_eq!(info.status, JobStatus::Downloading);
     assert_eq!(
         info.download_state,
-        crate::jobs::model::DownloadState::Queued
+        crate::jobs::model::DownloadState::Downloading
     );
     assert_eq!(info.post_state, crate::jobs::model::PostState::Idle);
 }

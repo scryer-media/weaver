@@ -3094,6 +3094,15 @@ pub struct Pipeline {
     pub(super) propagation_delay_forced: Option<Duration>,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
+    // The dispatch stall the watchdog is timing toward a kick or a release.
+    pub(super) download_dispatch_stall: Option<download::DispatchStallWatch>,
+    // The available fill servers of the dispatch attempt running now, in
+    // its order; `None` outside one. Read by the rotation hint, which keeps
+    // an article off its hinted server only while one of these could take it.
+    pub(super) download_pass_fill_servers: Option<Vec<usize>>,
+    // Whether the stall watchdog escalates (kick, then release). Read once
+    // from `WEAVER_DOWNLOAD_STALL_RECOVERY` at construction; on by default.
+    pub(super) download_stall_recovery: bool,
     // Retry-storm window: when it opened, and the retry and download counts
     // it opened with. A pipeline that retries without ever finishing an
     // article is as stalled as one with no active downloads, but it looks

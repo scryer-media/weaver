@@ -196,14 +196,19 @@ impl JobRow {
         }
     }
 
-    pub fn info(&self, globals: &Globals) -> JobInfo {
-        let mut job = self.report.job.clone();
-        let activity = self.report.download_active
+    // A lane holds the job, or bytes arrived since the pipeline last reported it.
+    pub(crate) fn download_activity(&self) -> bool {
+        self.report.download_active
             || self
                 .counters
                 .last_byte_at_ms
                 .load(std::sync::atomic::Ordering::Relaxed)
-                > self.report.observed_byte_at_ms;
+                > self.report.observed_byte_at_ms
+    }
+
+    pub fn info(&self, globals: &Globals) -> JobInfo {
+        let mut job = self.report.job.clone();
+        let activity = self.download_activity();
         let propagation = self
             .report
             .propagation_until_epoch_ms
@@ -233,8 +238,6 @@ impl JobRow {
             )
         {
             job.download_state = crate::DownloadState::Downloading;
-        } else if job.status == crate::JobStatus::Downloading && !activity {
-            job.download_state = crate::DownloadState::Queued;
         }
         if !self.phases.is_empty() {
             job.phase_progress = self.sampled_phases.clone();

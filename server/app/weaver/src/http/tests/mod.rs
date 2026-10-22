@@ -825,6 +825,8 @@ fn populated_metrics_snapshot() -> MetricsSnapshot {
         segments_failed_permanent: 18,
         parked_infrastructure_work: 29,
         nntp_generation_recovery_requeues: 30,
+        download_dispatch_stall_kicks: 2,
+        download_dispatch_stall_releases: 1,
         download_failures_article_not_found: 24,
         download_failures_capacity_unavailable: 25,
         download_failures_transient: 26,

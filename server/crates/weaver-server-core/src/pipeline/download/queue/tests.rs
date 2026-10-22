@@ -91,6 +91,23 @@ fn clear_exclude_servers_drops_stale_indices_and_counter() {
 }
 
 #[test]
+fn clear_exclude_servers_drops_hints_on_hint_only_work() {
+    let mut q = DownloadQueue::new();
+    let mut hinted = make_work(1, 0, 0, 10);
+    hinted.avoid_server = Some(3);
+    q.push(hinted);
+    q.push(make_work(1, 0, 1, 20));
+    assert_eq!(q.excluded_work_count(), 1);
+
+    q.clear_exclude_servers();
+    assert_eq!(q.excluded_work_count(), 0);
+    assert_eq!(q.len(), 2);
+    while let Some(work) = q.pop() {
+        assert_eq!(work.avoid_server, None);
+    }
+}
+
+#[test]
 fn priority_ordering() {
     let mut q = DownloadQueue::new();
     q.push(make_work(1, 0, 0, 100));

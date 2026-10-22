@@ -463,6 +463,11 @@ pub struct PipelineMetrics {
     pub segments_failed_permanent: AtomicU64,
     pub parked_infrastructure_work: AtomicUsize,
     pub nntp_generation_recovery_requeues: AtomicU64,
+    // Download dispatch stall recoveries, by escalation: a kick clears the
+    // dispatch-side holds of a stall nothing explains; a release books the
+    // stalled jobs' queued articles missing when the kick moved no bytes.
+    pub download_dispatch_stall_kicks: AtomicU64,
+    pub download_dispatch_stall_releases: AtomicU64,
     pub download_failures_article_not_found: AtomicU64,
     pub download_failures_capacity_unavailable: AtomicU64,
     pub download_failures_transient: AtomicU64,
@@ -607,6 +612,8 @@ impl PipelineMetrics {
             segments_failed_permanent: AtomicU64::new(0),
             parked_infrastructure_work: AtomicUsize::new(0),
             nntp_generation_recovery_requeues: AtomicU64::new(0),
+            download_dispatch_stall_kicks: AtomicU64::new(0),
+            download_dispatch_stall_releases: AtomicU64::new(0),
             download_failures_article_not_found: AtomicU64::new(0),
             download_failures_capacity_unavailable: AtomicU64::new(0),
             download_failures_transient: AtomicU64::new(0),
@@ -862,6 +869,12 @@ impl PipelineMetrics {
             nntp_generation_recovery_requeues: self
                 .nntp_generation_recovery_requeues
                 .load(Ordering::Relaxed),
+            download_dispatch_stall_kicks: self
+                .download_dispatch_stall_kicks
+                .load(Ordering::Relaxed),
+            download_dispatch_stall_releases: self
+                .download_dispatch_stall_releases
+                .load(Ordering::Relaxed),
             download_failures_article_not_found: self
                 .download_failures_article_not_found
                 .load(Ordering::Relaxed),
@@ -1015,6 +1028,10 @@ pub struct MetricsSnapshot {
     pub parked_infrastructure_work: usize,
     #[serde(default)]
     pub nntp_generation_recovery_requeues: u64,
+    #[serde(default)]
+    pub download_dispatch_stall_kicks: u64,
+    #[serde(default)]
+    pub download_dispatch_stall_releases: u64,
     pub download_failures_article_not_found: u64,
     pub download_failures_capacity_unavailable: u64,
     pub download_failures_transient: u64,

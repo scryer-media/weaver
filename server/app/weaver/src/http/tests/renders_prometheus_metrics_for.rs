@@ -109,6 +109,14 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_failures_total{kind=\"permanent\"} 28"));
     assert!(rendered.contains("weaver_pipeline_parked_infrastructure_work 29"));
     assert!(rendered.contains("weaver_nntp_generation_recovery_requeues_total 30"));
+    assert!(
+        rendered.contains(
+            "weaver_pipeline_download_dispatch_stall_recoveries_total{action=\"kick\"} 2"
+        )
+    );
+    assert!(rendered.contains(
+        "weaver_pipeline_download_dispatch_stall_recoveries_total{action=\"release\"} 1"
+    ));
     // The descriptive labels live on the info metric; the value series carry
     // job_id alone so a rename or a status change does not churn their identity.
     assert!(rendered.contains(
@@ -285,6 +293,8 @@ fn renders_prometheus_download_observed_limiter_states() {
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
         nntp_generation_recovery_requeues: 0,
+        download_dispatch_stall_kicks: 0,
+        download_dispatch_stall_releases: 0,
         download_failures_article_not_found: 0,
         download_failures_capacity_unavailable: 0,
         download_failures_transient: 0,

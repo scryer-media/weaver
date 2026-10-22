@@ -108,6 +108,8 @@ metric_families! {
         "Segments parked while NNTP infrastructure is unavailable.");
     GENERATION_RECOVERY_REQUEUES = ("weaver_nntp_generation_recovery_requeues_total", Counter, [],
         "Segments requeued after stale NNTP generation failures.");
+    DOWNLOAD_DISPATCH_STALL_RECOVERIES = ("weaver_pipeline_download_dispatch_stall_recoveries_total", Counter, ["action"],
+        "Download dispatch stalls recovered, by escalation (kick, release).");
 
     // ---- failures --------------------------------------------------------
     DOWNLOAD_FAILURES = ("weaver_pipeline_download_failures_total", Counter, ["kind"],

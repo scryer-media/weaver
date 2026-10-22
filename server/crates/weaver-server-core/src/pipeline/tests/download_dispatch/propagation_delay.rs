@@ -615,7 +615,7 @@ async fn list_jobs_projects_downloading_while_extracting_with_active_download_wo
 }
 
 #[tokio::test]
-async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
+async fn list_jobs_keeps_a_lane_less_download_downloading_and_rewarms_its_phase_rate() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -677,7 +677,8 @@ async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
         now + Duration::from_secs(2),
     );
     let inactive = pipeline.shared_state.get_job(job_id).unwrap();
-    assert_eq!(inactive.download_state, crate::DownloadState::Queued);
+    assert_eq!(inactive.status, JobStatus::Downloading);
+    assert_eq!(inactive.download_state, crate::DownloadState::Downloading);
     assert!(inactive.phase_progress.is_empty());
 
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -692,6 +693,53 @@ async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
     assert_eq!(active.phase_progress.len(), 1);
     assert_eq!(active.phase_progress[0].phase, JobPhase::Downloading);
     assert!(active.phase_progress[0].rate_bps.is_none());
+}
+
+#[tokio::test]
+async fn a_started_download_with_only_queued_work_lists_as_downloading() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20010);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Wedged Download", &[("queued.bin".to_string(), 512)]),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(state.status, JobStatus::Downloading);
+        assert_eq!(state.download_queue.len(), 1);
+    }
+    assert!(
+        !pipeline
+            .active_download_connections_by_job
+            .contains_key(&job_id)
+    );
+    assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
+    assert!(!pipeline.active_decodes_by_job.contains_key(&job_id));
+    assert!(!pipeline.job_has_current_download_activity(job_id));
+
+    let info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|info| info.job_id == job_id)
+        .expect("job should be listed");
+
+    assert_eq!(info.status, JobStatus::Downloading);
+    assert_eq!(
+        info.download_state,
+        crate::jobs::model::DownloadState::Downloading
+    );
 }
 
 #[tokio::test]
