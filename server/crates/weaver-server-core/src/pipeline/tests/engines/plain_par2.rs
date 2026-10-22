@@ -395,3 +395,20 @@ async fn a_waiting_set_rules_in_the_step_its_first_block_arrives() {
     assert_eq!(ruled, Some((2, needed)));
     retire_pipeline_database(pipeline).await;
 }
+
+// Every article of the payload lost, under a set with a block for each of
+// its slices: the set asks for its volume and rebuilds the whole file from
+// nothing, exactly as it rebuilds a file only some of whose articles came.
+#[tokio::test]
+async fn an_entirely_lost_payload_under_par2_is_rebuilt_under_graph() {
+    let scenario = Scenario::new(covered(&[("lantern.bin", payload(2 * ARTICLE, 23))], 2))
+        .lost(0, 0)
+        .lost(0, 1);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 2 })]
+    );
+}
