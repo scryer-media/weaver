@@ -1369,17 +1369,25 @@ impl Pipeline {
             state.downloaded_bytes = state.downloaded_bytes.saturating_sub(lost_bytes);
         }
 
-        for (file_id, ready, contiguous_end) in unblocked {
+        // A write lost here is lost like any other on the decode path: the
+        // batch's bytes are gone from memory and never reach disk, so the job
+        // fails rather than waiting on, or post-processing, a file with a hole
+        // nothing will fill. The batches not yet written leave the backlog
+        // account with it, and the rest of the handback is the failed job's
+        // no longer: its queues are torn down, and nothing is owed to files a
+        // terminal job will never complete.
+        let mut unblocked = unblocked.into_iter();
+        while let Some((file_id, ready, contiguous_end)) = unblocked.next() {
             if let Err(error) = self
                 .persist_ready_segments(file_id, ready, contiguous_end)
                 .await
             {
-                warn!(
-                    job_id = job_id.0,
-                    file_index = file_id.file_index,
-                    error = %error,
-                    "failed to write the articles a demoted volume's handback unblocked"
+                self.release_unwritten_segments(unblocked.flat_map(|(_, ready, _)| ready));
+                self.fail_job_for_disk_write(
+                    error,
+                    "failed to write the articles a demoted volume's handback unblocked",
                 );
+                return;
             }
         }
 

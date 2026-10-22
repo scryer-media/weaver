@@ -2237,6 +2237,115 @@ async fn quiescent_flush_leaves_demotion_owned_articles_until_handback() {
 }
 
 #[tokio::test]
+async fn a_demotion_handback_whose_parked_write_fails_fails_the_job() {
+    let volumes = demotion_fixture_volumes("Silver.Horizon.S01E29.mkv");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(41064);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let spec = direct_store_job_spec("Silver Horizon", &volumes);
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for (file_index, segment_number) in [(0, 0), (0, 1), (1, 0)] {
+        take_queued_segment(
+            &mut pipeline,
+            job_id,
+            SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number,
+            },
+        );
+        submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number).await;
+    }
+    pipeline
+        .demote_direct_set(job_id, 0, DemotionReason::HoldsBudgetExceeded)
+        .await;
+
+    // The article the decode seam parked for volume 1 while the sweep owned
+    // it: the sweep rebuilds the prefix before it, so the handback is what
+    // writes it.
+    let parked_file = NzbFileId {
+        job_id,
+        file_index: 1,
+    };
+    let (tail_start, tail_end) = article_extent(volumes[1].1.len(), 1, 2);
+    let tail = &volumes[1].1[tail_start..tail_end];
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .assembly
+        .file_mut(parked_file)
+        .unwrap()
+        .record_placement(1, tail_start as u64, tail.len() as u32);
+    pipeline
+        .write_buffers
+        .entry(parked_file)
+        .or_insert_with(|| WriteReorderBuffer::new(4))
+        .insert(
+            tail_start as u64,
+            BufferedDecodedSegment {
+                damaged_source: None,
+                encoding: SegmentEncoding::Yenc,
+                segment_id: SegmentId {
+                    file_id: parked_file,
+                    segment_number: 1,
+                },
+                decoded_size: tail.len() as u32,
+                data: DecodedChunk::from(tail.to_vec()),
+                part_crc: checksum::crc32(tail),
+                part_crc_verified: true,
+                declared_file_len: 0,
+                yenc_name: volumes[1].0.clone(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                segments: Vec::new(),
+            },
+        );
+    pipeline.note_write_buffered(tail.len(), 1);
+    assert!(pipeline.demotion_sweep_owns_file(parked_file));
+
+    // Volume 1's report arrives once the sweep has written it. The path is
+    // made unwritable between that write and the handback, so the handback's
+    // own write of the parked article is the one that fails.
+    loop {
+        let done = pipeline
+            .direct_demotion_done_rx
+            .recv()
+            .await
+            .expect("the demotion completion channel should stay open");
+        let reports_parked_volume = matches!(
+            &done.progress,
+            crate::pipeline::DirectDemotionProgress::Volume(outcome) if outcome.volume_index == 1
+        );
+        if reports_parked_volume {
+            let volume_path = working_dir.join(&volumes[1].0);
+            tokio::fs::remove_file(&volume_path).await.unwrap();
+            tokio::fs::create_dir(&volume_path).await.unwrap();
+        }
+        pipeline.handle_direct_demotion_done(done).await;
+        if reports_parked_volume {
+            break;
+        }
+    }
+
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(
+        matches!(
+            &status,
+            JobStatus::Failed { error } if error.contains("demoted volume's handback")
+        ),
+        "a lost handback write fails its job instead of leaving it waiting: {status:?}"
+    );
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(
+        pipeline.direct_demotion_in_flight.is_empty(),
+        "and the failed job's sweep has no ticket left to hand back"
+    );
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+    assert_eq!(pipeline.write_buffered_segments, 0);
+}
+
+#[tokio::test]
 async fn a_demotion_returns_before_its_reconstruction_sweep_finishes() {
     let member_name = "Silver.Horizon.S01E24.mkv";
     let volumes = demotion_fixture_volumes(member_name);

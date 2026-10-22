@@ -3136,7 +3136,11 @@ impl Pipeline {
         filename
     }
 
-    fn fail_job_for_disk_write(&mut self, error: SegmentWriteError, context: &'static str) {
+    pub(in crate::pipeline) fn fail_job_for_disk_write(
+        &mut self,
+        error: SegmentWriteError,
+        context: &'static str,
+    ) {
         let job_id = error.file_id.job_id;
         let out_of_space = crate::operations::is_out_of_space(&error.source);
         let message = if out_of_space {
@@ -3158,7 +3162,7 @@ impl Pipeline {
         self.fail_job(job_id, message);
     }
 
-    fn release_unwritten_segments<I>(&mut self, segments: I)
+    pub(in crate::pipeline) fn release_unwritten_segments<I>(&mut self, segments: I)
     where
         I: IntoIterator<Item = (u64, BufferedDecodedSegment)>,
     {
