@@ -871,7 +871,8 @@ impl Pipeline {
         self.cancel_generation += 1;
         let generation = self.cancel_generation;
         for cleanup in &cleanups {
-            self.pending_cancellations.insert(cleanup.job_id, generation);
+            self.pending_cancellations
+                .insert(cleanup.job_id, generation);
         }
         let keep_files = matches!(
             origin,
@@ -881,14 +882,16 @@ impl Pipeline {
         tokio::spawn(async move {
             let archived = committed.await;
             let _ = completed
-                .send(TerminalPostProcessingEvent::CancelJobsDone(CancelJobsDone {
-                    generation,
-                    cleanups,
-                    archived,
-                    keep_files,
-                    results,
-                    reply,
-                }))
+                .send(TerminalPostProcessingEvent::CancelJobsDone(
+                    CancelJobsDone {
+                        generation,
+                        cleanups,
+                        archived,
+                        keep_files,
+                        results,
+                        reply,
+                    },
+                ))
                 .await;
         });
     }

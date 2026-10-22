@@ -834,7 +834,10 @@ async fn delete_history_reports_a_failed_cleanup_as_deleted_with_its_error() {
     let failing = JobId(30026);
     let clean = JobId(30027);
     let mut dirs = BTreeMap::new();
-    for (job_id, name) in [(failing, "history-cleanup-fails"), (clean, "history-cleanup-ok")] {
+    for (job_id, name) in [
+        (failing, "history-cleanup-fails"),
+        (clean, "history-cleanup-ok"),
+    ] {
         let output_dir = intermediate_dir.join(name);
         tokio::fs::create_dir_all(&output_dir).await.unwrap();
         tokio::fs::write(

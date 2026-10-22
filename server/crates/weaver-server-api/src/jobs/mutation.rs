@@ -985,10 +985,12 @@ async fn delete_history_ids(
         {
             Ok(outcome) => {
                 deleted.extend(outcome.deleted.keys().map(|job_id| job_id.0));
-                let failures = outcome
-                    .refused
-                    .into_values()
-                    .chain(outcome.deleted.into_values().filter_map(|cleanup| cleanup.err()));
+                let failures = outcome.refused.into_values().chain(
+                    outcome
+                        .deleted
+                        .into_values()
+                        .filter_map(|cleanup| cleanup.err()),
+                );
                 for failure in failures {
                     first_failure.get_or_insert(failure);
                 }

@@ -1376,7 +1376,10 @@ impl SchedulerHandle {
         if let Some(error) = outcome.refused.remove(&job_id) {
             return Err(error);
         }
-        outcome.deleted.remove(&job_id).unwrap_or(Ok(Default::default()))
+        outcome
+            .deleted
+            .remove(&job_id)
+            .unwrap_or(Ok(Default::default()))
     }
 
     // Delete a batch of completed/failed/cancelled jobs from history in one

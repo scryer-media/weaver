@@ -21,7 +21,12 @@ async fn insert_queued_jobs(pipeline: &mut Pipeline, ids: &[JobId]) {
 }
 
 async fn cancel_batch(pipeline: &mut Pipeline, ids: &[JobId]) -> crate::jobs::CancelJobsOutcome {
-    cancel_jobs_command(pipeline, ids.iter().copied().collect(), CancellationOrigin::User).await
+    cancel_jobs_command(
+        pipeline,
+        ids.iter().copied().collect(),
+        CancellationOrigin::User,
+    )
+    .await
 }
 
 // Makes the history insert for `job_id` fail inside its archive transaction,
@@ -32,13 +37,17 @@ async fn fail_history_insert_for(pipeline: &Pipeline, job_id: JobId) {
         "CREATE TRIGGER reject_cancel_archive BEFORE INSERT ON job_history WHEN NEW.job_id = {} BEGIN SELECT RAISE(ABORT, 'synthetic archive failure'); END",
         job_id.0
     );
-    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(&datastore, "test_archive_fault", |tx| {
-        let sql = sql.clone();
-        Box::pin(async move {
-            tx.execute(&sql, &[]).await?;
-            Ok(())
-        })
-    })
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_archive_fault",
+        |tx| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                tx.execute(&sql, &[]).await?;
+                Ok(())
+            })
+        },
+    )
     .await
     .unwrap();
 }
@@ -250,12 +259,17 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
 
     // Recoverable: once the fault clears, the same job cancels cleanly.
     let datastore = pipeline.db.datastore();
-    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(&datastore, "test_archive_fault", |tx| {
-        Box::pin(async move {
-            tx.execute("DROP TRIGGER reject_cancel_archive", &[]).await?;
-            Ok(())
-        })
-    })
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_archive_fault",
+        |tx| {
+            Box::pin(async move {
+                tx.execute("DROP TRIGGER reject_cancel_archive", &[])
+                    .await?;
+                Ok(())
+            })
+        },
+    )
     .await
     .unwrap();
     let retried = cancel_batch(&mut pipeline, &[failing]).await;
