@@ -89,6 +89,9 @@ struct Volume {
     // The articles a deferral can still park: waiting, in the normal
     // order. Filed on the two paths that change a state or a class.
     parkable: BTreeSet<usize>,
+    // The articles a queueing can bring back: waiting, and parked. Filed
+    // beside `parkable`.
+    parked: BTreeSet<usize>,
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
@@ -123,6 +126,7 @@ impl Volume {
             known: BTreeMap::from([(0, 0)]),
             disorder: 0,
             parkable: (0..sizes.len()).collect(),
+            parked: BTreeSet::new(),
             ordered_only: false,
             starts: BTreeMap::new(),
             marks: Marks::default(),
@@ -196,10 +200,16 @@ impl Volume {
 
     fn file_parkable(&mut self, index: usize) {
         let article = self.articles[index];
-        if article.state == State::Waiting && article.class == Class::Ordinary {
+        let waiting = article.state == State::Waiting;
+        if waiting && article.class == Class::Ordinary {
             self.parkable.insert(index);
         } else {
             self.parkable.remove(&index);
+        }
+        if waiting && article.class == Class::Parked {
+            self.parked.insert(index);
+        } else {
+            self.parked.remove(&index);
         }
     }
 
@@ -264,6 +274,16 @@ impl Volume {
             low = low.max(above_at.saturating_sub(self.encoded_at(*above) - encoded));
         }
         (low, high.max(low))
+    }
+
+    // The covering articles a queueing can bring back. With none parked
+    // there is no run to find.
+    fn parked_covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
+        (!self.parked.is_empty())
+            .then(|| self.run(range))
+            .into_iter()
+            .flat_map(move |run| self.parked.range(run).copied())
+            .filter(move |index| self.may_carry(*index, range))
     }
 
     // The articles whose bytes may fall in the range.
@@ -560,15 +580,17 @@ impl ArticleMap {
 
     // Queue the articles that may carry `range` without raising them: they
     // are wanted, but ahead of nothing, so queued work keeps its order and
-    // only parked work joins it. An article already raised keeps its class.
+    // only parked work joins it, which is the one move this makes. An
+    // article already raised keeps its class, and one already queued is
+    // left as it is.
     pub(crate) fn queue(&mut self, volume: VolumeIndex, range: ByteRange) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return;
         };
-        let covering: Vec<usize> = found.covering(range).collect();
-        for index in covering {
+        let parked: Vec<usize> = found.parked_covering(range).collect();
+        for index in parked {
             let article = found.articles[index];
-            if article.state == State::Waiting && article.class >= Class::Ordinary {
+            if article.state == State::Waiting && article.class > Class::Ordinary {
                 found.set_class(index, Class::Ordinary);
                 self.moves.push(Move {
                     volume,

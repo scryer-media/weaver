@@ -222,6 +222,20 @@ impl Shelf {
         result
     }
 
+    // Change the shelf as `change` says it did, and wake whoever waits on
+    // it only when it did: a waiter woken to an unchanged shelf only waits
+    // again. One that failed part way may have changed it, and wakes them.
+    pub(crate) fn update_if<E>(
+        &self,
+        change: impl FnOnce(&mut Shelved) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let result = change(&mut self.lock());
+        if !matches!(result, Ok(false)) {
+            self.changed.notify_all();
+        }
+        result.map(|_| ())
+    }
+
     // Wait for the shelf to change; the guard is given back once it did.
     pub(crate) fn wait<'a>(&self, state: MutexGuard<'a, Shelved>) -> MutexGuard<'a, Shelved> {
         self.changed

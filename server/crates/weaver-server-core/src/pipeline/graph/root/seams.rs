@@ -9,7 +9,7 @@
 // This file is where the two meet, and the only place the root's classes
 // touch the queue's work items.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -316,54 +316,67 @@ impl Pipeline {
 // move brings parked work back to the main queue, since a moved article is
 // wanted. A class change re-queues the work under its new flags; a window
 // rank re-keys it in place, ranked ahead of everything else at its priority.
+// A queue is walked only for the moves that can change it, so a round's cost
+// follows its moves, not the length of the queue.
 pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     if moves.is_empty() {
         return;
     }
     let job_id = state.job_id;
-    let classes: HashMap<SegmentId, Class> = moves
+    // The latest class of each moved article, by its place in the post.
+    let classes: BTreeMap<(u32, u32), Class> = moves
         .iter()
-        .map(|found| (segment(job_id, found.volume, found.ordinal), found.class))
+        .map(|found| ((found.volume.0, found.ordinal), found.class))
         .collect();
-    for (id, class) in &classes {
+    let class_of = |work: &DownloadWork| {
+        let id = work.segment_id;
+        (id.file_id.job_id == job_id)
+            .then(|| classes.get(&(id.file_id.file_index, id.segment_number)))
+            .flatten()
+            .copied()
+    };
+    let any = |pick: fn(Class) -> bool| classes.values().any(|class| pick(*class));
+    for (&(volume, ordinal), class) in &classes {
         if *class == Class::FirstArticle {
-            state.download_queue.note_first_article(*id);
+            state
+                .download_queue
+                .note_first_article(segment(job_id, VolumeIndex(volume), ordinal));
         }
     }
-    let parked = |work: &DownloadWork| classes.get(&work.segment_id) == Some(&Class::Parked);
-    for work in state.download_queue.extract_matching(parked) {
-        state.recovery_queue.push(work);
+    let parked = |work: &DownloadWork| class_of(work) == Some(Class::Parked);
+    if any(|class| class == Class::Parked) {
+        for work in state.download_queue.extract_matching(parked) {
+            state.recovery_queue.push(work);
+        }
     }
-    let ranked =
-        |work: &DownloadWork| matches!(classes.get(&work.segment_id), Some(Class::Window(_)));
     let mut taken = state
         .recovery_queue
-        .extract_matching(|work| classes.contains_key(&work.segment_id) && !parked(work));
+        .extract_matching(|work| class_of(work).is_some_and(|class| class != Class::Parked));
     // An ordinary move only brings parked work back: queued work keeps its
-    // place.
-    let raised = |work: &DownloadWork| {
-        classes
-            .get(&work.segment_id)
-            .is_some_and(|class| *class < Class::Ordinary)
-    };
-    taken.extend(
-        state
-            .download_queue
-            .extract_matching(|work| raised(work) && !ranked(work)),
-    );
-    taken.sort_by_key(|work| classes.get(&work.segment_id).copied());
+    // place. A window move re-keys in place below.
+    let raised = |class: Class| class < Class::Ordinary && !matches!(class, Class::Window(_));
+    if any(raised) {
+        taken.extend(
+            state
+                .download_queue
+                .extract_matching(|work| class_of(work).is_some_and(raised)),
+        );
+    }
+    taken.sort_by_key(|work| class_of(work));
     for mut work in taken {
-        if let Some(class) = classes.get(&work.segment_id) {
-            classify(&mut work, *class);
+        if let Some(class) = class_of(&work) {
+            classify(&mut work, class);
         }
         state.download_queue.push(work);
     }
-    state
-        .download_queue
-        .reprioritize_matching_with_rank(|work| match classes.get(&work.segment_id) {
-            Some(Class::Window(rank)) => Some((work.priority.min(WINDOW_PRIORITY), Some(*rank))),
-            _ => None,
-        });
+    if any(|class| matches!(class, Class::Window(_))) {
+        state
+            .download_queue
+            .reprioritize_matching_with_rank(|work| match class_of(work) {
+                Some(Class::Window(rank)) => Some((work.priority.min(WINDOW_PRIORITY), Some(rank))),
+                _ => None,
+            });
+    }
 }
 
 // The queue flags a class is fetched under.

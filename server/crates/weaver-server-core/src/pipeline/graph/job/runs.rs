@@ -7,12 +7,11 @@
 // and tells each object how far its run has read, so it bids for what comes
 // next. What a run says is applied here, at the node it speaks for.
 
-use std::collections::BTreeSet;
-
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
+use crate::pipeline::graph::envelope::Shelf;
 use crate::pipeline::graph::namespace::{Returned, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
@@ -106,7 +105,7 @@ impl GraphJob {
             admitted.extend(self.runs.forget_gone(&engines, limit));
             for node in engines {
                 let shelf = self.writer.shelf(node);
-                self.feed(node)?;
+                self.feed(node, &shelf)?;
                 let asks = match self.runs.generation(node) {
                     Some(generation) if generation != shelf.generation() => {
                         self.retract_run(node)?;
@@ -189,41 +188,44 @@ impl GraphJob {
 
     // Bring the node's shelf up to what the tree knows of its volumes: how
     // many there are, which are closed and how long, which will receive
-    // nothing more, and whether any more can join.
-    fn feed(&mut self, node: NodeId) -> Result<(), GraphError> {
+    // nothing more, and whether any more can join. A shelf already there is
+    // left as it is, and its run is not woken to find nothing new.
+    fn feed(&self, node: NodeId, shelf: &Shelf) -> Result<(), GraphError> {
         let Some((parent, volumes)) = self.tree.volumes(node) else {
             return Ok(());
         };
         let Some(namespace) = self.tree.namespace(parent) else {
             return Ok(());
         };
-        let bound: BTreeSet<u32> = volumes.keys().map(|volume| volume.0).collect();
         // A volume can still join while a member's front has yet to decide
         // its owner, and while anything more can come: a recovery object yet
         // to rule may rebuild a volume never posted.
         let ended = self.ended(parent);
         let deciding = !ended || self.tree.deciding(parent);
         let complete = ended && !deciding;
-        let ends: Vec<(u32, Option<u64>, bool)> = volumes
-            .iter()
-            .filter_map(|(volume, member)| {
-                let record = namespace.get(*member)?;
-                let closed = record.closed.then(|| record.length.unwrap_or(0));
-                Some((volume.0, closed, record.closed && ended))
-            })
-            .collect();
-        let shelf = self.writer.shelf(node);
+        let bound = volumes.keys().map(|volume| volume.0);
         shelf
-            .update(|state| {
-                state.volumes = bound;
+            .update_if(|state| {
+                let mut changed = state.complete != complete || state.deciding != deciding;
+                if !state.volumes.iter().copied().eq(bound.clone()) {
+                    state.volumes = bound.collect();
+                    changed = true;
+                }
                 state.complete = complete;
                 state.deciding = deciding;
-                for (volume, closed, settled) in ends {
-                    let kept = shelf.kept(state, volume)?;
+                for (volume, member) in volumes {
+                    let Some(record) = namespace.get(*member) else {
+                        continue;
+                    };
+                    let closed = record.closed.then(|| record.length.unwrap_or(0));
+                    let settled = record.closed && ended;
+                    changed |= !state.kept.contains_key(&volume.0);
+                    let kept = shelf.kept(state, volume.0)?;
+                    changed |= kept.closed != closed || kept.settled != settled;
                     kept.closed = closed;
                     kept.settled = settled;
                 }
-                Ok(())
+                Ok(changed)
             })
             .map_err(|error| GraphError::Write(WriteError::Leaf(error)))
     }

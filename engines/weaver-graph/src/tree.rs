@@ -2458,8 +2458,7 @@ impl Tree {
         let holder = match engine {
             Some(engine) => engine,
             None => {
-                if let Some(found) = self.nodes.get_mut(&node) {
-                    found.refused = Some(why);
+                if let Some(found) = self.nodes.refuse(&node, why) {
                     if let Some(object) = found.object.as_mut() {
                         object.refused();
                     }
@@ -2483,17 +2482,7 @@ impl Tree {
 
     // The objects bound in `node`'s namespace that refused their volumes.
     fn refused_below(&self, node: NodeId) -> Vec<NodeId> {
-        self.nodes
-            .iter()
-            .filter(|(_, found)| {
-                found.refused.is_some()
-                    && found
-                        .binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.parent == node)
-            })
-            .map(|(child, _)| *child)
-            .collect()
+        self.nodes.refused_below(node).collect()
     }
 
     // Remove a node and return the parent members that were its volumes.

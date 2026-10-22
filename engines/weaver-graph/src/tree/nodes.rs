@@ -6,10 +6,11 @@
 // snapshot asks again only the nodes marked since the generation it took
 // last. Nothing outside reaches a node to change it but through here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 use super::{Node, NodeId};
+use crate::deliver::Why;
 use crate::engine::Engine;
 use crate::marks::Marked;
 use crate::member::MemberId;
@@ -27,6 +28,9 @@ pub(super) struct Nodes {
     // because a member an object gave up is settled: no object bound later
     // is offered it.
     retired: BTreeMap<(NodeId, MemberId), GivenUp>,
+    // The refused nodes, each under the node it is bound in. Filed where a
+    // node comes, goes, or is refused, the only paths that change it.
+    refused: BTreeSet<(NodeId, NodeId)>,
 }
 
 impl Deref for Nodes {
@@ -54,13 +58,36 @@ impl Nodes {
     }
 
     pub(super) fn insert(&mut self, node: NodeId, found: Node) {
+        if let (Some(_), Some(binding)) = (found.refused, &found.binding) {
+            self.refused.insert((binding.parent, node));
+        }
         self.nodes.insert(node, found);
+    }
+
+    // The object at `node` refused its volumes, for `why`.
+    pub(super) fn refuse(&mut self, node: &NodeId, why: Why) -> Option<&mut Node> {
+        let found = self.nodes.get_mut(node)?;
+        found.refused = Some(why);
+        if let Some(binding) = &found.binding {
+            self.refused.insert((binding.parent, *node));
+        }
+        Some(found)
+    }
+
+    // The refused nodes bound in `parent`'s namespace, in node order.
+    pub(super) fn refused_below(&self, parent: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.refused
+            .range((parent, NodeId(0))..=(parent, NodeId(u32::MAX)))
+            .map(|(_, node)| *node)
     }
 
     // A node goes, and what it gave up with it.
     pub(super) fn remove(&mut self, node: &NodeId) -> Option<Node> {
         let removed = self.nodes.remove(node)?;
         self.retired.retain(|(at, _), _| at != node);
+        if let Some(binding) = &removed.binding {
+            self.refused.remove(&(binding.parent, *node));
+        }
         Some(removed)
     }
 
