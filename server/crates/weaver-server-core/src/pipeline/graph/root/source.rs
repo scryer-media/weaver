@@ -405,23 +405,6 @@ impl ArticleMap {
             .is_some_and(Volume::to_come)
     }
 
-    // The articles still waiting that the queue holds parked. One already
-    // raised keeps its class.
-    pub(crate) fn parked(&mut self, mut held: impl FnMut(VolumeIndex, u32) -> bool) {
-        for (index, found) in self.volumes.iter_mut().enumerate() {
-            let volume = VolumeIndex(index as u32);
-            for at in 0..found.articles.len() {
-                let article = found.articles[at];
-                if article.state == State::Waiting
-                    && article.class == Class::Ordinary
-                    && held(volume, article.ordinal)
-                {
-                    found.set_class(at, Class::Parked);
-                }
-            }
-        }
-    }
-
     // The ranges of lost articles that can now be marked damaged.
     pub(crate) fn take_damage(&mut self, out: &mut Vec<(VolumeIndex, ByteRange)>) {
         let mut ranges = Vec::new();
@@ -436,21 +419,27 @@ impl ArticleMap {
         }
     }
 
-    // Answer a seek, and raise the articles that carry it to `class` when
+    // Answer a seek, and move the articles that carry it to `class` when
     // one is given. A seek with no class is only answered: a bid the window
     // did not draw keeps its articles where they are. A lost article loses
     // the seek, but every article of the range that can still come is
     // raised all the same: one lost article does not leave the rest of the
     // range where the normal order would never reach it, and the lost range
     // itself reaches every object it lands in at its exact bounds as damage.
+    //
+    // `Parked` is the one class that lowers: it takes only articles still
+    // in the normal order, so one already raised keeps its class, and a
+    // later raise takes a parked one as it takes any. A deferral is never
+    // lost or unseekable to the asker: its answer is how many it parked.
     pub(crate) fn seek(
         &mut self,
         volume: VolumeIndex,
         range: ByteRange,
         class: Option<Class>,
     ) -> Pull {
+        let parks = class == Some(Class::Parked);
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
-            return Pull::Lost;
+            return if parks { Pull::Moved(0) } else { Pull::Lost };
         };
         // The clamp for open-ended seeks: a recovery object does not know how
         // long its volume is and asks to the end of the address space, so the
@@ -460,7 +449,7 @@ impl ArticleMap {
         if found.ordered_only {
             // Without positions only the front can be told apart, and it is
             // already here.
-            return if range.end <= found.front() {
+            return if parks || range.end <= found.front() {
                 Pull::Moved(0)
             } else {
                 Pull::Unseekable
@@ -474,7 +463,11 @@ impl ArticleMap {
         let mut moved = 0;
         for index in covering {
             let article = found.articles[index];
-            if let Some(class) = class.filter(|class| *class < article.class)
+            let moves = |class: &Class| match class {
+                Class::Parked => article.class == Class::Ordinary,
+                _ => *class < article.class,
+            };
+            if let Some(class) = class.filter(moves)
                 && article.state == State::Waiting
             {
                 found.set_class(index, class);
@@ -486,7 +479,11 @@ impl ArticleMap {
                 moved += 1;
             }
         }
-        if lost { Pull::Lost } else { Pull::Moved(moved) }
+        if lost && !parks {
+            Pull::Lost
+        } else {
+            Pull::Moved(moved)
+        }
     }
 
     // Queue the articles that may carry `range` without raising them: they

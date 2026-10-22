@@ -422,12 +422,6 @@ impl GraphJob {
         self.root.map.volume_to_come(volume)
     }
 
-    // The articles the queue holds parked when the job is installed: they
-    // are fetched only once something asks for them.
-    pub(crate) fn parked(&mut self, held: impl FnMut(VolumeIndex, u32) -> bool) {
-        self.root.map.parked(held);
-    }
-
     // One round of seeks: every object's standing wants lifted to the root,
     // answered together so the window draws from all of them at once, and
     // the answers handed back. Returns the class changes for the queue.

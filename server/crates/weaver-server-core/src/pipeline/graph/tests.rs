@@ -72,6 +72,15 @@ fn payload(len: usize, seed: u8) -> Vec<u8> {
 // A PAR2 set over `data` posted as `name`: an index and one volume of two
 // recovery blocks, sliced at the article size.
 fn par2_set(name: &str, data: &[u8]) -> Vec<Post> {
+    let posts = par2_volumes(name, data, 2, 1);
+    assert_eq!(posts.len(), 2, "an index and one volume");
+    posts
+}
+
+// A PAR2 set over `data` posted as `name`: an index and `volumes` volumes
+// carrying `blocks` recovery blocks between them, sliced at the article
+// size. Each volume opens with a recovery packet.
+fn par2_volumes(name: &str, data: &[u8], blocks: u32, volumes: u32) -> Vec<Post> {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
 
     let source = tempfile::tempdir().unwrap();
@@ -82,8 +91,8 @@ fn par2_set(name: &str, data: &[u8]) -> Vec<Post> {
         vec![source.path().join(name)],
     );
     options.block_sizing = BlockSizing::Bytes(ARTICLE as u64);
-    options.recovery_amount = RecoveryAmount::Count(2);
-    options.volume_count = Some(1);
+    options.recovery_amount = RecoveryAmount::Count(blocks);
+    options.volume_count = Some(volumes);
     let creator = Par2Creator::new(options);
     let created = creator.create(&creator.plan().unwrap()).unwrap();
     let mut posts: Vec<Post> = created
@@ -95,16 +104,20 @@ fn par2_set(name: &str, data: &[u8]) -> Vec<Post> {
             Post {
                 role: FileRole::Par2 {
                     is_index,
-                    recovery_block_count: if is_index { 0 } else { 2 },
+                    recovery_block_count: if is_index { 0 } else { blocks / volumes },
                 },
                 bytes: std::fs::read(path).unwrap(),
                 name,
             }
         })
         .collect();
-    // The index first, then the volume.
-    posts.sort_by_key(|post| !matches!(post.role, FileRole::Par2 { is_index: true, .. }));
-    assert_eq!(posts.len(), 2, "an index and one volume");
+    // The index first, then the volumes in name order.
+    posts.sort_by_key(|post| {
+        (
+            !matches!(post.role, FileRole::Par2 { is_index: true, .. }),
+            post.name.clone(),
+        )
+    });
     posts
 }
 
@@ -808,3 +821,189 @@ fn classic_switches_apply_only_to_classic() {
 }
 
 mod refusals;
+
+// The articles of a recovery volume's head: enough for its first recovery
+// packet to pass, which is what tells the PAR2 object what the volume is.
+const HEAD: u32 = 3;
+
+fn assert_parked(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
+    let id = segment_id(job_id, index, ordinal);
+    assert_eq!(
+        pipeline.graph_jobs[&job_id].article_class(weaver_graph::VolumeIndex(index), ordinal),
+        Some(root::source::Class::Parked),
+        "file {index} article {ordinal}"
+    );
+    let state = &pipeline.jobs[&job_id];
+    assert_eq!(
+        state
+            .recovery_queue
+            .count_matching(|work| work.segment_id == id),
+        1
+    );
+    assert_eq!(
+        state
+            .download_queue
+            .count_matching(|work| work.segment_id == id),
+        0
+    );
+}
+
+fn assert_raised(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
+    let id = segment_id(job_id, index, ordinal);
+    assert_eq!(
+        pipeline.graph_jobs[&job_id].article_class(weaver_graph::VolumeIndex(index), ordinal),
+        Some(root::source::Class::Recovery),
+        "file {index} article {ordinal}"
+    );
+    let state = &pipeline.jobs[&job_id];
+    assert_eq!(
+        state
+            .recovery_queue
+            .count_matching(|work| work.segment_id == id),
+        0
+    );
+    assert_eq!(
+        state
+            .download_queue
+            .count_matching(|work| work.segment_id == id
+                && work.is_recovery
+                && work.completion_critical),
+        1
+    );
+}
+
+fn after_head(posts: &[Post], index: u32) -> std::ops::Range<u32> {
+    HEAD..posts[index as usize].articles().count() as u32
+}
+
+async fn decode_head(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {
+    for ordinal in 0..HEAD {
+        decode(pipeline, job_id, posts, index, ordinal, true).await;
+    }
+}
+
+// A data file and a PAR2 set of three volumes of two blocks each.
+fn three_volumes(seed: u8) -> Vec<Post> {
+    let data = payload(8 * ARTICLE, seed);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_volumes("lantern.bin", &data, 6, 3));
+    assert_eq!(posts.len(), 5, "the data, an index and three volumes");
+    posts
+}
+
+// The head of a recovery volume arrives before any damage. The PAR2 object
+// knows from it what the volume is and defers the rest, so the root parks
+// it: it leaves the download queue and nothing fetches it.
+#[tokio::test]
+async fn a_recovery_volume_whose_head_arrived_before_damage_is_parked_not_fetched() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_030);
+    let posts = three_volumes(30);
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let state = &pipeline.jobs[&job_id];
+    assert!(state.recovery_queue.is_empty(), "nothing parked by name");
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    decode_head(&mut pipeline, job_id, &posts, 2).await;
+    let rest = after_head(&posts, 2);
+    assert!(!rest.is_empty());
+    for ordinal in rest {
+        assert_parked(&pipeline, job_id, 2, ordinal);
+    }
+    retire_pipeline_database(pipeline).await;
+}
+
+// Damage appears: four slices lost, three blocks in hand from the heads.
+// The one block short is wanted from the first volume, whole, now; the
+// other volumes stay parked.
+#[tokio::test]
+async fn damage_raises_the_volumes_the_shortfall_needs_and_the_others_stay_parked() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_031);
+    let posts = three_volumes(31);
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    for index in 2..5 {
+        decode_head(&mut pipeline, job_id, &posts, index).await;
+    }
+    for index in 2..5 {
+        for ordinal in after_head(&posts, index) {
+            assert_parked(&pipeline, job_id, index, ordinal);
+        }
+    }
+    for ordinal in [0, 2, 4, 6] {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    for ordinal in [1, 3, 5, 7] {
+        pipeline.book_terminal_segment(
+            segment_id(job_id, 0, ordinal),
+            SegmentTerminalState::Missing,
+        );
+    }
+    hear_repair(&mut pipeline, job_id).await;
+    let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
+    assert_eq!(
+        job.recovery_summary()[0].outcome,
+        Some(RepairOutcome::Waiting)
+    );
+    for ordinal in after_head(&posts, 2) {
+        assert_raised(&pipeline, job_id, 2, ordinal);
+    }
+    for index in 3..5 {
+        for ordinal in after_head(&posts, index) {
+            assert_parked(&pipeline, job_id, index, ordinal);
+        }
+    }
+    retire_pipeline_database(pipeline).await;
+}
+
+// A restart while a volume is parked: no class of it was kept, as a parked
+// one has no row, and the restored PAR2 object defers it again on the first
+// seek round.
+#[tokio::test]
+async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_032);
+    let posts = three_volumes(32);
+    let working_dir = {
+        let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+        root::tests::stamp_graph(&pipeline.db, job_id);
+        decode_all(&mut pipeline, job_id, &posts, 1).await;
+        decode_head(&mut pipeline, job_id, &posts, 2).await;
+        for ordinal in after_head(&posts, 2) {
+            assert_parked(&pipeline, job_id, 2, ordinal);
+        }
+        pipeline.db.flush_write_queue().await.unwrap();
+        retire_pipeline_database(pipeline).await;
+        working_dir
+    };
+
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: spec("lantern joined", &posts),
+            complete_files: std::collections::HashSet::new(),
+            file_progress: Default::default(),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            extracted_members: std::collections::HashSet::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    for ordinal in after_head(&posts, 2) {
+        assert_parked(&pipeline, job_id, 2, ordinal);
+    }
+    retire_pipeline_database(pipeline).await;
+}

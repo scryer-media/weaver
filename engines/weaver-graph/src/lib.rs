@@ -59,7 +59,7 @@ pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
 };
 pub use recovery::{Recovery, Segment, SliceVerdict};
-pub use seek::{Pull, Purpose, Seek, SeekUp, Weight};
+pub use seek::{Pull, Purpose, Seek, SeekUp, Weight, When};
 pub use sniff::{Sniff, VERDICT_BYTES, signed, sniff};
 pub use tree::{Builder, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};

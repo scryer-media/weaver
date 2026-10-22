@@ -186,17 +186,21 @@ impl Pipeline {
 
     // Whether work going back on the queue waits in the recovery queue
     // until something asks for it. Classic parks the recovery nothing waits
-    // on, for its completion check to promote. A graph job parks only what
-    // it has never asked for, when the job is assembled, and its root's
-    // moves are the one way out: work coming back was dispatched, so it was
-    // asked for, and it goes back on the download queue whatever server
-    // failed it.
+    // on, for its completion check to promote. A graph job parks what its
+    // root holds parked: an article an object deferred while it was on the
+    // wire goes back parked, whatever server failed it, and the root's
+    // moves are the one way out.
     pub(in crate::pipeline) fn requeue_parks(&self, work: &DownloadWork) -> bool {
-        work.is_recovery
-            && !work.completion_critical
-            && self
-                .job_engine(work.segment_id.file_id.job_id)
-                .classic_switches_apply()
+        match self.graph_article_parked(work.segment_id) {
+            Some(parked) => parked,
+            None => {
+                work.is_recovery
+                    && !work.completion_critical
+                    && self
+                        .job_engine(work.segment_id.file_id.job_id)
+                        .classic_switches_apply()
+            }
+        }
     }
 
     // Whether the job has recovery work parked for its completion check to

@@ -465,10 +465,21 @@ impl Recovery for Par2 {
     }
 
     // Per set, ask for the volumes that serve it and are not yet in hand,
-    // in order, until what they are named to carry covers its shortfall.
+    // the fewest blocks first, as the classic promotion takes the smallest
+    // files, until what they are named to carry covers its shortfall. Every
+    // other volume the walk has shown carries recovery blocks is deferred:
+    // its head told what it is, and the rest waits until a shortfall wants
+    // it. Nothing of the deferral is kept: the same walk says it again on
+    // every round, after a restart too.
     fn wants(&self, out: &mut Vec<Seek>) {
         let seen = self.damaged_seen();
         let packet = self.smallest_packet();
+        let mut order: Vec<usize> = (0..self.volumes.len()).collect();
+        order.sort_by_key(|index| {
+            let named = self.volumes[*index].named_blocks;
+            (named.is_none(), named, *index)
+        });
+        let mut asked = vec![false; self.volumes.len()];
         for key in self.ordered() {
             let state = &self.sets[&key];
             let wanted = state
@@ -476,15 +487,24 @@ impl Recovery for Par2 {
                 .unwrap_or(0)
                 .max(seen.get(&key).copied().unwrap_or(0));
             let mut shortfall = wanted.saturating_sub(state.recovery.len() as u64);
-            for (index, volume) in self.volumes.iter().enumerate() {
+            for index in &order {
                 if shortfall == 0 {
                     break;
                 }
+                let volume = &self.volumes[*index];
                 if volume.closed || !volume.serves(&key) {
                     continue;
                 }
                 shortfall = shortfall.saturating_sub(volume.coming(packet));
-                volume.ask(VolumeIndex(index as u32), out);
+                if !asked[*index] {
+                    asked[*index] = true;
+                    volume.ask(VolumeIndex(*index as u32), out);
+                }
+            }
+        }
+        for (index, volume) in self.volumes.iter().enumerate() {
+            if !asked[index] && !volume.closed && volume.shows_recovery() {
+                volume.defer(VolumeIndex(index as u32), out);
             }
         }
     }

@@ -2518,7 +2518,7 @@ impl Tree {
             let Some(member) = binding.volumes.get(&ask.volume).copied() else {
                 // A volume the object has not been given yet cannot be
                 // asked for by name; it arrives when the parent sees it.
-                pulled = pulled.fold(Pull::Unseekable);
+                pulled = pulled.fold(ask.unseekable());
                 continue;
             };
             // A seek past the end of a window asks for nothing that is the
@@ -2547,7 +2547,7 @@ impl Tree {
                 // The parent does not know the member's layout yet, so it
                 // cannot say where the bytes lie; the ask waits for the
                 // normal order to reach them.
-                pulled = pulled.fold(Pull::Unseekable);
+                pulled = pulled.fold(ask.unseekable());
             }
             for extent in extents.iter().rev() {
                 asks.push((
@@ -3366,6 +3366,40 @@ mod tests {
         );
         assert_eq!(tree.lift(child, seek, &mut root), Pull::Unseekable);
         assert!(root.0.is_empty());
+    }
+
+    // A deferral walks up as any seek does and reaches the root's volume
+    // still deferred; where nothing can be translated it parks nothing and
+    // is no problem for the asker.
+    #[test]
+    fn a_deferral_is_lifted_unchanged_and_is_never_unseekable() {
+        let (mut tree, _, child, _) = bound_tree();
+        let mut root = Root(Vec::new());
+        let early = Seek::deferred(VolumeIndex(1), ByteRange::new(0, 10));
+        assert_eq!(tree.lift(child, early, &mut root), Pull::Moved(0));
+        assert!(root.0.is_empty());
+        let second = tree.announce_root("show.r00", None, &mut Vec::new());
+        tree.deliver(
+            NodeId::ROOT,
+            second,
+            Posted {
+                offset: 0,
+                bytes: Bytes::from_static(b"w"),
+                provenance: Provenance::Fresh,
+            },
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let mut root = Root(Vec::new());
+        assert_eq!(tree.lift(child, early, &mut root), Pull::Moved(1));
+        assert_eq!(
+            root.0,
+            vec![Seek {
+                volume: VolumeIndex(second.0),
+                ..early
+            }]
+        );
+        assert_eq!(root.0[0].when, crate::seek::When::Deferred);
     }
 
     #[test]

@@ -106,11 +106,15 @@ impl Pipeline {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
+        // The root parks what an object defers and nothing else, so the
+        // queue holds nothing parked until the first seek round says so: work
+        // the post's names parked joins the download queue, and a volume an
+        // object deferred before a restart is parked again by its wants.
+        for work in state.recovery_queue.drain_all() {
+            state.download_queue.push(work);
+        }
         let moves = graph.sample();
         apply_moves(state, &moves);
-        let mut parked = std::collections::HashSet::new();
-        state.recovery_queue.extend_segment_ids(&mut parked);
-        graph.parked(|volume, ordinal| parked.contains(&segment(job_id, volume, ordinal)));
         self.graph_jobs.insert(job_id, graph);
         self.lend_graph_repairs(job_id);
         self.after_graph_step(job_id);
@@ -175,6 +179,18 @@ impl Pipeline {
                     segment_id.segment_number,
                 )
                 .is_some_and(Class::waited_on),
+        )
+    }
+
+    // Whether the root holds an article of a graph job parked: an object
+    // deferred it and nothing has wanted it since. `None` for a classic job.
+    pub(in crate::pipeline) fn graph_article_parked(&self, segment_id: SegmentId) -> Option<bool> {
+        let graph = self.graph_jobs.get(&segment_id.file_id.job_id)?;
+        Some(
+            graph.article_class(
+                VolumeIndex(segment_id.file_id.file_index),
+                segment_id.segment_number,
+            ) == Some(Class::Parked),
         )
     }
 
@@ -295,10 +311,11 @@ impl Pipeline {
     }
 }
 
-// Put each moved article in its new class. Parked recovery work joins the
-// main queue, since a moved article is wanted. A class
-// change re-queues the work under its new flags; a window rank re-keys it in
-// place, ranked ahead of everything else at its priority.
+// Put each moved article in its new class. A parked article leaves the
+// download queue for the recovery queue, which dispatches nothing; any other
+// move brings parked work back to the main queue, since a moved article is
+// wanted. A class change re-queues the work under its new flags; a window
+// rank re-keys it in place, ranked ahead of everything else at its priority.
 pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     if moves.is_empty() {
         return;
@@ -313,17 +330,21 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
             state.download_queue.note_first_article(*id);
         }
     }
+    let parked = |work: &DownloadWork| classes.get(&work.segment_id) == Some(&Class::Parked);
+    for work in state.download_queue.extract_matching(parked) {
+        state.recovery_queue.push(work);
+    }
     let ranked =
         |work: &DownloadWork| matches!(classes.get(&work.segment_id), Some(Class::Window(_)));
     let mut taken = state
         .recovery_queue
-        .extract_matching(|work| classes.contains_key(&work.segment_id));
+        .extract_matching(|work| classes.contains_key(&work.segment_id) && !parked(work));
     // An ordinary move only brings parked work back: queued work keeps its
     // place.
     let raised = |work: &DownloadWork| {
         classes
             .get(&work.segment_id)
-            .is_some_and(|class| *class != Class::Ordinary)
+            .is_some_and(|class| *class < Class::Ordinary)
     };
     taken.extend(
         state

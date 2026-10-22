@@ -25,7 +25,7 @@ pub(crate) mod window;
 #[cfg(test)]
 pub(super) mod tests;
 
-use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, VolumeIndex, Weight};
+use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, VolumeIndex, Weight, When};
 
 use self::intake::{Checksums, Decoded};
 use self::source::{ArticleMap, Class};
@@ -81,10 +81,10 @@ impl ArticleRoot {
         decoded.into_arrival()
     }
 
-    // Answer one round of seeks. A recovery seek is promoted; an unweighted
-    // data seek is critical; a weighted one is a bid, and only bids the
-    // window draws move anything. Bids already in the window (the
-    // bootstrap's) take part in the same draw.
+    // Answer one round of seeks. A deferred seek parks; a recovery seek is
+    // promoted; an unweighted data seek is critical; a weighted one is a
+    // bid, and only bids the window draws move anything. Bids already in
+    // the window (the bootstrap's) take part in the same draw.
     pub(crate) fn answer(
         &mut self,
         asks: &[Ask],
@@ -105,10 +105,13 @@ impl ArticleRoot {
         let answers = asks
             .iter()
             .map(|ask| {
-                let class = match (ask.seek.purpose, is_bid(ask.seek)) {
-                    (Purpose::Recovery, _) => Some(Class::Recovery),
-                    (Purpose::Data, false) => Some(Class::Critical),
-                    (Purpose::Data, true) => self.window.rank(ask.seek.volume).map(Class::Window),
+                let class = match (ask.seek.when, ask.seek.purpose, is_bid(ask.seek)) {
+                    (When::Deferred, _, _) => Some(Class::Parked),
+                    (When::Now, Purpose::Recovery, _) => Some(Class::Recovery),
+                    (When::Now, Purpose::Data, false) => Some(Class::Critical),
+                    (When::Now, Purpose::Data, true) => {
+                        self.window.rank(ask.seek.volume).map(Class::Window)
+                    }
                 };
                 self.map.seek(ask.seek.volume, ask.seek.range, class)
             })
@@ -145,5 +148,5 @@ impl Segments for ArticleRoot {
 }
 
 fn is_bid(seek: Seek) -> bool {
-    seek.purpose == Purpose::Data && seek.weight > Weight::FIRST
+    seek.when == When::Now && seek.purpose == Purpose::Data && seek.weight > Weight::FIRST
 }

@@ -86,6 +86,13 @@ impl Walker {
         self.streamed.as_ref().map_or(self.next, |open| open.at)
     }
 
+    // Whether the packet being read past the front is a recovery packet.
+    pub(super) fn reading_recovery(&self) -> bool {
+        self.streamed
+            .as_ref()
+            .is_some_and(|open| matches!(open.header.packet_type, PacketType::RecoverySlice))
+    }
+
     pub(super) fn lost(&self) -> &[ByteRange] {
         &self.lost
     }

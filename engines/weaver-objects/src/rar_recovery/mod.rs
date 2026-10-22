@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
     ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Namespace, Object, ObjectId,
-    Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
 };
 
 use self::header::{Header, RAR3_FOOTER, Read};
@@ -89,6 +89,17 @@ impl Rev {
                 self.footer[(at - start) as usize] = Some(bytes[(at - offset) as usize]);
             }
         }
+    }
+
+    // Where a RAR3 volume's footer starts while it is still to come: a
+    // volume that is no RAR5 one says what it is at its end, so that much
+    // of it is wanted however the rest waits.
+    fn footer_wanted(&self) -> Option<u64> {
+        let length = self.length?;
+        let rar3 =
+            matches!(header::rar5(&self.front), Read::Not) && !self.front.starts_with(REV5_SIGN);
+        (rar3 && self.footer.iter().any(Option::is_none))
+            .then(|| length.saturating_sub(RAR3_FOOTER as u64))
     }
 
     fn header(&self) -> Option<Header> {
@@ -296,7 +307,9 @@ impl Object for RarRecovery {
         self.rev(volume).lost = true;
     }
 
-    fn wants(&self, _out: &mut Vec<Seek>) {}
+    fn wants(&self, out: &mut Vec<Seek>) {
+        Recovery::wants(self, out);
+    }
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
@@ -449,7 +462,47 @@ impl Recovery for RarRecovery {
         });
     }
 
-    fn wants(&self, _out: &mut Vec<Seek>) {}
+    // A recovery volume is spent whole. Once its front is in, the rest
+    // waits deferred (what is in hand of it the root leaves be) until the
+    // set comes up short; then as many as it is
+    // short of are wanted whole. Nothing of the deferral is kept: the same
+    // ruling says it again on every round, after a restart too.
+    fn wants(&self, out: &mut Vec<Seek>) {
+        let mut short = match self.last {
+            Some(Ruling::Short { needed }) => needed.saturating_sub(self.usable()),
+            _ => 0,
+        };
+        for (index, rev) in self.revs.iter().enumerate() {
+            let volume = VolumeIndex(index as u32);
+            if rev.closed {
+                continue;
+            }
+            if short > 0 && !rev.lost {
+                short -= 1;
+                out.push(Seek::recovery(
+                    volume,
+                    ByteRange::new(0, u64::MAX),
+                    Weight::FIRST,
+                ));
+                continue;
+            }
+            if rev.front.is_empty() {
+                continue;
+            }
+            let end = match rev.footer_wanted() {
+                Some(start) => {
+                    out.push(Seek::recovery(
+                        volume,
+                        ByteRange::new(start, start + RAR3_FOOTER as u64),
+                        Weight::FIRST,
+                    ));
+                    start
+                }
+                None => u64::MAX,
+            };
+            out.push(Seek::deferred(volume, ByteRange::new(0, end)));
+        }
+    }
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         let outcome = self.rule(access);

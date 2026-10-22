@@ -261,7 +261,7 @@ fn segment_id(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId 
 
 // Stamp a row graph behind the switch's back, the way a row written by a
 // process with the switch on reads after a restart with it off.
-fn stamp_graph(db: &crate::Database, job_id: JobId) {
+pub(in crate::pipeline::graph) fn stamp_graph(db: &crate::Database, job_id: JobId) {
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
@@ -879,7 +879,8 @@ fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
         }),
         Box::new(|root| {
             root.map.sample();
-            root.map.parked(|_, ordinal| ordinal % 3 == 0);
+            root.map
+                .seek(a, ByteRange::new(2_000, u64::MAX), Some(Class::Parked));
             root.map.queue(a, ByteRange::new(0, 2_000));
         }),
         Box::new(|root| root.map.arrived_before(|_, ordinal| ordinal % 2 == 0)),
@@ -996,5 +997,48 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
             .unwrap()
             .as_deref(),
         Some("downloading")
+    );
+}
+
+// A deferral lowers only articles still in the normal order: one already
+// raised keeps its class, a later raise takes a parked one, and a deferral
+// over a lost article or a missing volume is never Lost to the asker.
+#[test]
+fn a_deferral_never_lowers_a_raised_article_and_is_never_lost() {
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100, 100])]);
+    let volume = VolumeIndex(0);
+    // The first article gives the positions of the rest.
+    root.receive(decoded(0, 0, 0, &[7; 100], Some(400)));
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(100, 200), Some(Class::Recovery)),
+        Pull::Moved(1)
+    );
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(0, u64::MAX), Some(Class::Parked)),
+        Pull::Moved(2)
+    );
+    assert_eq!(root.map.class(volume, 1), Some(Class::Recovery));
+    for ordinal in 2..4 {
+        assert_eq!(root.map.class(volume, ordinal), Some(Class::Parked));
+    }
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(200, 300), Some(Class::Recovery)),
+        Pull::Moved(1)
+    );
+    assert_eq!(root.map.class(volume, 2), Some(Class::Recovery));
+
+    root.map.lost(volume, 3);
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(0, u64::MAX), Some(Class::Parked)),
+        Pull::Moved(0)
+    );
+    assert_eq!(
+        root.map
+            .seek(VolumeIndex(9), ByteRange::new(0, 100), Some(Class::Parked)),
+        Pull::Moved(0)
     );
 }
