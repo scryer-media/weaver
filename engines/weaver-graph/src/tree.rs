@@ -678,6 +678,22 @@ impl Tree {
         self.nodes.get_mut(&node)?.object.as_mut()?.engine_mut()
     }
 
+    // How far the engine's run read, told to its object so it bids for what
+    // comes next. A run's progress is no part of the object's facts.
+    pub fn run_reached(&mut self, node: NodeId, volume: VolumeIndex, offset: u64) {
+        if let Some(engine) = self.nodes.run_progress(&node) {
+            engine.reached(volume, offset);
+        }
+    }
+
+    // The engine's run asked for a password, told to its object; as
+    // progress, no part of its facts.
+    pub fn run_asked(&mut self, node: NodeId) {
+        if let Some(engine) = self.nodes.run_progress(&node) {
+            engine.asked();
+        }
+    }
+
     // Every live node, the root first. A node is numbered after the node
     // it was bound in, so every parent comes before its children.
     pub fn live(&self) -> Vec<NodeId> {

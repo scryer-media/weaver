@@ -330,14 +330,14 @@ impl Runs {
         admitted
     }
 
-    // Forget the runs of nodes no longer among `engines`: refused, retracted
-    // or unbound. Their slots and their memory go to whoever waits; returns
-    // the nodes that may start now.
+    // Forget the runs of nodes no longer among `engines`, which are in node
+    // order: refused, retracted or unbound. Their slots and their memory go
+    // to whoever waits; returns the nodes that may start now.
     pub(crate) fn forget_gone(&mut self, engines: &[NodeId], limit: usize) -> Vec<NodeId> {
         let gone = self
             .runs
             .keys()
-            .filter(|node| !engines.contains(node))
+            .filter(|node| engines.binary_search(node).is_err())
             .copied()
             .collect();
         self.forget(gone, limit)

@@ -82,6 +82,13 @@ struct Volume {
     // Decoded offsets known exactly, by boundary index: boundary `k` is
     // where article `k` starts, and boundary `articles.len()` is the end.
     known: BTreeMap<usize, u64>,
+    // How many pairs of neighbouring known boundaries fall: the later
+    // offset below the earlier. None while the post's placements agree,
+    // and then every boundary's bounds rise with its index.
+    disorder: usize,
+    // The articles a deferral can still park: waiting, in the normal
+    // order. Filed on the two paths that change a state or a class.
+    parkable: BTreeSet<usize>,
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
@@ -114,6 +121,8 @@ impl Volume {
             articles,
             encoded_len: encoded,
             known: BTreeMap::from([(0, 0)]),
+            disorder: 0,
+            parkable: (0..sizes.len()).collect(),
             ordered_only: false,
             starts: BTreeMap::new(),
             marks: Marks::default(),
@@ -133,6 +142,7 @@ impl Volume {
             return;
         }
         self.articles[index].state = state;
+        self.file_parkable(index);
         self.marks.mark(Chunk::Articles(of_ordinal(ordinal)));
         let (from, to) = (start_of(was), start_of(state));
         if from == to {
@@ -180,18 +190,48 @@ impl Volume {
         }
         article.class = class;
         let chunk = of_ordinal(article.ordinal);
+        self.file_parkable(index);
         self.marks.mark(Chunk::Articles(chunk));
     }
 
+    fn file_parkable(&mut self, index: usize) {
+        let article = self.articles[index];
+        if article.state == State::Waiting && article.class == Class::Ordinary {
+            self.parkable.insert(index);
+        } else {
+            self.parkable.remove(&index);
+        }
+    }
+
     fn know(&mut self, boundary: usize, offset: u64) {
-        if self.known.insert(boundary, offset) != Some(offset) {
+        self.disorder -= self.falls_around(boundary);
+        let was = self.known.insert(boundary, offset);
+        self.disorder += self.falls_around(boundary);
+        if was != Some(offset) {
             self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
         }
     }
 
     fn unknow(&mut self, boundary: usize) {
-        if self.known.remove(&boundary).is_some() {
+        self.disorder -= self.falls_around(boundary);
+        let was = self.known.remove(&boundary);
+        self.disorder += self.falls_around(boundary);
+        if was.is_some() {
             self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
+        }
+    }
+
+    // The falling pairs among the known boundaries next to `boundary`'s
+    // place: the two it makes when known, the one across it when not.
+    fn falls_around(&self, boundary: usize) -> usize {
+        let below = self.known.range(..boundary).next_back().map(|(_, at)| *at);
+        let above = self.known.range(boundary + 1..).next().map(|(_, at)| *at);
+        let falls = |low: Option<u64>, high: Option<u64>| {
+            usize::from(matches!((low, high), (Some(low), Some(high)) if low > high))
+        };
+        match self.known.get(&boundary) {
+            Some(at) => falls(below, Some(*at)) + falls(Some(*at), above),
+            None => falls(below, above),
         }
     }
 
@@ -228,9 +268,35 @@ impl Volume {
 
     // The articles whose bytes may fall in the range.
     fn covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
-        (0..self.articles.len()).filter(move |index| {
-            self.bounds(*index).0 < range.end && self.bounds(index + 1).1 > range.start
-        })
+        self.run(range)
+            .filter(move |index| self.may_carry(*index, range))
+    }
+
+    // The covering articles a deferral can still park.
+    fn parkable_covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
+        self.parkable
+            .range(self.run(range))
+            .copied()
+            .filter(move |index| self.may_carry(*index, range))
+    }
+
+    // The articles that may carry the range lie in this run. While no
+    // known boundaries fall, an article's bounds rise with its index, so
+    // they are one run, found by halving.
+    fn run(&self, range: ByteRange) -> std::ops::Range<usize> {
+        let all = self.articles.len();
+        match self.disorder {
+            0 => {
+                let start = first_of(all, |index| self.bounds(index + 1).1 > range.start);
+                let end = first_of(all, |index| self.bounds(index).0 >= range.end);
+                start..end.max(start)
+            }
+            _ => 0..all,
+        }
+    }
+
+    fn may_carry(&self, index: usize, range: ByteRange) -> bool {
+        self.bounds(index).0 < range.end && self.bounds(index + 1).1 > range.start
     }
 
     // Whether the article's bytes certainly include some of the range.
@@ -455,11 +521,17 @@ impl ArticleMap {
                 Pull::Unseekable
             };
         }
-        let covering: Vec<usize> = found.covering(range).collect();
-        let lost = covering.iter().any(|index| {
-            matches!(found.articles[*index].state, State::Lost { .. })
-                && found.surely_in(*index, range)
-        });
+        // A deferral moves only what it can park, and is never lost.
+        let covering: Vec<usize> = if parks {
+            found.parkable_covering(range).collect()
+        } else {
+            found.covering(range).collect()
+        };
+        let lost = !parks
+            && covering.iter().any(|index| {
+                matches!(found.articles[*index].state, State::Lost { .. })
+                    && found.surely_in(*index, range)
+            });
         let mut moved = 0;
         for index in covering {
             let article = found.articles[index];
@@ -539,6 +611,21 @@ impl ArticleMap {
         moves.dedup();
         moves
     }
+}
+
+// The first index below `len` at which `rises` holds, which then holds at
+// every index after it; `len` when it holds at none.
+fn first_of(len: usize, rises: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if rises(middle) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
 }
 
 fn start_of(state: State) -> Option<u64> {

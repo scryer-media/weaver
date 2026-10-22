@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::ops::Deref;
 
 use super::{Node, NodeId};
+use crate::engine::Engine;
 use crate::marks::Marked;
 use crate::member::MemberId;
 use crate::volume::VolumeIndex;
@@ -39,6 +40,17 @@ impl Deref for Nodes {
 impl Nodes {
     pub(super) fn get_mut(&mut self, node: &NodeId) -> Option<&mut Node> {
         self.nodes.get_mut(node)
+    }
+
+    // The engine face of a node's object, to tell it how its run goes: how
+    // far it read, and that it asked for a password. An object keeps no
+    // run's progress in its facts, so this marks nothing a snapshot reads.
+    pub(super) fn run_progress(&mut self, node: &NodeId) -> Option<&mut dyn Engine> {
+        self.nodes
+            .get_mut_unread(node)?
+            .object
+            .as_mut()?
+            .engine_mut()
     }
 
     pub(super) fn insert(&mut self, node: NodeId, found: Node) {

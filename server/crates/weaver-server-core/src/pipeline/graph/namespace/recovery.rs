@@ -322,13 +322,16 @@ impl NamespaceWriter {
         (node, reading): (NodeId, &dyn Fn(NodeId) -> bool),
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // Only a set describes files: a namespace with none announces
+        // nothing, whatever its members.
+        let sets = tree.recovery_nodes(node);
         let known = |namespace: NodeId| members_known(tree, namespace, reading(namespace));
-        if !known(node) || !self.members_in(tree, node) {
+        if sets.is_empty() || !known(node) || !self.members_in(tree, node) {
             return Ok(());
         }
         let below_known = tree.namespaces_below(node).into_iter().all(known);
         let mut absent = Vec::new();
-        for set in tree.recovery_nodes(node) {
+        for set in sets {
             let Some(recovery) = tree.recovery(set) else {
                 continue;
             };

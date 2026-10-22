@@ -34,10 +34,8 @@ impl GraphJob {
             Heard::Emit(emit) => {
                 // The object is told its run is asking, as it is told how
                 // far the run read: it rules on it when the job is quiet.
-                if emit == Emit::NeedsPassword
-                    && let Some(engine) = self.tree.engine_mut(node)
-                {
-                    engine.asked();
+                if emit == Emit::NeedsPassword {
+                    self.tree.run_asked(node);
                 }
                 let mut out = Vec::new();
                 self.writer.said(
@@ -124,10 +122,8 @@ impl GraphJob {
                 if asks {
                     admitted.extend(self.runs.ask(node, limit));
                 }
-                if let (Some((volume, offset)), Some(engine)) =
-                    (shelf.reached(), self.tree.engine_mut(node))
-                {
-                    engine.reached(volume, offset);
+                if let Some((volume, offset)) = shelf.reached() {
+                    self.tree.run_reached(node, volume, offset);
                 }
             }
             // With every run started, a damaged namespace nothing will
