@@ -216,30 +216,17 @@ impl RarStore {
     }
 
     // Whether the first enciphered header of `volume` unseals under
-    // `password` with its CRC whole. Each RAR4 header is its salt, then the
-    // header ciphered to a whole block; under a wrong key the header is
-    // noise, so whichever of its size or CRC fails first refutes it. `None`
-    // while its bytes are not here whole, which wants them.
+    // `password`, read from what the volume kept; `None` while its bytes are
+    // not here whole, which wants them.
     fn rar4_unseals(&mut self, volume: VolumeIndex, password: &str) -> Option<bool> {
         let found = self.volumes.get_mut(&volume)?;
         let length = found.length;
         let kept = &mut found.kept;
-        let main = whole(kept, ByteRange::at(RAR4_SIGNATURE, RAR4_BASE))?;
-        let at = RAR4_SIGNATURE + u64::from(u16::from_le_bytes([main[5], main[6]]));
-        let front = whole(kept, ByteRange::at(at, RAR4_SALT + AES_BLOCK as u64))?;
-        let salt: [u8; 8] = front[..8].try_into().ok()?;
-        let mut block: [u8; AES_BLOCK] = front[8..].try_into().ok()?;
-        let (key, iv) = rar4_derive_key(password, Some(&salt));
-        decrypt_cipher_range_rar4(&key, &iv, &mut block).ok()?;
-        let size = usize::from(u16::from_le_bytes([block[5], block[6]]));
-        let sealed = ByteRange::at(at + RAR4_SALT, size.next_multiple_of(AES_BLOCK) as u64);
-        if (size as u64) < RAR4_BASE || length.is_some_and(|length| sealed.end > length) {
-            return Some(false);
-        }
-        let mut header = whole(kept, sealed)?.to_vec();
-        decrypt_cipher_range_rar4(&key, &iv, &mut header).ok()?;
-        let crc = crc32(&header[2..size]) & 0xffff;
-        Some(crc == u32::from(u16::from_le_bytes([header[0], header[1]])))
+        rar4_unseals(
+            &mut |range| whole(kept, range).map(<[u8]>::to_vec),
+            length,
+            password,
+        )
     }
 
     // The candidates in the order to try them: the one that opened the
@@ -332,6 +319,36 @@ const RAR4_SIGNATURE: u64 = 7;
 const RAR4_BASE: u64 = 7;
 const RAR4_SALT: u64 = 8;
 const AES_BLOCK: usize = 16;
+
+// Whether the first enciphered header of a RAR4 volume `length` long
+// unseals under `password` with its CRC whole: the one proof a RAR4
+// candidate has, as unrar takes it. Each RAR4 header is its salt, then the
+// header ciphered to a whole block; under a wrong key the header is noise,
+// so whichever of its size or CRC fails first refutes it. `read` gives the
+// volume's bytes over a range when they are here whole; `None` while one
+// the proof needs is not.
+pub(crate) fn rar4_unseals(
+    read: &mut dyn FnMut(ByteRange) -> Option<Vec<u8>>,
+    length: Option<u64>,
+    password: &str,
+) -> Option<bool> {
+    let main = read(ByteRange::at(RAR4_SIGNATURE, RAR4_BASE))?;
+    let at = RAR4_SIGNATURE + u64::from(u16::from_le_bytes([main[5], main[6]]));
+    let front = read(ByteRange::at(at, RAR4_SALT + AES_BLOCK as u64))?;
+    let salt: [u8; 8] = front[..8].try_into().ok()?;
+    let mut block: [u8; AES_BLOCK] = front[8..].try_into().ok()?;
+    let (key, iv) = rar4_derive_key(password, Some(&salt));
+    decrypt_cipher_range_rar4(&key, &iv, &mut block).ok()?;
+    let size = usize::from(u16::from_le_bytes([block[5], block[6]]));
+    let sealed = ByteRange::at(at + RAR4_SALT, size.next_multiple_of(AES_BLOCK) as u64);
+    if (size as u64) < RAR4_BASE || length.is_some_and(|length| sealed.end > length) {
+        return Some(false);
+    }
+    let mut header = read(sealed)?;
+    decrypt_cipher_range_rar4(&key, &iv, &mut header).ok()?;
+    let crc = crc32(&header[2..size]) & 0xffff;
+    Some(crc == u32::from(u16::from_le_bytes([header[0], header[1]])))
+}
 
 // The bytes of `range` when they are here whole; otherwise they are wanted.
 fn whole(kept: &mut Kept, range: ByteRange) -> Option<&[u8]> {

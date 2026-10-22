@@ -12,13 +12,17 @@
 // volume against the record, read by range through the namespace: clean
 // when no unit is damaged, repaired once the damaged units it rebuilt are
 // written back into the member, impossible when the record cannot rebuild
-// them all, cannot vouch for every protected byte, is not there, or cannot
-// be read. A clean or repaired ruling proves the protected bytes only.
+// them all or cannot vouch for every protected byte. A clean or repaired
+// ruling proves the protected bytes only. A record that is not there or
+// cannot be read says nothing of the volume: it covers nothing, and, as a
+// recovery object with nothing to rule on does, rules clean on nothing.
 //
 // A RAR3 volume with enciphered headers is walked to its record under a
-// password: the record asks for every candidate the job holds and reads
-// under the first that leads it to a record, which is the one the volume's
-// store proved, since that store announced the record.
+// password, taken as the volume's store takes one: each candidate the job
+// offers is held against the volume's first enciphered header, the next is
+// asked for while the ones offered are refuted or cannot be told yet, and
+// none once one unseals it. The one that did is the last the record was
+// offered, which is the one a restore offers it again.
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod encode;
@@ -52,10 +56,11 @@ pub struct RarRecord {
     // How many bytes at the front of the volume the record protects, as
     // the last ruling that read it found.
     protected: Option<u64>,
-    // Whether the volume's headers are enciphered, as its front says.
-    #[serde(default)]
-    sealed: bool,
-    // The job's password candidates, in the order offered.
+    // The volume's front as it was bound, kept when it says the headers
+    // after it are enciphered: a candidate is held against it, after a
+    // restore too.
+    front: Vec<u8>,
+    // The job's candidates the front did not refute, in the order offered.
     #[serde(skip)]
     passwords: Vec<Zeroizing<String>>,
     // The volume's bytes that passed whole, as the namespace fed them. A
@@ -82,12 +87,30 @@ enum Said {
 }
 
 impl Durable for RarRecord {
-    const VERSION: u16 = 1;
+    // 2: the front a sealed volume's candidates are held against, where
+    // only whether it was sealed was kept.
+    const VERSION: u16 = 2;
 }
 
 impl RarRecord {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn sealed(&self) -> bool {
+        !self.front.is_empty()
+    }
+
+    // Whether `password` unseals the volume's first enciphered header, as
+    // far as the front reaches.
+    fn unseals(&self, password: &str) -> Option<bool> {
+        let front = &self.front;
+        let mut read = |range: ByteRange| {
+            front
+                .get(range.start as usize..range.end as usize)
+                .map(<[u8]>::to_vec)
+        };
+        crate::rar_store::rar4_unseals(&mut read, None, password)
     }
 
     fn proven_whole(&self, length: u64) -> bool {
@@ -112,7 +135,7 @@ impl RarRecord {
             return Said::Intact;
         }
         let mut volume = Volume::new(access, member, length);
-        let passwords: Vec<Option<&str>> = match self.sealed {
+        let passwords: Vec<Option<&str>> = match self.sealed() {
             true => self
                 .passwords
                 .iter()
@@ -254,20 +277,28 @@ impl Object for RarRecord {
     // which is when a ruling reads it.
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
         self.closed = true;
-        if self.sealed && self.passwords.is_empty() {
+        if self.sealed() && self.passwords.is_empty() {
             out.push(Emit::NeedsPassword);
         }
     }
 
-    // Each candidate is kept and the next asked for, so the ruling holds
-    // them all; what it said before this one came is said again.
+    // A candidate the front refutes is dropped and the next asked for; one
+    // it cannot tell yet is held and the next asked for too, so the ruling
+    // holds every one that may open the headers; one that unseals them is
+    // held and nothing more is asked. What the record said before a
+    // candidate it holds came is said again.
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
-        if !self.sealed || self.passwords.iter().any(|held| held.as_str() == secret) {
+        if !self.sealed() || self.passwords.iter().any(|held| held.as_str() == secret) {
             return;
         }
-        self.passwords.push(Zeroizing::new(secret.to_owned()));
-        self.said = None;
-        out.push(Emit::NeedsPassword);
+        let unseals = self.unseals(secret);
+        if unseals != Some(false) {
+            self.passwords.push(Zeroizing::new(secret.to_owned()));
+            self.said = None;
+        }
+        if unseals != Some(true) {
+            out.push(Emit::NeedsPassword);
+        }
     }
 
     // A lost range of the record is found when the ruling reads it.
@@ -308,7 +339,11 @@ impl Object for RarRecord {
 
     fn bound(&mut self, _volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         self.name = name.to_owned();
-        self.sealed = sealed(front);
+        self.front = if sealed(front) {
+            front.to_vec()
+        } else {
+            Vec::new()
+        };
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {
@@ -341,12 +376,13 @@ impl Recovery for RarRecord {
         }
     }
 
+    // The volume it sits in, unless it could not read itself there.
     fn covers(&self, member: MemberId) -> bool {
-        self.member == Some(member)
+        self.member == Some(member) && self.said != Some(Said::Unread)
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
-        if !self.covers(member) {
+        if self.member != Some(member) {
             return;
         }
         for segment in segments {
@@ -386,17 +422,15 @@ impl Recovery for RarRecord {
     }
 
     // A ruling made while the volume was open waits for it to close, and
-    // is due again once it has.
+    // is due again once it has. One that could not read the record has
+    // nothing to rule on, so it is clean on the nothing it covers.
     fn outcome(&self) -> Option<RepairOutcome> {
         Some(match self.said? {
             Said::Waiting => return (!self.closed).then_some(RepairOutcome::Waiting),
             Said::Intact => RepairOutcome::Clean,
             Said::Rebuilt { units } => RepairOutcome::Repaired { slices: units },
             Said::Short { damaged, reachable } => RepairOutcome::Impossible { damaged, reachable },
-            Said::Unread => RepairOutcome::Impossible {
-                damaged: 1,
-                reachable: 0,
-            },
+            Said::Unread => RepairOutcome::Clean,
         })
     }
 }

@@ -14,8 +14,8 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_model::files::FileRole;
 
 use super::harness::{
-    ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, admit, assert_same, kinds, par2_set,
-    payload, run, run_both, run_unprompted, serve_job, try_run,
+    ARTICLE, Claim, GraphView, JOB, Outcome, Post, Scenario, Stall, admit, assert_same, kinds,
+    par2_set, payload, run, run_both, run_unprompted, serve_job, try_run,
 };
 use crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY;
 use crate::history::HistoryFailureKind;
@@ -28,7 +28,8 @@ use crate::pipeline::tests::direct_store::scenarios::{
 };
 use crate::pipeline::tests::direct_store::{
     obfuscate_volumes, protected_rar4_store_set, protected_sealed_rar4_store_set,
-    protected_store_set, single_member_rar4_store_set_numbered, single_member_store_set,
+    protected_store_set, protected_store_set_led_by, single_member_rar4_store_set_numbered,
+    single_member_store_set,
 };
 use crate::pipeline::tests::{
     debug_job_state, insert_active_job, job_status_for_assert, retire_pipeline_database,
@@ -1216,6 +1217,133 @@ async fn a_rar4_volume_with_a_recovery_record_beside_par2_is_repaired_once_by_th
         ]
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// A five-volume set's member, `lead` beside it in the first volume when
+// given, and of the third volume's articles one of the member's lost and,
+// when `unreadable`, every one wholly inside its record: the first body
+// whose third volume starts its record on an article boundary, so the
+// record's own header is lost and the service header before it is not.
+fn middle_volume_lost(lead: Option<&[u8]>, unreadable: bool) -> (Vec<u8>, Scenario) {
+    const MIDDLE: u32 = 2;
+    let article = ARTICLE as u64;
+    let build = |body: &[u8]| match lead {
+        Some(lead) => protected_store_set_led_by(("ember.bin", lead), MEMBER, body, 5, 1),
+        None => protected_store_set(MEMBER, body, 5, 1),
+    };
+    (0..10 * ARTICLE)
+        .find_map(|extra| {
+            let body = payload(30 * ARTICLE + extra, 61);
+            let set = build(&body);
+            let volume = &set[MIDDLE as usize].1;
+            let layout = unrar_rs::locate_recovery_record(&mut std::io::Cursor::new(volume), None)
+                .unwrap()
+                .unwrap();
+            if layout.record_offset % article != 0 {
+                return None;
+            }
+            let first = (layout.record_offset / article) as u32;
+            let last = ((layout.record_offset + layout.record_size) / article) as u32;
+            let mut scenario = Scenario::new(posts(set)).lost(MIDDLE, 2);
+            if unreadable {
+                for ordinal in first..last {
+                    scenario = scenario.lost(MIDDLE, ordinal);
+                }
+            }
+            Some((body, scenario))
+        })
+        .unwrap()
+}
+
+// One file in a five-volume set, an article of the third volume lost and
+// that volume's record unreadable. The record says nothing of its volume,
+// nothing rebuilds the member, and nothing comes out whole: the job ends
+// Failed, not Partial and not stalled.
+#[tokio::test]
+async fn one_file_whose_middle_volume_is_lost_and_its_record_unreadable_fails_under_graph() {
+    let (_, scenario) = middle_volume_lost(None, true);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    let view = graph.graph();
+    assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
+    assert_record_said_nothing(view);
+}
+
+// Every volume's record ruled clean, the third's on nothing: it vouched for
+// none of its volume, whose damage stands.
+fn assert_record_said_nothing(view: &GraphView) {
+    assert_eq!(
+        view.rulings,
+        vec![("rar_record".to_string(), Some(RepairOutcome::Clean)); 5]
+    );
+    assert_eq!(view.claims["silver.horizon.part03.rar"], Claim::Damaged);
+}
+
+// The same shape with the record readable: it rebuilds the lost article and
+// the file comes out whole.
+#[tokio::test]
+async fn one_file_whose_middle_volume_is_lost_and_its_record_readable_is_repaired_under_graph() {
+    let (body, scenario) = middle_volume_lost(None, false);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, MEMBER, &body);
+    assert!(
+        graph.graph().rulings.contains(&(
+            "rar_record".to_string(),
+            Some(RepairOutcome::Repaired { slices: 1 })
+        )),
+        "{:?}",
+        graph.graph().rulings
+    );
+}
+
+// Two files, the first whole in the first volume and the second across all
+// five, an article of the third volume lost and its record unreadable. The
+// first comes out whole and the second does not: the job ends Partial.
+#[tokio::test]
+async fn two_files_one_whole_beside_a_middle_volume_lost_with_its_record_unreadable_are_partial_under_graph()
+ {
+    let lead = payload(3 * ARTICLE + 5, 62);
+    let (_, scenario) = middle_volume_lost(Some(&lead), true);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    let view = graph.graph();
+    assert_eq!(
+        view.delivery.whole,
+        vec!["ember.bin".to_string()],
+        "{:?}",
+        view.delivery
+    );
+    assert_record_said_nothing(view);
+    assert!(
+        graph.files[&delivered("ember.bin")] == lead,
+        "the whole file's bytes"
+    );
+}
+
+// The same two files with the record readable: both come out whole.
+#[tokio::test]
+async fn two_files_beside_a_middle_volume_lost_with_its_record_readable_are_complete_under_graph() {
+    let lead = payload(3 * ARTICLE + 5, 62);
+    let (body, scenario) = middle_volume_lost(Some(&lead), false);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(
+        graph.files[&delivered("ember.bin")] == lead,
+        "the first file's bytes"
+    );
+    assert!(
+        graph.files[&delivered(MEMBER)] == body,
+        "the second file's bytes"
+    );
 }
 
 // More of the second volume lost than its PAR2 set can rebuild: the store

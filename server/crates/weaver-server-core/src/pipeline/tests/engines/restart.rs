@@ -29,7 +29,8 @@ use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_store_set, header_encrypted_store_set,
 };
 use crate::pipeline::tests::direct_store::{
-    obfuscate_volumes, protected_rar4_store_set, protected_store_set, single_member_store_set,
+    obfuscate_volumes, protected_rar4_store_set, protected_sealed_rar4_store_set,
+    protected_store_set, single_member_store_set,
 };
 use crate::pipeline::tests::{
     insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
@@ -694,6 +695,40 @@ async fn a_rar4_volume_repaired_from_its_recovery_record_restarted_after_every_a
     let body = payload(8 * ARTICLE + 17, 77);
     let posts = volumes(protected_rar4_store_set("beacon.bin", &body, 2, 1));
     restart_row(Scenario::new(posts).damaged(0, 2)).await;
+}
+
+// A RAR4 `-hp` set whose volumes each carry a record, one article of the
+// first served damaged, under `scenario`'s candidates. The candidate that
+// proved itself on the first enciphered header is the one each restore
+// offers again, to the store and to the record alike, so the record reads
+// under it and rebuilds the sector as a run that never restarted does.
+async fn sealed_rar4_record_restart_row(scenario: impl Fn(Scenario) -> Scenario) {
+    let body = payload(8 * ARTICLE + 17, 78);
+    let posts = volumes(protected_sealed_rar4_store_set(
+        "beacon.bin",
+        &body,
+        2,
+        1,
+        SECRET,
+    ));
+    restart_row(scenario(Scenario::new(posts).damaged(0, 2))).await;
+}
+
+#[tokio::test]
+async fn a_rar4_hp_volume_repaired_from_its_recovery_record_restarted_after_every_article_is_repaired_with_no_refetch()
+ {
+    sealed_rar4_record_restart_row(|scenario| scenario.password(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_rar4_hp_volume_proven_on_its_first_candidate_restarted_after_every_article_is_repaired_with_no_refetch()
+ {
+    sealed_rar4_record_restart_row(|scenario| {
+        scenario
+            .global_password(SECRET)
+            .global_password("lantern-restart-wrong")
+    })
+    .await;
 }
 
 #[tokio::test]
