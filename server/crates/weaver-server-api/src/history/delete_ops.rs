@@ -257,22 +257,34 @@ impl HistoryDeleteManager {
             Err(SchedulerError::Internal(PIPELINE_DID_NOT_ANSWER.to_string()))
         });
 
-        // Targets grouped by the state and message they end in.
+        // Targets grouped by the state and message they end in, and every id
+        // whose record is gone, which is announced as removed whatever state
+        // its target ends in.
         let mut settled: BTreeMap<(bool, Option<String>), Vec<u64>> = BTreeMap::new();
+        let mut removed = Vec::new();
         match result {
             Ok(outcome) => {
                 for (job_id, deleted) in &outcome.deleted {
-                    // The record is gone either way; a directory whose marker
+                    removed.push(job_id.0);
+                    // The record is gone either way. A directory whose marker
                     // stopped matching it was left on disk, and the target
-                    // says which rather than claiming a clean delete.
-                    settled
-                        .entry((true, left_in_place_note(deleted)))
-                        .or_default()
-                        .push(job_id.0);
+                    // says which rather than claiming a clean delete; a
+                    // cleanup that failed fails the target with its error.
+                    let entry = match deleted {
+                        Ok(deleted) => (true, left_in_place_note(deleted)),
+                        Err(error) => (
+                            false,
+                            Some(format!("record deleted; cleanup did not finish: {error}")),
+                        ),
+                    };
+                    settled.entry(entry).or_default().push(job_id.0);
                 }
                 for (job_id, error) in &outcome.refused {
                     let entry = match error {
-                        SchedulerError::JobNotFound(_) => (true, None),
+                        SchedulerError::JobNotFound(_) => {
+                            removed.push(job_id.0);
+                            (true, None)
+                        }
                         error => (false, Some(error.to_string())),
                     };
                     settled.entry(entry).or_default().push(job_id.0);
@@ -286,10 +298,8 @@ impl HistoryDeleteManager {
             }
         }
 
-        let mut removed = Vec::new();
         for ((completed, message), ids) in settled {
             let state = if completed {
-                removed.extend_from_slice(&ids);
                 AsyncOperationTargetState::Completed
             } else {
                 AsyncOperationTargetState::Failed
@@ -413,7 +423,7 @@ mod tests {
         HistoryDeleteBatchOutcome {
             deleted: job_ids
                 .iter()
-                .map(|job_id| (*job_id, Default::default()))
+                .map(|job_id| (*job_id, Ok(Default::default())))
                 .collect(),
             refused: BTreeMap::new(),
         }
@@ -465,7 +475,7 @@ mod tests {
             worker_db.delete_job_history(11).unwrap();
             worker_db.delete_job_history(13).unwrap();
             let mut outcome = HistoryDeleteBatchOutcome::default();
-            outcome.deleted.insert(JobId(11), Default::default());
+            outcome.deleted.insert(JobId(11), Ok(Default::default()));
             outcome.refused.insert(
                 JobId(12),
                 SchedulerError::Conflict("job 12 is active".into()),
@@ -494,6 +504,82 @@ mod tests {
                 .contains("active")
         );
         assert!(db.get_job_history(12).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_record_deleted_before_its_cleanup_failed_is_announced_and_fails_its_target() {
+        let db = Database::open_in_memory().unwrap();
+        for id in [21, 22] {
+            db.insert_job_history(&history(id)).unwrap();
+        }
+        let operation_id = db
+            .insert_history_delete_operation(&[21, 22], false, false)
+            .unwrap();
+        let operation = db.next_history_delete_operation().unwrap().unwrap();
+        let (command_tx, mut commands) = mpsc::channel(1);
+        let (event_tx, _) = broadcast::channel(1);
+        let handle = SchedulerHandle::new(
+            command_tx,
+            event_tx,
+            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        );
+        let replay = QueueEventReplay::new(8);
+        let manager = HistoryDeleteManager::new(db.clone(), handle, replay.clone());
+        let worker_db = db.clone();
+        let scheduler = tokio::spawn(async move {
+            let weaver_server_core::SchedulerCommand::DeleteHistory { job_ids, reply, .. } =
+                commands.recv().await.unwrap()
+            else {
+                panic!("expected history delete command");
+            };
+            // Both records go in the delete transaction; 21's directory then
+            // fails to come off disk.
+            let ids: Vec<JobId> = job_ids.iter().copied().collect();
+            worker_db
+                .delete_job_histories_and_forget_duplicate_identities(&ids)
+                .unwrap();
+            let mut outcome = HistoryDeleteBatchOutcome::default();
+            outcome.deleted.insert(
+                JobId(21),
+                Err(SchedulerError::Io(std::io::Error::other(
+                    "synthetic directory removal failure",
+                ))),
+            );
+            outcome.deleted.insert(JobId(22), Ok(Default::default()));
+            reply.send(Ok(outcome)).unwrap();
+        });
+
+        manager.process_operation(operation).await.unwrap();
+        scheduler.await.unwrap();
+
+        let removed: Vec<u64> = replay
+            .replay_after(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|notification| notification.event.kind == QueueEventKind::ItemRemoved)
+            .filter_map(|notification| notification.event.item_id)
+            .collect();
+        assert_eq!(
+            removed,
+            vec![21, 22],
+            "a record that is gone is announced removed, whatever its cleanup did"
+        );
+        let state = db.list_history_delete_row_states(&[21, 22]).unwrap();
+        assert!(!state.contains_key(&22));
+        assert_eq!(state[&21].state, AsyncOperationTargetState::Failed);
+        let message = state[&21].error_message.as_deref().unwrap();
+        assert!(message.contains("record deleted"), "{message}");
+        assert!(
+            message.contains("synthetic directory removal failure"),
+            "{message}"
+        );
+        let summaries = db.list_history_delete_operations(false).unwrap();
+        assert_eq!(summaries[0].id, operation_id);
+        assert_eq!(
+            summaries[0].state,
+            weaver_server_core::AsyncOperationState::CompletedWithErrors
+        );
     }
 
     #[tokio::test]

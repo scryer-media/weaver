@@ -876,7 +876,7 @@ fn spawn_test_scheduler(
                             .expect("failed to delete history row from test db");
                         db.delete_job_events(job_id.0)
                             .expect("failed to delete history events from test db");
-                        outcome.deleted.insert(job_id, Default::default());
+                        outcome.deleted.insert(job_id, Ok(Default::default()));
                     }
                     let _ = reply.send(Ok(outcome));
                 }

@@ -739,17 +739,17 @@ async fn run_history_delete(
         })
         .await
         {
-            refused.insert(job_id, crate::SchedulerError::State(error));
+            deleted.insert(job_id, Err(crate::SchedulerError::State(error)));
             continue;
         }
         match dirs.remove(intermediate_dir, job_id).await {
             Ok(left_in_place) => {
                 Pipeline::cleanup_owned_output_dir(output_dirs.get(&job_id).map(PathBuf::as_path))
                     .await;
-                deleted.insert(job_id, crate::HistoryDeleteOutcome { left_in_place });
+                deleted.insert(job_id, Ok(crate::HistoryDeleteOutcome { left_in_place }));
             }
             Err(error) => {
-                refused.insert(job_id, error);
+                deleted.insert(job_id, Err(error));
             }
         }
     }

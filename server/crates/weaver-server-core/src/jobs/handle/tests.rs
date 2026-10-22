@@ -485,7 +485,7 @@ fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
                     let _ = reply.send(Ok(crate::HistoryDeleteBatchOutcome {
                         deleted: job_ids
                             .into_iter()
-                            .map(|job_id| (job_id, Default::default()))
+                            .map(|job_id| (job_id, Ok(Default::default())))
                             .collect(),
                         refused: Default::default(),
                     }));

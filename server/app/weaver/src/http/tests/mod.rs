@@ -521,7 +521,7 @@ fn scheduler_handle_with_mock_commands_with_db(
                             let _ = db.delete_job_history(job_id.0);
                             let _ = db.delete_job_events(job_id.0);
                         }
-                        outcome.deleted.insert(job_id, Default::default());
+                        outcome.deleted.insert(job_id, Ok(Default::default()));
                     }
                     let _ = reply.send(Ok(outcome));
                 }
