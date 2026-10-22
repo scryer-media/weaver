@@ -6,7 +6,9 @@ use weaver_server_core::jobs::ids::JobId;
 
 use super::mutation::action_error;
 use super::service;
-use super::types::{ScheduleSeedingGql, Torrent, TorrentPeerGql, TorrentTrackerGql};
+use super::types::{
+    ScheduleSeedingGql, Torrent, TorrentPeerGql, TorrentRouteGql, TorrentTrackerGql,
+};
 use crate::auth::ReadGuard;
 
 #[derive(Default)]
@@ -54,6 +56,18 @@ impl TorrentsQuery {
         };
         Ok(torrents
             .schedule_seeding()
+            .await
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Every torrent route, by the scopes that run on it, with whether
+    /// peers can reach its session.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_routes(&self, ctx: &Context<'_>) -> Result<Vec<TorrentRouteGql>> {
+        Ok(service(ctx)?
+            .routes()
             .await
             .into_iter()
             .map(Into::into)

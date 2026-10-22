@@ -2,7 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use async_graphql::{Enum, InputObject, SimpleObject};
-use weaver_server_core::torrents::service::{ScheduleSeeding, SeedingSource, TorrentView};
+use weaver_server_core::proxies::TorrentScope;
+use weaver_server_core::torrents::service::{
+    ScheduleSeeding, SeedingSource, TorrentRoute, TorrentView,
+};
+use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
     TorrentTracker, TorrentVersion, TrackerEntry, TrackerStatus,
@@ -117,6 +121,131 @@ impl From<ScheduleSeeding> for ScheduleSeedingGql {
         Self {
             host_pattern: seeding.host_pattern,
             torrents: seeding.torrents,
+        }
+    }
+}
+
+/// What runs on a torrent route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentRouteScope")]
+pub enum TorrentRouteScopeGql {
+    Default,
+    Category,
+    TrackerRule,
+}
+
+/// A scope that runs on a torrent route: the default, or a category or
+/// tracker rule by its id and name.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentRouteUse")]
+pub struct TorrentRouteUseGql {
+    pub scope: TorrentRouteScopeGql,
+    pub id: Option<u32>,
+    pub name: Option<String>,
+}
+
+impl From<(TorrentScope, Option<String>)> for TorrentRouteUseGql {
+    fn from((scope, name): (TorrentScope, Option<String>)) -> Self {
+        let (scope, id) = match scope {
+            TorrentScope::Default => (TorrentRouteScopeGql::Default, None),
+            TorrentScope::Category(id) => (TorrentRouteScopeGql::Category, Some(id)),
+            TorrentScope::TrackerRule(id) => (TorrentRouteScopeGql::TrackerRule, Some(id)),
+        };
+        Self { scope, id, name }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PortMapper")]
+pub enum PortMapperGql {
+    Upnp,
+    NatPmp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "PortMapProtocol")]
+pub enum PortMapProtocolGql {
+    Tcp,
+    Udp,
+}
+
+/// A gateway's last word on one port mapping.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentPortMapping")]
+pub struct TorrentPortMappingGql {
+    pub mapper: PortMapperGql,
+    pub protocol: PortMapProtocolGql,
+    pub local_port: u16,
+    /// The port the gateway forwards; none once the mapping failed or was
+    /// removed.
+    pub external_port: Option<u16>,
+    /// The gateway's external address, when it told it.
+    pub gateway_address: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<PortMapped> for TorrentPortMappingGql {
+    fn from(mapped: PortMapped) -> Self {
+        Self {
+            mapper: match mapped.transport {
+                PortmapTransport::Upnp => PortMapperGql::Upnp,
+                PortmapTransport::NatPmp => PortMapperGql::NatPmp,
+            },
+            protocol: match mapped.protocol {
+                PortmapProtocol::Tcp => PortMapProtocolGql::Tcp,
+                PortmapProtocol::Udp => PortMapProtocolGql::Udp,
+            },
+            local_port: mapped.local_port,
+            external_port: mapped.external_port,
+            gateway_address: mapped.external_ip.map(|ip| ip.to_string()),
+            error: mapped.error,
+        }
+    }
+}
+
+/// A torrent route and whether peers can reach its session.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentRoute")]
+pub struct TorrentRouteGql {
+    pub key: String,
+    pub scopes: Vec<TorrentRouteUseGql>,
+    /// Whether its session is open.
+    pub open: bool,
+    /// The address its session listens on, TCP's, and uTP's when `utp`.
+    pub listen_address: Option<String>,
+    pub utp: bool,
+    pub mappings: Vec<TorrentPortMappingGql>,
+    /// Its address as the internet sees it.
+    pub external_addresses: Vec<String>,
+    /// Why its session is held closed, or why its leg is down.
+    pub reason: Option<String>,
+}
+
+impl From<TorrentRoute> for TorrentRouteGql {
+    fn from(route: TorrentRoute) -> Self {
+        let session = route.session;
+        let reason = session
+            .as_ref()
+            .map_or(route.down, |session| session.held.clone());
+        Self {
+            key: route.key.as_str().to_owned(),
+            scopes: route.scopes.into_iter().map(Into::into).collect(),
+            open: session
+                .as_ref()
+                .is_some_and(|session| session.held.is_none()),
+            listen_address: session
+                .as_ref()
+                .and_then(|session| session.listen)
+                .map(|addr| addr.to_string()),
+            utp: session.as_ref().is_some_and(|session| session.utp),
+            mappings: session
+                .as_ref()
+                .map(|session| session.mappings.iter().cloned().map(Into::into).collect())
+                .unwrap_or_default(),
+            external_addresses: session
+                .map(|session| session.external.iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
+            reason,
         }
     }
 }

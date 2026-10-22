@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 pub use weaver_torrent::IpRanges;
 use weaver_torrent::dht::DhtPersistenceConfig;
+use weaver_torrent::upnp::PortMapEvents;
+pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
     ConnectionOptions, DhtSessionConfig, HttpClients, IpFilter, ListenerMode, ListenerOptions,
     PeerConnectionOptions, Session, SessionLimits, SessionOptions, SocketFactory,
@@ -432,11 +434,53 @@ enum Slot {
         leg: Option<Arc<TorrentLeg>>,
         port: u16,
         kind: LegKind,
+        mappings: PortMappings,
     },
     Held {
         reason: String,
         kind: LegKind,
     },
+}
+
+/// The last report of each of a session's port mappings, one for each
+/// mapper and protocol, kept as the mappers make them.
+#[derive(Clone)]
+struct PortMappings(Arc<tokio::sync::watch::Sender<Vec<PortMapped>>>);
+
+impl Default for PortMappings {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(Vec::new())))
+    }
+}
+
+impl PortMappings {
+    fn record(&self, event: PortMapped) {
+        self.0.send_modify(|mappings| {
+            match mappings.iter_mut().find(|mapping| {
+                mapping.transport == event.transport && mapping.protocol == event.protocol
+            }) {
+                Some(mapping) => *mapping = event,
+                None => mappings.push(event),
+            }
+        });
+    }
+
+    fn get(&self) -> Vec<PortMapped> {
+        self.0.borrow().clone()
+    }
+
+    // Where a session sends its mappers' reports: each is kept as it
+    // arrives, until the session lets go of the sender.
+    fn follow(&self) -> PortMapEvents {
+        let (events, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let mappings = self.clone();
+        tokio::spawn(async move {
+            while let Some(event) = reports.recv().await {
+                mappings.record(event);
+            }
+        });
+        events
+    }
 }
 
 /// A session as consumers read it.
@@ -446,6 +490,14 @@ pub struct SessionView {
     pub kind: LegKind,
     /// The listen port, while open.
     pub port: Option<u16>,
+    /// The address the session listens on, while open and listening: TCP's,
+    /// and uTP's when `utp`.
+    pub listen: Option<SocketAddr>,
+    pub utp: bool,
+    /// The last report of each of its port mappings.
+    pub mappings: Vec<PortMapped>,
+    /// Its address as the internet sees it, of each family it knows one for.
+    pub external: Vec<IpAddr>,
     /// Why it holds closed.
     pub held: Option<String>,
 }
@@ -641,7 +693,8 @@ impl Sessions {
         }
         // The peer limit is each torrent's, whatever else is open.
         let peers = self.config().max_peers_total as usize;
-        match self.build(plan, port_slot, peers).await {
+        let mappings = PortMappings::default();
+        match self.build(plan, port_slot, peers, &mappings).await {
             Ok((session, leg, port)) => {
                 self.rates.add(&session);
                 self.configured().add(&session);
@@ -652,6 +705,7 @@ impl Sessions {
                         leg,
                         port,
                         kind: plan.kind.clone(),
+                        mappings,
                     },
                 );
                 Ok(session)
@@ -674,6 +728,7 @@ impl Sessions {
         plan: &RoutePlan,
         slot: Result<(u16, Option<u16>), String>,
         peers: usize,
+        mappings: &PortMappings,
     ) -> Result<(Arc<Session>, Option<Arc<TorrentLeg>>, u16), String> {
         let (slot, mapped) = slot?;
         let port = self
@@ -691,7 +746,10 @@ impl Sessions {
         };
         let torrent = self.config();
         let ip_filter = self.ip_filter(&torrent).await?;
-        let options = session_options(&env, &leg, port, &dir, peers, &torrent, ip_filter);
+        let options = SessionOptions {
+            port_map_events: Some(mappings.follow()),
+            ..session_options(&env, &leg, port, &dir, peers, &torrent, ip_filter)
+        };
         Session::new_with_opts(dir.join("output"), options)
             .await
             .map(|session| (session, leg.leg, port))
@@ -911,16 +969,30 @@ async fn close_all(slots: BTreeMap<RouteKey, Slot>) {
 
 fn view(key: &RouteKey, slot: &Slot) -> SessionView {
     match slot {
-        Slot::Open { port, kind, .. } => SessionView {
+        Slot::Open {
+            session,
+            port,
+            kind,
+            mappings,
+            ..
+        } => SessionView {
             key: key.clone(),
             kind: kind.clone(),
             port: Some(*port),
+            listen: session.listen_addr(),
+            utp: session.listens_utp(),
+            mappings: mappings.get(),
+            external: session.external_ips(),
             held: None,
         },
         Slot::Held { reason, kind } => SessionView {
             key: key.clone(),
             kind: kind.clone(),
             port: None,
+            listen: None,
+            utp: false,
+            mappings: Vec::new(),
+            external: Vec::new(),
             held: Some(reason.clone()),
         },
     }

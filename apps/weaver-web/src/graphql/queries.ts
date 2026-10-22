@@ -1487,6 +1487,33 @@ export const TRACKER_HOSTS_QUERY = gql`
   }
 `;
 
+/** Every torrent route, and whether peers can reach its session. */
+export const TORRENT_ROUTES_QUERY = gql`
+  query TorrentRoutes {
+    torrentRoutes {
+      key
+      scopes {
+        scope
+        id
+        name
+      }
+      open
+      listenAddress
+      utp
+      mappings {
+        mapper
+        protocol
+        localPort
+        externalPort
+        gatewayAddress
+        error
+      }
+      externalAddresses
+      reason
+    }
+  }
+`;
+
 export const SAVE_TRACKER_RULE_MUTATION = gql`
   mutation SaveTrackerRule($id: Int, $input: TrackerRuleInput!) {
     saveTrackerRule(id: $id, input: $input) {

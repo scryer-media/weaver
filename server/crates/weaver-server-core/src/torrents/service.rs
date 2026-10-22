@@ -60,7 +60,7 @@ use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{
-    NetworkRoutes, RouteKey, SessionEnv, SessionError, Sessions, encryption_policy,
+    NetworkRoutes, RouteKey, SessionEnv, SessionError, SessionView, Sessions, encryption_policy,
 };
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
@@ -267,6 +267,17 @@ pub enum SeedingSource {
 pub struct ScheduleSeeding {
     pub host_pattern: String,
     pub torrents: u32,
+}
+
+/// A torrent route as it stands: the scopes that run on it, with their
+/// names, and its session, open or held, once one was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorrentRoute {
+    pub key: RouteKey,
+    pub scopes: Vec<(TorrentScope, Option<String>)>,
+    pub session: Option<SessionView>,
+    /// Why its leg is down, when it is.
+    pub down: Option<String>,
 }
 
 /// What torrent jobs are built with.
@@ -3470,6 +3481,61 @@ impl TorrentService {
         Ok(())
     }
 
+    // The scopes that run on a route of their own, with their names: the
+    // default, then each category's and tracker rule's that asks for one.
+    fn route_scopes(&self) -> Vec<(TorrentScope, Option<String>)> {
+        let categories = self
+            .settings()
+            .categories
+            .into_iter()
+            .filter(|category| category.torrent_route)
+            .map(|category| (TorrentScope::Category(category.id), Some(category.name)));
+        let rules = self.rules();
+        let rules = rules.iter().filter(|rule| rule.torrent_route).map(|rule| {
+            (
+                TorrentScope::TrackerRule(rule.id),
+                Some(rule.host_pattern.clone()),
+            )
+        });
+        std::iter::once((TorrentScope::Default, None))
+            .chain(categories)
+            .chain(rules)
+            .collect()
+    }
+
+    /// Every torrent route, by the scopes that plan to it, in their order,
+    /// then any session left on a route no scope plans to.
+    pub async fn routes(&self) -> Vec<TorrentRoute> {
+        let routes = self.inner.sessions.routes();
+        let mut listed: Vec<TorrentRoute> = Vec::new();
+        for (scope, name) in self.route_scopes() {
+            let Ok(plan) = routes.plan(scope) else {
+                continue;
+            };
+            match listed.iter_mut().find(|route| route.key == plan.key) {
+                Some(route) => route.scopes.push((scope, name)),
+                None => listed.push(TorrentRoute {
+                    key: plan.key,
+                    scopes: vec![(scope, name)],
+                    session: None,
+                    down: plan.down,
+                }),
+            }
+        }
+        for view in self.inner.sessions.views().await {
+            match listed.iter_mut().find(|route| route.key == view.key) {
+                Some(route) => route.session = Some(view),
+                None => listed.push(TorrentRoute {
+                    key: view.key.clone(),
+                    scopes: Vec::new(),
+                    session: Some(view),
+                    down: None,
+                }),
+            }
+        }
+        listed
+    }
+
     async fn drop_idle_sessions(&self) {
         let used: BTreeSet<RouteKey> = self
             .inner
@@ -3485,23 +3551,11 @@ impl TorrentService {
             }
         }
         // The routes that exist are the ones a scope plans to.
-        let settings = self.settings();
         let routes = self.inner.sessions.routes();
-        let existing: BTreeSet<RouteKey> = std::iter::once(TorrentScope::Default)
-            .chain(
-                settings
-                    .categories
-                    .iter()
-                    .filter(|category| category.torrent_route)
-                    .map(|category| TorrentScope::Category(category.id)),
-            )
-            .chain(
-                self.rules()
-                    .iter()
-                    .filter(|rule| rule.torrent_route)
-                    .map(|rule| TorrentScope::TrackerRule(rule.id)),
-            )
-            .filter_map(|scope| routes.plan(scope).ok())
+        let existing: BTreeSet<RouteKey> = self
+            .route_scopes()
+            .into_iter()
+            .filter_map(|(scope, _)| routes.plan(scope).ok())
             .map(|plan| plan.key)
             .collect();
         self.inner.sessions.forget_routes(existing).await;

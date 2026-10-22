@@ -7,6 +7,7 @@ import { useMutation, useQuery } from "urql";
 import {
   DELETE_TRACKER_RULE_MUTATION,
   SAVE_TRACKER_RULE_MUTATION,
+  TORRENT_ROUTES_QUERY,
   TORRENT_SETTINGS_QUERY,
   TRACKER_HOSTS_QUERY,
   TRACKER_RULES_QUERY,
@@ -285,6 +286,106 @@ function HostPicker({
       )}
     </div>
   );
+}
+
+interface TorrentPortMapping {
+  mapper: "UPNP" | "NAT_PMP";
+  protocol: "TCP" | "UDP";
+  localPort: number;
+  /** Null once the mapping failed or was removed. */
+  externalPort: number | null;
+  gatewayAddress: string | null;
+  error: string | null;
+}
+
+interface TorrentRoute {
+  key: string;
+  scopes: { scope: "DEFAULT" | "CATEGORY" | "TRACKER_RULE"; id: number | null; name: string | null }[];
+  open: boolean;
+  listenAddress: string | null;
+  utp: boolean;
+  mappings: TorrentPortMapping[];
+  externalAddresses: string[];
+  /** Why the route's session is held closed, or why its leg is down. */
+  reason: string | null;
+}
+
+const MAPPERS: Record<TorrentPortMapping["mapper"], string> = { UPNP: "UPnP", NAT_PMP: "NAT-PMP" };
+
+function mappingText(mapping: TorrentPortMapping): string {
+  const what = `${MAPPERS[mapping.mapper]} ${mapping.protocol}`;
+  if (mapping.error !== null) {
+    return `${what}: ${mapping.error}`;
+  }
+  if (mapping.externalPort === null) {
+    return `${what}: ${EM_DASH}`;
+  }
+  const gateway = mapping.gatewayAddress === null ? "" : ` ${mapping.gatewayAddress}`;
+  return `${what} ${mapping.externalPort}${gateway}`;
+}
+
+/** Each torrent route, where its session listens, and how its port is mapped. */
+function useTorrentRoutes(t: Translate): SettingsBlock {
+  const [{ data }] = useQuery<{ torrentRoutes: TorrentRoute[] }>({
+    query: TORRENT_ROUTES_QUERY,
+    requestPolicy: "cache-and-network",
+  });
+  const routes = data?.torrentRoutes ?? [];
+  const scopeName = (scope: TorrentRoute["scopes"][number]) =>
+    scope.scope === "DEFAULT" ? t("next.torrents.routeDefault") : (scope.name ?? `#${scope.id ?? ""}`);
+  return {
+    kind: "table",
+    id: "torrentRoutes",
+    title: t("next.torrents.routes"),
+    columns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1.2fr)",
+    headers: [
+      t("next.torrents.routeScopes"),
+      t("next.torrents.routeListen"),
+      t("next.torrents.routeMapping"),
+      t("next.torrents.routeExternal"),
+      t("next.torrents.routeStatus"),
+    ],
+    empty: t("next.torrents.routesEmpty"),
+    rows: routes.map((route) => {
+      const scopes = route.scopes.map(scopeName).join(", ");
+      const listen =
+        route.listenAddress === null ? EM_DASH : `${route.listenAddress}${route.utp ? " TCP+uTP" : " TCP"}`;
+      const mappings = route.mappings.length === 0 ? EM_DASH : route.mappings.map(mappingText).join("; ");
+      const external = route.externalAddresses.length === 0 ? EM_DASH : route.externalAddresses.join(", ");
+      const status =
+        route.reason ?? t(route.open ? "next.torrents.routeOpen" : "next.torrents.routeIdle");
+      return {
+        id: route.key,
+        searchText: [scopes, listen, mappings, external, status].join(" "),
+        cells: [
+          <Cell key="scopes" title={scopes}>
+            {scopes || route.key}
+          </Cell>,
+          <Cell key="listen" mono title={listen}>
+            {listen}
+          </Cell>,
+          <Cell
+            key="mapping"
+            mono
+            title={mappings}
+            className={route.mappings.some((mapping) => mapping.error !== null) ? "text-wv-error-text" : undefined}
+          >
+            {mappings}
+          </Cell>,
+          <Cell key="external" mono title={external}>
+            {external}
+          </Cell>,
+          <Cell
+            key="status"
+            title={status}
+            className={route.reason !== null ? "text-wv-error-text" : "text-wv-muted"}
+          >
+            {status}
+          </Cell>,
+        ],
+      };
+    }),
+  };
 }
 
 /** The tracker rules' table, and the editor and confirmation it opens. */
@@ -680,6 +781,7 @@ export function TorrentsPanel() {
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const trackerRules = useTrackerRules(t);
+  const torrentRoutes = useTorrentRoutes(t);
 
   const source = useMemo<TorrentForm | null>(() => {
     const settings = data?.settings;
@@ -897,6 +999,7 @@ export function TorrentsPanel() {
             },
           ],
         },
+        torrentRoutes,
         {
           kind: "section",
           id: "bittorrent",

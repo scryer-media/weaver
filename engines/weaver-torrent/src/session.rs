@@ -46,8 +46,8 @@ use crate::tracker::{
     UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
-    PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, UpnpPortForwarder,
-    UpnpPortForwarderOptions,
+    PortMapEvents, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
+    UpnpPortForwarder, UpnpPortForwarderOptions,
 };
 use crate::{
     ApiError, CreateTorrentOptions, FileInfos, ManagedTorrent, ManagedTorrentShared,
@@ -1016,6 +1016,10 @@ pub struct SessionOptions {
     /// (libtorrent `allow_multiple_connections_per_ip`). Off by default: one
     /// connection per address.
     pub allow_multiple_connections_per_ip: bool,
+
+    /// Where the session also sends each report its port mappers make, as
+    /// they make it.
+    pub port_map_events: Option<PortMapEvents>,
 }
 
 impl Default for SessionOptions {
@@ -1053,6 +1057,7 @@ impl Default for SessionOptions {
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
             allow_multiple_connections_per_ip: false,
+            port_map_events: None,
         }
     }
 }
@@ -1547,6 +1552,7 @@ impl Session {
                         requests,
                         bind_device.clone(),
                         opts.bind_device_name.as_deref(),
+                        opts.port_map_events.take(),
                     );
                 }
             }
@@ -1770,13 +1776,15 @@ impl Session {
 
     /// Keep the listen port mapped on the gateway over UPnP and over PCP /
     /// NAT-PMP at once (libtorrent `session_impl::start_upnp` and
-    /// `start_natpmp`), announce the TCP port a mapper got, and count the
-    /// address the gateway gave as the router's vote (`on_port_mapping`).
+    /// `start_natpmp`), announce the TCP port a mapper got, count the
+    /// address the gateway gave as the router's vote (`on_port_mapping`),
+    /// and pass each report on to `forward`.
     fn start_port_mapping(
         &self,
         requests: Vec<PortMapRequest>,
         bind_device: Option<BindDevice>,
         bind_device_name: Option<&str>,
+        forward: Option<PortMapEvents>,
     ) {
         info!(?requests, "starting UPnP and NAT-PMP / PCP port mapping");
         let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
@@ -1813,6 +1821,9 @@ impl Session {
                 }
                 announce_port.on_port_mapping(&event);
                 external_ips.on_port_mapping(&event, tokio::time::Instant::now());
+                if let Some(forward) = &forward {
+                    let _ = forward.send(event);
+                }
             }
             Ok(())
         });
@@ -2869,6 +2880,17 @@ impl Session {
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         self.listen_addr
+    }
+
+    /// Whether the session listens on uTP as well, on the listen address.
+    pub fn listens_utp(&self) -> bool {
+        self.utp
+    }
+
+    /// Our address as the internet sees it, IPv4 first, of each family the
+    /// vote has settled on.
+    pub fn external_ips(&self) -> Vec<IpAddr> {
+        self.external_ips.get()
     }
 
     /// The port peers are told to connect to: the one a mapper got on the

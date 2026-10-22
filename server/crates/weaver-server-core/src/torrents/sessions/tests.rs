@@ -261,13 +261,7 @@ async fn a_route_announces_the_port_mapped_to_it() {
     let dir = tempfile::tempdir().unwrap();
     let routes = Arc::new(FakeRoutes::default());
     routes.route(TorrentScope::Default, 1);
-    let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
-    let loopback = Arc::new(weaver_tunnel::pipe::Egress::new(
-        4,
-        weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
-        std::time::Duration::MAX,
-    ));
-    routes.set_leg(kind.clone(), Arc::new(LegSockets::new(loopback, &kind)));
+    loopback_leg(&routes);
     let db = Database::open_in_memory().unwrap();
     let mut env = env(dir.path());
     env.announce_port = Some(51_413);
@@ -283,6 +277,118 @@ async fn a_route_announces_the_port_mapped_to_it() {
 
     sessions.forget_routes(BTreeSet::new()).await;
     assert_eq!(mapped_port(&db, &plan.key).unwrap(), None);
+    sessions.stop_all().await;
+}
+
+// A loopback leg whose session listens on 127.0.0.1.
+fn loopback_leg(routes: &FakeRoutes) {
+    let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
+    let loopback = Arc::new(weaver_tunnel::pipe::Egress::new(
+        4,
+        weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+        std::time::Duration::MAX,
+    ));
+    routes.set_leg(kind.clone(), Arc::new(LegSockets::new(loopback, &kind)));
+}
+
+// An open route's view carries the address its session bound, and each
+// gateway's last report on its mappings as it arrives: a failure with its
+// reason, a success with the port and the gateway's address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_shows_where_it_listens_and_how_its_ports_are_mapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    loopback_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let session = sessions.session(&plan).await.unwrap();
+
+    let view = sessions.view(&plan.key).await.unwrap();
+    let listen = view.listen.expect("an open loopback session listens");
+    assert_eq!(listen.ip(), IpAddr::from([127, 0, 0, 1]));
+    assert_ne!(listen.port(), 0);
+    assert_eq!(view.listen, session.listen_addr());
+    assert_eq!(view.utp, session.listens_utp());
+    assert!(view.mappings.is_empty());
+    assert_eq!(view.held, None);
+
+    let mappings = match sessions.slots.lock().await.get(&plan.key) {
+        Some(Slot::Open { mappings, .. }) => mappings.clone(),
+        _ => panic!("the route is open"),
+    };
+    let mut reported = mappings.0.subscribe();
+    let events = mappings.follow();
+    let failed = PortMapped {
+        transport: PortmapTransport::Upnp,
+        protocol: PortmapProtocol::Tcp,
+        local_port: listen.port(),
+        external_port: None,
+        external_ip: None,
+        error: Some("ConflictInMappingEntry".into()),
+    };
+    let mapped = PortMapped {
+        transport: PortmapTransport::NatPmp,
+        protocol: PortmapProtocol::Tcp,
+        local_port: listen.port(),
+        external_port: Some(40_001),
+        external_ip: Some(IpAddr::from([203, 0, 113, 7])),
+        error: None,
+    };
+    events.send(failed.clone()).unwrap();
+    events.send(mapped.clone()).unwrap();
+    reported
+        .wait_for(|mappings| mappings.len() == 2)
+        .await
+        .unwrap();
+    let view = sessions.view(&plan.key).await.unwrap();
+    assert_eq!(view.mappings, [failed.clone(), mapped.clone()]);
+
+    // A later report on a mapping stands in for the one before it.
+    let renewed = PortMapped {
+        external_port: Some(40_002),
+        error: None,
+        ..failed
+    };
+    events.send(renewed.clone()).unwrap();
+    reported
+        .wait_for(|mappings| mappings.first() == Some(&renewed))
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions.view(&plan.key).await.unwrap().mappings,
+        [renewed, mapped]
+    );
+    sessions.stop_all().await;
+}
+
+// A route whose session could not listen holds closed with the reason, and
+// shows no address and no mapping.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_that_could_not_listen_shows_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
+    routes.set_leg(kind, Arc::new(Nowhere));
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let Err(SessionError::Build(error)) = sessions.session(&plan).await else {
+        panic!("a leg that cannot listen builds no session");
+    };
+
+    let view = sessions.view(&plan.key).await.unwrap();
+    assert_eq!(view.held.as_deref(), Some(error.as_str()));
+    assert!(error.contains("listen"), "{error}");
+    assert_eq!(view.listen, None);
+    assert!(view.mappings.is_empty());
+    assert!(view.external.is_empty());
     sessions.stop_all().await;
 }
 

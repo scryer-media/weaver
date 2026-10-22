@@ -996,3 +996,111 @@ async fn a_torrents_trackers_are_listed_and_edited() {
         assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"), "{query}");
     }
 }
+
+// Every route is listed with the scopes that run on it; one whose leg is
+// down shows why, and no address or mapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
+    let rig = rig().await;
+    let response = rig
+        .execute(
+            r#"mutation { saveTrackerRule(input: {
+                hostPattern: "tracker.test", torrentRoute: true
+            }) { id } }"#,
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["saveTrackerRule"][0]["id"]
+        .as_u64()
+        .unwrap();
+
+    let response = rig
+        .execute(
+            "{ torrentRoutes { key scopes { scope id name } open listenAddress utp \
+             mappings { mapper protocol localPort externalPort gatewayAddress error } \
+             externalAddresses reason } }",
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
+    assert_eq!(
+        response.data.into_json().unwrap()["torrentRoutes"],
+        serde_json::json!([{
+            "key": key.as_str(),
+            "scopes": [
+                { "scope": "DEFAULT", "id": null, "name": null },
+                { "scope": "TRACKER_RULE", "id": id, "name": "tracker.test" },
+            ],
+            "open": false,
+            "listenAddress": null,
+            "utp": false,
+            "mappings": [],
+            "externalAddresses": [],
+            "reason": "offline",
+        }])
+    );
+}
+
+// An open route shows where its session listens, each mapping's last report
+// and the address the internet sees.
+#[test]
+fn an_open_route_shows_where_it_listens_and_its_mappings() {
+    use weaver_server_api::torrents::types::TorrentRouteGql;
+    use weaver_server_core::torrents::service::TorrentRoute;
+    use weaver_server_core::torrents::sessions::{
+        PortMapped, PortmapProtocol, PortmapTransport, SessionView,
+    };
+
+    let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
+    let route = TorrentRouteGql::from(TorrentRoute {
+        key: key.clone(),
+        scopes: vec![(TorrentScope::Category(3), Some("tv".into()))],
+        session: Some(SessionView {
+            key: key.clone(),
+            kind: LegKind::System,
+            port: Some(6881),
+            listen: Some("127.0.0.1:6881".parse().unwrap()),
+            utp: true,
+            mappings: vec![
+                PortMapped {
+                    transport: PortmapTransport::Upnp,
+                    protocol: PortmapProtocol::Tcp,
+                    local_port: 6881,
+                    external_port: None,
+                    external_ip: None,
+                    error: Some("ConflictInMappingEntry".into()),
+                },
+                PortMapped {
+                    transport: PortmapTransport::NatPmp,
+                    protocol: PortmapProtocol::Udp,
+                    local_port: 6881,
+                    external_port: Some(40_001),
+                    external_ip: Some("203.0.113.7".parse().unwrap()),
+                    error: None,
+                },
+            ],
+            external: vec!["203.0.113.7".parse().unwrap()],
+            held: None,
+        }),
+        down: None,
+    });
+    assert_eq!(route.key, key.as_str());
+    assert!(route.open);
+    assert_eq!(route.listen_address.as_deref(), Some("127.0.0.1:6881"));
+    assert!(route.utp);
+    assert_eq!(route.scopes[0].id, Some(3));
+    assert_eq!(route.scopes[0].name.as_deref(), Some("tv"));
+    assert_eq!(route.mappings.len(), 2);
+    assert_eq!(route.mappings[0].external_port, None);
+    assert_eq!(
+        route.mappings[0].error.as_deref(),
+        Some("ConflictInMappingEntry")
+    );
+    assert_eq!(route.mappings[1].external_port, Some(40_001));
+    assert_eq!(
+        route.mappings[1].gateway_address.as_deref(),
+        Some("203.0.113.7")
+    );
+    assert_eq!(route.external_addresses, ["203.0.113.7"]);
+    assert_eq!(route.reason, None);
+}
