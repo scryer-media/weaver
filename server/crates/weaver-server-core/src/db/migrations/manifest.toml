@@ -1077,3 +1077,20 @@ kind = "sql"
 file = "migrations/0084_graph_member_copy_of/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 85
+description = "a torrent keeps only what its next start needs; its peers and bans move to its ledger row"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0085_torrent_lean_resume/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0085_torrent_lean_resume/postgres.sql"
+engine = "postgres"
+scope = "all"

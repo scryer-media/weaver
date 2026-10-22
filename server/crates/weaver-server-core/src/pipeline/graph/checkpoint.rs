@@ -135,7 +135,7 @@ impl Pending {
 
     // Queue what this checkpoint changes; true when a write must be queued
     // to take it.
-    pub(super) fn put<R: Root>(&self, job: &mut GraphJob<R>) -> bool {
+    pub(crate) fn put<R: Root>(&self, job: &mut GraphJob<R>) -> bool {
         let mut slot = self.slot();
         let slot = &mut *slot;
         let mut delta = Delta {
@@ -230,13 +230,13 @@ impl Pending {
         }
     }
 
-    pub(super) fn take(&self) -> Option<Delta> {
+    pub(crate) fn take(&self) -> Option<Delta> {
         self.slot().queued.take()
     }
 
     // A write failed or was never queued, so what the database holds is not
     // known: the next checkpoint writes the whole job, and queues it.
-    fn forget(&self) {
+    pub(crate) fn forget(&self) {
         let mut slot = self.slot();
         slot.held = None;
         slot.queued = None;

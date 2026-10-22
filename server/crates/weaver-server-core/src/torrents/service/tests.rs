@@ -844,30 +844,53 @@ async fn pause_resume_and_force_are_kept() {
     assert!(rig.db.get_torrent(job_id).unwrap().unwrap().forced);
 }
 
-// The running tick writes the ledger, which is never left longer than its
-// limit, on the runtime's own clock.
-#[tokio::test(start_paused = true)]
-async fn the_ledger_is_kept_on_the_tick() {
-    let clock = Arc::new(RuntimeClock(tokio::time::Instant::now()));
+// The tick writes a ledger that changed once a minute has passed since it
+// was last written, and nothing while it stands still.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ledger_is_written_once_a_minute_while_it_changes() {
+    let clock = set_clock();
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
     // No session is built while the route is down.
     rig.routes.set_down(Some("down"));
-    let mut written = rig.service.written();
-    rig.service.start().await.unwrap();
+    rig.service.open().await.unwrap();
     let job_id = rig
         .service
         .add(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
-    for _ in 0..8 {
-        let ledgers = written.borrow_and_update().ledgers;
-        written
-            .wait_for(|written| written.ledgers > ledgers)
-            .await
-            .unwrap();
-        let ledger = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
-        assert!(clock.now_ms() - ledger.updated_at_ms < LEDGER_EVERY_MS);
-    }
+    let written = rig.service.written();
+    let base = written.borrow().ledgers;
+    // What a session moved for it.
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .counters
+        .uploaded_bytes = 5;
+    clock.0.fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    rig.service.tick().await;
+    assert_eq!(written.borrow().ledgers, base);
+    assert_eq!(
+        rig.db.get_torrent_counters(job_id).unwrap().unwrap(),
+        TorrentCounters::default()
+    );
+    clock.0.fetch_add(LEDGER_EVERY_MS, Ordering::SeqCst);
+    rig.service.tick().await;
+    assert_eq!(written.borrow().ledgers, base + 1);
+    assert_eq!(
+        rig.db
+            .get_torrent_counters(job_id)
+            .unwrap()
+            .unwrap()
+            .uploaded_bytes,
+        5
+    );
+    clock.0.fetch_add(LEDGER_EVERY_MS, Ordering::SeqCst);
+    rig.service.tick().await;
+    assert_eq!(written.borrow().ledgers, base + 1);
 }
 
 // A member with an extension the operator does not want, found inside an
@@ -1603,21 +1626,24 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
         })
     );
     // The ledger as the running tick keeps it: the time between two ticks
-    // the torrent ran in its session is active, and it ran complete.
+    // the torrent ran in its session is active, and it ran complete. Inside
+    // a minute of the last write nothing is written, and a clean stop
+    // writes the ledger as it stands.
     rig.service.tick().await;
     clock.0.fetch_add(30_000, Ordering::SeqCst);
     rig.service.tick().await;
+    let kept = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    assert_eq!(kept.active_duration_s, 0);
+    rig.service.stop().await;
     let ledger = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
     assert_eq!(
         (
             ledger.downloaded_bytes,
-            ledger.checked_bytes,
             ledger.active_duration_s,
             ledger.last_seen_complete_ms,
         ),
-        (total, total, 30, Some(EPOCH_MS + 30_000))
+        (total, 30, Some(EPOCH_MS + 30_000))
     );
-    rig.service.stop().await;
     // What the server's recovery clears before anything starts.
     rig.db.prune_orphan_active_state().unwrap();
 
@@ -1725,12 +1751,19 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
 
     let connection = claims_complete(&listener, 100).await;
     rig.service.tick().await;
-    let at = seen().expect("the peer's sighting is the torrent's");
+    let at = rig
+        .service
+        .torrent(job_id)
+        .await
+        .unwrap()
+        .last_seen_complete_ms
+        .expect("the peer's sighting is the torrent's");
     assert!(at <= EPOCH_MS - 100_000, "{at}");
 
     // With the peer gone, as a pause disconnects every peer, nobody is
-    // left to say it: the date kept stands.
+    // left to say it: the date kept stands, written as the pause is.
     rig.service.pause(job_id).await.unwrap();
+    assert_eq!(seen(), Some(at));
     let handle = handle_of(&rig.service, job_id).await;
     assert!(handle.live().is_none());
     assert_eq!(rig.service.torrent(job_id).await.unwrap().peers, 0);
@@ -2338,13 +2371,10 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         .await
         .unwrap();
     assert_eq!(
-        rig.db.get_torrent(kept).unwrap().unwrap().tracker_rule_id,
+        rig.service.inner.live.lock().await[&kept].rule_id,
         Some(rule.id)
     );
-    assert_eq!(
-        rig.db.get_torrent(plain).unwrap().unwrap().tracker_rule_id,
-        None
-    );
+    assert_eq!(rig.service.inner.live.lock().await[&plain].rule_id, None);
     for job_id in [kept, plain] {
         rig.service
             .inner
@@ -2463,10 +2493,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         paused_by(&rig.service, kept).await,
         Some(HoldOrigin::Scheduled)
     );
-    assert_eq!(
-        rig.db.get_torrent(kept).unwrap().unwrap().tracker_rule_id,
-        None
-    );
+    assert_eq!(rig.service.inner.live.lock().await[&kept].rule_id, None);
     assert_eq!(
         rig.service.torrent(kept).await.unwrap().seeding_source,
         SeedingSource::Global
@@ -2528,7 +2555,6 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         name: "set".into(),
         source: TorrentSource::Metainfo,
         metainfo: None,
-        private: false,
         category_id: Some(1),
         added_at_ms: EPOCH_MS,
         intent: TorrentIntent::Resumed,
@@ -2536,7 +2562,6 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         completed_at_ms: None,
         storage_dir: None,
         policy_override: None,
-        tracker_rule_id: Some(1),
         unpack: None,
         metadata: Vec::new(),
         upload_limit: None,
@@ -2568,15 +2593,15 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         torrent: TorrentConfig::default(),
     };
 
-    assert!(settings.unpack(&record, &rules));
+    assert!(settings.unpack(&record, rules.first()));
     settings.torrent.unpack = false;
-    assert!(!settings.unpack(&record, &rules));
+    assert!(!settings.unpack(&record, rules.first()));
     settings.categories[0].unpack = Some(true);
-    assert!(settings.unpack(&record, &rules));
+    assert!(settings.unpack(&record, rules.first()));
     rules[0].unpack = Some(false);
-    assert!(!settings.unpack(&record, &rules));
+    assert!(!settings.unpack(&record, rules.first()));
     record.unpack = Some(true);
-    assert!(settings.unpack(&record, &rules));
+    assert!(settings.unpack(&record, rules.first()));
 }
 
 // A torrent takes its tracker rule's route when the rule routes its torrents
@@ -2774,10 +2799,11 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
         })
         .await
         .unwrap();
-    let current = handle_of(&rig.service, job_id)
-        .await
-        .resume_peers()
-        .unwrap();
+    // A ban the session holds and the database does not yet: stop writes
+    // only what changed.
+    let handle = handle_of(&rig.service, job_id).await;
+    handle.ban_peers(&["127.0.0.9".parse().unwrap()]);
+    let current = handle.resume_peers().unwrap();
     // An older save of the torrent on its way: the writer runs it, held
     // until the test lets it go.
     let older = ResumePeers {
@@ -2924,43 +2950,148 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
         .unwrap();
     assert_eq!(held.banned, [in_session]);
     assert_eq!(rig.db.torrent_peers(job_id).unwrap().banned, [in_session]);
+    rig.service.stop().await;
+    // Two peers it knows of when it next starts, beside the ban written.
+    let mut known = rig.db.torrent_peers(job_id).unwrap();
+    known.peers = vec![
+        "127.0.0.4:6881".parse().unwrap(),
+        "127.0.0.5:6881".parse().unwrap(),
+    ];
+    assert!(rig.db.save_torrent_peers(job_id, &known).unwrap());
+
+    // The ban made in the session holds in the next one.
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert_eq!(
+        handle_of(&again, job_id)
+            .await
+            .resume_peers()
+            .unwrap()
+            .banned,
+        [in_session]
+    );
 
     // In no session: torrents are off.
-    let mut settings = rig.service.settings();
+    let mut settings = again.settings();
     settings.torrent.enabled = false;
-    rig.service.set_settings(settings).await;
-    assert!(rig.service.peers(job_id).await.unwrap().is_empty());
+    again.set_settings(settings).await;
+    assert!(again.peers(job_id).await.unwrap().is_empty());
     let off: IpAddr = "127.0.0.4".parse().unwrap();
-    assert!(
-        rig.db
-            .save_torrent_peers(
-                job_id,
-                &ResumePeers {
-                    peers: vec![
-                        "127.0.0.4:6881".parse().unwrap(),
-                        "127.0.0.5:6881".parse().unwrap()
-                    ],
-                    banned: vec![in_session],
-                },
-            )
-            .unwrap()
-    );
-    rig.service.ban_peers(job_id, &[off]).await.unwrap();
+    again.ban_peers(job_id, &[off]).await.unwrap();
     let saved = ResumePeers {
         peers: vec!["127.0.0.5:6881".parse().unwrap()],
         banned: vec![in_session, off],
     };
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
-    rig.service.stop().await;
+    again.stop().await;
 
-    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    let third = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    third.open().await.unwrap();
     assert_eq!(
-        handle_of(&again, job_id).await.resume_peers(),
+        handle_of(&third, job_id).await.resume_peers(),
         Some(saved.clone())
     );
-    again.stop().await;
+    third.stop().await;
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), saved);
+}
+
+// A ban made while the torrent is in no session is on its list once it is
+// in one: attach hands the session the bans the torrent holds, with no
+// read of the database between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ban_made_in_no_session_holds_once_the_torrent_is_in_one() {
+    use std::net::IpAddr;
+
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let early: IpAddr = "127.0.0.6".parse().unwrap();
+    rig.service.ban_peers(job_id, &[early]).await.unwrap();
+    assert_eq!(rig.db.torrent_peers(job_id).unwrap().banned, [early]);
+    rig.routes.set_down(None);
+    on_loopback(&rig.routes);
+    rig.service.attach(job_id).await;
+    assert_eq!(
+        handle_of(&rig.service, job_id)
+            .await
+            .resume_peers()
+            .unwrap()
+            .banned,
+        [early]
+    );
+    rig.service.stop().await;
+}
+
+// A checkpoint writes only what changed since the database last held the
+// job: a second save of a job that did nothing writes no row, and a job
+// brought back from its checkpoint writes none either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_checkpoint_writes_only_what_changed() {
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let job = |service: &TorrentService| {
+        let service = service.clone();
+        async move {
+            service.inner.live.lock().await[&job_id]
+                .job
+                .clone()
+                .unwrap()
+        }
+    };
+    let first = job(&rig.service).await;
+    rig.service.save_checkpoint(job_id, &first).await;
+    let whole = first.with(|job| job.pending().tally());
+    assert!(whole.rows > 0);
+    rig.service.save_checkpoint(job_id, &first).await;
+    let again = first.with(|job| job.pending().tally());
+    assert_eq!(again.checkpoints, whole.checkpoints + 1);
+    assert_eq!(again.rows, whole.rows);
+    assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
+    rig.service.stop().await;
+
+    let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    restarted.open().await.unwrap();
+    let restored = job(&restarted).await;
+    restarted.save_checkpoint(job_id, &restored).await;
+    assert_eq!(restored.with(|job| job.pending().tally()).rows, 0);
+    restarted.stop().await;
+}
+
+// A pause and a completion at once keep both: each writes its own column
+// under the torrent's lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_racing_completion_keeps_the_completion() {
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let (paused, ()) = tokio::join!(rig.service.pause(job_id), rig.service.completed(job_id));
+    paused.unwrap();
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.intent, TorrentIntent::Paused);
+    assert_eq!(stored.completed_at_ms, Some(EPOCH_MS));
+    rig.service.resume(job_id).await.unwrap();
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.intent, TorrentIntent::Resumed);
+    assert_eq!(stored.completed_at_ms, Some(EPOCH_MS));
 }
 
 // libtorrent `torrent::set_upload_limit` / `set_download_limit` throttle the

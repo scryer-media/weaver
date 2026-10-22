@@ -92,7 +92,6 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::Text(torrent.name.clone()),
         SqlArg::Text(torrent.source.as_str().to_string()),
         SqlArg::OptBytes(torrent.metainfo.as_deref().map(<[u8]>::to_vec)),
-        SqlArg::Bool(torrent.private),
         SqlArg::OptI64(torrent.category_id.map(i64::from)),
         SqlArg::I64(torrent.added_at_ms),
         SqlArg::Text(torrent.intent.as_str().to_string()),
@@ -100,7 +99,6 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptI64(torrent.completed_at_ms),
         SqlArg::OptText(torrent.storage_dir.clone()),
         SqlArg::OptText(policy_override),
-        SqlArg::OptI64(torrent.tracker_rule_id.map(i64::from)),
         SqlArg::OptBool(torrent.unpack),
         SqlArg::OptText(metadata),
         SqlArg::OptI64(torrent.upload_limit.map(stored).transpose()?),
@@ -125,7 +123,6 @@ impl Database {
             ));
         }
         let job_id = torrent.job_id;
-        let added_at_ms = torrent.added_at_ms;
         let torrent_args = torrent_args(torrent)?;
         let id = stored(job_id.0)?;
         let trackers = trackers.to_vec();
@@ -149,8 +146,8 @@ impl Database {
                     .await?;
                     insert_trackers(tx, id, &trackers).await?;
                     tx.execute(
-                        "INSERT INTO torrent_counters (job_id, updated_at_ms) VALUES ({}, {})",
-                        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(added_at_ms)],
+                        "INSERT INTO torrent_counters (job_id) VALUES ({})",
+                        &[SqlArg::I64(job_id.0 as i64)],
                     )
                     .await?;
                     Ok(TorrentInsert::Inserted)
@@ -160,61 +157,91 @@ impl Database {
         })
     }
 
-    // What the operator asked of the torrent, and when it completed.
-    // Returns whether the torrent exists.
+    // What the operator asked of the torrent, and no other column: its
+    // completion is written apart, so a pause racing a completion keeps
+    // both. Returns whether the torrent exists.
     pub fn update_torrent_intent(
         &self,
         job_id: JobId,
         intent: TorrentIntent,
-        completed_at_ms: Option<i64>,
     ) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE torrents SET state = {}, completed_at_ms = {} WHERE job_id = {}",
-                &[
-                    SqlArg::Text(intent.as_str().to_string()),
-                    SqlArg::OptI64(completed_at_ms),
-                    SqlArg::I64(stored(job_id.0)?),
-                ],
-            )
-            .await?;
-            Ok(changed > 0)
-        })
+        let args = vec![
+            SqlArg::Text(intent.as_str().to_string()),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("state", args)
     }
 
-    // Returns whether the torrent exists.
+    // When the torrent completed. Returns whether the torrent exists.
+    pub fn set_torrent_completed(&self, job_id: JobId, at_ms: i64) -> Result<bool, StateError> {
+        let args = vec![SqlArg::I64(at_ms), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("completed_at_ms", args)
+    }
+
+    // The torrent's ledger. Returns whether the torrent exists.
     pub fn update_torrent_counters(
         &self,
         job_id: JobId,
         counters: &TorrentCounters,
     ) -> Result<bool, StateError> {
-        let args = vec![
-            SqlArg::I64(stored(counters.uploaded_bytes)?),
-            SqlArg::I64(stored(counters.downloaded_bytes)?),
-            SqlArg::I64(stored(counters.checked_bytes)?),
-            SqlArg::I64(stored(counters.active_duration_s)?),
-            SqlArg::OptI64(counters.last_seen_complete_ms),
-            SqlArg::I64(stored(counters.finished_duration_s)?),
-            SqlArg::OptI64(counters.last_activity_ms),
-            SqlArg::I64(stored(counters.last_announce_uploaded_bytes)?),
-            SqlArg::I64(counters.updated_at_ms),
-            SqlArg::I64(stored(job_id.0)?),
-        ];
+        self.save_torrent_resume(job_id, Some(counters), None)
+    }
+
+    // The peers and bans a torrent begins its next start with. Returns
+    // whether the torrent exists.
+    pub fn save_torrent_peers(
+        &self,
+        job_id: JobId,
+        peers: &ResumePeers,
+    ) -> Result<bool, StateError> {
+        self.save_torrent_resume(job_id, None, Some(peers))
+    }
+
+    // The row a torrent's next start reads as it ran: its ledger, and the
+    // peers and bans it begins with, each written only when given, in one
+    // statement. The row is apart from the one that holds the metainfo, so
+    // writing it as the torrent runs never writes the metainfo again.
+    // Returns whether the torrent exists.
+    pub fn save_torrent_resume(
+        &self,
+        job_id: JobId,
+        counters: Option<&TorrentCounters>,
+        peers: Option<&ResumePeers>,
+    ) -> Result<bool, StateError> {
+        let mut sets = Vec::new();
+        let mut args = Vec::new();
+        if let Some(counters) = counters {
+            sets.push(
+                "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
+                 last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}",
+            );
+            args.extend([
+                SqlArg::I64(stored(counters.uploaded_bytes)?),
+                SqlArg::I64(stored(counters.downloaded_bytes)?),
+                SqlArg::I64(stored(counters.active_duration_s)?),
+                SqlArg::OptI64(counters.last_seen_complete_ms),
+                SqlArg::I64(stored(counters.finished_duration_s)?),
+                SqlArg::OptI64(counters.last_activity_ms),
+            ]);
+        }
+        if let Some(peers) = peers {
+            sets.push("peers = {}, banned_peers = {}");
+            args.extend([
+                SqlArg::OptText(stored_list(&peers.peers)?),
+                SqlArg::OptText(stored_list(&peers.banned)?),
+            ]);
+        }
+        if sets.is_empty() {
+            return Ok(false);
+        }
+        args.push(SqlArg::I64(stored(job_id.0)?));
+        let sql = format!(
+            "UPDATE torrent_counters SET {} WHERE job_id = {{}}",
+            sets.join(", ")
+        );
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE torrent_counters
-                    SET uploaded_bytes = {}, downloaded_bytes = {}, checked_bytes = {},
-                        active_duration_s = {}, last_seen_complete_ms = {}, finished_duration_s = {},
-                        last_activity_ms = {}, last_announce_uploaded_bytes = {},
-                        updated_at_ms = {}
-                  WHERE job_id = {}",
-                &args,
-            )
-            .await?;
+            let changed = SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
             Ok(changed > 0)
         })
     }
@@ -243,13 +270,30 @@ impl Database {
         })
     }
 
-    // The torrent's category, forced flag and seeding override. Returns
-    // whether the torrent exists.
-    pub fn update_torrent_options(
+    // The torrent's category. Returns whether the torrent exists.
+    pub fn set_torrent_category(
         &self,
         job_id: JobId,
         category_id: Option<u32>,
-        forced: bool,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptI64(category_id.map(i64::from)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("category_id", args)
+    }
+
+    // Whether the torrent runs past the download queue. Returns whether the
+    // torrent exists.
+    pub fn set_torrent_forced(&self, job_id: JobId, forced: bool) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(forced), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("forced", args)
+    }
+
+    // The torrent's own seeding policy. Returns whether the torrent exists.
+    pub fn set_torrent_policy_override(
+        &self,
+        job_id: JobId,
         policy_override: Option<SeedingPolicy>,
     ) -> Result<bool, StateError> {
         let policy_override = policy_override
@@ -257,45 +301,10 @@ impl Database {
             .transpose()
             .map_err(|error| StateError::Database(error.to_string()))?;
         let args = vec![
-            SqlArg::OptI64(category_id.map(i64::from)),
-            SqlArg::Bool(forced),
             SqlArg::OptText(policy_override),
             SqlArg::I64(stored(job_id.0)?),
         ];
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE torrents SET category_id = {}, forced = {}, policy_override = {}
-                  WHERE job_id = {}",
-                &args,
-            )
-            .await?;
-            Ok(changed > 0)
-        })
-    }
-
-    // The tracker rule the torrent's trackers matched. Returns whether the
-    // torrent exists.
-    pub fn set_torrent_tracker_rule(
-        &self,
-        job_id: JobId,
-        rule_id: Option<u32>,
-    ) -> Result<bool, StateError> {
-        let args = vec![
-            SqlArg::OptI64(rule_id.map(i64::from)),
-            SqlArg::I64(stored(job_id.0)?),
-        ];
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE torrents SET tracker_rule_id = {} WHERE job_id = {}",
-                &args,
-            )
-            .await?;
-            Ok(changed > 0)
-        })
+        self.set_torrent_column("policy_override", args)
     }
 
     // The torrent's trackers, as edited (libtorrent `write_resume_data`
@@ -362,7 +371,6 @@ impl Database {
         infohash_v2: Option<[u8; 32]>,
         name: &str,
         metainfo: &[u8],
-        private: bool,
         storage_dir: &str,
         trackers: &[TrackerEntry],
     ) -> Result<bool, StateError> {
@@ -372,7 +380,6 @@ impl Database {
             SqlArg::OptBytes(infohash_v2.map(|hash| hash.to_vec())),
             SqlArg::Text(name.to_owned()),
             SqlArg::Bytes(metainfo.to_vec()),
-            SqlArg::Bool(private),
             SqlArg::Text(storage_dir.to_owned()),
             SqlArg::I64(id),
         ];
@@ -386,7 +393,7 @@ impl Database {
                     let changed = tx
                         .execute(
                             "UPDATE torrents SET infohash_v1 = {}, infohash_v2 = {}, name = {}, metainfo = {},
-                                     private = {}, storage_dir = {}
+                                     storage_dir = {}
                               WHERE job_id = {}",
                             &head,
                         )
@@ -496,30 +503,6 @@ impl Database {
         })
     }
 
-    // The peers and bans a torrent begins its next start with, written
-    // beside its checkpoint. Returns whether the torrent exists.
-    pub fn save_torrent_peers(
-        &self,
-        job_id: JobId,
-        peers: &ResumePeers,
-    ) -> Result<bool, StateError> {
-        let args = vec![
-            SqlArg::OptText(stored_list(&peers.peers)?),
-            SqlArg::OptText(stored_list(&peers.banned)?),
-            SqlArg::I64(stored(job_id.0)?),
-        ];
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE torrents SET peers = {}, banned_peers = {} WHERE job_id = {}",
-                &args,
-            )
-            .await?;
-            Ok(changed > 0)
-        })
-    }
-
     // The peers and bans a torrent last saved; none when it saved none or
     // is not a torrent.
     pub fn torrent_peers(&self, job_id: JobId) -> Result<ResumePeers, StateError> {
@@ -528,7 +511,7 @@ impl Database {
         let row = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT peers, banned_peers FROM torrents WHERE job_id = {}",
+                "SELECT peers, banned_peers FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(id)],
             )
             .await

@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -27,7 +28,6 @@ use crate::StateError;
 use crate::categories::CategoryConfig;
 use crate::categories::model::{completion_parent, resolve_category_config};
 use crate::jobs::JobId;
-use crate::jobs::graph_checkpoint::Delta;
 use crate::jobs::handle::{
     CancellationOrigin, HoldOrigin, HoldSet, JobInfo, QueueAction, QueueMoveTarget, QueueOwner,
     SchedulerHandle, TorrentRate,
@@ -122,20 +122,24 @@ impl TorrentSettings {
         }
     }
 
-    fn policy(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> Option<SeedingPolicy> {
+    fn policy(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> Option<SeedingPolicy> {
         resolve_seeding_policy(
             record.policy_override.as_ref(),
-            rule_of(record, rules).and_then(|rule| rule.seeding.as_ref()),
+            rule.and_then(|rule| rule.seeding.as_ref()),
             self.category_seeding(record),
             self.seeding.as_ref(),
         )
     }
 
     // The policy the torrent would have without its own override.
-    fn inherited(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> Option<SeedingPolicy> {
+    fn inherited(
+        &self,
+        record: &TorrentRecord,
+        rule: Option<&TrackerRule>,
+    ) -> Option<SeedingPolicy> {
         resolve_seeding_policy(
             None,
-            rule_of(record, rules).and_then(|rule| rule.seeding.as_ref()),
+            rule.and_then(|rule| rule.seeding.as_ref()),
             self.category_seeding(record),
             self.seeding.as_ref(),
         )
@@ -143,10 +147,10 @@ impl TorrentSettings {
 
     // Whether the torrent's archives are extracted: its own value, else its
     // tracker rule's, else its category's, else the global default.
-    fn unpack(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> bool {
+    fn unpack(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> bool {
         record
             .unpack
-            .or_else(|| rule_of(record, rules).and_then(|rule| rule.unpack))
+            .or_else(|| rule.and_then(|rule| rule.unpack))
             .or_else(|| {
                 self.category(record.category_id)
                     .and_then(|category| category.unpack)
@@ -160,8 +164,8 @@ impl TorrentSettings {
     }
 
     // The most specific level that sets a policy.
-    fn seeding_source(&self, record: &TorrentRecord, rules: &[TrackerRule]) -> SeedingSource {
-        let rule = rule_of(record, rules).filter(|rule| rule.seeding.is_some());
+    fn seeding_source(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> SeedingSource {
+        let rule = rule.filter(|rule| rule.seeding.is_some());
         if record.policy_override.is_some() {
             SeedingSource::Torrent
         } else if let Some(rule) = rule {
@@ -174,17 +178,16 @@ impl TorrentSettings {
     }
 }
 
-// The tracker rule `record` matched, while it stands.
-fn rule_of<'r>(record: &TorrentRecord, rules: &'r [TrackerRule]) -> Option<&'r TrackerRule> {
-    let id = record.tracker_rule_id?;
+// The tracker rule of id `id`, while it stands.
+fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
+    let id = id?;
     rules.iter().find(|rule| rule.id == id)
 }
 
-// How `record` names itself to peers and trackers: as the client its tracker
-// rule names, else Weaver, under a fresh peer id.
-fn identity_of(record: &TorrentRecord, rules: &[TrackerRule]) -> Identity {
-    rule_of(record, rules)
-        .and_then(|rule| rule.client)
+// How a torrent under `rule` names itself to peers and trackers: as the
+// client its tracker rule names, else Weaver, under a fresh peer id.
+fn identity_of(rule: Option<&TrackerRule>) -> Identity {
+    rule.and_then(|rule| rule.client)
         .unwrap_or(Client::Weaver)
         .name()
         .identity()
@@ -680,6 +683,17 @@ struct Attached {
 // What the service keeps of each torrent while it lives.
 struct Live {
     record: TorrentRecord,
+    // The tracker rule its trackers match, picked again whenever they or
+    // the rules change: the trackers are what is kept, not the rule.
+    rule_id: Option<u32>,
+    // Whether its metainfo marks it private; read from the metainfo, never
+    // kept apart from it.
+    private: bool,
+    // The peers and bans its next start begins with: the one place a ban
+    // made here lives until it is written.
+    resume: ResumePeers,
+    // What the database holds of its ledger and peers.
+    ledger: Ledger,
     names: Vec<String>,
     total: u64,
     layout: Option<Arc<PieceLayout>>,
@@ -718,11 +732,11 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
     let complete = torrent.complete();
     // A torrent under a never-pause rule still owes its tracker while it
     // downloads, and while it seeds with a goal left.
-    let runs_through_schedule = rule_of(&torrent.record, rules)
-        .is_some_and(|rule| rule.never_pause)
+    let rule = torrent.rule(rules);
+    let runs_through_schedule = rule.is_some_and(|rule| rule.never_pause)
         && (!complete
             || status::goal_left(
-                settings.policy(&torrent.record, rules).as_ref(),
+                settings.policy(&torrent.record, rule).as_ref(),
                 &torrent.counters,
                 torrent.total,
                 now,
@@ -753,9 +767,29 @@ impl Live {
             .collect()
     }
 
-    fn new(record: TorrentRecord, counters: TorrentCounters) -> Self {
+    // The tracker rule it is under, while that rule stands.
+    fn rule<'r>(&self, rules: &'r [TrackerRule]) -> Option<&'r TrackerRule> {
+        rule_of(self.rule_id, rules)
+    }
+
+    // A torrent whose ledger and peers the database holds as given, as of
+    // `now`.
+    fn new(
+        record: TorrentRecord,
+        counters: TorrentCounters,
+        resume: ResumePeers,
+        now: i64,
+    ) -> Self {
         Self {
             record,
+            rule_id: None,
+            private: false,
+            ledger: Ledger {
+                written: Some((counters, resume.clone())),
+                at_ms: now,
+                lost: Arc::default(),
+            },
+            resume,
             names: Vec::new(),
             total: 0,
             layout: None,
@@ -781,6 +815,50 @@ impl Live {
 
     fn complete(&self) -> bool {
         self.record.completed_at_ms.is_some()
+    }
+
+    // Fold what the session moved since the last reading into the ledger,
+    // as it leaves the session or is written at once.
+    fn settle(&mut self, now: i64) {
+        let reading = self.reading(now);
+        self.file_have = reading.file_have;
+        self.counters = reading.counters;
+        self.seen = reading.seen;
+    }
+
+    // What of the ledger and peers the database does not hold yet, taken
+    // as written: none before a minute has passed since the last write
+    // unless `at_once`, and none when nothing changed. The peers are the
+    // session's while it runs the torrent; one stopped by an error keeps
+    // those last taken.
+    fn take_resume(&mut self, now: i64, at_once: bool) -> Option<Resume> {
+        if !at_once && now - self.ledger.at_ms < LEDGER_EVERY_MS {
+            return None;
+        }
+        if let Some(peers) = self
+            .attached
+            .as_ref()
+            .and_then(|attached| attached.handle.resume_peers())
+        {
+            self.resume = peers;
+        }
+        if self.ledger.lost.swap(false, Ordering::AcqRel) {
+            self.ledger.written = None;
+        }
+        let (counters, peers) = match &self.ledger.written {
+            Some((counters, peers)) => (
+                (*counters != self.counters).then_some(self.counters),
+                (!same_peers(peers, &self.resume)).then(|| self.resume.clone()),
+            ),
+            None => (Some(self.counters), Some(self.resume.clone())),
+        };
+        self.ledger.written = Some((self.counters, self.resume.clone()));
+        self.ledger.at_ms = now;
+        (counters.is_some() || peers.is_some()).then(|| Resume {
+            counters,
+            peers,
+            lost: Arc::clone(&self.ledger.lost),
+        })
     }
 
     fn resumed(&self) -> bool {
@@ -866,7 +944,6 @@ impl Live {
         let mut counters = self.counters;
         counters.uploaded_bytes += up;
         counters.downloaded_bytes += down;
-        counters.checked_bytes += delta(seen.checked, self.seen.checked);
         if up + down > 0 {
             counters.last_activity_ms = Some(now);
         }
@@ -933,6 +1010,48 @@ struct Seen {
     uploaded: u64,
     fetched: u64,
     checked: u64,
+}
+
+impl Seen {
+    // Fetched bytes whose pieces did not verify, this run.
+    fn wasted(&self) -> u64 {
+        self.fetched.saturating_sub(self.checked)
+    }
+}
+
+// What the database holds of a torrent's ledger and peers, and when it was
+// last written.
+struct Ledger {
+    // `None` while what it holds is not known: the next write is all of it.
+    written: Option<(TorrentCounters, ResumePeers)>,
+    at_ms: i64,
+    // Set by a write that failed, so the next one writes all of it.
+    lost: Arc<AtomicBool>,
+}
+
+// A write of what changed in a torrent's ledger and peers.
+struct Resume {
+    counters: Option<TorrentCounters>,
+    peers: Option<ResumePeers>,
+    lost: Arc<AtomicBool>,
+}
+
+// A write of a torrent's ledger and peers, queued.
+struct Landing {
+    job_id: JobId,
+    landed: oneshot::Receiver<Result<bool, StateError>>,
+    lost: Arc<AtomicBool>,
+}
+
+// The same peers and bans, in whatever order: the session lists the peers
+// it never reached in no fixed order.
+fn same_peers(a: &ResumePeers, b: &ResumePeers) -> bool {
+    fn sorted<T: Ord + Copy>(items: &[T]) -> Vec<T> {
+        let mut items = items.to_vec();
+        items.sort_unstable();
+        items
+    }
+    sorted(&a.peers) == sorted(&b.peers) && sorted(&a.banned) == sorted(&b.banned)
 }
 
 // What the job side asks the service to look at: the jobs that changed,
@@ -1101,14 +1220,7 @@ impl TorrentService {
                     .db
                     .list_torrent_trackers(job_id)
                     .map_err(state_error)?;
-                let rule_id = self.rule_id(&trackers);
-                if rule_id != torrent.record.tracker_rule_id {
-                    self.inner
-                        .db
-                        .set_torrent_tracker_rule(job_id, rule_id)
-                        .map_err(state_error)?;
-                    torrent.record.tracker_rule_id = rule_id;
-                }
+                torrent.rule_id = self.rule_id(&trackers);
             }
         }
         self.apply_queue().await;
@@ -1137,7 +1249,7 @@ impl TorrentService {
         for torrent in self.inner.live.lock().await.values() {
             if torrent.resumed()
                 && holds.spares(queued(&settings, &rules, torrent, now).target())
-                && let Some(id) = torrent.record.tracker_rule_id
+                && let Some(id) = torrent.rule_id
             {
                 *counts.entry(id).or_default() += 1;
             }
@@ -1250,19 +1362,13 @@ impl TorrentService {
             task.abort();
         }
         self.stop_tick();
-        let attached: Vec<(JobId, Arc<ManagedTorrent>)> = self
-            .inner
-            .live
-            .lock()
-            .await
-            .iter()
-            .filter_map(|(job_id, torrent)| {
-                Some((*job_id, torrent.attached.as_ref()?.handle.clone()))
-            })
-            .collect();
-        for (job_id, handle) in attached {
-            self.save_peers(job_id, &handle).await;
-        }
+        // The last reading of every torrent, and what of its ledger and
+        // peers changed since the last write, before the sessions close
+        // (qBittorrent saves only what changed as it exits, libtorrent
+        // `torrent::write_resume_data` reads the peers off the torrent).
+        let now = self.inner.clock.now_ms();
+        let elapsed_s = self.elapsed_s(now);
+        self.read(now, elapsed_s, true).await;
         self.inner.sessions.stop_all().await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -1399,50 +1505,68 @@ impl TorrentService {
         self.publish().await;
     }
 
-    // Write the checkpoints of `jobs`, and beside each the peers and bans of
-    // its torrent while it is in a session.
+    // Write the checkpoints of `jobs`.
     async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
-        type Saved = (JobId, Arc<TorrentJob>, Option<Arc<ManagedTorrent>>);
-        let jobs: Vec<Saved> = {
+        let jobs: Vec<(JobId, Arc<TorrentJob>)> = {
             let live = self.inner.live.lock().await;
             jobs.into_iter()
-                .filter_map(|job_id| {
-                    let torrent = live.get(&job_id)?;
-                    let handle = torrent.attached.as_ref().map(|a| a.handle.clone());
-                    Some((job_id, torrent.job.clone()?, handle))
-                })
+                .filter_map(|job_id| Some((job_id, live.get(&job_id)?.job.clone()?)))
                 .collect()
         };
-        for (job_id, job, handle) in jobs {
+        for (job_id, job) in jobs {
             self.save_checkpoint(job_id, &job).await;
-            if let Some(handle) = handle {
-                self.save_peers(job_id, &handle).await;
-            }
         }
     }
 
-    // Write the peers and bans the torrent begins its next start with
-    // (libtorrent `torrent::write_resume_data`). A torrent stopped by an
-    // error keeps those last written.
-    async fn save_peers(&self, job_id: JobId, handle: &ManagedTorrent) {
-        let Some(peers) = handle.resume_peers() else {
-            return;
-        };
-        if let Err(error) = self.write_peers(job_id, peers).await {
-            tracing::warn!(job_id = job_id.0, %error, "could not save a torrent's peers");
-        }
-    }
-
-    // The one writer of a torrent's saved peers and bans.
-    async fn write_peers(&self, job_id: JobId, peers: ResumePeers) -> Result<(), String> {
-        let landed = self.queue_save(job_id, "torrent_peers", move |db| {
-            db.save_torrent_peers(job_id, &peers)
+    // Queue a write of what changed in the torrent's ledger and peers
+    // (libtorrent `torrent::write_resume_data`), in the step that takes it.
+    // The one writer of both: every ban, every peer list and every ledger
+    // goes through here under the torrent's lock.
+    fn queue_resume(&self, torrent: &mut Live, now: i64, at_once: bool) -> Option<Landing> {
+        let Resume {
+            counters,
+            peers,
+            lost,
+        } = torrent.take_resume(now, at_once)?;
+        let job_id = torrent.record.job_id;
+        let landed = self.queue_save(job_id, "torrent_resume", move |db| {
+            db.save_torrent_resume(job_id, counters.as_ref(), peers.as_ref())
         });
-        match landed.await {
+        Some(Landing {
+            job_id,
+            landed,
+            lost,
+        })
+    }
+
+    // Wait for a write of a torrent's ledger and peers to land. One that
+    // failed leaves what the database holds unknown, so the next writes
+    // all of it.
+    async fn landed(&self, landing: Option<Landing>) -> Result<(), String> {
+        let Some(Landing {
+            job_id,
+            landed,
+            lost,
+        }) = landing
+        else {
+            return Ok(());
+        };
+        let result = match landed.await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(error)) => Err(state_error(error)),
             Err(error) => Err(error.to_string()),
+        };
+        match &result {
+            Ok(()) => self
+                .inner
+                .written
+                .send_modify(|written| written.ledgers += 1),
+            Err(error) => {
+                lost.store(true, Ordering::Release);
+                tracing::warn!(job_id = job_id.0, %error, "could not keep a torrent's ledger and peers");
+            }
         }
+        result
     }
 
     // Queue a save of a torrent's state on its job's lane of the database's
@@ -1468,21 +1592,34 @@ impl TorrentService {
         receiver
     }
 
+    // Write what the job's checkpoint changed since the database last held
+    // it: the rows that differ, as the pipeline writes its jobs'.
     async fn save_checkpoint(&self, job_id: JobId, job: &TorrentJob) {
-        let snapshot = job.with(|job| job.snapshot());
-        // A torrent job's checkpoint is written whole: its rows change little
-        // and seldom.
-        let rows = Arc::new(Delta::between(None, &checkpoint::rows(&snapshot)));
-        let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
-            db.save_graph_checkpoint(job_id, rows)
+        let pending = job.with(|job| {
+            let pending = job.pending().clone();
+            pending.put(job).then_some(pending)
         });
-        match landed.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
-            }
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
+        if let Some(pending) = pending {
+            let writer = pending.clone();
+            let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
+                let Some(delta) = writer.take() else {
+                    return Ok(());
+                };
+                let written = db.save_graph_checkpoint(job_id, Arc::new(delta));
+                if written.is_err() {
+                    writer.forget();
+                }
+                written
+            });
+            match landed.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
+                }
+                Err(error) => {
+                    pending.forget();
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
+                }
             }
         }
         self.inner
@@ -1490,21 +1627,26 @@ impl TorrentService {
             .send_modify(|written| written.checkpoints += 1);
     }
 
+    // The job is done: its completion is written on its own, so an intent
+    // written beside it keeps it, and the ledger and peers as they stand.
     async fn completed(&self, job_id: JobId) {
         let now = self.inner.clock.now_ms();
-        let mut live = self.inner.live.lock().await;
-        let Some(torrent) = live.get_mut(&job_id) else {
-            return;
+        let landing = {
+            let mut live = self.inner.live.lock().await;
+            let Some(torrent) = live.get_mut(&job_id) else {
+                return;
+            };
+            if torrent.complete() {
+                return;
+            }
+            torrent.record.completed_at_ms = Some(now);
+            if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
+            }
+            torrent.settle(now);
+            self.queue_resume(torrent, now, true)
         };
-        if torrent.complete() {
-            return;
-        }
-        torrent.record.completed_at_ms = Some(now);
-        let (intent, at) = (torrent.record.intent, torrent.record.completed_at_ms);
-        drop(live);
-        if let Err(error) = self.inner.db.update_torrent_intent(job_id, intent, at) {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
-        }
+        let _ = self.landed(landing).await;
     }
 
     fn storage(&self, dir: PathBuf, layout: &PieceLayout, unpack: bool) -> Storage {
@@ -1547,16 +1689,20 @@ impl TorrentService {
             .load_graph_checkpoint(job_id)
             .ok()
             .flatten()
-            .and_then(|rows| checkpoint::snapshot(&rows).ok())
-            .and_then(|snapshot| {
-                GraphJob::restore_torrent(
+            .and_then(|rows| {
+                let snapshot = checkpoint::snapshot(&rows).ok()?;
+                let restored = GraphJob::restore_torrent(
                     &snapshot,
                     Arc::clone(layout),
                     job_id.0,
                     self.storage(dir.clone(), layout, unpack),
                     slots,
                 )
-                .ok()
+                .ok()?;
+                // The database holds these rows: the next checkpoint writes
+                // only what changes from them.
+                restored.job.pending().written(rows);
+                Some(restored)
             });
         let job = match restored {
             Some(restored) => restored.job,
@@ -1605,7 +1751,9 @@ impl TorrentService {
     // here and kept, so a restart builds the same tree.
     fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) {
         let job_id = torrent.record.job_id;
-        let unpack = self.settings().unpack(&torrent.record, &self.rules());
+        let unpack = self
+            .settings()
+            .unpack(&torrent.record, torrent.rule(&self.rules()));
         if torrent.record.unpack.is_none() {
             if let Err(error) = self.inner.db.set_torrent_unpack(job_id, unpack) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
@@ -1634,6 +1782,7 @@ impl TorrentService {
         torrent.job = Some(job);
         torrent.intake = Some(intake);
         torrent.about = parsed.about.clone();
+        torrent.private = parsed.private;
     }
 
     // Add a torrent. A metainfo becomes a job at once; a magnet needs its
@@ -1674,7 +1823,7 @@ impl TorrentService {
                 let dir = self
                     .claim_dir(&settings, category.as_ref(), &parsed.manifest, job_id)
                     .await?;
-                let mut record = self.record(
+                let record = self.record(
                     job_id,
                     &request,
                     category.as_ref(),
@@ -1682,14 +1831,15 @@ impl TorrentService {
                     parsed.manifest.name.clone(),
                     TorrentSource::Metainfo,
                     Some(bytes),
-                    parsed.private,
                     Some(dir.clone()),
                 );
-                if let Err(error) = self.insert(&mut record, &parsed.trackers) {
-                    give_back(&dir).await;
-                    return Err(error);
-                }
-                let mut torrent = Live::new(record, TorrentCounters::default());
+                let mut torrent = match self.insert(record, &parsed.trackers) {
+                    Ok(torrent) => torrent,
+                    Err(error) => {
+                        give_back(&dir).await;
+                        return Err(error);
+                    }
+                };
                 self.give_metainfo(&mut torrent, &parsed);
                 self.inner.live.lock().await.insert(job_id, torrent);
                 self.apply_queue().await;
@@ -1734,7 +1884,7 @@ impl TorrentService {
                     .name
                     .clone()
                     .unwrap_or_else(|| hashes.best().as_string());
-                let mut record = self.record(
+                let record = self.record(
                     job_id,
                     &request,
                     category.as_ref(),
@@ -1742,12 +1892,10 @@ impl TorrentService {
                     name,
                     TorrentSource::Magnet,
                     None,
-                    false,
                     None,
                 );
-                self.insert(&mut record, &trackers)?;
-                let identity = identity_of(&record, &rules);
-                let mut torrent = Live::new(record, TorrentCounters::default());
+                let mut torrent = self.insert(record, &trackers)?;
+                let identity = identity_of(torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
                 self.spawn_resolve(job_id, session, uri, None, identity);
@@ -1819,7 +1967,6 @@ impl TorrentService {
         name: String,
         source: TorrentSource,
         metainfo: Option<Bytes>,
-        private: bool,
         storage_dir: Option<String>,
     ) -> TorrentRecord {
         TorrentRecord {
@@ -1829,7 +1976,6 @@ impl TorrentService {
             name,
             source,
             metainfo,
-            private,
             category_id: category.map(|category| category.id),
             added_at_ms: self.inner.clock.now_ms(),
             intent: if request.paused {
@@ -1841,7 +1987,6 @@ impl TorrentService {
             completed_at_ms: None,
             storage_dir,
             policy_override: request.policy_override.clone(),
-            tracker_rule_id: None,
             unpack: request.unpack,
             metadata: request.metadata.clone(),
             upload_limit: None,
@@ -1851,15 +1996,21 @@ impl TorrentService {
         }
     }
 
-    // Keep `record` with the rule its trackers match.
-    fn insert(
-        &self,
-        record: &mut TorrentRecord,
-        trackers: &[TrackerEntry],
-    ) -> Result<(), AddError> {
-        record.tracker_rule_id = self.rule_id(trackers);
-        match self.inner.db.insert_torrent(record, trackers) {
-            Ok(TorrentInsert::Inserted) => Ok(()),
+    // Keep `record` with its trackers: a torrent new to the database, under
+    // the rule its trackers match.
+    fn insert(&self, record: TorrentRecord, trackers: &[TrackerEntry]) -> Result<Live, AddError> {
+        match self.inner.db.insert_torrent(&record, trackers) {
+            Ok(TorrentInsert::Inserted) => {
+                let now = self.inner.clock.now_ms();
+                let mut torrent = Live::new(
+                    record,
+                    TorrentCounters::default(),
+                    ResumePeers::default(),
+                    now,
+                );
+                torrent.rule_id = self.rule_id(trackers);
+                Ok(torrent)
+            }
             Ok(TorrentInsert::Duplicate(existing)) => Err(AddError::Duplicate(existing)),
             Err(error) => Err(AddError::State(state_error(error))),
         }
@@ -1939,7 +2090,6 @@ impl TorrentService {
         torrent.record.infohash_v1 = parsed.hashes.v1.map(|hash| hash.0);
         torrent.record.infohash_v2 = parsed.hashes.v2.map(|hash| hash.0);
         torrent.record.name = parsed.manifest.name.clone();
-        torrent.record.private = parsed.private;
         torrent.record.storage_dir = Some(dir.clone());
         torrent.record.metainfo = Some(bytes.clone());
         // libtorrent `torrent::set_metadata` keeps the trackers the magnet
@@ -1951,12 +2101,7 @@ impl TorrentService {
             .map_err(|error| AddError::State(state_error(error)))?;
         trackers.extend(parsed.trackers.iter().cloned());
         let trackers = tidy_trackers(trackers);
-        let rule_id = self.rule_id(&trackers);
-        self.inner
-            .db
-            .set_torrent_tracker_rule(job_id, rule_id)
-            .map_err(|error| AddError::State(state_error(error)))?;
-        torrent.record.tracker_rule_id = rule_id;
+        torrent.rule_id = self.rule_id(&trackers);
         self.inner
             .db
             .set_torrent_metainfo(
@@ -1965,7 +2110,6 @@ impl TorrentService {
                 torrent.record.infohash_v2,
                 &parsed.manifest.name,
                 &bytes,
-                parsed.private,
                 &dir,
                 &trackers,
             )
@@ -1979,20 +2123,18 @@ impl TorrentService {
     // Fetch a stored magnet's metainfo again, on its route's session once
     // the route is up.
     async fn resolve(&self, job_id: JobId) {
-        let Some(record) = self
+        let rules = self.rules();
+        let Some((record, rule)) = self
             .inner
             .live
             .lock()
             .await
             .get(&job_id)
-            .map(|torrent| torrent.record.clone())
+            .map(|torrent| (torrent.record.clone(), torrent.rule(&rules)))
         else {
             return;
         };
-        let rules = self.rules();
-        let scope = self
-            .settings()
-            .scope(record.category_id, rule_of(&record, &rules));
+        let scope = self.settings().scope(record.category_id, rule);
         let plan = match self.inner.sessions.routes().plan(scope) {
             Ok(plan) => plan,
             Err(reason) => return self.held(job_id, None, Held::RouteDown(reason)).await,
@@ -2014,8 +2156,7 @@ impl TorrentService {
             .into_iter()
             .map(|tracker| tracker.url)
             .collect();
-        let identity = identity_of(&record, &rules);
-        self.spawn_resolve(job_id, session, uri, Some(trackers), identity);
+        self.spawn_resolve(job_id, session, uri, Some(trackers), identity_of(rule));
     }
 
     // Put a torrent in its route's session, or hold it while the route is
@@ -2024,7 +2165,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
-        let (scope, bytes, layout, intake, dir, paused, ratelimits, have, identity, picking) = {
+        let (scope, bytes, layout, intake, dir, paused, ratelimits, have, identity, picking, saved) = {
             let live = self.inner.live.lock().await;
             let Some(torrent) = live.get(&job_id) else {
                 return;
@@ -2040,10 +2181,10 @@ impl TorrentService {
             ) else {
                 return;
             };
-            let ratelimits =
-                ratelimits_of(&torrent.record, settings.policy(&torrent.record, &rules));
+            let rule = torrent.rule(&rules);
+            let ratelimits = ratelimits_of(&torrent.record, settings.policy(&torrent.record, rule));
             (
-                settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules)),
+                settings.scope(torrent.record.category_id, rule),
                 bytes,
                 layout,
                 intake,
@@ -2056,12 +2197,15 @@ impl TorrentService {
                         .is_some(),
                 ratelimits,
                 job.with(|job| initial_have(job)),
-                identity_of(&torrent.record, &rules),
+                identity_of(rule),
                 (
                     fetch_levels(torrent, job),
                     torrent.record.sequential,
                     torrent.record.first_last_piece_first,
                 ),
+                // libtorrent `torrent::read_resume_data`: the saved peers
+                // are known from the start and the saved bans hold.
+                torrent.resume.clone(),
             )
         };
         let plan = match self.inner.sessions.routes().plan(scope) {
@@ -2078,12 +2222,6 @@ impl TorrentService {
                 return;
             }
         };
-        // libtorrent `torrent::read_resume_data`: the saved peers are known
-        // from the start and the saved bans hold.
-        let saved = self.inner.db.torrent_peers(job_id).unwrap_or_else(|error| {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
-            Default::default()
-        });
         // libtorrent `torrent::read_resume_data`: the trackers the torrent
         // lists now stand in for its metainfo's.
         let trackers = match self.inner.db.list_torrent_trackers(job_id) {
@@ -2106,8 +2244,8 @@ impl TorrentService {
             ratelimits,
             identity: Some(identity),
             tracker_tiers: Some(trackers),
-            initial_peers: (!saved.peers.is_empty()).then_some(saved.peers),
-            banned_peers: saved.banned,
+            initial_peers: (!saved.peers.is_empty()).then(|| saved.peers.clone()),
+            banned_peers: saved.banned.clone(),
             file_priorities: Some(picking.0),
             sequential: picking.1,
             first_last_piece_first: picking.2,
@@ -2132,6 +2270,18 @@ impl TorrentService {
         let mut live = self.inner.live.lock().await;
         match live.get_mut(&job_id) {
             Some(torrent) => {
+                // A ban made while the session took the torrent holds in
+                // it too.
+                let since: Vec<IpAddr> = torrent
+                    .resume
+                    .banned
+                    .iter()
+                    .filter(|ip| !saved.banned.contains(ip))
+                    .copied()
+                    .collect();
+                if !since.is_empty() {
+                    handle.ban_peers(&since);
+                }
                 torrent.attached = Some(Attached { session, handle });
                 torrent.route = Some(plan.key);
                 torrent.held = None;
@@ -2158,7 +2308,8 @@ impl TorrentService {
     }
 
     // Take a torrent out of its session, its checkpoint written first when
-    // it is behind the job.
+    // it is behind the job, and what changed in its ledger and peers taken
+    // before the session lets it go.
     async fn detach(&self, torrent: &mut Live) {
         let job_id = torrent.record.job_id;
         if let Some(job) = &torrent.job
@@ -2166,13 +2317,22 @@ impl TorrentService {
         {
             self.save_checkpoint(job_id, job).await;
         }
+        let now = self.inner.clock.now_ms();
+        let landing = torrent
+            .attached
+            .is_some()
+            .then(|| {
+                torrent.settle(now);
+                self.queue_resume(torrent, now, true)
+            })
+            .flatten();
         if let Some(attached) = torrent.attached.take() {
-            self.save_peers(job_id, &attached.handle).await;
             let id = TorrentIdOrHash::Id(attached.handle.id());
             if let Err(error) = attached.session.delete(id, false).await {
                 tracing::debug!(error = %error, "a torrent was already gone from its session");
             }
         }
+        let _ = self.landed(landing).await;
         torrent.engine = Engine::Absent;
         torrent.run_error = None;
     }
@@ -2199,22 +2359,20 @@ impl TorrentService {
         }
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let (report, hash) = {
+        let (report, hash, landing) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
             };
-            torrent.record.intent = TorrentIntent::Stopped;
-            if let Err(error) = self.save_intent(&torrent.record) {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's stop");
-            }
+            let landing = self.stop_torrent(torrent, now);
             let report = report(
                 self.view(&settings, torrent, now),
                 JobStatus::Failed { error },
                 now,
             );
-            (report, hashes_of(&torrent.record).best())
+            (report, hashes_of(&torrent.record).best(), landing)
         };
+        let _ = self.landed(landing).await;
         self.apply_queue().await;
         self.finish(report, "failed", hash, now).await;
     }
@@ -2270,8 +2428,8 @@ impl TorrentService {
         let now = self.inner.clock.now_ms();
         let mut live = self.inner.live.lock().await;
         let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
-        if torrent.record.private && !confirm_unmet_goal {
-            let policy = settings.policy(&torrent.record, &self.rules());
+        if torrent.private && !confirm_unmet_goal {
+            let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
             if let Some(left) =
                 status::goal_left(policy.as_ref(), &torrent.counters, torrent.total, now)
             {
@@ -2310,25 +2468,39 @@ impl TorrentService {
         change(torrent)
     }
 
-    fn save_options(&self, record: &TorrentRecord) -> Result<(), ActionError> {
-        self.inner
-            .db
-            .update_torrent_options(
-                record.job_id,
-                record.category_id,
-                record.forced,
-                record.policy_override.clone(),
-            )
-            .map(|_| ())
-            .map_err(|error| ActionError::State(state_error(error)))
+    // What the operator asks of the torrent, written under its lock with
+    // no other column, and the ledger and peers as they stand beside it.
+    async fn set_intent(&self, job_id: JobId, intent: TorrentIntent) -> Result<(), ActionError> {
+        let now = self.inner.clock.now_ms();
+        let landing = self
+            .with_torrent(job_id, |torrent| {
+                self.inner
+                    .db
+                    .update_torrent_intent(job_id, intent)
+                    .map_err(|error| ActionError::State(state_error(error)))?;
+                torrent.record.intent = intent;
+                torrent.settle(now);
+                Ok(self.queue_resume(torrent, now, true))
+            })
+            .await?;
+        let _ = self.landed(landing).await;
+        Ok(())
     }
 
-    fn save_intent(&self, record: &TorrentRecord) -> Result<(), ActionError> {
-        self.inner
+    // Stop the torrent for good, as its goal or a refusal does: its intent
+    // is written, and the ledger and peers as they stand, queued.
+    fn stop_torrent(&self, torrent: &mut Live, now: i64) -> Option<Landing> {
+        let job_id = torrent.record.job_id;
+        torrent.record.intent = TorrentIntent::Stopped;
+        if let Err(error) = self
+            .inner
             .db
-            .update_torrent_intent(record.job_id, record.intent, record.completed_at_ms)
-            .map(|_| ())
-            .map_err(|error| ActionError::State(state_error(error)))
+            .update_torrent_intent(job_id, torrent.record.intent)
+        {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's stop");
+        }
+        torrent.settle(now);
+        self.queue_resume(torrent, now, true)
     }
 
     // The torrent's place in its session, while it has one.
@@ -2354,27 +2526,23 @@ impl TorrentService {
     /// The bans are written with the peers and bans the torrent's next
     /// start begins with, so they outlive a restart.
     pub async fn ban_peers(&self, job_id: JobId, ips: &[IpAddr]) -> Result<(), ActionError> {
-        let held = self
-            .handle_of(job_id)
-            .await?
-            .and_then(|handle| handle.ban_peers(ips));
-        let peers = match held {
-            Some(peers) => peers,
-            // In no session, or stopped by an error: the bans join the list
-            // it saved, which its next start begins with.
-            None => {
-                let db = self.inner.db.clone();
-                let mut saved = tokio::task::spawn_blocking(move || db.torrent_peers(job_id))
-                    .await
-                    .map_err(|error| ActionError::State(error.to_string()))?
-                    .map_err(|error| ActionError::State(state_error(error)))?;
-                ips.iter().for_each(|ip| saved.ban(*ip));
-                saved
-            }
-        };
-        self.write_peers(job_id, peers)
-            .await
-            .map_err(ActionError::State)
+        let now = self.inner.clock.now_ms();
+        let landing = self
+            .with_torrent(job_id, |torrent| {
+                match torrent
+                    .attached
+                    .as_ref()
+                    .and_then(|attached| attached.handle.ban_peers(ips))
+                {
+                    Some(peers) => torrent.resume = peers,
+                    // In no session, or stopped by an error: the bans join
+                    // the list its next start begins with.
+                    None => ips.iter().for_each(|ip| torrent.resume.ban(*ip)),
+                }
+                Ok(self.queue_resume(torrent, now, true))
+            })
+            .await?;
+        self.landed(landing).await.map_err(ActionError::State)
     }
 
     /// The torrent's trackers, each with how announcing to it went.
@@ -2455,7 +2623,7 @@ impl TorrentService {
             if !stored {
                 return Err(ActionError::NotFound(job_id));
             }
-            torrent.record.tracker_rule_id = self.rule_id(&trackers);
+            torrent.rule_id = self.rule_id(&trackers);
             if let Some(attached) = &torrent.attached {
                 attached.handle.replace_trackers(tracker_tiers(&trackers));
             }
@@ -2507,13 +2675,7 @@ impl TorrentService {
     }
 
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {
-        let record = self
-            .with_torrent(job_id, |torrent| {
-                torrent.record.intent = TorrentIntent::Paused;
-                Ok(torrent.record.clone())
-            })
-            .await?;
-        self.save_intent(&record)?;
+        self.set_intent(job_id, TorrentIntent::Paused).await?;
         self.apply_queue().await;
         self.publish().await;
         Ok(())
@@ -2521,26 +2683,22 @@ impl TorrentService {
 
     /// Resume a paused torrent, or one its seeding goal stopped.
     pub async fn resume(&self, job_id: JobId) -> Result<(), ActionError> {
-        let record = self
-            .with_torrent(job_id, |torrent| {
-                torrent.record.intent = TorrentIntent::Resumed;
-                Ok(torrent.record.clone())
-            })
-            .await?;
-        self.save_intent(&record)?;
+        self.set_intent(job_id, TorrentIntent::Resumed).await?;
         self.apply_queue().await;
         self.publish().await;
         Ok(())
     }
 
     pub async fn set_forced(&self, job_id: JobId, forced: bool) -> Result<(), ActionError> {
-        let record = self
-            .with_torrent(job_id, |torrent| {
-                torrent.record.forced = forced;
-                Ok(torrent.record.clone())
-            })
-            .await?;
-        self.save_options(&record)?;
+        self.with_torrent(job_id, |torrent| {
+            self.inner
+                .db
+                .set_torrent_forced(job_id, forced)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            torrent.record.forced = forced;
+            Ok(())
+        })
+        .await?;
         self.apply_queue().await;
         self.publish().await;
         Ok(())
@@ -2719,13 +2877,15 @@ impl TorrentService {
         job_id: JobId,
         policy: Option<SeedingPolicy>,
     ) -> Result<(), ActionError> {
-        let record = self
-            .with_torrent(job_id, |torrent| {
-                torrent.record.policy_override = policy;
-                Ok(torrent.record.clone())
-            })
-            .await?;
-        self.save_options(&record)?;
+        self.with_torrent(job_id, |torrent| {
+            self.inner
+                .db
+                .set_torrent_policy_override(job_id, policy)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            torrent.record.policy_override = policy;
+            Ok(())
+        })
+        .await?;
         // New goals move what the holds and the queue make of the torrent.
         self.apply_queue().await;
         self.publish().await;
@@ -2752,10 +2912,13 @@ impl TorrentService {
         let moved = {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
-            let rule = rule_of(&torrent.record, &rules);
+            let rule = torrent.rule(&rules);
             let before = settings.scope(torrent.record.category_id, rule);
+            self.inner
+                .db
+                .set_torrent_category(job_id, category_id)
+                .map_err(|error| ActionError::State(state_error(error)))?;
             torrent.record.category_id = category_id;
-            self.save_options(&torrent.record)?;
             let moved = before != settings.scope(category_id, rule);
             if moved {
                 self.detach(torrent).await;
@@ -2819,6 +2982,7 @@ impl TorrentService {
     async fn restore(&self) -> Result<(), String> {
         self.load_rules()?;
         let records = self.inner.db.list_torrents().map_err(state_error)?;
+        let now = self.inner.clock.now_ms();
         for record in records {
             let job_id = record.job_id;
             let counters = self
@@ -2828,7 +2992,18 @@ impl TorrentService {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            let mut torrent = Live::new(record.clone(), counters);
+            let resume = self.inner.db.torrent_peers(job_id).unwrap_or_else(|error| {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
+                ResumePeers::default()
+            });
+            // The rule is the one its trackers match now (libtorrent keeps
+            // the trackers, not what was made of them).
+            let trackers = self.inner.db.list_torrent_trackers(job_id).unwrap_or_else(|error| {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's trackers");
+                Vec::new()
+            });
+            let mut torrent = Live::new(record.clone(), counters, resume, now);
+            torrent.rule_id = self.rule_id(&trackers);
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
                     self.give_metainfo(&mut torrent, &parsed);
@@ -2898,18 +3073,9 @@ impl TorrentService {
     /// apply what that changes.
     pub async fn tick(&self) {
         let now = self.inner.clock.now_ms();
-        let elapsed_s = {
-            let mut last = self
-                .inner
-                .last_tick_ms
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let elapsed = last.map_or(0, |last| ((now - last).max(0) / 1000) as u64);
-            *last = Some(now);
-            elapsed
-        };
+        let elapsed_s = self.elapsed_s(now);
         self.follow_routes().await;
-        self.read(now, elapsed_s).await;
+        self.read(now, elapsed_s, false).await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
         self.apply_goals(now).await;
@@ -2919,6 +3085,18 @@ impl TorrentService {
         self.drop_idle_sessions().await;
         self.publish().await;
         self.inner.ticks.send_modify(|ticks| *ticks += 1);
+    }
+
+    // The whole seconds since the last reading, as of `now`.
+    fn elapsed_s(&self, now: i64) -> u64 {
+        let mut last = self
+            .inner
+            .last_tick_ms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let elapsed = last.map_or(0, |last| ((now - last).max(0) / 1000) as u64);
+        *last = Some(now);
+        elapsed
     }
 
     // A torrent whose route changed moves to the new route's session; one
@@ -2938,8 +3116,7 @@ impl TorrentService {
                     }
                     continue;
                 }
-                let scope =
-                    settings.scope(torrent.record.category_id, rule_of(&torrent.record, &rules));
+                let scope = settings.scope(torrent.record.category_id, torrent.rule(&rules));
                 match self.inner.sessions.routes().plan(scope) {
                     Ok(plan) => {
                         if let Some(reason) = &plan.down {
@@ -2974,13 +3151,13 @@ impl TorrentService {
         }
     }
 
-    // The session's figures for each torrent, and the ledger kept from them.
-    async fn read(&self, now: i64, elapsed_s: u64) {
-        let mut changed = Vec::new();
+    // The session's figures for each torrent, and the ledger kept from
+    // them: written once a minute while it changes, or now when `at_once`.
+    async fn read(&self, now: i64, elapsed_s: u64, at_once: bool) {
+        let mut landings = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
-                let before = torrent.counters;
                 let reading = torrent.reading(now);
                 torrent.engine = reading.engine;
                 torrent.file_have = reading.file_have;
@@ -2996,38 +3173,13 @@ impl TorrentService {
                 if matches!(torrent.engine, Engine::Live { .. }) {
                     torrent.counters.active_duration_s += elapsed_s;
                 }
-                if torrent.counters != before
-                    || now - torrent.counters.updated_at_ms >= LEDGER_EVERY_MS
-                {
-                    torrent.counters.updated_at_ms = now;
-                    changed.push((torrent.record.job_id, torrent.counters));
-                }
+                // Queued in the step that took it, so ledgers land in the
+                // order they were read.
+                landings.extend(self.queue_resume(torrent, now, at_once));
             }
         }
-        // Every ledger is queued before any is waited on, each in the step
-        // that took it.
-        let landed: Vec<_> = changed
-            .into_iter()
-            .map(|(job_id, counters)| {
-                let landed = self.queue_save(job_id, "torrent_ledger", move |db| {
-                    db.update_torrent_counters(job_id, &counters)
-                });
-                (job_id, landed)
-            })
-            .collect();
-        for (job_id, landed) in landed {
-            match landed.await {
-                Ok(Ok(_)) => self
-                    .inner
-                    .written
-                    .send_modify(|written| written.ledgers += 1),
-                Ok(Err(error)) => {
-                    tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's ledger");
-                }
-                Err(error) => {
-                    tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's ledger");
-                }
-            }
+        for landing in landings {
+            let _ = self.landed(Some(landing)).await;
         }
     }
 
@@ -3036,6 +3188,7 @@ impl TorrentService {
         let settings = self.settings();
         let rules = self.rules();
         let mut actions = Vec::new();
+        let mut landings = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
@@ -3043,7 +3196,7 @@ impl TorrentService {
                 if !torrent.complete() || !torrent.resumed() || torrent.record.forced {
                     continue;
                 }
-                let Some(policy) = settings.policy(&torrent.record, &rules) else {
+                let Some(policy) = settings.policy(&torrent.record, torrent.rule(&rules)) else {
                     continue;
                 };
                 if status::goal_left(Some(&policy), &torrent.counters, torrent.total, now).is_some()
@@ -3051,16 +3204,14 @@ impl TorrentService {
                     continue;
                 }
                 match policy.action {
-                    SeedingAction::Stop => {
-                        torrent.record.intent = TorrentIntent::Stopped;
-                        if let Err(error) = self.save_intent(&torrent.record) {
-                            tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not keep a torrent's stop");
-                        }
-                    }
+                    SeedingAction::Stop => landings.extend(self.stop_torrent(torrent, now)),
                     SeedingAction::Remove => actions.push((torrent.record.job_id, false)),
                     SeedingAction::RemoveWithData => actions.push((torrent.record.job_id, true)),
                 }
             }
+        }
+        for landing in landings {
+            let _ = self.landed(Some(landing)).await;
         }
         for (job_id, delete_files) in actions {
             if let Err(error) = self.remove(job_id, delete_files, true).await {
@@ -3124,7 +3275,10 @@ impl TorrentService {
             let Some(attached) = &torrent.attached else {
                 continue;
             };
-            let limits = ratelimits_of(&torrent.record, settings.policy(&torrent.record, &rules));
+            let limits = ratelimits_of(
+                &torrent.record,
+                settings.policy(&torrent.record, torrent.rule(&rules)),
+            );
             if attached.handle.ratelimits() != limits {
                 attached.handle.set_ratelimits(limits);
             }
@@ -3282,7 +3436,8 @@ impl TorrentService {
         let total = torrent.total;
         let have = on_disk(torrent.layout.as_deref(), &reading.file_have);
         let rules = self.rules();
-        let policy = settings.policy(record, &rules);
+        let rule = torrent.rule(&rules);
+        let policy = settings.policy(record, rule);
         let swarm = status::swarm(&torrent.announces(), now);
         let active = counters.active_duration_s;
         let average = |bytes: u64| bytes.checked_div(active).unwrap_or(0);
@@ -3302,7 +3457,7 @@ impl TorrentService {
             category: settings
                 .category(record.category_id)
                 .map(|category| category.name.clone()),
-            private: record.private,
+            private: torrent.private,
             forced: record.forced,
             progress: if total == 0 {
                 0.0
@@ -3329,7 +3484,7 @@ impl TorrentService {
             active_seconds: active,
             download_avg_bps: average(counters.downloaded_bytes),
             upload_avg_bps: average(counters.uploaded_bytes),
-            wasted_bytes: counters.wasted_bytes(),
+            wasted_bytes: reading.seen.wasted(),
             last_seen_complete_ms: counters.last_seen_complete_ms,
             pieces: torrent.pieces(),
             created_by: torrent.about.created_by.clone(),
@@ -3340,10 +3495,10 @@ impl TorrentService {
             storage_dir: record.storage_dir.clone(),
             seeding_left: status::goal_left(policy.as_ref(), counters, total, now),
             seeding_override: record.policy_override,
-            seeding_inherited: settings.inherited(record, &rules),
+            seeding_inherited: settings.inherited(record, rule),
             seeding_policy: policy.unwrap_or_default(),
-            seeding_source: settings.seeding_source(record, &rules),
-            unpack: settings.unpack(record, &rules),
+            seeding_source: settings.seeding_source(record, rule),
+            unpack: settings.unpack(record, rule),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
             sequential: record.sequential,

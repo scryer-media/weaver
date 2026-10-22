@@ -17,7 +17,6 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         name: format!("torrent {job_id}"),
         source: TorrentSource::Magnet,
         metainfo: None,
-        private: false,
         category_id: None,
         added_at_ms: 1_000 + job_id as i64,
         intent: TorrentIntent::Resumed,
@@ -25,7 +24,6 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         completed_at_ms: None,
         storage_dir: None,
         policy_override: None,
-        tracker_rule_id: None,
         unpack: None,
         metadata: Vec::new(),
         upload_limit: None,
@@ -54,7 +52,6 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
     let mut record = torrent(7, Some([1; 20]), Some([2; 32]));
     record.source = TorrentSource::Metainfo;
     record.metainfo = Some(bytes::Bytes::from_static(b"d4:infod4:name1:aee"));
-    record.private = true;
     record.forced = true;
     record.category_id = Some(4);
     record.storage_dir = Some("/data/torrents/7".to_string());
@@ -88,10 +85,7 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
     assert_eq!(db.list_torrent_trackers(JobId(7)).unwrap(), trackers());
     assert_eq!(
         db.get_torrent_counters(JobId(7)).unwrap(),
-        Some(TorrentCounters {
-            updated_at_ms: 1_007,
-            ..TorrentCounters::default()
-        })
+        Some(TorrentCounters::default())
     );
     assert_eq!(db.get_torrent(JobId(8)).unwrap(), None);
 }
@@ -135,8 +129,18 @@ fn intent_and_counters_update_in_place() {
     db.insert_torrent(&torrent(3, Some([3; 20]), None), &[])
         .unwrap();
 
+    assert!(db.set_torrent_completed(JobId(3), 9_000).unwrap());
+    // An intent written after, or racing, the completion keeps it: the two
+    // are apart.
     assert!(
-        db.update_torrent_intent(JobId(3), TorrentIntent::Stopped, Some(9_000))
+        db.update_torrent_intent(JobId(3), TorrentIntent::Paused)
+            .unwrap()
+    );
+    let stored = db.get_torrent(JobId(3)).unwrap().unwrap();
+    assert_eq!(stored.intent, TorrentIntent::Paused);
+    assert_eq!(stored.completed_at_ms, Some(9_000));
+    assert!(
+        db.update_torrent_intent(JobId(3), TorrentIntent::Stopped)
             .unwrap()
     );
     let stored = db.get_torrent(JobId(3)).unwrap().unwrap();
@@ -146,21 +150,31 @@ fn intent_and_counters_update_in_place() {
     let counters = TorrentCounters {
         uploaded_bytes: 7_000_000_000,
         downloaded_bytes: 3_500_000_000,
-        checked_bytes: 3_400_000_000,
         active_duration_s: 900,
         last_seen_complete_ms: Some(8_800),
         finished_duration_s: 600,
         last_activity_ms: Some(8_500),
-        last_announce_uploaded_bytes: 6_000_000_000,
-        updated_at_ms: 9_100,
     };
     assert!(db.update_torrent_counters(JobId(3), &counters).unwrap());
     assert_eq!(db.get_torrent_counters(JobId(3)).unwrap(), Some(counters));
-
+    // A write of the peers alone leaves the ledger as it is.
+    let peers = weaver_torrent::ResumePeers {
+        peers: vec!["10.0.0.1:6881".parse().unwrap()],
+        banned: Vec::new(),
+    };
     assert!(
-        !db.update_torrent_intent(JobId(4), TorrentIntent::Paused, None)
+        db.save_torrent_resume(JobId(3), None, Some(&peers))
             .unwrap()
     );
+    assert_eq!(db.get_torrent_counters(JobId(3)).unwrap(), Some(counters));
+    assert_eq!(db.torrent_peers(JobId(3)).unwrap(), peers);
+    assert!(!db.save_torrent_resume(JobId(3), None, None).unwrap());
+
+    assert!(
+        !db.update_torrent_intent(JobId(4), TorrentIntent::Paused)
+            .unwrap()
+    );
+    assert!(!db.set_torrent_completed(JobId(4), 1).unwrap());
     assert!(!db.update_torrent_counters(JobId(4), &counters).unwrap());
 }
 
@@ -263,7 +277,6 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
             None,
             "torrent 5",
             b"d4:infodee",
-            true,
             "/data/t5",
             &more
         )
@@ -325,47 +338,38 @@ fn torrents_list_by_category_in_the_order_added() {
     assert!(ids(Some(9)).is_empty());
 }
 
+// Each option is its own write: one leaves the others as they are.
 #[test]
-fn a_torrent_keeps_the_tracker_rule_it_matched_until_the_rule_goes() {
-    use crate::settings::model::TrackerRule;
-
+fn each_option_writes_its_own_column() {
     let db = Database::open_in_memory().unwrap();
-    let rule = db
-        .insert_tracker_rule(
-            &TrackerRule {
-                id: 0,
-                host_pattern: "*.invalid".into(),
-                seeding: None,
-                never_pause: true,
-                unpack: None,
-                client: None,
-                torrent_route: false,
-            },
-            1,
-        )
+    db.insert_torrent(&torrent(1, Some([1; 20]), None), &[])
         .unwrap();
-    let mut record = torrent(1, Some([1; 20]), None);
-    record.tracker_rule_id = Some(rule.id);
-    db.insert_torrent(&record, &trackers()).unwrap();
-    assert_eq!(db.get_torrent(JobId(1)).unwrap(), Some(record.clone()));
-
-    assert!(db.set_torrent_tracker_rule(JobId(1), None).unwrap());
-    assert_eq!(
-        db.get_torrent(JobId(1)).unwrap().unwrap().tracker_rule_id,
-        None
-    );
+    let policy = SeedingPolicy {
+        ratio_goal: Some(2.0),
+        seed_time_goal_minutes: None,
+        inactive_goal_minutes: None,
+        mode: SeedingGoalMode::Any,
+        action: SeedingAction::Stop,
+        max_upload_bps: None,
+    };
+    assert!(db.set_torrent_category(JobId(1), Some(4)).unwrap());
+    assert!(db.set_torrent_forced(JobId(1), true).unwrap());
     assert!(
-        db.set_torrent_tracker_rule(JobId(1), Some(rule.id))
+        db.set_torrent_policy_override(JobId(1), Some(policy))
             .unwrap()
     );
-    assert!(!db.set_torrent_tracker_rule(JobId(2), None).unwrap());
-
-    // A rule that goes leaves its torrents with none.
-    db.delete_tracker_rule(rule.id).unwrap();
+    let stored = db.get_torrent(JobId(1)).unwrap().unwrap();
     assert_eq!(
-        db.get_torrent(JobId(1)).unwrap().unwrap().tracker_rule_id,
-        None
+        (stored.category_id, stored.forced, stored.policy_override),
+        (Some(4), true, Some(policy))
     );
+    assert!(db.set_torrent_forced(JobId(1), false).unwrap());
+    let stored = db.get_torrent(JobId(1)).unwrap().unwrap();
+    assert_eq!(
+        (stored.category_id, stored.forced, stored.policy_override),
+        (Some(4), false, Some(policy))
+    );
+    assert!(!db.set_torrent_forced(JobId(2), true).unwrap());
 }
 
 // A torrent's saved peers and bans read back as written, an empty list as

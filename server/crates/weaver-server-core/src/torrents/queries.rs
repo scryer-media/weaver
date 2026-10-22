@@ -11,10 +11,9 @@ use crate::torrents::{
     TrackerEntry,
 };
 
-pub(crate) const TORRENT_COLUMNS: &str =
-    "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
-     private, category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
-     policy_override, tracker_rule_id, unpack, metadata, upload_limit, download_limit,
+pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
+     category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
+     policy_override, unpack, metadata, upload_limit, download_limit, \
      sequential, first_last_piece_first";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
@@ -65,7 +64,6 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         name: row.text("name")?,
         source: TorrentSource::parse(&source).ok_or_else(|| corrupt("source", &source))?,
         metainfo: row.opt_bytes("metainfo")?.map(bytes::Bytes::from),
-        private: row.bool("private")?,
         category_id: opt_u32(row, "category_id")?,
         added_at_ms: row.i64("added_at_ms")?,
         intent: TorrentIntent::parse(&intent).ok_or_else(|| corrupt("intent", &intent))?,
@@ -73,7 +71,6 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         completed_at_ms: row.opt_i64("completed_at_ms")?,
         storage_dir: row.opt_text("storage_dir")?,
         policy_override,
-        tracker_rule_id: opt_u32(row, "tracker_rule_id")?,
         unpack: row.opt_bool("unpack")?,
         metadata,
         upload_limit: opt_u64(row, "upload_limit")?,
@@ -266,9 +263,8 @@ impl Database {
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT uploaded_bytes, downloaded_bytes, checked_bytes, active_duration_s,
-                        last_seen_complete_ms, finished_duration_s, last_activity_ms,
-                        last_announce_uploaded_bytes, updated_at_ms
+                "SELECT uploaded_bytes, downloaded_bytes, active_duration_s,
+                        last_seen_complete_ms, finished_duration_s, last_activity_ms
                    FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
@@ -277,13 +273,10 @@ impl Database {
                 Ok(TorrentCounters {
                     uploaded_bytes: count(&row, "uploaded_bytes")?,
                     downloaded_bytes: count(&row, "downloaded_bytes")?,
-                    checked_bytes: count(&row, "checked_bytes")?,
                     active_duration_s: count(&row, "active_duration_s")?,
                     last_seen_complete_ms: row.opt_i64("last_seen_complete_ms")?,
                     finished_duration_s: count(&row, "finished_duration_s")?,
                     last_activity_ms: row.opt_i64("last_activity_ms")?,
-                    last_announce_uploaded_bytes: count(&row, "last_announce_uploaded_bytes")?,
-                    updated_at_ms: row.i64("updated_at_ms")?,
                 })
             })
             .transpose()

@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 84;
+const CURRENT_SCHEMA_VERSION: i64 = 85;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -543,6 +543,15 @@ async fn apply_single_migration(
 ) -> Result<(), StateError> {
     let start = Instant::now();
     let mut tx = pool.begin().await.map_err(db_err)?;
+    // The pool may hand this migration a connection whose cached schema
+    // predates the migrations that ran on another. A statement that reads
+    // a table checks the schema cookie and reloads the cache; `ALTER TABLE
+    // DROP COLUMN` looks its column up in the cache first and fails on a
+    // stale one without that check.
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_master")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
     for step in &migration.steps {
         if !step.engine().applies_to(EngineScope::Sqlite) {
             continue;
@@ -1566,8 +1575,9 @@ mod tests {
         );
     }
 
-    // Migration 78 gives each torrent its saved peers and bans: a fresh
-    // database has them, and an existing torrent starts with none.
+    // Migration 78 gives each torrent its saved peers and bans: an existing
+    // torrent starts with none. They sit on its ledger row once the lean
+    // resume migration moves them there.
     #[tokio::test]
     async fn sqlite_migration_78_gives_torrents_saved_peers_and_bans() {
         let columns = ["peers", "banned_peers"];
@@ -1579,7 +1589,11 @@ mod tests {
         replay_catalog_into_fresh_db(&fresh, &catalog, &payload, None, true)
             .await
             .unwrap();
-        assert_eq!(pragma_column_count(&fresh, "torrents", &columns).await, 2);
+        assert_eq!(pragma_column_count(&fresh, "torrents", &columns).await, 0);
+        assert_eq!(
+            pragma_column_count(&fresh, "torrent_counters", &columns).await,
+            2
+        );
         fresh.close().await;
 
         let db_path = temp.path().join("pre-torrent-peers.db");
@@ -1601,13 +1615,112 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 2);
-        let row: (String, Option<String>, Option<String>) =
-            sqlx::query_as("SELECT name, peers, banned_peers FROM torrents WHERE job_id = 7")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT torrents.name, torrent_counters.peers, torrent_counters.banned_peers
+               FROM torrents JOIN torrent_counters USING (job_id) WHERE job_id = 7",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(row, ("saved".to_string(), None, None));
+        pool.close().await;
+    }
+
+    // The lean resume migration keeps only what a torrent's next start
+    // needs: the peers and bans move from the torrent's row to its ledger
+    // row, a torrent with no ledger row gets one, and the columns nothing
+    // reads back go.
+    #[tokio::test]
+    async fn sqlite_lean_resume_migration_moves_peers_to_the_ledger_row() {
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let gone_torrents = ["peers", "banned_peers", "private", "tracker_rule_id"];
+        let gone_counters = [
+            "checked_bytes",
+            "last_announce_uploaded_bytes",
+            "updated_at_ms",
+        ];
+
+        let fresh = open_test_pool(&temp.path().join("fresh.db")).await;
+        replay_catalog_into_fresh_db(&fresh, &catalog, &payload, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            pragma_column_count(&fresh, "torrents", &gone_torrents).await,
+            0
+        );
+        assert_eq!(
+            pragma_column_count(&fresh, "torrent_counters", &gone_counters).await,
+            0
+        );
+        fresh.close().await;
+
+        let db_path = temp.path().join("pre-lean-resume.db");
+        let pool = open_test_pool(&db_path).await;
+        replay_catalog_into_fresh_db(
+            &pool,
+            &catalog,
+            &payload,
+            Some(CURRENT_SCHEMA_VERSION - 1),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pragma_column_count(&pool, "torrents", &gone_torrents).await,
+            4
+        );
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state,
+                                   peers, banned_peers, private)
+             VALUES (7, ?, 'ledger', 'magnet', 1, 'queued', '10.0.0.1:6881', '10.0.0.9', 1),
+                    (8, ?, 'bare', 'magnet', 2, 'queued', NULL, '10.0.0.8', 0)",
+        )
+        .bind(vec![7_u8; 20])
+        .bind(vec![8_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO torrent_counters (job_id, uploaded_bytes, checked_bytes, updated_at_ms)
+             VALUES (7, 42, 40, 5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        assert_eq!(
+            pragma_column_count(&pool, "torrents", &gone_torrents).await,
+            0
+        );
+        assert_eq!(
+            pragma_column_count(&pool, "torrent_counters", &gone_counters).await,
+            0
+        );
+        let rows: Vec<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT job_id, uploaded_bytes, peers, banned_peers
+               FROM torrent_counters ORDER BY job_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    7,
+                    42,
+                    Some("10.0.0.1:6881".to_string()),
+                    Some("10.0.0.9".to_string())
+                ),
+                (8, 0, None, Some("10.0.0.8".to_string())),
+            ]
+        );
         pool.close().await;
     }
 
@@ -1704,7 +1817,7 @@ mod tests {
         pool.close().await;
     }
 
-    // The file-priority migration, the latest, gives each torrent one
+    // The file-priority migration gives each torrent one
     // value for its file levels, none set, and its sequential and
     // first-and-last toggles, both off, and drops the file rows: their path
     // and length are the metainfo's, and `selected` held only whether the
@@ -1735,15 +1848,9 @@ mod tests {
 
         let db_path = temp.path().join("pre-file-priority.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(
-            &pool,
-            &catalog,
-            &payload,
-            Some(CURRENT_SCHEMA_VERSION - 1),
-            true,
-        )
-        .await
-        .unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(82), true)
+            .await
+            .unwrap();
         assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
         sqlx::query(
             "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
@@ -2487,6 +2594,65 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stamped, 1);
+    }
+
+    // A connection caches the schema it last read; a migration that drops a
+    // column added through another connection fails on that cache.
+    #[tokio::test]
+    async fn a_migration_drops_a_column_another_connection_added() {
+        use sqlx::Connection as _;
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("stale.db").display()
+        );
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        ensure_migration_ledger_shape(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE stale (id INTEGER PRIMARY KEY);")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut other = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql("ALTER TABLE stale ADD COLUMN gone INTEGER;")
+            .execute(&mut other)
+            .await
+            .unwrap();
+        other.close().await.unwrap();
+
+        let payload = b"ALTER TABLE stale DROP COLUMN gone;";
+        let migration = CompiledMigration {
+            version: 9_998,
+            description: "drops a column another connection added".to_string(),
+            key: "9998_drop_gone".to_string(),
+            filename: "synthetic.sql".to_string(),
+            checksum_algo: ChecksumAlgorithm::Blake3,
+            checksum: ChecksumAlgorithm::Blake3.digest(payload),
+            legacy_line_ending_checksums: Vec::new(),
+            steps: vec![CompiledMigrationStep::Sql {
+                file: "synthetic.sql".to_string(),
+                engine: EngineScope::Sqlite,
+                scope: StepScope::All,
+                payload: PayloadSlice {
+                    start: 0,
+                    len: payload.len() as u64,
+                },
+            }],
+        };
+        apply_single_migration(&pool, &migration, payload, MigrationInstallKind::Upgrade)
+            .await
+            .unwrap();
+
+        let columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('stale') WHERE name = 'gone'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(columns, 0);
     }
 
     #[tokio::test]

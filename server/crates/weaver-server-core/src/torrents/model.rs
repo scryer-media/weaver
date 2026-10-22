@@ -128,7 +128,6 @@ pub struct TorrentRecord {
     /// The one copy of the metainfo: the job's tree and the session's
     /// torrent are made from views of it.
     pub metainfo: Option<bytes::Bytes>,
-    pub private: bool,
     pub category_id: Option<u32>,
     pub added_at_ms: i64,
     pub intent: TorrentIntent,
@@ -136,8 +135,6 @@ pub struct TorrentRecord {
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
     pub policy_override: Option<SeedingPolicy>,
-    // The tracker rule its trackers matched, if any.
-    pub tracker_rule_id: Option<u32>,
     // Whether its archives are extracted: the torrent's own value until its
     // job is built, then the value in force.
     pub unpack: Option<bool>,
@@ -281,8 +278,6 @@ pub struct TorrentCounters {
     pub uploaded_bytes: u64,
     // Every byte fetched from peers, whether it verified or not.
     pub downloaded_bytes: u64,
-    // The fetched bytes whose pieces verified.
-    pub checked_bytes: u64,
     // Time spent running in a session, in seconds.
     pub active_duration_s: u64,
     // The last time a complete copy was in reach: the torrent's own while it
@@ -291,16 +286,6 @@ pub struct TorrentCounters {
     // Time spent complete and seeding, in seconds.
     pub finished_duration_s: u64,
     pub last_activity_ms: Option<i64>,
-    // The upload total reported in the last announce.
-    pub last_announce_uploaded_bytes: u64,
-    pub updated_at_ms: i64,
-}
-
-impl TorrentCounters {
-    /// The fetched bytes that did not verify.
-    pub fn wasted_bytes(&self) -> u64 {
-        self.downloaded_bytes.saturating_sub(self.checked_bytes)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
