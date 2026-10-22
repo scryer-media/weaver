@@ -233,22 +233,34 @@ impl HistoryDeleteManager {
             .delete_history_batch(job_ids, delete_files)
             .await;
 
-        // Targets grouped by the state and message they end in.
+        // Targets grouped by the state and message they end in, and every id
+        // whose record is gone, which is announced as removed whatever state
+        // its target ends in.
         let mut settled: BTreeMap<(bool, Option<String>), Vec<u64>> = BTreeMap::new();
+        let mut removed = Vec::new();
         match result {
             Ok(outcome) => {
                 for (job_id, deleted) in &outcome.deleted {
-                    // The record is gone either way; a directory whose marker
+                    removed.push(job_id.0);
+                    // The record is gone either way. A directory whose marker
                     // stopped matching it was left on disk, and the target
-                    // says which rather than claiming a clean delete.
-                    settled
-                        .entry((true, left_in_place_note(deleted)))
-                        .or_default()
-                        .push(job_id.0);
+                    // says which rather than claiming a clean delete; a
+                    // cleanup that failed fails the target with its error.
+                    let entry = match deleted {
+                        Ok(deleted) => (true, left_in_place_note(deleted)),
+                        Err(error) => (
+                            false,
+                            Some(format!("record deleted; cleanup did not finish: {error}")),
+                        ),
+                    };
+                    settled.entry(entry).or_default().push(job_id.0);
                 }
                 for (job_id, error) in &outcome.refused {
                     let entry = match error {
-                        SchedulerError::JobNotFound(_) => (true, None),
+                        SchedulerError::JobNotFound(_) => {
+                            removed.push(job_id.0);
+                            (true, None)
+                        }
                         error => (false, Some(error.to_string())),
                     };
                     settled.entry(entry).or_default().push(job_id.0);
@@ -262,10 +274,8 @@ impl HistoryDeleteManager {
             }
         }
 
-        let mut removed = Vec::new();
         for ((completed, message), ids) in settled {
             let state = if completed {
-                removed.extend_from_slice(&ids);
                 AsyncOperationTargetState::Completed
             } else {
                 AsyncOperationTargetState::Failed

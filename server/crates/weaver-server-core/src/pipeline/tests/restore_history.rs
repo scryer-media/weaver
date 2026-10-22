@@ -813,11 +813,93 @@ async fn delete_history_with_a_stale_marker_removes_the_row_and_keeps_the_dir() 
     let outcome = delete_history_batch(&mut pipeline, &[job_id], false).await;
 
     assert_eq!(
-        outcome.deleted[&job_id].left_in_place,
+        outcome.deleted[&job_id].as_ref().unwrap().left_in_place,
         vec![output_dir.clone()]
     );
     assert!(output_dir.join("leftover.bin").exists());
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn delete_history_reports_a_failed_cleanup_as_deleted_with_its_error() {
+    // The record goes in the delete transaction; the directory only after the
+    // job's scripts have stopped. A cleanup that fails in between must not
+    // pass for a record that survived: the id is deleted, and its error rides
+    // with it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let failing = JobId(30026);
+    let clean = JobId(30027);
+    let mut dirs = BTreeMap::new();
+    for (job_id, name) in [
+        (failing, "history-cleanup-fails"),
+        (clean, "history-cleanup-ok"),
+    ] {
+        let output_dir = intermediate_dir.join(name);
+        tokio::fs::create_dir_all(&output_dir).await.unwrap();
+        tokio::fs::write(
+            crate::jobs::working_dir::working_dir_marker_path(&output_dir),
+            [],
+        )
+        .await
+        .unwrap();
+        pipeline
+            .db
+            .insert_job_history(&history_row_with_output_dir(
+                job_id,
+                name,
+                "failed",
+                output_dir.clone(),
+            ))
+            .unwrap();
+        dirs.insert(job_id, output_dir);
+    }
+    // A script still running for the failing job holds its cleanup at the
+    // script-stop barrier, after its record is gone and before its directory
+    // goes.
+    let running = crate::post_processing::events::hold_test_event_run(
+        &pipeline.db,
+        failing.0,
+        "history-cleanup-barrier",
+    );
+
+    pipeline.report_all_for_test();
+    let delete = tokio::spawn(
+        pipeline
+            .shared_state
+            .queue
+            .clone()
+            .delete_history([failing, clean].into_iter().collect(), false),
+    );
+    let db = pipeline.db.clone();
+    crate::post_processing::events::wait_for_test_script_change(&db, || {
+        db.get_job_history(failing.0).unwrap().is_none()
+    })
+    .await;
+    // The directory now names another job, so its removal is refused.
+    tokio::fs::write(
+        crate::jobs::working_dir::working_dir_marker_path(&dirs[&failing]),
+        format!("weaver-job-v1:{}:{}\n", 99_999, "0".repeat(64)),
+    )
+    .await
+    .unwrap();
+    drop(running);
+    let outcome = delete.await.unwrap().unwrap();
+
+    assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
+    let error = outcome.deleted[&failing]
+        .as_ref()
+        .expect_err("the failing id's cleanup error is reported");
+    assert!(
+        error.to_string().contains("no longer belongs"),
+        "unexpected cleanup error: {error}"
+    );
+    assert!(outcome.deleted[&clean].is_ok());
+    for job_id in [failing, clean] {
+        assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+    }
+    assert!(dirs[&failing].exists());
+    assert!(!dirs[&clean].exists());
 }
 
 #[tokio::test]
@@ -895,7 +977,10 @@ async fn history_deletion_waits_for_scripts_without_blocking_commands() {
             () = std::future::ready(()) => {},
         }
         assert!(output_dir.exists());
-        handle.pipeline_diagnostics().await.unwrap();
+        let (diagnostics, ()) = tokio::join!(handle.pipeline_diagnostics(), async {
+            pipeline.answer_diagnostics_request();
+        });
+        diagnostics.unwrap();
         for reprocess in [false, true] {
             let result = if reprocess {
                 handle.reprocess_job(job_id).await

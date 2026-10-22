@@ -846,9 +846,12 @@ pub const HISTORY_DELETE_BATCH_SIZE: usize =
 // back the rest of the batch.
 #[derive(Debug, Default)]
 pub struct HistoryDeleteBatchOutcome {
-    // Ids whose record is gone, with what each left on disk.
-    pub deleted: BTreeMap<JobId, HistoryDeleteOutcome>,
-    // Ids that were not deleted, or whose cleanup did not finish, and why.
+    // Every id whose record is gone, with what its cleanup did: what it left
+    // on disk, or why it did not finish. A cleanup that failed still leaves
+    // the record deleted, so the id is here either way and is announced as
+    // removed; the error is reported beside that, never instead of it.
+    pub deleted: BTreeMap<JobId, Result<HistoryDeleteOutcome, SchedulerError>>,
+    // Ids whose record was not deleted, and why.
     pub refused: BTreeMap<JobId, SchedulerError>,
 }
 
@@ -1140,6 +1143,10 @@ impl SchedulerHandle {
     }
 
     // Delete a completed/failed/cancelled job from history.
+    //
+    // An `Err` does not say the record survived: a cleanup that failed after
+    // the record was deleted is returned as its error too. A caller that must
+    // know whether the record is gone reads `delete_history_batch`.
     pub async fn delete_history(
         &self,
         job_id: JobId,
@@ -1151,7 +1158,10 @@ impl SchedulerHandle {
         if let Some(error) = outcome.refused.remove(&job_id) {
             return Err(error);
         }
-        Ok(outcome.deleted.remove(&job_id).unwrap_or_default())
+        outcome
+            .deleted
+            .remove(&job_id)
+            .unwrap_or(Ok(Default::default()))
     }
 
     // Delete a batch of completed/failed/cancelled jobs from history in one
@@ -1307,14 +1317,37 @@ impl SchedulerHandle {
         self.state.note_server_probe_latency(server_id, latency);
     }
 
-    // Read-only pipeline internals for the diagnostics package.
+    // Read-only pipeline internals for the diagnostics package. The pipeline
+    // builds the snapshot at the top of its next turn after the request is
+    // recorded; only this endpoint pays for it.
     pub async fn pipeline_diagnostics(
         &self,
     ) -> Result<crate::pipeline::diagnostics::PipelineDiagnostics, SchedulerError> {
-        self.state
-            .queue
-            .read(|inner| inner.diagnostics.clone())
-            .ok_or(SchedulerError::ChannelClosed)
+        let queue = &self.state.queue;
+        let mut changes = queue.subscribe();
+        let wanted = queue.write_intent(|inner| {
+            inner.diagnostics_requested += 1;
+            Change::unchanged(inner.diagnostics_requested)
+        });
+        loop {
+            let answer = queue.read(|inner| {
+                inner
+                    .diagnostics
+                    .as_ref()
+                    .filter(|(answered, _)| *answered >= wanted)
+                    .map(|(_, diagnostics)| diagnostics.clone())
+            });
+            if let Some(diagnostics) = answer {
+                return Ok(diagnostics);
+            }
+            if queue.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SchedulerError::ChannelClosed);
+            }
+            changes
+                .changed()
+                .await
+                .map_err(|_| SchedulerError::ChannelClosed)?;
+        }
     }
 
     // Change only the speed test's transient download hold.
@@ -1586,15 +1619,21 @@ impl SchedulerHandle {
                     "invalid NNTP runtime client supplied for activation".into(),
                 )
             })?;
-        Ok(self.state.queue.write_intent(|inner| {
+        // A rebuild the pipeline has not taken yet is superseded; its client
+        // leaves the lock with the write and is dropped after it.
+        let (activation, _superseded) = self.state.queue.write_intent(|inner| {
             inner.globals.nntp_generation += 1;
             let generation = inner.globals.nntp_generation;
-            inner.nntp = Some((generation, *client, total_connections));
-            Change::changed(NntpRuntimeActivation {
-                generation,
-                configured_connections: total_connections,
-            })
-        }))
+            let superseded = inner.nntp.replace((generation, *client, total_connections));
+            Change::changed((
+                NntpRuntimeActivation {
+                    generation,
+                    configured_connections: total_connections,
+                },
+                superseded,
+            ))
+        });
+        Ok(activation)
     }
 
     // Update disk tuning after the background startup measurement completes.

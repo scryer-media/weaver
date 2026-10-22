@@ -69,19 +69,28 @@ impl Pipeline {
         }
         // Freeze acceptance before taking the terminal fields. An intent
         // recorded before this lock belongs to this run's terminal result.
+        // A row already retiring is a cancel whose archive is in flight; its
+        // done event decides the job.
         let cancelled = self.shared_state.queue.write(|inner| {
             let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) else {
                 return crate::pipeline::queue::Change::unchanged(None);
             };
+            if row.report.retiring {
+                return crate::pipeline::queue::Change::unchanged(Some(None));
+            }
             if let Some(origin) = row.intents.cancelled {
-                return crate::pipeline::queue::Change::unchanged(Some(origin));
+                return crate::pipeline::queue::Change::unchanged(Some(Some(origin)));
             }
             row.report.retiring = true;
             crate::pipeline::queue::Change::changed(None)
         });
-        if let Some(origin) = cancelled {
-            self.start_cancel_jobs(BTreeSet::from([job_id]), origin);
-            return;
+        match cancelled {
+            Some(Some(origin)) => {
+                self.start_cancel_jobs(BTreeSet::from([job_id]), origin);
+                return;
+            }
+            Some(None) => return,
+            None => {}
         }
         self.apply_pending_job_update(job_id);
         // Taken before the long immutable borrow below, and before the runtime

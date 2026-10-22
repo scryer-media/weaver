@@ -1090,6 +1090,9 @@ impl Pipeline {
             TerminalPostProcessingEvent::Done(done) => {
                 self.handle_terminal_post_processing_done(done);
             }
+            TerminalPostProcessingEvent::CancelJobsDone(done) => {
+                self.handle_cancel_jobs_done(done);
+            }
         }
     }
 
@@ -1132,6 +1135,19 @@ impl Pipeline {
                     }
                 }
                 self.apply_queue_intents().await;
+                // A recorded cancel is settled before exit: its archive decides
+                // the job, and that answer returns on the done channel.
+                while queue.read(|inner| {
+                    inner
+                        .jobs
+                        .iter()
+                        .any(|row| row.intents.cancelled.is_some() && row.report.retiring)
+                }) {
+                    let Some(event) = self.terminal_post_processing_done_rx.recv().await else {
+                        break;
+                    };
+                    self.handle_terminal_post_processing_event(event).await;
+                }
                 self.demand_direct_store_barriers_for_all_jobs(
                     crate::pipeline::direct_store::barrier::BarrierDemand::Shutdown,
                 )
@@ -1449,7 +1465,6 @@ impl Pipeline {
                 self.reconcile_clean = false;
             }
             dispatch_due = turn_active;
-            self.report_diagnostics();
             if live != metrics_live {
                 metrics_live = live;
                 metrics_snapshot_interval = Self::metrics_snapshot_timer(live);
@@ -1466,13 +1481,14 @@ impl Pipeline {
         metrics_interval: &mut tokio::time::Interval,
     ) -> usize {
         let mut processed = 0;
+        // One report per job per turn, however many of its results landed.
+        let mut reported = BTreeSet::new();
         while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
             let Some(result) = pending.pop_front() else {
                 break;
             };
-            let reported_job = result.job_id;
+            reported.insert(result.job_id);
             self.process_released_download_done(result).await;
-            self.report_job(reported_job);
             processed += 1;
             // Return freed connections during ingestion rather than waiting
             // until the entire result batch has been processed.
@@ -1480,6 +1496,9 @@ impl Pipeline {
             if self.take_download_dispatch_wake() {
                 self.dispatch_downloads();
             }
+        }
+        for job_id in reported {
+            self.report_job(job_id);
         }
         if processed != 0 {
             // A backlog can keep every actor operation immediately ready.
@@ -2608,6 +2627,7 @@ fn write_segments_to_disk_blocking(
     segments: Vec<(u64, BufferedDecodedSegment)>,
     queued_at: Instant,
 ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    crate::e2e_failpoint::maybe_hold(crate::e2e_failpoint::DISK_WRITE, &path);
     let task_started = Instant::now();
     crate::runtime::perf_probe::record(
         "download.disk_write.owner.queue_wait",

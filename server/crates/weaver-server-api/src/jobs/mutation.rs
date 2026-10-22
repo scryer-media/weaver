@@ -444,8 +444,9 @@ impl JobsMutation {
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<Vec<HistoryItem>> {
         let handle = ctx.data::<SchedulerHandle>()?;
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
-        handle.delete_history(JobId(id), delete_files).await?;
+        delete_history_ids(handle, replay, [id], delete_files).await?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Explicitly forget durable duplicate identity for a job without deleting history or files.
@@ -567,8 +568,9 @@ impl JobsMutation {
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<Vec<HistoryItem>> {
         let handle = ctx.data::<SchedulerHandle>()?;
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
         let db = ctx.data::<Database>()?.clone();
-        delete_history_ids(handle, ids, delete_files).await?;
+        delete_history_ids(handle, replay, ids, delete_files).await?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Delete all completed/failed/cancelled jobs from history.
@@ -599,7 +601,8 @@ impl JobsMutation {
                 })
                 .map(|info| info.job_id.0),
         );
-        delete_history_ids(handle, ids, delete_files).await?;
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
+        delete_history_ids(handle, replay, ids, delete_files).await?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
     }
     /// Update category and/or priority for one or more jobs.
@@ -833,22 +836,10 @@ impl JobsMutation {
         #[graphql(default = false)] delete_files: bool,
     ) -> Result<HistoryCommandResult> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
-        map_scheduler_result(delete_history_ids(handle, ids.iter().copied(), delete_files).await)?;
-        for id in &ids {
-            replay
-                .append(PersistedQueueEvent {
-                    occurred_at_ms: chrono::Utc::now().timestamp_millis(),
-                    kind: QueueEventKind::ItemRemoved,
-                    item_id: Some(*id),
-                    item: None,
-                    state: None,
-                    previous_state: None,
-                    attention: None,
-                    global_state: None,
-                })
-                .await;
-        }
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;
+        map_scheduler_result(
+            delete_history_ids(handle, replay, ids.iter().copied(), delete_files).await,
+        )?;
         Ok(HistoryCommandResult {
             success: true,
             removed_ids: ids,
@@ -943,10 +934,15 @@ fn scheduler_graphql_error(error: SchedulerError) -> async_graphql::Error {
 }
 
 // Deletes `ids` from history through the pipeline, one command per
-// `HISTORY_DELETE_BATCH_SIZE` ids, and fails with the first refusal once
-// every batch has run.
+// `HISTORY_DELETE_BATCH_SIZE` ids, and announces every id whose record is
+// gone. A refusal never holds back the other ids, and an id whose record was
+// deleted is announced as removed even when its cleanup then failed or
+// another id was refused, so no client keeps a row the server has already
+// deleted. The first refusal or cleanup failure, once every batch has run,
+// is the result.
 async fn delete_history_ids(
     handle: &SchedulerHandle,
+    replay: &crate::jobs::replay::QueueEventReplay,
     ids: impl IntoIterator<Item = u64>,
     delete_files: bool,
 ) -> std::result::Result<(), SchedulerError> {
@@ -955,16 +951,47 @@ async fn delete_history_ids(
         .map(JobId)
         .collect::<std::collections::BTreeSet<_>>();
     let ids = ids.into_iter().collect::<Vec<_>>();
-    let mut first_refusal = None;
+    let mut deleted = Vec::new();
+    let mut first_failure = None;
     for batch in ids.chunks(weaver_server_core::HISTORY_DELETE_BATCH_SIZE) {
-        let outcome = handle
+        match handle
             .delete_history_batch(batch.iter().copied().collect(), delete_files)
-            .await?;
-        if first_refusal.is_none() {
-            first_refusal = outcome.refused.into_values().next();
+            .await
+        {
+            Ok(outcome) => {
+                deleted.extend(outcome.deleted.keys().map(|job_id| job_id.0));
+                let failures = outcome.refused.into_values().chain(
+                    outcome
+                        .deleted
+                        .into_values()
+                        .filter_map(|cleanup| cleanup.err()),
+                );
+                for failure in failures {
+                    first_failure.get_or_insert(failure);
+                }
+            }
+            // The pipeline is gone: no later batch can run either.
+            Err(error) => {
+                first_failure.get_or_insert(error);
+                break;
+            }
         }
     }
-    first_refusal.map_or(Ok(()), Err)
+    for id in deleted {
+        replay
+            .append(PersistedQueueEvent {
+                occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+                kind: QueueEventKind::ItemRemoved,
+                item_id: Some(id),
+                item: None,
+                state: None,
+                previous_state: None,
+                attention: None,
+                global_state: None,
+            })
+            .await;
+    }
+    first_failure.map_or(Ok(()), Err)
 }
 
 fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Result<T> {

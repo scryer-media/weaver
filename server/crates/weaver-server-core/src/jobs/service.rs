@@ -117,7 +117,7 @@ impl Pipeline {
         }
 
         self.jobs_finalizing_download.insert(job_id);
-        let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+        self.emit_job_event(PipelineEvent::DownloadFinished {
             job_id,
             finalization_pending: true,
         });
@@ -1696,7 +1696,7 @@ impl Pipeline {
             )
             .await;
 
-        let _ = self.event_tx.send(PipelineEvent::JobCreated {
+        self.emit_job_event(PipelineEvent::JobCreated {
             job_id,
             name: spec.name.clone(),
             total_files: spec.files.len() as u32,

@@ -87,6 +87,7 @@ async fn shutdown_services_terminal_completion_needed_by_pending_readmission() {
     let mut events = handle.subscribe_events();
     handle.cancel_job(id).await.unwrap();
     pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
     while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
     {
     }
@@ -337,6 +338,7 @@ async fn terminal_capture_honors_cancellation_accepted_before_retirement() {
     let mut events = handle.subscribe_events();
     handle.cancel_job_keeping_files(id).await.unwrap();
     pipeline.complete_job_after_terminal_post_processing(id);
+    finish_cancel_jobs(&mut pipeline).await;
     loop {
         match events.recv().await.unwrap() {
             PipelineEvent::JobCompleted { job_id } if job_id == id => {
@@ -355,7 +357,7 @@ async fn terminal_capture_honors_cancellation_accepted_before_retirement() {
 }
 
 #[tokio::test]
-async fn accepted_pause_survives_draining_downloads_and_resumes_the_deferred_move() {
+async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_deferred_move() {
     for (index, post_processing_paused, superseded_pause) in
         [(0, false, false), (1, true, false), (2, false, true)]
     {
@@ -389,17 +391,25 @@ async fn accepted_pause_survives_draining_downloads_and_resumes_the_deferred_mov
         if superseded_pause {
             handle.resume_job(id).await.unwrap();
         }
+        let watermark = handle.job_revision();
         pipeline.apply_queue_intents().await;
+        // The download work drained before the boundary, so the pipeline
+        // refuses the pause: the job stays live, the view shows no pause
+        // intent, and the move deferred behind it is released.
+        assert!(handle.job_revision() > watermark);
         assert!(pipeline.deferred_moves.contains(&id));
         assert!(!pipeline.inflight_moves.contains(&id));
-        if !superseded_pause {
-            assert_eq!(
-                pipeline.jobs[&id].run_state,
-                crate::jobs::model::RunState::Paused
-            );
-            handle.resume_job(id).await.unwrap();
-            pipeline.apply_queue_intents().await;
-        }
+        assert_ne!(
+            pipeline.jobs[&id].run_state,
+            crate::jobs::model::RunState::Paused
+        );
+        assert!(pipeline.shared_state.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .any(|row| row.id == id && row.intents.paused != Some(true))
+        }));
+        assert_ne!(handle.get_job(id).unwrap().status, JobStatus::Paused);
         assert!(pipeline.pending_completion_checks.contains(&id));
         let mut events = handle.subscribe_events();
         pipeline.check_job_completion(id).await;

@@ -165,6 +165,7 @@ async fn history_delete_waits_for_retirement_but_never_needs_a_pipeline_turn() {
         Err(SchedulerError::Conflict(_))
     ));
     pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
     loop {
         if matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
         {
@@ -263,6 +264,7 @@ async fn retry_waits_for_cancelled_directory_cleanup_before_readmission() {
     assert!(handle.get_job(id).is_err());
     assert!(path.exists());
     pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
     while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
     {
     }
@@ -459,6 +461,7 @@ async fn final_delete_archives_before_the_event_and_erases_history_after_cleanup
     assert!(path.exists());
     assert!(pipeline.db.get_job_history(id.0).unwrap().is_none());
     pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
     while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
     {
     }
@@ -484,4 +487,135 @@ async fn final_delete_archives_before_the_event_and_erases_history_after_cleanup
     pipeline.report_all_for_test();
     assert!(handle.get_job(id).is_err());
     assert!(pipeline.db.get_job_history(id.0).unwrap().is_none());
+}
+
+// A fake provider on one listener: the first BODY it is asked for is the one
+// article of the job under test; every later BODY is left unanswered until
+// the client hangs up, so a second job stays mid-download without a timer.
+async fn spawn_one_article_server(payload: Vec<u8>) -> u16 {
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut article = Vec::new();
+    weaver_yenc::encode(&payload, &mut article, 128, "payload.bin").unwrap();
+    if !article.ends_with(b"\r\n") {
+        article.extend_from_slice(b"\r\n");
+    }
+    let article = Arc::new(article);
+    let served = Arc::new(AtomicBool::new(false));
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let article = Arc::clone(&article);
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let (reader, mut writer) = socket.into_split();
+                if writer.write_all(b"200 fixture ready\r\n").await.is_err() {
+                    return;
+                }
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let reply: Vec<u8> = if line == "CAPABILITIES" {
+                        b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n".to_vec()
+                    } else if line.starts_with("GROUP ") {
+                        b"211 1 1 1 alt.binaries.test\r\n".to_vec()
+                    } else if line.starts_with("BODY ") {
+                        if served.swap(true, Ordering::SeqCst) {
+                            // Held: answered by nothing until the client goes.
+                            while let Ok(Some(_)) = lines.next_line().await {}
+                            return;
+                        }
+                        let mut body = b"222 0 <article> body follows\r\n".to_vec();
+                        body.extend_from_slice(&article);
+                        body.extend_from_slice(b".\r\n");
+                        body
+                    } else if line == "QUIT" {
+                        let _ = writer.write_all(b"205 closing\r\n").await;
+                        return;
+                    } else {
+                        b"500 unsupported\r\n".to_vec()
+                    };
+                    if writer.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+// One job's disk write is held on the writer thread. Another job is added,
+// paused and cancelled meanwhile: each reply is recorded at once, the
+// pipeline acts on each, and the held job completes once its write lands.
+#[tokio::test]
+async fn held_segment_write_leaves_other_jobs_commands_answered() {
+    let port = spawn_one_article_server(vec![b'x'; 100]).await;
+    let server = weaver_nntp::ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port,
+        tls: false,
+        // Far beyond any run: the held BODY must never time out into a retry.
+        connect_timeout: Duration::from_secs(3600),
+        command_timeout: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let harness =
+        TestHarness::new_with_nntp(NntpClient::new(NntpClientConfig::single(server, 1)), 1).await;
+    let hold = crate::e2e_failpoint::Hold::install(
+        crate::e2e_failpoint::DISK_WRITE,
+        &harness._temp_dir.path().join("intermediate"),
+    );
+    let handle = &harness.handle;
+    let mut events = handle.subscribe_events();
+    let mut revisions = handle.subscribe_job_changes();
+    let a = JobId(9101);
+    let b = JobId(9102);
+    handle
+        .add_job(
+            a,
+            segmented_job_spec("held write", "payload.bin", &[100]),
+            PathBuf::from("held-write.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+    hold.arrived().await;
+
+    let watermark = handle.job_revision();
+    add(handle, b).await;
+    assert!(handle.job_revision() > watermark);
+    let watermark = handle.job_revision();
+    handle.pause_job(b).await.unwrap();
+    assert!(handle.job_revision() > watermark);
+    loop {
+        revisions.mark_unchanged();
+        if handle
+            .get_job(b)
+            .is_ok_and(|job| job.status == JobStatus::Paused)
+        {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    let watermark = handle.job_revision();
+    handle.cancel_job(b).await.unwrap();
+    assert!(handle.job_revision() > watermark);
+    assert!(handle.get_job(b).is_err());
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == b)
+    {
+    }
+    assert!(handle.list_jobs().iter().all(|job| job.job_id != b));
+    assert!(
+        handle
+            .get_job(a)
+            .is_ok_and(|job| job.status != JobStatus::Complete)
+    );
+
+    hold.release();
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCompleted { job_id, .. } if job_id == a)
+    {
+    }
+    assert_eq!(handle.get_job(a).unwrap().status, JobStatus::Complete);
 }

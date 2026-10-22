@@ -27,9 +27,13 @@ async fn cancel_batch(pipeline: &mut Pipeline, ids: &[JobId]) -> crate::jobs::Ca
         .queue
         .cancel_jobs(ids.iter().copied().collect(), CancellationOrigin::User);
     pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(pipeline).await;
+    // Every accepted id whose archive committed announces itself; one whose
+    // archive failed is live again instead.
     let mut pending: BTreeSet<_> = outcome
         .iter()
         .filter_map(|(id, result)| result.is_ok().then_some(*id))
+        .filter(|id| !pipeline.jobs.contains_key(id))
         .collect();
     while !pending.is_empty() {
         if let PipelineEvent::JobCancelled { job_id } = events.recv().await.unwrap() {
@@ -37,6 +41,29 @@ async fn cancel_batch(pipeline: &mut Pipeline, ids: &[JobId]) -> crate::jobs::Ca
         }
     }
     outcome
+}
+
+// Makes the history insert for `job_id` fail inside its archive transaction,
+// so that job's archive rolls back while the rest of the batch commits.
+async fn fail_history_insert_for(pipeline: &Pipeline, job_id: JobId) {
+    let datastore = pipeline.db.datastore();
+    let sql = format!(
+        "CREATE TRIGGER reject_cancel_archive BEFORE INSERT ON job_history WHEN NEW.job_id = {} BEGIN SELECT RAISE(ABORT, 'synthetic archive failure'); END",
+        job_id.0
+    );
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_archive_fault",
+        |tx| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                tx.execute(&sql, &[]).await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -131,4 +158,95 @@ async fn cancel_event_follows_a_readable_history_row() {
     for job_id in ids {
         assert_eq!(seen[&job_id].as_deref(), Some("cancelled"));
     }
+}
+
+#[tokio::test]
+async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let ids = [JobId(31_401), JobId(31_402), JobId(31_403)];
+    insert_queued_jobs(&mut pipeline, &ids).await;
+    let failing = JobId(31_402);
+    fail_history_insert_for(&pipeline, failing).await;
+    let mut events = pipeline.event_tx.subscribe();
+
+    let outcome = cancel_batch(&mut pipeline, &ids).await;
+
+    // Every intent was recorded. The failed id stays the live job: in
+    // memory, visible in the Queue with no cancel pending, with its active
+    // row and no history row.
+    assert!(outcome.values().all(Result::is_ok));
+    assert!(pipeline.jobs.contains_key(&failing));
+    assert!(
+        pipeline
+            .shared_state
+            .list_jobs()
+            .iter()
+            .any(|job| job.job_id == failing)
+    );
+    assert!(pipeline.shared_state.queue.read(|inner| {
+        inner.jobs.iter().any(|row| {
+            row.id == failing
+                && row.intents.cancelled.is_none()
+                && !row.intents.delete_history_after_cancel
+                && !row.report.retiring
+        })
+    }));
+    assert!(pipeline.db.get_job_history(failing.0).unwrap().is_none());
+    assert!(
+        pipeline
+            .db
+            .load_active_jobs()
+            .unwrap()
+            .contains_key(&failing)
+    );
+    // The rest of the batch committed and left, one `JobCancelled` each.
+    for job_id in [ids[0], ids[2]] {
+        assert!(!pipeline.jobs.contains_key(&job_id));
+        assert_eq!(
+            pipeline
+                .db
+                .get_job_history(job_id.0)
+                .unwrap()
+                .expect("archived")
+                .status,
+            "cancelled"
+        );
+    }
+    let mut announced = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let PipelineEvent::JobCancelled { job_id } = event {
+            announced.push(job_id);
+        }
+    }
+    announced.sort();
+    assert_eq!(announced, vec![ids[0], ids[2]]);
+
+    // Recoverable: once the fault clears, the same job cancels cleanly.
+    let datastore = pipeline.db.datastore();
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_archive_fault",
+        |tx| {
+            Box::pin(async move {
+                tx.execute("DROP TRIGGER reject_cancel_archive", &[])
+                    .await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
+    let retried = cancel_batch(&mut pipeline, &[failing]).await;
+    assert!(retried[&failing].is_ok());
+    assert!(!pipeline.jobs.contains_key(&failing));
+    assert_eq!(
+        pipeline
+            .db
+            .get_job_history(failing.0)
+            .unwrap()
+            .expect("archived")
+            .status,
+        "cancelled"
+    );
 }

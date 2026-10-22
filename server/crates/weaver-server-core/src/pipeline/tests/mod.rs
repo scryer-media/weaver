@@ -1915,11 +1915,25 @@ async fn cancel_one_job(
         .remove(&job_id)
         .unwrap()?;
     pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(pipeline).await;
     loop {
         if matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id: id } if id == job_id)
         {
             return Ok(());
         }
+    }
+}
+
+// Hands the actor the archive outcome of the one cancel batch in flight.
+async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
+    match pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    {
+        TerminalPostProcessingEvent::CancelJobsDone(done) => pipeline.handle_cancel_jobs_done(done),
+        _ => panic!("expected the cancel's archive done event"),
     }
 }
 

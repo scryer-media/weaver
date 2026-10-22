@@ -12,6 +12,7 @@ mod runtime;
 mod scripts;
 mod state;
 
+pub(super) use commands::CancelJobsDone;
 pub(super) use runtime::timestamp_secs;
 pub(crate) use runtime::{
     DirectWriteBatches, SegmentWriteBatchError, close_cached_write_handles_under,

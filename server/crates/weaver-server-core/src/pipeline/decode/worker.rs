@@ -3592,6 +3592,17 @@ impl Pipeline {
         hash_mode: SegmentHashMode,
     ) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.commit_persisted_segment");
+        // Every segment the disk write answered for passes here once, so the
+        // job's placed bytes move with the write itself.
+        if let Some(counters) = self
+            .shared_state
+            .queue
+            .job_counters(segment.segment_id.file_id.job_id)
+        {
+            counters
+                .placed
+                .fetch_add(segment.len_bytes() as u64, Ordering::Relaxed);
+        }
         if let Some(unresolved) = segment.damaged_source.as_ref() {
             let source = &unresolved.source;
             let status = unresolved.status;

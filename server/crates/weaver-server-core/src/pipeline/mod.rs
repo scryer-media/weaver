@@ -1845,6 +1845,7 @@ pub(super) enum TerminalPostProcessingEvent {
     AddedScriptsDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
+    CancelJobsDone(orchestrator::CancelJobsDone),
 }
 
 pub(super) struct TerminalPostProcessingDone {

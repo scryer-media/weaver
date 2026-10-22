@@ -61,11 +61,24 @@ impl Pipeline {
         }
     }
 
-    pub(crate) fn report_diagnostics(&self) {
+    // The snapshot walks the actor's maps, so it is built only when the
+    // diagnostics endpoint has asked for one since the last answer.
+    pub(crate) fn answer_diagnostics_request(&self) {
+        let requested = self.shared_state.queue.read(|inner| {
+            (inner.diagnostics_requested
+                > inner
+                    .diagnostics
+                    .as_ref()
+                    .map_or(0, |(answered, _)| *answered))
+            .then_some(inner.diagnostics_requested)
+        });
+        let Some(requested) = requested else {
+            return;
+        };
         let diagnostics = self.diagnostics_snapshot();
         self.shared_state.queue.write(|inner| {
-            inner.diagnostics = Some(diagnostics);
-            Change::unchanged(())
+            inner.diagnostics = Some((requested, diagnostics));
+            Change::changed(())
         });
     }
 
@@ -104,6 +117,5 @@ impl Pipeline {
         for id in &self.job_order {
             self.report_job(*id);
         }
-        self.report_diagnostics();
     }
 }

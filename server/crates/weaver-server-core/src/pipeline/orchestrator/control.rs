@@ -6,6 +6,7 @@ use crate::pipeline::queue::Change;
 
 impl Pipeline {
     pub(crate) async fn apply_queue_intents(&mut self) {
+        self.answer_diagnostics_request();
         self.apply_queue_globals().await;
         let restores = self.shared_state.queue.write(|inner| {
             Change::unchanged(
@@ -118,6 +119,10 @@ impl Pipeline {
                 }
                 self.terminal_post_processing_executor.cancel_job(job_id.0);
             }
+            // A pause or resume the job's state no longer allows is refused
+            // here: the user's flag is withdrawn so the view never shows an
+            // intent the pipeline did not act on.
+            let mut refused = false;
             if let Some(paused) = intents.paused.filter(|_| apply_pause) {
                 if paused {
                     self.demand_direct_store_barriers_for_pause(Some(job_id))
@@ -128,29 +133,42 @@ impl Pipeline {
                 } else {
                     self.resume_restored_job(job_id).await
                 };
-                if result.is_ok() {
-                    if !paused
-                        && (self.deferred_moves.contains(&job_id)
-                            || self.deferred_post_processing.contains(&job_id))
-                    {
-                        self.schedule_job_completion_check(job_id);
+                match result {
+                    Ok(()) => {
+                        self.report_job(job_id);
+                        if paused {
+                            self.emit_download_finished_if_active(job_id);
+                        }
+                        self.emit_job_event(if paused {
+                            PipelineEvent::JobPaused { job_id }
+                        } else {
+                            PipelineEvent::JobResumed { job_id }
+                        });
                     }
-                    self.report_job(job_id);
-                    if paused {
-                        self.emit_download_finished_if_active(job_id);
+                    Err(error) => {
+                        warn!(job_id = job_id.0, paused, %error, "pipeline refused the job's pause intent");
+                        refused = true;
                     }
-                    self.emit_job_event(if paused {
-                        PipelineEvent::JobPaused { job_id }
-                    } else {
-                        PipelineEvent::JobResumed { job_id }
-                    });
+                }
+                // Work deferred behind the pause intent goes once the job
+                // is live, whether the intent was a resume or was refused.
+                if self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| state.run_state != crate::jobs::model::RunState::Paused)
+                    && (self.deferred_moves.contains(&job_id)
+                        || self.deferred_post_processing.contains(&job_id))
+                {
+                    self.schedule_job_completion_check(job_id);
                 }
             }
             self.apply_pending_job_update(job_id);
-            self.report_job(job_id);
             self.shared_state.queue.write(|inner| {
                 if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) {
                     row.report.seen_intent_seq = intents.seq;
+                    if refused && row.intents.pause_seq == intents.pause_seq {
+                        row.intents.paused = None;
+                    }
                     if row.intents.seq == intents.seq {
                         row.intents.update = None;
                         row.intents.cancel_post_processing = false;
@@ -158,6 +176,7 @@ impl Pipeline {
                 }
                 Change::changed(())
             });
+            self.report_job(job_id);
         }
         let renames = self.shared_state.queue.read(|inner| {
             inner

@@ -72,7 +72,10 @@ pub struct QueueInner {
     pub(crate) history_operations: std::collections::HashSet<JobId>,
     pub(crate) pending_cleanup: std::collections::HashSet<JobId>,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
-    pub(crate) diagnostics: Option<crate::pipeline::diagnostics::PipelineDiagnostics>,
+    // The endpoint's request count and the pipeline's latest answer, tagged
+    // with the request count it answers.
+    pub(crate) diagnostics_requested: u64,
+    pub(crate) diagnostics: Option<(u64, crate::pipeline::diagnostics::PipelineDiagnostics)>,
     pub(crate) metrics: Option<crate::operations::metrics::MetricsSnapshot>,
 }
 
