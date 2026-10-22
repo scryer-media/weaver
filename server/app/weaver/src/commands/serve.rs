@@ -5,14 +5,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast};
 use tracing::{error, info, warn};
 
 use crate::{heartbeat, http, restart, shutdown, wiring};
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
-use weaver_server_core::{Database, Pipeline, SchedulerCommand, SchedulerHandle};
+use weaver_server_core::{Database, Pipeline, SchedulerHandle};
 
 pub(crate) async fn run(
     config: Config,
@@ -174,13 +174,12 @@ pub(crate) async fn run(
     // Wrap config for shared runtime access.
     let shared_config: SharedConfig = Arc::new(RwLock::new(config));
 
-    // Set up scheduler channels and shared control-plane state.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
+    // Set up events and shared control-plane state.
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let metrics = weaver_server_core::PipelineMetrics::new();
     // SharedPipelineState starts empty; initial_history is published below after recovery.
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
-    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+    let handle = SchedulerHandle::new(event_tx.clone(), shared_state.clone());
     handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
     handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(Arc::clone(nntp.pool()));
@@ -198,7 +197,7 @@ pub(crate) async fn run(
     let initial_global_paused = recovered_state.initial_global_paused;
 
     // Publish recovered history to shared state so the API has data immediately.
-    shared_state.publish_jobs(initial_history.clone());
+    shared_state.load_history(initial_history.clone());
 
     let rss = weaver_server_api::RssService::new(handle.clone(), shared_config.clone(), db.clone());
     let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
@@ -232,7 +231,7 @@ pub(crate) async fn run(
     let api_key_cache =
         weaver_server_core::auth::ApiKeyCache::from_rows(db.list_api_key_auth_rows()?);
 
-    // Load schedules from DB and spawn the schedule evaluator.
+    // Load schedules before preparing the runtime; replay starts afterwards.
     let shared_schedules: weaver_server_core::bandwidth::schedule::SharedSchedules = {
         let initial = db.list_schedules().unwrap_or_else(|error| {
             error!(%error, "failed to load schedules; scheduled holds are unavailable until the settings are repaired");
@@ -240,21 +239,6 @@ pub(crate) async fn run(
         });
         std::sync::Arc::new(tokio::sync::RwLock::new(initial))
     };
-    let (schedule_task, schedules_replayed) =
-        weaver_server_core::bandwidth::schedule::spawn_evaluator_with_services(
-            handle.clone(),
-            shared_schedules.clone(),
-            weaver_server_core::bandwidth::schedule::ScheduleServices {
-                watch_folder: Some(watch_folder.clone()),
-                rss: Some(rss.clone()),
-                servers: Some(weaver_server_core::servers::service::ServersService::new(
-                    db.clone(),
-                    shared_config.clone(),
-                    handle.clone(),
-                )),
-                db: Some(db.clone()),
-            },
-        );
     let pipeline_config = shared_config.clone();
 
     // Spawn event persistence subscriber (records meaningful events to SQLite).
@@ -273,7 +257,6 @@ pub(crate) async fn run(
     let maintenance_complete_dir = complete_dir.clone();
     let iops_probe_dir = data_dir.clone();
     let mut pipeline = Pipeline::new(
-        cmd_rx,
         event_tx,
         nntp,
         Arc::clone(&buffers),
@@ -290,6 +273,29 @@ pub(crate) async fn run(
         pipeline_config,
     )
     .await?;
+
+    // Queue every recovered row before HTTP or intake can observe readiness.
+    // Installing the tickets remains asynchronous on the pipeline.
+    enqueue_restore_tickets(&handle, to_restore).await;
+
+    // Construction seeds the Queue globals. Replay must follow that seed so
+    // accepted schedule intents cannot be overwritten by startup defaults.
+    // Spawning installs the initial replay hold before the actor or intake starts.
+    let (schedule_task, schedules_replayed) =
+        weaver_server_core::bandwidth::schedule::spawn_evaluator_with_services(
+            handle.clone(),
+            shared_schedules.clone(),
+            weaver_server_core::bandwidth::schedule::ScheduleServices {
+                watch_folder: Some(watch_folder.clone()),
+                rss: Some(rss.clone()),
+                servers: Some(weaver_server_core::servers::service::ServersService::new(
+                    db.clone(),
+                    shared_config.clone(),
+                    handle.clone(),
+                )),
+                db: Some(db.clone()),
+            },
+        );
 
     let nntp_pool = pipeline.nntp_pool();
     // The pipeline's own free-space samplers: metrics and the NZBGet status
@@ -525,14 +531,6 @@ pub(crate) async fn run(
         })
     };
 
-    // Restore in-progress jobs from SQLite after the listener is available so
-    // long restore passes do not block process readiness.
-    for candidate in to_restore {
-        match handle.restore_job(candidate.request).await {
-            Ok(()) => info!(job_id = candidate.job_id.0, "job restored"),
-            Err(e) => error!(job_id = candidate.job_id.0, error = %e, "failed to restore job"),
-        }
-    }
     match weaver_server_core::ingest::reconcile_semantic_promotions(&db, &handle).await {
         Ok(count) if count > 0 => info!(count, "recovered semantic promotion claims"),
         Ok(_) => {}
@@ -669,6 +667,82 @@ pub(crate) async fn run(
     heartbeat::log_peak_rss();
 
     Ok(stop)
+}
+
+async fn enqueue_restore_tickets(
+    handle: &SchedulerHandle,
+    candidates: Vec<weaver_server_core::operations::RestoreCandidate>,
+) {
+    for candidate in candidates {
+        match handle.restore_job(candidate.request).await {
+            Ok(()) => info!(job_id = candidate.job_id.0, "job queued for restoration"),
+            Err(e) => {
+                error!(job_id = candidate.job_id.0, error = %e, "failed to queue job restoration")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod restore_ticket_tests {
+    use super::*;
+    use weaver_server_core::{JobId, JobSpec, JobStatus, RestoreJobRequest, SharedPipelineState};
+
+    #[tokio::test]
+    async fn recovered_rows_are_visible_and_controllable_before_pipeline_start() {
+        let state = SharedPipelineState::new(weaver_server_core::PipelineMetrics::new(), vec![]);
+        let (events, _) = broadcast::channel(16);
+        let handle = SchedulerHandle::new(events, state);
+        let candidates =
+            [JobId(42), JobId(7)].map(|job_id| weaver_server_core::operations::RestoreCandidate {
+                job_id,
+                queue_position: None,
+                request: RestoreJobRequest {
+                    job_id,
+                    job_hash: [0; 32],
+                    spec: JobSpec {
+                        name: format!("restore-{}", job_id.0),
+                        password: None,
+                        category: None,
+                        metadata: vec![],
+                        files: vec![],
+                        total_bytes: 0,
+                    },
+                    complete_files: Default::default(),
+                    file_progress: Default::default(),
+                    detected_archives: Default::default(),
+                    file_identities: Default::default(),
+                    extracted_members: Default::default(),
+                    status: JobStatus::Queued,
+                    download_state: None,
+                    post_state: None,
+                    run_state: None,
+                    queued_repair_at_epoch_ms: None,
+                    queued_extract_at_epoch_ms: None,
+                    paused_resume_status: None,
+                    paused_resume_download_state: None,
+                    paused_resume_post_state: None,
+                    working_dir: PathBuf::from(format!("restore-fixture/{}", job_id.0)),
+                },
+            });
+
+        enqueue_restore_tickets(&handle, candidates.into()).await;
+
+        let first_view = handle.list_jobs();
+        assert_eq!(
+            first_view.iter().map(|job| job.job_id).collect::<Vec<_>>(),
+            vec![JobId(42), JobId(7)]
+        );
+        assert!(
+            first_view
+                .iter()
+                .all(|job| { job.download_wait_reason.as_deref() == Some("Restoring saved job") })
+        );
+        handle.pause_job(JobId(42)).await.unwrap();
+        handle.cancel_job(JobId(7)).await.unwrap();
+        assert_eq!(handle.list_jobs().len(), 1);
+        assert!(handle.queued_job_ids().contains(&JobId(7)));
+    }
 }
 
 // The GraphQL endpoint as a script on this host reaches it, given the address

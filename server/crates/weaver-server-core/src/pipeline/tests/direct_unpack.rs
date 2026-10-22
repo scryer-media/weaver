@@ -2377,6 +2377,7 @@ async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
 fn queue_download_work(pipeline: &mut Pipeline, job_id: JobId, message_id: &str) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.download_queue.push(DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id,

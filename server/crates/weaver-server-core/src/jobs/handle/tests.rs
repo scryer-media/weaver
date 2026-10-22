@@ -1,180 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::events::model::PipelineEvent;
-use crate::jobs::assembly::JobAssembly;
 use crate::jobs::ids::JobId;
 
 use super::*;
-use crate::jobs::model::{FieldUpdate, JobSpec, JobState, JobStatus, JobUpdate, epoch_ms_now};
+use crate::jobs::model::{FieldUpdate, JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::PipelineMetrics;
-use crate::pipeline::download::queue::DownloadQueue;
-
-fn runtime_lanes_for_status(
-    status: &JobStatus,
-) -> (
-    crate::jobs::model::DownloadState,
-    crate::jobs::model::PostState,
-    crate::jobs::model::RunState,
-    Option<String>,
-) {
-    match status {
-        JobStatus::AwaitingQueueScripts => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::AwaitingQueueScripts,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Queued => (
-            crate::jobs::model::DownloadState::Queued,
-            crate::jobs::model::PostState::Idle,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Downloading => (
-            crate::jobs::model::DownloadState::Downloading,
-            crate::jobs::model::PostState::Idle,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Checking => (
-            crate::jobs::model::DownloadState::Checking,
-            crate::jobs::model::PostState::Idle,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Verifying => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::Verifying,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::QueuedRepair => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::QueuedRepair,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Repairing => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::Repairing,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::QueuedExtract => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::QueuedExtract,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Extracting => (
-            crate::jobs::model::DownloadState::Downloading,
-            crate::jobs::model::PostState::Extracting,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Moving => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::Finalizing,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::QueuedPostProcessing => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::QueuedPostProcessing,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::PostProcessing => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::PostProcessing,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Complete => (
-            crate::jobs::model::DownloadState::Complete,
-            crate::jobs::model::PostState::Completed,
-            crate::jobs::model::RunState::Active,
-            None,
-        ),
-        JobStatus::Failed { error } => (
-            crate::jobs::model::DownloadState::Failed,
-            crate::jobs::model::PostState::Failed,
-            crate::jobs::model::RunState::Active,
-            Some(error.clone()),
-        ),
-        JobStatus::Paused => (
-            crate::jobs::model::DownloadState::Downloading,
-            crate::jobs::model::PostState::Idle,
-            crate::jobs::model::RunState::Paused,
-            None,
-        ),
-    }
-}
-
-fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
-    jobs.values()
-        .map(|state| JobInfo {
-            job_id: state.job_id,
-            job_hash: Some(state.job_hash),
-            name: state.spec.name.clone(),
-            error: if let JobStatus::Failed { error } = &state.status {
-                Some(error.clone())
-            } else {
-                None
-            },
-            download_wait_reason: None,
-            download_retry_at_epoch_ms: None,
-            status: state.status.clone(),
-            download_state: state.download_state,
-            finalizing_download: false,
-            fetching_repair_data: false,
-            post_state: state.post_state,
-            run_state: state.run_state,
-            progress: state.assembly.progress(),
-            total_bytes: state.spec.total_bytes,
-            downloaded_bytes: 0,
-            optional_recovery_bytes: 0,
-            optional_recovery_downloaded_bytes: 0,
-            phase_progress: Vec::new(),
-            failed_bytes: 0,
-            health: 1000,
-            terminal_discards: Vec::new(),
-            total_files: 0,
-            completed_files: 0,
-            remaining_par_files: 0,
-            password: state.spec.password.clone(),
-            category: state.spec.category.clone(),
-            metadata: state.spec.metadata.clone(),
-            output_dir: None,
-            server_attribution: Vec::new(),
-            created_at_epoch_ms: state.created_at_epoch_ms,
-        })
-        .collect()
-}
 
 #[test]
 fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
     let metrics = PipelineMetrics::new();
     let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
+    let now = std::time::Instant::now();
+    shared_state.refresh_metrics_snapshot(now);
 
-    std::thread::sleep(Duration::from_millis(60));
     metrics
         .bytes_downloaded
         .fetch_add(256 * 1024, Ordering::Relaxed);
-    shared_state.refresh_metrics_snapshot();
+    shared_state.refresh_metrics_snapshot(now + Duration::from_secs(1));
 
     let initial = shared_state.metrics_snapshot();
     assert!(initial.current_download_speed > 0);
 
     for _ in 0..24 {
-        std::thread::sleep(Duration::from_millis(60));
         let cached = shared_state.metrics_snapshot();
         assert_eq!(
             cached.current_download_speed,
@@ -182,7 +36,7 @@ fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
         );
     }
 
-    shared_state.refresh_metrics_snapshot();
+    shared_state.refresh_metrics_snapshot(now + Duration::from_secs(3));
     let refreshed = shared_state.metrics_snapshot();
     assert!(refreshed.current_download_speed < initial.current_download_speed);
 }
@@ -191,18 +45,18 @@ fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
 fn raw_metrics_snapshot_reads_do_not_cool_shared_speed_tracker() {
     let metrics = PipelineMetrics::new();
     let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
+    let now = std::time::Instant::now();
+    shared_state.refresh_metrics_snapshot(now);
 
-    std::thread::sleep(Duration::from_millis(60));
     metrics
         .bytes_downloaded
         .fetch_add(256 * 1024, Ordering::Relaxed);
-    shared_state.refresh_metrics_snapshot();
+    shared_state.refresh_metrics_snapshot(now + Duration::from_secs(1));
 
     let initial = shared_state.metrics_snapshot();
     assert!(initial.current_download_speed > 0);
 
     for _ in 0..24 {
-        std::thread::sleep(Duration::from_millis(60));
         let live = shared_state.raw_metrics_snapshot();
         assert_eq!(live.bytes_downloaded, 256 * 1024);
     }
@@ -213,402 +67,51 @@ fn raw_metrics_snapshot_reads_do_not_cool_shared_speed_tracker() {
         initial.current_download_speed
     );
 
-    shared_state.refresh_metrics_snapshot();
+    shared_state.refresh_metrics_snapshot(now + Duration::from_secs(3));
     let refreshed = shared_state.metrics_snapshot();
     assert!(refreshed.current_download_speed < initial.current_download_speed);
 }
 
-// Create a test scheduler handle with a minimal background loop.
-fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
-    let (event_tx, _) = broadcast::channel(256);
-    let metrics = PipelineMetrics::new();
-    let shared_state = SharedPipelineState::new(metrics, vec![]);
-
-    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
-
+// Exercise the real admission and pipeline boundaries, including persistence.
+async fn test_scheduler() -> (SchedulerHandle, tokio::task::JoinHandle<()>) {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
     let task = tokio::spawn(async move {
-        let mut jobs: HashMap<JobId, JobState> = HashMap::new();
-
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
-                SchedulerCommand::AddJob {
-                    job_id,
-                    spec,
-                    nzb_path: _,
-                    options,
-                    reply,
-                    ..
-                } => {
-                    if jobs.contains_key(&job_id) {
-                        let _ = reply.send(Err(SchedulerError::JobExists(job_id)));
-                        continue;
-                    }
-                    let assembly = JobAssembly::new(job_id);
-                    let par2_bytes = spec.par2_bytes();
-                    let status = if options.initially_paused {
-                        JobStatus::Paused
-                    } else {
-                        JobStatus::Queued
-                    };
-                    let (download_state, post_state, run_state, failure_error) =
-                        if options.initially_paused {
-                            (
-                                crate::jobs::model::DownloadState::Queued,
-                                crate::jobs::model::PostState::Idle,
-                                crate::jobs::model::RunState::Paused,
-                                None,
-                            )
-                        } else {
-                            runtime_lanes_for_status(&status)
-                        };
-                    let state = JobState {
-                        job_id,
-                        job_hash: [0; 32],
-                        spec,
-                        status,
-                        download_state,
-                        post_state,
-                        run_state,
-                        assembly,
-                        extraction_depth: 0,
-                        created_at: std::time::Instant::now(),
-                        created_at_epoch_ms: epoch_ms_now(),
-                        queued_repair_at_epoch_ms: None,
-                        queued_extract_at_epoch_ms: None,
-                        paused_resume_status: options.initially_paused.then_some(JobStatus::Queued),
-                        paused_resume_download_state: options
-                            .initially_paused
-                            .then_some(crate::jobs::model::DownloadState::Queued),
-                        paused_resume_post_state: options
-                            .initially_paused
-                            .then_some(crate::jobs::model::PostState::Idle),
-                        failure_error,
-                        working_dir: PathBuf::from("/tmp/test"),
-                        downloaded_bytes: 0,
-                        restored_download_floor_bytes: 0,
-                        downloaded_wire_bytes: 0,
-                        server_attribution: Default::default(),
-                        failed_bytes: 0,
-                        probe_projected_failed_bytes: 0,
-                        par2_bytes,
-                        health_probing: false,
-                        health_deferral: Default::default(),
-                        health_probe_round: 0,
-                        announced_checkpoints: Default::default(),
-                        health_probe_failing_files: 0,
-                        health_failing_files: std::collections::HashSet::new(),
-                        early_recovery_requested_blocks: 0,
-                        last_health_probe_failed_bytes: 0,
-                        next_health_probe_failed_bytes: 1,
-                        support_facts: Default::default(),
-                        detected_archives: HashMap::new(),
-                        file_identities: HashMap::new(),
-                        held_segments: Vec::new(),
-                        download_queue: DownloadQueue::new(),
-                        recovery_queue: DownloadQueue::new(),
-                        staging_dir: None,
-                        category_bytes: None,
-                        nzb_password_candidates: Default::default(),
-                    };
-                    let _ = event_tx.send(PipelineEvent::JobCreated {
-                        job_id,
-                        name: state.spec.name.clone(),
-                        total_files: state.spec.files.len() as u32,
-                        total_bytes: state.spec.total_bytes,
-                    });
-                    jobs.insert(job_id, state);
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::PauseJob { job_id, reply } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) => {
-                            let previous_download_state = state.download_state;
-                            let previous_post_state = state.post_state;
-                            state.paused_resume_status =
-                                Some(crate::jobs::model::derive_legacy_job_status(
-                                    previous_download_state,
-                                    previous_post_state,
-                                    crate::jobs::model::RunState::Active,
-                                    None,
-                                ));
-                            state.paused_resume_download_state = Some(previous_download_state);
-                            state.paused_resume_post_state = Some(previous_post_state);
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Paused);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            state.refresh_legacy_status();
-                            let _ = event_tx.send(PipelineEvent::JobPaused { job_id });
-                            Ok(())
-                        }
-                        None => Err(SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::ResumeJob { job_id, reply } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) => {
-                            let resume_status = state
-                                .paused_resume_status
-                                .take()
-                                .unwrap_or(JobStatus::Downloading);
-                            let (default_download_state, default_post_state, run_state, _) =
-                                runtime_lanes_for_status(&resume_status);
-                            let download_state = state
-                                .paused_resume_download_state
-                                .take()
-                                .unwrap_or(default_download_state);
-                            let post_state = state
-                                .paused_resume_post_state
-                                .take()
-                                .unwrap_or(default_post_state);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            state.refresh_legacy_status();
-                            let _ = event_tx.send(PipelineEvent::JobResumed { job_id });
-                            Ok(())
-                        }
-                        None => Err(SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::CancelJobs { job_ids, reply, .. } => {
-                    let results = job_ids
-                        .into_iter()
-                        .map(|job_id| {
-                            let result = if jobs.remove(&job_id).is_some() {
-                                Ok(())
-                            } else {
-                                Err(SchedulerError::JobNotFound(job_id))
-                            };
-                            (job_id, result)
-                        })
-                        .collect();
-                    let _ = reply.send(results);
-                }
-                SchedulerCommand::PauseAll { reply } => {
-                    shared_state.set_paused(true);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                    shared_state.set_speed_test_paused(paused);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::ResumeAll { reply } => {
-                    shared_state.set_paused(false);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::SetPropagationDelay { reply, .. }
-                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::RebuildNntp { reply, .. } => {
-                    let _ = reply.send(Ok(NntpRuntimeActivation {
-                        generation: 1,
-                        configured_connections: 0,
-                    }));
-                }
-                SchedulerCommand::UpdateRuntimePaths { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::ApplyScheduleAction { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::SetHardwareProfile { reply, .. }
-                | SchedulerCommand::SetScheduledHardwareProfile { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::RestoreJob { request, reply } => {
-                    let RestoreJobRequest {
-                        job_id,
-                        spec,
-                        status,
-                        working_dir,
-                        ..
-                    } = *request;
-                    let assembly = JobAssembly::new(job_id);
-                    let par2_bytes = spec.par2_bytes();
-                    let (download_state, post_state, run_state, failure_error) =
-                        runtime_lanes_for_status(&status);
-                    let state = JobState {
-                        job_id,
-                        job_hash: [0; 32],
-                        spec,
-                        status,
-                        download_state,
-                        post_state,
-                        run_state,
-                        assembly,
-                        extraction_depth: 0,
-                        created_at: std::time::Instant::now(),
-                        created_at_epoch_ms: epoch_ms_now(),
-                        queued_repair_at_epoch_ms: None,
-                        queued_extract_at_epoch_ms: None,
-                        paused_resume_status: None,
-                        paused_resume_download_state: None,
-                        paused_resume_post_state: None,
-                        failure_error,
-                        working_dir,
-                        downloaded_bytes: 0,
-                        restored_download_floor_bytes: 0,
-                        downloaded_wire_bytes: 0,
-                        server_attribution: Default::default(),
-                        failed_bytes: 0,
-                        probe_projected_failed_bytes: 0,
-                        par2_bytes,
-                        health_probing: false,
-                        health_deferral: Default::default(),
-                        health_probe_round: 0,
-                        announced_checkpoints: Default::default(),
-                        health_probe_failing_files: 0,
-                        health_failing_files: std::collections::HashSet::new(),
-                        early_recovery_requested_blocks: 0,
-                        last_health_probe_failed_bytes: 0,
-                        next_health_probe_failed_bytes: 1,
-                        support_facts: Default::default(),
-                        detected_archives: HashMap::new(),
-                        file_identities: HashMap::new(),
-                        held_segments: Vec::new(),
-                        download_queue: DownloadQueue::new(),
-                        recovery_queue: DownloadQueue::new(),
-                        staging_dir: None,
-                        category_bytes: None,
-                        nzb_password_candidates: Default::default(),
-                    };
-                    jobs.insert(job_id, state);
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::DeleteHistory { job_ids, reply, .. } => {
-                    let _ = reply.send(Ok(crate::HistoryDeleteBatchOutcome {
-                        deleted: job_ids
-                            .into_iter()
-                            .map(|job_id| (job_id, Default::default()))
-                            .collect(),
-                        refused: Default::default(),
-                    }));
-                }
-                SchedulerCommand::ReprocessJob {
-                    job_id,
-                    password,
-                    reply,
-                } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Downloading);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            if let Some(password) = password {
-                                state.spec.password = Some(password);
-                            }
-                            state.failure_error = None;
-                            state.refresh_legacy_status();
-                            Ok(())
-                        }
-                        Some(_) => Err(SchedulerError::Conflict(format!(
-                            "job {} is not failed",
-                            job_id.0
-                        ))),
-                        None => Err(SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::RedownloadJob {
-                    job_id,
-                    password,
-                    reply,
-                } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Queued);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            if let Some(password) = password {
-                                state.spec.password = Some(password);
-                            }
-                            state.failure_error = None;
-                            state.refresh_legacy_status();
-                            Ok(())
-                        }
-                        Some(_) => Err(SchedulerError::Conflict(format!(
-                            "job {} is not failed",
-                            job_id.0
-                        ))),
-                        None => Err(SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::UpdateJob {
-                    job_id,
-                    update,
-                    reply,
-                } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) => {
-                            update.apply_to_spec(&mut state.spec);
-                            Ok(())
-                        }
-                        None => Err(SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::UpdateHistory { job_id, reply, .. } => {
-                    let _ = reply.send(Err(SchedulerError::JobNotFound(job_id)));
-                }
-                SchedulerCommand::ReorderJob { job_id, reply, .. } => {
-                    let result = if jobs.contains_key(&job_id) {
-                        Ok(())
-                    } else {
-                        Err(SchedulerError::JobNotFound(job_id))
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::ReorderJobs { moves, reply } => {
-                    // This mock does not track a manual queue order, so there
-                    // is nothing to splice; just validate that every job id in
-                    // the batch is known, mirroring the all-or-nothing
-                    // contract of the real handler.
-                    let result = match moves.iter().find(|(job_id, _)| !jobs.contains_key(job_id)) {
-                        Some((job_id, _)) => Err(SchedulerError::JobNotFound(*job_id)),
-                        None => Ok(()),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::PausePostProcessing { reply }
-                | SchedulerCommand::ResumePostProcessing { reply } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::CancelPostProcessing { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                // This stub has no pipeline behind it, so the reply channel is
-                // dropped and the caller sees the command go unanswered.
-                SchedulerCommand::PipelineDiagnostics { .. } => {}
-                SchedulerCommand::Shutdown => break,
-            }
-            // Publish updated job list to shared state after every command.
-            shared_state.publish_jobs(build_job_list(&jobs));
-        }
+        let _temp = temp;
+        pipeline.run().await;
     });
-
     (handle, task)
+}
+
+async fn wait_status(handle: &SchedulerHandle, id: JobId, status: JobStatus) -> JobInfo {
+    let mut changes = handle.subscribe_job_changes();
+    loop {
+        let info = handle.get_job(id).unwrap();
+        if info.status == status {
+            return info;
+        }
+        changes.changed().await.unwrap();
+    }
 }
 
 fn make_spec(name: &str) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
-        files: vec![],
-        total_bytes: 1_000_000,
+        files: vec![crate::FileSpec {
+            filename: "payload.bin".into(),
+            role: weaver_model::files::FileRole::Standalone,
+            groups: vec!["alt.binaries.test".into()],
+            posted_at_epoch: None,
+            segments: vec![crate::SegmentSpec {
+                ordinal: 0,
+                article_number: 1,
+                bytes: 10,
+                message_id: "abc@test".into(),
+            }],
+        }],
+        total_bytes: 10,
         category: None,
         metadata: vec![],
     }
@@ -631,7 +134,7 @@ fn sample_nzb_zstd() -> Vec<u8> {
 
 #[tokio::test]
 async fn update_random_read_iops_reaches_scheduler() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle.update_random_read_iops(1_500.0).await.unwrap();
 
@@ -641,7 +144,7 @@ async fn update_random_read_iops_reaches_scheduler() {
 
 #[tokio::test]
 async fn add_and_list_jobs() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle
         .add_job(
@@ -675,7 +178,7 @@ async fn add_and_list_jobs() {
 
 #[tokio::test]
 async fn add_job_with_options_can_start_paused_and_resume_to_queued() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle
         .add_job_with_options(
@@ -702,7 +205,7 @@ async fn add_job_with_options_can_start_paused_and_resume_to_queued() {
     assert_eq!(info.run_state, crate::jobs::model::RunState::Paused);
 
     handle.resume_job(JobId(1)).await.unwrap();
-    let info = handle.get_job(JobId(1)).unwrap();
+    let info = wait_status(&handle, JobId(1), JobStatus::Queued).await;
     assert_eq!(info.status, JobStatus::Queued);
     assert_eq!(
         info.download_state,
@@ -716,7 +219,7 @@ async fn add_job_with_options_can_start_paused_and_resume_to_queued() {
 
 #[tokio::test]
 async fn pause_resume() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle
         .add_job(
@@ -729,11 +232,11 @@ async fn pause_resume() {
         .unwrap();
 
     handle.pause_job(JobId(1)).await.unwrap();
-    let info = handle.get_job(JobId(1)).unwrap();
+    let info = wait_status(&handle, JobId(1), JobStatus::Paused).await;
     assert_eq!(info.status, JobStatus::Paused);
 
     handle.resume_job(JobId(1)).await.unwrap();
-    let info = handle.get_job(JobId(1)).unwrap();
+    let info = wait_status(&handle, JobId(1), JobStatus::Queued).await;
     assert_eq!(info.status, JobStatus::Queued);
 
     handle.shutdown().await.unwrap();
@@ -742,7 +245,7 @@ async fn pause_resume() {
 
 #[tokio::test]
 async fn cancel_job() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle
         .add_job(
@@ -764,33 +267,40 @@ async fn cancel_job() {
 
 #[tokio::test]
 async fn redownload_failed_job() {
-    let (handle, task) = test_scheduler();
-
-    handle
-        .restore_job(RestoreJobRequest {
-            job_id: JobId(1),
-            job_hash: [0; 32],
-            spec: make_spec("Failed Job"),
-            file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
-            detected_archives: HashMap::new(),
-            file_identities: HashMap::new(),
-            extracted_members: HashSet::new(),
-            status: JobStatus::Failed {
-                error: "boom".to_string(),
-            },
-            download_state: None,
-            post_state: None,
-            run_state: None,
-            queued_repair_at_epoch_ms: None,
-            queued_extract_at_epoch_ms: None,
-            paused_resume_status: None,
-            paused_resume_download_state: None,
-            paused_resume_post_state: None,
-            working_dir: PathBuf::from("/tmp/test"),
-        })
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp).await;
+    pipeline
+        .add_job(
+            JobId(1),
+            make_spec("Failed Job"),
+            PathBuf::from("failed.nzb"),
+            sample_nzb_zstd(),
+            AddJobOptions::default(),
+        )
         .await
         .unwrap();
+    let state = pipeline.jobs.get_mut(&JobId(1)).unwrap();
+    state.status = JobStatus::Failed {
+        error: "fixture failure".into(),
+    };
+    state.refresh_runtime_lanes_from_status();
+    pipeline.report_all_for_test();
+    let mut changes = pipeline.shared_state.queue.subscribe();
+    pipeline.record_job_history(JobId(1), None);
+    while !pipeline
+        .shared_state
+        .queue
+        .history()
+        .iter()
+        .any(|job| job.job_id == JobId(1))
+    {
+        changes.changed().await.unwrap();
+    }
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let task = tokio::spawn(async move {
+        let _temp = temp;
+        pipeline.run().await;
+    });
 
     handle.redownload_job(JobId(1)).await.unwrap();
     let info = handle.get_job(JobId(1)).unwrap();
@@ -802,7 +312,7 @@ async fn redownload_failed_job() {
 
 #[tokio::test]
 async fn update_job_applies_explicit_patch() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle
         .add_job(
@@ -820,6 +330,7 @@ async fn update_job_applies_explicit_patch() {
             JobUpdate {
                 category: FieldUpdate::Set("movies".to_string()),
                 metadata: FieldUpdate::Set(vec![("priority".to_string(), "high".to_string())]),
+                metadata_edits: Vec::new(),
                 password: FieldUpdate::Unchanged,
                 name: None,
             },
@@ -840,6 +351,7 @@ async fn update_job_applies_explicit_patch() {
             JobUpdate {
                 category: FieldUpdate::Clear,
                 metadata: FieldUpdate::Clear,
+                metadata_edits: Vec::new(),
                 password: FieldUpdate::Unchanged,
                 name: None,
             },
@@ -857,7 +369,7 @@ async fn update_job_applies_explicit_patch() {
 
 #[tokio::test]
 async fn job_not_found() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     let err = handle.get_job(JobId(999)).unwrap_err();
     assert!(matches!(err, SchedulerError::JobNotFound(_)));
@@ -874,7 +386,7 @@ async fn job_not_found() {
 
 #[tokio::test]
 async fn event_subscription() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     let mut rx = handle.subscribe_events();
 
@@ -903,7 +415,7 @@ async fn event_subscription() {
 
 #[tokio::test]
 async fn duplicate_job_rejected() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle
         .add_job(
@@ -931,7 +443,7 @@ async fn duplicate_job_rejected() {
 
 #[tokio::test]
 async fn password_passthrough() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     let mut spec = make_spec("Protected");
     spec.password = Some("secret123".to_string());
@@ -950,7 +462,7 @@ async fn password_passthrough() {
 
 #[tokio::test]
 async fn reorder_jobs_batch_succeeds_when_all_ids_known() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     for id in [1_u64, 2, 3] {
         handle
@@ -978,7 +490,7 @@ async fn reorder_jobs_batch_succeeds_when_all_ids_known() {
 
 #[tokio::test]
 async fn reorder_jobs_batch_rejects_unknown_id_without_partial_application() {
-    let (handle, task) = test_scheduler();
+    let (handle, task) = test_scheduler().await;
 
     handle
         .add_job(

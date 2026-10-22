@@ -2771,6 +2771,7 @@ async fn complete_payload_does_not_finalize_while_promoted_recovery_is_pending()
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -2833,6 +2834,7 @@ async fn complete_payload_finalizes_while_optional_recovery_is_parked() {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -2954,6 +2956,7 @@ async fn complete_direct_payload_with_loaded_par2_does_not_finalize_with_parked_
             .commit_segment(1, 64)
             .unwrap();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -3079,6 +3082,7 @@ async fn archive_payload_does_not_extract_while_promoted_recovery_is_pending() {
             },
         );
         state.download_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -3158,6 +3162,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: recovery_file_id,
                 segment_number: 0,
@@ -3173,6 +3178,7 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
             avoid_server: None,
         });
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: recovery_file_id,
                 segment_number: 1,
@@ -3327,6 +3333,7 @@ async fn promoted_recovery_wait_does_not_reverify_until_recovery_finishes() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -3483,6 +3490,7 @@ async fn promoted_recovery_retry_reenters_dispatchable_queue() {
 
     pipeline.note_retry_scheduled(segment_id);
     pipeline.requeue_retry_work(DownloadWork {
+        counters: None,
         segment_id,
         message_id: MessageId::new("retry-routing-recovery@example.com"),
         groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),

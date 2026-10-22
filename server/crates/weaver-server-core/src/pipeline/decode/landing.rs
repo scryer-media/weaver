@@ -60,6 +60,7 @@ impl Pipeline {
         let answer = submit_segments_to_disk(&file_path, segments);
         let (outcome_tx, outcome) = oneshot::channel();
         let done_tx = self.segment_write_done_tx.clone();
+        let counters = self.shared_state.queue.job_counters(file_id.job_id);
         // The answer first, so a settle never waits on the done channel,
         // which only the pipeline task drains. A closed channel is the
         // pipeline gone; the ticket goes with it.
@@ -68,6 +69,17 @@ impl Pipeline {
                 .await
                 .unwrap_or_else(|_| unanswered("the disk write owner did not answer"));
             crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
+            if let Some(counters) = counters {
+                let written = match &outcome {
+                    Ok(written) => written,
+                    Err(error) => &error.written,
+                };
+                let bytes: u64 = written
+                    .iter()
+                    .map(|(_, segment)| segment.len_bytes() as u64)
+                    .sum();
+                counters.placed.fetch_add(bytes, Ordering::Relaxed);
+            }
             let _ = outcome_tx.send(outcome);
             let _ = done_tx
                 .send(SegmentWriteDone {

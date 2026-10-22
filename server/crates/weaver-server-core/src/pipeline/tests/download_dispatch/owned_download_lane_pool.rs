@@ -833,6 +833,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         soft_timeout: Duration::from_secs(1),
     }));
     let work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id,
@@ -882,6 +883,7 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: JobId(40141),
@@ -1958,6 +1960,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
                 scheduled_pool_generation: pipeline.pool_generation,
                 infrastructure_retry: true,
                 work: DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&format!(
                         "<batch-{segment_number}>"
@@ -1975,13 +1978,29 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
         );
     }
 
+    pipeline.report_job(job_id);
+    assert!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .download_wait_reason
+            .is_some()
+    );
     let mut job_changes = pipeline.shared_state.subscribe_job_changes();
     let previous_revision = *job_changes.borrow();
     assert_eq!(pipeline.wake_all_infrastructure_retries(), RETRY_COUNT);
-    pipeline.publish_snapshot();
     job_changes.changed().await.unwrap();
 
     assert_eq!(*job_changes.borrow(), previous_revision.wrapping_add(1));
+    assert!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .download_wait_reason
+            .is_none()
+    );
     assert_eq!(
         pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
         RETRY_COUNT
@@ -3351,6 +3370,7 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
     };
 
     pipeline.enqueue_download_work(DownloadWork {
+        counters: None,
         segment_id,
         message_id: crate::jobs::ids::MessageId::new("unservable@example.com"),
         groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
@@ -3736,6 +3756,7 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
         state.status = JobStatus::Downloading;
         state.download_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -3808,6 +3829,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
             outstanding: HashMap::from([(
                 segment_id,
                 DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: MessageId::new("carried-article@example.com"),
                     groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
@@ -4044,9 +4066,8 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
         Some(policy.clone()),
     )
     .unwrap();
-    let (commands, _) = tokio::sync::mpsc::channel(1);
     let (events, _) = tokio::sync::broadcast::channel(1);
-    let handle = crate::SchedulerHandle::new(commands, events, pipeline.shared_state.clone());
+    let handle = crate::SchedulerHandle::new(events, pipeline.shared_state.clone());
     handle.set_proxy_runtime(runtime.clone());
     pipeline.shared_state.set_server_transfer_policy(policy);
 

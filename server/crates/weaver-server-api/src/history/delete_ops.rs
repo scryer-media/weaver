@@ -19,20 +19,6 @@ use weaver_server_core::{
     HistoryDeleteOperationInsertError, HistoryDeleteOperationRow, SchedulerError, SchedulerHandle,
 };
 
-// How long one batch of targets waits for the pipeline to answer its history
-// delete.
-//
-// The pipeline actor answers deletes between its other work, so a slow
-// answer is normal; no answer at all is not. Without a bound, a pipeline
-// that never replies leaves the whole operation claimed forever and every
-// target in it showing as in progress. Past this the batch is failed as
-// unanswered and the operation finalises, so the rows can be retried. The
-// pipeline may still carry the delete out after the deadline; the error
-// text says so, and a retry settles which way it went.
-const HISTORY_DELETE_REPLY_DEADLINE: Duration = Duration::from_secs(300);
-
-const PIPELINE_DID_NOT_ANSWER: &str = "pipeline did not answer the history delete within the deadline; the delete may still finish, retry to confirm";
-
 #[derive(Clone)]
 pub(crate) struct HistoryDeleteManager {
     db: Database,
@@ -228,7 +214,7 @@ impl HistoryDeleteManager {
         Ok(())
     }
 
-    // One pipeline command for the batch, then one target update per
+    // One history-store operation for the batch, then one target update per
     // distinct result: the clean deletes together, each failure message
     // together.
     async fn process_batch(
@@ -242,20 +228,10 @@ impl HistoryDeleteManager {
             .copied()
             .map(weaver_server_core::JobId)
             .collect::<BTreeSet<_>>();
-        let result = tokio::time::timeout(
-            HISTORY_DELETE_REPLY_DEADLINE,
-            self.handle.delete_history_batch(job_ids, delete_files),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            tracing::warn!(
-                operation_id,
-                targets = batch.len(),
-                deadline_secs = HISTORY_DELETE_REPLY_DEADLINE.as_secs(),
-                "pipeline did not answer the history delete in time; failing the batch, the delete may still finish"
-            );
-            Err(SchedulerError::Internal(PIPELINE_DID_NOT_ANSWER.to_string()))
-        });
+        let result = self
+            .handle
+            .delete_history_batch(job_ids, delete_files)
+            .await;
 
         // Targets grouped by the state and message they end in.
         let mut settled: BTreeMap<(bool, Option<String>), Vec<u64>> = BTreeMap::new();
@@ -381,10 +357,7 @@ fn map_insert_error(error: HistoryDeleteOperationInsertError) -> async_graphql::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{broadcast, mpsc};
-    use weaver_server_core::jobs::handle::SharedPipelineState;
-    use weaver_server_core::operations::metrics::PipelineMetrics;
-    use weaver_server_core::{HistoryDeleteBatchOutcome, JobHistoryRow, JobId};
+    use weaver_server_core::{JobHistoryRow, JobId};
 
     fn history(job_id: u64) -> JobHistoryRow {
         JobHistoryRow {
@@ -409,33 +382,25 @@ mod tests {
         }
     }
 
-    fn deleted_all(job_ids: &BTreeSet<JobId>) -> HistoryDeleteBatchOutcome {
-        HistoryDeleteBatchOutcome {
-            deleted: job_ids
-                .iter()
-                .map(|job_id| (*job_id, Default::default()))
-                .collect(),
-            refused: BTreeMap::new(),
-        }
-    }
-
-    fn manager_with_channel(
+    async fn manager_with_idle_pipeline(
         db: &Database,
-        capacity: usize,
     ) -> (
         HistoryDeleteManager,
-        mpsc::Receiver<weaver_server_core::SchedulerCommand>,
+        weaver_server_core::Pipeline,
+        tempfile::TempDir,
     ) {
-        let (command_tx, command_rx) = mpsc::channel(capacity);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = db.load_config().unwrap();
+        settings.data_dir = root.path().display().to_string();
+        settings.intermediate_dir = Some(root.path().join("intermediate").display().to_string());
+        settings.complete_dir = Some(root.path().join("complete").display().to_string());
+        let config = Arc::new(tokio::sync::RwLock::new(settings));
+        let (pipeline, handle, _) =
+            weaver_server_core::pipeline::test_support::idle_pipeline(db.clone(), config).await;
         (
             HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1)),
-            command_rx,
+            pipeline,
+            root,
         )
     }
 
@@ -448,39 +413,27 @@ mod tests {
         db.insert_history_delete_operation(&[11, 12, 13], false, false)
             .unwrap();
         let operation = db.next_history_delete_operation().unwrap().unwrap();
-        let (manager, mut commands) = manager_with_channel(&db, 1);
-        let worker_db = db.clone();
-        let scheduler = tokio::spawn(async move {
-            let weaver_server_core::SchedulerCommand::DeleteHistory { job_ids, reply, .. } =
-                commands.recv().await.unwrap()
-            else {
-                panic!("expected history delete command");
-            };
-            assert_eq!(
-                job_ids,
-                [JobId(11), JobId(12), JobId(13)].into_iter().collect()
-            );
-            // 12 is live: the pipeline refuses it. 13 is already gone, which
-            // counts as deleted.
-            worker_db.delete_job_history(11).unwrap();
-            worker_db.delete_job_history(13).unwrap();
-            let mut outcome = HistoryDeleteBatchOutcome::default();
-            outcome.deleted.insert(JobId(11), Default::default());
-            outcome.refused.insert(
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        manager
+            .handle
+            .add_job(
                 JobId(12),
-                SchedulerError::Conflict("job 12 is active".into()),
-            );
-            outcome
-                .refused
-                .insert(JobId(13), SchedulerError::JobNotFound(JobId(13)));
-            reply.send(Ok(outcome)).unwrap();
-            commands
-        });
-
+                weaver_server_core::JobSpec {
+                    name: "Active fixture".into(),
+                    password: None,
+                    category: None,
+                    metadata: vec![],
+                    files: vec![],
+                    total_bytes: 0,
+                },
+                std::path::PathBuf::from("fixture.nzb"),
+                vec![],
+            )
+            .await
+            .unwrap();
+        db.delete_job_history(13).unwrap();
         manager.process_operation(operation).await.unwrap();
-        let mut commands = scheduler.await.unwrap();
 
-        assert!(commands.try_recv().is_err(), "one batch, one command");
         // Completed targets drop out of the row states; only the refusal stays.
         let state = db.list_history_delete_row_states(&[11, 12, 13]).unwrap();
         assert!(!state.contains_key(&11));
@@ -497,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_large_delete_reaches_the_scheduler_as_bounded_batches() {
+    async fn a_large_delete_finishes_all_targets_without_a_pipeline_turn() {
         let db = Database::open_in_memory().unwrap();
         let ids: Vec<u64> = (1..=(HISTORY_DELETE_BATCH_SIZE as u64 + 1)).collect();
         for id in &ids {
@@ -506,31 +459,9 @@ mod tests {
         db.insert_history_delete_operation(&ids, false, false)
             .unwrap();
         let operation = db.next_history_delete_operation().unwrap().unwrap();
-        let (manager, mut commands) = manager_with_channel(&db, 2);
-        let worker_db = db.clone();
-        let scheduler = tokio::spawn(async move {
-            let mut sizes = Vec::new();
-            for _ in 0..2 {
-                let weaver_server_core::SchedulerCommand::DeleteHistory { job_ids, reply, .. } =
-                    commands.recv().await.unwrap()
-                else {
-                    panic!("expected history delete command");
-                };
-                sizes.push(job_ids.len());
-                let ids: Vec<JobId> = job_ids.iter().copied().collect();
-                worker_db
-                    .delete_job_histories_and_forget_duplicate_identities(&ids)
-                    .unwrap();
-                reply.send(Ok(deleted_all(&job_ids))).unwrap();
-            }
-            (sizes, commands)
-        });
-
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
         manager.process_operation(operation).await.unwrap();
-        let (sizes, mut commands) = scheduler.await.unwrap();
 
-        assert_eq!(sizes, vec![HISTORY_DELETE_BATCH_SIZE, 1]);
-        assert!(commands.try_recv().is_err());
         assert!(db.list_history_delete_row_states(&ids).unwrap().is_empty());
         assert_eq!(
             db.list_history_delete_operations(false).unwrap()[0].state,
@@ -555,21 +486,10 @@ mod tests {
         db.recover_running_history_delete_operations().unwrap();
         let operation = db.next_history_delete_operation().unwrap().unwrap();
 
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
-
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        let revision = manager.handle.job_revision();
         manager.process_operation(operation).await.unwrap();
-
-        assert!(matches!(
-            command_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert_eq!(manager.handle.job_revision(), revision);
         assert!(db.get_job_history(7).unwrap().is_some());
         assert!(output_dir.join("payload.bin").is_file());
         let state = db.list_history_delete_row_states(&[7]).unwrap();
@@ -604,40 +524,9 @@ mod tests {
         let operation = db.next_history_delete_operation().unwrap().unwrap();
         assert!(operation.file_delete_authorized);
 
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let db_for_scheduler = db.clone();
-        let scheduler = tokio::spawn(async move {
-            let command = command_rx.recv().await.expect("expected history delete");
-            let weaver_server_core::SchedulerCommand::DeleteHistory {
-                job_ids,
-                delete_files,
-                reply,
-            } = command
-            else {
-                panic!("expected history delete command");
-            };
-            assert!(delete_files);
-            assert_eq!(job_ids.len(), 1);
-            let job_id = *job_ids.first().unwrap();
-            let output_dir = db_for_scheduler
-                .get_job_history(job_id.0)
-                .unwrap()
-                .and_then(|row| row.output_dir)
-                .expect("recorded output directory");
-            std::fs::remove_dir_all(output_dir).unwrap();
-            db_for_scheduler.delete_job_history(job_id.0).unwrap();
-            reply.send(Ok(deleted_all(&job_ids))).unwrap();
-        });
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
-
+        weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir).unwrap();
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
         manager.process_operation(operation).await.unwrap();
-        scheduler.await.unwrap();
 
         assert!(db.get_job_history(8).unwrap().is_none());
         assert!(!output_dir.exists());
@@ -647,52 +536,21 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_pipeline_that_never_answers_fails_the_target_and_finalises() {
+    #[tokio::test]
+    async fn deletion_finishes_when_the_pipeline_has_stopped() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(9)).unwrap();
-        let operation_id = db
-            .insert_history_delete_operation(&[9], false, false)
+        db.insert_history_delete_operation(&[9], false, false)
             .unwrap();
         let operation = db.next_history_delete_operation().unwrap().unwrap();
-
-        // The command is buffered and held, never answered: its reply sender
-        // stays alive in `command_rx`, so the only way out is the deadline.
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
-
+        let (manager, pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        drop(pipeline);
+        assert!(manager.handle.is_closed());
         manager.process_operation(operation).await.unwrap();
-
-        let Ok(weaver_server_core::SchedulerCommand::DeleteHistory { job_ids, .. }) =
-            command_rx.try_recv()
-        else {
-            panic!("the delete must have reached the scheduler");
-        };
-        assert_eq!(job_ids, [JobId(9)].into_iter().collect());
-        // The message is the deadline's own, not "channel closed": the target
-        // failed because nothing answered, not because the reply was dropped.
-        let state = db.list_history_delete_row_states(&[9]).unwrap();
-        assert_eq!(state[&9].state, AsyncOperationTargetState::Failed);
+        assert!(db.get_job_history(9).unwrap().is_none());
         assert_eq!(
-            state[&9].error_message.as_deref(),
-            Some(PIPELINE_DID_NOT_ANSWER)
-        );
-        // The row may yet be deleted by the pipeline, so the message must not
-        // read as a final refusal.
-        assert!(PIPELINE_DID_NOT_ANSWER.contains("may still finish"));
-        assert!(PIPELINE_DID_NOT_ANSWER.contains("retry"));
-        let summaries = db.list_history_delete_operations(false).unwrap();
-        assert_eq!(summaries[0].id, operation_id);
-        assert_eq!(
-            summaries[0].state,
-            weaver_server_core::AsyncOperationState::CompletedWithErrors,
-            "an unanswered target must not leave the operation claimed"
+            db.list_history_delete_operations(false).unwrap()[0].state,
+            weaver_server_core::AsyncOperationState::Completed
         );
     }
     #[tokio::test]
@@ -720,42 +578,20 @@ mod tests {
         .await
         .unwrap();
         notification.notified().await;
-        let (commands, mut received) = mpsc::channel(3);
-        let (events, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            commands,
-            events,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let worker_db = db.clone();
-        let pipeline = tokio::spawn(async move {
-            let mut removed = std::collections::BTreeMap::new();
-            // One batch per prune operation: the completed rows and the
-            // failed rows carry different file authority.
-            for _ in 0..2 {
-                let weaver_server_core::SchedulerCommand::DeleteHistory {
-                    job_ids,
-                    delete_files,
-                    reply,
-                } = received.recv().await.unwrap()
-                else {
-                    panic!("expected manual delete path");
-                };
-                for job_id in &job_ids {
-                    removed.insert(job_id.0, delete_files);
-                    worker_db.delete_job_history(job_id.0).unwrap();
-                }
-                reply.send(Ok(deleted_all(&job_ids))).unwrap();
-            }
-            removed
-        });
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        let mut removed = BTreeMap::new();
         while let Some(operation) = db.next_history_delete_operation().unwrap() {
             assert_eq!(operation.file_delete_authorized, operation.delete_files);
+            for target in db
+                .list_history_delete_operation_targets(operation.id, operation.delete_files)
+                .unwrap()
+            {
+                removed.insert(target.target_id, operation.delete_files);
+            }
             manager.process_operation(operation).await.unwrap();
         }
         assert_eq!(
-            pipeline.await.unwrap(),
+            removed,
             [(1, false), (2, true), (4, true)].into_iter().collect()
         );
         assert!(db.get_job_history(3).unwrap().is_some());

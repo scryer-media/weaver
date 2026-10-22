@@ -1608,7 +1608,7 @@ impl Pipeline {
         if released_extract {
             self.promote_queued_extractions();
         }
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     // Spawn a dedicated STAT probe task to quickly estimate job health.

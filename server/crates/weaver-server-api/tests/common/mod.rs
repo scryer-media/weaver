@@ -4,15 +4,13 @@
 // Test helper module — not all items are used by every test binary.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{
     Arc, Condvar, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, RwLock as StdRwLock,
 };
 
 use async_graphql::{Request, Response, Variables};
 use serde_json::Value;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use weaver_server_api::auth::{CallerIdentity, CallerScope, LoginAuthCache};
@@ -20,123 +18,15 @@ use weaver_server_api::{
     RssService, SchemaContext, SystemRuntimeContext, TestDbTaskHookGuard, WeaverSchema,
     build_schema, install_test_db_task_hook,
 };
+use weaver_server_core::SchedulerHandle;
 use weaver_server_core::auth::ApiKeyCache;
-use weaver_server_core::events::model::PipelineEvent;
-use weaver_server_core::jobs::handle::{JobInfo, SharedPipelineState};
-use weaver_server_core::jobs::ids::JobId;
-use weaver_server_core::jobs::model::{JobState, JobStatus, epoch_ms_now};
+use weaver_server_core::jobs::handle::SharedPipelineState;
 use weaver_server_core::operations::metrics::PipelineMetrics;
-use weaver_server_core::pipeline::download::queue::DownloadQueue;
 use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::{Database, JobHistoryRow};
-use weaver_server_core::{RestoreJobRequest, SchedulerCommand, SchedulerHandle};
-
-use weaver_server_core::jobs::assembly::JobAssembly;
-
-fn runtime_lanes_for_status(
-    status: &JobStatus,
-) -> (
-    weaver_server_core::DownloadState,
-    weaver_server_core::PostState,
-    weaver_server_core::RunState,
-    Option<String>,
-) {
-    match status {
-        JobStatus::AwaitingQueueScripts => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::AwaitingQueueScripts,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Queued => (
-            weaver_server_core::DownloadState::Queued,
-            weaver_server_core::PostState::Idle,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Downloading => (
-            weaver_server_core::DownloadState::Downloading,
-            weaver_server_core::PostState::Idle,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Checking => (
-            weaver_server_core::DownloadState::Checking,
-            weaver_server_core::PostState::Idle,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Verifying => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::Verifying,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::QueuedRepair => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::QueuedRepair,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Repairing => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::Repairing,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::QueuedExtract => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::QueuedExtract,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Extracting => (
-            weaver_server_core::DownloadState::Downloading,
-            weaver_server_core::PostState::Extracting,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Moving => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::Finalizing,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::QueuedPostProcessing => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::QueuedPostProcessing,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::PostProcessing => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::PostProcessing,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Complete => (
-            weaver_server_core::DownloadState::Complete,
-            weaver_server_core::PostState::Completed,
-            weaver_server_core::RunState::Active,
-            None,
-        ),
-        JobStatus::Failed { error } => (
-            weaver_server_core::DownloadState::Failed,
-            weaver_server_core::PostState::Failed,
-            weaver_server_core::RunState::Active,
-            Some(error.clone()),
-        ),
-        JobStatus::Paused => (
-            weaver_server_core::DownloadState::Downloading,
-            weaver_server_core::PostState::Idle,
-            weaver_server_core::RunState::Paused,
-            None,
-        ),
-    }
-}
 
 // Self-contained test harness that provides a fully-wired GraphQL schema
-// backed by an in-memory database and a mock scheduler.
+// backed by an in-memory database and the real idle pipeline.
 //
 // Each test should create its own harness for full isolation.
 #[allow(dead_code)]
@@ -155,20 +45,32 @@ pub struct TestHarness {
     // the trusted-network list is observable from a test.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub update_check: weaver_server_core::update_check::UpdateCheckService,
-    // The archive passwords each submission handed the scheduler beside the
-    // job's own, by job.
-    pub supplied_passwords: SuppliedPasswords,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
 
 impl TestHarness {
+    pub async fn wait_for_job_status(&self, id: u64, status: weaver_server_core::JobStatus) {
+        let mut revisions = self.handle.subscribe_job_changes();
+        loop {
+            revisions.mark_unchanged();
+            if self
+                .handle
+                .get_job(weaver_server_core::JobId(id))
+                .is_ok_and(|job| job.status == status)
+            {
+                return;
+            }
+            revisions.changed().await.expect("pipeline revision stream");
+        }
+    }
+
     fn local_identity() -> CallerIdentity {
         CallerIdentity::Local([7; 32])
     }
 
-    // Create a new test harness with in-memory DB, default config, mock
-    // scheduler, and a real GraphQL schema. Spawns the background
+    // Create a new test harness with in-memory DB, default config, and
+    // a real idle pipeline and GraphQL schema. Spawns the background
     // history-delete worker, matching production.
     pub async fn new() -> Self {
         Self::new_with_options(true).await
@@ -206,7 +108,10 @@ impl TestHarness {
         security: weaver_server_core::security::RuntimeSecurityConfig,
     ) -> Self {
         let tempdir = tempfile::TempDir::new().expect("failed to create tempdir");
-        let db = Database::open_in_memory().expect("failed to open in-memory DB");
+        let mut db = Database::open_in_memory().expect("failed to open in-memory DB");
+        db.set_encryption_key(
+            weaver_server_core::persistence::encryption::EncryptionKey::generate(),
+        );
 
         let config = Config {
             data_dir: tempdir.path().to_string_lossy().to_string(),
@@ -230,9 +135,16 @@ impl TestHarness {
         };
         let shared_config: SharedConfig = Arc::new(RwLock::new(config));
 
-        let supplied_passwords = SuppliedPasswords::default();
-        let (handle, metrics, shared_state, scheduler_task) =
-            spawn_test_scheduler(db.clone(), supplied_passwords.clone());
+        let (mut pipeline, handle, shared_state) =
+            weaver_server_core::pipeline::test_support::idle_pipeline(
+                db.clone(),
+                shared_config.clone(),
+            )
+            .await;
+        let metrics = handle.pipeline_metrics();
+        let scheduler_task = tokio::spawn(async move {
+            pipeline.run().await;
+        });
         let rss = RssService::new(handle.clone(), shared_config.clone(), db.clone());
         let watch_folder = weaver_server_core::watch_folder::WatchFolderService::new(
             db.clone(),
@@ -339,7 +251,6 @@ impl TestHarness {
             auth_cache,
             security,
             update_check,
-            supplied_passwords,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }
@@ -564,459 +475,8 @@ pub fn make_multi_file_nzb(name: &str, file_count: usize) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Mock scheduler
-// ---------------------------------------------------------------------------
-
-// Spawn a mock scheduler that handles commands without performing real
-// downloads. Returns the handle and the background task.
-pub type SuppliedPasswords =
-    Arc<std::sync::Mutex<HashMap<JobId, Vec<weaver_server_core::jobs::ArchivePasswordCandidate>>>>;
-
-fn spawn_test_scheduler(
-    db: Database,
-    supplied_passwords: SuppliedPasswords,
-) -> (
-    SchedulerHandle,
-    Arc<PipelineMetrics>,
-    SharedPipelineState,
-    JoinHandle<()>,
-) {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
-    let (event_tx, _) = broadcast::channel(256);
-    let metrics = PipelineMetrics::new();
-    let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
-
-    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
-    let scheduler_state = shared_state.clone();
-
-    let task = tokio::spawn(async move {
-        let mut jobs: HashMap<JobId, JobState> = HashMap::new();
-        let mut nntp_generation = 0u64;
-
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
-                SchedulerCommand::AddJob {
-                    job_id,
-                    spec,
-                    nzb_path: _,
-                    options,
-                    reply,
-                    ..
-                } => {
-                    supplied_passwords
-                        .lock()
-                        .unwrap()
-                        .insert(job_id, options.supplied_password_candidates);
-                    if jobs.contains_key(&job_id) {
-                        let _ =
-                            reply.send(Err(weaver_server_core::SchedulerError::JobExists(job_id)));
-                        scheduler_state.publish_jobs(build_job_list(&jobs));
-                        continue;
-                    }
-                    let assembly = JobAssembly::new(job_id);
-                    let par2_bytes = spec.par2_bytes();
-                    let status = JobStatus::Queued;
-                    let (download_state, post_state, run_state, failure_error) =
-                        runtime_lanes_for_status(&status);
-                    let state = JobState {
-                        job_id,
-                        job_hash: [0; 32],
-                        spec,
-                        status,
-                        download_state,
-                        post_state,
-                        run_state,
-                        assembly,
-                        extraction_depth: 0,
-                        created_at: std::time::Instant::now(),
-                        created_at_epoch_ms: epoch_ms_now(),
-                        queued_repair_at_epoch_ms: None,
-                        queued_extract_at_epoch_ms: None,
-                        paused_resume_status: None,
-                        paused_resume_download_state: None,
-                        paused_resume_post_state: None,
-                        failure_error,
-                        working_dir: PathBuf::from("/tmp/test"),
-                        downloaded_bytes: 0,
-                        failed_bytes: 0,
-                        probe_projected_failed_bytes: 0,
-                        par2_bytes,
-                        health_probing: false,
-                        health_deferral: Default::default(),
-                        health_probe_round: 0,
-                        health_probe_failing_files: 0,
-                        health_failing_files: std::collections::HashSet::new(),
-                        early_recovery_requested_blocks: 0,
-                        last_health_probe_failed_bytes: 0,
-                        next_health_probe_failed_bytes: 1,
-                        support_facts: Default::default(),
-                        detected_archives: HashMap::new(),
-                        file_identities: HashMap::new(),
-                        held_segments: Vec::new(),
-                        download_queue: DownloadQueue::new(),
-                        recovery_queue: DownloadQueue::new(),
-                        staging_dir: None,
-                        category_bytes: None,
-                        nzb_password_candidates: Default::default(),
-                        restored_download_floor_bytes: 0,
-                        downloaded_wire_bytes: 0,
-                        server_attribution: Default::default(),
-                        announced_checkpoints: Default::default(),
-                    };
-                    let _ = event_tx.send(PipelineEvent::JobCreated {
-                        job_id,
-                        name: state.spec.name.clone(),
-                        total_files: state.spec.files.len() as u32,
-                        total_bytes: state.spec.total_bytes,
-                    });
-                    jobs.insert(job_id, state);
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::PauseJob { job_id, reply } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) => {
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Paused);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            state.refresh_legacy_status();
-                            let _ = event_tx.send(PipelineEvent::JobPaused { job_id });
-                            Ok(())
-                        }
-                        None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::ResumeJob { job_id, reply } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) => {
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Downloading);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            state.refresh_legacy_status();
-                            let _ = event_tx.send(PipelineEvent::JobResumed { job_id });
-                            Ok(())
-                        }
-                        None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::CancelJobs { job_ids, reply, .. } => {
-                    let outcome = job_ids
-                        .into_iter()
-                        .map(|job_id| {
-                            let result = if jobs.remove(&job_id).is_some() {
-                                Ok(())
-                            } else {
-                                Err(weaver_server_core::SchedulerError::JobNotFound(job_id))
-                            };
-                            (job_id, result)
-                        })
-                        .collect();
-                    let _ = reply.send(outcome);
-                }
-                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                    scheduler_state.set_speed_test_paused(paused);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::PauseAll { reply } => {
-                    scheduler_state.set_paused(true);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::ResumeAll { reply } => {
-                    scheduler_state.set_paused(false);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::SetPropagationDelay { reply, .. }
-                | SchedulerCommand::SetSpeedLimit { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::RebuildNntp {
-                    client,
-                    total_connections,
-                    reply,
-                } => {
-                    let activation = client
-                        .downcast::<weaver_nntp::NntpClient>()
-                        .map_err(|_| {
-                            weaver_server_core::SchedulerError::Internal(
-                                "invalid NNTP client type".to_owned(),
-                            )
-                        })
-                        .map(|_client| {
-                            nntp_generation = nntp_generation.wrapping_add(1);
-                            weaver_server_core::NntpRuntimeActivation {
-                                generation: nntp_generation,
-                                configured_connections: total_connections,
-                            }
-                        });
-                    if let Ok(activation) = activation {
-                        scheduler_state.set_nntp_runtime_activation(activation);
-                    }
-                    let _ = reply.send(activation);
-                }
-                SchedulerCommand::UpdateRuntimePaths { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::ApplyScheduleAction { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                // Stands in for the pipeline: the chosen profile is in force
-                // at once, since this mock has no schedule behind it.
-                SchedulerCommand::SetHardwareProfile { profile, reply } => {
-                    scheduler_state.set_hardware_profile_in_force(
-                        weaver_server_core::HardwareProfileInForce {
-                            active: profile,
-                            scheduled: None,
-                        },
-                    );
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::SetScheduledHardwareProfile { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::RestoreJob { request, reply } => {
-                    let RestoreJobRequest {
-                        job_id,
-                        spec,
-                        status,
-                        working_dir,
-                        ..
-                    } = *request;
-                    let assembly = JobAssembly::new(job_id);
-                    let par2_bytes = spec.par2_bytes();
-                    let (download_state, post_state, run_state, failure_error) =
-                        runtime_lanes_for_status(&status);
-                    let state = JobState {
-                        job_id,
-                        job_hash: [0; 32],
-                        spec,
-                        status,
-                        download_state,
-                        post_state,
-                        run_state,
-                        assembly,
-                        extraction_depth: 0,
-                        created_at: std::time::Instant::now(),
-                        created_at_epoch_ms: epoch_ms_now(),
-                        queued_repair_at_epoch_ms: None,
-                        queued_extract_at_epoch_ms: None,
-                        paused_resume_status: None,
-                        paused_resume_download_state: None,
-                        paused_resume_post_state: None,
-                        failure_error,
-                        working_dir,
-                        downloaded_bytes: 0,
-                        failed_bytes: 0,
-                        probe_projected_failed_bytes: 0,
-                        par2_bytes,
-                        health_probing: false,
-                        health_deferral: Default::default(),
-                        health_probe_round: 0,
-                        health_probe_failing_files: 0,
-                        health_failing_files: std::collections::HashSet::new(),
-                        early_recovery_requested_blocks: 0,
-                        last_health_probe_failed_bytes: 0,
-                        next_health_probe_failed_bytes: 1,
-                        support_facts: Default::default(),
-                        detected_archives: HashMap::new(),
-                        file_identities: HashMap::new(),
-                        held_segments: Vec::new(),
-                        download_queue: DownloadQueue::new(),
-                        recovery_queue: DownloadQueue::new(),
-                        staging_dir: None,
-                        category_bytes: None,
-                        nzb_password_candidates: Default::default(),
-                        restored_download_floor_bytes: 0,
-                        downloaded_wire_bytes: 0,
-                        server_attribution: Default::default(),
-                        announced_checkpoints: Default::default(),
-                    };
-                    jobs.insert(job_id, state);
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::DeleteHistory {
-                    job_ids,
-                    delete_files,
-                    reply,
-                } => {
-                    let mut outcome = weaver_server_core::HistoryDeleteBatchOutcome::default();
-                    for job_id in job_ids {
-                        if delete_files
-                            && let Some(output_dir) = db
-                                .get_job_history(job_id.0)
-                                .expect("failed to load history row from test db")
-                                .and_then(|row| row.output_dir)
-                        {
-                            let output_dir = PathBuf::from(output_dir);
-                            if output_dir.exists() {
-                                std::fs::remove_dir_all(&output_dir)
-                                    .expect("failed to remove test history output directory");
-                            }
-                        }
-                        jobs.remove(&job_id);
-                        db.delete_job_history(job_id.0)
-                            .expect("failed to delete history row from test db");
-                        db.delete_job_events(job_id.0)
-                            .expect("failed to delete history events from test db");
-                        outcome.deleted.insert(job_id, Default::default());
-                    }
-                    let _ = reply.send(Ok(outcome));
-                }
-                SchedulerCommand::ReprocessJob {
-                    job_id,
-                    password,
-                    reply,
-                } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Downloading);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            if let Some(password) = password {
-                                state.spec.password = Some(password);
-                            }
-                            state.failure_error = None;
-                            state.refresh_legacy_status();
-                            Ok(())
-                        }
-                        Some(_) => Err(weaver_server_core::SchedulerError::Other(format!(
-                            "job {} is not failed",
-                            job_id.0
-                        ))),
-                        None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::RedownloadJob {
-                    job_id,
-                    password,
-                    reply,
-                } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) if matches!(state.status, JobStatus::Failed { .. }) => {
-                            let (download_state, post_state, run_state, _) =
-                                runtime_lanes_for_status(&JobStatus::Queued);
-                            state.download_state = download_state;
-                            state.post_state = post_state;
-                            state.run_state = run_state;
-                            if let Some(password) = password {
-                                state.spec.password = Some(password);
-                            }
-                            state.failure_error = None;
-                            state.refresh_legacy_status();
-                            Ok(())
-                        }
-                        Some(_) => Err(weaver_server_core::SchedulerError::Other(format!(
-                            "job {} is not failed",
-                            job_id.0
-                        ))),
-                        None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::UpdateJob {
-                    job_id,
-                    update,
-                    reply,
-                } => {
-                    let result = match jobs.get_mut(&job_id) {
-                        Some(state) => {
-                            update.apply_to_spec(&mut state.spec);
-                            Ok(())
-                        }
-                        None => Err(weaver_server_core::SchedulerError::JobNotFound(job_id)),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::UpdateHistory { job_id, reply, .. } => {
-                    let _ =
-                        reply.send(Err(weaver_server_core::SchedulerError::JobNotFound(job_id)));
-                }
-                SchedulerCommand::ReorderJob { job_id, reply, .. } => {
-                    let result = if jobs.contains_key(&job_id) {
-                        Ok(())
-                    } else {
-                        Err(weaver_server_core::SchedulerError::JobNotFound(job_id))
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::ReorderJobs { moves, reply } => {
-                    let result = match moves.iter().find(|(job_id, _)| !jobs.contains_key(job_id)) {
-                        Some((job_id, _)) => {
-                            Err(weaver_server_core::SchedulerError::JobNotFound(*job_id))
-                        }
-                        None => Ok(()),
-                    };
-                    let _ = reply.send(result);
-                }
-                SchedulerCommand::PausePostProcessing { reply }
-                | SchedulerCommand::ResumePostProcessing { reply } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::CancelPostProcessing { reply, .. } => {
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::UpdateRandomReadIops { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                // Dropping the reply is the answer: the diagnostics request
-                // reports a pipeline that did not respond, which is what a
-                // mock scheduler is.
-                SchedulerCommand::PipelineDiagnostics { .. } => {}
-                SchedulerCommand::Shutdown => break,
-            }
-            // Publish updated job list to shared state after every command.
-            scheduler_state.publish_jobs(build_job_list(&jobs));
-        }
-    });
-
-    (handle, metrics, shared_state, task)
-}
-
-fn build_job_list(jobs: &HashMap<JobId, JobState>) -> Vec<JobInfo> {
-    jobs.values()
-        .map(|state| JobInfo {
-            job_id: state.job_id,
-            job_hash: Some(state.job_hash),
-            name: state.spec.name.clone(),
-            error: if let JobStatus::Failed { error } = &state.status {
-                Some(error.clone())
-            } else {
-                None
-            },
-            download_wait_reason: None,
-            download_retry_at_epoch_ms: None,
-            status: state.status.clone(),
-            download_state: state.download_state,
-            finalizing_download: false,
-            fetching_repair_data: false,
-            post_state: state.post_state,
-            run_state: state.run_state,
-            progress: state.assembly.progress(),
-            total_bytes: state.spec.total_bytes,
-            downloaded_bytes: 0,
-            optional_recovery_bytes: 0,
-            optional_recovery_downloaded_bytes: 0,
-            phase_progress: Vec::new(),
-            failed_bytes: 0,
-            health: 1000,
-            terminal_discards: Vec::new(),
-            total_files: 0,
-            completed_files: 0,
-            remaining_par_files: 0,
-            password: state.spec.password.clone(),
-            category: state.spec.category.clone(),
-            metadata: state.spec.metadata.clone(),
-            output_dir: None,
-            created_at_epoch_ms: state.created_at_epoch_ms,
-            server_attribution: Vec::new(),
-        })
-        .collect()
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        self._scheduler_task.abort();
+    }
 }

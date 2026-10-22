@@ -4,12 +4,7 @@
 import type { APIRequestContext } from "@playwright/test";
 
 import { graphql, submitProbeNzb } from "../../helpers";
-
-type HistoryPage = {
-  historyPage: {
-    totalCount: number;
-  };
-};
+import { waitTerminal } from "../downloads";
 
 export async function seedRuntimeHistory(
   request: APIRequestContext,
@@ -26,7 +21,6 @@ export async function seedRuntimeHistory(
     request,
     "mutation WeaverE2ERuntimeHistoryPause { pauseAll }",
   );
-  const before = await historyCount(request);
   const jobIds: number[] = [];
   for (const [index, name] of names.entries()) {
     const result = await submitProbeNzb(
@@ -54,31 +48,8 @@ export async function seedRuntimeHistory(
     }
   }
 
-  const expected = before + count;
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    if ((await historyCount(request)) >= expected) {
-      return { newest: names.at(-1)!, oldest: names[0] };
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
+  for (const jobId of jobIds) {
+    await waitTerminal(request, jobId);
   }
-  throw new Error(`runtime history did not reach ${expected} entries`);
-}
-
-async function historyCount(request: APIRequestContext): Promise<number> {
-  const data = await graphql<HistoryPage>(
-    request,
-    `query WeaverE2ERuntimeHistoryCount($input: HistoryPageInput!) {
-      historyPage(input: $input) { totalCount }
-    }`,
-    {
-      input: {
-        pageIndex: 0,
-        pageSize: 1,
-        sortField: "COMPLETED_AT",
-        sortDirection: "DESC",
-      },
-    },
-  );
-  return data.historyPage.totalCount;
+  return { newest: names.at(-1)!, oldest: names[0] };
 }

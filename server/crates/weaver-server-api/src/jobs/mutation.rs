@@ -41,29 +41,6 @@ use weaver_server_core::{
 #[derive(Default)]
 pub(crate) struct JobsMutation;
 
-fn upsert_metadata_entry(metadata: &mut Vec<(String, String)>, key: &str, value: String) {
-    let canonical_key = key.to_string();
-    let mut updated = Vec::with_capacity(metadata.len() + 1);
-    let mut replaced = false;
-
-    for (existing_key, existing_value) in metadata.drain(..) {
-        if existing_key.eq_ignore_ascii_case(key) {
-            if !replaced {
-                updated.push((canonical_key.clone(), value.clone()));
-                replaced = true;
-            }
-        } else {
-            updated.push((existing_key, existing_value));
-        }
-    }
-
-    if !replaced {
-        updated.push((canonical_key, value));
-    }
-
-    *metadata = updated;
-}
-
 #[Object]
 impl JobsMutation {
     /// Analyze an NZB without submitting it. Reads nothing and changes
@@ -656,9 +633,9 @@ impl JobsMutation {
         for &id in &ids {
             let mut update = base_update.clone();
             if let Some(priority) = normalized_priority.as_ref() {
-                let mut metadata = map_scheduler_result(handle.get_job(JobId(id)))?.metadata;
-                upsert_metadata_entry(&mut metadata, PRIORITY_ATTRIBUTE_KEY, priority.clone());
-                update.metadata = FieldUpdate::Set(metadata);
+                update
+                    .metadata_edits
+                    .push((PRIORITY_ATTRIBUTE_KEY.to_string(), Some(priority.clone())));
             }
             handle.update_job(JobId(id), update.clone()).await?;
         }

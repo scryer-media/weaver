@@ -151,7 +151,7 @@ impl Pipeline {
         // What the scripts asked for has to be in force before the first
         // article is fetched.
         self.apply_queue_script_effects(job_id);
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     // Returns true while the completion pass must yield to its queue scripts.
@@ -228,7 +228,7 @@ impl Pipeline {
                 Some("waiting for queue scripts"),
             );
             self.persist_active_runtime(job_id);
-            self.publish_snapshot();
+            self.report_job(job_id);
         }
     }
 

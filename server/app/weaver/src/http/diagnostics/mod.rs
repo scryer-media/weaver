@@ -362,16 +362,9 @@ fn service_log_text(data: &serde_json::Value) -> String {
 // The read-only pipeline snapshot, which exists nowhere else.
 async fn collect_pipeline_internals(handle: &SchedulerHandle) -> Component {
     const FILE: &str = "pipeline-internals.json";
-    // A wedged pipeline is exactly the case this endpoint is for, so the
-    // request must not inherit the wedge: if the actor cannot answer promptly,
-    // that fact is the diagnostic.
-    match tokio::time::timeout(Duration::from_secs(3), handle.pipeline_diagnostics()).await {
-        Ok(Ok(diagnostics)) => Component::json(FILE, &diagnostics),
-        Ok(Err(error)) => Component::failed(FILE, error),
-        Err(_) => Component::failed(
-            FILE,
-            "the pipeline did not answer the diagnostics command within 3s",
-        ),
+    match handle.pipeline_diagnostics().await {
+        Ok(diagnostics) => Component::json(FILE, &diagnostics),
+        Err(error) => Component::failed(FILE, error),
     }
 }
 

@@ -1356,6 +1356,7 @@ impl Pipeline {
                         continue;
                     }
                     work.push(DownloadWork {
+                        counters: None,
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
                         groups: std::sync::Arc::from(file.groups.as_slice()),
@@ -1454,6 +1455,7 @@ impl Pipeline {
                         continue;
                     }
                     work.push(DownloadWork {
+                        counters: None,
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
                         groups: std::sync::Arc::from(file.groups.as_slice()),

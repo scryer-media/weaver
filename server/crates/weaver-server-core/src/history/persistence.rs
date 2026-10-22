@@ -308,7 +308,7 @@ impl Database {
 // returns those ids. Each chunk runs one `IN (...)` statement per table; the
 // `script_output_state` lock is taken once, first, in the same order as
 // insertion takes it.
-async fn delete_job_history_bundles_tx(
+pub(crate) async fn delete_job_history_bundles_tx(
     tx: &mut SqlTx<'_>,
     job_ids: &[JobId],
 ) -> Result<Vec<JobId>, StateError> {

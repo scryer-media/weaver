@@ -51,6 +51,7 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
                 segment_number: index as u32,
             };
             let work = DownloadWork {
+                counters: None,
                 segment_id,
                 message_id: MessageId::new(&format!("held-{}-{index}@share.test", job_id.0)),
                 groups: Arc::from(Vec::new()),
@@ -510,9 +511,8 @@ async fn only_a_failed_pause_or_server_disable_holds_admission() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     add_job(&mut pipeline, JobId(71080), "Schedule Gate", 200).await;
-    let (commands, _) = tokio::sync::mpsc::channel(1);
     let (events, _) = tokio::sync::broadcast::channel(1);
-    let handle = crate::SchedulerHandle::new(commands, events, pipeline.shared_state.clone());
+    let handle = crate::SchedulerHandle::new(events, pipeline.shared_state.clone());
     let rule = |active| ScheduleEntry {
         id: "server-rule".into(),
         enabled: true,
@@ -584,12 +584,12 @@ async fn every_whole_link_gate_yields_under_its_own_name() {
     let hot = JobId(71081);
     add_job(&mut pipeline, hot, "Gated Reel", 200).await;
 
-    pipeline.global_paused = true;
+    pipeline.shared_state.set_paused(true);
     assert!(matches!(
         ask(&mut pipeline, SERVER_A, 8, None),
         Handout::Yield(YieldReason::Paused)
     ));
-    pipeline.global_paused = false;
+    pipeline.shared_state.set_paused(false);
 
     pipeline.nntp_handoff_draining = true;
     assert!(matches!(

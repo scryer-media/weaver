@@ -20,19 +20,27 @@ async fn insert_queued_jobs(pipeline: &mut Pipeline, ids: &[JobId]) {
 }
 
 async fn cancel_batch(pipeline: &mut Pipeline, ids: &[JobId]) -> crate::jobs::CancelJobsOutcome {
-    let (reply, done) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJobs {
-            job_ids: ids.iter().copied().collect(),
-            origin: CancellationOrigin::User,
-            reply,
-        })
-        .await;
-    done.await.unwrap()
+    pipeline.report_all_for_test();
+    let mut events = pipeline.event_tx.subscribe();
+    let outcome = pipeline
+        .shared_state
+        .queue
+        .cancel_jobs(ids.iter().copied().collect(), CancellationOrigin::User);
+    pipeline.apply_queue_intents().await;
+    let mut pending: BTreeSet<_> = outcome
+        .iter()
+        .filter_map(|(id, result)| result.is_ok().then_some(*id))
+        .collect();
+    while !pending.is_empty() {
+        if let PipelineEvent::JobCancelled { job_id } = events.recv().await.unwrap() {
+            pending.remove(&job_id);
+        }
+    }
+    outcome
 }
 
 #[tokio::test]
-async fn cancel_batch_of_queued_jobs_archives_every_row_in_one_command() {
+async fn cancel_batch_of_queued_jobs_archives_every_row() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let ids: Vec<JobId> = (31_001..31_006).map(JobId).collect();

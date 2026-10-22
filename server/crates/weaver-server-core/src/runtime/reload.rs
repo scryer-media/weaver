@@ -138,9 +138,23 @@ pub async fn rebuild_nntp_from_config(
     );
     let client = nntp_client(servers);
 
-    let pool = std::sync::Arc::clone(client.pool());
     let activation = handle.rebuild_nntp(client, total).await?;
-    handle.set_nntp_pool(pool);
+    let mut changes = handle.subscribe_job_changes();
+    loop {
+        if handle
+            .nntp_runtime_activation()
+            .is_some_and(|active| active.generation >= activation.generation)
+        {
+            break;
+        }
+        if handle.is_closed() {
+            return Err(SchedulerError::ChannelClosed);
+        }
+        changes
+            .changed()
+            .await
+            .map_err(|_| SchedulerError::ChannelClosed)?;
+    }
     Ok(activation)
 }
 
@@ -195,7 +209,7 @@ pub async fn reload_runtime_from_db(
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::{RwLock, broadcast, mpsc};
+    use tokio::sync::{RwLock, broadcast};
 
     use super::*;
     use crate::events::model::PipelineEvent;
@@ -272,17 +286,17 @@ mod tests {
             metrics: Default::default(),
             config_path: None,
         }));
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+
         let (event_tx, _) = broadcast::channel::<PipelineEvent>(1);
         let state = SharedPipelineState::new(PipelineMetrics::new(), Vec::new());
-        let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
+        let handle = SchedulerHandle::new(event_tx, state);
         handle.set_server_transfer_policy(policy);
         handle.set_proxy_runtime(proxies);
         let error = rebuild_nntp_from_config(&config, &handle)
             .await
             .expect_err("policy failure must not replace the active generation");
         assert!(error.to_string().contains("transfer policies"));
-        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(handle.job_revision(), 0);
         assert!(handle.nntp_pool().is_none());
     }
 
@@ -308,15 +322,15 @@ mod tests {
             metrics: Default::default(),
             config_path: None,
         }));
-        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+
         let (event_tx, _) = broadcast::channel::<PipelineEvent>(1);
         let state = SharedPipelineState::new(PipelineMetrics::new(), Vec::new());
-        let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
+        let handle = SchedulerHandle::new(event_tx, state);
         let error = rebuild_nntp_from_config(&config, &handle)
             .await
             .expect_err("missing policy registry must not replace the active generation");
         assert!(error.to_string().contains("registry unavailable"));
-        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(handle.job_revision(), 0);
         assert!(handle.nntp_pool().is_none());
     }
     #[tokio::test]
@@ -324,10 +338,9 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.insert_server(&server(42)).unwrap();
         let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-        let (commands, _received) = mpsc::channel(1);
+
         let (events, _) = broadcast::channel(1);
         let handle = SchedulerHandle::new(
-            commands,
             events,
             SharedPipelineState::new(PipelineMetrics::new(), vec![]),
         );
@@ -356,13 +369,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let (commands, mut received) = mpsc::channel(1);
-        let (events, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            commands,
-            events,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runtime, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp).await;
+        let state = runtime.shared_state.clone();
+        let handle = SchedulerHandle::new(runtime.event_tx.clone(), state.clone());
         handle.set_server_transfer_policy(registry);
         handle.set_proxy_runtime(
             crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
@@ -394,21 +405,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        let crate::SchedulerCommand::RebuildNntp { reply, .. } = received.recv().await.unwrap()
-        else {
-            panic!("expected server runtime rebuild");
-        };
+        let mut changes = state.queue.subscribe();
+        while state.queue.read(|inner| inner.globals.nntp_generation) == 0 {
+            changes.changed().await.unwrap();
+        }
         tokio::select! {
             biased;
             _ = &mut ready => panic!("startup became ready before server hold activated"),
             () = std::future::ready(()) => {}
         }
-        reply
-            .send(Ok(NntpRuntimeActivation {
-                generation: 1,
-                configured_connections: 0,
-            }))
-            .unwrap();
+        runtime.apply_queue_intents().await;
         ready.await.unwrap().unwrap();
         task.shutdown().await;
     }
@@ -426,57 +432,47 @@ mod tests {
             )
             .unwrap(),
         );
-        let (commands, mut received) = mpsc::channel(2);
-        let (events, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            commands,
-            events,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runtime, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp).await;
+        let state = runtime.shared_state.clone();
+        let handle = SchedulerHandle::new(runtime.event_tx.clone(), state.clone());
         handle.set_server_transfer_policy(registry);
         handle.set_proxy_runtime(
             crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
                 .unwrap(),
         );
-        let (generations, mut activations) = mpsc::channel(2);
         let pipeline = tokio::spawn(async move {
-            let mut generation = 0;
-            while let Some(command) = received.recv().await {
-                match command {
-                    crate::SchedulerCommand::RebuildNntp {
-                        total_connections,
-                        reply,
-                        ..
-                    } => {
-                        generation += 1;
-                        let activation = NntpRuntimeActivation {
-                            generation,
-                            configured_connections: total_connections,
-                        };
-                        generations
-                            .send((generation, total_connections))
-                            .await
-                            .unwrap();
-                        reply.send(Ok(activation)).unwrap();
-                    }
-                    _ => panic!(
-                        "a server toggle must not alter download, speed, profile or quota tracks"
-                    ),
-                }
-            }
+            let _temp = temp;
+            runtime.run().await;
         });
-        let service =
-            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        let service = crate::servers::service::ServersService::new(
+            db.clone(),
+            config.clone(),
+            handle.clone(),
+        );
         service.set_active(42, false).await.unwrap();
-        assert_eq!(activations.recv().await.unwrap(), (1, 0));
+        assert_eq!(
+            handle.nntp_runtime_activation(),
+            Some(NntpRuntimeActivation {
+                generation: 1,
+                configured_connections: 0
+            })
+        );
         assert!(!db.load_config().unwrap().servers[0].active);
         service.set_active(42, true).await.unwrap();
-        assert_eq!(activations.recv().await.unwrap(), (2, 2));
+        assert_eq!(
+            handle.nntp_runtime_activation(),
+            Some(NntpRuntimeActivation {
+                generation: 2,
+                configured_connections: 2
+            })
+        );
         assert!(db.load_config().unwrap().servers[0].active);
         assert!(config.read().await.servers[0].active);
         service.set_active(42, true).await.unwrap();
         assert!(
-            activations.try_recv().is_err(),
+            handle.nntp_runtime_activation().unwrap().generation == 2,
             "an unchanged active state must not rebuild"
         );
         config.write().await.servers.clear();
@@ -487,6 +483,7 @@ mod tests {
         );
         assert!(service.set_active(999, true).await.is_err());
         drop(service);
+        handle.shutdown().await.unwrap();
         pipeline.await.unwrap();
     }
 
@@ -496,13 +493,11 @@ mod tests {
         let provider = server(42);
         db.insert_server(&provider).unwrap();
         let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-        let (commands, mut received) = mpsc::channel(2);
-        let (events, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            commands,
-            events,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut runtime, _, _) = crate::pipeline::tests::new_direct_pipeline(&temp).await;
+        let state = runtime.shared_state.clone();
+        let handle = SchedulerHandle::new(runtime.event_tx.clone(), state.clone());
         handle.set_server_transfer_policy(Arc::new(
             crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
                 db.clone(),
@@ -514,32 +509,17 @@ mod tests {
             crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
                 .unwrap(),
         );
-        let (rebuilt, mut rebuilds) = mpsc::channel(2);
         let pipeline = tokio::spawn(async move {
-            let mut generation = 0;
-            while let Some(command) = received.recv().await {
-                let crate::SchedulerCommand::RebuildNntp {
-                    total_connections,
-                    reply,
-                    ..
-                } = command
-                else {
-                    panic!("a provider speed limit only rebuilds the provider generation");
-                };
-                generation += 1;
-                rebuilt.send(generation).await.unwrap();
-                reply
-                    .send(Ok(NntpRuntimeActivation {
-                        generation,
-                        configured_connections: total_connections,
-                    }))
-                    .unwrap();
-            }
+            let _temp = temp;
+            runtime.run().await;
         });
-        let service =
-            crate::servers::service::ServersService::new(db.clone(), config.clone(), handle);
+        let service = crate::servers::service::ServersService::new(
+            db.clone(),
+            config.clone(),
+            handle.clone(),
+        );
         service.set_server_speed_limit(42, 2_000_000).await.unwrap();
-        assert_eq!(rebuilds.recv().await.unwrap(), 1);
+        assert_eq!(handle.nntp_runtime_activation().unwrap().generation, 1);
         assert_eq!(
             db.load_config().unwrap().servers[0].max_download_speed,
             2_000_000
@@ -547,13 +527,14 @@ mod tests {
         assert_eq!(config.read().await.servers[0].max_download_speed, 2_000_000);
         // The same value again changes nothing.
         service.set_server_speed_limit(42, 2_000_000).await.unwrap();
-        assert!(rebuilds.try_recv().is_err());
+        assert_eq!(handle.nntp_runtime_activation().unwrap().generation, 1);
         // 0 removes the limit.
         service.set_server_speed_limit(42, 0).await.unwrap();
-        assert_eq!(rebuilds.recv().await.unwrap(), 2);
+        assert_eq!(handle.nntp_runtime_activation().unwrap().generation, 2);
         assert_eq!(db.load_config().unwrap().servers[0].max_download_speed, 0);
         assert!(service.set_server_speed_limit(999, 1).await.is_err());
         drop(service);
+        handle.shutdown().await.unwrap();
         pipeline.await.unwrap();
     }
 
@@ -596,10 +577,9 @@ mod tests {
             .unwrap()
             .id;
         let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-        let (commands, _received) = mpsc::channel(2);
+
         let (events, _) = broadcast::channel(1);
         let handle = SchedulerHandle::new(
-            commands,
             events,
             SharedPipelineState::new(PipelineMetrics::new(), vec![]),
         );

@@ -317,7 +317,7 @@ impl Pipeline {
             crate::operations::instrumentation::StageOutcomeKind::Complete,
             u64::from(slices_repaired),
         );
-        let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+        self.emit_job_event(PipelineEvent::RepairComplete {
             job_id,
             slices_repaired,
         });
@@ -488,7 +488,7 @@ impl Pipeline {
             crate::operations::instrumentation::StageOutcomeKind::Failed,
             0,
         );
-        let _ = self.event_tx.send(PipelineEvent::RepairFailed {
+        self.emit_job_event(PipelineEvent::RepairFailed {
             job_id,
             error: error.clone(),
         });

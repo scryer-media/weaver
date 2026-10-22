@@ -994,6 +994,7 @@ impl Pipeline {
                 continue;
             }
             let set_name = plan.set_name.clone();
+            let password = self.job_password_at_boundary(job_id, spec.password.as_deref());
             let mut set = DirectSet::new(job_id, plan.clone());
             self.direct_store.apply_ceilings(&mut set);
             // Bound **before** the layout is rebuilt, because
@@ -1003,7 +1004,7 @@ impl Pipeline {
             // password itself was never persisted — this is the live job spec,
             // which restore has already re-derived from the stored NZB and the
             // job's password override.
-            set.router.set_password(spec.password.as_deref());
+            set.router.set_password(password.as_deref());
             let par2_available = super::plan::spec_carries_par2(spec);
             set.router.note_par2_available(par2_available);
             set.router
@@ -1017,7 +1018,7 @@ impl Pipeline {
                     .get_or_insert_with(|| self.harvest_direct_header_passwords(job_id));
                 super::wiring::offer_direct_header_candidates(
                     &mut set,
-                    spec.password.as_deref(),
+                    password.as_deref(),
                     harvest,
                 );
             }
@@ -1214,9 +1215,10 @@ impl Pipeline {
                         );
                         continue;
                     }
+                    let password = self.job_password_at_boundary(job_id, spec.password.as_deref());
                     let mut set = DirectSet::new(job_id, plan.clone());
                     self.direct_store.apply_ceilings(&mut set);
-                    set.router.set_password(spec.password.as_deref());
+                    set.router.set_password(password.as_deref());
                     // A harvest above has already been kept for the job, and
                     // the live seam only offers a harvest when it runs; hand it
                     // to this fresh set here instead. With no harvest yet, the
@@ -1224,7 +1226,7 @@ impl Pipeline {
                     if let Some(harvest) = header_candidates.as_deref() {
                         super::wiring::offer_direct_header_candidates(
                             &mut set,
-                            spec.password.as_deref(),
+                            password.as_deref(),
                             harvest,
                         );
                     }

@@ -440,9 +440,7 @@ impl Pipeline {
                 "NNTP download pass started"
             );
             self.phase_begin(job_id, JobPhase::Downloading, Some(total));
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::DownloadStarted { job_id });
+            self.emit_job_event(PipelineEvent::DownloadStarted { job_id });
         }
     }
 
@@ -497,13 +495,11 @@ impl Pipeline {
         // Every early return below except an operator pause is a gate that
         // can lift with no event to announce it, so the pass is retried on
         // the idle tick until one gets as far as the eligible jobs.
-        self.download_dispatch_retry =
-            !self.global_paused && !self.shared_state.speed_test_paused();
+        self.download_dispatch_retry = !self.shared_state.is_paused();
         // Lanes already connected and waiting in the actor are answered
         // before any dial: an established socket outranks a new one.
         self.service_held_download_refills();
-        if self.global_paused
-            || self.shared_state.speed_test_paused()
+        if self.shared_state.is_paused()
             || self.shared_state.schedule_replay_paused()
             || self.rate_limiter.should_wait()
         {

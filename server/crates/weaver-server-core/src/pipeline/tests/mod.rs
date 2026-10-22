@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::SchedulerError;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -47,6 +48,7 @@ macro_rules! segment_spec {
 
 mod archive_topology;
 mod cancel_batch;
+mod control_lifecycle;
 mod core;
 mod decode_and_files;
 mod direct_store;
@@ -65,6 +67,7 @@ mod par3_recovery;
 #[cfg(unix)]
 mod post_processing_completion;
 mod post_processing_pause;
+mod queue;
 mod rar_extraction;
 mod restart_resume_floor;
 mod restore_history;
@@ -76,6 +79,23 @@ mod support_facts;
 mod terminal_settlement;
 mod yenc_compatibility;
 mod zip64;
+
+impl Pipeline {
+    async fn restore_job(&mut self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
+        let id = request.job_id;
+        if self.jobs.contains_key(&id) {
+            return Err(SchedulerError::JobExists(id));
+        }
+        // Some crash fixtures reuse the stopped runtime's shared queue.
+        self.shared_state.queue.write(|inner| {
+            inner.jobs.retain(|row| row.id != id);
+            crate::pipeline::queue::Change::changed(())
+        });
+        self.shared_state.queue.restore(request)?;
+        self.apply_queue_intents().await;
+        Ok(())
+    }
+}
 
 struct TestHarness {
     _temp_dir: TempDir,
@@ -135,10 +155,9 @@ impl TestHarness {
             config_path: None,
         }));
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
         let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
         let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-        let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+        let handle = SchedulerHandle::new(event_tx.clone(), shared_state.clone());
 
         let profile = SystemProfile {
             cpu: CpuProfile {
@@ -167,7 +186,6 @@ impl TestHarness {
         });
 
         let mut pipeline = Pipeline::new(
-            cmd_rx,
             event_tx,
             nntp,
             buffers,
@@ -552,7 +570,6 @@ async fn new_direct_pipeline_on_machine(
         config_path: None,
     }));
 
-    let (_cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
     // Dispatch asks the pool which server a new lane should try, so a harness
@@ -582,7 +599,6 @@ async fn new_direct_pipeline_on_machine(
     let buffers = BufferPool::new(buffer_config);
 
     let pipeline = Pipeline::new(
-        cmd_rx,
         event_tx,
         nntp,
         buffers,
@@ -606,7 +622,7 @@ async fn new_direct_pipeline_on_machine(
     (pipeline, intermediate_dir, complete_dir)
 }
 
-async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
     new_direct_pipeline_with_buffers(
         temp_dir,
         BufferPoolConfig {
@@ -1884,22 +1900,27 @@ fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
     spec
 }
 
-// Sends one single-id cancel command and returns that id's result, which
-// arrives once the cancelled job's history row has committed.
+// Record cancellation, drive its boundary, then observe the durable archive.
 async fn cancel_one_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
     origin: crate::jobs::handle::CancellationOrigin,
 ) -> Result<(), crate::SchedulerError> {
-    let (reply, done) = tokio::sync::oneshot::channel();
+    pipeline.report_all_for_test();
+    let mut events = pipeline.event_tx.subscribe();
     pipeline
-        .handle_command(SchedulerCommand::CancelJobs {
-            job_ids: std::collections::BTreeSet::from([job_id]),
-            origin,
-            reply,
-        })
-        .await;
-    done.await.unwrap().remove(&job_id).unwrap()
+        .shared_state
+        .queue
+        .cancel_jobs(BTreeSet::from([job_id]), origin)
+        .remove(&job_id)
+        .unwrap()?;
+    pipeline.apply_queue_intents().await;
+    loop {
+        if matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id: id } if id == job_id)
+        {
+            return Ok(());
+        }
+    }
 }
 
 async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
@@ -2026,6 +2047,7 @@ async fn insert_active_job_with_persisted_nzb_named(
         },
     );
     pipeline.job_order.push(job_id);
+    pipeline.report_all_for_test();
     working_dir
 }
 
@@ -2709,13 +2731,7 @@ fn job_status_for_assert(pipeline: &Pipeline, job_id: JobId) -> Option<JobStatus
         .jobs
         .get(&job_id)
         .map(|state| state.status.clone())
-        .or_else(|| {
-            pipeline
-                .finished_jobs
-                .iter()
-                .find(|job| job.job_id == job_id)
-                .map(|job| job.status.clone())
-        })
+        .or_else(|| pipeline.shared_state.get_job(job_id).map(|job| job.status))
 }
 
 fn drain_job_verification_started(
@@ -3250,6 +3266,7 @@ async fn setup_extracting_rar_full_set(
 
 fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWork {
     DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId { job_id, file_index },
             segment_number: 0,

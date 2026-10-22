@@ -581,7 +581,14 @@ impl Pipeline {
         if matches!(previous_run_state, crate::jobs::model::RunState::Paused) {
             return Ok(());
         }
-        if self.awaiting_queue_script_barrier(job_id) {
+        let accepted_pause = self.shared_state.queue.read(|inner| {
+            inner.jobs.iter().any(|row| {
+                row.id == job_id
+                    && row.intents.paused == Some(true)
+                    && row.intents.pause_seq > row.report.seen_intent_seq
+            })
+        });
+        if !accepted_pause && self.awaiting_queue_script_barrier(job_id) {
             return Err(crate::SchedulerError::Conflict(
                 "the download is complete and waiting for queue scripts".into(),
             ));
@@ -606,7 +613,9 @@ impl Pipeline {
             crate::jobs::model::PostState::Extracting
         ) && self
             .job_has_pending_download_pipeline_work(job_id);
-        if !(pauseable_download_lane || extracting_with_download_work) {
+        // Eligibility was checked when the API recorded a pending pause. Work
+        // draining before this boundary must not revoke that accepted intent.
+        if !(accepted_pause || pauseable_download_lane || extracting_with_download_work) {
             return Err(crate::SchedulerError::Conflict(format!(
                 "pause is only supported in queued or downloading states (current: {:?})",
                 previous_status
@@ -791,7 +800,7 @@ impl Pipeline {
 
         self.phase_end_extracting_if_idle(job_id);
         self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
-        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
+        self.emit_job_event(PipelineEvent::RepairStarted { job_id });
         true
     }
 
@@ -829,9 +838,7 @@ impl Pipeline {
         }
 
         self.transition_postprocessing_status(job_id, JobStatus::Extracting, Some("extracting"));
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::ExtractionReady { job_id });
+        self.emit_job_event(PipelineEvent::ExtractionReady { job_id });
         info!(job_id = job_id.0, "extraction ready");
         true
     }
@@ -844,7 +851,7 @@ impl Pipeline {
             return;
         };
         self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
-        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
+        self.emit_job_event(PipelineEvent::RepairStarted { job_id });
         self.schedule_job_completion_check(job_id);
     }
 
@@ -882,9 +889,7 @@ impl Pipeline {
                 JobStatus::Extracting,
                 Some("extracting"),
             );
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::ExtractionReady { job_id });
+            self.emit_job_event(PipelineEvent::ExtractionReady { job_id });
             self.schedule_job_completion_check(job_id);
         }
     }

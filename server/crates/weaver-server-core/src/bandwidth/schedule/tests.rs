@@ -58,10 +58,8 @@ async fn startup_readiness_reports_server_and_intake_failures() {
         ),
         (ScheduleAction::PauseWatchFolderScanning, false),
     ] {
-        let (commands, _received) = tokio::sync::mpsc::channel(1);
         let (events, _) = tokio::sync::broadcast::channel(1);
         let handle = SchedulerHandle::new(
-            commands,
             events,
             crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
         );
@@ -745,10 +743,9 @@ async fn timed_resume_defers_scheduled_resume_without_suppressing_pause_or_retry
     let db = crate::Database::open_in_memory().unwrap();
     db.set_setting("nzbget.scheduled_resume_at", "12345")
         .unwrap();
-    let (commands, mut received) = tokio::sync::mpsc::channel(4);
+
     let (events, _) = tokio::sync::broadcast::channel(1);
     let handle = SchedulerHandle::new(
-        commands,
         events,
         crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
     );
@@ -764,20 +761,8 @@ async fn timed_resume_defers_scheduled_resume_without_suppressing_pause_or_retry
         })
         .await;
     assert!(evaluator.applied.is_empty());
-    assert!(received.try_recv().is_err());
+    assert_eq!(handle.job_revision(), 0);
 
-    let pipeline = tokio::spawn(async move {
-        let mut applied = Vec::new();
-        while let Some(command) = received.recv().await {
-            if let crate::SchedulerCommand::ApplyScheduleAction { action, reply } = command {
-                applied.push(action);
-                reply.send(()).unwrap();
-            } else {
-                panic!("unexpected schedule command");
-            }
-        }
-        applied
-    });
     apply_schedule_action(
         handle.clone(),
         services.clone(),
@@ -786,6 +771,7 @@ async fn timed_resume_defers_scheduled_resume_without_suppressing_pause_or_retry
     )
     .await
     .unwrap();
+    assert!(handle.is_globally_paused());
     assert_eq!(
         db.get_setting("nzbget.scheduled_resume_at")
             .unwrap()
@@ -799,11 +785,7 @@ async fn timed_resume_defers_scheduled_resume_without_suppressing_pause_or_retry
         })
         .await;
     assert_eq!(evaluator.applied.len(), 1);
-    drop(handle);
-    assert_eq!(
-        pipeline.await.unwrap(),
-        [ScheduleAction::Pause, ScheduleAction::Resume]
-    );
+    assert!(!handle.is_globally_paused());
 }
 
 #[tokio::test]
@@ -900,42 +882,44 @@ async fn one_shot_dispatch_queues_every_occurrence_without_blocking_hold_changes
 }
 
 #[tokio::test]
-async fn initial_replay_and_shutdown_wait_for_runtime_acknowledgement() {
-    let (commands, mut received) = tokio::sync::mpsc::channel(1);
-    let (events, _) = tokio::sync::broadcast::channel(1);
-    let handle = SchedulerHandle::new(
-        commands,
-        events,
-        crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
-    );
-    let schedules = Arc::new(RwLock::new(vec![entry(
-        "pause",
-        "08:00",
-        vec![],
-        ScheduleAction::Pause,
-    )]));
-    let (task, mut replayed) =
-        spawn_evaluator_with_services(handle, schedules, ScheduleServices::default());
-    let Some(crate::SchedulerCommand::ApplyScheduleAction { action, reply }) =
-        received.recv().await
-    else {
-        panic!("initial hold was not sent to the runtime");
-    };
-    assert_eq!(action, ScheduleAction::Pause);
-    assert_eq!(
-        replayed.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    );
-    let mut shutdown = Box::pin(task.shutdown());
-    tokio::select! {
-        biased;
-        () = &mut shutdown => panic!("shutdown must wait for the running hold"),
-        () = std::future::ready(()) => {},
-    }
-    reply.send(()).unwrap();
+async fn initial_replay_preserves_pause_speed_and_profile_before_the_first_pipeline_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut config = db.load_config().unwrap();
+    config.data_dir = temp.path().join("data").display().to_string();
+    config.intermediate_dir = Some(temp.path().join("intermediate").display().to_string());
+    config.complete_dir = Some(temp.path().join("complete").display().to_string());
+    let (mut pipeline, handle, state) =
+        crate::pipeline::test_support::idle_pipeline(db, Arc::new(RwLock::new(config))).await;
+    let profile = HardwareProfile::Efficient;
+    let limit = 12_345;
+    let schedules = Arc::new(RwLock::new(vec![
+        entry("pause", "00:00", vec![], ScheduleAction::Pause),
+        entry("speed", "00:00", vec![], global_speed(limit)),
+        entry(
+            "profile",
+            "00:00",
+            vec![],
+            ScheduleAction::HardwareProfile { profile },
+        ),
+    ]));
+    let (task, replayed) =
+        spawn_evaluator_with_services(handle.clone(), schedules, ScheduleServices::default());
+    assert!(state.schedule_replay_paused());
     replayed.await.unwrap().unwrap();
-    shutdown.await;
-    assert!(received.recv().await.is_none());
+    assert!(handle.is_globally_paused());
+    state.queue.read(|inner| {
+        assert!(inner.globals.paused);
+        assert_eq!(inner.globals.scheduled_speed_limit, Some(limit));
+        assert_eq!(inner.globals.scheduled_hardware_profile, Some(profile));
+    });
+    pipeline.apply_queue_intents().await;
+    assert!(handle.is_globally_paused());
+    assert_eq!(state.download_block().scheduled_speed_limit, limit);
+    let in_force = handle.hardware_profile_in_force().unwrap();
+    assert_eq!(in_force.active, profile);
+    assert_eq!(in_force.scheduled, Some(profile));
+    task.shutdown().await;
 }
 
 #[tokio::test]
@@ -944,10 +928,9 @@ async fn timed_download_resume_does_not_defer_intake_resume() {
     db.set_setting("nzbget.scheduled_resume_at", "12345")
         .unwrap();
     let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-    let (commands, mut received) = tokio::sync::mpsc::channel(1);
+
     let (events, _) = tokio::sync::broadcast::channel(1);
     let handle = SchedulerHandle::new(
-        commands,
         events,
         crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
     );
@@ -975,7 +958,7 @@ async fn timed_download_resume_does_not_defer_intake_resume() {
     assert!(!config.read().await.watch_folder.scanning_paused);
     assert!(matches!(
         apply_schedule_action(
-            handle,
+            handle.clone(),
             services,
             ScheduleAction::Resume,
             Some(ScheduleTrack::Downloads)
@@ -983,17 +966,16 @@ async fn timed_download_resume_does_not_defer_intake_resume() {
         .await,
         Err(ScheduleApplyError::Pending)
     ));
-    assert!(received.try_recv().is_err());
+    assert_eq!(handle.job_revision(), 0);
 }
 
 #[tokio::test(start_paused = true)]
 async fn failed_initial_hold_reports_readiness_and_retries_after_repair() {
     let db = crate::Database::open_in_memory().unwrap();
     let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-    let (commands, _) = tokio::sync::mpsc::channel(1);
+
     let (events, _) = tokio::sync::broadcast::channel(1);
     let handle = SchedulerHandle::new(
-        commands,
         events,
         crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
     );
@@ -1048,10 +1030,9 @@ async fn failed_initial_hold_reports_readiness_and_retries_after_repair() {
 async fn failed_watch_folder_resume_does_not_pause_scanning() {
     let db = crate::Database::open_in_memory().unwrap();
     let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-    let (commands, _) = tokio::sync::mpsc::channel(1);
+
     let (events, _) = tokio::sync::broadcast::channel(1);
     let handle = SchedulerHandle::new(
-        commands,
         events,
         crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
     );
@@ -1101,10 +1082,9 @@ async fn failed_scheduled_server_activation_restores_persisted_state() {
     .unwrap();
     db.insert_server(&server).unwrap();
     let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-    let (commands, _) = tokio::sync::mpsc::channel(1);
+
     let (events, _) = tokio::sync::broadcast::channel(1);
     let handle = SchedulerHandle::new(
-        commands,
         events,
         crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
     );
@@ -1121,10 +1101,9 @@ async fn failed_scheduled_server_activation_restores_persisted_state() {
 async fn initial_metadata_failure_pauses_intake_until_recovery() {
     let db = crate::Database::open_in_memory().unwrap();
     let config = Arc::new(RwLock::new(db.load_config().unwrap()));
-    let (commands, _) = tokio::sync::mpsc::channel(1);
+
     let (events, _) = tokio::sync::broadcast::channel(1);
     let handle = SchedulerHandle::new(
-        commands,
         events,
         crate::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]),
     );

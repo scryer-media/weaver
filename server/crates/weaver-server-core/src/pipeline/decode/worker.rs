@@ -989,6 +989,7 @@ impl Pipeline {
                 segment_id,
                 retry_count + 1,
                 DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -1281,6 +1282,7 @@ impl Pipeline {
         if self.jobs.contains_key(&job_id) && self.job_decode_stage_drained(job_id) {
             self.maybe_finish_download_pass(job_id);
         }
+        self.report_job(job_id);
     }
 
     // Handle a decode failure by re-queuing the segment for re-download.
@@ -1405,6 +1407,7 @@ impl Pipeline {
                     .find(|s| s.ordinal == segment_id.segment_number)
             {
                 let work = DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -2939,6 +2942,7 @@ impl Pipeline {
         };
 
         let work = DownloadWork {
+            counters: None,
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -4191,7 +4195,7 @@ impl Pipeline {
                         crate::post_processing::model::QueueEvent::FileDownloaded,
                         None,
                     );
-                    let _ = self.event_tx.send(PipelineEvent::FileComplete {
+                    self.emit_job_event(PipelineEvent::FileComplete {
                         file_id,
                         filename: filename.to_string(),
                         total_bytes,

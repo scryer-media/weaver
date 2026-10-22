@@ -7,6 +7,7 @@ use super::*;
 
 fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadWork {
     DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: JobId(job_id),
@@ -483,6 +484,7 @@ fn min_queued_byte_estimate_tracks_every_add_and_removal_path() {
         file_index,
     };
     let sized = |file_index, seg, bytes| DownloadWork {
+        counters: None,
         byte_estimate: bytes,
         ..make_work(7, file_index, seg, 10)
     };

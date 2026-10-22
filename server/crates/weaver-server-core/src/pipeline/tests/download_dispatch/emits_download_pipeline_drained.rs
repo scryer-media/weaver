@@ -258,6 +258,7 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
         state.restored_download_floor_bytes = 1;
     }
     let next_work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id,
             segment_number: 0,
@@ -620,6 +621,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         file_index: complete_files,
     };
     let next_work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: next_file_id,
             segment_number: 0,
@@ -800,6 +802,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         file_index: 0,
     };
     let work = |segment_number, message_id| DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id,
             segment_number,
