@@ -5,7 +5,7 @@
 //! torrent automation drives, served beside the first-party GraphQL API.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1628,6 +1628,9 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "dht_bootstrap_nodes": torrent.dht_bootstrap_nodes,
         "ip_filter_enabled": torrent.blocklist_enabled,
         "ip_filter_path": torrent.blocklist.as_deref().unwrap_or_default(),
+        "ip_filter_trackers": torrent.filter_trackers,
+        "banned_IPs": torrent.banned_ips.join("\n"),
+        "block_peers_on_privileged_ports": torrent.block_privileged_ports,
         "stop_tracker_timeout": torrent.stop_tracker_timeout_secs,
         "max_ratio_enabled": seeding.is_some_and(|policy| policy.ratio_goal.is_some()),
         "max_ratio": seeding.and_then(|policy| policy.ratio_goal).map_or(-1.0, f64::from),
@@ -1735,6 +1738,20 @@ fn torrent_preferences(
     if let Some(path) = changes.get("ip_filter_path").and_then(Value::as_str) {
         torrent.blocklist = Some(path.to_owned());
     }
+    if let Some(filter) = flag("ip_filter_trackers") {
+        torrent.filter_trackers = filter;
+    }
+    // One entry a line, blank lines skipped (`SessionImpl::setBannedIPs`).
+    if let Some(banned) = changes.get("banned_IPs").and_then(Value::as_str) {
+        torrent.banned_ips = banned
+            .split('\n')
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    if let Some(block) = flag("block_peers_on_privileged_ports") {
+        torrent.block_privileged_ports = block;
+    }
     torrent.checked().map_err(|errors| errors.join("\n"))
 }
 
@@ -1786,6 +1803,32 @@ async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Respons
         ctx.refresh_settings().await;
     }
     ok()
+}
+
+// Add `ips` to the banned addresses, saved and laid over the sessions. The
+// settings stay locked from read to save, so a ban made beside another
+// change loses neither.
+async fn ban_session_wide(ctx: &TorrentFacadeContext, ips: &[IpAddr]) -> Result<(), String> {
+    let inner = &ctx.inner;
+    let mut config = inner.config.write().await;
+    let mut torrent = config.torrent.clone();
+    torrent
+        .banned_ips
+        .extend(ips.iter().map(ToString::to_string));
+    let torrent = torrent.checked().map_err(|errors| errors.join("\n"))?;
+    if torrent == config.torrent {
+        return Ok(());
+    }
+    let db = inner.db.clone();
+    let saved = torrent.clone();
+    tokio::task::spawn_blocking(move || db.save_torrent_config(&saved))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    config.torrent = torrent;
+    drop(config);
+    ctx.refresh_settings().await;
+    Ok(())
 }
 
 impl TorrentFacadeContext {
@@ -2063,16 +2106,14 @@ async fn torrent_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response 
 }
 
 // `transfer/banPeers` (qBittorrent `TransferController::banPeersAction`):
-// `|`-separated `ip:port`s, each IP banned from every torrent. qBittorrent's
-// `SessionImpl::banIP` bans session-wide; the bans here go on each
-// torrent's own peer list (libtorrent `torrent::ban_peer`), saved once per
+// `|`-separated `ip:port`s, each IP banned from every torrent. Each joins
+// the banned addresses every session filters, as qBittorrent's
+// `SessionImpl::banIP` adds it to `BannedIPs`, and goes on each torrent's
+// own peer list too (libtorrent `torrent::ban_peer`), saved once per
 // torrent. A torrent that fails to save does not stop the others.
 async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(peers) = params.get("peers") else {
         return text(StatusCode::BAD_REQUEST, "Missing parameter: peers");
-    };
-    let Some(torrents) = &ctx.inner.torrents else {
-        return ok();
     };
     let ips: Vec<_> = peers
         .split('|')
@@ -2082,6 +2123,12 @@ async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     if ips.is_empty() {
         return ok();
     }
+    if let Err(error) = ban_session_wide(ctx, &ips).await {
+        return internal(error);
+    }
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
     let mut failed = None;
     for view in torrents.torrents(None).await {
         match torrents.ban_peers(view.job_id, &ips).await {

@@ -306,7 +306,8 @@ pub struct Session {
     pub(crate) allow_multiple_connections_per_ip: bool,
     pub ratelimits: Limits,
 
-    pub blocklist: Arc<IpRanges>,
+    // Read wherever an address is judged; changed by `set_ip_filter`.
+    ip_filter: RwLock<IpFilter>,
     pub allowlist: Option<IpRanges>,
 
     // Monitoring / tracing / logging
@@ -832,6 +833,58 @@ pub struct SessionLimits {
     pub connection_speed: NonZeroU32,
 }
 
+/// What the session refuses to reach, taken as it changes (libtorrent
+/// `session_impl::set_ip_filter`, with `no_connect_privileged_ports` and
+/// `apply_ip_filter_to_trackers`).
+#[derive(Clone)]
+pub struct IpFilter {
+    /// The address ranges no peer is taken from or dialed at, and no web
+    /// seed is asked at (libtorrent's `ip_filter`).
+    pub blocked: Arc<IpRanges>,
+    /// No peer on a port below 1024 is dialed or kept (libtorrent
+    /// `no_connect_privileged_ports`). Off by default.
+    pub no_privileged_ports: bool,
+    /// Trackers are held to `blocked` too (libtorrent
+    /// `apply_ip_filter_to_trackers`). On by default.
+    pub trackers: bool,
+}
+
+impl Default for IpFilter {
+    fn default() -> Self {
+        Self {
+            blocked: Arc::default(),
+            no_privileged_ports: false,
+            trackers: true,
+        }
+    }
+}
+
+impl std::fmt::Debug for IpFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpFilter")
+            .field("blocked", &self.blocked.len())
+            .field("no_privileged_ports", &self.no_privileged_ports)
+            .field("trackers", &self.trackers)
+            .finish()
+    }
+}
+
+// One list is one filter: two filters are the same when they share it.
+impl PartialEq for IpFilter {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.blocked, &other.blocked)
+            && self.no_privileged_ports == other.no_privileged_ports
+            && self.trackers == other.trackers
+    }
+}
+
+impl IpFilter {
+    /// Whether a peer on `port` is refused.
+    fn refuses_port(&self, port: u16) -> bool {
+        self.no_privileged_ports && port < 1024
+    }
+}
+
 pub struct SessionOptions {
     /// DHT configuration. Set to None to disable DHT entirely.
     /// Defaults to DHT enabled with persistence.
@@ -883,10 +936,10 @@ pub struct SessionOptions {
 
     pub ratelimits: LimitsConfig,
 
-    /// The address ranges no peer is taken from or dialed at, loaded by
-    /// whoever builds the session, so that one list serves every session
-    /// that shares it.
-    pub blocklist: Option<Arc<IpRanges>>,
+    /// The IP filter the session opens with, its ranges loaded by whoever
+    /// builds the session, so that one list serves every session that
+    /// shares it; [`Session::set_ip_filter`] changes it.
+    pub ip_filter: IpFilter,
     pub allowlist_url: Option<String>,
 
     // The list of tracker URLs to always use for each torrent.
@@ -976,7 +1029,7 @@ impl Default for SessionOptions {
             runtime_worker_threads: None,
             root_span: None,
             ratelimits: LimitsConfig::default(),
-            blocklist: None,
+            ip_filter: IpFilter::default(),
             allowlist_url: None,
             trackers: HashSet::new(),
             peer_limit: None,
@@ -1305,8 +1358,6 @@ impl Session {
                 .context("error creating stream connector")?,
             );
 
-            let blocklist = opts.blocklist.unwrap_or_default();
-
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
                 let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
@@ -1413,7 +1464,7 @@ impl Session {
                 choker: Arc::new(Choker::new(opts.unchoke_slots_limit)),
                 disable_pex: opts.disable_pex,
                 allow_multiple_connections_per_ip: opts.allow_multiple_connections_per_ip,
-                blocklist,
+                ip_filter: RwLock::new(opts.ip_filter),
                 allowlist,
                 lsd,
             });
@@ -1550,6 +1601,11 @@ impl Session {
                     .fetch_add(1, Ordering::Relaxed);
             }
             bail!("incoming connection refused: {} is {why}", addr.ip());
+        }
+        // No peer on a privileged port is kept, whichever way it connects
+        // (libtorrent `torrent::privileged_port_updated` disconnects one).
+        if self.refuses_port(addr.port()) {
+            bail!("incoming connection refused: {addr} is on a privileged port");
         }
 
         // Every byte from here on crossed the peer's socket for the torrent
@@ -1759,6 +1815,38 @@ impl Session {
         self.connection_slots.set_limit(limits.connections_limit);
         self.choker.set_slots(limits.unchoke_slots_limit);
         self.connection_slots.set_speed(limits.connection_speed);
+    }
+
+    /// The IP filter the session holds to now.
+    pub fn ip_filter(&self) -> IpFilter {
+        self.ip_filter.read().clone()
+    }
+
+    /// Hold the session to `filter` from now on: every torrent's peers it
+    /// refuses leave the peer list, a connection to one closing first
+    /// (libtorrent `session_impl::set_ip_filter` and
+    /// `update_privileged_ports`, which run `torrent::ip_filter_updated` and
+    /// `privileged_port_updated` over every torrent). Trackers are held to it
+    /// from their next announce.
+    pub fn set_ip_filter(&self, filter: IpFilter) {
+        {
+            let mut held = self.ip_filter.write();
+            if *held == filter {
+                return;
+            }
+            *held = filter;
+        }
+        let torrents: Vec<_> = self.db.read().torrents.values().cloned().collect();
+        for torrent in torrents {
+            if let Some(live) = torrent.live() {
+                live.refilter();
+            }
+        }
+    }
+
+    /// Whether the session refuses a peer on `port`.
+    pub(crate) fn refuses_port(&self, port: u16) -> bool {
+        self.ip_filter.read().refuses_port(port)
     }
 
     fn merge_peer_opts(&self, other: Option<PeerConnectionOptions>) -> PeerConnectionOptions {
@@ -2528,24 +2616,41 @@ impl Session {
     /// the blocklist and the allowlist, must let it through (libtorrent's one
     /// `ip_filter`: `torrent::add_peer` applies it to a peer,
     /// `torrent::connect_web_seed` to a web seed, and the two tracker
-    /// functions to a tracker).
+    /// functions to a tracker while [`IpFilter::trackers`] holds).
     pub(crate) fn may_reach(&self, ip: IpAddr) -> Result<(), Unreachable> {
+        self.may_reach_under(ip, true)
+    }
+
+    // `may_reach`, the IP filter applied only when `filtered`.
+    fn may_reach_under(&self, ip: IpAddr, filtered: bool) -> Result<(), Unreachable> {
         if self.ipv4_only && ip.is_ipv6() {
             return Err(Unreachable::Family);
         }
-        if self.blocklist.has(ip) || self.allowlist.as_ref().is_some_and(|l| !l.has(ip)) {
+        if filtered
+            && (self.ip_filter.read().blocked.has(ip)
+                || self.allowlist.as_ref().is_some_and(|l| !l.has(ip)))
+        {
             return Err(Unreachable::Filtered);
         }
         Ok(())
     }
 
-    /// [`Session::may_reach`] for the tracker task, which already holds the
-    /// session (its counters).
+    /// The addresses the tracker task may ask a tracker at: those of a
+    /// family the session connects over, and while the filter applies to
+    /// trackers those it lets through (libtorrent
+    /// `torrent::build_tracker_request` and `scrape_tracker_impl` hand the
+    /// request the filter only when `apply_ip_filter_to_trackers` is set),
+    /// read at each lookup.
     // Weak, as the tracker task outlives no session: holding it strongly
     // would keep a session whose torrents announce nowhere alive.
     fn reachable(self: &Arc<Self>) -> Reachable {
         let session = Arc::downgrade(self);
-        Arc::new(move |ip| session.upgrade().map_or(Ok(()), |s| s.may_reach(ip)))
+        Arc::new(move |ip| {
+            session.upgrade().map_or(Ok(()), |s| {
+                let filtered = s.ip_filter.read().trackers;
+                s.may_reach_under(ip, filtered)
+            })
+        })
     }
 
     // Get a peer stream from both DHT and trackers, under every hash the
@@ -2996,9 +3101,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AddTorrent, AddTorrentOptions, AddTorrentResponse, ExternalIps, Session, SessionOptions,
-        TorrentIdOrHash, is_bare_info_hash, merge_tracker_tiers, metainfo_tracker_tiers,
-        torrent_file_from_info_bytes, torrent_from_bytes,
+        AddTorrent, AddTorrentOptions, AddTorrentResponse, ExternalIps, IpFilter, Session,
+        SessionOptions, TorrentIdOrHash, is_bare_info_hash, merge_tracker_tiers,
+        metainfo_tracker_tiers, torrent_file_from_info_bytes, torrent_from_bytes,
     };
 
     fn url(s: &str) -> url::Url {
@@ -4549,15 +4654,18 @@ mod tests {
         let session = quiet_session(
             &dir,
             SessionOptions {
-                blocklist: Some(Arc::new(
-                    crate::IpRanges::load_from_file(ip_list(
-                        &dir,
-                        "block.txt",
-                        "10.0.0.1-10.0.0.1",
-                    ))
-                    .await
-                    .unwrap(),
-                )),
+                ip_filter: IpFilter {
+                    blocked: Arc::new(
+                        crate::IpRanges::load_from_file(ip_list(
+                            &dir,
+                            "block.txt",
+                            "10.0.0.1-10.0.0.1",
+                        ))
+                        .await
+                        .unwrap(),
+                    ),
+                    ..IpFilter::default()
+                },
                 allowlist_url: Some(
                     url::Url::from_file_path(ip_list(&dir, "allow.txt", "10.0.0.0-10.0.0.255"))
                         .unwrap()
@@ -4606,6 +4714,79 @@ mod tests {
         assert_eq!(blocked_incoming(&session), 0);
 
         assert_eq!(check_once(&session, "192.0.2.1:6881"), None);
+        session.stop().await;
+    }
+
+    // libtorrent `session_impl::set_ip_filter` and `update_privileged_ports`
+    // take hold in a running session: an incoming connection is judged by
+    // the filter as it is when it arrives, its address against the ranges
+    // and its port against `no_connect_privileged_ports`.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_session_judges_incoming_connections_by_its_filter_as_it_changes() {
+        let dir = TempDir::with_prefix("incoming_refiltered").unwrap();
+        let session = quiet_session(&dir, SessionOptions::default()).await;
+        assert_eq!(check_once(&session, "10.0.0.1:6881"), None);
+        assert_eq!(check_once(&session, "10.0.0.2:80"), None);
+
+        let blocked = Arc::new(crate::IpRanges::new(
+            ["10.0.0.1".parse().unwrap().."10.0.0.2".parse().unwrap()],
+            [],
+        ));
+        session.set_ip_filter(IpFilter {
+            blocked: Arc::clone(&blocked),
+            no_privileged_ports: true,
+            trackers: true,
+        });
+        let refusal = check_once(&session, "10.0.0.1:6881").expect("refused unread");
+        assert!(refusal.contains("banned by the IP filter"), "{refusal}");
+        let refusal = check_once(&session, "10.0.0.2:80").expect("refused unread");
+        assert!(refusal.contains("privileged port"), "{refusal}");
+        assert_eq!(check_once(&session, "10.0.0.2:1024"), None);
+        assert_eq!(blocked_incoming(&session), 1);
+
+        session.set_ip_filter(IpFilter::default());
+        assert_eq!(check_once(&session, "10.0.0.1:6881"), None);
+        assert_eq!(check_once(&session, "10.0.0.2:80"), None);
+        session.stop().await;
+    }
+
+    // libtorrent `torrent::build_tracker_request` hands an announce the IP
+    // filter only under `apply_ip_filter_to_trackers`: off, a tracker is
+    // asked at an address the filter blocks; the family rule holds either
+    // way.
+    #[tokio::test(start_paused = true)]
+    async fn trackers_are_held_to_the_ip_filter_only_while_it_applies_to_them() {
+        use crate::tracker::Unreachable;
+        let dir = TempDir::with_prefix("tracker_filter").unwrap();
+        let session = quiet_session(
+            &dir,
+            SessionOptions {
+                ipv4_only: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let reachable = session.reachable();
+        let blocked: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let filter = |trackers| IpFilter {
+            blocked: Arc::new(crate::IpRanges::new(
+                ["10.0.0.1".parse().unwrap().."10.0.0.2".parse().unwrap()],
+                [],
+            )),
+            no_privileged_ports: false,
+            trackers,
+        };
+
+        session.set_ip_filter(filter(true));
+        assert_eq!(reachable(blocked), Err(Unreachable::Filtered));
+        session.set_ip_filter(filter(false));
+        assert_eq!(reachable(blocked), Ok(()));
+        assert_eq!(
+            reachable("2001:db8::1".parse().unwrap()),
+            Err(Unreachable::Family)
+        );
+        // Peers stay held to it.
+        assert_eq!(session.may_reach(blocked), Err(Unreachable::Filtered));
         session.stop().await;
     }
 }

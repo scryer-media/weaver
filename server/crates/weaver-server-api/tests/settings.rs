@@ -949,3 +949,55 @@ async fn torrent_session_settings_default_to_libtorrents_then_persist_and_refuse
     assert_eq!(torrent["blocklistEnabled"], true);
     assert_eq!(h.db.load_config().unwrap().torrent.blocklist, None);
 }
+
+// qBittorrent's defaults (`BannedIPs` empty, `BlockPeersOnPrivilegedPorts`
+// and `IPFilterTrackers` off); banned entries are kept in one form, sorted
+// and once, and an entry that names no address is refused whole.
+#[tokio::test]
+async fn banned_addresses_and_filter_switches_default_off_then_persist() {
+    let h = TestHarness::new().await;
+    const FIELDS: &str = "bannedIps blockPrivilegedPorts filterTrackers";
+    let defaults = h
+        .execute(&format!("{{ settings {{ torrent {{ {FIELDS} }} }} }}"))
+        .await;
+    assert_no_errors(&defaults);
+    let torrent = &response_data(&defaults)["settings"]["torrent"];
+    assert_eq!(torrent["bannedIps"], serde_json::json!([]));
+    assert_eq!(torrent["blockPrivilegedPorts"], false);
+    assert_eq!(torrent["filterTrackers"], false);
+
+    let saved = h
+        .execute(&format!(
+            r#"mutation {{ updateSettings(input: {{ torrent: {{
+                bannedIps: [" 192.0.2.7 ", "10.0.0.0/24", "192.0.2.7", ""],
+                blockPrivilegedPorts: true, filterTrackers: true
+            }} }}) {{ torrent {{ {FIELDS} }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&saved);
+    let torrent = &response_data(&saved)["updateSettings"]["torrent"];
+    assert_eq!(
+        torrent["bannedIps"],
+        serde_json::json!(["10.0.0.0 - 10.0.0.255", "192.0.2.7"])
+    );
+    assert_eq!(torrent["blockPrivilegedPorts"], true);
+    assert_eq!(torrent["filterTrackers"], true);
+    let stored = h.db.load_config().unwrap();
+    assert_eq!(stored.torrent, h.config.read().await.torrent);
+    assert_eq!(
+        stored.torrent.banned_ips,
+        ["10.0.0.0 - 10.0.0.255", "192.0.2.7"]
+    );
+
+    let refused = h
+        .execute(r#"mutation { updateSettings(input: { torrent: { bannedIps: ["192.0.2.8", "lists.example"] } }) { torrent { bannedIps } } }"#)
+        .await;
+    assert!(!refused.errors.is_empty());
+    assert_eq!(h.db.load_config().unwrap().torrent, stored.torrent);
+
+    let cleared = h
+        .execute(r#"mutation { updateSettings(input: { torrent: { bannedIps: [] } }) { torrent { bannedIps } } }"#)
+        .await;
+    assert_no_errors(&cleared);
+    assert!(h.db.load_config().unwrap().torrent.banned_ips.is_empty());
+}

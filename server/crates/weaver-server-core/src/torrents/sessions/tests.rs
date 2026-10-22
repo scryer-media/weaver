@@ -408,7 +408,118 @@ async fn a_route_whose_blocklist_does_not_load_holds_closed() {
     // Once it is there, the route opens on its next session.
     std::fs::write(&missing, "test:10.0.0.1-10.0.0.1\n").unwrap();
     let session = sessions.session(&plan).await.unwrap();
-    assert!(session.blocklist.has("10.0.0.1".parse().unwrap()));
+    assert!(session.ip_filter().blocked.has("10.0.0.1".parse().unwrap()));
+    sessions.stop_all().await;
+}
+
+// The banned addresses, the privileged ports and whether trackers are
+// filtered reach the open sessions at once, with the blocklist once it has
+// loaded (libtorrent `session_impl::set_ip_filter`, qBittorrent
+// `SessionImpl::processBannedIPs`); settings that change none of them keep
+// the one list.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ip_filter_settings_reach_the_open_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    *routes.blocklist.lock().unwrap() = Some("test:192.0.2.1-192.0.2.1\n".to_owned());
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(TorrentConfig::default());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let session = sessions.session(&plan).await.unwrap();
+    let (banned, listed): (IpAddr, IpAddr) =
+        ("10.0.0.7".parse().unwrap(), "192.0.2.1".parse().unwrap());
+    // qBittorrent's defaults: nothing blocked, no port refused, trackers
+    // left alone.
+    let filter = session.ip_filter();
+    assert!(!filter.blocked.has(banned));
+    assert!(!filter.no_privileged_ports);
+    assert!(!filter.trackers);
+
+    let bans = TorrentConfig {
+        banned_ips: vec!["10.0.0.0 - 10.0.0.255".to_owned()],
+        block_privileged_ports: true,
+        filter_trackers: true,
+        ..TorrentConfig::default()
+    };
+    sessions.set_config(bans.clone());
+    sessions.settled().await;
+    let filter = session.ip_filter();
+    assert!(filter.blocked.has(banned));
+    assert!(!filter.blocked.has(listed));
+    assert!(filter.no_privileged_ports);
+    assert!(filter.trackers);
+
+    let listing = TorrentConfig {
+        blocklist_enabled: true,
+        blocklist: Some("https://lists.example/level1.p2p".to_owned()),
+        ..bans
+    };
+    sessions.set_config(listing.clone());
+    sessions.settled().await;
+    let filter = session.ip_filter();
+    assert!(filter.blocked.has(banned));
+    assert!(filter.blocked.has(listed));
+
+    // Other settings keep the list the session holds.
+    sessions.set_config(TorrentConfig {
+        connection_speed: speed(9),
+        ..listing
+    });
+    sessions.settled().await;
+    assert!(Arc::ptr_eq(&session.ip_filter().blocked, &filter.blocked));
+    assert_eq!(routes.fetched.load(Ordering::SeqCst), 1);
+
+    sessions.set_config(TorrentConfig::default());
+    sessions.settled().await;
+    let filter = session.ip_filter();
+    assert!(!filter.blocked.has(banned));
+    assert!(!filter.blocked.has(listed));
+    assert!(!filter.no_privileged_ports);
+    assert!(Arc::ptr_eq(
+        &session,
+        &sessions.session(&plan).await.unwrap()
+    ));
+    sessions.stop_all().await;
+}
+
+// A blocklist named while sessions are open that does not load holds them
+// closed, as it holds closed a route opening under it; once it loads, the
+// route opens again under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocklist_that_does_not_load_holds_the_open_sessions_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let session = sessions.session(&plan).await.unwrap();
+
+    sessions.set_config(TorrentConfig {
+        blocklist_enabled: true,
+        blocklist: Some("https://lists.example/level1.p2p".to_owned()),
+        ..TorrentConfig::default()
+    });
+    sessions.settled().await;
+    let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
+    assert!(held.contains("the blocklist did not load"), "{held}");
+    assert!(session.cancellation_token().is_cancelled());
+
+    *routes.blocklist.lock().unwrap() = Some("test:192.0.2.1-192.0.2.1\n".to_owned());
+    let reopened = sessions.session(&plan).await.unwrap();
+    assert!(!Arc::ptr_eq(&session, &reopened));
+    assert!(
+        reopened
+            .ip_filter()
+            .blocked
+            .has("192.0.2.1".parse().unwrap())
+    );
     sessions.stop_all().await;
 }
 
@@ -437,8 +548,8 @@ async fn every_route_shares_one_blocklist_load() {
     let a = sessions.session(&first).await.unwrap();
     let b = sessions.session(&second).await.unwrap();
     assert!(!Arc::ptr_eq(&a, &b));
-    assert!(Arc::ptr_eq(&a.blocklist, &b.blocklist));
-    assert!(a.blocklist.has("10.0.0.1".parse().unwrap()));
+    assert!(Arc::ptr_eq(&a.ip_filter().blocked, &b.ip_filter().blocked));
+    assert!(a.ip_filter().blocked.has("10.0.0.1".parse().unwrap()));
     assert_eq!(routes.fetched.load(Ordering::SeqCst), 1);
 
     sessions.drop_route(&first.key).await;
@@ -464,7 +575,11 @@ fn the_built_session_options_carry_the_configured_values() {
         stop_tracker_timeout_secs: 0,
         ..TorrentConfig::default()
     };
-    let blocklist = Arc::new(IpRanges::default());
+    let filter = IpFilter {
+        blocked: Arc::new(IpRanges::default()),
+        no_privileged_ports: true,
+        trackers: false,
+    };
     let options = session_options(
         &env,
         &leg(LegKind::System),
@@ -472,7 +587,7 @@ fn the_built_session_options_carry_the_configured_values() {
         dir.path(),
         75,
         &torrent,
-        Some(Arc::clone(&blocklist)),
+        filter.clone(),
     );
     assert_eq!(options.connections_limit, 450);
     assert_eq!(options.unchoke_slots_limit, 12);
@@ -489,7 +604,7 @@ fn the_built_session_options_carry_the_configured_values() {
             .as_slice()
         )
     );
-    assert!(Arc::ptr_eq(options.blocklist.as_ref().unwrap(), &blocklist));
+    assert_eq!(options.ip_filter, filter);
     assert_eq!(options.tracker_stopped_timeout, Some(Duration::ZERO));
 
     // The defaults are libtorrent's, and peers go over TCP alone.
@@ -500,7 +615,7 @@ fn the_built_session_options_carry_the_configured_values() {
         dir.path(),
         75,
         &TorrentConfig::default(),
-        None,
+        IpFilter::default(),
     );
     assert_eq!(defaults.connections_limit, 200);
     assert_eq!(defaults.unchoke_slots_limit, 8);
@@ -517,7 +632,7 @@ fn the_built_session_options_carry_the_configured_values() {
                 .as_slice()
         )
     );
-    assert!(defaults.blocklist.is_none());
+    assert_eq!(defaults.ip_filter.blocked.len(), 0);
     assert_eq!(
         defaults.tracker_stopped_timeout,
         Some(Duration::from_secs(5))
@@ -540,7 +655,15 @@ fn the_peer_protocol_picks_the_transports_the_leg_carries() {
             peer_protocol: protocol,
             ..TorrentConfig::default()
         };
-        let options = session_options(&env, leg, 6881, dir.path(), 100, &torrent, None);
+        let options = session_options(
+            &env,
+            leg,
+            6881,
+            dir.path(),
+            100,
+            &torrent,
+            IpFilter::default(),
+        );
         (
             options.listen.map(|listen| listen.mode),
             options.connect.unwrap().enable_tcp,
@@ -601,7 +724,7 @@ fn session_options_follow_the_leg() {
         dir.path(),
         100,
         &TorrentConfig::default(),
-        None,
+        IpFilter::default(),
     );
     assert!(system.dht.is_some());
     let listen = system.listen.as_ref().unwrap();
@@ -622,7 +745,7 @@ fn session_options_follow_the_leg() {
         dir.path(),
         100,
         &TorrentConfig::default(),
-        None,
+        IpFilter::default(),
     );
     assert!(interface.dht.is_some());
     assert_eq!(interface.bind_device_name.as_deref(), Some("en1"));
@@ -636,7 +759,7 @@ fn session_options_follow_the_leg() {
         dir.path(),
         100,
         &TorrentConfig::default(),
-        None,
+        IpFilter::default(),
     );
     assert!(source.dht.is_some());
     assert_eq!(
@@ -652,7 +775,7 @@ fn session_options_follow_the_leg() {
         dir.path(),
         100,
         &TorrentConfig::default(),
-        None,
+        IpFilter::default(),
     );
     assert!(ladder.dht.is_none());
     assert!(ladder.listen.is_none());
@@ -671,7 +794,7 @@ fn session_options_follow_the_leg() {
         dir.path(),
         100,
         &TorrentConfig::default(),
-        None,
+        IpFilter::default(),
     );
     assert_eq!(tunnel.dht.as_ref().and_then(|dht| dht.port), Some(6884));
     assert!(tunnel.listen.is_none());
@@ -690,7 +813,7 @@ fn a_peer_may_stay_quiet_for_two_minutes_on_any_leg() {
             dir.path(),
             100,
             &TorrentConfig::default(),
-            None,
+            IpFilter::default(),
         );
         let peer = options.connect.unwrap().peer_opts.unwrap();
         assert_eq!(peer.read_write_timeout, Some(Duration::from_secs(120)));

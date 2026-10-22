@@ -322,6 +322,14 @@ impl Database {
                 "torrent.blocklist_enabled",
                 torrent.blocklist_enabled.to_string(),
             ),
+            (
+                "torrent.block_privileged_ports",
+                torrent.block_privileged_ports.to_string(),
+            ),
+            (
+                "torrent.filter_trackers",
+                torrent.filter_trackers.to_string(),
+            ),
         ] {
             self.set_setting(key, &value)?;
         }
@@ -334,6 +342,12 @@ impl Database {
         match torrent.blocklist.as_deref() {
             Some(blocklist) => self.set_setting("torrent.blocklist", blocklist)?,
             None => self.delete_setting("torrent.blocklist")?,
+        }
+        // One entry a line, as qBittorrent keeps `BannedIPs`.
+        if torrent.banned_ips.is_empty() {
+            self.delete_setting("torrent.banned_ips")?;
+        } else {
+            self.set_setting("torrent.banned_ips", &torrent.banned_ips.join("\n"))?;
         }
         Ok(())
     }
@@ -587,6 +601,14 @@ fn torrent_config_from_settings(
         blocklist: settings.get("torrent.blocklist").cloned(),
         stop_tracker_timeout_secs: parsed_setting(settings, "torrent.stop_tracker_timeout_secs")
             .unwrap_or(defaults.stop_tracker_timeout_secs),
+        banned_ips: settings
+            .get("torrent.banned_ips")
+            .map(|banned| banned.lines().map(str::to_owned).collect())
+            .unwrap_or(defaults.banned_ips),
+        block_privileged_ports: parsed_setting(settings, "torrent.block_privileged_ports")
+            .unwrap_or(defaults.block_privileged_ports),
+        filter_trackers: parsed_setting(settings, "torrent.filter_trackers")
+            .unwrap_or(defaults.filter_trackers),
     }
 }
 

@@ -1424,6 +1424,9 @@ const TORRENT_SETTINGS_FIELDS = `
       blocklistEnabled
       blocklist
       stopTrackerTimeoutSecs
+      bannedIps
+      blockPrivilegedPorts
+      filterTrackers
     }
   }
   ${SEEDING_POLICY_FIELDS}

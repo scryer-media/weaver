@@ -80,6 +80,31 @@ impl IpRanges {
         }
     }
 
+    /// The ranges of every one of `lists`, as one list (libtorrent's one
+    /// `ip_filter`, which qBittorrent's `SessionImpl::processBannedIPs`
+    /// adds the banned addresses to over the parsed filter file).
+    pub fn union<'a>(lists: impl IntoIterator<Item = &'a IpRanges>) -> Self {
+        let (mut v4, mut v6) = (Vec::new(), Vec::new());
+        for list in lists {
+            v4.extend(list.v4.ranges.iter().cloned());
+            v6.extend(list.v6.ranges.iter().cloned());
+        }
+        Self::new(v4, v6)
+    }
+
+    /// The addresses from each first to its last, both included.
+    pub fn of_inclusive(ranges: impl IntoIterator<Item = (IpAddr, IpAddr)>) -> Self {
+        let (mut v4, mut v6) = (Vec::new(), Vec::new());
+        for (first, last) in ranges {
+            match inclusive(first, last) {
+                Some(IpRange::V4(range)) => v4.push(range),
+                Some(IpRange::V6(range)) => v6.push(range),
+                None => {}
+            }
+        }
+        Self::new(v4, v6)
+    }
+
     pub fn len(&self) -> usize {
         self.v4.len + self.v6.len
     }
@@ -193,7 +218,12 @@ fn parse_ip_range(line: &str) -> Option<IpRange> {
         }
     };
     let (start, end) = ips.split_once('-')?;
-    match (IpAddr::from_str(start).ok()?, IpAddr::from_str(end).ok()?) {
+    inclusive(IpAddr::from_str(start).ok()?, IpAddr::from_str(end).ok()?)
+}
+
+// The range from `start` to `end`, both included, when both are of one family.
+fn inclusive(start: IpAddr, end: IpAddr) -> Option<IpRange> {
+    match (start, end) {
         (IpAddr::V4(start), IpAddr::V4(end)) => {
             let end = Ipv4Addr::from_bits(end.to_bits().saturating_add(1));
             Some(IpRange::V4(start..end))
@@ -267,6 +297,31 @@ mod tests {
         tokio::fs::remove_file("temp_list.txt").await?;
 
         Ok(())
+    }
+
+    // qBittorrent `SessionImpl::processBannedIPs` adds the banned ranges to
+    // the filter parsed from the list: one filter holds both.
+    #[test]
+    fn a_union_holds_every_range_of_every_list() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let v4 = |a: &str, b: &str| a.parse::<Ipv4Addr>().unwrap()..b.parse().unwrap();
+        let list = IpRanges::new(
+            [v4("10.0.0.0", "10.0.1.0")],
+            ["2001:db8::".parse::<Ipv6Addr>().unwrap().."2001:db8::10".parse().unwrap()],
+        );
+        let bans = IpRanges::of_inclusive([
+            (ip("10.0.0.200"), ip("10.0.1.255")),
+            (ip("192.0.2.7"), ip("192.0.2.7")),
+            (ip("192.0.2.9"), ip("2001:db8::1")),
+        ]);
+        let union = IpRanges::union([&list, &bans]);
+        for blocked in ["10.0.0.1", "10.0.1.255", "192.0.2.7", "2001:db8::f"] {
+            assert!(union.has(ip(blocked)), "{blocked}");
+        }
+        for open in ["10.0.2.0", "192.0.2.8", "192.0.2.9", "2001:db8::10"] {
+            assert!(!union.has(ip(open)), "{open}");
+        }
+        assert!(!IpRanges::union([]).has(ip("10.0.0.1")));
     }
 
     #[test]

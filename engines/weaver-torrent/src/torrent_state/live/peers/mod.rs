@@ -410,6 +410,47 @@ impl PeerStates {
         }
     }
 
+    /// Every peer on the list at an address `refused` names leaves it: one
+    /// with no connection now, one with a connection once it has closed,
+    /// asked to here, and [`Self::refuse_at`] runs for it (libtorrent
+    /// `peer_list::apply_ip_filter`, `apply_port_filter`). A web seed is on
+    /// no list.
+    pub fn refuse(&self, refused: impl Fn(SocketAddr) -> bool) {
+        let _admission = self.admission.lock();
+        let named: Vec<PeerHandle> = self
+            .states
+            .iter()
+            .map(|e| *e.key())
+            .filter(|handle| !is_web_seed(*handle) && refused(*handle))
+            .collect();
+        for handle in named {
+            self.leave(handle);
+        }
+    }
+
+    /// [`Self::refuse`] for the one peer at `handle`, whose connection
+    /// closed.
+    pub fn refuse_at(&self, handle: PeerHandle, refused: impl Fn(SocketAddr) -> bool) {
+        let _admission = self.admission.lock();
+        if !is_web_seed(handle) && refused(handle) {
+            self.leave(handle);
+        }
+    }
+
+    // The peer at `handle` leaves the list, or its connection is asked to
+    // close first.
+    fn leave(&self, handle: PeerHandle) {
+        match self
+            .states
+            .remove_if(&handle, |_, peer| peer.connected_out().is_none())
+        {
+            Some((_, peer)) => self.erased(handle, &peer),
+            None => {
+                self.with_peer(handle, Peer::disconnect);
+            }
+        }
+    }
+
     pub fn stats(&self) -> AggregatePeerStats {
         self.stats.snapshot()
     }
@@ -1967,6 +2008,46 @@ mod tests {
 
     fn at_port(addr: SocketAddr, port: u16) -> SocketAddr {
         SocketAddr::new(addr.ip(), port)
+    }
+
+    // libtorrent `peer_list::apply_ip_filter`: a refused peer with no
+    // connection is erased and counted out; one with a connection is asked
+    // to close and is erased once it has; a web seed is on no list.
+    #[test]
+    fn a_refused_peer_leaves_the_list_once_it_has_no_connection() {
+        let peers = make_peer_states();
+        let (idle, other) = (peer_addr(1), peer_addr(2));
+        peers.add_peer(idle, PeerSourceFlag::Tracker);
+        peers.add_peer(other, PeerSourceFlag::Tracker);
+        let (live, mut live_rx) = add_live_peer(&peers, "10.0.0.3:50000");
+        let seed = SocketAddr::new(
+            std::net::Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 1).into(),
+            0,
+        );
+        peers.admit_web_seed(seed).unwrap();
+        let refused = |addr: SocketAddr| addr == idle || addr == live || addr == seed;
+        peers.refuse(refused);
+        assert_eq!(state_of(&peers, idle), None);
+        assert_eq!(state_of(&peers, other), Some("queued"));
+        assert_eq!(state_of(&peers, live), Some("live"));
+        assert!(matches!(
+            live_rx.try_recv(),
+            Ok(WriterRequest::Disconnect(Ok(())))
+        ));
+        assert_eq!(state_of(&peers, seed), Some("connecting"));
+
+        // Its connection closed, the refused peer goes too.
+        peers
+            .with_peer_mut(live, "test", |peer| {
+                peer.take_state(&peers);
+                peers.connection_closed(peer, Instant::now(), false, true);
+            })
+            .unwrap();
+        peers.refuse_at(live, refused);
+        assert_eq!(state_of(&peers, live), None);
+        peers.refuse_at(other, refused);
+        assert_eq!(state_of(&peers, other), Some("queued"));
+        assert_eq!(peers.stats().live, 0);
     }
 
     #[test]

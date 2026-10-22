@@ -5191,6 +5191,12 @@ type TorrentSettings {
 	"""
 	blocklist: String
 	stopTrackerTimeoutSecs: Int!
+	"""
+	Each one address or `first - last`.
+	"""
+	bannedIps: [String!]!
+	blockPrivilegedPorts: Boolean!
+	filterTrackers: Boolean!
 }
 
 input TorrentSettingsInput {
@@ -5221,6 +5227,12 @@ input TorrentSettingsInput {
 	"""
 	blocklist: String
 	stopTrackerTimeoutSecs: Int
+	"""
+	Each an address, `first - last` or a subnet; the whole list.
+	"""
+	bannedIps: [String!]
+	blockPrivilegedPorts: Boolean
+	filterTrackers: Boolean
 }
 
 enum TorrentState {

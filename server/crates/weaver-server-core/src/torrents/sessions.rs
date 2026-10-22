@@ -17,7 +17,7 @@ use sha1::{Digest, Sha1};
 pub use weaver_torrent::IpRanges;
 use weaver_torrent::dht::DhtPersistenceConfig;
 use weaver_torrent::{
-    ConnectionOptions, DhtSessionConfig, HttpClients, ListenerMode, ListenerOptions,
+    ConnectionOptions, DhtSessionConfig, HttpClients, IpFilter, ListenerMode, ListenerOptions,
     PeerConnectionOptions, Session, SessionLimits, SessionOptions, SocketFactory,
 };
 
@@ -344,8 +344,7 @@ pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
 }
 
 /// The options of a session on `leg`, listening on `port` when it listens,
-/// under the torrent settings `torrent` and with `blocklist` loaded from
-/// them.
+/// under the torrent settings `torrent` and the IP filter made of them.
 pub fn session_options(
     env: &SessionEnv,
     leg: &OpenLeg,
@@ -353,7 +352,7 @@ pub fn session_options(
     dir: &Path,
     peers: usize,
     torrent: &TorrentConfig,
-    blocklist: Option<Arc<IpRanges>>,
+    ip_filter: IpFilter,
 ) -> SessionOptions {
     let shape = leg.shape;
     let listen_ip = leg.kind.listen_ip().unwrap_or_else(|| unspecified(binds));
@@ -397,7 +396,7 @@ pub fn session_options(
         tracker_stopped_timeout: Some(Duration::from_secs(
             torrent.stop_tracker_timeout_secs.into(),
         )),
-        blocklist,
+        ip_filter,
         disable_local_service_discovery: !shape.own_sockets,
         socket_factory: leg.factory.clone(),
         http_client: Some(leg.http.clone()),
@@ -449,14 +448,18 @@ pub struct Sessions {
     routes: Arc<dyn Routes>,
     env: SessionEnv,
     db: Database,
-    slots: tokio::sync::Mutex<BTreeMap<RouteKey, Slot>>,
+    slots: Arc<tokio::sync::Mutex<BTreeMap<RouteKey, Slot>>>,
     // Read and written under the slots' lock.
     on: AtomicBool,
     // The torrent settings, and the open sessions that take them as they
     // change.
-    config: Mutex<Configured>,
-    // The blocklist the settings name, loaded once for every session.
-    blocklist: tokio::sync::Mutex<Option<(BlocklistSource, Arc<IpRanges>)>>,
+    config: Arc<Mutex<Configured>>,
+    // Held while the blocklist the settings name is loaded, once for every
+    // session.
+    loading: Arc<tokio::sync::Mutex<()>>,
+    // The last settings given whose IP filter the open sessions hold, or
+    // whose blocklist did not load, by count.
+    applied: Arc<tokio::sync::watch::Sender<u64>>,
     // Held while the stored port slots are read and written.
     port_slots: Arc<Mutex<()>>,
     // The torrents' download rate, laid over every open session.
@@ -469,10 +472,11 @@ impl Sessions {
             routes,
             env,
             db,
-            slots: tokio::sync::Mutex::new(BTreeMap::new()),
+            slots: Arc::default(),
             on: AtomicBool::new(true),
-            config: Mutex::new(Configured::default()),
-            blocklist: tokio::sync::Mutex::new(None),
+            config: Arc::default(),
+            loading: Arc::default(),
+            applied: Arc::new(tokio::sync::watch::Sender::new(0)),
             port_slots: Arc::default(),
             rates: SessionRates::default(),
         }
@@ -483,14 +487,41 @@ impl Sessions {
         &self.rates
     }
 
-    /// The torrent settings. The open sessions take the limits at once; the
-    /// transports, the DHT's bootstrap nodes, the blocklist, the stopped
-    /// announce timeout and connections per address are a session's from
-    /// when it opens, so each takes them when its route next opens.
+    /// The torrent settings. The open sessions take the limits and the IP
+    /// filter at once (libtorrent `session_impl::set_ip_filter`), the filter
+    /// once the blocklist it names has loaded; a blocklist that does not
+    /// load holds them closed. The transports, the DHT's bootstrap nodes,
+    /// the stopped announce timeout and connections per address are a
+    /// session's from when it opens, so each takes them when its route next
+    /// opens.
     pub fn set_config(&self, config: TorrentConfig) {
         let mut configured = self.configured();
         configured.torrent = config;
-        configured.lay_over();
+        configured.given += 1;
+        let given = configured.given;
+        if configured.lay_over() {
+            drop(configured);
+            self.applied
+                .send_modify(|applied| *applied = given.max(*applied));
+            return;
+        }
+        drop(configured);
+        tokio::spawn(refilter(
+            Arc::clone(&self.routes),
+            Arc::clone(&self.config),
+            Arc::clone(&self.slots),
+            Arc::clone(&self.loading),
+            Arc::clone(&self.applied),
+            given,
+        ));
+    }
+
+    /// Settles once the open sessions hold the IP filter of the settings
+    /// last given, or are held closed as its blocklist did not load.
+    pub async fn settled(&self) {
+        let given = self.configured().given;
+        let mut applied = self.applied.subscribe();
+        let _ = applied.wait_for(|applied| *applied >= given).await;
     }
 
     pub fn config(&self) -> TorrentConfig {
@@ -498,31 +529,18 @@ impl Sessions {
     }
 
     fn configured(&self) -> std::sync::MutexGuard<'_, Configured> {
-        self.config.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.config)
     }
 
-    // The blocklist `torrent` names, loaded when it names another than the
-    // one loaded; a list that does not load fails the session.
-    async fn blocklist(&self, torrent: &TorrentConfig) -> Result<Option<Arc<IpRanges>>, String> {
-        let Some(source) = torrent.blocklist_source() else {
-            return Ok(None);
-        };
-        let mut loaded = self.blocklist.lock().await;
-        if let Some((from, list)) = loaded.as_ref()
-            && *from == source
-        {
-            return Ok(Some(Arc::clone(list)));
-        }
-        let list = match &source {
-            BlocklistSource::Http(url) => self.routes.fetch_blocklist(url).await,
-            BlocklistSource::File(path) => IpRanges::load_from_file(path)
-                .await
-                .map_err(|error| format!("{error:#}")),
-        }
-        .map_err(|error| format!("the blocklist did not load: {error}"))?;
-        let list = Arc::new(list);
-        *loaded = Some((source, Arc::clone(&list)));
-        Ok(Some(list))
+    // The IP filter `torrent` asks for, its blocklist loaded when it names
+    // another than the one loaded; a list that does not load fails the
+    // session.
+    async fn ip_filter(&self, torrent: &TorrentConfig) -> Result<IpFilter, String> {
+        let _loading = self.loading.lock().await;
+        load_blocklist(&*self.routes, &self.config, torrent).await?;
+        lock(&self.config)
+            .filter_of(torrent)
+            .ok_or_else(|| "the blocklist did not load".to_owned())
     }
 
     // The route's port slot, read or taken off the async threads, and the
@@ -665,8 +683,8 @@ impl Sessions {
             ..self.env.clone()
         };
         let torrent = self.config();
-        let blocklist = self.blocklist(&torrent).await?;
-        let options = session_options(&env, &leg, port, &dir, peers, &torrent, blocklist);
+        let ip_filter = self.ip_filter(&torrent).await?;
+        let options = session_options(&env, &leg, port, &dir, peers, &torrent, ip_filter);
         Session::new_with_opts(dir.join("output"), options)
             .await
             .map(|session| (session, leg.leg, port))
@@ -715,11 +733,23 @@ impl Sessions {
     }
 }
 
+fn lock(config: &Mutex<Configured>) -> std::sync::MutexGuard<'_, Configured> {
+    config.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 // The torrent settings, and the sessions open under them.
 #[derive(Default)]
 struct Configured {
     torrent: TorrentConfig,
     open: Vec<Weak<Session>>,
+    // Settings given, counted.
+    given: u64,
+    // The blocklist last loaded, and where from.
+    loaded: Option<(BlocklistSource, Arc<IpRanges>)>,
+    // The addresses last blocked, and the blocklist and banned entries they
+    // were made of: settings that change neither keep the one list, so the
+    // sessions are not filtered again.
+    blocked: Option<(Option<Arc<IpRanges>>, Vec<String>, Arc<IpRanges>)>,
 }
 
 impl Configured {
@@ -729,19 +759,137 @@ impl Configured {
         self.lay_over();
     }
 
-    // Every open session holds to the settings' limits.
-    fn lay_over(&mut self) {
+    // The IP filter `torrent` asks for: the blocklist it names with its
+    // banned addresses added (qBittorrent `SessionImpl::processBannedIPs`),
+    // once that blocklist is the one loaded.
+    fn filter_of(&mut self, torrent: &TorrentConfig) -> Option<IpFilter> {
+        let list = match torrent.blocklist_source() {
+            None => None,
+            Some(source) => match &self.loaded {
+                Some((from, list)) if *from == source => Some(Arc::clone(list)),
+                _ => return None,
+            },
+        };
+        let blocked = match &self.blocked {
+            Some((of, banned, blocked))
+                if *banned == torrent.banned_ips
+                    && match (of, &list) {
+                        (Some(of), Some(list)) => Arc::ptr_eq(of, list),
+                        (of, list) => of.is_none() && list.is_none(),
+                    } =>
+            {
+                Arc::clone(blocked)
+            }
+            _ => {
+                let bans = IpRanges::of_inclusive(torrent.banned_ranges());
+                let blocked = match &list {
+                    Some(list) if torrent.banned_ips.is_empty() => Arc::clone(list),
+                    Some(list) => Arc::new(IpRanges::union([&**list, &bans])),
+                    None => Arc::new(bans),
+                };
+                self.blocked = Some((list, torrent.banned_ips.clone(), Arc::clone(&blocked)));
+                blocked
+            }
+        };
+        Some(IpFilter {
+            blocked,
+            no_privileged_ports: torrent.block_privileged_ports,
+            trackers: torrent.filter_trackers,
+        })
+    }
+
+    // Every open session holds to the settings' limits and, once the
+    // blocklist they name is loaded, to their IP filter; whether it is.
+    fn lay_over(&mut self) -> bool {
         let limits = session_limits(&self.torrent);
+        let torrent = self.torrent.clone();
+        let filter = self.filter_of(&torrent);
         self.open.retain(|session| {
             session.upgrade().is_some_and(|session| {
                 let open = !session.cancellation_token().is_cancelled();
                 if open && session.limits() != limits {
                     session.set_limits(limits);
                 }
+                if let Some(filter) = filter.as_ref().filter(|_| open) {
+                    session.set_ip_filter(filter.clone());
+                }
                 open
             })
         });
+        filter.is_some()
     }
+}
+
+// Load the blocklist `torrent` names into `config`, unless it is the one
+// loaded. Called under the loading lock.
+async fn load_blocklist(
+    routes: &dyn Routes,
+    config: &Mutex<Configured>,
+    torrent: &TorrentConfig,
+) -> Result<(), String> {
+    let Some(source) = torrent.blocklist_source() else {
+        return Ok(());
+    };
+    if lock(config)
+        .loaded
+        .as_ref()
+        .is_some_and(|(from, _)| *from == source)
+    {
+        return Ok(());
+    }
+    let list = match &source {
+        BlocklistSource::Http(url) => routes.fetch_blocklist(url).await,
+        BlocklistSource::File(path) => IpRanges::load_from_file(path)
+            .await
+            .map_err(|error| format!("{error:#}")),
+    }
+    .map_err(|error| format!("the blocklist did not load: {error}"))?;
+    lock(config).loaded = Some((source, Arc::new(list)));
+    Ok(())
+}
+
+// Settings `given` name a blocklist not loaded: load it, then lay the filter
+// of the settings as they stand over the open sessions. A list that does not
+// load holds them closed, as it would fail them opening, unless newer
+// settings have been given since.
+async fn refilter(
+    routes: Arc<dyn Routes>,
+    config: Arc<Mutex<Configured>>,
+    slots: Arc<tokio::sync::Mutex<BTreeMap<RouteKey, Slot>>>,
+    loading: Arc<tokio::sync::Mutex<()>>,
+    applied: Arc<tokio::sync::watch::Sender<u64>>,
+    given: u64,
+) {
+    let loaded = {
+        let _loading = loading.lock().await;
+        let torrent = lock(&config).torrent.clone();
+        load_blocklist(&*routes, &config, &torrent).await
+    };
+    match loaded {
+        Ok(()) => {
+            lock(&config).lay_over();
+        }
+        Err(reason) if lock(&config).given == given => {
+            let mut slots = slots.lock().await;
+            let open: Vec<RouteKey> = slots
+                .iter()
+                .filter(|(_, slot)| matches!(slot, Slot::Open { .. }))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in open {
+                if let Some(Slot::Open {
+                    session, leg, kind, ..
+                }) = slots.remove(&key)
+                {
+                    close(session, leg).await;
+                    let reason = reason.clone();
+                    slots.insert(key, Slot::Held { reason, kind });
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    applied.send_modify(|applied| *applied = given.max(*applied));
 }
 
 async fn close_all(slots: BTreeMap<RouteKey, Slot>) {

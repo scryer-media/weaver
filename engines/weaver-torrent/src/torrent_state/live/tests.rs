@@ -4269,6 +4269,51 @@ async fn a_finished_torrent_still_dials_a_leecher_and_not_a_seed() {
     assert!(h.peers.connect_next(due).is_none());
 }
 
+// libtorrent `session_impl::set_ip_filter` and `update_privileged_ports`
+// run `torrent::ip_filter_updated` and `privileged_port_updated`
+// (`peer_list::apply_ip_filter`, `apply_port_filter`): an idle peer the new
+// filter refuses leaves the list at once, a connected one has its connection
+// closed and leaves once it has; from then on `torrent::add_peer` takes no
+// peer the filter refuses or that is on a privileged port.
+#[tokio::test]
+async fn a_changed_ip_filter_takes_the_peers_it_refuses_off_the_list() {
+    let h = Harness::new("refilter").await;
+    let (connected, mut connected_rx) = h.peer("127.0.0.1:6881");
+    for addr in ["203.0.113.1:6881", "203.0.113.2:80", "203.0.113.3:6881"] {
+        h.add_peer(sock(addr), PeerSourceFlag::Tracker);
+    }
+    let listed = |addr: &str| h.peers.with_peer(sock(addr), |_| ()).is_some();
+
+    h._session.set_ip_filter(crate::IpFilter {
+        blocked: Arc::new(crate::IpRanges::new(
+            [
+                "127.0.0.1".parse().unwrap().."127.0.0.2".parse().unwrap(),
+                "203.0.113.1".parse().unwrap().."203.0.113.2".parse().unwrap(),
+            ],
+            [],
+        )),
+        no_privileged_ports: true,
+        trackers: true,
+    });
+    assert!(!listed("203.0.113.1:6881"));
+    assert!(!listed("203.0.113.2:80"));
+    assert!(listed("203.0.113.3:6881"));
+    assert!(
+        std::iter::from_fn(|| connected_rx.try_recv().ok())
+            .any(|r| matches!(r, WriterRequest::Disconnect(Ok(()))))
+    );
+    assert!(listed("127.0.0.1:6881"));
+    connected.on_peer_died(None).unwrap();
+    assert!(!listed("127.0.0.1:6881"));
+
+    for addr in ["203.0.113.1:6881", "203.0.113.4:443", "203.0.113.4:6881"] {
+        h.add_peer(sock(addr), PeerSourceFlag::Tracker);
+    }
+    assert!(!listed("203.0.113.1:6881"));
+    assert!(!listed("203.0.113.4:443"));
+    assert!(listed("203.0.113.4:6881"));
+}
+
 // libtorrent `peer_list::compare_peer`: among candidates that failed as
 // often, one on a local network is dialed first.
 #[tokio::test]

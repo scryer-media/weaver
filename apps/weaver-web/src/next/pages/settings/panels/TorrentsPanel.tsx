@@ -479,6 +479,9 @@ interface TorrentConnection {
   blocklistEnabled: boolean;
   blocklist: string | null;
   stopTrackerTimeoutSecs: number;
+  bannedIps: string[];
+  blockPrivilegedPorts: boolean;
+  filterTrackers: boolean;
 }
 
 interface TorrentForm {
@@ -504,6 +507,9 @@ const DEFAULT_CONNECTION: TorrentConnection = {
   blocklistEnabled: false,
   blocklist: null,
   stopTrackerTimeoutSecs: 5,
+  bannedIps: [],
+  blockPrivilegedPorts: false,
+  filterTrackers: false,
 };
 
 const PEER_PROTOCOLS: { value: TorrentPeerProtocol; label: string }[] = [
@@ -732,6 +738,27 @@ export function TorrentsPanel() {
                 onChange: (next) => patchTorrent({ blocklist: next.trim() === "" ? null : next }),
               },
             },
+            {
+              id: "filterTrackers",
+              label: t("next.torrents.filterTrackers"),
+              keywords: "ip filter trackers",
+              control: {
+                kind: "toggle",
+                value: values.torrent.filterTrackers,
+                onChange: (filterTrackers) => patchTorrent({ filterTrackers }),
+              },
+            },
+            {
+              id: "bannedIps",
+              label: t("next.torrents.bannedIps"),
+              keywords: "ip filter ban banned addresses",
+              control: {
+                kind: "textarea",
+                rows: 4,
+                value: values.torrent.bannedIps.join("\n"),
+                onChange: (next) => patchTorrent({ bannedIps: next.split("\n") }),
+              },
+            },
           ],
         },
         {
@@ -791,6 +818,16 @@ export function TorrentsPanel() {
                 kind: "toggle",
                 value: values.torrent.allowMultipleConnectionsPerIp,
                 onChange: (allowMultipleConnectionsPerIp) => patchTorrent({ allowMultipleConnectionsPerIp }),
+              },
+            },
+            {
+              id: "blockPrivilegedPorts",
+              label: t("next.torrents.blockPrivilegedPorts"),
+              keywords: "privileged ports peers",
+              control: {
+                kind: "toggle",
+                value: values.torrent.blockPrivilegedPorts,
+                onChange: (blockPrivilegedPorts) => patchTorrent({ blockPrivilegedPorts }),
               },
             },
             {

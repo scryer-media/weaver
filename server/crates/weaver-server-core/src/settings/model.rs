@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -609,6 +610,15 @@ pub struct TorrentConfig {
     // How long a `stopped` announce may take; 0 sends none (libtorrent
     // `stop_tracker_timeout`).
     pub stop_tracker_timeout_secs: u32,
+    // Addresses no peer is taken from or dialed at, beside the blocklist:
+    // each one address or `first - last` (qBittorrent `BannedIPs`).
+    pub banned_ips: Vec<String>,
+    // Whether peers on ports below 1024 are neither dialed nor taken
+    // (libtorrent `no_connect_privileged_ports`).
+    pub block_privileged_ports: bool,
+    // Whether trackers are held to the blocklist and banned addresses
+    // (libtorrent `apply_ip_filter_to_trackers`).
+    pub filter_trackers: bool,
 }
 
 impl TorrentConfig {
@@ -632,9 +642,32 @@ impl TorrentConfig {
         Some(BlocklistSource::of(blocklist))
     }
 
-    // The settings as they are kept, the bootstrap nodes as one list and a
-    // blank blocklist as none; or what is wrong with them.
+    // The banned addresses, each from its first to its last.
+    pub fn banned_ranges(&self) -> Vec<(IpAddr, IpAddr)> {
+        self.banned_ips
+            .iter()
+            .filter_map(|entry| banned_range(entry))
+            .collect()
+    }
+
+    // The settings as they are kept, the bootstrap nodes as one list, a
+    // blank blocklist as none and each banned entry in one form, sorted and
+    // once (qBittorrent `SessionImpl::setBannedIPs`); or what is wrong with
+    // them.
     pub fn checked(mut self) -> Result<Self, Vec<String>> {
+        let mut banned: Vec<(Option<(IpAddr, IpAddr)>, String)> = self
+            .banned_ips
+            .iter()
+            .map(|entry| entry.trim())
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| match banned_range(entry) {
+                Some(range) => (Some(range), banned_entry(range)),
+                None => (None, entry.to_owned()),
+            })
+            .collect();
+        banned.sort();
+        banned.dedup();
+        self.banned_ips = banned.into_iter().map(|(_, entry)| entry).collect();
         self.dht_bootstrap_nodes = self.dht_bootstrap_nodes().join(",");
         self.blocklist = self
             .blocklist
@@ -657,6 +690,13 @@ impl TorrentConfig {
             if port.is_none() {
                 errors.push(format!(
                     "torrent.dht_bootstrap_nodes: {node} is not host:port"
+                ));
+            }
+        }
+        for entry in &self.banned_ips {
+            if banned_range(entry).is_none() {
+                errors.push(format!(
+                    "torrent.banned_ips: {entry} is not an address, a range or a subnet"
                 ));
             }
         }
@@ -690,7 +730,67 @@ impl Default for TorrentConfig {
             blocklist_enabled: false,
             blocklist: None,
             stop_tracker_timeout_secs: 5,
+            // qBittorrent's defaults: none banned, privileged ports and
+            // trackers left alone.
+            banned_ips: Vec::new(),
+            block_privileged_ports: false,
+            filter_trackers: false,
         }
+    }
+}
+
+// The addresses a banned entry names, first to last (qBittorrent
+// `Utils::Net::parseIPRange`): one address, `first - last` or a subnet, of
+// one family, first not after last.
+pub fn banned_range(entry: &str) -> Option<(IpAddr, IpAddr)> {
+    let entry = entry.trim();
+    let (first, last) = if let Some((first, last)) = entry.split_once('-') {
+        (first.trim().parse().ok()?, last.trim().parse().ok()?)
+    } else if let Some((addr, prefix)) = entry.split_once('/') {
+        subnet(addr.trim().parse().ok()?, prefix.trim().parse().ok()?)?
+    } else {
+        let addr = entry.parse().ok()?;
+        (addr, addr)
+    };
+    let ordered = match (first, last) {
+        (IpAddr::V4(first), IpAddr::V4(last)) => first <= last,
+        (IpAddr::V6(first), IpAddr::V6(last)) => first <= last,
+        _ => false,
+    };
+    ordered.then_some((first, last))
+}
+
+// The first and last address of a subnet (qBittorrent
+// `Utils::Net::subnetToIPRange`).
+fn subnet(addr: IpAddr, prefix: u32) -> Option<(IpAddr, IpAddr)> {
+    match addr {
+        IpAddr::V4(addr) if prefix <= u32::BITS => {
+            let host = u32::MAX.checked_shr(prefix).unwrap_or(0);
+            let first = addr.to_bits() & !host;
+            Some((
+                Ipv4Addr::from_bits(first).into(),
+                Ipv4Addr::from_bits(first | host).into(),
+            ))
+        }
+        IpAddr::V6(addr) if prefix <= u128::BITS => {
+            let host = u128::MAX.checked_shr(prefix).unwrap_or(0);
+            let first = addr.to_bits() & !host;
+            Some((
+                Ipv6Addr::from_bits(first).into(),
+                Ipv6Addr::from_bits(first | host).into(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+// A banned range as it is kept (qBittorrent `Utils::Net::ipRangeToString`):
+// the one address, or `first - last`.
+fn banned_entry((first, last): (IpAddr, IpAddr)) -> String {
+    if first == last {
+        first.to_string()
+    } else {
+        format!("{first} - {last}")
     }
 }
 
@@ -1174,6 +1274,9 @@ name = "tv"
             blocklist_enabled: true,
             blocklist: Some("https://lists.example/level1.p2p".to_owned()),
             stop_tracker_timeout_secs: 0,
+            banned_ips: vec!["192.0.2.7".to_owned(), "10.0.0.0 - 10.0.0.255".to_owned()],
+            block_privileged_ports: true,
+            filter_trackers: true,
         };
 
         let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
@@ -1200,6 +1303,11 @@ name = "tv"
         assert!(!torrent.blocklist_enabled);
         assert_eq!(torrent.blocklist, None);
         assert_eq!(torrent.stop_tracker_timeout_secs, 5);
+        // qBittorrent's: none banned, privileged ports and trackers left
+        // alone.
+        assert!(torrent.banned_ips.is_empty());
+        assert!(!torrent.block_privileged_ports);
+        assert!(!torrent.filter_trackers);
         assert_eq!(torrent.validate(), Ok(()));
 
         let config: Config = toml::from_str(
@@ -1297,6 +1405,66 @@ connections_limit = 0
             trimmed.blocklist.as_deref(),
             Some("/var/lib/weaver/level1.p2p")
         );
+    }
+
+    // qBittorrent `SessionImpl::setBannedIPs`: each entry an address, a
+    // range or a subnet, kept in one form, sorted and once.
+    #[test]
+    fn banned_entries_are_kept_in_one_form_sorted_and_once() {
+        let checked = TorrentConfig {
+            banned_ips: [
+                " 192.0.2.7 ",
+                "",
+                "2001:0db8:0000::1",
+                "10.0.0.0/24",
+                "10.0.0.0-10.0.0.255",
+                "192.0.2.7",
+                "2001:db8::/120",
+                "172.16.0.9 - 172.16.0.9",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            ..TorrentConfig::default()
+        }
+        .checked()
+        .unwrap();
+        assert_eq!(
+            checked.banned_ips,
+            [
+                "10.0.0.0 - 10.0.0.255",
+                "172.16.0.9",
+                "192.0.2.7",
+                "2001:db8:: - 2001:db8::ff",
+                "2001:db8::1",
+            ]
+        );
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(
+            checked.banned_ranges()[0],
+            (ip("10.0.0.0"), ip("10.0.0.255"))
+        );
+        assert_eq!(
+            banned_range("0.0.0.0/0"),
+            Some((ip("0.0.0.0"), ip("255.255.255.255")))
+        );
+        assert_eq!(banned_range("::1/128"), Some((ip("::1"), ip("::1"))));
+
+        for refused in [
+            "192.0.2.300",
+            "10.0.0.9 - 10.0.0.1",
+            "10.0.0.1 - ::1",
+            "10.0.0.0/33",
+            "10.0.0.1 - 10.0.0.2 - 10.0.0.3",
+            "example.org",
+        ] {
+            let errors = TorrentConfig {
+                banned_ips: vec![refused.to_owned()],
+                ..TorrentConfig::default()
+            }
+            .checked()
+            .unwrap_err();
+            assert_eq!(errors.len(), 1, "{refused}");
+        }
     }
 
     #[test]

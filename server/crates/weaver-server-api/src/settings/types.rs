@@ -1398,6 +1398,10 @@ pub struct TorrentSettings {
     /// An http, https or file URL, or a path.
     pub blocklist: Option<String>,
     pub stop_tracker_timeout_secs: u32,
+    /// Each one address or `first - last`.
+    pub banned_ips: Vec<String>,
+    pub block_privileged_ports: bool,
+    pub filter_trackers: bool,
 }
 
 impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
@@ -1424,6 +1428,9 @@ impl From<&weaver_server_core::settings::TorrentConfig> for TorrentSettings {
             blocklist_enabled: value.blocklist_enabled,
             blocklist: value.blocklist.clone(),
             stop_tracker_timeout_secs: value.stop_tracker_timeout_secs,
+            banned_ips: value.banned_ips.clone(),
+            block_privileged_ports: value.block_privileged_ports,
+            filter_trackers: value.filter_trackers,
         }
     }
 }
@@ -1451,6 +1458,10 @@ pub struct TorrentSettingsInput {
     /// An http, https or file URL, or a path.
     pub blocklist: MaybeUndefined<String>,
     pub stop_tracker_timeout_secs: Option<u32>,
+    /// Each an address, `first - last` or a subnet; the whole list.
+    pub banned_ips: Option<Vec<String>>,
+    pub block_privileged_ports: Option<bool>,
+    pub filter_trackers: Option<bool>,
 }
 
 impl TorrentSettingsInput {
@@ -1515,6 +1526,15 @@ impl TorrentSettingsInput {
         }
         if let Some(secs) = self.stop_tracker_timeout_secs {
             torrent.stop_tracker_timeout_secs = secs;
+        }
+        if let Some(banned) = &self.banned_ips {
+            torrent.banned_ips.clone_from(banned);
+        }
+        if let Some(block) = self.block_privileged_ports {
+            torrent.block_privileged_ports = block;
+        }
+        if let Some(filter) = self.filter_trackers {
+            torrent.filter_trackers = filter;
         }
     }
 }

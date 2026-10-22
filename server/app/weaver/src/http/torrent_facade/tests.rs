@@ -1339,6 +1339,9 @@ async fn preferences_read_and_apply_the_mapped_keys() {
     assert_eq!(before["ip_filter_enabled"], false);
     assert_eq!(before["ip_filter_path"], "");
     assert_eq!(before["stop_tracker_timeout"], 5);
+    assert_eq!(before["banned_IPs"], "");
+    assert_eq!(before["ip_filter_trackers"], false);
+    assert_eq!(before["block_peers_on_privileged_ports"], false);
 
     let json = r#"{"dl_limit":1048576,"up_limit":2048,"max_active_downloads":7,"listen_port":1}"#;
     let set = rig
@@ -1450,6 +1453,22 @@ async fn preferences_read_and_apply_the_mapped_keys() {
     let on = rig.config.read().await.torrent.clone();
     assert!(on.blocklist_enabled);
     assert_eq!(on.blocklist.as_deref(), Some("/var/lib/weaver/level2.p2p"));
+
+    // The banned addresses are one a line, blank lines skipped, kept in one
+    // form and sorted (`SessionImpl::setBannedIPs`); an entry that names no
+    // address refuses the request.
+    let json = r#"{"banned_IPs":"192.0.2.7\n\n10.0.0.0/24\n","ip_filter_trackers":true,"block_peers_on_privileged_ports":true}"#;
+    assert_eq!(rig.set_preferences(json).await, StatusCode::OK);
+    let after = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(after["banned_IPs"], "10.0.0.0 - 10.0.0.255\n192.0.2.7");
+    assert_eq!(after["ip_filter_trackers"], true);
+    assert_eq!(after["block_peers_on_privileged_ports"], true);
+    let banned = rig.config.read().await.torrent.clone();
+    assert!(banned.filter_trackers && banned.block_privileged_ports);
+    assert_eq!(rig.db.load_config().unwrap().torrent, banned);
+    let json = r#"{"banned_IPs":"192.0.2.8\nlists.example"}"#;
+    assert_eq!(rig.set_preferences(json).await, StatusCode::BAD_REQUEST);
+    assert_eq!(rig.config.read().await.torrent, banned);
 
     // A Windows path is a path, not a URL of scheme `c`.
     let json = r#"{"ip_filter_path":"C:\\lists\\level1.p2p"}"#;
@@ -1995,6 +2014,19 @@ async fn peers_are_listed_by_hash_and_a_ban_reaches_every_torrent() {
             .collect();
         assert_eq!(banned, ["127.0.0.3", "::1"], "torrent {job:?}");
     }
+    // Each joins the banned addresses every session filters, once
+    // (`SessionImpl::banIP`).
+    assert_eq!(
+        rig.post("/api/v2/transfer/banPeers", "peers=127.0.0.3%3A51413")
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let torrent = rig.config.read().await.torrent.clone();
+    assert_eq!(torrent.banned_ips, ["127.0.0.3", "::1"]);
+    assert_eq!(rig.db.load_config().unwrap().torrent, torrent);
+    let preferences = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(preferences["banned_IPs"], "127.0.0.3\n::1");
     assert_eq!(
         rig.post("/api/v2/transfer/banPeers", "").await.status,
         StatusCode::BAD_REQUEST

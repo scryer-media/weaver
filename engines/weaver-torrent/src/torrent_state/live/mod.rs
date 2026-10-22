@@ -401,6 +401,10 @@ impl TorrentStateLive {
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
             utp: session.utp,
         });
+        // The list a pause left is held to the filter as it is now. Under the
+        // torrent's lock, as a filter change reads `live()` under it: the
+        // change finds this run, or this run finds the change.
+        state.refilter();
 
         // Upload mode ends once it lasted OPTIMISTIC_DISK_RETRY (libtorrent
         // `torrent::second_tick`).
@@ -519,7 +523,7 @@ impl TorrentStateLive {
         );
         for due in due {
             // The IP filter: a seed it blocks is tried again later.
-            if due.endpoint.is_some_and(|e| !self.may_connect_to(e)) {
+            if due.endpoint.is_some_and(|e| !self.may_reach(e)) {
                 continue;
             }
             let Ok(permit) = self.peer_semaphore.clone().try_acquire_owned() else {
@@ -589,7 +593,7 @@ impl TorrentStateLive {
             .outgoing_connection_attempts
             .fetch_add(1, Ordering::Relaxed);
         // The session's IP filter, on the address the seed's host resolved to.
-        let allowed = |addr| self.may_connect_to(addr);
+        let allowed = |addr| self.may_reach(addr);
         let connection =
             WebSeedConnection::new(clients, resolver, &allowed, &self.web_layout, &link);
         let res = tokio::select! {
@@ -936,12 +940,43 @@ impl TorrentStateLive {
         }
     }
 
-    // Whether we may open a connection to `addr`: a port to connect to
-    // (libtorrent `peer_list::add_peer` takes no port-0 peer), at an
-    // address the session may reach (`Session::may_reach`, the rule
-    // trackers pass too). The peer list holds no address we may not
-    // connect to.
+    // Whether we may connect to a peer at `addr`: one on a port the session
+    // does not refuse (libtorrent `torrent::add_peer` takes no peer below
+    // port 1024 under `no_connect_privileged_ports`), that we may reach. The
+    // peer list holds no address we may not connect to.
     fn may_connect_to(&self, addr: SocketAddr) -> bool {
+        let Some(session) = self.shared.session.upgrade() else {
+            return false;
+        };
+        if session.refuses_port(addr.port()) {
+            debug!(?addr, "skipping peer on a privileged port");
+            return false;
+        }
+        self.may_reach(addr)
+    }
+
+    // Whether the session's IP filter now refuses the peer at `addr`, which
+    // is then to leave the peer list (`refilter`).
+    fn refuses(&self, addr: SocketAddr) -> bool {
+        self.shared.session.upgrade().is_some_and(|session| {
+            session.refuses_port(addr.port()) || session.may_reach(addr.ip()).is_err()
+        })
+    }
+
+    /// The session's IP filter changed: every peer on the list it now
+    /// refuses leaves it, an idle one at once, a connected one when its
+    /// connection, asked to close, has closed (libtorrent
+    /// `torrent::ip_filter_updated` and `privileged_port_updated`, through
+    /// `peer_list::apply_ip_filter` and `apply_port_filter`).
+    pub(crate) fn refilter(&self) {
+        self.peers.refuse(|addr| self.refuses(addr));
+    }
+
+    // Whether we may open a connection to `addr`, a peer or a web seed: a
+    // port to connect to (libtorrent `peer_list::add_peer` takes no port-0
+    // peer), at an address the session may reach (`Session::may_reach`, the
+    // rule trackers pass too).
+    fn may_reach(&self, addr: SocketAddr) -> bool {
         use crate::tracker::Unreachable;
         let Some(session) = self.shared.session.upgrade() else {
             return false;
@@ -2496,6 +2531,9 @@ impl PeerHandler {
         peers.settle_closed(pe.value_mut(), needed);
         trace!(state = %pe.value().get_state(), "peer settled after its connection closed");
         drop(pe);
+        // A peer the IP filter came to refuse while it was connected leaves
+        // the list now its connection is gone.
+        peers.refuse_at(handle, |addr| self.state.refuses(addr));
         if rendezvous && let Some(introducer) = peers.introducer(handle) {
             let _ = introducer.send(WriterRequest::Message(Message::Extended(
                 ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(handle)),
