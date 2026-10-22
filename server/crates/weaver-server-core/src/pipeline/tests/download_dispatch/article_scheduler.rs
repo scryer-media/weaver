@@ -627,6 +627,9 @@ async fn per_article_exclusions_decide_which_server_a_job_is_blocked_on() {
     let next = JobId(71092);
     add_job(&mut pipeline, hot, "Failed Over Reel", 40).await;
     add_job(&mut pipeline, next, "Untouched Reel", 40).await;
+    // Both servers are up in this dispatch attempt, so a rotated article
+    // has somewhere else to go.
+    pipeline.download_pass_fill_servers = Some(vec![SERVER_A, SERVER_B]);
     // Half the hot job's articles failed on this server, the other half were
     // merely rotated away from it: neither may come back to it.
     rewrite_queue(&mut pipeline, hot, |work| {
@@ -648,6 +651,47 @@ async fn per_article_exclusions_decide_which_server_a_job_is_blocked_on() {
     let on_b = taken(ask(&mut pipeline, SERVER_B, 8, None));
     assert_eq!(single_job(&on_b), hot);
     assert_eq!(idle_with_servable(&pipeline), 0);
+}
+
+// The rotation hint is a preference: with the alternative out of this
+// dispatch attempt, the hinted server serves the article after all.
+#[tokio::test]
+async fn a_rotated_article_returns_to_its_server_while_the_alternative_is_down() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(71093);
+    add_job(&mut pipeline, job_id, "Rotated Reel", 4).await;
+    rewrite_queue(&mut pipeline, job_id, |work| {
+        work.avoid_server = Some(SERVER_A);
+    });
+    pipeline.download_pass_fill_servers = Some(vec![SERVER_A]);
+
+    let on_a = taken(ask(&mut pipeline, SERVER_A, 8, None));
+    assert_eq!(on_a.len(), 4);
+    assert_eq!(single_job(&on_a), job_id);
+    assert_eq!(queued(&pipeline, job_id), 0);
+}
+
+// With the alternative in this dispatch attempt, the hinted server is
+// refused and the alternative takes the article.
+#[tokio::test]
+async fn a_rotated_article_goes_to_the_alternative_while_it_is_up() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(71094);
+    add_job(&mut pipeline, job_id, "Rotated Reel", 4).await;
+    rewrite_queue(&mut pipeline, job_id, |work| {
+        work.avoid_server = Some(SERVER_A);
+    });
+    pipeline.download_pass_fill_servers = Some(vec![SERVER_A, SERVER_B]);
+
+    assert!(taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
+    assert_eq!(queued(&pipeline, job_id), 4);
+
+    let on_b = taken(ask(&mut pipeline, SERVER_B, 8, None));
+    assert_eq!(on_b.len(), 4);
+    assert_eq!(single_job(&on_b), job_id);
+    assert_eq!(queued(&pipeline, job_id), 0);
 }
 
 // Rule 2: the hot job is recomputed on every call, so a higher-priority job

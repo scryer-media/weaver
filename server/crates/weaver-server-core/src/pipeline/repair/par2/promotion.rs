@@ -1378,14 +1378,10 @@ impl Pipeline {
             };
             let (mut download_state, post_state, run_state) =
                 crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
-            let has_current_download_activity =
-                self.job_has_current_download_activity(state.job_id);
             if matches!(download_state, crate::jobs::model::DownloadState::Complete)
-                && has_current_download_activity
+                && self.job_has_current_download_activity(state.job_id)
             {
                 download_state = crate::jobs::model::DownloadState::Downloading;
-            } else if matches!(status, JobStatus::Downloading) && !has_current_download_activity {
-                download_state = crate::jobs::model::DownloadState::Queued;
             }
             let remaining_par_files = state
                 .assembly

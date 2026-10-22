@@ -1313,6 +1313,37 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
 }
 
 #[tokio::test]
+async fn nzbget_listgroups_reports_a_started_download_with_no_live_lane_as_downloading() {
+    // A started download that holds no lane, decode or result at this instant
+    // (between retries, between lanes, or wedged) lists with its download phase
+    // gone and no rate, but it has started: it is DOWNLOADING, never QUEUED.
+    let job = nzbget_test_job(
+        97,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        5_174_000_000,
+        815_000_000,
+        vec![],
+    );
+    assert!(job.phase_progress.is_empty());
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        scheduler_handle_with_mock_commands(vec![job]),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    let group = &groups[0];
+    assert_eq!(group["NZBID"], 97);
+    assert_eq!(group["Status"], "DOWNLOADING");
+    assert_eq!(group["ActiveDownloads"], 1);
+
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(status["ServerStandBy"], false);
+}
+
+#[tokio::test]
 async fn nzbget_status_clamps_download_rate_to_arr_int() {
     let metrics = PipelineMetrics::new();
     let (cmd_tx, _cmd_rx) = mpsc::channel(1);

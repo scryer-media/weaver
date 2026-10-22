@@ -2155,9 +2155,13 @@ impl Pipeline {
         absent
     }
 
-    // Whether a job currently owns live download-stage work for queue presentation.
-    // Queued articles and delayed retries deliberately do not count: they are the
-    // scheduler's backlog, not current transfer activity.
+    // Whether a job currently owns live download-stage work. It feeds two
+    // things: `list_jobs` showing a job whose download state reads Complete as
+    // still Downloading while transfers finish, and the download phase rate
+    // in the progress samples, which only counts while transfers are live.
+    // Queued articles and delayed retries deliberately do not count: they are
+    // the scheduler's backlog, not current transfer activity, and a started
+    // job with only backlog still lists as Downloading on its own state.
     pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
         self.active_download_connections_by_job
             .get(&job_id)
