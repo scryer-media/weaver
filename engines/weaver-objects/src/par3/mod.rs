@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use par3_rs::layout::{BlockLayout, FileLayout};
 use par3_rs::runtime::ExecutionOptions;
-use par3_rs::{MAGIC, Packet, Par3Set, ScanLimits};
+use par3_rs::{HEADER_SIZE, MAGIC, Packet, PacketHeader, PacketType, Par3Set, ScanLimits};
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
@@ -88,6 +88,53 @@ struct Volume {
     front: Vec<u8>,
     arrived: Coverage,
     closed: bool,
+    // The recovery blocks the volume's name says it carries.
+    named_blocks: Option<u64>,
+}
+
+impl Volume {
+    // Whether the volume shows it carries recovery blocks: its packets,
+    // header by header from its start through what arrived of its front,
+    // reach a recovery packet, or its name says it carries some and its
+    // front holds a packet. A recovery volume repeats the index ahead of
+    // its blocks, so its first article may hold only index packets.
+    fn shows_recovery(&self) -> bool {
+        let Some(first) = readable(&self.arrived).into_iter().next() else {
+            return false;
+        };
+        if first.start != 0 {
+            return false;
+        }
+        let end = first.end.min(self.front.len() as u64);
+        let mut at = 0u64;
+        while at.saturating_add(HEADER_SIZE as u64) <= end {
+            let Ok(header) = PacketHeader::parse(&self.front[at as usize..end as usize], at) else {
+                return false;
+            };
+            if matches!(
+                header.packet_type,
+                PacketType::RecoveryData | PacketType::RecoveryExternalData
+            ) {
+                return true;
+            }
+            at = at.saturating_add(header.length);
+        }
+        at > 0 && self.named_blocks.unwrap_or(0) > 0
+    }
+
+    // Each range of the volume not yet in hand, the last open-ended: the
+    // volume's length is the parent's to know, and the root clamps an open
+    // end to it.
+    fn gaps(&self, mut each: impl FnMut(ByteRange)) {
+        let mut cursor = 0;
+        for run in self.arrived.runs() {
+            if run.range.start > cursor {
+                each(ByteRange::new(cursor, run.range.start));
+            }
+            cursor = run.range.end;
+        }
+        each(ByteRange::new(cursor, u64::MAX));
+    }
 }
 
 // A member that may be a described file no member carries: no described
@@ -259,6 +306,16 @@ fn scan(bytes: &[u8], into: &mut Vec<Packet>) {
     }
 }
 
+// The recovery blocks a volume's name says it carries, as the creator names
+// a volume: `<stem>.vol<start>+<count>.par3`.
+fn named_blocks(name: &str) -> Option<u64> {
+    let lower = name.to_ascii_lowercase();
+    let (_, tail) = lower.strip_suffix(".par3")?.rsplit_once(".vol")?;
+    let (start, count) = tail.split_once('+')?;
+    start.parse::<u64>().ok()?;
+    count.parse().ok()
+}
+
 // Every set the packets describe; a job of more sets than the limit has none.
 fn sets(packets: Vec<Packet>) -> Vec<Par3Set> {
     let sets = Par3Set::from_packets(packets).unwrap_or_default();
@@ -351,8 +408,8 @@ impl Object for Par3 {
             .then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {
-        self.volume(volume);
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
+        self.volume(volume).named_blocks = named_blocks(name);
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {
@@ -462,12 +519,19 @@ impl Recovery for Par3 {
     // Nothing is known before a readback.
     fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
 
+    // While the last repair waits on damaged blocks, every open volume is
+    // wanted now. Otherwise every volume whose head shows it carries
+    // recovery is deferred: the rest waits until a repair is short. Nothing
+    // of the deferral is kept: the same fronts say it again on every round.
     fn wants(&self, out: &mut Vec<Seek>) {
-        if self.needed == 0 {
-            return;
-        }
         for (index, volume) in self.volumes.iter().enumerate() {
             if volume.closed {
+                continue;
+            }
+            if self.needed == 0 {
+                if volume.shows_recovery() {
+                    volume.gaps(|range| out.push(Seek::deferred(VolumeIndex(index as u32), range)));
+                }
                 continue;
             }
             let start = volume.arrived.runs().next().map_or(0, |run| {

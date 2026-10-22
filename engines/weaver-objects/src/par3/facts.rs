@@ -95,6 +95,7 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
             front: Vec::new(),
             arrived: volume.arrived,
             closed: volume.closed,
+            named_blocks: None,
         })
         .collect();
     par3.bound = kept.bound;
