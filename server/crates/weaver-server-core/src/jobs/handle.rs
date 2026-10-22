@@ -824,10 +824,14 @@ pub struct HistoryDeleteOutcome {
     pub left_in_place: Vec<std::path::PathBuf>,
 }
 
-// How many history ids one delete command carries. It matches the SQL bind
-// chunk, so one command's delete is one statement per table.
-pub const HISTORY_DELETE_BATCH_SIZE: usize =
-    crate::persistence::sql_runtime::SQLITE_BATCH_BIND_LIMIT;
+// How many history ids one delete command carries. A batch is one
+// transaction, one statement per table, and one reply the caller waits for,
+// while the queue scripts of each job in it are stopped one after another
+// before its directory goes. So a batch is also what one database error or
+// one slow script fails whole: small enough to keep that to a few dozen
+// rows, large enough that the transaction, lock and sweep a batch pays once
+// are still shared across many.
+pub const HISTORY_DELETE_BATCH_SIZE: usize = 50;
 
 // What one batched history delete did, id by id. A refused id never holds
 // back the rest of the batch.
