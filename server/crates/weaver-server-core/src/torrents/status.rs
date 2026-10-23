@@ -379,7 +379,7 @@ pub fn swarm(announces: &[TrackerAnnounce], now_ms: i64) -> Swarm {
 /// A torrent's trackers: the ones its run announces to, each in the tier
 /// the torrent lists it in, or, before it has run, the ones it lists. A
 /// tracker the torrent does not list came with its magnet, whose trackers
-/// all sit in the first tier.
+/// each take a tier of their own in the link's order.
 pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec<TorrentTracker> {
     let mut trackers: Vec<TorrentTracker> = if announces.is_empty() {
         listed

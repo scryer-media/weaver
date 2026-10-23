@@ -235,11 +235,26 @@ pub struct TrackerResponse<'a> {
     /// IPv6 peers (BEP 7).
     #[serde(default, borrow)]
     pub peers6: Peers<'a, SocketAddrV6>,
+    /// Our address as the tracker saw it (BEP 24), compact: 4 bytes for
+    /// IPv4, 16 for IPv6 (libtorrent `parse_tracker_response`).
+    #[serde(rename = "external ip", default, borrow)]
+    pub external_ip: Option<ByteBuf<'a>>,
 }
 
 impl TrackerResponse<'_> {
     pub fn iter_peers(&self) -> impl Iterator<Item = SocketAddr> {
         self.peers.iter().chain(self.peers6.iter())
+    }
+
+    /// The `external ip` the answer gave, None when it gave none or one of
+    /// neither length.
+    pub fn external_ip(&self) -> Option<IpAddr> {
+        let bytes: &[u8] = self.external_ip.as_ref()?.as_ref();
+        match bytes.len() {
+            4 => <[u8; 4]>::try_from(bytes).ok().map(IpAddr::from),
+            16 => <[u8; 16]>::try_from(bytes).ok().map(IpAddr::from),
+            _ => None,
+        }
     }
 }
 
@@ -439,7 +454,7 @@ pub(crate) async fn get(
     ask: Ask,
     query: &str,
     user_agent: &str,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<Answer> {
     let mut url = tracker.clone();
     match tracker.query() {
         Some(own) if has_tracker_query(own) => {
@@ -476,10 +491,21 @@ pub(crate) async fn get(
     if !response.status().is_success() {
         anyhow::bail!("tracker responded with {:?}", response.status());
     }
+    let from = response.remote_addr().map(|addr| addr.ip());
     let chunks = futures::stream::try_unfold(response, |mut response| async move {
         Ok(response.chunk().await?.map(|chunk| (chunk, response)))
     });
-    read_body(chunks).await
+    Ok(Answer {
+        body: read_body(chunks).await?,
+        from,
+    })
+}
+
+/// A tracker's answer to a GET.
+pub(crate) struct Answer {
+    pub(crate) body: Vec<u8>,
+    /// The address the answer came from, when the client tells it.
+    pub(crate) from: Option<IpAddr>,
 }
 
 /// Collects a body from `chunks` within [`RECEIVE_TIMEOUT`] per chunk and
@@ -674,6 +700,32 @@ mod tests {
         let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
         assert_eq!(response.complete, None);
         assert_eq!(response.incomplete, None);
+    }
+
+    #[test]
+    fn the_external_ip_a_tracker_answer_gives_is_read_in_either_family() {
+        let data = b"d11:external ip4:\xcb\x00\x71\x058:intervali1800e5:peers0:e";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        assert_eq!(response.external_ip(), Some("203.0.113.5".parse().unwrap()));
+
+        let mut data = b"d11:external ip16:".to_vec();
+        data.extend_from_slice(
+            &"2001:db8::5"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        data.extend_from_slice(b"8:intervali1800e5:peers0:e");
+        let response = crate::bencode::from_bytes::<TrackerResponse>(&data).unwrap();
+        assert_eq!(response.external_ip(), Some("2001:db8::5".parse().unwrap()));
+
+        // Of neither length, or left out: none.
+        let data = b"d11:external ip3:abc8:intervali1800e5:peers0:e";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        assert_eq!(response.external_ip(), None);
+        let data = b"d8:intervali1800e5:peers0:e";
+        let response = crate::bencode::from_bytes::<TrackerResponse>(data).unwrap();
+        assert_eq!(response.external_ip(), None);
     }
 
     #[test]

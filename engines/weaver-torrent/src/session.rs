@@ -2901,6 +2901,7 @@ impl Session {
                     } else {
                         Arc::new(Vec::new)
                     },
+                    self.external_ips.tracker_vote(),
                     match ssl {
                         Some(ssl) => Arc::new(SslHttpClients {
                             inner: self.http_clients.clone(),

@@ -395,6 +395,23 @@ mod tests {
         assert_eq!(m.trackers, vec!["udp://foo.bar/announce"]);
     }
 
+    // libtorrent `parse_magnet_uri`: each `tr` is a tier of its own, in the
+    // order the link gives them.
+    #[test]
+    fn a_magnets_trackers_are_read_in_the_order_the_link_gives() {
+        let link = "magnet:?xt=urn:btih:a621779b5e3d486e127c3efbca9b6f8d135f52e5\
+                    &tr=https%3A%2F%2Ftorrent.example%2Fannounce\
+                    &tr=https%3A%2F%2Fipv6.torrent.example%2Fannounce";
+        let m = Magnet::parse(link).unwrap();
+        assert_eq!(
+            m.trackers,
+            vec![
+                "https://torrent.example/announce",
+                "https://ipv6.torrent.example/announce"
+            ]
+        );
+    }
+
     // libtorrent test_magnet.cpp `parse_web_seeds`, and a torrent's link
     // carrying its web seeds escaped (`make_magnet_uri`).
     #[test]

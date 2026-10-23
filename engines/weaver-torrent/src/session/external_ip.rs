@@ -3,13 +3,15 @@
 
 //! Our address as the internet sees it, one for each address family: the
 //! winner of a vote among those that see us (libtorrent `ip_voter`). Peers
-//! vote with the `yourip` of their extended handshake and the gateway with
-//! the address a port mapper got from it.
+//! vote with the `yourip` of their extended handshake, trackers with the
+//! `external ip` of an accepted announce, and the gateway with the address
+//! a port mapper got from it.
 
 use std::{
     cmp::Ordering,
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -25,6 +27,9 @@ use crate::upnp::PortMapped;
 pub(crate) enum Voter {
     /// A peer, at its address, by its `yourip`.
     Peer(IpAddr),
+    /// A tracker, at the address its answer came from, by the answer's
+    /// `external ip`.
+    Tracker(IpAddr),
     /// The gateway, by a port mapper's report. Its address is not known,
     /// so every mapper votes as one voter (libtorrent votes the router as
     /// the unspecified address).
@@ -36,17 +41,19 @@ impl Voter {
     // family it votes for.
     fn key(self, ip: IpAddr) -> IpAddr {
         match self {
-            Voter::Peer(at) => at.to_canonical(),
+            Voter::Peer(at) | Voter::Tracker(at) => at.to_canonical(),
             Voter::Router if ip.is_ipv4() => Ipv4Addr::UNSPECIFIED.into(),
             Voter::Router => Ipv6Addr::UNSPECIFIED.into(),
         }
     }
 
-    // libtorrent's `source_peer` and `source_router` bits: an address the
-    // gateway named outranks one only peers named, when the votes tie.
+    // libtorrent's `source_peer`, `source_tracker` and `source_router`
+    // bits: when the votes tie, an address the gateway named outranks one a
+    // tracker named, which outranks one only peers named.
     fn kind(self) -> u8 {
         match self {
             Voter::Peer(_) => 1 << 1,
+            Voter::Tracker(_) => 1 << 2,
             Voter::Router => 1 << 3,
         }
     }
@@ -226,6 +233,16 @@ impl ExternalIps {
         }
     }
 
+    /// The vote of a tracker that accepted an announce: the address it says
+    /// we are at, by the tracker at the address its answer came from
+    /// (libtorrent `torrent::tracker_response`).
+    pub(crate) fn tracker_vote(self: &Arc<Self>) -> crate::tracker::ExternalIpVote {
+        let ips = Arc::clone(self);
+        Arc::new(move |ip, tracker| {
+            ips.cast_vote(ip, Voter::Tracker(tracker), Instant::now());
+        })
+    }
+
     /// Our addresses, IPv4 first, of the families we know one for.
     pub(crate) fn get(&self) -> Vec<IpAddr> {
         [self.v4.lock().address, self.v6.lock().address]
@@ -326,6 +343,26 @@ mod tests {
         assert_eq!(ips.v4.lock().candidates[0].votes(), 1);
         ips.cast_vote(ip("203.0.113.5"), peer("198.51.100.2"), now);
         assert!(ips.v4.lock().settled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tracker_votes_as_one_voter_at_its_address_and_ties_go_its_way() {
+        let now = Instant::now();
+        let ips = Arc::new(ExternalIps::new(now));
+        let vote = ips.tracker_vote();
+        vote(ip("203.0.113.5"), ip("198.51.100.1"));
+        assert_eq!(ips.get(), [ip("203.0.113.5")]);
+        // Its second answer is the same voter again.
+        vote(ip("203.0.113.5"), ip("198.51.100.1"));
+        assert_eq!(ips.v4.lock().candidates[0].votes(), 1);
+        // A tracker of the other family counts for nothing here.
+        vote(ip("203.0.113.5"), ip("2001:db8::1"));
+        assert_eq!(ips.v4.lock().candidates[0].votes(), 1);
+        // A peer naming another address ties it: the tracker's outranks it.
+        ips.cast_vote(ip("203.0.113.9"), peer("198.51.100.2"), now);
+        let mut candidates = std::mem::take(&mut ips.v4.lock().candidates);
+        candidates.sort_by(Candidate::rank);
+        assert_eq!(candidates[0].addr, ip("203.0.113.5"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -303,13 +303,21 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
     let (conn, event) = read_announce(&tracker).await?;
     assert_eq!(event.as_deref(), Some("started"));
     assert!(handle.tracker_announces()[0].in_flight);
+    assert_eq!(session.external_ips(), Vec::<std::net::IpAddr>::new());
+    // The answer names our address, 88.89.90.91 (`XYZ[`), compact.
     respond(
         conn,
-        "d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e",
+        "d8:completei3e11:external ip4:XYZ[10:incompletei5e8:intervali1800e5:peers0:e",
     )
     .await?;
     first.subscribe().wait_for(|a| a[0].last.is_some()).await?;
+    // The tracker's vote, cast before the row took the answer.
+    assert_eq!(
+        session.external_ips(),
+        [std::net::IpAddr::from(Ipv4Addr::new(88, 89, 90, 91))]
+    );
     let answered = handle.tracker_announces();
+    assert!(answered[0].next_announce.is_some());
     assert!(!answered[0].in_flight);
     assert_eq!(
         answered[0].last.as_ref().context("answered")?.result,
@@ -325,12 +333,26 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         })
     );
 
-    // Paused: the task ends (it sends `stopped`), the outcome stays readable.
+    // Paused: the task ends and sends `stopped`, whose answer is the row's
+    // last outcome; no announce is due while paused.
     session.pause(&handle).await?;
     let (conn, event) = read_announce(&tracker).await?;
     assert_eq!(event.as_deref(), Some("stopped"));
-    respond(conn, "d8:intervali1800e5:peers0:e").await?;
-    assert_eq!(handle.tracker_announces(), answered);
+    assert_eq!(handle.tracker_announces()[0].next_announce, None);
+    respond(conn, "d8:completei7e8:intervali1800e5:peers0:e").await?;
+    first
+        .subscribe()
+        .wait_for(|a| {
+            !a[0].in_flight
+                && a[0]
+                    .last
+                    .as_ref()
+                    .is_some_and(|l| l.result.as_ref().is_ok_and(|ok| ok.seeders == Some(7)))
+        })
+        .await?;
+    let answered = handle.tracker_announces();
+    assert_eq!(answered[0].next_announce, None);
+    assert_eq!(answered[0].fails, 0);
 
     // Second live run: a new table for the new task.
     session.unpause(&handle).await?;

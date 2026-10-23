@@ -51,6 +51,8 @@ pub struct TrackerComms {
     announce_port: ListenPort,
     /// Our own addresses an HTTP announce names (see [`AnnounceIps`]).
     announce_ips: AnnounceIps,
+    /// Where an accepted announce's `external ip` goes.
+    vote: ExternalIpVote,
     http_clients: Arc<dyn HttpClients>,
     reachable: Reachable,
     udp_client: UdpTrackerClient,
@@ -148,6 +150,12 @@ pub type ListenPort = tokio::sync::watch::Receiver<Option<u16>>;
 /// read as each announce goes out (libtorrent `torrent::build_tracker_request`
 /// reads the session's listen sockets per request).
 pub type AnnounceIps = Arc<dyn Fn() -> Vec<IpAddr> + Send + Sync>;
+
+/// Takes the vote of a tracker that accepted an announce: the address it
+/// says we are at (`external ip`), then the tracker's own address, the one
+/// the answer came from (libtorrent `torrent::tracker_response` hands both
+/// to `session_impl::set_external_address` as `source_tracker`).
+pub type ExternalIpVote = Arc<dyn Fn(IpAddr, IpAddr) + Send + Sync>;
 
 /// Why the session may not reach an address. The family is judged first, so
 /// a refusal of every address names the last rule any of them met.
@@ -312,6 +320,9 @@ struct TrackerList {
     /// they may be, whatever the walk would pick (libtorrent
     /// `torrent::announce_tracker_now`).
     forced: Vec<SupportedTracker>,
+    /// The run announces until it stops (libtorrent
+    /// `torrent::m_announcing`); after that no tracker is due again.
+    announcing: bool,
 }
 
 impl TrackerList {
@@ -331,6 +342,7 @@ impl TrackerList {
             entries,
             complete_sent: false,
             forced: Vec::new(),
+            announcing: true,
         }
     }
 
@@ -546,9 +558,11 @@ impl TrackerList {
         }
     }
 
-    /// The trackers owed `stopped`: the walk over those that accepted
-    /// `started`, each of them due (libtorrent `torrent::stop_announcing`).
-    fn stopped(&self) -> Vec<SupportedTracker> {
+    /// The run stops announcing (libtorrent `torrent::stop_announcing`): no
+    /// tracker is due again, and the trackers owed `stopped` are the walk
+    /// over those that accepted `started`, each of them due.
+    fn stop(&mut self) -> Vec<SupportedTracker> {
+        self.announcing = false;
         self.walk(|e| e.start_sent, |_| true)
             .into_iter()
             .map(|i| self.entries[i].tracker.clone())
@@ -709,6 +723,9 @@ struct Announced {
     leechers: Option<u32>,
     downloaded: Option<u32>,
     warning: Option<String>,
+    /// Our address as the tracker saw it, and the tracker's address the
+    /// answer came from: its vote (see [`ExternalIpVote`]).
+    seen_as: Option<(IpAddr, IpAddr)>,
 }
 
 /// What a tracker answered to an announce it accepted (libtorrent
@@ -775,7 +792,8 @@ impl From<&anyhow::Error> for AnnounceError {
     }
 }
 
-/// The outcome of the most recent regular announce to a tracker.
+/// The outcome of the most recent announce to a tracker, `stopped`
+/// included.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastAnnounce {
     /// When the announce finished.
@@ -788,7 +806,7 @@ pub struct LastAnnounce {
 pub struct TrackerAnnounce {
     /// The announce URL.
     pub url: String,
-    /// A regular announce to this tracker is waiting for its answer.
+    /// An announce to this tracker is waiting for its answer.
     pub in_flight: bool,
     /// None until the tracker has been announced to.
     pub last: Option<LastAnnounce>,
@@ -796,7 +814,8 @@ pub struct TrackerAnnounce {
     /// `announce_infohash::fails`).
     pub fails: u8,
     /// When it is next due, once an announce to it has ended or one was
-    /// forced (libtorrent `announce_infohash::next_announce`).
+    /// forced (libtorrent `announce_infohash::next_announce`); None again
+    /// once the run has stopped announcing.
     pub next_announce: Option<SystemTime>,
 }
 
@@ -964,7 +983,7 @@ impl Scraper {
     async fn scrape_http(&self, tracker_url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
         let url =
             tracker_comms_http::scrape_url(tracker_url).context("the tracker offers no scrape")?;
-        let body = tracker_comms_http::get(
+        let answer = tracker_comms_http::get(
             &*self.http_clients,
             self.udp_client.resolver(),
             &self.reachable,
@@ -974,7 +993,7 @@ impl Scraper {
             &self.user_agent,
         )
         .await?;
-        tracker_comms_http::parse_scrape(&body, &info_hash)
+        tracker_comms_http::parse_scrape(&answer.body, &info_hash)
     }
 
     async fn scrape_udp(&self, url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
@@ -1395,10 +1414,12 @@ impl Drop for RunningGuard {
 }
 
 /// Lives inside the peer stream. When the stream is dropped (the torrent was
-/// paused, removed or the session is stopping), every tracker that accepted
-/// `started` is sent `stopped` with the final counters, unless the stopped
-/// announces may take no time at all: then none is sent (libtorrent
-/// `torrent::announce_with_tracker` with `stop_tracker_timeout <= 0`).
+/// paused, removed or the session is stopping), the run stops announcing,
+/// and every tracker that accepted `started` is sent `stopped` with the
+/// final counters, each recorded in the table as any announce is, unless
+/// the stopped announces may take no time at all: then none is sent
+/// (libtorrent `torrent::announce_with_tracker` with
+/// `stop_tracker_timeout <= 0`).
 struct StopOnDrop {
     comms: Arc<TrackerComms>,
     timeout: Duration,
@@ -1408,11 +1429,9 @@ struct StopOnDrop {
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         let running = self.running.take();
-        if self.timeout.is_zero() {
-            return;
-        }
-        let trackers = self.comms.list.lock().stopped();
-        if trackers.is_empty() {
+        let trackers = self.comms.list.lock().stop();
+        self.comms.publish(Instant::now(), SystemTime::now());
+        if self.timeout.is_zero() || trackers.is_empty() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -1426,14 +1445,8 @@ impl Drop for StopOnDrop {
             async move {
                 let _running = running;
                 let stats = comms.stats.get();
-                let announces = trackers.iter().map(|tracker| {
-                    comms
-                        .announce(tracker, Some(TrackerRequestEvent::Stopped), &stats)
-                        .map(move |r| {
-                            if let Err(e) = r {
-                                debug!(?tracker, "error sending stopped: {e:#}");
-                            }
-                        })
+                let announces = trackers.into_iter().map(|tracker| {
+                    comms.announce_recorded(tracker, Some(TrackerRequestEvent::Stopped), stats)
                 });
                 if tokio::time::timeout(timeout, futures::future::join_all(announces))
                     .await
@@ -1526,6 +1539,7 @@ impl TrackerComms {
         force_interval: Option<Duration>,
         listen_port: ListenPort,
         announce_ips: AnnounceIps,
+        vote: ExternalIpVote,
         http_clients: Arc<dyn HttpClients>,
         reachable: Reachable,
         udp_client: UdpTrackerClient,
@@ -1538,6 +1552,7 @@ impl TrackerComms {
             force_interval,
             listen_port,
             announce_ips,
+            vote,
             http_clients,
             reachable,
             udp_client,
@@ -1554,11 +1569,12 @@ impl TrackerComms {
     /// becomes a seed during this run (see
     /// [`TrackerCommsStats::finished_during_run`]) and no tracker has
     /// accepted it yet, and `stopped` when the returned stream is dropped. `stopped` is bounded
-    /// and tracked by `stopped`. Each regular announce is recorded in the
-    /// returned [`TrackerStatus`]. `listen_port` is the port peers reach this
+    /// and tracked by `stopped`. Each announce, `stopped` included, is
+    /// recorded in the returned [`TrackerStatus`]. `listen_port` is the port peers reach this
     /// session on, None when it accepts no connections; when it changes, each
     /// tier announces it as soon as its tracker's `min interval` allows.
-    /// `announce_ips` gives the addresses each HTTP announce names as ours.
+    /// `announce_ips` gives the addresses each HTTP announce names as ours,
+    /// and `vote` takes the address an accepted answer says is ours.
     /// A tracker, HTTP or UDP, announce or scrape, every hop, is asked only
     /// at the addresses `reachable` lets through.
     ///
@@ -1578,6 +1594,7 @@ impl TrackerComms {
         force_interval: Option<Duration>,
         listen_port: ListenPort,
         announce_ips: AnnounceIps,
+        vote: ExternalIpVote,
         http_clients: Arc<dyn HttpClients>,
         reachable: Reachable,
         udp_client: UdpTrackerClient,
@@ -1615,6 +1632,7 @@ impl TrackerComms {
                     tx: tx.clone(),
                     announce_port: listen_port.clone(),
                     announce_ips: announce_ips.clone(),
+                    vote: vote.clone(),
                     http_clients: http_clients.clone(),
                     reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
@@ -1679,8 +1697,8 @@ impl TrackerComms {
                     continue;
                 };
                 let asked = entry.start_sent || entry.fails > 0;
-                let next =
-                    asked.then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
+                let next = (list.announcing && asked)
+                    .then(|| wall(entry.next_announce.max(entry.min_announce), now, at));
                 if (row.fails, row.next_announce) != (entry.fails, next) {
                     (row.fails, row.next_announce) = (entry.fails, next);
                     modified = true;
@@ -1715,7 +1733,7 @@ impl TrackerComms {
             let current = *port.borrow_and_update();
             let due = self.list.lock().start_due(Instant::now(), current, &stats);
             for (tracker, event) in due {
-                let (announce, abort) = futures::future::abortable(self.announce_regular(
+                let (announce, abort) = futures::future::abortable(self.announce_recorded(
                     tracker.clone(),
                     event,
                     stats,
@@ -1755,9 +1773,10 @@ impl TrackerComms {
         }
     }
 
-    /// A regular announce, its outcome told to the list and recorded in the
-    /// status table; the peers it found.
-    async fn announce_regular(
+    /// An announce, its outcome told to the list and recorded in the status
+    /// table, and the address an accepted answer says is ours handed to the
+    /// vote; the peers it found.
+    async fn announce_recorded(
         &self,
         tracker: SupportedTracker,
         event: Option<TrackerRequestEvent>,
@@ -1775,6 +1794,9 @@ impl TrackerComms {
                 );
                 debug!(?tracker, ?delay, "tracker answered");
                 self.list.lock().on_success(&tracker, event, now, &delay);
+                if let Some((ours, by)) = announced.seen_as {
+                    (self.vote)(ours, by);
+                }
                 let ok = AnnounceOk {
                     interval: announced.interval,
                     min_interval: announced.min_interval,
@@ -1848,7 +1870,7 @@ impl TrackerComms {
             ips: &ips,
         };
 
-        let bytes = tracker_comms_http::get(
+        let answer = tracker_comms_http::get(
             &*self.http_clients,
             self.udp_client.resolver(),
             &self.reachable,
@@ -1858,7 +1880,7 @@ impl TrackerComms {
             &self.identity.user_agent,
         )
         .await?;
-        let response = read_answer(&bytes)?;
+        let response = read_answer(&answer.body)?;
         if let Some(id) = &response.tracker_id {
             self.tracker_ids
                 .lock()
@@ -1876,6 +1898,7 @@ impl TrackerComms {
                 .warning_message
                 .as_ref()
                 .map(|m| String::from_utf8_lossy(m.as_ref()).into_owned()),
+            seen_as: response.external_ip().zip(answer.from),
         })
     }
 
@@ -1957,6 +1980,8 @@ impl TrackerComms {
                     leechers: Some(response.leechers),
                     downloaded: None,
                     warning: None,
+                    // A UDP answer (BEP 15) names no address of ours.
+                    seen_as: None,
                 })
             }
             Err(e) => {
@@ -2251,22 +2276,22 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.stopped(), []);
+        assert_eq!(list.stop(), []);
 
         list.start_due(t0, None, &stats);
         // Not yet accepted: nothing is owed.
-        assert_eq!(list.stopped(), []);
+        assert_eq!(list.stop(), []);
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.stopped(), [http("a")]);
+        assert_eq!(list.stop(), [http("a")]);
 
         // a fails and b takes over: until b accepts `started`, a, failing,
         // is still owed `stopped`.
         list.on_failure(&http("a"), t0, Duration::ZERO);
         assert_eq!(list.start_due(t0, None, &stats), [(http("b"), STARTED)]);
-        assert_eq!(list.stopped(), [http("a")]);
+        assert_eq!(list.stop(), [http("a")]);
         // Then b, the tracker in use, is.
         list.on_success(&http("b"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.stopped(), [http("b")]);
+        assert_eq!(list.stop(), [http("b")]);
     }
 
     #[test]
@@ -2378,6 +2403,11 @@ mod tests {
         Arc::new(Vec::new)
     }
 
+    /// Takes no tracker's vote.
+    fn no_vote() -> super::ExternalIpVote {
+        Arc::new(|_, _| {})
+    }
+
     /// The session reaches every address.
     fn reach_all() -> Reachable {
         Arc::new(|_| Ok(()))
@@ -2421,6 +2451,7 @@ mod tests {
             None,
             listen_port,
             announce_ips,
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -2477,6 +2508,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -2632,6 +2664,7 @@ mod tests {
             None,
             listen_port,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -2684,6 +2717,7 @@ mod tests {
             None,
             listen_port,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -2741,6 +2775,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -2816,6 +2851,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -2858,6 +2894,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(|| {
                 reqwest::Client::builder()
                     .no_proxy()
@@ -2922,6 +2959,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -2988,6 +3026,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(reqwest::Client::builder),
             reach_all(),
             udp_client,
@@ -3029,6 +3068,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -3121,12 +3161,226 @@ mod tests {
         assert!(error.message.contains("nope"), "{error}");
         assert_eq!(error.kind, AnnounceErrorKind::Refused);
 
-        // The table outlives the task: the outcomes stay readable.
+        // The table outlives the task: the `stopped` answer is the last
+        // outcome of the tracker in use, the refusal stays the other's, and
+        // with the run over no tracker is due again.
         drop(peers);
         let q = next_announce(&ok).await;
         assert_eq!(query_param(&q, "event"), Some("stopped"));
         stopped.wait_idle().await;
-        assert_eq!(status.announces(), announces);
+        let after = status.announces();
+        assert!(
+            after
+                .iter()
+                .all(|a| !a.in_flight && a.next_announce.is_none()),
+            "{after:?}"
+        );
+        assert_eq!(
+            announce_of(&after, &err_url).last,
+            announce_of(&announces, &err_url).last
+        );
+        assert_eq!(announce_of(&after, &err_url).fails, 1);
+        let stopped_answer = announce_of(&after, &ok_url).last.as_ref().unwrap();
+        assert_eq!(
+            stopped_answer.result.as_ref().map(|a| a.seeders),
+            Ok(None),
+            "the row holds the stopped answer, which gave no counts"
+        );
+        token.cancel();
+    }
+
+    /// Answers the next HTTP request with `body`, driving `peers` meanwhile;
+    /// the request's query string.
+    async fn answer(
+        listener: &tokio::net::TcpListener,
+        peers: &mut (impl futures::Stream<Item = SocketAddr> + Unpin),
+        body: &str,
+    ) -> String {
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            q = async {
+                let (conn, q) = read_announce(listener).await;
+                respond(conn, body).await;
+                q
+            } => q,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_announce_is_the_rows_last_and_leaves_none_due_until_the_next_run() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+
+        let q = answer(
+            &listener,
+            &mut peers,
+            "d8:completei3e8:intervali1800e5:peers0:e",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a[0].last.is_some() && !a[0].in_flight) => { r.unwrap(); }
+        }
+        let started = status.announces()[0].clone();
+        assert!(started.next_announce.is_some());
+        let started_at = started.last.as_ref().unwrap().at;
+
+        // Paused: `stopped` goes out and its answer is recorded as any is.
+        drop(peers);
+        let (conn, q) = read_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        // While it waits for its answer, the row says so, and no announce
+        // is due any more.
+        let waiting = status.announces()[0].clone();
+        assert!(waiting.in_flight);
+        assert_eq!(waiting.next_announce, None);
+        assert_eq!(waiting.last, started.last);
+        respond(conn, "d8:completei7e8:intervali1800e5:peers0:e").await;
+        stopped.wait_idle().await;
+        let row = status.announces()[0].clone();
+        assert!(!row.in_flight);
+        assert_eq!(row.next_announce, None);
+        assert_eq!(row.fails, 0);
+        let last = row.last.unwrap();
+        assert!(last.at >= started_at);
+        assert_eq!(last.result.map(|a| a.seeders), Ok(Some(7)));
+
+        // Resumed: a new run, whose table records `started` again.
+        let (task, token2) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        let q = answer(&listener, &mut peers, "d8:intervali1800e5:peers0:e").await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a[0].last.is_some() && !a[0].in_flight) => { r.unwrap(); }
+        }
+        let row = status.announces()[0].clone();
+        assert!(row.last.unwrap().result.is_ok());
+        assert!(row.next_announce.is_some());
+        drop(peers);
+        let q = next_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        token.cancel();
+        token2.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_refused_stopped_announce_counts_a_failure_and_leaves_none_due() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        answer(&listener, &mut peers, "d8:intervali1800e5:peers0:e").await;
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a[0].last.is_some() && !a[0].in_flight) => { r.unwrap(); }
+        }
+
+        drop(peers);
+        let (conn, q) = read_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        respond(conn, "d14:failure reason4:nopee").await;
+        stopped.wait_idle().await;
+        let row = status.announces()[0].clone();
+        assert_eq!(row.fails, 1);
+        assert_eq!(row.next_announce, None);
+        let error = row.last.unwrap().result.unwrap_err();
+        assert_eq!(error.kind, AnnounceErrorKind::Refused);
+        assert!(error.message.contains("nope"), "{error}");
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_zero_stopped_timeout_still_leaves_no_announce_due() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::new(Duration::ZERO);
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        answer(&listener, &mut peers, "d8:intervali1800e5:peers0:e").await;
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a[0].last.is_some() && !a[0].in_flight) => { r.unwrap(); }
+        }
+        let answered = status.announces()[0].clone();
+        assert!(answered.next_announce.is_some());
+
+        // No `stopped` goes out, and the run is over all the same.
+        drop(peers);
+        let row = status.announces()[0].clone();
+        assert_eq!(row.next_announce, None);
+        assert_eq!(row.last, answered.last);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn an_accepted_answers_external_ip_is_the_trackers_vote() {
+        let (refusing, refusing_url) = http_listener().await;
+        let (listener, url) = http_listener().await;
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let (votes, mut voted) = tokio::sync::mpsc::unbounded_channel();
+        let stopped = StoppedAnnounces::default();
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            vec![vec![refusing_url], vec![url]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            Arc::new(move |ours, by| votes.send((ours, by)).unwrap()),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        )
+        .peers;
+
+        // The first tier's tracker refuses, naming an address (65.65.65.65):
+        // a refusal casts no vote.
+        let q = answer(
+            &refusing,
+            &mut peers,
+            "d11:external ip4:AAAA14:failure reason4:nopee",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        // The next tier's accepts, naming 88.89.90.91: its vote, at the
+        // address its answer came from.
+        let q = answer(
+            &listener,
+            &mut peers,
+            "d11:external ip4:XYZ[8:intervali1800e5:peers0:e",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        let vote = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            v = voted.recv() => v.unwrap(),
+        };
+        assert_eq!(
+            vote,
+            (
+                IpAddr::from(Ipv4Addr::new(88, 89, 90, 91)),
+                IpAddr::from(Ipv4Addr::LOCALHOST)
+            )
+        );
+        drop(peers);
+        let q = next_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        assert!(voted.try_recv().is_err(), "an answer without one voted");
         token.cancel();
     }
 
@@ -3388,6 +3642,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
             udp_client,
@@ -3521,6 +3776,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             clients.clone(),
             reach_all(),
             udp_client,
@@ -3774,6 +4030,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             clients.clone(),
             reach_but(vec![loopback], true),
             udp_client,
@@ -3832,6 +4089,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_ips(),
+            no_vote(),
             clients.clone(),
             reach_but(vec![blocked], true),
             udp_client,

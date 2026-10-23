@@ -1973,7 +1973,8 @@ impl TorrentService {
                 let trackers: Vec<TrackerEntry> = magnet
                     .trackers
                     .iter()
-                    .filter_map(|url| tracker(0, url.as_bytes()))
+                    .enumerate()
+                    .filter_map(|(tier, url)| tracker(tier as u32, url.as_bytes()))
                     .collect();
                 let rules = self.rules();
                 let rule =
