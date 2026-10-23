@@ -839,9 +839,10 @@ impl Pipeline {
                         | DownloadFailureKind::EstablishedTransport
                         | DownloadFailureKind::Auth
                         | DownloadFailureKind::ContentOrProtocol
-                ) && let Some(suppressed_since_last) = self
-                    .body_fetch_failure_log_throttle
-                    .admit(job_id, BODY_FETCH_FAILURE_LOG_INTERVAL)
+                ) && self.unclean_batch_is_server_fault(job_id)
+                    && let Some(suppressed_since_last) = self
+                        .body_fetch_failure_log_throttle
+                        .admit(job_id, BODY_FETCH_FAILURE_LOG_INTERVAL)
                 {
                     info!(
                         job_id = job_id.0,

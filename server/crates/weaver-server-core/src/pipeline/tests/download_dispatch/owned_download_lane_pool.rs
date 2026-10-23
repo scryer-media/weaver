@@ -4157,3 +4157,138 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
     pipeline.shared_state.publish_jobs(Vec::new());
     runtime.network.shutdown().await;
 }
+
+// A pipelined BODY batch that ended with its connection torn down.
+fn unclean_batch_result(job_id: JobId, segment_number: u32) -> DownloadResult {
+    DownloadResult {
+        lane_id: 0,
+        job_id,
+        runtime_generation: 0,
+        segment_id: held_segment(job_id, 0, segment_number),
+        data: Err(DownloadError::Fetch(DownloadFailure::new(
+            DownloadFailureKind::EstablishedTransport,
+            "connection closed",
+        ))),
+        attempts: Vec::new(),
+        lane_observation: Some(DownloadLaneObservation {
+            server_idx: Some(0),
+            mode: DownloadLaneMode::Pipelined { depth: 2 },
+            supports_pipelining: true,
+            latency_sample: None,
+            cold: false,
+            transfer: None,
+            payload_bytes: 0,
+            policy_elapsed: Duration::ZERO,
+            pressure_clear: true,
+            batch_complete: true,
+            batch_clean: false,
+            unresolved_count: 1,
+            connection_discarded: true,
+        }),
+        source_server_idx: Some(0),
+        origin: DownloadResultOrigin::NormalPrimary,
+        retry_count: 0,
+        exclude_servers: Vec::new(),
+        release_connection_slot: false,
+    }
+}
+
+#[tokio::test]
+async fn a_batch_cut_short_by_cancellation_is_not_an_unclean_batch() {
+    // Shutdown, a job cancel and a pause all tear down lanes mid-batch. None
+    // of that says anything about the server, so none of it may lower the
+    // depth or pin the server; a genuine transport fault still does.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20031);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Cut Short", "payload.bin", &[64, 64, 64, 64, 64, 64, 64]),
+    )
+    .await;
+    pipeline.download_lane_runtime.servers.insert(
+        0,
+        crate::pipeline::download::transport::ServerPipelineExplorer::seeded(Some(2), None, None),
+    );
+    let depth = |pipeline: &Pipeline| {
+        let explorer = pipeline.download_lane_runtime.servers.get(&0).unwrap();
+        (explorer.current_depth(), explorer.pinned_sequential())
+    };
+    assert_eq!(depth(&pipeline), (2, false));
+    let queue = pipeline.shared_state.queue.clone();
+    let set_row = |paused: Option<bool>, cancelled: bool| {
+        queue.write(|inner| {
+            let row = inner.jobs.iter_mut().find(|row| row.id == job_id).unwrap();
+            row.intents.paused = paused;
+            row.intents.cancelled =
+                cancelled.then_some(crate::jobs::handle::CancellationOrigin::User);
+            crate::pipeline::queue::Change::changed(())
+        })
+    };
+
+    let mut segment = 0;
+    let mut release_unclean = |pipeline: &mut Pipeline| {
+        hold_on_test_lane(pipeline, &[held_segment(job_id, 0, segment)]);
+        pipeline.release_download_result(&unclean_batch_result(job_id, segment));
+        segment += 1;
+    };
+
+    // Shutdown.
+    queue.write(|inner| {
+        inner.globals.shutting_down = true;
+        crate::pipeline::queue::Change::changed(())
+    });
+    release_unclean(&mut pipeline);
+    release_unclean(&mut pipeline);
+    queue.write(|inner| {
+        inner.globals.shutting_down = false;
+        crate::pipeline::queue::Change::changed(())
+    });
+    // The global pause.
+    queue.write(|inner| {
+        inner.globals.paused = true;
+        crate::pipeline::queue::Change::changed(())
+    });
+    release_unclean(&mut pipeline);
+    queue.write(|inner| {
+        inner.globals.paused = false;
+        crate::pipeline::queue::Change::changed(())
+    });
+    // The job's own pause, then its cancel.
+    set_row(Some(true), false);
+    release_unclean(&mut pipeline);
+    set_row(None, true);
+    assert!(!pipeline.unclean_batch_is_server_fault(job_id));
+    set_row(None, false);
+
+    assert_eq!(
+        depth(&pipeline),
+        (2, false),
+        "a batch cut short by cancellation must neither lower depth nor pin the server"
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pipeline_trial_failure_total
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    // The same batch while the job is meant to be downloading is a server
+    // fault, and the explorer acts on it.
+    assert!(pipeline.unclean_batch_is_server_fault(job_id));
+    release_unclean(&mut pipeline);
+    assert_eq!(
+        depth(&pipeline),
+        (1, false),
+        "a genuine BODY failure still lowers depth"
+    );
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_pipeline_trial_failure_total
+            .load(Ordering::Relaxed),
+        1
+    );
+}

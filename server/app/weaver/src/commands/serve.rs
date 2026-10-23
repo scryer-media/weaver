@@ -600,8 +600,11 @@ pub(crate) async fn run(
             auto_backup_scheduler.abort();
             let _ = auto_backup_scheduler.await;
             tokio::join!(backup.shutdown(), schedule_task.shutdown());
-            proxies.stop_all().await;
+            // The pipeline learns it is stopping before the network goes:
+            // a batch torn down by the shutdown is then not read as the
+            // server failing it.
             handle.shutdown().await.ok();
+            proxies.stop_all().await;
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
             }
@@ -641,8 +644,9 @@ pub(crate) async fn run(
     auto_backup_scheduler.abort();
     let _ = auto_backup_scheduler.await;
     tokio::join!(backup.shutdown(), schedule_task.shutdown());
-    proxies.stop_all().await;
+    // Before the network stops; see the HTTP shutdown arm above.
     handle.shutdown().await.ok();
+    proxies.stop_all().await;
     if let Err(join_error) = pipeline_task.await {
         error!(error = %join_error, "pipeline task failed during shutdown");
     }
