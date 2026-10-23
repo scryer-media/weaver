@@ -2305,12 +2305,21 @@ async fn a_trackers_status_follows_its_announces() {
     let at = working.last_announce_ms.unwrap();
     assert_eq!(working.next_announce_ms, Some(at + 1_800_000));
 
-    // Paused, the answer stands with nothing in flight.
+    // Paused, the stopped announce is the row's last outcome (refused: the
+    // tracker is gone) and nothing is due until the torrent runs again.
     rig.service.pause(job_id).await.unwrap();
-    assert_eq!(
-        rig.service.torrent(job_id).await.unwrap().trackers,
-        trackers
-    );
+    let trackers = trackers_once(&rig.service, job_id, |announces| {
+        !announces[0].in_flight
+            && announces[0]
+                .last
+                .as_ref()
+                .is_some_and(|last| last.result.is_err())
+    })
+    .await;
+    let paused = &trackers[0];
+    assert_eq!(paused.status, TrackerStatus::NotWorking);
+    assert!(!paused.updating);
+    assert_eq!((paused.next_announce_ms, paused.fails), (None, 1));
 
     // The next run's first announce finds no tracker.
     rig.service.resume(job_id).await.unwrap();
