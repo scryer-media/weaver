@@ -22,8 +22,8 @@ use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::root::phase::{self, RootPhase};
 use crate::pipeline::tests::{
-    hear_graph_mail, insert_active_job, job_status_for_assert, new_direct_pipeline,
-    rar5_fixture_bytes, standalone_job_spec, submit_decoded_segment,
+    hear_graph_mail, insert_active_job, insert_active_job_on, job_status_for_assert,
+    new_direct_pipeline, rar5_fixture_bytes, standalone_job_spec, submit_decoded_segment,
 };
 
 // A graph job's reads, prepared by the test: a namespace, a summary, and the
@@ -159,7 +159,7 @@ async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engi
             ("ember.field.sfv".to_string(), listing.len() as u32),
         ],
     );
-    insert_active_job(pipeline, job_id, spec).await;
+    insert_active_job_on(pipeline, job_id, spec, engine).await;
     pipeline.admit_graph_job(job_id, engine);
     let file = |file_index| NzbFileId { job_id, file_index };
     submit_decoded_segment(
@@ -670,7 +670,7 @@ async fn a_graph_job_never_rescans_its_output_for_nested_archives() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let spec = standalone_job_spec("Ember Nested", &[("outer.bin".to_string(), 8)]);
-        insert_active_job(&mut pipeline, job_id, spec).await;
+        insert_active_job_on(&mut pipeline, job_id, spec, engine).await;
         pipeline.admit_graph_job(job_id, engine);
         let staging = temp_dir.path().join("ember-nested");
         tokio::fs::create_dir_all(&staging).await.unwrap();
@@ -697,7 +697,7 @@ async fn a_graph_census_keeps_a_damaged_member_and_refuses_an_empty_delivery() {
     // Nothing of the payload ever arrived: refused with the classic words.
     let job_id = JobId(91_206);
     let spec = standalone_job_spec("Ember Empty", &[("ember.bin".to_string(), 64)]);
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
     let Some(Err(error)) = pipeline.reconcile_graph_delivery(job_id) else {
         panic!("an empty graph delivery is refused");

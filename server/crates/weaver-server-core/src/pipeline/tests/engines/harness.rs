@@ -17,7 +17,7 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_model::files::FileRole;
 
 use super::super::{
-    debug_job_state, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    debug_job_state, insert_active_job_on, job_status_for_assert, new_direct_pipeline_with_buffers,
     pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
     settle_direct_demotion_work, settle_direct_verification_read, settle_segment_write_work,
 };
@@ -672,7 +672,7 @@ pub(super) async fn admit(
         pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
     }
     scenario.prepare(&mut pipeline);
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), engine).await;
     pipeline.admit_graph_job(JOB, engine);
     assert_eq!(pipeline.is_graph_job(JOB), engine == Engine::Graph);
     (temp_dir, pipeline, complete_dir)

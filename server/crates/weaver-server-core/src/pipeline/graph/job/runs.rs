@@ -11,7 +11,6 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
-use crate::pipeline::graph::envelope::Shelf;
 use crate::pipeline::graph::namespace::{Returned, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
@@ -104,8 +103,8 @@ impl GraphJob {
             let engines = self.tree.engines();
             admitted.extend(self.runs.forget_gone(&engines, limit));
             for node in engines {
+                self.feed(node)?;
                 let shelf = self.writer.shelf(node);
-                self.feed(node, &shelf)?;
                 let asks = match self.runs.generation(node) {
                     Some(generation) if generation != shelf.generation() => {
                         self.retract_run(node)?;
@@ -190,7 +189,7 @@ impl GraphJob {
     // many there are, which are closed and how long, which will receive
     // nothing more, and whether any more can join. A shelf already there is
     // left as it is, and its run is not woken to find nothing new.
-    fn feed(&self, node: NodeId, shelf: &Shelf) -> Result<(), GraphError> {
+    fn feed(&mut self, node: NodeId) -> Result<(), GraphError> {
         let Some((parent, volumes)) = self.tree.volumes(node) else {
             return Ok(());
         };
@@ -204,8 +203,8 @@ impl GraphJob {
         let deciding = !ended || self.tree.deciding(parent);
         let complete = ended && !deciding;
         let bound = volumes.keys().map(|volume| volume.0);
-        shelf
-            .update_if(|state| {
+        self.writer
+            .update_shelf(node, |shelf, state| {
                 let mut changed = state.complete != complete || state.deciding != deciding;
                 if !state.volumes.iter().copied().eq(bound.clone()) {
                     state.volumes = bound.collect();

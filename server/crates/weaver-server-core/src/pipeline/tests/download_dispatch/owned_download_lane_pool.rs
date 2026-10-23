@@ -4226,7 +4226,13 @@ async fn par2_metadata_bootstrap_holds_a_graph_jobs_payload_until_its_index_is_r
             },
         ],
     };
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec,
+        crate::pipeline::graph::Engine::Graph,
+    )
+    .await;
     pipeline.admit_graph_job(job_id, crate::pipeline::graph::Engine::Graph);
     assert!(pipeline.is_graph_job(job_id));
     let queued = pipeline.jobs.get(&job_id).unwrap().download_queue.len();

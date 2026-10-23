@@ -106,13 +106,6 @@ impl Pipeline {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
-        // The root parks what an object defers and nothing else, so the
-        // queue holds nothing parked until the first seek round says so: work
-        // the post's names parked joins the download queue, and a volume an
-        // object deferred before a restart is parked again by its wants.
-        for work in state.recovery_queue.drain_all() {
-            state.download_queue.push(work);
-        }
         let moves = graph.sample();
         apply_moves(state, &moves);
         self.graph_jobs.insert(job_id, graph);
@@ -316,8 +309,10 @@ impl Pipeline {
 // move brings parked work back to the main queue, since a moved article is
 // wanted. A class change re-queues the work under its new flags; a window
 // rank re-keys it in place, ranked ahead of everything else at its priority.
-// A queue is walked only for the moves that can change it, so a round's cost
-// follows its moves, not the length of the queue.
+// A queue is walked only when the round holds a kind of move that can change
+// it: the download queue once for a park, once for a raise and once for a
+// window rank, the recovery queue for any move. Each walk reads the whole
+// queue, so a round costs a pass per kind of move it holds, not one per move.
 pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     if moves.is_empty() {
         return;

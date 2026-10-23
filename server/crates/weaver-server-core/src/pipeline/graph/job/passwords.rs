@@ -13,17 +13,18 @@
 //
 // The values are secrets. Nothing here prints them; Debug says how many.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
-use weaver_graph::{Builder, Effect, NodeId};
+use weaver_graph::{Builder, Effect, Marked, NodeId};
 
 use super::GraphJob;
 
 #[derive(Default)]
 pub(super) struct Passwords {
     candidates: Vec<String>,
-    offered: BTreeMap<NodeId, usize>,
+    // How many candidates each node was offered, marked for every node an
+    // offer moves on, so a checkpoint reads again only those.
+    offered: Marked<NodeId, usize>,
 }
 
 impl fmt::Debug for Passwords {
@@ -31,7 +32,7 @@ impl fmt::Debug for Passwords {
         formatter
             .debug_struct("Passwords")
             .field("candidates", &self.candidates.len())
-            .field("offered", &self.offered)
+            .field("offered", &*self.offered)
             .finish()
     }
 }
@@ -44,12 +45,21 @@ impl Passwords {
         }
     }
 
-    // The candidate each node was offered last, by index: a checkpoint
-    // keeps the index, never the candidate.
-    pub(super) fn last_offered(&self) -> impl Iterator<Item = (NodeId, usize)> + '_ {
-        self.offered
-            .iter()
-            .filter_map(|(node, offered)| Some((*node, offered.checked_sub(1)?)))
+    // The candidate the node was offered last, by index: a checkpoint keeps
+    // the index, never the candidate.
+    pub(super) fn last_offered(&self, node: NodeId) -> Option<usize> {
+        self.offered.get(&node)?.checked_sub(1)
+    }
+
+    // The generation of the offers: an offer to a node marks it under a
+    // later one.
+    pub(super) fn generation(&self) -> u64 {
+        self.offered.marks().at()
+    }
+
+    // The nodes offered a candidate since generation `at`.
+    pub(super) fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.offered.marks().since(at)
     }
 
     // A restore takes up where the checkpoint left the node: the cursor is
@@ -63,9 +73,9 @@ impl Passwords {
 
     // The candidate after the one the node was offered last, if any is left.
     fn next(&mut self, node: NodeId) -> Option<&str> {
-        let offered = self.offered.entry(node).or_default();
-        let candidate = self.candidates.get(*offered)?;
-        *offered += 1;
+        let offered = self.offered.get(&node).copied().unwrap_or_default();
+        let candidate = self.candidates.get(offered)?;
+        self.offered.insert(node, offered + 1);
         Some(candidate)
     }
 }
@@ -73,8 +83,8 @@ impl Passwords {
 impl GraphJob {
     // How many candidates each node has been offered, by node.
     #[cfg(test)]
-    pub(crate) fn passwords_offered(&self) -> BTreeMap<NodeId, usize> {
-        self.passwords.offered.clone()
+    pub(crate) fn passwords_offered(&self) -> std::collections::BTreeMap<NodeId, usize> {
+        (*self.passwords.offered).clone()
     }
 
     // The object at `node` asked for a password: it gets the next candidate,

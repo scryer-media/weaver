@@ -7,12 +7,12 @@
 // what the download and decode paths learn; nothing else of the pipeline
 // reaches into the tree, and nothing else writes the job's files.
 
+mod durable;
 mod loans;
 mod passwords;
 mod repair;
 pub(crate) mod restore;
 mod runs;
-mod snapshot;
 
 use std::path::PathBuf;
 use std::sync::Arc;

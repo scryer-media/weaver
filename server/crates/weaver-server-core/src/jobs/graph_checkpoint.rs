@@ -358,19 +358,6 @@ pub(crate) struct Delta {
 }
 
 impl Delta {
-    // What `after` changes of `before`, which is the checkpoint the
-    // database holds or will once what is queued is written; `None` when
-    // nothing says what it holds. Both are in key order.
-    #[cfg(test)]
-    pub(crate) fn between(before: Option<&GraphCheckpoint>, after: &GraphCheckpoint) -> Self {
-        let mut out = Self {
-            whole: before.is_none(),
-            ..Self::default()
-        };
-        out.compare(before.unwrap_or(&GraphCheckpoint::default()), after);
-        out
-    }
-
     // What `after` changes of `before`, taken into this change: rows of one
     // part of the job, whose other rows are compared apart. Both are in key
     // order.

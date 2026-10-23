@@ -33,8 +33,8 @@ use crate::pipeline::tests::direct_store::{
     protected_store_set, single_member_store_set,
 };
 use crate::pipeline::tests::{
-    insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
-    pump_pipeline_runtime_queues, retire_pipeline_database,
+    insert_active_job, insert_active_job_on, job_status_for_assert,
+    new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::pipeline::{Pipeline, PipelineEvent};
 
@@ -93,7 +93,7 @@ pub(super) async fn run_restarting_at(
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     stamp_graph(&pipeline.db);
     pipeline.admit_graph_job(JOB, Engine::Graph);
     assert!(pipeline.is_graph_job(JOB));
@@ -423,7 +423,7 @@ async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     stamp_graph(&pipeline.db);
     pipeline.admit_graph_job(JOB, Engine::Graph);
     let mut sent = pipeline.event_tx.subscribe();
@@ -534,7 +534,7 @@ pub(super) async fn run_restarted_while_repairing(scenario: &Scenario) -> (Resta
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     stamp_graph(&pipeline.db);
     pipeline.admit_graph_job(JOB, Engine::Graph);
     let mut sent = pipeline.event_tx.subscribe();

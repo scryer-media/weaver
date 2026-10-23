@@ -32,7 +32,7 @@ use crate::pipeline::tests::direct_store::{
     single_member_store_set,
 };
 use crate::pipeline::tests::{
-    debug_job_state, insert_active_job, job_status_for_assert, retire_pipeline_database,
+    debug_job_state, insert_active_job_on, job_status_for_assert, retire_pipeline_database,
 };
 
 const MEMBER: &str = "beacon.bin";
@@ -377,7 +377,7 @@ fn a_graph_job_held_after_its_repair_holds_no_other_job() {
         let held = opening_lost_recovery_refused();
         let other = Scenario::new(vec![Post::plain("ember.bin", payload(3 * ARTICLE + 5, 23))]);
         let (_temp_dir, mut pipeline, _) = admit(&held, Engine::Graph).await;
-        insert_active_job(&mut pipeline, OTHER, other.spec()).await;
+        insert_active_job_on(&mut pipeline, OTHER, other.spec(), Engine::Graph).await;
         pipeline.admit_graph_job(OTHER, Engine::Graph);
 
         drive_to_move(&mut pipeline, JOB, &held).await;

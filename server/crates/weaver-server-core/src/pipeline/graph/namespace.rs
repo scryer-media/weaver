@@ -37,7 +37,7 @@ use weaver_graph::{
 };
 
 use super::checkpoint::why_name;
-use super::envelope::{Envelopes, Shelf};
+use super::envelope::{Envelopes, Shelf, Shelved};
 use super::leaf::{Leaf, LeafError};
 use super::limits::Caps;
 use crate::operations::disk::CapacityReader;
@@ -672,6 +672,16 @@ impl NamespaceWriter {
     // them as its volumes.
     pub(crate) fn shelf(&mut self, node: NodeId) -> Arc<Shelf> {
         self.envelopes.shelf(node)
+    }
+
+    // Change the node's envelopes as `change` says it did: what the shelf
+    // keeps of them is a checkpoint's, so a change goes through here.
+    pub(crate) fn update_shelf<E>(
+        &mut self,
+        node: NodeId,
+        change: impl FnOnce(&Shelf, &mut Shelved) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        self.envelopes.update_if(node, change)
     }
 
     fn apply(

@@ -96,8 +96,12 @@ fn par3_indexes_and_smaller_volumes_do_not_change_par2_promotion() {
         for file in &mut spec.files {
             file.role = FileRole::from_filename(&file.filename);
         }
-        let (_, mut downloads, _) =
-            Pipeline::build_job_assembly(JobId(3190), &spec, &HashSet::new());
+        let (_, mut downloads, _) = Pipeline::build_job_assembly(
+            JobId(3190),
+            &spec,
+            &HashSet::new(),
+            crate::pipeline::graph::Engine::Classic,
+        );
         let mut actual = Vec::new();
         while let Some(work) = downloads.pop() {
             let index = work.segment_id.file_id.file_index;

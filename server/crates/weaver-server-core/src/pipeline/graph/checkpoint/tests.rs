@@ -398,6 +398,18 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));
 }
 
+// What `after` changes of `before`, which is the checkpoint the database
+// holds or will once what is queued is written; `None` when nothing says
+// what it holds. Both are in key order.
+fn between(before: Option<&GraphCheckpoint>, after: &GraphCheckpoint) -> Delta {
+    let mut out = Delta {
+        whole: before.is_none(),
+        ..Delta::default()
+    };
+    out.compare(before.unwrap_or(&GraphCheckpoint::default()), after);
+    out
+}
+
 #[test]
 fn a_change_queued_behind_another_writes_both_as_one() {
     let first = rows(&full());
@@ -406,8 +418,8 @@ fn a_change_queued_behind_another_writes_both_as_one() {
     second.coverage[0].verified = true;
     let mut third = second.clone();
     third.coverage[0].verified = false;
-    let mut queued = Delta::between(Some(&first), &second);
-    queued.absorb(Delta::between(Some(&second), &third));
+    let mut queued = between(Some(&first), &second);
+    queued.absorb(between(Some(&second), &third));
     assert_eq!(
         queued.members.values().filter(|row| row.is_none()).count(),
         1
@@ -418,12 +430,12 @@ fn a_change_queued_behind_another_writes_both_as_one() {
         Some(&Some(first.coverage[0].clone()))
     );
     // Nothing known of the database clears the job whatever follows.
-    let mut whole = Delta::between(None, &first);
-    whole.absorb(Delta::between(Some(&first), &second));
+    let mut whole = between(None, &first);
+    whole.absorb(between(Some(&first), &second));
     assert!(whole.whole);
-    queued.absorb(Delta::between(None, &third));
-    assert_eq!(queued, Delta::between(None, &third));
-    assert!(!Delta::between(Some(&GraphCheckpoint::default()), &first).is_empty());
+    queued.absorb(between(None, &third));
+    assert_eq!(queued, between(None, &third));
+    assert!(!between(Some(&GraphCheckpoint::default()), &first).is_empty());
 }
 
 #[test]

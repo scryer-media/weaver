@@ -23,26 +23,40 @@ pub(crate) struct KeptRecord {
 }
 
 impl Envelopes {
-    pub(crate) fn records(&self) -> Vec<KeptRecord> {
-        let mut out = Vec::new();
-        for (node, shelf) in &self.shelves {
-            let state = shelf.lock();
-            for (envelope, kept) in &state.kept {
-                out.push(KeptRecord {
-                    node: *node,
-                    envelope: *envelope,
-                    runs: kept.coverage.runs().copied().collect(),
-                    closed: kept.closed,
-                    settled: kept.settled,
-                });
-            }
-        }
-        out
+    // The node's kept envelopes, in envelope order.
+    pub(crate) fn records(&self, node: NodeId) -> Vec<KeptRecord> {
+        let Some(shelf) = self.shelves.get(&node) else {
+            return Vec::new();
+        };
+        let state = shelf.lock();
+        state
+            .kept
+            .iter()
+            .map(|(envelope, kept)| KeptRecord {
+                node,
+                envelope: *envelope,
+                runs: kept.coverage.runs().copied().collect(),
+                closed: kept.closed,
+                settled: kept.settled,
+            })
+            .collect()
+    }
+
+    // The generation of the kept envelopes: a change to what a checkpoint
+    // says of a node's marks it under a later one.
+    pub(crate) fn generation(&self) -> u64 {
+        self.marks.at()
+    }
+
+    // The nodes whose kept envelopes changed since generation `at`.
+    pub(crate) fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.marks.since(at)
     }
 
     // An envelope as a checkpoint described it, over the file it left.
     pub(crate) fn restore(&mut self, record: &KeptRecord) -> Result<(), LeafError> {
         let shelf = self.shelf(record.node);
+        self.marks.mark(record.node);
         let name = format!(
             ".weaver-chunks/graph-envelope-{}-{}",
             record.node.0, record.envelope

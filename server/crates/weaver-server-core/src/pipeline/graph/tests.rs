@@ -22,7 +22,7 @@ use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::{Delivered, Delivery};
-use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
+use crate::pipeline::tests::{insert_active_job_on, new_direct_pipeline, retire_pipeline_database};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
     YencLayoutAssertions,
@@ -167,7 +167,13 @@ async fn graph_job(
     posts: &[Post],
 ) -> (Pipeline, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
-    insert_active_job(&mut pipeline, job_id, spec("lantern joined", posts)).await;
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec("lantern joined", posts),
+        Engine::Graph,
+    )
+    .await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
     assert!(pipeline.graph_jobs.contains_key(&job_id));
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();

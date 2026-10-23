@@ -702,8 +702,11 @@ impl Pipeline {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        // The engine is decided once, here, and stamped on the row: a restart
+        // resumes the job on it whatever the switch says by then.
+        let engine = crate::pipeline::graph::Engine::from_environment();
         let (assembly, download_queue, recovery_queue) =
-            Self::build_job_assembly(job_id, &spec, &HashSet::new());
+            Self::build_job_assembly(job_id, &spec, &HashSet::new(), engine);
         // A bare `.7z` has no topology to wait for, so it arms off its opening
         // bytes instead — which means the commit path has to know it is coming.
         self.register_direct_unpack_singles(job_id, &spec);
@@ -731,9 +734,6 @@ impl Pipeline {
         );
 
         stage_start = std::time::Instant::now();
-        // The engine is decided once, here, and stamped on the row: a restart
-        // resumes the job on it whatever the switch says by then.
-        let engine = crate::pipeline::graph::Engine::from_environment();
         let active_job = crate::ActiveJob {
             engine,
             job_id,
@@ -938,6 +938,7 @@ impl Pipeline {
         job_id: JobId,
         spec: &JobSpec,
         skip: &HashSet<SegmentId>,
+        engine: crate::pipeline::graph::Engine,
     ) -> (JobAssembly, DownloadQueue, DownloadQueue) {
         let mut assembly = JobAssembly::new(job_id);
         let mut download_queue = DownloadQueue::new();
@@ -971,6 +972,10 @@ impl Pipeline {
 
             let priority = file_spec.role.download_priority();
             let is_recovery = file_spec.role.is_recovery();
+            // A recovery file waits parked, by its name, only under the
+            // classic engine. A graph job's root parks what its objects defer
+            // and nothing else, and its own classes say what is recovery.
+            let parked = is_recovery && engine.classic_switches_apply();
 
             if is_recovery {
                 let total: u64 = file_spec.segments.iter().map(|s| s.bytes as u64).sum();
@@ -1065,7 +1070,7 @@ impl Pipeline {
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
                 } else {
-                    let target_queue = if is_recovery {
+                    let target_queue = if parked {
                         &mut recovery_queue
                     } else {
                         &mut download_queue
@@ -1077,7 +1082,7 @@ impl Pipeline {
                         priority,
                         byte_estimate: seg.bytes,
                         retry_count: 0,
-                        is_recovery,
+                        is_recovery: parked,
                         completion_critical: false,
                         exclude_servers: vec![],
                         avoid_server: None,
@@ -1261,7 +1266,7 @@ impl Pipeline {
             let engine = crate::pipeline::graph::Engine::from_environment();
             let skip = Self::reprocess_skip(job_id, &spec, engine);
             let (assembly, download_queue, recovery_queue) =
-                Self::build_job_assembly(job_id, &spec, &skip);
+                Self::build_job_assembly(job_id, &spec, &skip, engine);
             let status = Self::reprocess_status(&download_queue);
             let (download_state, _, _) =
                 crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
@@ -1369,7 +1374,7 @@ impl Pipeline {
             let skip = Self::reprocess_skip(job_id, &state.spec, engine);
             let spec_clone = state.spec.clone();
             let (assembly, download_queue, recovery_queue) =
-                Self::build_job_assembly(job_id, &spec_clone, &skip);
+                Self::build_job_assembly(job_id, &spec_clone, &skip, engine);
             let status = Self::reprocess_status(&download_queue);
             let file_identities;
             {
@@ -2066,7 +2071,7 @@ impl Pipeline {
             crate::pipeline::graph::Engine::Classic => None,
         };
         let (mut assembly, download_queue, recovery_queue) =
-            Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
+            Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip, engine);
         let repair_outputs = self
             .db
             .load_repair_outputs(job_id)
@@ -2631,8 +2636,12 @@ mod tests {
         all_ids.sort_unstable();
         assert_eq!(all_ids, vec![0, 1, 2]);
 
-        let (assembly, mut download_queue, recovery_queue) =
-            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        let (assembly, mut download_queue, recovery_queue) = Pipeline::build_job_assembly(
+            job_id,
+            &spec,
+            &HashSet::new(),
+            crate::pipeline::graph::Engine::Classic,
+        );
 
         let mut queued = Vec::new();
         while let Some(work) = download_queue.pop() {
@@ -2659,8 +2668,12 @@ mod tests {
         let job_id = JobId(42);
         let spec = sparse_segment_job_spec();
         let committed = Pipeline::all_segment_ids(job_id, &spec);
-        let (assembly, mut download_queue, recovery_queue) =
-            Pipeline::build_job_assembly(job_id, &spec, &committed);
+        let (assembly, mut download_queue, recovery_queue) = Pipeline::build_job_assembly(
+            job_id,
+            &spec,
+            &committed,
+            crate::pipeline::graph::Engine::Classic,
+        );
 
         assert!(download_queue.pop().is_none());
         assert!(recovery_queue.is_empty());

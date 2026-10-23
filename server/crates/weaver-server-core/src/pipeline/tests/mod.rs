@@ -1930,6 +1930,36 @@ async fn insert_active_job_with_persisted_nzb_named(
     nzb_zstd: Vec<u8>,
     nzb_file_name: Option<&str>,
 ) -> PathBuf {
+    insert_on(
+        pipeline,
+        job_id,
+        spec,
+        nzb_zstd,
+        nzb_file_name,
+        crate::pipeline::graph::Engine::Classic,
+    )
+    .await
+}
+
+// [`insert_active_job`] for a job admitted under `engine`: its row is
+// stamped with it and its queues are built as admission builds them for it.
+pub(in crate::pipeline) async fn insert_active_job_on(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    engine: crate::pipeline::graph::Engine,
+) -> PathBuf {
+    insert_on(pipeline, job_id, spec, sample_nzb_zstd(), None, engine).await
+}
+
+async fn insert_on(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    nzb_zstd: Vec<u8>,
+    nzb_file_name: Option<&str>,
+    engine: crate::pipeline::graph::Engine,
+) -> PathBuf {
     let nzb_file_name = nzb_file_name
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}.nzb", job_id.0));
@@ -1952,7 +1982,7 @@ async fn insert_active_job_with_persisted_nzb_named(
     pipeline
         .db
         .create_active_job(&crate::ActiveJob {
-            engine: crate::pipeline::graph::Engine::Classic,
+            engine,
             job_id,
             nzb_hash: [0; 32],
             nzb_path: working_dir.join(&nzb_file_name),
@@ -1973,7 +2003,7 @@ async fn insert_active_job_with_persisted_nzb_named(
         })
         .unwrap();
     let (assembly, download_queue, recovery_queue) =
-        Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), engine);
     // Mirror admission: `add_job` registers a job's bare `.7z` files as
     // direct-unpack arming candidates, and this harness hand-builds the state
     // `add_job` would otherwise have produced.

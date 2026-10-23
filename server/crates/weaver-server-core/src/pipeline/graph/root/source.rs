@@ -15,9 +15,7 @@ mod durable;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use weaver_graph::{ByteRange, Pull, VolumeIndex};
-
-use weaver_graph::Marks;
+use weaver_graph::{ByteRange, Marks, Pull, VolumeIndex};
 
 use super::facts::{Chunk, of_boundary, of_ordinal};
 

@@ -30,7 +30,8 @@ use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd,
+    insert_active_job, insert_active_job_on, new_direct_pipeline, retire_pipeline_database,
+    sample_nzb_zstd,
 };
 use crate::pipeline::{
     DecodeResult, DecodedChunk, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -586,7 +587,13 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
         .collect();
     files.push(("lantern.vol0+4.par2".to_string(), recovery_role(), 3));
     let members = files.len();
-    insert_active_job(&mut pipeline, job_id, spec("lantern sample", files)).await;
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec("lantern sample", files),
+        Engine::Graph,
+    )
+    .await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
@@ -665,7 +672,7 @@ async fn a_lost_article_marks_its_range_damaged() {
             ("lantern.dat".to_string(), FileRole::Standalone, 19),
         ],
     );
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
     pipeline.book_terminal_segment(segment_id(job_id, 0, 0), SegmentTerminalState::Missing);
     assert_eq!(
@@ -695,7 +702,7 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
         "lantern damaged",
         vec![("lantern.bin".to_string(), FileRole::Standalone, 1)],
     );
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
     let body = vec![3u8; 64];
     pipeline

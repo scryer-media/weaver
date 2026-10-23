@@ -4,7 +4,8 @@
 // What a checkpoint says of the writer, and the writer a restore puts back:
 // which members have a file of their own and why a member is a leaf, the
 // kept envelopes, how many member reads the repairs made, and the read of a
-// root member back from wherever its bytes went. Holds are not here: a hold is fetched again.
+// root member back from wherever its bytes went. Holds are not here: a hold
+// is fetched again.
 
 use weaver_graph::{MemberId, NodeId, Tree};
 
@@ -32,8 +33,20 @@ impl NamespaceWriter {
         self.files.marks().since(at)
     }
 
-    pub(crate) fn kept_records(&self) -> Vec<KeptRecord> {
-        self.envelopes.records()
+    // The node's kept envelopes.
+    pub(crate) fn kept_records(&self, node: NodeId) -> Vec<KeptRecord> {
+        self.envelopes.records(node)
+    }
+
+    // The generation of the kept envelopes: a change to a node's marks it
+    // under a later one.
+    pub(crate) fn kept_generation(&self) -> u64 {
+        self.envelopes.generation()
+    }
+
+    // The nodes whose kept envelopes changed since generation `at`.
+    pub(crate) fn kept_changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.envelopes.changed_since(at)
     }
 
     // A member's file as it was left. Nothing on disk is touched: the file
