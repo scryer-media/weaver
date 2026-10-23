@@ -5947,3 +5947,163 @@ async fn a_requester_in_the_end_game_wakes_only_for_what_it_can_act_on() {
          ({delivered} delivered, {cancelled} cancelled)"
     );
 }
+
+/// A seeder played by the test: it sends the blocks asked of it in the
+/// order asked, one each [`PlayedSeeder::block_time`]. The first
+/// [`SEND_AHEAD`] of its queue are already on their way, so a Cancel stops
+/// only those behind them.
+struct PlayedSeeder {
+    queue: std::collections::VecDeque<(u32, u32)>,
+    slow: Duration,
+    sent: u32,
+    next_block_at: Option<tokio::time::Instant>,
+}
+
+impl PlayedSeeder {
+    /// A millisecond a block, but `slow` for every other [`PHASE`] blocks
+    /// it sends: a peer whose pace swings, as on a public swarm.
+    fn block_time(&self) -> Duration {
+        if (self.sent / PHASE) % 2 == 1 {
+            self.slow
+        } else {
+            Duration::from_millis(1)
+        }
+    }
+}
+
+const PHASE: u32 = 32;
+const SEND_AHEAD: usize = 4;
+const WINDOW: usize = 16;
+
+// A block is asked of a second peer only in the end game, once every queued
+// piece has a block received: before it no block is asked twice and none
+// arrives that is had already, and in it a block arrives only as often as it
+// was asked for, so each copy wasted answers a request beyond the first for
+// its block. One leecher and six seeders with every piece, over 256 pieces,
+// at most 16 requests out to each; the first seeder sends a block a
+// millisecond, the others swing between that and 40 to 200 ms. The clock is
+// paused and moved to each block's arrival.
+#[tokio::test]
+async fn only_the_end_game_fetches_a_block_already_had() {
+    const SEEDERS: usize = 6;
+    const PIECES_HERE: u32 = 256;
+    let out = TempDir::with_prefix("waste").unwrap();
+    let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+        .await
+        .unwrap();
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        peer_opts: Some(crate::PeerConnectionOptions {
+            max_request_window: Some(WINDOW),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let h = Harness::added_to(
+        session,
+        out,
+        "waste",
+        PIECES_HERE,
+        &[0x00; PIECES_HERE as usize / 8],
+        add,
+    )
+    .await;
+    tokio::time::pause();
+
+    let (peers, mut rxs): (Vec<_>, Vec<_>) = (0..SEEDERS)
+        .map(|i| h.peer(&format!("127.0.0.{}:6881", i + 1)))
+        .unzip();
+    let mut seeders: Vec<PlayedSeeder> = (0..SEEDERS)
+        .map(|i| PlayedSeeder {
+            queue: Default::default(),
+            slow: Duration::from_millis(40 * i as u64).max(Duration::from_millis(1)),
+            sent: 0,
+            next_block_at: None,
+        })
+        .collect();
+    let mut requesters: Vec<Polled<'_>> = peers
+        .iter()
+        .map(|peer| {
+            peer.on_i_am_unchoked();
+            let waker = Arc::new(WakeCount::default());
+            waker.woken.store(true, Ordering::SeqCst);
+            Polled {
+                task: Box::pin(peer.request_chunks()),
+                waker,
+            }
+        })
+        .collect();
+    let end_game = || {
+        h.live
+            .lock_read("test")
+            .get_pieces()
+            .unwrap()
+            .chunks()
+            .every_queued_piece_started()
+    };
+
+    let mut asked = BTreeSet::new();
+    let mut asked_again = 0;
+    let mut asked_again_before_end_game = 0;
+    let mut wasted_before_end_game = 0;
+    while !(0..PIECES_HERE).all(|p| h.have(p)) {
+        settle(&mut requesters);
+        let now = tokio::time::Instant::now();
+        let in_end_game = end_game();
+        for (seeder, rx) in seeders.iter_mut().zip(&mut rxs) {
+            while let Ok(sent) = rx.try_recv() {
+                match sent {
+                    WriterRequest::Message(Message::Request(r)) => {
+                        if !asked.insert((r.index, r.begin)) {
+                            asked_again += 1;
+                            if !in_end_game {
+                                asked_again_before_end_game += 1;
+                            }
+                        }
+                        if seeder.queue.is_empty() {
+                            seeder.next_block_at = Some(now + seeder.block_time());
+                        }
+                        seeder.queue.push_back((r.index, r.begin));
+                    }
+                    WriterRequest::Message(Message::Cancel(r)) => {
+                        let at = seeder.queue.iter().position(|b| *b == (r.index, r.begin));
+                        if let Some(at) = at.filter(|at| *at >= SEND_AHEAD) {
+                            seeder.queue.remove(at);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (i, at) = seeders
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.next_block_at.map(|at| (i, at)))
+            .min_by_key(|(_, at)| *at)
+            .expect("the requesters wait while no request is outstanding");
+        tokio::time::advance(at - now).await;
+        let seeder = &mut seeders[i];
+        let block = seeder.queue.pop_front().unwrap();
+        seeder.sent += 1;
+        seeder.next_block_at = (!seeder.queue.is_empty()).then(|| at + seeder.block_time());
+        let wasted = h.get_redundant_bytes();
+        h.deliver(&peers[i], block).await;
+        if !in_end_game {
+            wasted_before_end_game += h.get_redundant_bytes() - wasted;
+        }
+    }
+    settle(&mut requesters);
+
+    let wasted = h.get_redundant_bytes();
+    assert_eq!(
+        (asked_again_before_end_game, wasted_before_end_game),
+        (0, 0),
+        "blocks asked twice, and bytes wasted, before the end game"
+    );
+    // The seeders send only blocks asked of them, once a request, and the
+    // first copy of each block is kept.
+    assert!(
+        wasted <= asked_again * u64::from(CHUNK_SIZE),
+        "{wasted} B wasted, {asked_again} requests for a block asked before"
+    );
+}

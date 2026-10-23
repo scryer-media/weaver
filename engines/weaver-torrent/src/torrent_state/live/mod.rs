@@ -2589,7 +2589,7 @@ impl PeerHandler {
         Ok(())
     }
 
-    /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
+    /// Acquire a piece for this peer: reserve → in the end game, take over a piece held 3x the peer's piece time, or double a block.
     fn acquire_next_piece(&self) -> crate::Result<Pick> {
         // While the peer chokes us we may fetch only the pieces it allows
         // (libtorrent `request_a_block` masks the peer's bitfield with them).
@@ -3221,7 +3221,7 @@ impl PeerHandler {
                 () = wants_changed.as_mut() => continue,
             }
 
-            // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
+            // Acquire a piece using the strategy: reserve → in the end game, take over a piece held 3x the peer's piece time, or double a block.
             // What the peer lets us request changes too: it unchokes us, or
             // lets us fetch another piece while it chokes us.
             let slots_changed = self.request_slots_changed();

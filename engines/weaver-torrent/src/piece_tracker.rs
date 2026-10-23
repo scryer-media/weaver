@@ -98,12 +98,16 @@ impl FromIterator<Option<PeerHandle>> for Senders {
     }
 }
 
+/// In the end game, a piece goes over to a peer once its owner has held it
+/// this many times the peer's average piece time.
+const TAKE_OVER_AFTER: u32 = 3;
+
 /// Result of attempting to acquire a piece.
 #[derive(Debug)]
 pub enum AcquireResult {
     /// A new piece was reserved from the queue.
     Reserved(ValidPieceIndex),
-    /// A piece was stolen from a slower peer.
+    /// A piece was taken over from the peer that held it, in the end game.
     Stolen {
         piece: ValidPieceIndex,
         from_peer: PeerHandle,
@@ -243,11 +247,16 @@ impl PieceTracker {
     /// Attempt to acquire a piece for the requesting peer.
     ///
     /// The acquisition strategy is:
-    /// 1. Take over a piece from a peer that's 10x slower
-    /// 2. Reserve a piece: a stream's next piece first, then the one
+    /// 1. Reserve a piece: a stream's next piece first, then the one
     ///    [`Self::pick`] chooses
-    /// 3. In the end game, take over a piece from a peer that's 3x slower,
-    ///    or else ask for a block already asked of another peer
+    /// 2. In the end game, take over a piece its owner has held at least
+    ///    [`TAKE_OVER_AFTER`] times the requesting peer's average piece
+    ///    time, or else ask for a block already asked of another peer
+    ///
+    /// A block in flight with one peer is asked of another only in the end
+    /// game, once every queued piece has a block received: no piece is left
+    /// that no peer has started. Before it, a copy the first peer already
+    /// sent would arrive for a block we have.
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
@@ -265,7 +274,7 @@ impl PieceTracker {
         self.acquire_admitted_piece(req, |_| true)
     }
 
-    /// [`Self::acquire_piece`], with `admit` asked of the one piece step 2 would
+    /// [`Self::acquire_piece`], with `admit` asked of the one piece step 1 would
     /// reserve. A piece it refuses stays queued and no other is reserved in its
     /// place: the refusal is a lack of room, not of that piece. A steal takes a
     /// piece already in flight, so it is never asked.
@@ -287,15 +296,7 @@ impl PieceTracker {
         // A peer on parole takes no piece another peer is downloading.
         let may_steal = !req.options.on_parole;
 
-        // 1. Try steal with 10x threshold (very slow peer). Weaver's own:
-        // libtorrent lets any peer request the free blocks of a piece another
-        // is downloading; with one owner a piece, a far faster peer takes the
-        // piece over instead.
-        if may_steal && let Some(result) = self.try_steal(&req, 10.0) {
-            return result;
-        }
-
-        // 2. A stream's next pieces first, in the order it needs them, then
+        // 1. A stream's next pieces first, in the order it needs them, then
         // the picker's choice.
         let needed = req.priority_pieces.by_ref().find(|&piece| {
             !self.chunks.is_piece_have(piece)
@@ -312,8 +313,8 @@ impl PieceTracker {
         // Past here, a piece to hand out is one the storage refused.
         let refused = needed.is_some();
 
-        // 3. The end game: every wanted piece has a block asked for or
-        // received, and the peer has no request outstanding (libtorrent
+        // 2. The end game: every piece not in flight has a block received,
+        // and the peer has no request outstanding (libtorrent
         // `request_a_block` with `strict_end_game_mode`: a busy block only
         // once the download queue holds every piece wanted, and only by a
         // peer whose queues are empty). A piece held three times as long as
@@ -321,7 +322,7 @@ impl PieceTracker {
         // peer doubles a block.
         let end_game = req.outstanding_requests == 0 && self.chunks.every_queued_piece_started();
         if may_steal && end_game {
-            if let Some(result) = self.try_steal(&req, 3.0) {
+            if let Some(result) = self.try_steal(&req) {
                 return result;
             }
             if let Some(result) = self.double_a_block(&req) {
@@ -508,11 +509,11 @@ impl PieceTracker {
         AcquireResult::Reserved(piece)
     }
 
-    /// Try to steal a piece from a slower peer.
+    /// Try to take over a piece another peer has held at least
+    /// [`TAKE_OVER_AFTER`] times the requesting peer's average piece time.
     fn try_steal<I, P, A, S>(
         &mut self,
         req: &AcquireRequest<'_, I, P, A, S>,
-        threshold: f64,
     ) -> Option<AcquireResult>
     where
         I: Iterator<Item = ValidPieceIndex>,
@@ -521,10 +522,11 @@ impl PieceTracker {
         S: Fn(ValidPieceIndex) -> bool,
     {
         let my_avg = req.peer_avg_time?;
-        let min_elapsed = Duration::from_secs_f64(my_avg.as_secs_f64() * threshold);
+        let min_elapsed = my_avg * TAKE_OVER_AFTER;
 
-        // Find the slowest piece from another peer that exceeds threshold
-        // and that the stealing peer actually has (can download)
+        // The piece held longest by another peer, held at least
+        // TAKE_OVER_AFTER times the requesting peer's piece time, and that
+        // the requesting peer has (can download)
         let (piece, old_peer, _) = self
             .inflight
             .iter()
@@ -1294,12 +1296,25 @@ mod tests {
         let second = reserved(tracker.acquire_piece(ask(peer_a, a_has, one)));
         assert_eq!(BTreeSet::from([first, second]), BTreeSet::from([0, 4]));
 
-        // Peer B is ten times as fast as A has been on both: 1 ms a piece
-        // against 20 ms held. It has piece 4 only.
+        // Peer B is twenty times as fast as A has been on both: 1 ms a
+        // piece against 20 ms held. It has piece 4 only.
         tokio::time::advance(Duration::from_millis(20)).await;
-        let mut request = ask(peer_b, |p: ValidPieceIndex| p.get() == 4, one);
-        request.peer_avg_time = Some(Duration::from_millis(1));
-        match tracker.acquire_piece(request) {
+        let request = || {
+            let mut request = ask(peer_b, |p: ValidPieceIndex| p.get() == 4, one);
+            request.peer_avg_time = Some(Duration::from_millis(1));
+            request
+        };
+
+        // Pieces 1 to 3 are queued, unstarted: no end game, and no piece
+        // changes hands, however slow its owner.
+        let result = tracker.acquire_piece(request());
+        assert!(matches!(result, AcquireResult::NoneAvailable), "{result:?}");
+
+        // Another peer takes them; now every wanted piece is in flight.
+        for _ in 1..=3 {
+            reserved(tracker.acquire_piece(ask(peer(3), all, one)));
+        }
+        match tracker.acquire_piece(request()) {
             AcquireResult::Stolen { piece, from_peer } => {
                 assert_eq!(piece.get(), 4);
                 assert_eq!(from_peer, peer_a);
@@ -1471,7 +1486,7 @@ mod tests {
         reserved(tracker.acquire_piece(ask(slow, slow_has, one)));
 
         // The fast peer takes a piece in 1 s; the slow one has held both
-        // for 5 s, past three times that and short of ten.
+        // for 5 s, past three times that.
         tokio::time::advance(Duration::from_secs(5)).await;
         let request = |outstanding_requests| {
             let mut request = ask(fast, slow_has, one);
