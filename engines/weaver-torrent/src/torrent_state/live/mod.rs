@@ -250,8 +250,11 @@ pub struct TorrentStateLive {
     // room back with every piece it takes.
     room_notify: Arc<Notify>,
     layer_fetch: hash_fetch::LayerFetch,
-    // Whether every wanted piece was already present when this run began.
-    finished_at_start: bool,
+    // Whether every piece, wanted or not, was already present when this run
+    // began: a run that began as a seed never completes (libtorrent
+    // `torrent::files_checked` presets `m_complete_sent` for a torrent added as a
+    // seed).
+    seed_at_start: bool,
 
     down_speed_estimator: SpeedEstimator,
     up_speed_estimator: SpeedEstimator,
@@ -357,8 +360,8 @@ impl TorrentStateLive {
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let finished_at_start = paused.chunk_tracker.get_hns().finished();
         let lengths = *paused.chunk_tracker.get_lengths();
-        let super_seeding =
-            paused.shared.options.super_seeding && paused.chunk_tracker.bytes_left() == 0;
+        let seed_at_start = paused.chunk_tracker.bytes_left() == 0;
+        let super_seeding = paused.shared.options.super_seeding && seed_at_start;
         let peer_limit = paused.shared.options.peer_limit.unwrap_or(128);
 
         let (upload_turns, upload_turns_rx) = unbounded_channel::<PeerHandle>();
@@ -390,7 +393,7 @@ impl TorrentStateLive {
             room_notify: Arc::new(Notify::new()),
             layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
             finished_notify: Notify::new(),
-            finished_at_start,
+            seed_at_start,
             down_speed_estimator,
             up_speed_estimator,
             cancellation_token,
@@ -1314,6 +1317,22 @@ impl TorrentStateLive {
         finished.await;
     }
 
+    /// Resolves once the torrent has every piece, whichever are wanted
+    /// (libtorrent `torrent::is_seed`). The piece that makes it a seed
+    /// finishes any selection, so it rings `finished_notify`; one that
+    /// finishes a selection short of a seed is waited past. The wait is
+    /// taken before the check, as in `wait_until_completed`.
+    pub async fn wait_until_seed(&self) {
+        loop {
+            let mut finished = std::pin::pin!(self.finished_notify.notified());
+            finished.as_mut().enable();
+            if self.is_seed() {
+                return;
+            }
+            finished.await;
+        }
+    }
+
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {
         self.cancellation_token.cancel();
 
@@ -1499,10 +1518,16 @@ impl TorrentStateLive {
         self.get_hns().map(|h| h.finished()).unwrap_or_default()
     }
 
-    /// Whether the torrent was missing wanted pieces when this run began and
-    /// has all of them now.
-    pub(crate) fn finished_during_run(&self) -> bool {
-        !self.finished_at_start && self.is_finished()
+    /// Whether the torrent has every piece, whichever are wanted (libtorrent
+    /// `torrent::is_seed`).
+    pub(crate) fn is_seed(&self) -> bool {
+        self.get_hns()
+            .is_some_and(|h| h.have_bytes == self.lengths.total_length())
+    }
+
+    /// Whether the torrent had every piece when this run began.
+    pub(crate) fn seed_at_start(&self) -> bool {
+        self.seed_at_start
     }
 
     fn has_active_streams_unfinished_files(&self, state: &TorrentStateLocked) -> bool {

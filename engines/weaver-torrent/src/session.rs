@@ -3371,11 +3371,10 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             torrent_state,
             // `completed` is for becoming a seed, not for finishing a
             // selection (libtorrent `torrent::finished` calls `completed`
-            // only when `is_seed`). A run that began finished had every
-            // selected piece, so one that finished during it began short of
-            // a seed too.
-            finished_during_run: live.is_some_and(|l| l.finished_during_run())
-                && left_bytes == Some(0),
+            // only when `is_seed`), and only for a run that began short of
+            // one, whatever was wanted when it began: a torrent added as a
+            // seed sends none (`torrent::files_checked` presets `m_complete_sent`).
+            completed_during_run: left_bytes == Some(0) && live.is_some_and(|l| !l.seed_at_start()),
         }
     }
 
@@ -3392,10 +3391,12 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
                 next_added.as_mut().enable();
                 if let Some(mt) = self.torrent() {
                     // The torrent finishes its selection; it completes only if
-                    // that makes it a seed. An error, or a selection that
-                    // finished short of a seed, leaves nothing to wait on in
-                    // this run: a later regular announce reads the state.
-                    if mt.wait_until_completed().await.is_err() || !self.get().is_completed() {
+                    // that makes it a seed. A selection that finishes short of
+                    // a seed keeps the wait, so a later wider selection that
+                    // makes it one still announces at once. An error leaves
+                    // nothing to wait on in this run: a later regular
+                    // announce reads the state.
+                    if mt.wait_until_seed().await.is_err() {
                         futures::future::pending::<()>().await;
                     }
                     return;
@@ -3983,7 +3984,7 @@ mod tests {
         let (info, stats) = tracker_stats(&session, &handle);
         assert_eq!(stats.left_bytes, Some(0));
         // Seeding from the start: no `completed`, and nothing to wait for.
-        assert!(!stats.finished_during_run);
+        assert!(!stats.completed_during_run);
         assert!(info.wait_until_completed().now_or_never().is_some());
         session.stop().await;
     }
@@ -4252,11 +4253,12 @@ mod tests {
             .map(|file| (file, crate::FilePriority::Ignored))
             .collect();
         handle.set_file_priorities(&ignored).unwrap();
-        assert!(handle.live().unwrap().finished_during_run());
+        assert!(handle.live().unwrap().is_finished());
+        assert!(!handle.live().unwrap().is_seed());
 
         let (info, stats) = tracker_stats(&session, &handle);
         assert_eq!(stats.left_bytes, Some(PIECE as u64));
-        assert!(!stats.finished_during_run);
+        assert!(!stats.completed_during_run);
         assert!(info.wait_until_completed().now_or_never().is_none());
 
         // Paused, the pieces still say what the torrent lacks, and so does

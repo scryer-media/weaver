@@ -18,8 +18,8 @@ use tokio::{
 };
 
 use crate::{
-    AddTorrent, AddTorrentOptions, AnnounceOk, BF, CreateTorrentOptions, ListenerMode,
-    ListenerOptions, Session, SessionOptions, TrackerAnnounce, create_torrent,
+    AddTorrent, AddTorrentOptions, AnnounceOk, BF, CreateTorrentOptions, FilePriority,
+    ListenerMode, ListenerOptions, Session, SessionOptions, TrackerAnnounce, create_torrent,
     spawn_utils::BlockingSpawner,
     storage::StorageFactory,
     tests::{
@@ -252,6 +252,162 @@ async fn test_partial_selection_announces_what_the_whole_torrent_lacks() -> anyh
         param(&query, "left"),
         Some((3 * 4 * PIECE_LENGTH).to_string().as_str())
     );
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+// libtorrent `torrent::finished` calls `completed` only `if (is_seed())`,
+// and `torrent::files_checked` presets `m_complete_sent` only for a torrent added as
+// a seed: a run that began short of a seed with nothing wanted still
+// completes once it has every piece.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_run_that_began_with_nothing_wanted_completes_once_it_is_a_seed()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    const PIECE_LENGTH: u32 = 1024;
+    const LENGTH: usize = 8 * PIECE_LENGTH as usize;
+    let t = TestTorrent::new("test_nothing_wanted_completes", LENGTH, PIECE_LENGTH).await?;
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+
+    let out = TempDir::with_prefix("test_nothing_wanted_completes_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url]),
+                file_priorities: Some(vec![FilePriority::Ignored]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    // Nothing wanted: the selection is finished as the run begins, the
+    // torrent lacks every piece.
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "left"), Some(LENGTH.to_string().as_str()));
+    respond_bytes(conn, &answer_with_peer(seeder_addr)?).await?;
+
+    // Wanted now: the torrent becomes a seed and announces `completed` at
+    // once, the interval far off.
+    handle.set_file_priorities(&[(0, FilePriority::Normal)])?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    assert_eq!(param(&query, "left"), Some("0"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+
+    // Once: the next announce is the run's `stopped`.
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "left"), Some("0"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+// A torrent added as a seed never sends `completed` (libtorrent
+// `torrent::files_checked`: "we just added this torrent as a seed").
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_torrent_added_as_a_seed_never_completes() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_added_as_seed", 4096, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+
+    let session = Session::new_with_opts(t.dir.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(t.dir.path().to_str().context("utf-8 path")?.to_owned()),
+                overwrite: true,
+                trackers: Some(vec![url]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "left"), Some("0"));
+    let status = handle.tracker_status().context("a live run has a table")?;
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    // The tracker took `started`, so it is owed `stopped`.
+    status.subscribe().wait_for(|a| a[0].last.is_some()).await?;
+
+    // The next announce is the run's `stopped`: no `completed` came between.
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "left"), Some("0"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+// A run that finishes its selection short of a seed sends no `completed`
+// (libtorrent `torrent::finished` without `is_seed`).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_finished_selection_short_of_a_seed_never_completes() -> anyhow::Result<()> {
+    setup_test_logging();
+    const PIECE_LENGTH: u32 = 1024;
+    const FILE: usize = 4 * PIECE_LENGTH as usize;
+    let dir = create_default_random_dir_with_torrents(2, FILE, Some("short_of_seed"));
+    let torrent = create_torrent(
+        dir.path(),
+        CreateTorrentOptions {
+            name: None,
+            piece_length: Some(PIECE_LENGTH),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?
+    .as_bytes()?;
+    let t = TestTorrent {
+        dir,
+        torrent,
+        content: Vec::new(),
+    };
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+
+    let out = TempDir::with_prefix("test_short_of_seed_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url]),
+                file_priorities: Some(vec![FilePriority::Normal, FilePriority::Ignored]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "left"), Some((2 * FILE).to_string().as_str()));
+    respond_bytes(conn, &answer_with_peer(seeder_addr)?).await?;
+    handle.wait_until_completed().await?;
+
+    // The selection finished, one file still lacked: the next announce is
+    // the run's `stopped`, no `completed` before it.
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "left"), Some(FILE.to_string().as_str()));
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
     Ok(())
 }

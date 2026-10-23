@@ -1288,12 +1288,27 @@ impl ManagedTorrent {
         .boxed()
     }
 
+    /// Resolves once a run has every wanted piece.
     #[inline(never)]
     pub fn wait_until_completed(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.wait_live(|live| async move { live.wait_until_completed().await }.boxed())
+    }
+
+    /// Resolves once a run has every piece, whichever are wanted: the
+    /// torrent is a seed (libtorrent `torrent::is_seed`).
+    pub(crate) fn wait_until_seed(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        self.wait_live(|live| async move { live.wait_until_seed().await }.boxed())
+    }
+
+    /// Resolves once `wait` resolves on a run of the torrent.
+    fn wait_live(
+        &self,
+        wait: impl Fn(Arc<TorrentStateLive>) -> BoxFuture<'static, ()> + Send + 'static,
+    ) -> BoxFuture<'_, anyhow::Result<()>> {
         async move {
-            // A run completes the torrent, or the state changes and is read
-            // again: a paused torrent waits for the next run, a failed or
-            // removed one ends the wait.
+            // A run reaches the point waited for, or the state changes and
+            // is read again: a paused torrent waits for the next run, a
+            // failed or removed one ends the wait.
             loop {
                 let changed = self.next_state_change();
                 let live = self.with_state(|s| match s {
@@ -1306,7 +1321,7 @@ impl ManagedTorrent {
                 })?;
                 match live {
                     Some(live) => tokio::select! {
-                        _ = live.wait_until_completed() => return Ok(()),
+                        _ = wait(live) => return Ok(()),
                         _ = changed => {}
                     },
                     None => changed.await,

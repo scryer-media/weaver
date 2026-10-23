@@ -106,11 +106,12 @@ pub struct TrackerCommsStats {
     /// magnet still resolving its metadata).
     pub left_bytes: Option<u64>,
     pub torrent_state: TrackerCommsStatsState,
-    /// The torrent was incomplete when its current run began and is a seed
-    /// now. Each tracker hears `completed` (BEP 3) once for such a run; a
-    /// torrent that was already a seed when it started never sends it, and
-    /// neither does one that has only its selected files.
-    pub finished_during_run: bool,
+    /// The torrent lacked a piece when its current run began, whichever
+    /// pieces were wanted then, and is a seed now. Each tracker hears
+    /// `completed` (BEP 3) once for such a run; a torrent that was already a
+    /// seed when it started never sends it, and neither does one that has
+    /// only its selected files.
+    pub completed_during_run: bool,
 }
 
 impl TrackerCommsStats {
@@ -452,7 +453,7 @@ impl TrackerList {
         port: Option<u16>,
         stats: &TrackerCommsStats,
     ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
-        let seed = stats.finished_during_run;
+        let seed = stats.completed_during_run;
         // A tracker forced alone goes now if it may, else the walk and the
         // timer reach it (libtorrent `torrent::announce_tracker_now`); one
         // waiting for an answer is not asked twice.
@@ -485,7 +486,7 @@ impl TrackerList {
     fn event(&self, entry: &Entry, stats: &TrackerCommsStats) -> Option<TrackerRequestEvent> {
         if !entry.start_sent {
             Some(TrackerRequestEvent::Started)
-        } else if stats.finished_during_run && !self.complete_sent && !entry.complete_sent {
+        } else if stats.completed_during_run && !self.complete_sent && !entry.complete_sent {
             Some(TrackerRequestEvent::Completed)
         } else {
             None
@@ -583,9 +584,9 @@ impl TrackerList {
 
 /// Whether the torrent may yet become a seed during this run, so its
 /// trackers may yet be owed `completed`. A torrent live and complete
-/// without finishing during this run was a seed from the start.
+/// without completing during this run was a seed from the start.
 fn may_complete(stats: &TrackerCommsStats) -> bool {
-    stats.finished_during_run
+    stats.completed_during_run
         || !(stats.torrent_state == TrackerCommsStatsState::Live && stats.is_completed())
 }
 
@@ -1616,7 +1617,7 @@ impl TrackerComms {
     ///
     /// Each tracker is sent `started`, then `completed` if the torrent
     /// becomes a seed during this run (see
-    /// [`TrackerCommsStats::finished_during_run`]) and no tracker has
+    /// [`TrackerCommsStats::completed_during_run`]) and no tracker has
     /// accepted it yet, and `stopped` when the returned stream is dropped. `stopped` is bounded
     /// and tracked by `stopped`. Each announce, `stopped` included, is
     /// recorded in the returned [`TrackerStatus`]. `listen_port` is the port peers reach this
@@ -1888,7 +1889,7 @@ impl TrackerComms {
                 }
                 _ = self.stats.wait_until_completed(), if !completion_seen && may_complete(&stats) => {
                     completion_seen = true;
-                    if self.stats.get().finished_during_run {
+                    if self.stats.get().completed_during_run {
                         trace!("torrent completed, announcing early");
                         self.list.lock().completed(Instant::now());
                     }
@@ -2168,7 +2169,7 @@ mod tests {
         SupportedTracker::Http(Url::parse(&format!("http://{name}/announce")).unwrap())
     }
 
-    fn live(downloaded: u64, left: u64, finished_during_run: bool) -> TrackerCommsStats {
+    fn live(downloaded: u64, left: u64, completed_during_run: bool) -> TrackerCommsStats {
         TrackerCommsStats {
             uploaded_bytes: 0,
             downloaded_bytes: downloaded,
@@ -2176,7 +2177,7 @@ mod tests {
             redundant_bytes: 0,
             left_bytes: Some(left),
             torrent_state: TrackerCommsStatsState::Live,
-            finished_during_run,
+            completed_during_run,
         }
     }
 
