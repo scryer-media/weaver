@@ -1171,3 +1171,21 @@ fn an_open_route_shows_where_it_listens_and_its_mappings() {
     assert_eq!(route.external_addresses, ["203.0.113.7"]);
     assert_eq!(route.reason, None);
 }
+
+// A route whose leg is up and that nothing has asked to open says so.
+#[test]
+fn a_route_nothing_asked_to_open_says_so() {
+    use weaver_server_api::torrents::types::{NOT_ASKED_TO_OPEN, TorrentRouteGql};
+    use weaver_server_core::torrents::service::TorrentRoute;
+
+    let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
+    let route = TorrentRouteGql::from(TorrentRoute {
+        key,
+        scopes: vec![(TorrentScope::Default, None)],
+        session: None,
+        down: None,
+    });
+    assert!(!route.open);
+    assert_eq!(route.listen_address, None);
+    assert_eq!(route.reason.as_deref(), Some(NOT_ASKED_TO_OPEN));
+}

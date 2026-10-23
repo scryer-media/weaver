@@ -219,16 +219,21 @@ pub struct TorrentRouteGql {
     pub mappings: Vec<TorrentPortMappingGql>,
     /// Its address as the internet sees it.
     pub external_addresses: Vec<String>,
-    /// Why its session is held closed, or why its leg is down.
+    /// Why its session is closed: held closed, its leg down, or not opened
+    /// as nothing has asked it to open. None while open.
     pub reason: Option<String>,
 }
+
+/// The reason of a route with no session whose leg is up.
+pub const NOT_ASKED_TO_OPEN: &str = "not opened: nothing has asked it to open";
 
 impl From<TorrentRoute> for TorrentRouteGql {
     fn from(route: TorrentRoute) -> Self {
         let session = route.session;
-        let reason = session
-            .as_ref()
-            .map_or(route.down, |session| session.held.clone());
+        let reason = match &session {
+            Some(session) => session.held.clone(),
+            None => Some(route.down.unwrap_or_else(|| NOT_ASKED_TO_OPEN.to_owned())),
+        };
         Self {
             key: route.key.as_str().to_owned(),
             scopes: route.scopes.into_iter().map(Into::into).collect(),

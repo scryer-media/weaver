@@ -104,6 +104,9 @@ struct Mapping {
     outstanding: bool,
     /// Cleared once the gateway closed the mapping.
     live: bool,
+    /// The gateway granted the mapping and its last answer still stands:
+    /// only such a mapping is reported removed on close.
+    granted: bool,
 }
 
 impl Mapping {
@@ -121,6 +124,7 @@ impl Mapping {
             map_sent: false,
             outstanding: false,
             live: true,
+            granted: false,
         }
     }
 }
@@ -241,8 +245,9 @@ impl State {
         });
     }
 
-    /// libtorrent `resend_request`.
-    async fn resend_request(&mut self, i: usize, socket: &UdpSocket) {
+    /// libtorrent `resend_request`. A mapping the gateway never answered is
+    /// reported failed, as one it refused is.
+    async fn resend_request(&mut self, i: usize, socket: &UdpSocket, events: &PortMapEvents) {
         let Some(flight) = self.in_flight.filter(|f| f.index == i) else {
             return;
         };
@@ -252,7 +257,17 @@ impl State {
             m.action = Action::None;
             // Counted from when the last resend fell due.
             m.expires = Some(flight.resend_at + RETRY_FAILED_AFTER);
+            m.granted = false;
             debug!(protocol = ?m.request.protocol, "the gateway never answered");
+            // Nobody listening is no reason to stop mapping.
+            let _ = events.send(PortMapped {
+                transport: PortmapTransport::NatPmp,
+                protocol: m.request.protocol,
+                local_port: m.request.local_port,
+                external_port: None,
+                external_ip: None,
+                error: Some("the gateway never answered".to_owned()),
+            });
             return;
         }
         self.send_map_request(i, socket).await;
@@ -294,11 +309,11 @@ impl State {
     }
 
     /// libtorrent `on_resend_request` and `mapping_expired`.
-    async fn on_timer(&mut self, socket: &UdpSocket) {
+    async fn on_timer(&mut self, socket: &UdpSocket, events: &PortMapEvents) {
         let now = Instant::now();
         if let Some(flight) = self.in_flight {
             if flight.resend_at <= now {
-                self.resend_request(flight.index, socket).await;
+                self.resend_request(flight.index, socket, events).await;
             }
             return;
         }
@@ -330,6 +345,10 @@ impl State {
             }
             let m = &mut self.mappings[i];
             m.live = false;
+            // A mapping last reported failed stays as reported.
+            if !std::mem::take(&mut m.granted) {
+                continue;
+            }
             trace!(protocol = ?m.request.protocol, external_port = m.external_port, "port mapping removed");
             let _ = events.send(PortMapped {
                 transport: PortmapTransport::NatPmp,
@@ -384,7 +403,7 @@ impl State {
                 debug!("the gateway speaks NAT-PMP, not PCP");
                 self.version = VERSION_NATPMP;
                 if let Some(flight) = self.in_flight {
-                    self.resend_request(flight.index, socket).await;
+                    self.resend_request(flight.index, socket, events).await;
                 }
                 self.send_public_address_request(socket).await;
             }
@@ -474,8 +493,10 @@ impl State {
         };
         if result != 0 {
             m.expires = Some(now + RETRY_FAILED_AFTER);
+            m.granted = false;
             report(None, None, Some(result_message(version, result)));
         } else if m.action == Action::Add {
+            m.granted = m.live;
             let external_ip = if pcp { m.external_ip } else { self.external_ip };
             report(m.live.then_some(m.external_port), external_ip, None);
         }
@@ -549,7 +570,7 @@ impl NatPmpMapper {
                     Ok(n) => state.on_reply(&buf[..n], &socket, &events).await,
                     Err(e) => debug!("error receiving from the gateway: {e:#}"),
                 },
-                _ = timer => state.on_timer(&socket).await,
+                _ = timer => state.on_timer(&socket, &events).await,
             }
         }
         state.close(&socket, &events).await;
@@ -1032,6 +1053,60 @@ mod tests {
 
         running.cancel.cancel();
         running.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_that_never_answers_is_reported_for_each_protocol_until_a_later_answer_maps_it()
+     {
+        let _hold = hold_clock();
+        let mut gateway = Gateway::new().await;
+        let mut running = run_mapper(&gateway, &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
+
+        for (protocol, number) in [(PortmapProtocol::Tcp, 6), (PortmapProtocol::Udp, 17)] {
+            let first = gateway.recv().await;
+            assert_pcp_map(&first, number, 3600, Ipv4Addr::UNSPECIFIED);
+            for n in 1..9 {
+                tokio::time::advance(Duration::from_millis(250 * n)).await;
+                assert_eq!(gateway.recv().await, first, "send {}", n + 1);
+            }
+            tokio::time::advance(Duration::from_millis(250 * 9)).await;
+            assert_eq!(
+                running.events.recv().await.unwrap(),
+                PortMapped {
+                    transport: PortmapTransport::NatPmp,
+                    protocol,
+                    local_port: 6881,
+                    external_port: None,
+                    external_ip: None,
+                    error: Some("the gateway never answered".into()),
+                }
+            );
+        }
+
+        // Two hours on the gateway answers the retry: the mapping it grants
+        // is the next report.
+        tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+        let retry = gateway.recv().await;
+        assert_pcp_map(&retry, 6, 3600, Ipv4Addr::UNSPECIFIED);
+        gateway.send(&pcp_answer(&retry, 0, 7200, 1000, 6881)).await;
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            mapped(PortmapProtocol::Tcp, EXTERNAL)
+        );
+
+        // Closing removes both, and reports removed only the one granted:
+        // the UDP mapping stays reported as the gateway left it.
+        running.cancel.cancel();
+        running.task.await.unwrap().unwrap();
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            PortMapped {
+                external_port: None,
+                external_ip: None,
+                ..mapped(PortmapProtocol::Tcp, EXTERNAL)
+            }
+        );
+        assert_eq!(running.events.recv().await, None);
     }
 
     #[tokio::test(start_paused = true)]

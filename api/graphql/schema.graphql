@@ -5218,7 +5218,8 @@ type TorrentRoute {
 	"""
 	externalAddresses: [String!]!
 	"""
-	Why its session is held closed, or why its leg is down.
+	Why its session is closed: held closed, its leg down, or not opened
+	as nothing has asked it to open. None while open.
 	"""
 	reason: String
 }

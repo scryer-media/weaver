@@ -1889,7 +1889,20 @@ impl Session {
                     mapper.run(self.cancellation_token.clone(), events_tx),
                 );
             }
-            Err(e) => debug!("no gateway for NAT-PMP / PCP: {e:#}"),
+            // No gateway to ask fails every mapping, as one that never
+            // answers does.
+            Err(e) => {
+                for request in &requests {
+                    let _ = events_tx.send(PortMapped {
+                        transport: PortmapTransport::NatPmp,
+                        protocol: request.protocol,
+                        local_port: request.local_port,
+                        external_port: None,
+                        external_ip: None,
+                        error: Some(format!("no gateway: {e:#}")),
+                    });
+                }
+            }
         }
         let announce_port = self.announce_port.clone();
         let external_ips = self.external_ips.clone();
