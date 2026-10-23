@@ -752,7 +752,7 @@ pub struct RestoreJobRequest {
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
     pub complete_files: HashSet<NzbFileId>,
-    pub file_progress: HashMap<u32, u64>,
+    pub file_progress: HashMap<u32, crate::jobs::assembly::FileCoverage>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub file_identities: HashMap<u32, ActiveFileIdentity>,
     pub extracted_members: HashSet<String>,

@@ -1704,18 +1704,19 @@ async fn postgres_bulk_hot_paths_when_configured() {
         .map(|file_index| ActiveFileProgress {
             job_id,
             file_index,
-            contiguous_bytes_written: 2048 + u64::from(file_index),
+            coverage: coverage_of(2048 + u64::from(file_index)),
         })
         .collect::<Vec<_>>();
     let low_progress = (0..325)
         .map(|file_index| ActiveFileProgress {
             job_id,
             file_index,
-            contiguous_bytes_written: 1024,
+            coverage: coverage_of(1024),
         })
         .collect::<Vec<_>>();
-    db.upsert_file_progress_batch(&high_progress).unwrap();
+    // Coverage rows are replaced: the last barrier's is the one that stands.
     db.upsert_file_progress_batch(&low_progress).unwrap();
+    db.upsert_file_progress_batch(&high_progress).unwrap();
     db.complete_file(job_id, 0, "archive.rar", &[0x44; 16])
         .unwrap();
 
@@ -1782,8 +1783,13 @@ async fn postgres_bulk_hot_paths_when_configured() {
     assert_eq!(job.file_identities.get(&1), Some(&file_identities[1]));
     assert_eq!(job.complete_files.len(), 1);
     assert_eq!(job.file_progress.len(), 324);
-    assert_eq!(job.file_progress.get(&0).copied(), None);
-    assert_eq!(job.file_progress.get(&324).copied(), Some(2048 + 324));
+    assert!(!job.file_progress.contains_key(&0));
+    assert_eq!(
+        job.file_progress
+            .get(&324)
+            .map(crate::jobs::assembly::FileCoverage::covered_bytes),
+        Some(2048 + 324)
+    );
     assert_eq!(db.get_job_events(job_id.0).unwrap().len(), 250);
     assert_eq!(
         db.list_integration_events_after(None, None, Some(300))
@@ -2185,7 +2191,7 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id,
         file_index: 1,
-        contiguous_bytes_written: 77,
+        coverage: coverage_of(77),
     }])
     .unwrap();
     db.mark_file_incomplete(job_id, 1).unwrap();
@@ -2249,7 +2255,7 @@ async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
         let result = writer_db.upsert_file_progress_batch(&[ActiveFileProgress {
             job_id,
             file_index: 0,
-            contiguous_bytes_written: 123,
+            coverage: coverage_of(123),
         }]);
         let _ = done_tx.send(result);
     });
@@ -2306,7 +2312,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
         db.upsert_file_progress_batch(&[ActiveFileProgress {
             job_id,
             file_index: 0,
-            contiguous_bytes_written: 1,
+            coverage: coverage_of(1),
         }])
         .unwrap();
 
@@ -2837,7 +2843,7 @@ async fn postgres_runtime_smoke_when_configured() {
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id,
         file_index: 0,
-        contiguous_bytes_written: 123,
+        coverage: coverage_of(123),
     }])
     .unwrap();
     assert_eq!(db.load_active_jobs().unwrap().len(), 1);
@@ -3206,4 +3212,14 @@ async fn execute_schema_ddl(pool: &sqlx::PgPool, sql: String) {
 fn postgres_url_for_schema(base_url: &str, schema: &str) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
     format!("{base_url}{separator}options=-csearch_path%3D{schema}")
+}
+
+// A coverage checkpoint of one run from offset zero, `bytes` long.
+fn coverage_of(bytes: u64) -> crate::jobs::assembly::FileCoverage {
+    crate::jobs::assembly::FileCoverage::from_ordered_runs([crate::jobs::assembly::CoverageRun {
+        first_ordinal: 0,
+        ordinals: 1,
+        start: 0,
+        end: bytes,
+    }])
 }

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use weaver_model::files::FileRole;
 
+use super::coverage::{CoverageRun, FileCoverage};
 use super::error::AssemblyError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,14 +103,15 @@ pub struct FileAssembly {
     // matter how many bytes this one managed to decode, so it outranks the
     // retained extent as an anchor.
     declared_damage_ends: BTreeMap<u32, u64>,
-    // Existing durable prefix evidence, clipped whenever resumed bytes are rewritten.
-    restored_prefix_end: u64,
-    // How many leading ordinals the resumed prefix already covers, so the
-    // first ordinal that still has to be fetched can be named. Unlike
-    // [`restored_prefix_end`](Self::restored_prefix_end) this is an ordinal
-    // count and never moves, which is what a byte offset derived from
-    // DECLARED sizes cannot be trusted to be.
-    restored_segments: u32,
+    // The runs a restart restored from the file's coverage checkpoint, keyed
+    // by first ordinal. A restored article has no placement of its own — only
+    // its run's decoded extent is known — so the run stands in for the
+    // placements of every ordinal in it. Clipped whenever a restored ordinal
+    // is placed again.
+    restored_runs: BTreeMap<u32, CoverageRun>,
+    // The ordinals a restart brought back already held, whatever told it so.
+    // Only these may stand on declared bounds when they have no extent.
+    restored_ordinals: BitVec,
     final_part_verified: bool,
     geometry_requires_verification: bool,
     // Outputs without NZB articles have independent availability and contribute
@@ -162,8 +164,8 @@ impl FileAssembly {
             damaged_segments: BTreeMap::new(),
             truncation_only_damage: BTreeSet::new(),
             declared_damage_ends: BTreeMap::new(),
-            restored_prefix_end: 0,
-            restored_segments: 0,
+            restored_runs: BTreeMap::new(),
+            restored_ordinals: bitvec![0; total_segments as usize],
             final_part_verified: false,
             geometry_requires_verification: false,
             repair_output_ready: None,
@@ -191,6 +193,23 @@ impl FileAssembly {
     // induction, without comparing against any but its two neighbours.
     pub fn placement_conflict(&self, segment_number: u32, offset: u64, len: u32) -> Option<u32> {
         let end = offset.saturating_add(u64::from(len));
+        // A restored run is the placement of all its ordinals at once. One
+        // that holds this ordinal is being rewritten, which
+        // [`record_placement`](Self::record_placement) clips.
+        if let Some((_, previous)) = self.restored_runs.range(..=segment_number).next_back()
+            && !previous.contains(segment_number)
+            && offset < previous.end
+        {
+            return Some(previous.end_ordinal() - 1);
+        }
+        if let Some((next, run)) = self
+            .restored_runs
+            .range(segment_number.saturating_add(1)..)
+            .next()
+            && end > run.start
+        {
+            return Some(*next);
+        }
         for placements in [&self.placements, &self.reconstructed_placements] {
             if let Some((previous, (previous_offset, previous_len))) =
                 placements.range(..segment_number).next_back()
@@ -211,7 +230,7 @@ impl FileAssembly {
     // Record where a segment was placed. Re-recording the same ordinal is the
     // ordinary duplicate/retry case and simply overwrites.
     pub fn record_placement(&mut self, segment_number: u32, offset: u64, len: u32) {
-        self.restored_prefix_end = self.restored_prefix_end.min(offset);
+        self.clip_restored_run_at(segment_number, Some(offset));
         self.reconstructed_placements.remove(&segment_number);
         self.placements.insert(segment_number, (offset, len));
     }
@@ -295,6 +314,11 @@ impl FileAssembly {
         if let Some((offset, len)) = self.placement_of(segment_number) {
             return Some(offset.saturating_add(u64::from(len)));
         }
+        if let Some((_, run)) = self.restored_runs.range(..=segment_number).next_back()
+            && run.end_ordinal() == segment_number.saturating_add(1)
+        {
+            return Some(run.end);
+        }
         if !settled {
             return None;
         }
@@ -309,21 +333,41 @@ impl FileAssembly {
     }
 
     // Only accepted bytes may exclude writes of a damaged candidate.
+    //
+    // An ordinal a restart brought back with no extent at all (a
+    // completed-file row, or a direct-store skip) records no placement; its
+    // declared bounds stand in, since they reach at least as far as the
+    // decoded bytes it holds.
     pub(crate) fn protected_write_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        std::iter::once((0, self.restored_prefix_end)).chain(
-            self.placements
-                .values()
-                .chain(self.reconstructed_placements.values())
-                .map(|&(offset, len)| (offset, offset.saturating_add(u64::from(len)))),
-        )
+        let unmeasured = self
+            .restored_ordinals
+            .iter_ones()
+            .map(|ordinal| ordinal as u32)
+            .filter(|&ordinal| {
+                self.has_segment(ordinal)
+                    && !self.placements.contains_key(&ordinal)
+                    && !self.reconstructed_placements.contains_key(&ordinal)
+                    && !self
+                        .restored_runs
+                        .range(..=ordinal)
+                        .next_back()
+                        .is_some_and(|(_, run)| run.contains(ordinal))
+            })
+            .filter_map(|ordinal| self.segment_bounds(ordinal));
+        self.restored_runs
+            .values()
+            .map(|run| (run.start, run.end))
+            .chain(
+                self.placements
+                    .values()
+                    .chain(self.reconstructed_placements.values())
+                    .map(|&(offset, len)| (offset, offset.saturating_add(u64::from(len)))),
+            )
+            .chain(unmeasured)
     }
 
     pub(crate) fn has_retained_damage(&self) -> bool {
         !self.damaged_segments.is_empty()
-    }
-
-    pub(crate) fn retained_damage_floor(&self) -> Option<u64> {
-        self.retained_damage_floor
     }
 
     pub(crate) fn segment_has_retained_damage(&self, segment_number: u32) -> bool {
@@ -348,23 +392,129 @@ impl FileAssembly {
         self.geometry_requires_verification = false;
     }
 
-    pub(crate) fn note_restored_prefix(&mut self, end: u64) {
-        self.restored_prefix_end = end;
-        self.restored_segments = self.received.count_ones() as u32;
+    // Record the runs a restart restored. Their ordinals must already be
+    // committed; a run naming any ordinal that is not is ignored, since it
+    // would describe bytes the assembly does not hold.
+    // Called once the restart has committed every ordinal it skips.
+    pub(crate) fn note_restored_ordinals(&mut self) {
+        self.restored_ordinals.clone_from(&self.received);
     }
 
-    // The first ordinal a resumed file still has to fetch, if it resumed at
-    // all and is not already whole.
+    pub(crate) fn note_restored_coverage(&mut self, coverage: &FileCoverage) {
+        for run in coverage.runs() {
+            if (run.first_ordinal..run.end_ordinal()).all(|ordinal| self.has_segment(ordinal)) {
+                self.restored_runs.insert(run.first_ordinal, *run);
+            }
+        }
+    }
+
+    // Whether `segment_number` is the first article still missing after a
+    // restored run: the part whose decoded offset is where that run's bytes
+    // stop, which is where a write cursor resumes.
+    pub(crate) fn follows_restored_run(&self, segment_number: u32) -> bool {
+        let Some(previous) = segment_number.checked_sub(1) else {
+            return false;
+        };
+        !self.has_segment(segment_number)
+            && self
+                .restored_runs
+                .range(..=previous)
+                .next_back()
+                .is_some_and(|(_, run)| run.end_ordinal() == segment_number)
+    }
+
+    // A restored ordinal placed again leaves its run covering only the
+    // ordinals below it, ending where the new placement starts. With no
+    // offset to end at (the ordinal was withdrawn), the run is dropped: its
+    // remaining ordinals stay received but are no longer durable coverage, so
+    // a restart refetches them.
+    fn clip_restored_run_at(&mut self, segment_number: u32, offset: Option<u64>) {
+        let Some((&first, run)) = self.restored_runs.range(..=segment_number).next_back() else {
+            return;
+        };
+        if !run.contains(segment_number) {
+            return;
+        }
+        let run = *run;
+        self.restored_runs.remove(&first);
+        if let Some(offset) = offset
+            && segment_number > first
+            && offset >= run.start
+        {
+            self.restored_runs.insert(
+                first,
+                CoverageRun {
+                    first_ordinal: first,
+                    ordinals: segment_number - first,
+                    start: run.start,
+                    end: offset,
+                },
+            );
+        }
+    }
+
+    // Every committed article whose decoded extent is known, in ordinal order:
+    // placed articles, rebuilt ones, and restored runs. Damaged ordinals are
+    // never committed, so they are never here. Nothing at or past the
+    // retained-damage floor is either: a part laid after damage may sit where
+    // the damaged part's extent put it, and no damaged state survives a
+    // restart to say whether that was right.
+    fn durable_extents(&self) -> Vec<CoverageRun> {
+        let single = |(ordinal, (offset, len)): (&u32, &(u64, u32))| CoverageRun {
+            first_ordinal: *ordinal,
+            ordinals: 1,
+            start: *offset,
+            end: offset.saturating_add(u64::from(*len)),
+        };
+        let mut extents: Vec<CoverageRun> = self
+            .placements
+            .iter()
+            .chain(
+                self.reconstructed_placements
+                    .iter()
+                    .filter(|(ordinal, _)| !self.placements.contains_key(ordinal)),
+            )
+            .filter(|(ordinal, _)| {
+                self.has_segment(**ordinal) && !self.segment_has_retained_damage(**ordinal)
+            })
+            .map(single)
+            .chain(self.restored_runs.values().copied())
+            .filter(|run| {
+                self.retained_damage_floor
+                    .is_none_or(|floor| run.end <= floor)
+            })
+            .collect();
+        extents.sort_by_key(|run| run.first_ordinal);
+        extents
+    }
+
+    // The received bytes a restart would keep, in the unit the job counts
+    // downloaded bytes in. Everything received, unless retained damage holds
+    // part of it back from the coverage.
+    pub(crate) fn durable_received_bytes(&self) -> u64 {
+        if self.retained_damage_floor.is_none() {
+            return self.received_bytes;
+        }
+        self.durable_coverage().covered_bytes()
+    }
+
+    // The file's durable coverage: what a restart may skip.
     //
-    // A restart commits the resumed prefix as a run of leading ordinals and
-    // queues nothing below it, so that run's length names the part whose
-    // decoded offset is where the bytes on disk stop. Nothing else can: the
-    // prefix is measured in an NZB's DECLARED segment sizes, which are
-    // ENCODED and therefore always a little larger than the decoded bytes the
-    // file actually holds.
-    pub(crate) fn resume_anchor_ordinal(&self) -> Option<u32> {
-        (self.restored_segments > 0 && self.restored_segments < self.total_segments)
-            .then_some(self.restored_segments)
+    // Every committed article with a known extent counts, wherever it sits —
+    // a gap costs a restart the gap, nothing more. Retained damage is never
+    // coverage: a damaged ordinal is not committed, so a restart refetches it
+    // until verification or repair settles it.
+    pub(crate) fn durable_coverage(&self) -> FileCoverage {
+        FileCoverage::from_ordered_runs(self.durable_extents())
+    }
+
+    // The decoded bytes the file holds without a hole from offset zero.
+    pub(crate) fn committed_decoded_prefix(&self) -> u64 {
+        self.durable_coverage()
+            .runs()
+            .first()
+            .filter(|run| run.first_ordinal == 0 && run.start == 0)
+            .map_or(0, |run| run.end)
     }
 
     pub(crate) fn note_part_verification(&mut self, ordinal: u32, verified: bool) {
@@ -384,26 +534,38 @@ impl FileAssembly {
             return None;
         }
         let final_ordinal = self.total_segments.checked_sub(1)?;
-        self.placements
-            .get(&final_ordinal)
-            .or_else(|| self.reconstructed_placements.get(&final_ordinal))?;
-        let mut cursor = self.restored_prefix_end;
-        let mut decoded = self.placements.iter().peekable();
-        let mut rebuilt = self.reconstructed_placements.iter().peekable();
-        while decoded.peek().is_some() || rebuilt.peek().is_some() {
-            let (_, (offset, len)) = if rebuilt.peek().is_none_or(|(rebuilt_ordinal, _)| {
-                decoded
-                    .peek()
-                    .is_some_and(|(ordinal, _)| ordinal < rebuilt_ordinal)
-            }) {
-                decoded.next()?
-            } else {
-                rebuilt.next()?
-            };
-            if *offset != cursor {
+        if !self.placements.contains_key(&final_ordinal)
+            && !self.reconstructed_placements.contains_key(&final_ordinal)
+            && !self
+                .restored_runs
+                .values()
+                .next_back()
+                .is_some_and(|run| run.contains(final_ordinal))
+        {
+            return None;
+        }
+        let single = |(ordinal, (offset, len)): (&u32, &(u64, u32))| CoverageRun {
+            first_ordinal: *ordinal,
+            ordinals: 1,
+            start: *offset,
+            end: offset.saturating_add(u64::from(*len)),
+        };
+        // Every extent, a rebuilt copy of a placed ordinal included: two
+        // claims on one ordinal cannot tile, and the walk says so.
+        let mut extents: Vec<CoverageRun> = self
+            .placements
+            .iter()
+            .map(single)
+            .chain(self.reconstructed_placements.iter().map(single))
+            .chain(self.restored_runs.values().copied())
+            .collect();
+        extents.sort_by_key(|run| run.first_ordinal);
+        let mut cursor = 0u64;
+        for extent in extents {
+            if extent.start != cursor {
                 return None;
             }
-            cursor = cursor.checked_add(u64::from(*len))?;
+            cursor = extent.end;
         }
         Some(cursor)
     }
@@ -458,8 +620,8 @@ impl FileAssembly {
         self.damaged_segments.clear();
         self.truncation_only_damage.clear();
         self.declared_damage_ends.clear();
-        self.restored_prefix_end = 0;
-        self.restored_segments = 0;
+        self.restored_runs.clear();
+        self.restored_ordinals.fill(false);
         self.final_part_verified = false;
         self.geometry_requires_verification = false;
     }
@@ -516,6 +678,7 @@ impl FileAssembly {
             return false;
         }
         self.received.set(segment_number as usize, false);
+        self.clip_restored_run_at(segment_number, None);
         let placement = self
             .placements
             .remove(&segment_number)

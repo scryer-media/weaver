@@ -635,7 +635,7 @@ async fn exhausted_damage_keeps_bytes_but_never_success_or_restart_coverage() {
     deliver(&mut pipeline, file_id, 0, 0, b"bad!", false).await;
     deliver(&mut pipeline, file_id, 1, 4, b"tail", true).await;
     pipeline.flush_quiescent_write_backlog().await;
-    pipeline.note_file_progress_floor(file_id, 8, false);
+    pipeline.note_file_coverage(file_id, false);
     assert_eq!(std::fs::read(path).unwrap(), b"bad!tail");
     let file = pipeline.jobs[&file_id.job_id]
         .assembly

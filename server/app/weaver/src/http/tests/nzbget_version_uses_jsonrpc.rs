@@ -2696,7 +2696,14 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
     db.upsert_file_progress_batch(&[weaver_server_core::ActiveFileProgress {
         job_id: JobId(55),
         file_index: 0,
-        contiguous_bytes_written: 150_000,
+        coverage: weaver_server_core::jobs::assembly::FileCoverage::from_ordered_runs([
+            weaver_server_core::jobs::assembly::CoverageRun {
+                first_ordinal: 0,
+                ordinals: 1,
+                start: 0,
+                end: 150_000,
+            },
+        ]),
     }])
     .unwrap();
     let handle = scheduler_handle_with_jobs(vec![job]).await;

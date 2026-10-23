@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A job that resumes after a restart must keep advancing its durable floor.
+// A job that resumes after a restart must resume from what it wrote, and keep
+// advancing its durable floor from there.
 //
-// The restored prefix is committed straight into assembly and never enters the
-// write reorder buffer, so the buffer's cursor has to be told where those bytes
-// stop. If it is not, every arriving part sits above a cursor still at zero,
-// the sequential drain never releases anything, and the file's contiguous
-// floor — the only input to the job's durable floor — stays pinned at the value
-// the restart credited it for the rest of the file's life.
+// A file's checkpoint is its written coverage: the runs of articles on disk,
+// wherever they sit. A restart commits those articles straight into the
+// assembly without fetching them, so they never enter the write reorder
+// buffer, and the buffer has to be told where each restored run stops. If it
+// is not, a part after a restored run sits above a cursor that never reaches
+// it, and the file can only drain by backlog eviction.
 
 use super::*;
 
@@ -16,10 +17,9 @@ use crate::jobs::handle::RestoreJobRequest;
 use crate::pipeline::tests::yenc_compatibility::deliver;
 
 // Declared segment sizes are ENCODED, the payloads are DECODED, and the two
-// deliberately disagree here: a prefix of 8 decoded bytes covers two parts on
-// disk while a walk over declared sizes can only prove one. That gap is the
-// whole reason the resumed cursor cannot be a byte count carried over from the
-// restart, and a fixture where the two agree would never show it.
+// deliberately disagree here: coverage records where each article's decoded
+// bytes landed, so nothing on the restart path may turn a declared size into
+// a file offset, and a fixture where the two agree would never show it.
 const DECLARED_SEGMENT_BYTES: u32 = 8;
 const DECODED_PAYLOADS: [&[u8]; 5] = [b"head", b"tail", b"more", b"tail", b"last"];
 
@@ -30,14 +30,28 @@ fn decoded_offset(ordinal: usize) -> u64 {
         .sum()
 }
 
-// Bring up a job in exactly the state a restart leaves it in: a partial file on
-// disk, a persisted contiguous floor over it, and the ordinals that floor
-// covers committed without ever being fetched.
+// The coverage checkpoint a previous run left for the `written` articles.
+fn coverage_of(written: &[usize]) -> crate::jobs::assembly::FileCoverage {
+    crate::jobs::assembly::FileCoverage::from_ordered_runs(written.iter().map(|&ordinal| {
+        crate::jobs::assembly::CoverageRun {
+            first_ordinal: ordinal as u32,
+            ordinals: 1,
+            start: decoded_offset(ordinal),
+            end: decoded_offset(ordinal) + DECODED_PAYLOADS[ordinal].len() as u64,
+        }
+    }))
+}
+
+// Bring up a job in exactly the state a restart leaves it in: the `written`
+// articles on disk at their decoded offsets, a coverage checkpoint over them,
+// and those articles committed without ever being fetched. Returns the
+// ordinals the restore queued, in ordinal order.
 async fn restore_resumed_job(
     temp: &TempDir,
     id: u64,
-    persisted_floor: u64,
-) -> (Pipeline, NzbFileId, PathBuf) {
+    written: &[usize],
+    status: JobStatus,
+) -> (Pipeline, NzbFileId, PathBuf, Vec<u32>) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp).await;
     let job_id = JobId(id);
     let spec = segmented_job_spec(
@@ -48,16 +62,22 @@ async fn restore_resumed_job(
     let working_dir = insert_active_job(&mut pipeline, job_id, spec.clone()).await;
     let path = working_dir.join("sample.bin");
 
-    // What the previous run had written when it stopped.
+    // What the previous run had written when it stopped, holes included.
     let mut on_disk = Vec::new();
-    for payload in DECODED_PAYLOADS {
-        if on_disk.len() as u64 >= persisted_floor {
-            break;
+    for &ordinal in written {
+        let start = decoded_offset(ordinal) as usize;
+        let payload = DECODED_PAYLOADS[ordinal];
+        if on_disk.len() < start + payload.len() {
+            on_disk.resize(start + payload.len(), 0);
         }
-        on_disk.extend_from_slice(payload);
+        on_disk[start..start + payload.len()].copy_from_slice(payload);
     }
-    on_disk.truncate(persisted_floor as usize);
     tokio::fs::write(&path, &on_disk).await.unwrap();
+    let file_progress = if written.is_empty() {
+        HashMap::new()
+    } else {
+        HashMap::from([(0u32, coverage_of(written))])
+    };
 
     // The restart itself: the runtime state built by `insert_active_job` is
     // dropped and rebuilt from the durable record, the way a fresh process
@@ -70,13 +90,13 @@ async fn restore_resumed_job(
             job_hash: [0; 32],
             spec,
             complete_files: HashSet::new(),
-            file_progress: HashMap::from([(0u32, persisted_floor)]),
+            file_progress,
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
             extracted_members: HashSet::new(),
-            status: JobStatus::Downloading,
-            download_state: Some(crate::jobs::model::DownloadState::Downloading),
-            post_state: Some(crate::jobs::model::PostState::Idle),
+            status,
+            download_state: None,
+            post_state: None,
             run_state: Some(crate::jobs::model::RunState::Active),
             queued_repair_at_epoch_ms: None,
             queued_extract_at_epoch_ms: None,
@@ -96,7 +116,11 @@ async fn restore_resumed_job(
     state.next_health_probe_failed_bytes = u64::MAX;
     state.par2_bytes = state.spec.total_bytes;
     // These tests deliver the results of already dispatched requests.
-    state.download_queue.drain_all();
+    let mut queued = Vec::new();
+    while let Some(work) = state.download_queue.pop() {
+        queued.push(work.segment_id.segment_number);
+    }
+    queued.sort_unstable();
 
     (
         pipeline,
@@ -105,45 +129,63 @@ async fn restore_resumed_job(
             file_index: 0,
         },
         path,
+        queued,
     )
 }
 
+fn work_for(file_id: NzbFileId, segment_number: u32) -> DownloadWork {
+    DownloadWork {
+        counters: None,
+        segment_id: SegmentId {
+            file_id,
+            segment_number,
+        },
+        message_id: MessageId::new("resume-lead@example.com"),
+        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+        priority: 0,
+        byte_estimate: DECLARED_SEGMENT_BYTES,
+        retry_count: 0,
+        is_recovery: false,
+        completion_critical: false,
+        exclude_servers: Vec::new(),
+        avoid_server: None,
+    }
+}
+
+// The admission verdict is compared through its metric label: the decision
+// type itself is private to the download worker.
+const WITHIN_LIMIT: &str = "within_limit";
+
 #[tokio::test]
-async fn resumed_file_advances_its_durable_floor_past_the_restart_credit() {
+async fn a_restored_file_requeues_only_the_articles_its_coverage_misses() {
     let temp = tempfile::tempdir().unwrap();
-    // Two parts' worth of decoded bytes are on disk; a walk over the declared
-    // sizes can only account for the first, so the second is refetched.
-    let (mut pipeline, file_id, path) = restore_resumed_job(&temp, 41001, 8).await;
+    // An early gap with everything after it written: the crash that used to
+    // come back at the gap and refetch the rest of the file.
+    let (mut pipeline, file_id, path, queued) =
+        restore_resumed_job(&temp, 41001, &[0, 2, 3], JobStatus::Downloading).await;
     let job_id = file_id.job_id;
 
-    let restored_floor = pipeline.jobs[&job_id].restored_download_floor_bytes;
-    assert_eq!(restored_floor, 8);
+    assert_eq!(
+        queued,
+        vec![1, 4],
+        "only what the checkpoint misses is owed"
+    );
+    let covered = 3 * u64::from(DECLARED_SEGMENT_BYTES);
+    let state = &pipeline.jobs[&job_id];
+    assert_eq!(state.downloaded_bytes, covered);
+    assert_eq!(state.restored_download_floor_bytes, covered);
+    assert!(Pipeline::effective_progress(state) > 0.0);
     assert_eq!(
         pipeline.persisted_file_progress.get(&file_id).copied(),
-        Some(8)
+        Some(covered)
     );
     assert_eq!(
         pipeline.durable_download_floor_bytes_for_job(job_id),
-        restored_floor
+        covered
     );
 
-    // Out of order on purpose: the part that follows the restored prefix is
-    // rarely the first to decode with a pool of connections behind it.
-    deliver(
-        &mut pipeline,
-        file_id,
-        2,
-        decoded_offset(2),
-        DECODED_PAYLOADS[2],
-        true,
-    )
-    .await;
-    assert_eq!(
-        pipeline.durable_download_floor_bytes_for_job(job_id),
-        restored_floor,
-        "a part past the prefix cannot be written in order on its own"
-    );
-
+    // The gap's part follows the first restored run, so it drains in order at
+    // its own offset; the last part follows the second run, and does too.
     deliver(
         &mut pipeline,
         file_id,
@@ -153,53 +195,16 @@ async fn resumed_file_advances_its_durable_floor_past_the_restart_credit() {
         true,
     )
     .await;
-
-    // The prefix's own part arrived, so the cursor now knows where the bytes on
-    // disk stop and both parts drained in order.
-    assert_eq!(
-        pipeline.pending_file_progress.get(&file_id).copied(),
-        Some(12),
-        "the contiguous floor must move past the restart credit"
-    );
-    let advanced_floor = pipeline.durable_download_floor_bytes_for_job(job_id);
-    assert_eq!(advanced_floor, 12);
-    assert!(advanced_floor > restored_floor);
-    assert!(
-        !pipeline.jobs[&job_id]
-            .assembly
-            .file(file_id)
-            .unwrap()
-            .is_complete(),
-        "the floor must advance while the file is still being downloaded"
-    );
-    assert_eq!(
-        pipeline.write_buffers[&file_id].buffered_len(),
-        0,
-        "nothing may be left parked behind a cursor that has been positioned"
-    );
-
-    // The undurable lead the restart guard measures is what is accepted above
-    // the durable floor, so an advancing floor is what keeps it bounded.
-    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = 40;
-    assert_eq!(
-        pipeline.estimated_undurable_download_bytes_for_job(job_id),
-        40 - advanced_floor
-    );
-
-    // The bytes landed where they belong, prefix included.
-    assert_eq!(std::fs::read(&path).unwrap(), b"headtailmore");
-
-    for ordinal in [3usize, 4] {
-        deliver(
-            &mut pipeline,
-            file_id,
-            ordinal as u32,
-            decoded_offset(ordinal),
-            DECODED_PAYLOADS[ordinal],
-            true,
-        )
-        .await;
-    }
+    assert_eq!(pipeline.write_buffers[&file_id].buffered_len(), 0);
+    deliver(
+        &mut pipeline,
+        file_id,
+        4,
+        decoded_offset(4),
+        DECODED_PAYLOADS[4],
+        true,
+    )
+    .await;
     assert_eq!(std::fs::read(&path).unwrap(), b"headtailmoretaillast");
     assert!(
         pipeline.jobs[&job_id]
@@ -211,49 +216,40 @@ async fn resumed_file_advances_its_durable_floor_past_the_restart_credit() {
 }
 
 #[tokio::test]
-async fn resumed_file_advances_its_durable_floor_on_in_order_arrivals() {
+async fn a_restored_job_whose_coverage_holds_every_article_refetches_nothing() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, file_id, path) = restore_resumed_job(&temp, 41002, 8).await;
+    // Downloaded end to end and verifying when it stopped, with no completed
+    // file row yet: its coverage alone has to carry it.
+    let (pipeline, file_id, _, queued) =
+        restore_resumed_job(&temp, 41002, &[0, 1, 2, 3, 4], JobStatus::Verifying).await;
     let job_id = file_id.job_id;
-    let restored_floor = pipeline.jobs[&job_id].restored_download_floor_bytes;
 
-    let mut floors = Vec::new();
-    for (ordinal, payload) in DECODED_PAYLOADS.iter().enumerate().skip(1) {
-        deliver(
-            &mut pipeline,
-            file_id,
-            ordinal as u32,
-            decoded_offset(ordinal),
-            payload,
-            true,
-        )
-        .await;
-        floors.push(pipeline.durable_download_floor_bytes_for_job(job_id));
-    }
-
-    // The first arrival re-covers ground the restart already credited, so it is
-    // the second onwards that has to show movement.
-    assert_eq!(floors, vec![8, 12, 16, 40]);
-    assert!(floors[1] > restored_floor);
-    assert_eq!(std::fs::read(&path).unwrap(), b"headtailmoretaillast");
+    assert!(queued.is_empty(), "nothing is refetched, got {queued:?}");
+    let state = &pipeline.jobs[&job_id];
+    assert!(state.recovery_queue.is_empty());
+    assert_eq!(state.downloaded_bytes, state.spec.total_bytes);
+    assert!((Pipeline::effective_progress(state) - 1.0).abs() < f64::EPSILON);
+    assert!(state.assembly.file(file_id).unwrap().is_complete());
+    assert_eq!(state.status, JobStatus::Verifying);
 }
 
-// A file with no persisted floor is not resumed, and nothing about it may
-// change: its cursor starts at zero because its first part really is coming.
+// A file with no coverage is not resumed, and nothing about it may change: its
+// cursor starts at zero because its first part really is coming.
 #[tokio::test]
-async fn a_file_without_a_restored_prefix_still_starts_at_zero() {
+async fn a_file_without_restored_coverage_still_starts_at_zero() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, file_id, path) = restore_resumed_job(&temp, 41003, 0).await;
+    let (mut pipeline, file_id, path, queued) =
+        restore_resumed_job(&temp, 41003, &[], JobStatus::Downloading).await;
     let job_id = file_id.job_id;
 
+    assert_eq!(queued, vec![0, 1, 2, 3, 4]);
     assert_eq!(pipeline.jobs[&job_id].restored_download_floor_bytes, 0);
     assert!(
-        pipeline.jobs[&job_id]
+        !pipeline.jobs[&job_id]
             .assembly
             .file(file_id)
             .unwrap()
-            .resume_anchor_ordinal()
-            .is_none()
+            .follows_restored_run(0)
     );
 
     deliver(
@@ -266,8 +262,8 @@ async fn a_file_without_a_restored_prefix_still_starts_at_zero() {
     )
     .await;
     assert_eq!(
-        pipeline.durable_download_floor_bytes_for_job(job_id),
-        0,
+        pipeline.write_buffers[&file_id].buffered_len(),
+        1,
         "a part that is not the file's first cannot be written in order"
     );
     deliver(
@@ -279,82 +275,121 @@ async fn a_file_without_a_restored_prefix_still_starts_at_zero() {
         true,
     )
     .await;
+    pipeline.flush_file_progress_batch("test.barrier");
     assert_eq!(pipeline.durable_download_floor_bytes_for_job(job_id), 8);
     assert_eq!(std::fs::read(&path).unwrap(), b"headtail");
 }
 
-// The restart guard's own units: it hands out one article at a time exactly
-// while the bytes accepted above the durable floor exceed its lead limit, so a
-// floor that cannot move is a job that never leaves that state. The limit is a
-// process-wide constant, so the fixture is written relative to it rather than
-// by lowering it.
+// The crawl: a restored job whose first missing article stays parked while
+// every later one arrives. The later articles reach disk out of order, and
+// that is coverage, so the floor follows them and the job keeps ordinary
+// handouts instead of dropping to one article at a time.
 #[tokio::test]
-async fn an_advancing_floor_brings_a_resumed_job_back_within_the_restart_lead() {
-    // The admission verdict is compared through its metric label: the decision
-    // type itself is private to the download worker.
-    const WITHIN_LIMIT: &str = "within_limit";
-
+async fn a_gap_early_in_a_restored_file_never_holds_the_job_to_one_article() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, file_id, _) = restore_resumed_job(&temp, 41004, 8).await;
+    let (mut pipeline, file_id, _, _) =
+        restore_resumed_job(&temp, 41004, &[0], JobStatus::Downloading).await;
     let job_id = file_id.job_id;
     let limit = Pipeline::restart_durable_lead_limit_bytes();
+    let restored_floor = pipeline.durable_download_floor_bytes_for_job(job_id);
+    assert_eq!(restored_floor, u64::from(DECLARED_SEGMENT_BYTES));
 
-    let work = DownloadWork {
-        counters: None,
-        segment_id: SegmentId {
+    // Article 1 never arrives; 2, 3 and 4 do, and are written past the gap.
+    for ordinal in [2usize, 3, 4] {
+        deliver(
+            &mut pipeline,
             file_id,
-            segment_number: 4,
-        },
-        message_id: MessageId::new("resume-lead@example.com"),
-        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
-        priority: 0,
-        byte_estimate: DECLARED_SEGMENT_BYTES,
-        retry_count: 0,
-        is_recovery: false,
-        completion_critical: false,
-        exclude_servers: Vec::new(),
-        avoid_server: None,
-    };
+            ordinal as u32,
+            decoded_offset(ordinal),
+            DECODED_PAYLOADS[ordinal],
+            true,
+        )
+        .await;
+    }
+    pipeline.flush_quiescent_write_backlog().await;
+    assert!(
+        !pipeline.jobs[&job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .has_segment(1),
+        "the gap is still open"
+    );
+    pipeline.flush_file_progress_batch("test.barrier");
+    let written_past_gap = 3 * DECODED_PAYLOADS[2].len() as u64;
+    assert_eq!(
+        pipeline.durable_download_floor_bytes_for_job(job_id),
+        restored_floor + written_past_gap,
+        "articles written past the gap are durable"
+    );
 
-    // Accepted bytes placed so that the guard is over its limit at the floor the
-    // restart credited, and back under it after one contiguous drain.
+    // Accepted bytes placed so that a floor frozen at the gap would leave the
+    // job over its lead limit, and the coverage floor leaves room for a lease
+    // of more than one article.
     pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = limit + 4;
+    let work = work_for(file_id, 1);
+    let admission = pipeline.checkpoint_admission(job_id);
+    assert_eq!(admission.decision(&work, &[]).as_str(), WITHIN_LIMIT);
+    assert_eq!(
+        admission.decision(&work, &[work_for(file_id, 1)]).as_str(),
+        WITHIN_LIMIT,
+        "a gap must not drop the job to one article at a time"
+    );
+}
+
+// The guard still bites where it should: written coverage that no barrier has
+// recorded is lost to a restart, so it stays in the lead until the barrier
+// runs, and running it releases the job.
+#[tokio::test]
+async fn a_checkpoint_behind_its_writes_throttles_until_the_barrier_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _, _) =
+        restore_resumed_job(&temp, 41005, &[0], JobStatus::Downloading).await;
+    let job_id = file_id.job_id;
+    let limit = Pipeline::restart_durable_lead_limit_bytes();
+    let restored_floor = pipeline.durable_download_floor_bytes_for_job(job_id);
+
+    for ordinal in [2usize, 3, 4] {
+        deliver(
+            &mut pipeline,
+            file_id,
+            ordinal as u32,
+            decoded_offset(ordinal),
+            DECODED_PAYLOADS[ordinal],
+            true,
+        )
+        .await;
+    }
+    pipeline.flush_quiescent_write_backlog().await;
+    assert!(
+        pipeline.pending_file_progress.contains_key(&file_id),
+        "the writes are coverage the barrier has yet to record"
+    );
+    assert_eq!(
+        pipeline.durable_download_floor_bytes_for_job(job_id),
+        restored_floor,
+        "unrecorded coverage is not durable"
+    );
+
+    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = limit + 4;
+    let work = work_for(file_id, 1);
     assert_ne!(
         pipeline
             .checkpoint_admission(job_id)
             .decision(&work, &[])
             .as_str(),
         WITHIN_LIMIT,
-        "the pinned floor must leave the job outside the lead limit"
+        "a checkpoint genuinely behind holds the job back"
     );
 
-    deliver(
-        &mut pipeline,
-        file_id,
-        2,
-        decoded_offset(2),
-        DECODED_PAYLOADS[2],
-        true,
-    )
-    .await;
-    deliver(
-        &mut pipeline,
-        file_id,
-        1,
-        decoded_offset(1),
-        DECODED_PAYLOADS[1],
-        true,
-    )
-    .await;
-    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = limit + 4;
-
-    assert_eq!(pipeline.durable_download_floor_bytes_for_job(job_id), 12);
+    pipeline.flush_file_progress_batch("test.barrier");
+    assert!(pipeline.pending_file_progress.is_empty());
     assert_eq!(
         pipeline
             .checkpoint_admission(job_id)
             .decision(&work, &[])
             .as_str(),
         WITHIN_LIMIT,
-        "an advanced floor must return the job to ordinary handouts"
+        "the barrier releases it"
     );
 }

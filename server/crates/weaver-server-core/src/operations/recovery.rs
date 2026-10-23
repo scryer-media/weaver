@@ -587,8 +587,8 @@ mod tests {
         execute_sql(
             &db,
             "INSERT INTO active_file_progress
-             (job_id, file_index, contiguous_bytes_written)
-             VALUES ({}, 0, 1024)",
+             (job_id, file_index, coverage)
+             VALUES ({}, 0, x'00')",
             vec![SqlArg::I64(100)],
         );
 

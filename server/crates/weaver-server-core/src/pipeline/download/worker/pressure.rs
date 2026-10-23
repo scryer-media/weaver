@@ -280,17 +280,14 @@ impl Pipeline {
                 if file.is_complete() {
                     return file.total_bytes();
                 }
-                let file_id = file.file_id();
+                // The file's checkpointed coverage: every article the last
+                // barrier recorded, wherever it sits. A gap costs the floor
+                // the gap; bytes written since the barrier stay in the lead
+                // until the next one runs.
                 self.persisted_file_progress
-                    .get(&file_id)
+                    .get(&file.file_id())
                     .copied()
                     .unwrap_or(0)
-                    .max(
-                        self.pending_file_progress
-                            .get(&file_id)
-                            .copied()
-                            .unwrap_or(0),
-                    )
                     .min(file.total_bytes())
             })
             .sum::<u64>();

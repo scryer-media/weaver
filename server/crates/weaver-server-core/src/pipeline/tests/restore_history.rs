@@ -1623,7 +1623,17 @@ async fn restore_job_uses_per_file_progress_floor_for_reporting() {
         .await
         .unwrap();
 
-    let file_progress = HashMap::from([(0u32, 40u64), (1u32, 100u64)]);
+    let run = |end| {
+        crate::jobs::assembly::FileCoverage::from_ordered_runs([
+            crate::jobs::assembly::CoverageRun {
+                first_ordinal: 0,
+                ordinals: 1,
+                start: 0,
+                end,
+            },
+        ])
+    };
+    let file_progress = HashMap::from([(0u32, run(40)), (1u32, run(100))]);
 
     pipeline
         .restore_job(RestoreJobRequest {

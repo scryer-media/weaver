@@ -3079,7 +3079,7 @@ impl Pipeline {
     // The entry is left in place as a tombstone rather than removed: parked
     // bytes are released, but the fact that this file is uuencode has to
     // outlive completion so the restart-checkpoint suppression in
-    // [`Self::note_file_progress_floor`] still holds for the file's final
+    // [`Self::note_file_coverage`] still holds for the file's final
     // write. Teardown drops it with the rest of the job's per-file state.
     fn finish_uu_file(&mut self, file_id: NzbFileId) -> Option<String> {
         self.uu_park_requeues
@@ -3311,7 +3311,7 @@ impl Pipeline {
         if let Some(source) = write_error {
             return Err(SegmentWriteError::new(file_id, source));
         }
-        self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
+        self.note_file_coverage(file_id, false);
         // The write syscalls above returned, so bytes `0..contiguous_end` are
         // on disk and a direct-unpack chase may read them. Costs one `is_empty`
         // when nothing is being chased, which is the overwhelmingly common
@@ -3603,6 +3603,9 @@ impl Pipeline {
             )
             .await;
         }
+        // Out-of-order writes are coverage too: a file whose early article is
+        // still missing holds every later article it wrote.
+        self.note_file_coverage(file_id, false);
         if let Some(source) = write_error {
             return Err(SegmentWriteError::new(file_id, source));
         }
@@ -3617,11 +3620,10 @@ impl Pipeline {
     // after a restart already holds its leading parts on disk and never
     // fetches them again, so a buffer whose cursor started at zero would
     // never release anything in order. Its bytes would only ever reach disk
-    // through backlog eviction, whose out-of-order writes record no contiguous
-    // coverage — and the contiguous coverage is what the file's durable floor,
-    // and with it the restart guard's lead, is made of. The offset where the
-    // resumed prefix ends is knowable only from the part that directly follows
-    // it, so the buffer adopts that part's offset the first time it decodes.
+    // through backlog eviction. A restored run of parts sits wherever its
+    // articles landed, so the buffer jumps over it: the part that directly
+    // follows a restored run adopts the run's end as the cursor the first
+    // time it decodes, which is its own offset.
     pub(in crate::pipeline) fn write_buffer_for_article(
         &mut self,
         file_id: NzbFileId,
@@ -3632,8 +3634,7 @@ impl Pipeline {
             .jobs
             .get(&file_id.job_id)
             .and_then(|state| state.assembly.file(file_id))
-            .and_then(crate::jobs::assembly::FileAssembly::resume_anchor_ordinal)
-            .filter(|anchor| *anchor == segment_number)
+            .filter(|file| file.follows_restored_run(segment_number))
             .map(|_| file_offset);
         let max_pending = self.write_buf_max_pending;
         let write_buf = self
