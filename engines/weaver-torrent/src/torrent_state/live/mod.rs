@@ -121,7 +121,7 @@ use self::{
         PeerState, PeerTx, RATE_SAMPLE_INTERVAL, Refused, RemoveInflightRequestResult,
         empty_bitfield,
         info::PeerInfo,
-        ingest_bitfield, opening_rank,
+        ingest_bitfield, opening_rank, rate_estimator,
         stats::{
             atomic::PeerCountersAtomic as AtomicPeerCounters,
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
@@ -354,8 +354,11 @@ impl TorrentStateLive {
             .upgrade()
             .context("session is dead, cannot start torrent")?;
         let session_stats = session.stats.clone();
-        let down_speed_estimator = SpeedEstimator::default();
-        let up_speed_estimator = SpeedEstimator::default();
+        // The torrent's rates average over the same window its connections'
+        // rates do: sampled every tick, a default estimator spans under half
+        // a second and reads 0 between the bursts of a slow upload.
+        let down_speed_estimator = rate_estimator();
+        let up_speed_estimator = rate_estimator();
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
         let finished_at_start = paused.chunk_tracker.get_hns().finished();

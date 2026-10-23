@@ -1059,7 +1059,7 @@ pub(crate) const RATE_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 /// libtorrent's `stat_channel` does.
 pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(5);
 
-fn rate_estimator() -> SpeedEstimator {
+pub(crate) fn rate_estimator() -> SpeedEstimator {
     // Samples one tick apart span one tick fewer than their count.
     let samples = RATE_WINDOW.as_millis() / RATE_SAMPLE_INTERVAL.as_millis() + 1;
     SpeedEstimator::new(samples as usize)
