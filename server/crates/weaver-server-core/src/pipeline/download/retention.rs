@@ -256,6 +256,18 @@ impl Pipeline {
         segment_id: SegmentId,
         exclude_servers: &[usize],
     ) {
+        self.book_unservable_segment_logged(segment_id, exclude_servers, true);
+    }
+
+    // Books the article and returns the servers refusing credentials that
+    // would otherwise have served it. A sweep books many articles in one
+    // pass and reports them once itself, so its per-article line is debug.
+    fn book_unservable_segment_logged(
+        &mut self,
+        segment_id: SegmentId,
+        exclude_servers: &[usize],
+        warn_per_article: bool,
+    ) -> Vec<usize> {
         let job_id = segment_id.file_id.job_id;
         let retention = self.job_retention_excludes(job_id);
         let pool = self.nntp.pool();
@@ -266,12 +278,21 @@ impl Pipeline {
                     && pool.refuses_credentials(*idx)
             })
             .collect::<Vec<_>>();
-        warn!(
-            segment = %segment_id,
-            exclude_servers = ?exclude_servers,
-            refusing_credentials = ?refused_by,
-            "no server may fetch this article; booking it as missing so repair can proceed"
-        );
+        if warn_per_article {
+            warn!(
+                segment = %segment_id,
+                exclude_servers = ?exclude_servers,
+                refusing_credentials = ?refused_by,
+                "no server may fetch this article; booking it as missing so repair can proceed"
+            );
+        } else {
+            debug!(
+                segment = %segment_id,
+                exclude_servers = ?exclude_servers,
+                refusing_credentials = ?refused_by,
+                "no server may fetch this article; booking it as missing so repair can proceed"
+            );
+        }
         if !refused_by.is_empty() {
             self.semantic_terminal_causes.insert(
                 job_id,
@@ -285,6 +306,7 @@ impl Pipeline {
         if self.book_failed_segment(segment_id) {
             self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
+        refused_by
     }
 
     // Book as missing every queued article of `job_id` that no server may
@@ -305,13 +327,28 @@ impl Pipeline {
         };
         let mut retired = state.download_queue.extract_matching(unservable);
         retired.extend(state.recovery_queue.extract_matching(unservable));
+        if retired.is_empty() {
+            return 0;
+        }
+        let mut exclude_sets = std::collections::BTreeSet::new();
+        let mut refusing = std::collections::BTreeSet::new();
         for work in &retired {
-            self.book_unservable_work(work);
+            exclude_sets.insert(work.exclude_servers.clone());
+            refusing.extend(self.book_unservable_segment_logged(
+                work.segment_id,
+                &work.exclude_servers,
+                false,
+            ));
         }
-        if !retired.is_empty() {
-            self.update_queue_metrics();
-            self.maybe_finish_download_pass(job_id);
-        }
+        warn!(
+            job_id = job_id.0,
+            booked = retired.len(),
+            exclude_sets = ?exclude_sets,
+            refusing_credentials = ?refusing,
+            "no server may fetch these queued articles; booking them as missing so repair can proceed"
+        );
+        self.update_queue_metrics();
+        self.maybe_finish_download_pass(job_id);
         retired.len()
     }
 
