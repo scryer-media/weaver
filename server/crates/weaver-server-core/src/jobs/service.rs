@@ -920,7 +920,7 @@ impl Pipeline {
         Ok(())
     }
 
-    // How many of a job's payload files lead with their first article.
+    // How many of a classic job's payload files lead with their first article.
     // Recovery volumes are never sampled, so they do not count toward it:
     // counted by file index, a post that lists its recovery first would
     // sample few payload files or none, and the gate could never run.
@@ -972,10 +972,11 @@ impl Pipeline {
 
             let priority = file_spec.role.download_priority();
             let is_recovery = file_spec.role.is_recovery();
+            let classic = engine.classic_switches_apply();
             // A recovery file waits parked, by its name, only under the
             // classic engine. A graph job's root parks what its objects defer
             // and nothing else, and its own classes say what is recovery.
-            let parked = is_recovery && engine.classic_switches_apply();
+            let parked = is_recovery && classic;
 
             if is_recovery {
                 let total: u64 = file_spec.segments.iter().map(|s| s.bytes as u64).sum();
@@ -1041,9 +1042,13 @@ impl Pipeline {
             // parked until something promotes them, so they cannot answer in
             // the first round trips, and a sample that waits on an article
             // nothing has asked for is a sample that never completes.
-            let first_segment = (!is_recovery && sampled_files < Self::FIRST_ARTICLE_SAMPLE_FILES)
-                .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
-                .flatten();
+            //
+            // A graph job is not sampled here: its root takes the first
+            // article of every volume when the job is installed.
+            let first_segment =
+                (classic && !is_recovery && sampled_files < Self::FIRST_ARTICLE_SAMPLE_FILES)
+                    .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
+                    .flatten();
             if first_segment.is_some() {
                 sampled_files += 1;
             }

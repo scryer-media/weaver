@@ -175,6 +175,26 @@ impl Pipeline {
         )
     }
 
+    // Put an article of a graph job back on the queue under the class the
+    // root holds it in now. Whatever built the work, a retry rebuilt from the
+    // post's names or work leased before the root raised it, says nothing the
+    // root does not. True when the job is a graph job.
+    pub(in crate::pipeline) fn graph_requeued(&self, work: &mut DownloadWork) -> bool {
+        let Some(graph) = self.graph_jobs.get(&work.segment_id.file_id.job_id) else {
+            return false;
+        };
+        let class = graph.article_class(
+            VolumeIndex(work.segment_id.file_id.file_index),
+            work.segment_id.segment_number,
+        );
+        work.is_recovery = false;
+        work.completion_critical = false;
+        if let Some(class) = class {
+            classify(work, class);
+        }
+        true
+    }
+
     // Whether the root holds an article of a graph job parked: an object
     // deferred it and nothing has wanted it since. `None` for a classic job.
     pub(in crate::pipeline) fn graph_article_parked(&self, segment_id: SegmentId) -> Option<bool> {
@@ -374,10 +394,13 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     }
 }
 
-// The queue flags a class is fetched under.
+// The queue flags a class is fetched under, and a window volume's priority.
 fn classify(work: &mut DownloadWork, class: Class) {
     work.completion_critical |= class.waited_on();
     work.is_recovery |= class == Class::Recovery;
+    if let Class::Window(_) = class {
+        work.priority = work.priority.min(WINDOW_PRIORITY);
+    }
 }
 
 fn file(job_id: JobId, volume: VolumeIndex) -> NzbFileId {
