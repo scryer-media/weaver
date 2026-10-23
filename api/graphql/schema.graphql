@@ -304,6 +304,19 @@ type BandwidthTestRequest {
 	customUrl: String
 }
 
+"""
+One job's result from a batched cancel.
+"""
+type CancelJobResult {
+	id: Int!
+	cancelled: Boolean!
+	"""
+	`NOT_FOUND`, `CONFLICT` or `INTERNAL` when the job was not cancelled.
+	"""
+	errorCode: String
+	message: String
+}
+
 type Category {
 	id: Int!
 	name: String!
@@ -1655,6 +1668,12 @@ type MutationRoot {
 	Cancel and remove a job.
 	"""
 	cancelJob(id: Int!): Boolean!
+	"""
+	Cancel and remove several jobs in one pipeline command. Each id gets
+	its own result; a job that cannot be cancelled never holds back the
+	rest.
+	"""
+	cancelJobs(ids: [Int!]!): [CancelJobResult!]!
 	"""
 	Reprocess a completed or failed job (re-run post-download stages without re-downloading).
 	"""

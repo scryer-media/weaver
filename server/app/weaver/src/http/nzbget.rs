@@ -2827,8 +2827,7 @@ async fn group_final_delete(
     ctx: &NzbgetFacadeContext,
     job_id: JobId,
 ) -> Result<(), SchedulerError> {
-    ctx.handle.cancel_job(job_id).await?;
-    ctx.handle.delete_history(job_id, false).await.map(|_| ())
+    ctx.handle.cancel_job_and_delete_history(job_id).await
 }
 
 // GroupMoveTop / GroupMoveBottom / GroupMoveOffset. The move delta arrives in
@@ -2879,12 +2878,21 @@ async fn set_job_category(
         weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
             .await
             .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
-    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
+    let mut metadata = Vec::new();
     let submitted = category.as_ref().map(|_| requested);
     record_submitted_category(&mut metadata, submitted, category.as_deref());
     let update = JobUpdate {
         category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: [SUBMITTED_CATEGORY_KEY, SUBMITTED_CATEGORY_FOR_KEY]
+            .into_iter()
+            .map(|key| {
+                let value = metadata
+                    .iter()
+                    .find(|(existing, _)| existing == key)
+                    .map(|(_, value)| value.clone());
+                (key.to_string(), value)
+            })
+            .collect(),
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -2914,15 +2922,17 @@ async fn set_job_priority(
     // Weaver dispatches by a three-level label; the number the client set is
     // kept beside it and reported back. Force dispatches as HIGH.
     let priority = parse_nzbget_priority(param);
-    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
-    metadata.retain(|(key, _)| !key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY));
-    metadata.push((
-        PRIORITY_ATTRIBUTE_KEY.to_string(),
-        priority_label(priority).to_string(),
-    ));
-    record_submitted_priority(&mut metadata, priority);
     let update = JobUpdate {
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: vec![
+            (
+                PRIORITY_ATTRIBUTE_KEY.to_string(),
+                Some(priority_label(priority).to_string()),
+            ),
+            (
+                SUBMITTED_PRIORITY_KEY.to_string(),
+                Some(priority.to_string()),
+            ),
+        ],
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -2974,13 +2984,8 @@ async fn upsert_job_metadata(
     key: &str,
     value: Option<String>,
 ) -> Result<(), SchedulerError> {
-    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
-    metadata.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
-    if let Some(value) = value {
-        metadata.push((key.to_string(), value));
-    }
     let update = JobUpdate {
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: vec![(key.to_string(), value)],
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -3041,19 +3046,25 @@ async fn set_history_category(
     job_id: JobId,
     requested: &str,
 ) -> Result<(), SchedulerError> {
-    let Some(row) = history_row(ctx, job_id).await? else {
-        return Err(SchedulerError::JobNotFound(job_id));
-    };
     let category =
         weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
             .await
             .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
-    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
+    let mut metadata = Vec::new();
     let submitted = category.as_ref().map(|_| requested);
     record_submitted_category(&mut metadata, submitted, category.as_deref());
     let update = JobUpdate {
         category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: [SUBMITTED_CATEGORY_KEY, SUBMITTED_CATEGORY_FOR_KEY]
+            .into_iter()
+            .map(|key| {
+                let value = metadata
+                    .iter()
+                    .find(|(existing, _)| existing == key)
+                    .map(|(_, value)| value.clone());
+                (key.to_string(), value)
+            })
+            .collect(),
         ..JobUpdate::default()
     };
     update_history(ctx, job_id, update).await
@@ -3065,22 +3076,17 @@ async fn set_history_parameter(
     name: &str,
     value: &str,
 ) -> Result<(), SchedulerError> {
-    let Some(row) = history_row(ctx, job_id).await? else {
+    if !history_row_exists(ctx, job_id).await? {
         return Err(SchedulerError::JobNotFound(job_id));
-    };
+    }
     let name = name.trim();
     if name.is_empty() {
         return Ok(());
     }
     let key = parameter_metadata_key(name)?;
-    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
-    metadata.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
     let value = parameter_metadata_value(name, value);
-    if !value.is_empty() {
-        metadata.push((key.to_string(), value));
-    }
     let update = JobUpdate {
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: vec![(key.to_string(), (!value.is_empty()).then_some(value))],
         ..JobUpdate::default()
     };
     update_history(ctx, job_id, update).await
@@ -3092,15 +3098,7 @@ async fn delete_as_duplicate(
     ctx: &NzbgetFacadeContext,
     job_id: JobId,
 ) -> Result<(), SchedulerError> {
-    ctx.handle.cancel_job(job_id).await?;
-    let db = ctx.db.clone();
-    // The cancel archives the row before it answers.
-    tokio::task::spawn_blocking(move || {
-        db.set_history_failure_kind(job_id.0, Some(HistoryFailureKind::Duplicate))
-    })
-    .await
-    .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
-    .map_err(SchedulerError::from)?;
+    ctx.handle.cancel_duplicate_job(job_id).await?;
     ctx.history_cache.lock().await.remove(&job_id.0);
     Ok(())
 }

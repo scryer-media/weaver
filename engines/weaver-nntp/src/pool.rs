@@ -43,7 +43,7 @@ async fn acquisition_budget<T>(
     }
 }
 use crate::error::{NntpError, Result};
-use crate::health::{DisableReason, HealthConfig, HealthTracker, ServerState};
+use crate::health::{HealthConfig, HealthTracker, ServerState};
 use crate::transfer::{ServerTransferControl, StableServerId};
 
 // Identifies a specific server in the configuration.
@@ -1457,7 +1457,7 @@ impl NntpPool {
         let excludes = (0..self.configs.len())
             .filter(|idx| is_excluded(*idx))
             .collect::<Vec<_>>();
-        let backfill_unlocked = self.fill_servers_exhausted_or_auth_disabled(&excludes, &health);
+        let backfill_unlocked = self.fill_servers_exhausted_or_auth_disabled(&excludes);
         let mut retry_after = None;
         for server_idx in 0..self.configs.len() {
             if is_excluded(server_idx)
@@ -1498,9 +1498,24 @@ impl NntpPool {
             .all(|(idx, _)| exclude.contains(&idx) || !self.route_available(idx))
     }
 
+    // Whether this server refuses this pool's credentials: health disabled it
+    // for `DisableReason::AuthFailure` and that disable still runs. This is
+    // the one answer to "may this server serve an article" beyond the
+    // article's own exclusions and its job's retention: a refusing server
+    // serves nothing, so the work it alone could serve is unservable, not
+    // waiting. Every other quarantine (transport, capacity, an outage) is a
+    // wait. Lock-free on a healthy server; reads the recovery gate, which
+    // holds the same deadline the health state does.
+    pub fn refuses_credentials(&self, idx: usize) -> bool {
+        self.recovery_gates
+            .get(idx)
+            .is_some_and(|gate| gate.refuses_credentials())
+    }
+
     // The ordering-side backfill gate: every fill server is either excluded
-    // for this request or disabled by health for a reason that will not
-    // heal on its own (`DisableReason::AuthFailure`).
+    // for this request or refusing this pool's credentials
+    // ([`Self::refuses_credentials`]), a condition that will not heal on its
+    // own.
     //
     // A fill server with bad credentials re-disables on every probe, so it
     // never produces the 430 that would exclude it and otherwise pins an
@@ -1515,14 +1530,12 @@ impl NntpPool {
     // `FailureRatio` disable is an outage that heals by itself; in both cases
     // waiting is far cheaper than spilling the whole queue onto a paid
     // backfill account. Note
-    // this is an *ordering* gate only — disabled servers must never enter a
-    // request's exclude set, or exhaustion booking would declare the segment
-    // missing before backfill was ever tried.
-    pub fn fill_servers_exhausted_or_auth_disabled(
-        &self,
-        exclude: &[usize],
-        health: &HealthTracker,
-    ) -> bool {
+    // this is an *ordering* gate only — a server disabled for any of those
+    // reasons must never enter a request's exclude set, or exhaustion booking
+    // would declare the segment missing before it came back. A credentials
+    // refusal is the exception: it is the server's answer for the article,
+    // and exhaustion still counts every backfill server before booking.
+    pub fn fill_servers_exhausted_or_auth_disabled(&self, exclude: &[usize]) -> bool {
         self.backfill
             .iter()
             .enumerate()
@@ -1530,13 +1543,7 @@ impl NntpPool {
             .all(|(idx, _)| {
                 exclude.contains(&idx)
                     || !self.route_available(idx)
-                    || matches!(
-                        health.server(idx).state(),
-                        ServerState::Disabled {
-                            reason: DisableReason::AuthFailure,
-                            ..
-                        }
-                    )
+                    || self.refuses_credentials(idx)
             })
     }
 
@@ -1604,9 +1611,15 @@ impl NntpPool {
         // gate holding the tier open for one probe, and reading it as
         // saturation sends the operator looking for a permit leak on a server
         // that has every permit free.
-        let health_lease = self.recovery_gates[idx]
-            .admit(demanded)
-            .ok_or(NntpError::ServerRecovering)?;
+        // Except for a server refusing this pool's credentials: no probe
+        // is due there, and its refusal is the answer the work gets.
+        let health_lease = self.recovery_gates[idx].admit(demanded).ok_or_else(|| {
+            if self.refuses_credentials(idx) {
+                NntpError::AuthenticationRejected
+            } else {
+                NntpError::ServerRecovering
+            }
+        })?;
         let socket_slot = budget
             .try_acquire()
             .or_else(|| {
@@ -1821,7 +1834,7 @@ mod recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::{HealthConfig, ServerState};
+    use crate::health::{DisableReason, HealthConfig, ServerState};
 
     #[tokio::test]
     async fn idle_route_probe_opens_one_socket_and_preserves_provider_health() {
@@ -2763,7 +2776,7 @@ mod tests {
             "the healthy backfill server must be visible past a disabled fill tier"
         );
         assert!(
-            disabled.fill_servers_exhausted_or_auth_disabled(&[], &*disabled.health().lock().await),
+            disabled.fill_servers_exhausted_or_auth_disabled(&[]),
             "the ordering gate itself must agree"
         );
         assert!(
@@ -2786,7 +2799,7 @@ mod tests {
             "a 5-10s cooldown must wait, not spill onto backfill"
         );
         assert!(
-            !cooling.fill_servers_exhausted_or_auth_disabled(&[], &*cooling.health().lock().await),
+            !cooling.fill_servers_exhausted_or_auth_disabled(&[]),
             "CoolingDown must not open the backfill gate"
         );
 
@@ -2815,7 +2828,7 @@ mod tests {
             "an outage disable heals on its own and must wait, not spill onto backfill"
         );
         assert!(
-            !outage.fill_servers_exhausted_or_auth_disabled(&[], &*outage.health().lock().await),
+            !outage.fill_servers_exhausted_or_auth_disabled(&[]),
             "ConsecutiveFailures must not open the backfill gate"
         );
     }

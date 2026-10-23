@@ -1070,7 +1070,7 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
 #[test]
 fn blocking_lane_preserves_provider_capacity_rejection() {
     let error = NntpError::from_status(crate::types::StatusCode::new(502), "Too many connections");
-    let error = BlockingBodyLaneAcquireError::from_connect_error(error);
+    let error = BlockingBodyLaneAcquireError::from_connect_error(ServerId(0), error);
 
     assert!(
         matches!(

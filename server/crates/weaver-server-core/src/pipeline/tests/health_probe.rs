@@ -641,6 +641,7 @@ async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1114,6 +1115,7 @@ async fn booked_damage_promotes_recovery_before_any_checkpoint() {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,

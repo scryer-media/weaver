@@ -336,23 +336,27 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
     );
     assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 1);
 
-    let (reply, recv) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
-        .await;
-    recv.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_all()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.global_paused);
+    pipeline.db.flush_write_queue().await.unwrap();
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
         Some("true")
     );
 
-    let (reply, recv) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumeAll { reply })
-        .await;
-    recv.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_all()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(!pipeline.global_paused);
+    pipeline.db.flush_write_queue().await.unwrap();
     assert_eq!(
         pipeline.db.get_setting("global_paused").unwrap().as_deref(),
         Some("false")
@@ -1412,8 +1416,6 @@ async fn disk_write_failure_fails_job_before_commit() {
             },
         )
         .await;
-    // The write fails on the owner thread; the job fails when it lands.
-    settle_segment_write_work(&mut pipeline).await;
 
     let status = job_status_for_assert(&pipeline, job_id).unwrap();
     assert!(matches!(
@@ -1880,7 +1882,6 @@ async fn completed_file_uses_decoded_size_when_raw_article_bytes_are_larger() {
             },
         )
         .await;
-    settle_segment_write_work(&mut pipeline).await;
 
     let drained_events = drain_job_events(&mut events, job_id);
     assert!(drained_events.iter().any(|event| matches!(
@@ -2637,7 +2638,6 @@ async fn quiescent_tail_flush_completes_data_file_with_only_recovery_left() {
     assert_eq!(state.recovery_queue.len(), 1);
 
     pipeline.flush_quiescent_write_backlog().await;
-    pipeline.settle_all_segment_writes().await;
     settle_inflight_moves(&mut pipeline).await;
 
     assert_eq!(pipeline.write_buffered_bytes, 0);
@@ -2772,7 +2772,6 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
     pipeline.active_downloads = 1;
     pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline.flush_quiescent_write_backlog().await;
-    pipeline.settle_all_segment_writes().await;
     assert!(pipeline.write_buffered_bytes > 0);
     assert!(pipeline.pending_completion_checks.is_empty());
     pipeline.active_downloads_by_job.remove(&job_id);
@@ -2788,7 +2787,6 @@ async fn quiescent_tail_flush_schedules_par2_analysis_when_recovery_is_parked() 
     pipeline.active_downloads_by_job.insert(competing_job_id, 1);
 
     pipeline.flush_quiescent_write_backlog().await;
-    pipeline.settle_all_segment_writes().await;
 
     assert_eq!(pipeline.write_buffered_bytes, 0);
     assert_eq!(pipeline.write_buffered_segments, 0);
@@ -3442,7 +3440,6 @@ async fn latched_write_backlog_spills_without_a_landing_and_wakes_dispatch() {
     // No article lands under the latch. The tick relief is what moves the
     // parked bytes to disk and lets dispatch resume.
     pipeline.relieve_latched_write_backlog().await;
-    pipeline.settle_all_segment_writes().await;
 
     assert!(
         (pipeline.write_buffered_bytes as u64) < write_soft,
@@ -3461,6 +3458,5 @@ async fn latched_write_backlog_spills_without_a_landing_and_wakes_dispatch() {
 
     // A second pass with nothing latched is a no-op and owes no wake.
     pipeline.relieve_latched_write_backlog().await;
-    pipeline.settle_all_segment_writes().await;
     assert!(!pipeline.take_download_dispatch_wake());
 }

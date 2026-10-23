@@ -47,7 +47,6 @@ impl Pipeline {
     // Create a new pipeline.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        cmd_rx: mpsc::Receiver<SchedulerCommand>,
         event_tx: broadcast::Sender<PipelineEvent>,
         nntp: NntpClient,
         buffers: Arc<BufferPool>,
@@ -102,6 +101,20 @@ impl Pipeline {
                 Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
+        let download_stall_recovery = download::download_stall_recovery_from_env_value(
+            std::env::var(download::DOWNLOAD_STALL_RECOVERY_ENV).ok(),
+        );
+        info!(
+            download_stall_recovery,
+            env = download::DOWNLOAD_STALL_RECOVERY_ENV,
+            "download dispatch stall recovery {} (on by default; {}=0, false or off disables it)",
+            if download_stall_recovery {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            download::DOWNLOAD_STALL_RECOVERY_ENV,
+        );
         let profile_tuning = hardware_profile.tuning(&profile);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
@@ -192,7 +205,6 @@ impl Pipeline {
         let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
         let (direct_barrier_done_tx, direct_barrier_done_rx) = mpsc::channel(32);
         let (direct_placement_done_tx, direct_placement_done_rx) = mpsc::channel(64);
-        let (segment_write_done_tx, segment_write_done_rx) = mpsc::channel(64);
         let (direct_rearm_done_tx, direct_rearm_done_rx) = mpsc::channel(32);
         let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
         let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
@@ -235,13 +247,12 @@ impl Pipeline {
         let chase_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
         );
-        let bandwidth_ledger = BandwidthLedgerRuntime::default();
 
         let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
             crate::pipeline::graph::limits::budgets(&direct_store_settings, &tuner).0,
         ));
         let mut pipeline = Self {
-            cmd_rx,
+            _control_runtime: crate::pipeline::queue::RuntimeGuard(shared_state.queue.clone()),
             event_tx,
             nntp,
             buffers,
@@ -406,11 +417,11 @@ impl Pipeline {
             queue_scripts_completed: HashSet::new(),
             added_script_holds: HashSet::new(),
             script_data_dir: data_dir.clone(),
-            pending_history_deletions: HashSet::new(),
             terminal_post_processing_cancellations: HashMap::new(),
             global_paused: initial_global_paused,
+            applied_speed_test_pause: false,
+            applied_random_read_iops: None,
             scheduled_pause: false,
-            bandwidth_ledger,
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,
             scheduled_rate_limit: None,
@@ -422,10 +433,6 @@ impl Pipeline {
             download_write_hard_pressure_latched: false,
             download_pressure_hard_stall_started_at: None,
             download_pressure_soft_dispatch_after: None,
-            snapshot_published_at: None,
-            snapshot_publish_pending: false,
-            snapshot_dirty: true,
-            footprint_metrics_stale: true,
             download_dispatch_retry: true,
             metrics_rates_moving: false,
             post_download_phases: 0,
@@ -434,12 +441,16 @@ impl Pipeline {
             download_restart_durable_lead_retry_after: HashMap::new(),
             checkpoint_progress_articles: HashMap::new(),
             download_lane_owners: HashMap::new(),
+            #[cfg(test)]
+            audit_lane_holdings: false,
             propagation_ready_at: HashMap::new(),
-            published_propagation_holds: HashMap::new(),
             propagation_delay,
             #[cfg(test)]
             propagation_delay_forced: None,
             last_download_dispatch_stall_log_at: None,
+            download_dispatch_stall: None,
+            download_stall_recovery,
+            download_pass_fill_servers: None,
             download_retry_storm_window: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
@@ -448,7 +459,6 @@ impl Pipeline {
             download_lanes_under_cap_since: None,
             last_download_lanes_under_cap_log_at: None,
             write_buffered_bytes: 0,
-            write_inflight_bytes: 0,
             write_buffered_segments: 0,
             uu_spooled_bytes: 0,
             uu_spooled_segments: 0,
@@ -493,8 +503,6 @@ impl Pipeline {
             file_crc_recoveries: HashMap::new(),
             inflight_extractions: HashMap::new(),
             phase_progress: HashMap::new(),
-            phase_progress_snapshots: HashMap::new(),
-            phase_publish_state: HashMap::new(),
             job_retention_exclude_cache: HashMap::new(),
             no_eligible_server_warn_throttle: Default::default(),
             body_lane_capacity_log_throttle: Default::default(),
@@ -521,11 +529,6 @@ impl Pipeline {
             next_direct_placement_flight_id: 0,
             direct_placement_done_tx,
             direct_placement_done_rx,
-            segment_writes: HashMap::new(),
-            orphaned_segment_writes: HashMap::new(),
-            next_segment_write_id: 0,
-            segment_write_done_tx,
-            segment_write_done_rx,
             #[cfg(test)]
             direct_placement_hold: None,
             #[cfg(test)]
@@ -567,13 +570,34 @@ impl Pipeline {
             sfv_checked: HashSet::new(),
             jobs_with_verification_outcome: HashSet::new(),
             unavailable_promoted_recovery_segments: HashSet::new(),
-            finished_jobs: initial_history.into(),
             shared_state,
             db,
             fire_and_forget_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             config,
             pp_pool,
         };
+        let _ = pipeline
+            .shared_state
+            .queue
+            .resources
+            .set(pipeline.admission_resources());
+        let initial_history: Arc<[JobInfo]> = initial_history.into();
+        pipeline.shared_state.queue.write(|inner| {
+            inner
+                .jobs
+                .retain(|row| !is_terminal_status(&row.report.job.status));
+            pipeline
+                .shared_state
+                .queue
+                .replace_history(inner, initial_history);
+            inner.globals.paused = initial_global_paused;
+            inner.globals.speed_limit = pipeline.configured_rate_limit;
+            inner.globals.scheduled_speed_limit = pipeline.scheduled_rate_limit;
+            inner.globals.propagation_delay = pipeline.propagation_delay;
+            inner.globals.hardware_profile = Some(pipeline.configured_hardware_profile);
+            inner.globals.scheduled_hardware_profile = pipeline.scheduled_hardware_profile;
+            crate::pipeline::queue::Change::changed(())
+        });
         pipeline.publish_download_block();
         pipeline.refresh_download_pressure();
         // The very first lease a lane takes must already know the depth its
@@ -864,7 +888,6 @@ impl Pipeline {
         // is being deleted.
         self.direct_store.clear_job(job_id);
         self.drop_direct_placements_for_job(job_id);
-        self.drop_segment_writes_for_job(job_id);
         self.forget_direct_tolerated_work(job_id);
         self.forget_par2_analysis_work(job_id);
         self.forget_direct_demotion_work(job_id);
@@ -889,7 +912,7 @@ impl Pipeline {
             } else {
                 self.jobs_finalizing_download.remove(&job_id);
             }
-            let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+            self.emit_job_event(PipelineEvent::DownloadFinished {
                 job_id,
                 finalization_pending,
             });
@@ -898,9 +921,7 @@ impl Pipeline {
 
     pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
         if self.jobs_finalizing_download.remove(&job_id) {
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::DownloadPipelineDrained { job_id });
+            self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
         }
     }
 
@@ -1014,7 +1035,7 @@ impl Pipeline {
                 Ok(()) => {
                     let released = self.release_stalled_download_runtime(job_id);
                     self.emit_download_finished_if_active(job_id);
-                    let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
+                    self.emit_job_event(PipelineEvent::JobPaused { job_id });
                     info!(
                         job_id = job_id.0,
                         released_downloads = released,
@@ -1070,6 +1091,29 @@ impl Pipeline {
         interval
     }
 
+    async fn handle_terminal_post_processing_event(&mut self, event: TerminalPostProcessingEvent) {
+        match event {
+            TerminalPostProcessingEvent::QueueAdmitted(job_id) => {
+                self.handle_queue_scripts_admitted(job_id);
+            }
+            TerminalPostProcessingEvent::QueueDone(job_id, result) => {
+                self.handle_queue_scripts_done(job_id, result).await;
+            }
+            TerminalPostProcessingEvent::AddedScriptsDone(job_id, result) => {
+                self.handle_added_scripts_done(job_id, result);
+            }
+            TerminalPostProcessingEvent::Started(job_id) => {
+                self.handle_terminal_post_processing_started(job_id);
+            }
+            TerminalPostProcessingEvent::Done(done) => {
+                self.handle_terminal_post_processing_done(done);
+            }
+            TerminalPostProcessingEvent::CancelJobsDone(done) => {
+                self.handle_cancel_jobs_done(done);
+            }
+        }
+    }
+
     pub async fn run(&mut self) {
         let mut metrics_live = true;
         let mut metrics_snapshot_interval = Self::metrics_snapshot_timer(metrics_live);
@@ -1082,6 +1126,8 @@ impl Pipeline {
         let mut state_reconcile_interval = tokio::time::interval(Self::STATE_RECONCILE_INTERVAL);
         state_reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut pending_download_results = VecDeque::new();
+        let queue = self.shared_state.queue.clone();
+        let turn_metrics = self.metrics.clone();
 
         info!("pipeline started");
 
@@ -1090,7 +1136,43 @@ impl Pipeline {
             self.reconcile_job_progress(job_id).await;
         }
 
-        'run_loop: loop {
+        loop {
+            let mut turn_timer = crate::operations::instrumentation::TurnTimer::new(
+                &turn_metrics.pipeline_histograms.turn_duration,
+            );
+            if queue.read(|inner| inner.globals.shutting_down) {
+                // Readmission can wait for cancellation cleanup, whose terminal
+                // completion event releases the last script cancellation sender.
+                // Keep servicing those events while accepted admissions settle.
+                loop {
+                    tokio::select! {
+                        _ = queue.finish_admissions() => break,
+                        Some(event) = self.terminal_post_processing_done_rx.recv() => {
+                            self.handle_terminal_post_processing_event(event).await;
+                        }
+                    }
+                }
+                self.apply_queue_intents().await;
+                // A recorded cancel is settled before exit: its archive decides
+                // the job, and that answer returns on the done channel.
+                while queue.read(|inner| {
+                    inner
+                        .jobs
+                        .iter()
+                        .any(|row| row.intents.cancelled.is_some() && row.report.retiring)
+                }) {
+                    let Some(event) = self.terminal_post_processing_done_rx.recv().await else {
+                        break;
+                    };
+                    self.handle_terminal_post_processing_event(event).await;
+                }
+                self.demand_direct_store_barriers_for_all_jobs(
+                    crate::pipeline::direct_store::barrier::BarrierDemand::Shutdown,
+                )
+                .await;
+                break;
+            }
+            self.apply_queue_intents().await;
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job
             // snapshot shows or what dispatch would hand out.
@@ -1168,27 +1250,6 @@ impl Pipeline {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
                 }));
 
-            loop {
-                match self.cmd_rx.try_recv() {
-                    Ok(SchedulerCommand::Shutdown) => {
-                        info!("pipeline shutting down");
-                        self.demand_direct_store_barriers_for_all_jobs(
-                            crate::pipeline::direct_store::barrier::BarrierDemand::Shutdown,
-                        )
-                        .await;
-                        break 'run_loop;
-                    }
-                    Ok(cmd) => {
-                        turn_active = true;
-                        if let Some(scope) = Self::pause_barrier_scope(&cmd) {
-                            self.demand_direct_store_barriers_for_pause(scope).await;
-                        }
-                        self.handle_command(cmd).await
-                    }
-                    Err(_) => break,
-                }
-            }
-
             self.drain_ready_lane_control_messages();
             if self.take_download_dispatch_wake() {
                 self.dispatch_downloads();
@@ -1205,22 +1266,11 @@ impl Pipeline {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
                 let mut idle_tick = false;
+                turn_timer.pause();
                 tokio::select! {
-                    cmd = self.cmd_rx.recv() => {
-                        match cmd {
-                            Some(SchedulerCommand::Shutdown) | None => {
-                                info!("pipeline shutting down");
-                                break;
-                            }
-                            Some(cmd) => {
-                                if let Some(scope) = Self::pause_barrier_scope(&cmd) {
-                                    self.demand_direct_store_barriers_for_pause(scope).await;
-                                }
-                                self.handle_command(cmd).await
-                            }
-                        }
-                    }
+                    _ = queue.intent_changed() => { turn_timer.resume(); }
                     Some(result) = self.download_done_rx.recv() => {
+                        turn_timer.resume();
                         if !self.release_download_result(&result) { continue; }
                         self.note_released_download_result_pending(
                             result.job_id,
@@ -1229,13 +1279,16 @@ impl Pipeline {
                         pending_download_results.push_back(result);
                     }
                     Some(request) = self.download_refill_rx.recv() => {
+                        turn_timer.resume();
                         self.drain_ready_download_results(&mut pending_download_results);
                         self.handle_download_lane_refill_request(request);
                     }
                     Some(parked) = self.download_lane_parked_rx.recv() => {
+                        turn_timer.resume();
                         self.handle_download_lane_parked(parked);
                     }
                     Some(event) = self.owned_download_lane_event_rx.recv() => {
+                        turn_timer.resume();
                         self.handle_owned_download_lane_event(
                             event,
                             &mut pending_download_results,
@@ -1245,6 +1298,7 @@ impl Pipeline {
                         self.graph_run_said(said);
                     }
                     Some(result) = self.decode_done_rx.recv() => {
+                        turn_timer.resume();
                         crate::runtime::perf_probe::record(
                             "download.decode.done_rx.received",
                             std::time::Duration::from_nanos(1),
@@ -1252,79 +1306,98 @@ impl Pipeline {
                         self.handle_decode_done(result).await;
                     }
                     Some(update) = self.probe_result_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = update.job_id;
                         self.handle_probe_update(update);
+                        self.report_job(reported_job);
                     }
                     Some(generation) = self.nntp_handoff_drained_rx.recv() => {
+                        turn_timer.resume();
                         self.handle_nntp_handoff_drained(generation);
                     }
                     Some(done) = self.extract_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = match &done {
+                            ExtractionDone::Batch { job_id, .. } | ExtractionDone::FullSet { job_id, .. } => *job_id,
+                        };
                         self.handle_extraction_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Some(done) = self.rar_refresh_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_rar_refresh_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Some(retry) = self.rar_capacity_retry_rx.recv() => {
+                        turn_timer.resume();
                         self.handle_rar_capacity_retry(retry).await;
                     }
                     Some(done) = self.move_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_move_to_complete_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Some(done) = self.direct_post_repair_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_direct_post_repair_done(done);
+                        self.report_job(reported_job);
                     }
                     Some(done) = self.direct_tolerated_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_direct_tolerated_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Some(done) = self.direct_barrier_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_direct_barrier_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Some(done) = self.direct_placement_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_direct_placement_done(done).await;
-                    }
-                    Some(done) = self.segment_write_done_rx.recv() => {
-                        self.handle_segment_write_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Some(done) = self.direct_rearm_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_direct_rearm_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Some(done) = self.repair_work_done_rx.recv() => {
+                        turn_timer.resume();
                         self.handle_repair_work_done(done).await;
                     }
                     Some(done) = self.direct_demotion_done_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = done.job_id;
                         self.handle_direct_demotion_done(done).await;
+                        self.report_job(reported_job);
                     }
                     Ok(()) = self.script_effects_rx.changed() => {
+                        turn_timer.resume();
                         for job_id in self.db.take_script_effects() {
                             self.apply_queue_script_effects(JobId(job_id));
+                            self.report_job(JobId(job_id));
                         }
-                        self.publish_snapshot();
                     }
                     Some(event) = self.terminal_post_processing_done_rx.recv() => {
-                        match event {
-                            TerminalPostProcessingEvent::HistoryDeleteDone(done) => {
-                                self.handle_history_delete_done(done);
-                            }
-                            TerminalPostProcessingEvent::QueueAdmitted(job_id) => {
-                                self.handle_queue_scripts_admitted(job_id);
-                            }
-                            TerminalPostProcessingEvent::QueueDone(job_id, result) => {
-                                self.handle_queue_scripts_done(job_id, result).await;
-                            }
-                            TerminalPostProcessingEvent::AddedScriptsDone(job_id, result) => {
-                                self.handle_added_scripts_done(job_id, result);
-                            }
-                            TerminalPostProcessingEvent::Started(job_id) => {
-                                self.handle_terminal_post_processing_started(job_id);
-                            }
-                            TerminalPostProcessingEvent::Done(done) => {
-                                self.handle_terminal_post_processing_done(done);
-                            }
-                        }
+                        turn_timer.resume();
+                        self.handle_terminal_post_processing_event(event).await;
                     }
                     Some(retry) = self.retry_rx.recv() => {
+                        turn_timer.resume();
+                        let reported_job = retry.work.segment_id.file_id.job_id;
                         self.receive_retry_work(retry);
+                        self.report_job(reported_job);
                     }
                     _ = metrics_snapshot_interval.tick() => {
+                        turn_timer.resume();
                         idle_tick = true;
                         self.refresh_periodic_snapshot();
                         // Lanes whose refill found nothing wait here for the
@@ -1332,15 +1405,18 @@ impl Pipeline {
                         // wake comes.
                         self.service_held_download_refills();
                     }
-                    _ = rate_sleep, if !rate_delay.is_zero() => {}
+                    _ = rate_sleep, if !rate_delay.is_zero() => { turn_timer.resume(); }
                     _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
+                        turn_timer.resume();
                         self.consume_due_checkpoint_rechecks();
                     }
-                    _ = propagation_sleep, if propagation_delay.is_some() => {}
+                    _ = propagation_sleep, if propagation_delay.is_some() => { turn_timer.resume(); }
                     _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
+                        turn_timer.resume();
                         self.requeue_due_infrastructure_retries();
                     }
                     _ = tune_interval.tick() => {
+                        turn_timer.resume();
                         idle_tick = true;
                         // An empty write backlog has nothing to flush.
                         if self.write_buffered_bytes > 0 {
@@ -1352,7 +1428,7 @@ impl Pipeline {
 
                         if tracing::enabled!(tracing::Level::DEBUG) {
                         let live = self.pipeline_is_live();
-                        let snapshot = self.metrics.snapshot();
+                        let snapshot = self.metrics.raw_snapshot();
                         let not_found = snapshot.articles_not_found;
                         // Folded over every job, so only while something
                         // is moving; an idle pipeline's health is unchanged.
@@ -1382,6 +1458,7 @@ impl Pipeline {
                         }
                     }
                     _ = stalled_download_interval.tick() => {
+                        turn_timer.resume();
                         // A stall needs a transfer in flight; with none the
                         // walk over every job would find nothing.
                         idle_tick = self.active_downloads_by_job.is_empty();
@@ -1390,6 +1467,7 @@ impl Pipeline {
                         }
                     }
                     _ = state_reconcile_interval.tick() => {
+                        turn_timer.resume();
                         idle_tick = true;
                         self.reconcile_candidate_jobs().await;
                     }
@@ -1399,26 +1477,14 @@ impl Pipeline {
 
             self.pump_decode_queue();
             let live = self.pipeline_is_live();
-            if turn_active || live {
-                self.snapshot_dirty = true;
-            }
             if turn_active {
                 self.reconcile_clean = false;
             }
             dispatch_due = turn_active;
-            self.publish_snapshot_debounced();
             if live != metrics_live {
                 metrics_live = live;
                 metrics_snapshot_interval = Self::metrics_snapshot_timer(live);
             }
-            #[cfg(test)]
-            self.shared_state.turn_observation.send_replace(Some(
-                crate::jobs::handle::PipelineTurnObservation {
-                    metrics_refreshes: self.shared_state.metrics_refresh_count(),
-                    job_revision: *self.shared_state.subscribe_job_changes().borrow(),
-                    period: metrics_snapshot_interval.period(),
-                },
-            ));
         }
 
         self.drain().await;
@@ -1431,10 +1497,13 @@ impl Pipeline {
         metrics_interval: &mut tokio::time::Interval,
     ) -> usize {
         let mut processed = 0;
+        // One report per job per turn, however many of its results landed.
+        let mut reported = BTreeSet::new();
         while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
             let Some(result) = pending.pop_front() else {
                 break;
             };
+            reported.insert(result.job_id);
             self.process_released_download_done(result).await;
             processed += 1;
             // Return freed connections during ingestion rather than waiting
@@ -1443,6 +1512,9 @@ impl Pipeline {
             if self.take_download_dispatch_wake() {
                 self.dispatch_downloads();
             }
+        }
+        for job_id in reported {
+            self.report_job(job_id);
         }
         if processed != 0 {
             // A backlog can keep every actor operation immediately ready.
@@ -1461,23 +1533,12 @@ impl Pipeline {
         processed
     }
 
-    fn refresh_periodic_snapshot(&mut self) {
+    pub(in crate::pipeline) fn refresh_periodic_snapshot(&mut self) {
         self.checkpoint_server_attribution_if_due();
-        let live = self.pipeline_is_live();
-        // Phase rows are sampled while anything moves, and once more after,
-        // so rates that were showing are cleared from the published rows.
-        if live || !self.phase_progress_snapshots.is_empty() || !self.phase_publish_state.is_empty()
-        {
-            self.sample_phase_progress();
-        }
-        // The footprint readings walk the job order; with nothing moving they
-        // only change when the jobs do, which marks them stale.
-        if live || self.footprint_metrics_stale {
-            self.footprint_metrics_stale = false;
-            self.publish_download_footprint_metrics();
-        }
-        self.metrics_rates_moving = self.shared_state.refresh_metrics_snapshot();
-        self.flush_pending_snapshot();
+        // Queue edits can change eligibility while the data plane is idle.
+        // The existing active/idle tick cadence bounds these small walks.
+        self.publish_download_footprint_metrics();
+        self.metrics_rates_moving = self.shared_state.metrics_snapshot().current_download_speed > 0;
     }
 
     // Publish the download side's memory footprint.
@@ -1500,28 +1561,6 @@ impl Pipeline {
             usize::from(eligible > 0),
             std::sync::atomic::Ordering::Relaxed,
         );
-    }
-
-    // The pause demand, at the command seam.
-    //
-    // A paused job stops feeding the byte trigger and its sets go quiet, so
-    // without this the last interval's coverage would sit uncheckpointed for
-    // however long the pause lasts — and a pause is a common thing to do
-    // *before* stopping the process. Demanded here rather than inside
-    // `pause_job_runtime`, which is synchronous and is also the transition every
-    // other pause path funnels through after the fact; the command is the point
-    // where the intent is known and the job has not stopped yet.
-    // Classified synchronously and by value: a `&SchedulerCommand` held across
-    // the await below would make the whole pipeline future non-`Send`, because
-    // the command carries reply channels whose payloads are `Send` but not
-    // `Sync`.
-    pub(crate) fn pause_barrier_scope(command: &SchedulerCommand) -> Option<Option<JobId>> {
-        match command {
-            SchedulerCommand::PauseJob { job_id, .. } => Some(Some(*job_id)),
-            SchedulerCommand::PauseAll { .. }
-            | SchedulerCommand::SetSpeedTestPause { paused: true, .. } => Some(None),
-            _ => None,
-        }
     }
 
     pub(crate) async fn demand_direct_store_barriers_for_pause(&mut self, scope: Option<JobId>) {
@@ -1556,83 +1595,6 @@ impl Pipeline {
             .map(|ready_at| ready_at.saturating_duration_since(now))
     }
 
-    pub(crate) fn publish_snapshot(&mut self) {
-        self.snapshot_published_at = Some(Instant::now());
-        self.snapshot_publish_pending = false;
-        self.snapshot_dirty = false;
-        self.footprint_metrics_stale = true;
-        if let Err(error) = self.bandwidth_ledger.prune_if_due(&self.db) {
-            warn!(error = %error, "failed to prune the bandwidth ledger");
-        }
-        self.publish_download_block();
-        // Live rows are rebuilt; finished rows are shared with the previous
-        // publish unless history itself changed.
-        let jobs = self.list_live_jobs();
-        let holds: HashMap<_, _> = jobs
-            .iter()
-            .filter(|job| {
-                job.download_wait_reason.as_deref()
-                    == Some(crate::jobs::handle::PROPAGATION_WAIT_REASON)
-            })
-            .filter_map(|job| {
-                job.download_retry_at_epoch_ms
-                    .map(|at| (job.job_id, at as i64))
-            })
-            .collect();
-        let changed: HashSet<_> = holds
-            .keys()
-            .chain(self.published_propagation_holds.keys())
-            .copied()
-            .filter(|job_id| holds.get(job_id) != self.published_propagation_holds.get(job_id))
-            .collect();
-        self.published_propagation_holds = holds;
-        let history = self.finished_jobs.shared();
-        self.shared_state.publish_live_jobs(jobs, history);
-        // Publish the updated payload before notifying live queue subscribers.
-        for job_id in changed {
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::PhaseProgressUpdated { job_id });
-        }
-    }
-
-    // Publish the job snapshot unless one was already published inside the
-    // debounce window; a suppressed publish is owed and caught up by the
-    // metrics tick.
-    //
-    // The run loop turns once per pipeline event — every download result,
-    // decode completion, and lane refill — and `list_jobs` rebuilds the whole
-    // snapshot (per-job clones plus per-file walks) on each call, so an
-    // unconditional per-turn publish scaled the orchestrator's overhead with
-    // article rate. Bumping the revision also wakes every quota-parked retry
-    // task, each of which re-reads its job from the published list; the same
-    // window bounds that herd. Explicit callers — command handlers, status
-    // transitions — keep the immediate `publish_snapshot` so user-visible
-    // changes never wait on the window.
-    pub(crate) fn publish_snapshot_debounced(&mut self) {
-        const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
-        if !self.snapshot_dirty && !self.snapshot_publish_pending {
-            return;
-        }
-        if self
-            .snapshot_published_at
-            .is_some_and(|at| at.elapsed() < SNAPSHOT_DEBOUNCE)
-        {
-            self.snapshot_publish_pending = true;
-            return;
-        }
-        self.publish_snapshot();
-    }
-
-    // The trailing edge of the debounce: publish a suppressed snapshot once
-    // the periodic tick comes around, so the last event before a quiet spell
-    // still reaches the UI.
-    pub(crate) fn flush_pending_snapshot(&mut self) {
-        if self.snapshot_publish_pending {
-            self.publish_snapshot();
-        }
-    }
-
     fn update_parked_infrastructure_metric(&self) {
         self.metrics
             .parked_infrastructure_work
@@ -1660,6 +1622,17 @@ impl Pipeline {
         self.requeue_infrastructure_retry_batch(ready)
     }
 
+    pub(in crate::pipeline) fn wake_infrastructure_retries_for_jobs(
+        &mut self,
+        jobs: &std::collections::HashSet<JobId>,
+    ) -> usize {
+        let ready = self
+            .infrastructure_retries
+            .wake_where(|retry| jobs.contains(&retry.work.segment_id.file_id.job_id));
+        self.update_parked_infrastructure_metric();
+        self.requeue_infrastructure_retry_batch(ready)
+    }
+
     fn requeue_due_infrastructure_retries(&mut self) -> usize {
         let ready = self
             .infrastructure_retries
@@ -1670,8 +1643,13 @@ impl Pipeline {
 
     fn requeue_infrastructure_retry_batch(&mut self, ready: Vec<RetryWork>) -> usize {
         let count = ready.len();
+        let mut jobs = HashSet::new();
         for retry in ready {
+            jobs.insert(retry.work.segment_id.file_id.job_id);
             self.receive_retry_work(retry);
+        }
+        for job_id in jobs {
+            self.report_job(job_id);
         }
         count
     }
@@ -1823,8 +1801,8 @@ impl Pipeline {
     pub(crate) async fn drain(&mut self) {
         // First, because a parked chase is a blocking thread that nothing else
         // here will ever wake: the pipeline's other state dies with the struct,
-        // but a thread waiting on a condvar does not. Both shutdown arms reach
-        // this, so aborting here covers the one that does not demand barriers.
+        // but a thread waiting on a condvar does not. Release it before joining
+        // the remaining data-plane work.
         self.direct_unpack_shutdown("pipeline shutting down").await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
@@ -1835,9 +1813,6 @@ impl Pipeline {
         // conventional backlog the flush below writes out.
         self.settle_all_direct_placements().await;
         self.flush_quiescent_write_backlog().await;
-        // Every batch the drain and the flush handed to the disk owner is
-        // still writing, off this task; its commit is joined here the same way.
-        self.settle_all_segment_writes().await;
         // A graph job's run or repair still out on a thread speaks through
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.
@@ -1871,7 +1846,7 @@ impl Pipeline {
         }
         self.flush_server_attribution();
         self.flush_support_facts();
-        if let Err(error) = self.flush_download_bandwidth_usage() {
+        if let Err(error) = self.shared_state.queue.sample_bandwidth(true) {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
 
@@ -1928,7 +1903,9 @@ impl Pipeline {
                     let mut pending = VecDeque::new();
                     self.handle_owned_download_lane_event(event, &mut pending);
                     while let Some(result) = pending.pop_front() {
+                        let reported_job = result.job_id;
                         self.process_released_download_done(result).await;
+                        self.report_job(reported_job);
                     }
                     self.pump_decode_queue();
                 }
@@ -2225,15 +2202,11 @@ impl DiskWriteOwnerPool {
         sync_index_for_path(path, self.senders.len())
     }
 
-    // Queues a batch on its owner thread and hands back its answer. An owner
-    // that has stopped answers at once, with everything unwritten.
-    fn submit_batch(
+    async fn write_batch(
         &self,
         path: std::path::PathBuf,
         segments: Vec<(u64, BufferedDecodedSegment)>,
-    ) -> tokio::sync::oneshot::Receiver<
-        Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
-    > {
+    ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
         let queued_at = Instant::now();
         crate::runtime::perf_probe::record_value("download.disk_write.owner.submitted", 1);
         let (response, response_rx) = tokio::sync::oneshot::channel();
@@ -2246,38 +2219,26 @@ impl DiskWriteOwnerPool {
         };
 
         if let Err(error) = self.senders[sender_index].send(command) {
-            let DiskWriteCommand::Batch {
-                segments, response, ..
-            } = error.0
-            else {
+            let DiskWriteCommand::Batch { segments, .. } = error.0 else {
                 unreachable!("disk write batch send returned a different command");
             };
-            let _ = response.send(Err(SegmentWriteBatchError {
+            return Err(SegmentWriteBatchError {
                 source: std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "disk write owner thread stopped",
                 ),
                 written: Vec::new(),
                 unwritten: segments,
-            }));
+            });
         }
-        response_rx
-    }
 
-    async fn write_batch(
-        &self,
-        path: std::path::PathBuf,
-        segments: Vec<(u64, BufferedDecodedSegment)>,
-    ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
-        self.submit_batch(path, segments)
-            .await
-            .unwrap_or_else(|error| {
-                Err(SegmentWriteBatchError {
-                    source: std::io::Error::other(error),
-                    written: Vec::new(),
-                    unwritten: Vec::new(),
-                })
+        response_rx.await.unwrap_or_else(|error| {
+            Err(SegmentWriteBatchError {
+                source: std::io::Error::other(error),
+                written: Vec::new(),
+                unwritten: Vec::new(),
             })
+        })
     }
 
     // Queues one destination's sub-batch and hands back its completion. Split
@@ -2708,6 +2669,7 @@ fn write_segments_to_disk_blocking(
     segments: Vec<(u64, BufferedDecodedSegment)>,
     queued_at: Instant,
 ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    crate::e2e_failpoint::maybe_hold(crate::e2e_failpoint::DISK_WRITE, &path);
     let task_started = Instant::now();
     crate::runtime::perf_probe::record(
         "download.disk_write.owner.queue_wait",
@@ -3100,16 +3062,15 @@ pub(crate) async fn sync_direct_destinations(
     results
 }
 
-// Hands a batch to its disk owner thread and returns at once; the answer
-// comes back on the receiver. The pipeline task never waits on it: a ticket
-// lands the commit when the done message arrives (`decode::landing`).
-pub(crate) fn submit_segments_to_disk(
+pub(crate) async fn write_segments_to_disk(
     path: &std::path::Path,
     segments: Vec<(u64, BufferedDecodedSegment)>,
-) -> tokio::sync::oneshot::Receiver<
-    Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
-> {
-    disk_write_owner_pool().submit_batch(path.to_owned(), segments)
+) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
+    let path = path.to_owned();
+    let started = Instant::now();
+    let result = disk_write_owner_pool().write_batch(path, segments).await;
+    crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
+    result
 }
 
 pub(crate) fn compute_write_backlog_budget_bytes(

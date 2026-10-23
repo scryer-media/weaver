@@ -1512,6 +1512,7 @@ async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
             .unwrap();
         // The second index is still coming: incomplete, and its article queued.
         state.download_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,

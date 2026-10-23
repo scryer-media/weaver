@@ -733,12 +733,13 @@ impl Database {
     // SCORE caller supplies the generation it received at admission; parking
     // or superseding that candidate invalidates the generation before any
     // stale request can create scheduler work.
-    pub(crate) fn materialize_active_job_with_file_identities(
+    pub(crate) fn materialize_admission(
         &self,
         job: &ActiveJob,
         identities: &[ActiveFileIdentity],
         semantic_materialization_generation: Option<i64>,
         semantic_promotion_generation: Option<i64>,
+        restart: bool,
     ) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let job_id = job.job_id;
@@ -770,7 +771,7 @@ impl Database {
             )?),
             SqlArg::Text(job.engine.as_str().to_string()),
         ];
-        self.run_sql_blocking(async move {
+        let result = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
                 &datastore,
                 "materialize_active_job_with_file_identities",
@@ -778,6 +779,12 @@ impl Database {
                     let args = args.clone();
                     let identities = identities.clone();
                     Box::pin(async move {
+                        if restart {
+                            let deleted = crate::history::persistence::delete_job_history_bundles_tx(tx, &[job_id]).await?;
+                            if deleted.is_empty() {
+                                return Err(StateError::Database("restart history row disappeared".into()));
+                            }
+                        }
                         if let Some(generation) = semantic_materialization_generation {
                             let lock = match tx {
                                 SqlTx::Postgres(_) => " FOR UPDATE",
@@ -895,7 +902,13 @@ impl Database {
                 },
             )
             .await
-        })
+        });
+        if restart && matches!(result, Ok(true)) {
+            self.forget_script_effects_for(&[job_id.0]);
+            self.invalidate_job_history_cache_for(&[job_id.0]);
+            self.notify_script_events_changed();
+        }
+        result
     }
 
     pub(crate) fn refresh_script_job_inputs(
@@ -936,9 +949,13 @@ impl Database {
             SqlRuntime::run_in_transaction(&datastore, "update_active_job", |tx| {
                 let update = update.clone();
                 Box::pin(async move {
-                    tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
+                    tx.execute(
+                        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+                        &[],
+                    )
+                    .await?;
                     let mut rewritten_effects = None;
-                    match update.category {
+                    match &update.category {
                         FieldUpdate::Unchanged => {}
                         FieldUpdate::Clear => {
                             tx.execute(
@@ -950,42 +967,86 @@ impl Database {
                         FieldUpdate::Set(category) => {
                             tx.execute(
                                 "UPDATE active_jobs SET category = {} WHERE job_id = {}",
-                                &[SqlArg::Text(category), SqlArg::I64(job_id.0 as i64)],
+                                &[SqlArg::Text(category.clone()), SqlArg::I64(job_id.0 as i64)],
                             )
                             .await?;
                         }
                     }
 
-                    if !matches!(update.metadata, FieldUpdate::Unchanged) {
-                        tx.execute("UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1", &[]).await?;
-                        if let Some(row) = tx.fetch_optional("SELECT state FROM script_job_state WHERE job_id = {}", &[SqlArg::I64(job_id.0 as i64)]).await? {
-                            let mut effects: crate::post_processing::effects::JobScriptEffects = serde_json::from_str(&row.text("state")?).map_err(|error| StateError::Database(error.to_string()))?;
-                            let metadata = match &update.metadata { FieldUpdate::Set(values) => values.clone(), _ => Vec::new() };
-                            for value in effects.parameters.values_mut() { value.clear(); }
-                            effects.parameters.extend(metadata);
-                            tx.execute("UPDATE script_job_state SET state = {} WHERE job_id = {}", &[SqlArg::Text(serde_json::to_string(&effects).map_err(|error| StateError::Database(error.to_string()))?), SqlArg::I64(job_id.0 as i64)]).await?;
-                            rewritten_effects = Some(effects);
-                        }
-                    }
-                    match update.metadata {
-                        FieldUpdate::Unchanged => {}
-                        FieldUpdate::Clear => {
-                            tx.execute(
-                                "UPDATE active_jobs SET metadata = NULL WHERE job_id = {}",
+                    if (!matches!(update.metadata, FieldUpdate::Unchanged)
+                        || !update.metadata_edits.is_empty()
+                        || update.name.is_some())
+                        && let Some(active) = tx
+                            .fetch_optional(
+                                "SELECT metadata FROM active_jobs WHERE job_id = {}",
                                 &[SqlArg::I64(job_id.0 as i64)],
                             )
-                            .await?;
+                            .await?
+                    {
+                        let mut metadata: Vec<(String, String)> = active
+                            .opt_text("metadata")?
+                            .map(|text| serde_json::from_str(&text).map_err(db_err))
+                            .transpose()?
+                            .unwrap_or_default();
+                        update.apply_to_metadata(&mut metadata);
+                        if let Some(name) = &update.name {
+                            crate::ingest::set_renamed_title(&mut metadata, name);
                         }
-                        FieldUpdate::Set(metadata) => {
+                        if let Some(row) = tx
+                            .fetch_optional(
+                                "SELECT state FROM script_job_state WHERE job_id = {}",
+                                &[SqlArg::I64(job_id.0 as i64)],
+                            )
+                            .await?
+                        {
+                            let mut effects: crate::post_processing::effects::JobScriptEffects =
+                                serde_json::from_str(&row.text("state")?)
+                                    .map_err(|error| StateError::Database(error.to_string()))?;
+                            if !matches!(update.metadata, FieldUpdate::Unchanged) {
+                                for value in effects.parameters.values_mut() {
+                                    value.clear();
+                                }
+                                effects.parameters.extend(metadata.clone());
+                            } else {
+                                let renamed = update.name.as_ref().map(|name| {
+                                    (
+                                        crate::ingest::RENAMED_TITLE_METADATA_KEY.to_string(),
+                                        Some(name.clone()),
+                                    )
+                                });
+                                for (key, value) in
+                                    update.metadata_edits.iter().chain(renamed.iter())
+                                {
+                                    for (existing, previous) in &mut effects.parameters {
+                                        if existing.eq_ignore_ascii_case(key) {
+                                            previous.clear();
+                                        }
+                                    }
+                                    effects
+                                        .parameters
+                                        .insert(key.clone(), value.clone().unwrap_or_default());
+                                }
+                            }
                             tx.execute(
-                                "UPDATE active_jobs SET metadata = {} WHERE job_id = {}",
+                                "UPDATE script_job_state SET state = {} WHERE job_id = {}",
                                 &[
-                                    SqlArg::OptText(metadata_json(&metadata)?),
+                                    SqlArg::Text(serde_json::to_string(&effects).map_err(
+                                        |error| StateError::Database(error.to_string()),
+                                    )?),
                                     SqlArg::I64(job_id.0 as i64),
                                 ],
                             )
                             .await?;
+                            rewritten_effects = Some(effects);
                         }
+                        tx.execute(
+                            "UPDATE active_jobs SET metadata = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(metadata_json(&metadata)?),
+                                SqlArg::I64(job_id.0 as i64),
+                            ],
+                        )
+                        .await?;
                     }
 
                     // Password override column: NULL = no override (restore
@@ -3468,7 +3529,7 @@ mod tests {
                     .create_active_job_with_file_identities(&job, &[])
                     .unwrap(),
                 _ => assert!(
-                    db.materialize_active_job_with_file_identities(&job, &[], None, None)
+                    db.materialize_admission(&job, &[], None, None, false)
                         .unwrap()
                 ),
             }
@@ -3493,6 +3554,183 @@ mod tests {
         assert!(db.has_encrypted_credentials().unwrap());
         db.validate_encrypted_credentials(db.encryption_key().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn metadata_edits_preserve_newer_script_parameters_and_refresh_effects() {
+        use crate::post_processing::effects::JobScriptEffects;
+
+        let db = Database::open_in_memory().unwrap();
+        let mut job = sample_active_job(41);
+        job.metadata = vec![("untouched".into(), "original".into())];
+        db.create_active_job(&job).unwrap();
+        let initial = JobScriptEffects {
+            parameters: [
+                ("Priority".into(), "NORMAL".into()),
+                ("obsolete".into(), "remove me".into()),
+                ("chain".into(), "preserve me".into()),
+            ]
+            .into(),
+            directory: Some(PathBuf::from("fixture-output")),
+            ..Default::default()
+        };
+        db.save_job_script_effects(job.job_id.0, &initial).unwrap();
+        let update = JobUpdate {
+            metadata_edits: vec![
+                ("priority".into(), Some("HIGH".into())),
+                ("OBSOLETE".into(), None),
+            ],
+            name: Some("renamed fixture".into()),
+            ..Default::default()
+        };
+        // A directive commits after the intent was built but before its writer
+        // runs. The edit must patch this current row rather than an old snapshot.
+        db.save_job_script_effects(
+            job.job_id.0,
+            &JobScriptEffects {
+                parameters: [("later".into(), "new directive".into())].into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.update_active_job(job.job_id, &update).unwrap();
+
+        let metadata = db.load_active_jobs().unwrap()[&job.job_id].metadata.clone();
+        for expected in [
+            ("untouched", "original"),
+            ("chain", "preserve me"),
+            ("later", "new directive"),
+            ("priority", "HIGH"),
+        ] {
+            assert!(
+                metadata
+                    .iter()
+                    .any(|(key, value)| key == expected.0 && value == expected.1)
+            );
+        }
+        assert!(
+            !metadata
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("obsolete"))
+        );
+        assert_eq!(
+            metadata
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("priority"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            crate::ingest::renamed_title(&metadata),
+            Some("renamed fixture")
+        );
+        let effects = db.job_script_effects(job.job_id.0).unwrap();
+        assert_eq!(effects.directory, initial.directory);
+        assert_eq!(effects.parameters["chain"], "preserve me");
+        assert_eq!(effects.parameters["later"], "new directive");
+        assert_eq!(effects.parameters["Priority"], "");
+        assert_eq!(effects.parameters["priority"], "HIGH");
+        let mut replayed = metadata.clone();
+        effects.merge_parameters(&mut replayed);
+        assert!(
+            !replayed
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("obsolete"))
+        );
+        assert_eq!(
+            replayed
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("priority"))
+                .count(),
+            1
+        );
+
+        db.save_job_script_effects(
+            job.job_id.0,
+            &JobScriptEffects {
+                parameters: [("next".into(), "another directive".into())].into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let metadata = db.load_active_jobs().unwrap()[&job.job_id].metadata.clone();
+        assert!(metadata.contains(&("later".into(), "new directive".into())));
+        assert!(metadata.contains(&("priority".into(), "HIGH".into())));
+        assert!(metadata.contains(&("next".into(), "another directive".into())));
+        assert_eq!(
+            crate::ingest::renamed_title(&metadata),
+            Some("renamed fixture")
+        );
+    }
+
+    #[test]
+    fn rename_only_persists_metadata_without_replacing_other_fields() {
+        let db = Database::open_in_memory().unwrap();
+        let mut job = sample_active_job(42);
+        job.metadata = vec![("preserved".into(), "value".into())];
+        db.create_active_job(&job).unwrap();
+        db.update_active_job(
+            job.job_id,
+            &JobUpdate {
+                name: Some("new title".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let metadata = db.load_active_jobs().unwrap()[&job.job_id].metadata.clone();
+        assert!(metadata.contains(&("preserved".into(), "value".into())));
+        assert_eq!(crate::ingest::renamed_title(&metadata), Some("new title"));
+    }
+
+    #[test]
+    fn metadata_replacement_and_clear_apply_edits_after_the_replacement() {
+        use crate::post_processing::effects::JobScriptEffects;
+
+        let db = Database::open_in_memory().unwrap();
+        let job = sample_active_job(43);
+        db.create_active_job(&job).unwrap();
+        db.save_job_script_effects(
+            job.job_id.0,
+            &JobScriptEffects {
+                parameters: [("chain".into(), "old directive".into())].into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.update_active_job(
+            job.job_id,
+            &JobUpdate {
+                metadata: FieldUpdate::Set(vec![("replacement".into(), "initial".into())]),
+                metadata_edits: vec![("REPLACEMENT".into(), Some("final".into()))],
+                name: Some("replacement title".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let metadata = db.load_active_jobs().unwrap()[&job.job_id].metadata.clone();
+        assert_eq!(metadata.len(), 2);
+        assert!(metadata.contains(&("REPLACEMENT".into(), "final".into())));
+        assert_eq!(
+            crate::ingest::renamed_title(&metadata),
+            Some("replacement title")
+        );
+        assert_eq!(
+            db.job_script_effects(job.job_id.0).unwrap().parameters["chain"],
+            ""
+        );
+        db.update_active_job(
+            job.job_id,
+            &JobUpdate {
+                metadata: FieldUpdate::Clear,
+                metadata_edits: vec![("after-clear".into(), Some("value".into()))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_active_jobs().unwrap()[&job.job_id].metadata,
+            vec![("after-clear".into(), "value".into())]
+        );
     }
 
     #[test]

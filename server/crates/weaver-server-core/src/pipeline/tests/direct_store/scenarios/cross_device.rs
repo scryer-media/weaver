@@ -354,15 +354,13 @@ async fn a_cancelled_job_cleans_what_it_wrote_on_the_complete_filesystem() {
     report("cancel-before-complete", &walk(&complete_dir));
     report("cancel-before-intermediate", &walk(&intermediate_dir));
 
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJob {
-            job_id,
-            origin: crate::jobs::handle::CancellationOrigin::User,
-            reply: reply_tx,
-        })
-        .await;
-    reply_rx.await.unwrap().unwrap();
+    let reply_rx = cancel_one_job(
+        &mut pipeline,
+        job_id,
+        crate::jobs::handle::CancellationOrigin::User,
+    )
+    .await;
+    reply_rx.unwrap();
 
     // The cleanup is spawned; give it a bounded window to land.
     for _ in 0..200 {

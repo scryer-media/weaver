@@ -245,6 +245,7 @@ impl Pipeline {
             .iter()
             .find(|seg| seg.ordinal == segment_id.segment_number)?;
         Some(DownloadWork {
+            counters: None,
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
@@ -446,9 +447,6 @@ impl Pipeline {
                 Err(_) => 0,
             };
             self.rate_limiter.consume(bytes);
-            if let Err(error) = self.record_download_bandwidth_usage(bytes) {
-                error!(%error, "failed to account for retired lane transport usage");
-            }
             return false;
         }
         if result.release_connection_slot
@@ -472,7 +470,6 @@ impl Pipeline {
         if !policy_outcome && !stale_generation {
             self.record_download_lane_observation(result);
         }
-        self.active_downloads = self.active_downloads.saturating_sub(1);
         if result.release_connection_slot {
             if let Some(observation) = result.lane_observation.as_ref() {
                 let reason = if observation.connection_discarded || !observation.batch_clean {
@@ -506,28 +503,7 @@ impl Pipeline {
                 }
             }
         }
-        if result.origin.is_recovery() {
-            self.active_recovery = self.active_recovery.saturating_sub(1);
-        }
-
-        let job_id = result.job_id;
-        self.note_download_activity(job_id);
-        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_job.remove(&job_id);
-            }
-        }
-        if let Some(in_flight) = self
-            .active_downloads_by_file
-            .get_mut(&result.segment_id.file_id)
-        {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_file
-                    .remove(&result.segment_id.file_id);
-            }
-        }
+        self.note_download_activity(result.job_id);
         self.publish_active_stage_metrics();
         let actual_raw_bytes = match &result.data {
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
@@ -538,20 +514,14 @@ impl Pipeline {
             Err(_) => None,
         };
         self.reconcile_rate_limit_for_download(result.segment_id, actual_raw_bytes);
-        if let Some(raw_bytes) = actual_raw_bytes
-            && let Err(error) = self.record_download_bandwidth_usage(raw_bytes)
-        {
-            error!(
-                error = %error,
-                segment = %result.segment_id,
-                "failed to record download bandwidth usage"
-            );
-        }
         true
     }
 
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
-        if self.release_download_result(&result) {
+        let released = self.release_download_result(&result);
+        #[cfg(test)]
+        self.audit_lane_holdings();
+        if released {
             self.process_download_done(result).await;
         }
     }
@@ -1048,8 +1018,8 @@ impl Pipeline {
                     return;
                 }
                 if failure.kind == DownloadFailureKind::LaneUnavailable {
-                    // A work item whose effective exclusions (failure plus
-                    // retention) cover every server can never be served: the
+                    // A work item no server may serve (failure exclusions,
+                    // retention, credential refusals) can never be served: the
                     // order it builds is empty, so it would requeue through
                     // this arm forever without a fetch to fail. A job older
                     // than every server's retention window hits exactly this.
@@ -1057,12 +1027,12 @@ impl Pipeline {
                     let server_count = self.nntp.pool().server_count();
                     let retention_excludes = self.job_retention_excludes(job_id);
                     let unavailable_server_count = Self::unavailable_server_count_from_excludes(
-                        server_count,
+                        self.nntp.pool(),
                         &excluded_servers,
                         &retention_excludes,
                     );
                     if server_count > 0 && unavailable_server_count >= server_count {
-                        self.message_id_unavailable(result.segment_id, &excluded_servers);
+                        self.book_unservable_segment(result.segment_id, &excluded_servers);
                         self.maybe_finish_download_pass(job_id);
                         return;
                     }
@@ -1227,14 +1197,19 @@ impl Pipeline {
                     };
                 let source_not_found = failure.kind == DownloadFailureKind::ArticleNotFound
                     && article_not_found_server_idx.is_some();
-                let retry_exclude_servers = if failure.kind == DownloadFailureKind::ArticleNotFound
-                {
-                    Self::decode_retry_exclude_servers(
+                // A server refusing the credentials has answered for the
+                // article just as a 430 does: it leaves the article's
+                // candidates, and the retry goes to a server that may still
+                // serve it, if one remains.
+                let retry_exclude_servers = match failure.kind {
+                    DownloadFailureKind::ArticleNotFound => Self::decode_retry_exclude_servers(
                         &excluded_servers,
                         article_not_found_server_idx,
-                    )
-                } else {
-                    excluded_servers.clone()
+                    ),
+                    DownloadFailureKind::Auth => {
+                        Self::decode_retry_exclude_servers(&excluded_servers, source_server_idx)
+                    }
+                    _ => excluded_servers.clone(),
                 };
                 // A 430 from a server the article already excluded taught
                 // the retry nothing: the next attempt re-enters selection
@@ -1266,6 +1241,10 @@ impl Pipeline {
                         .articles_not_found_without_new_server
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                // No server left that may serve it once the refusal is
+                // counted: a verdict, booked now, not a retry to wait on.
+                let credentials_exhausted = failure.kind == DownloadFailureKind::Auth
+                    && self.no_server_can_serve(job_id, &retry_exclude_servers);
 
                 // Transport rotation: point the retry away from the server
                 // whose established connection just failed, when an
@@ -1300,7 +1279,26 @@ impl Pipeline {
                 };
 
                 if article_not_found_exhausted {
-                    self.message_id_unavailable(result.segment_id, &retry_exclude_servers);
+                    // Every server is missing the id in use: the article moves
+                    // to its next id, or with every id spent is booked missing.
+                    if !self.spend_message_id(result.segment_id) {
+                        self.metrics
+                            .articles_not_found
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.send_segment_event(|| PipelineEvent::ArticleNotFound {
+                            segment_id: result.segment_id,
+                        });
+                        if self.book_failed_segment(result.segment_id) {
+                            self.note_gap_servers_support_fact(job_id, &retry_exclude_servers);
+                        }
+                    }
+                } else if credentials_exhausted {
+                    self.book_unservable_segment(result.segment_id, &retry_exclude_servers);
+                    // The refusal holds for the job's queued articles too:
+                    // every one only refusing servers could serve is booked
+                    // in this pass, not leased one batch at a time to be
+                    // refused again.
+                    self.retire_unservable_queued_work(job_id);
                 } else {
                     let seg_id = result.segment_id;
                     let completion_critical = self.segment_is_completion_critical(seg_id);
@@ -1356,6 +1354,7 @@ impl Pipeline {
                         {
                             let priority = file_spec.role.download_priority();
                             let work = DownloadWork {
+                                counters: None,
                                 segment_id: seg_id,
                                 message_id: crate::jobs::ids::MessageId::new(
                                     seg_spec.message_ids.in_use(),

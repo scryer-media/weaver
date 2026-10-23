@@ -2422,19 +2422,21 @@ async fn nested_rar_three_deep_extracts_through_inner_7z() {
     let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
     write_and_complete_rar_volume(&mut pipeline, job_id, 0, fixture_name, &fixture_bytes).await;
 
-    let (reply, received) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(crate::pipeline::SchedulerCommand::PausePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     pipeline.check_job_completion(job_id).await;
     assert!(pipeline.deferred_post_processing.contains(&job_id));
     assert_eq!(pipeline.jobs[&job_id].extraction_depth, 0);
-    let (reply, received) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(crate::pipeline::SchedulerCommand::ResumePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.pending_completion_checks.contains(&job_id));
     drive_extractions_to_terminal(&mut pipeline, job_id, 6).await;
 
@@ -2503,11 +2505,12 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     pipeline.jobs.insert(job_id, state);
     pipeline.job_order.push(job_id);
 
-    let (reply, received) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(crate::pipeline::SchedulerCommand::PausePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(
         pipeline
             .maybe_start_nested_extraction(job_id)
@@ -2518,11 +2521,12 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     assert_eq!(pipeline.jobs[&job_id].extraction_depth, 0);
     assert!(!pipeline.inflight_extractions.contains_key(&job_id));
     assert!(staging_dir.join("release.nfo.xz").exists());
-    let (reply, received) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(crate::pipeline::SchedulerCommand::ResumePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
 
     assert!(pipeline.pending_completion_checks.contains(&job_id));
     assert!(matches!(
@@ -3117,7 +3121,7 @@ async fn list_jobs_keeps_legacy_idle_post_state_for_waiting_rar_phase() {
     assert_eq!(info.status, JobStatus::Downloading);
     assert_eq!(
         info.download_state,
-        crate::jobs::model::DownloadState::Queued
+        crate::jobs::model::DownloadState::Downloading
     );
     assert_eq!(info.post_state, crate::jobs::model::PostState::Idle);
 }

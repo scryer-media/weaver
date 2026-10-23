@@ -379,6 +379,16 @@ fn render_pipeline_totals(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.nntp_generation_recovery_requeues,
     );
+    out.sample(
+        &f::DOWNLOAD_DISPATCH_STALL_RECOVERIES,
+        &[("action", "kick")],
+        snapshot.download_dispatch_stall_kicks,
+    );
+    out.sample(
+        &f::DOWNLOAD_DISPATCH_STALL_RECOVERIES,
+        &[("action", "release")],
+        snapshot.download_dispatch_stall_releases,
+    );
 
     for (kind, value) in [
         (
@@ -1434,6 +1444,7 @@ fn render_job_lifecycle(out: &mut Encoder, lifecycle: &JobLifecycleMetricsSnapsh
 }
 
 fn render_pipeline_histograms(out: &mut Encoder, histograms: &PipelineHistogramsSnapshot) {
+    render_histogram(out, &f::TURN_DURATION, &[], &histograms.turn_duration);
     render_histogram(
         out,
         &f::DISK_WRITE_DURATION,

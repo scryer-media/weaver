@@ -240,6 +240,13 @@ impl PostProcessingExecutor {
 
     // Signal every in-flight script for `job_id` to stop, the ones nothing
     // waits for included. Returns whether a pass was there to stop.
+    pub(crate) fn has_cancellable_job(&self, job_id: u64) -> bool {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&job_id)
+    }
+
     pub fn cancel_job(&self, job_id: u64) -> bool {
         self.db.cancel_background_scripts(job_id);
         let sender = self

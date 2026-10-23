@@ -262,7 +262,7 @@ fn nzbget_hidden_history_keeps_duplicate_identity() {
 }
 
 #[test]
-fn user_delete_all_history_forgets_only_history_identities() {
+fn user_batch_history_delete_forgets_only_history_identities() {
     let db = Database::open_in_memory().unwrap();
     let first_spec = spec(vec![vec![("one@example", 10)]]);
     let second_spec = spec(vec![vec![("two@example", 10)]]);
@@ -287,10 +287,12 @@ fn user_delete_all_history_forgets_only_history_identities() {
         .unwrap();
     db.insert_job_history(&history(second.0, "failed")).unwrap();
 
+    // The active job has no history row, so the batch skips it and its
+    // identity stays.
     assert_eq!(
-        db.delete_all_job_history_and_forget_duplicate_identities()
+        db.delete_job_histories_and_forget_duplicate_identities(&[first, second, active])
             .unwrap(),
-        2
+        vec![first, second]
     );
     assert!(db.duplicate_snapshot(first).unwrap().is_none());
     assert!(db.duplicate_snapshot(second).unwrap().is_none());
@@ -300,6 +302,70 @@ fn user_delete_all_history_forgets_only_history_identities() {
             .unwrap(),
         DuplicateAdmission::Accepted { .. }
     ));
+}
+
+#[test]
+fn batched_history_delete_sweeps_every_emptied_group_and_keeps_the_rest() {
+    let db = Database::open_in_memory().unwrap();
+    let candidate = |db: &Database, byte: u8, key: &str| match db
+        .admit_duplicate_submission(&score_request(
+            &spec(vec![vec![(&*format!("{key}-{byte}@example"), 10)]]),
+            byte,
+            key,
+            10,
+        ))
+        .unwrap()
+    {
+        DuplicateAdmission::Accepted { job_id, .. } => {
+            db.activate_duplicate_admission(job_id).unwrap();
+            job_id
+        }
+        DuplicateAdmission::Parked { job_id, .. } => job_id,
+        outcome => panic!("expected an admitted candidate, got {outcome:?}"),
+    };
+    // Group B is founded first, so its id is not the highest one: a fresh
+    // group for the same key can only get a new id if the old row is gone.
+    let b1 = candidate(&db, 31, "group-b");
+    let b2 = candidate(&db, 32, "group-b");
+    let a1 = candidate(&db, 33, "group-a");
+    let a2 = candidate(&db, 34, "group-a");
+    let group_b = db
+        .semantic_candidate_snapshot(b1)
+        .unwrap()
+        .unwrap()
+        .group_id;
+    let group_a = db
+        .semantic_candidate_snapshot(a2)
+        .unwrap()
+        .unwrap()
+        .group_id;
+    for job_id in [b1, b2, a1] {
+        db.insert_job_history(&history(job_id.0, "complete"))
+            .unwrap();
+    }
+
+    assert_eq!(
+        db.delete_job_histories_and_forget_duplicate_identities(&[b1, b2, a1])
+            .unwrap(),
+        vec![b1, b2, a1]
+    );
+
+    // Group A still has a member, so the sweep keeps it.
+    let survivor = db.semantic_candidate_snapshot(a2).unwrap().unwrap();
+    assert_eq!(survivor.group_id, group_a);
+    assert_eq!(survivor.normalized_key, "group-a");
+    for job_id in [b1, b2, a1] {
+        assert!(db.semantic_candidate_snapshot(job_id).unwrap().is_none());
+    }
+    // Both of group B's members went in the one batch; the sweep after them
+    // removed the emptied group, so the key founds a new one.
+    let refounded = candidate(&db, 35, "group-b");
+    let refounded_group = db
+        .semantic_candidate_snapshot(refounded)
+        .unwrap()
+        .unwrap()
+        .group_id;
+    assert_ne!(refounded_group, group_b);
 }
 
 #[test]

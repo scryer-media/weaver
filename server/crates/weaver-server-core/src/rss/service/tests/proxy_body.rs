@@ -54,7 +54,7 @@ async fn truncated_nzb_body_is_not_submitted_or_spliced_and_does_not_blame_the_r
             .iter()
             .all(|leg| leg.health == crate::proxies::LegHealthState::Up)
     );
-    assert!(submissions.lock().unwrap().is_empty());
+    assert!(submissions.list_jobs().is_empty());
     task.await.unwrap();
     runtime.stop_all().await;
 }

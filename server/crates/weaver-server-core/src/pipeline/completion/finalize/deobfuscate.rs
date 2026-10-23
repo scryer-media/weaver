@@ -19,6 +19,10 @@
 // before the move reports done, so post-processing, history and the completion
 // event all observe the final names.
 //
+// A delivered file whose name has no extension, renamed or not, takes the
+// extension its leading bytes identify: importers walk a delivery by
+// extension and pass over a payload without one.
+//
 // The pass never fails a job. Every step degrades to "leave the name alone".
 
 use std::collections::HashMap;
@@ -76,8 +80,9 @@ pub(crate) struct SrrdbInputs {
     pub(crate) proxies: Option<Arc<ProxyRuntime>>,
 }
 
-// Renames the delivery's payload when it still wears an obfuscated name.
-// Returns the renames applied, each with the full name it gave.
+// Renames the delivery's payload when it still wears an obfuscated name,
+// and names every file without an extension by its content. Returns the
+// renames applied, each with the full name it gave.
 //
 // `policy` is the unwanted extension policy the delivery was scanned under.
 // A payload it refuses, or an executable, is never named after the job.
@@ -89,7 +94,16 @@ pub(super) async fn rename_obfuscated_members(
 ) -> Vec<FileRename> {
     let files = {
         let root = root.to_path_buf();
-        match tokio::task::spawn_blocking(move || scan_delivery(&root)).await {
+        match tokio::task::spawn_blocking(move || {
+            let files = scan_delivery(&root);
+            let extensions: Vec<_> = files
+                .iter()
+                .map(|(relative_path, _)| content_extension(&root, relative_path))
+                .collect();
+            (files, extensions)
+        })
+        .await
+        {
             Ok(files) => files,
             Err(error) => {
                 warn!(
@@ -101,30 +115,36 @@ pub(super) async fn rename_obfuscated_members(
             }
         }
     };
+    let (files, extensions) = files;
     if files.is_empty() {
         return Vec::new();
     }
 
     let entries: Vec<DeliveredFile<'_>> = files
         .iter()
-        .map(|(relative_path, bytes)| DeliveredFile {
+        .zip(&extensions)
+        .map(|((relative_path, bytes), extension)| DeliveredFile {
             relative_path,
             bytes: *bytes,
+            content_extension: *extension,
         })
         .collect();
-    let Some(candidate) = weaver_nzb::select_rename_candidate(&entries, |name| {
+    let mut renames = match weaver_nzb::select_rename_candidate(&entries, |name| {
         policy.unacceptable_extension_match(name).is_some()
-    }) else {
-        return Vec::new();
+    }) {
+        Some(candidate) => {
+            let candidate_path = entries[candidate].relative_path;
+            match resolve_target_name(job_id, candidate_path, plan).await {
+                Some((target_stem, full_stem)) => {
+                    weaver_nzb::plan_renames(&entries, candidate, &target_stem, &full_stem)
+                }
+                None => Vec::new(),
+            }
+        }
+        None => Vec::new(),
     };
-    let candidate_path = entries[candidate].relative_path;
-
-    let target = resolve_target_name(job_id, candidate_path, plan).await;
-    let Some((target_stem, full_stem)) = target else {
-        return Vec::new();
-    };
-
-    let renames = weaver_nzb::plan_renames(&entries, candidate, &target_stem, &full_stem);
+    let named_by_content = weaver_nzb::plan_content_extensions(&entries, &renames);
+    renames.extend(named_by_content);
     if renames.is_empty() {
         return Vec::new();
     }
@@ -479,6 +499,23 @@ fn scan_delivery(root: &Path) -> Vec<(String, u64)> {
     files
 }
 
+// The extension a delivered file's content identifies, read only for a
+// file whose name has none. Unreadable or unknown bytes name nothing.
+fn content_extension(root: &Path, relative_path: &str) -> Option<&'static str> {
+    use std::io::Read;
+
+    let name = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    if !weaver_nzb::lacks_extension(name) {
+        return None;
+    }
+    let file = std::fs::File::open(root.join(relative_path)).ok()?;
+    let mut head = Vec::with_capacity(weaver_nzb::SNIFF_BYTES);
+    file.take(weaver_nzb::SNIFF_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    weaver_nzb::sniff_extension(&head)
+}
+
 fn apply_renames(job_id: JobId, root: &Path, renames: Vec<PlannedRename>) -> Vec<FileRename> {
     let mut applied = Vec::new();
     for rename in renames {
@@ -501,7 +538,7 @@ fn apply_renames(job_id: JobId, root: &Path, renames: Vec<PlannedRename>) -> Vec
                     job_id = job_id.0,
                     from = %rename.from,
                     to = %rename.to,
-                    "renamed an obfuscated delivered member"
+                    "renamed a delivered member"
                 );
                 applied.push(FileRename {
                     from: rename.from,
@@ -556,6 +593,22 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(bytes).unwrap();
     }
+
+    // A sparse file of `bytes` whose head is `head`.
+    fn write_file_with_head(root: &Path, relative_path: &str, bytes: u64, head: &[u8]) {
+        use std::io::Write;
+
+        write_file(root, relative_path, bytes);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(relative_path))
+            .unwrap();
+        file.write_all(head).unwrap();
+    }
+
+    // The start of a Matroska EBML header.
+    const MATROSKA_HEAD: &[u8] =
+        b"\x1A\x45\xDF\xA3\xA3\x42\x86\x81\x01\x42\x82\x88matroska\x42\x87\x81\x04";
 
     fn delivered_names(root: &Path) -> Vec<String> {
         let mut names: Vec<String> = scan_delivery(root)
@@ -939,6 +992,108 @@ mod tests {
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.iso".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extensionless_member_takes_the_job_name_and_its_content_extension() {
+        let root = tempfile::tempdir().unwrap();
+        write_file_with_head(root.path(), "Yb5drZSkNi20UCMkb", 64 * MIB, MATROSKA_HEAD);
+
+        let renamed = rename_obfuscated_members(
+            JobId(12),
+            root.path(),
+            &plan("Silver Horizon S01E03"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
+
+        assert_eq!(
+            renamed,
+            vec![FileRename {
+                from: "Yb5drZSkNi20UCMkb".to_string(),
+                to: "Silver Horizon S01E03.mkv".to_string(),
+                full_name: "Silver Horizon S01E03.mkv".to_string(),
+            }]
+        );
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Silver Horizon S01E03.mkv".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_readable_extensionless_member_takes_its_content_extension() {
+        let root = tempfile::tempdir().unwrap();
+        write_file_with_head(
+            root.path(),
+            "Silver Horizon S01E03",
+            64 * MIB,
+            MATROSKA_HEAD,
+        );
+
+        let renamed = rename_obfuscated_members(
+            JobId(13),
+            root.path(),
+            &plan("Quiet Harbour"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
+
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Silver Horizon S01E03.mkv".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extensionless_member_of_unknown_content_keeps_its_name() {
+        let root = tempfile::tempdir().unwrap();
+        write_file_with_head(
+            root.path(),
+            "Silver Horizon S01E03",
+            64 * MIB,
+            b"nothing a sniff knows",
+        );
+
+        let renamed = rename_obfuscated_members(
+            JobId(14),
+            root.path(),
+            &plan("Quiet Harbour"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
+
+        assert_eq!(renamed.len(), 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Silver Horizon S01E03".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_member_with_a_real_extension_keeps_it_whatever_its_content() {
+        let root = tempfile::tempdir().unwrap();
+        write_file_with_head(
+            root.path(),
+            "Silver.Horizon.S01E03.avi",
+            64 * MIB,
+            MATROSKA_HEAD,
+        );
+
+        let renamed = rename_obfuscated_members(
+            JobId(15),
+            root.path(),
+            &plan("Quiet Harbour"),
+            &PostProcessingSettings::default(),
+        )
+        .await;
+
+        assert_eq!(renamed.len(), 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Silver.Horizon.S01E03.avi".to_string()]
         );
     }
 

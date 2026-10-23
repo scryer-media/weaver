@@ -175,19 +175,8 @@ impl Database {
     }
 
     pub fn delete_job_history(&self, job_id: u64) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "delete_job_history_bundle", |tx| {
-                Box::pin(async move { delete_job_history_bundle_tx(tx, JobId(job_id)).await })
-            })
-            .await
-        });
-        if result.as_ref().is_ok_and(|changed| *changed) {
-            self.forget_script_effects(job_id);
-            self.invalidate_job_history_cache(job_id);
-            self.notify_script_events_changed();
-        }
-        result
+        self.delete_job_history_bundles(&[JobId(job_id)], false)
+            .map(|deleted| !deleted.is_empty())
     }
 
     // Permanently removes visible history and the duplicate identity it owns.
@@ -197,86 +186,61 @@ impl Database {
         &self,
         job_id: u64,
     ) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(
-                &datastore,
-                "delete_job_history_and_duplicate_identity",
-                |tx| {
-                    Box::pin(async move {
-                        let job_id = JobId(job_id);
-                        if !delete_job_history_bundle_tx(tx, job_id).await? {
-                            return Ok(false);
-                        }
-                        crate::jobs::duplicate_persistence::forget_duplicate_identity_for_history_delete_tx(
-                            tx, job_id,
-                        )
-                        .await?;
-                        Ok(true)
-                    })
-                },
-            )
-            .await
-        });
-        if result.as_ref().is_ok_and(|changed| *changed) {
-            self.forget_script_effects(job_id);
-            self.invalidate_job_history_cache(job_id);
-            self.notify_script_events_changed();
-        }
-        result
+        self.delete_job_histories_and_forget_duplicate_identities(&[JobId(job_id)])
+            .map(|deleted| !deleted.is_empty())
     }
 
-    pub fn delete_all_job_history(&self) -> Result<usize, StateError> {
+    // The batched form of `delete_job_history_and_forget_duplicate_identity`:
+    // every id's history bundle and duplicate identity go in one transaction.
+    // Returns the ids that had a history row; an id without one is skipped.
+    pub fn delete_job_histories_and_forget_duplicate_identities(
+        &self,
+        job_ids: &[JobId],
+    ) -> Result<Vec<JobId>, StateError> {
+        self.delete_job_history_bundles(job_ids, true)
+    }
+
+    fn delete_job_history_bundles(
+        &self,
+        job_ids: &[JobId],
+        forget_duplicate_identities: bool,
+    ) -> Result<Vec<JobId>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let datastore = self.datastore();
+        // Deduped so no chunk or tombstone insert names an id twice.
+        let job_ids = job_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "delete_all_job_history_bundles", |tx| {
-                Box::pin(async move { delete_all_job_history_bundles_tx(tx).await })
+            SqlRuntime::run_in_transaction(&datastore, "delete_job_history_bundles", |tx| {
+                let job_ids = job_ids.clone();
+                Box::pin(async move {
+                    let deleted = delete_job_history_bundles_tx(tx, &job_ids).await?;
+                    if forget_duplicate_identities {
+                        crate::jobs::duplicate_persistence::forget_duplicate_identities_for_history_delete_tx(
+                            tx, &deleted,
+                        )
+                        .await?;
+                    }
+                    Ok(deleted)
+                })
             })
             .await
         });
-        if result.as_ref().is_ok_and(|job_ids| !job_ids.is_empty()) {
-            for id in result.as_ref().unwrap() {
-                self.forget_script_effects(id.0);
-            }
-            self.clear_job_history_cache();
+        if let Ok(deleted) = &result
+            && !deleted.is_empty()
+        {
+            let ids = deleted.iter().map(|id| id.0).collect::<Vec<_>>();
+            self.forget_script_effects_for(&ids);
+            self.invalidate_job_history_cache_for(&ids);
             self.notify_script_events_changed();
         }
-        result.map(|job_ids| job_ids.len())
-    }
-
-    // Permanently removes all visible history and each associated duplicate
-    // identity in the same transaction.
-    pub fn delete_all_job_history_and_forget_duplicate_identities(
-        &self,
-    ) -> Result<usize, StateError> {
-        let datastore = self.datastore();
-        let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(
-                &datastore,
-                "delete_all_job_history_and_duplicate_identities",
-                |tx| {
-                    Box::pin(async move {
-                        let job_ids = delete_all_job_history_bundles_tx(tx).await?;
-                        for job_id in &job_ids {
-                            crate::jobs::duplicate_persistence::forget_duplicate_identity_for_history_delete_tx(
-                                tx, *job_id,
-                            )
-                            .await?;
-                        }
-                        Ok(job_ids)
-                    })
-                },
-            )
-            .await
-        });
-        if result.as_ref().is_ok_and(|ids| !ids.is_empty()) {
-            for id in result.as_ref().unwrap() {
-                self.forget_script_effects(id.0);
-            }
-            self.clear_job_history_cache();
-            self.notify_script_events_changed();
-        }
-        result.map(|ids| ids.len())
+        result
     }
 
     pub fn insert_integration_events(
@@ -340,95 +304,69 @@ impl Database {
     }
 }
 
-async fn delete_job_history_bundle_tx(
+// Deletes the history bundle of every id that has a history row, and
+// returns those ids. Each chunk runs one `IN (...)` statement per table; the
+// `script_output_state` lock is taken once, first, in the same order as
+// insertion takes it.
+pub(crate) async fn delete_job_history_bundles_tx(
     tx: &mut SqlTx<'_>,
-    job_id: JobId,
-) -> Result<bool, StateError> {
-    tx.execute(
-        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
-        &[],
-    )
-    .await?;
-    let job_id =
-        i64::try_from(job_id.0).map_err(|_| StateError::Database("job id is too large".into()))?;
-    let lock_sql = match tx {
-        SqlTx::Postgres(_) => "SELECT job_id FROM job_history WHERE job_id = {} FOR UPDATE",
-        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history WHERE job_id = {}",
-    };
-    if tx
-        .fetch_optional(lock_sql, &[SqlArg::I64(job_id)])
-        .await?
-        .is_none()
-    {
-        return Ok(false);
-    }
-    tx.execute(
-        "DELETE FROM job_events WHERE job_id = {}",
-        &[SqlArg::I64(job_id)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM job_history_attributes WHERE job_id = {}",
-        &[SqlArg::I64(job_id)],
-    )
-    .await?;
-    crate::post_processing::output::delete_script_state_tx(tx, job_id).await?;
-    Ok(tx
-        .execute(
-            "DELETE FROM job_history WHERE job_id = {}",
-            &[SqlArg::I64(job_id)],
-        )
-        .await?
-        > 0)
-}
-
-async fn delete_all_job_history_bundles_tx(tx: &mut SqlTx<'_>) -> Result<Vec<JobId>, StateError> {
-    tx.execute(
-        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
-        &[],
-    )
-    .await?;
-    let lock_sql = match tx {
-        SqlTx::Postgres(_) => "SELECT job_id FROM job_history FOR UPDATE",
-        SqlTx::Sqlite(_) => "SELECT job_id FROM job_history",
-    };
-    let history = tx.fetch_all(lock_sql, &[]).await?;
-    if history.is_empty() {
+    job_ids: &[JobId],
+) -> Result<Vec<JobId>, StateError> {
+    if job_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let job_ids = history
+    tx.execute(
+        "UPDATE script_output_state SET next_seq = next_seq WHERE singleton = 1",
+        &[],
+    )
+    .await?;
+    let ids = job_ids
         .iter()
-        .map(|row| {
-            row.i64("job_id")
-                .and_then(|value| {
-                    u64::try_from(value)
-                        .map_err(|_| StateError::Database("job id is negative".into()))
-                })
-                .map(JobId)
+        .map(|job_id| {
+            i64::try_from(job_id.0).map_err(|_| StateError::Database("job id is too large".into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    tx.execute(
-        "DELETE FROM job_events
-          WHERE EXISTS (
-              SELECT 1 FROM job_history h WHERE h.job_id = job_events.job_id
-          )",
-        &[],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM job_history_attributes
-          WHERE EXISTS (
-              SELECT 1 FROM job_history h
-               WHERE h.job_id = job_history_attributes.job_id
-          )",
-        &[],
-    )
-    .await?;
-    for job_id in &job_ids {
-        crate::post_processing::output::delete_script_state_tx(tx, job_id.0 as i64).await?;
+    let mut deleted = Vec::new();
+    for chunk in ids.chunks(max_rows_for_tx(tx, 1)) {
+        let placeholders = vec!["{}"; chunk.len()].join(", ");
+        let lock_sql = match tx {
+            SqlTx::Postgres(_) => {
+                format!(
+                    "SELECT job_id FROM job_history WHERE job_id IN ({placeholders}) FOR UPDATE"
+                )
+            }
+            SqlTx::Sqlite(_) => {
+                format!("SELECT job_id FROM job_history WHERE job_id IN ({placeholders})")
+            }
+        };
+        let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+        let present = tx
+            .fetch_all(&lock_sql, &args)
+            .await?
+            .iter()
+            .map(|row| row.i64("job_id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if present.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["{}"; present.len()].join(", ");
+        let args = present.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+        for table in ["job_events", "job_history_attributes"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE job_id IN ({placeholders})"),
+                &args,
+            )
+            .await?;
+        }
+        crate::post_processing::output::delete_script_state_rows_tx(tx, &present).await?;
+        tx.execute(
+            &format!("DELETE FROM job_history WHERE job_id IN ({placeholders})"),
+            &args,
+        )
+        .await?;
+        deleted.extend(present.into_iter().map(|id| JobId(id as u64)));
     }
-    tx.execute("DELETE FROM job_history", &[]).await?;
-    Ok(job_ids)
+    Ok(deleted)
 }
 
 fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {

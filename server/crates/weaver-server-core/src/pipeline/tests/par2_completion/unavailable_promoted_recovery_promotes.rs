@@ -113,6 +113,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
             .commit_segment(0, 64)
             .unwrap();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: first_segment,
             message_id: MessageId::new("fallback-recovery-small@example.com"),
             groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
@@ -125,6 +126,7 @@ async fn unavailable_promoted_recovery_promotes_next_candidate_before_failing() 
             avoid_server: None,
         });
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: second_segment,
             message_id: MessageId::new("fallback-recovery-large@example.com"),
             groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),

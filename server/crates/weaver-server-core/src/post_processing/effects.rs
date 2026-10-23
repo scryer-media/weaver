@@ -127,6 +127,10 @@ impl Database {
     }
 
     pub(crate) fn forget_script_effects(&self, job_id: u64) {
+        self.forget_script_effects_for(&[job_id]);
+    }
+
+    pub(crate) fn forget_script_effects_for(&self, job_ids: &[u64]) {
         let _writer = self
             .script_runtime
             .effects_writer
@@ -139,7 +143,9 @@ impl Database {
             .unwrap_or_else(|error| error.into_inner())
             .as_mut()
         {
-            cache.remove(&job_id);
+            for job_id in job_ids {
+                cache.remove(job_id);
+            }
         }
     }
 

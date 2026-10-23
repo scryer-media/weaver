@@ -216,10 +216,9 @@ pub struct LaneDiagnostics {
 impl Pipeline {
     // Copy the read-only diagnostics snapshot out of the actor.
     //
-    // `&self`, deliberately: the command handler must not be able to mutate
-    // anything on the way to answering.
+    // Diagnostics reads must not advance the independent rate windows.
     pub(crate) fn diagnostics_snapshot(&self) -> PipelineDiagnostics {
-        let metrics = self.metrics.snapshot();
+        let metrics = self.metrics.raw_snapshot();
         let now = std::time::Instant::now();
         let retry_now = tokio::time::Instant::now();
         let captured_at_epoch_ms = crate::jobs::epoch_ms_now();

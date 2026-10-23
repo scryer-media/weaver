@@ -114,9 +114,6 @@ impl Pipeline {
         reason: DemotionReason,
         handoffs: &[SegmentId],
     ) {
-        // A batch of the job's files still out to the disk owner would land
-        // over the sweep's image: it lands first.
-        self.settle_segment_writes_for_job(job_id).await;
         // Read before the claim, so the set being demoted is counted among the
         // sets that were sharing the holds limits when it gave up.
         let live_sets = self.direct_store.live_set_count();
@@ -1356,6 +1353,7 @@ impl Pipeline {
                         continue;
                     }
                     work.push(DownloadWork {
+                        counters: None,
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(segment.message_ids.in_use()),
                         groups: std::sync::Arc::from(file.groups.as_slice()),
@@ -1372,9 +1370,26 @@ impl Pipeline {
             state.downloaded_bytes = state.downloaded_bytes.saturating_sub(lost_bytes);
         }
 
-        for (file_id, ready, contiguous_end) in unblocked {
-            self.persist_ready_segments(file_id, ready, contiguous_end)
-                .await;
+        // A write lost here is lost like any other on the decode path: the
+        // batch's bytes are gone from memory and never reach disk, so the job
+        // fails rather than waiting on, or post-processing, a file with a hole
+        // nothing will fill. The batches not yet written leave the backlog
+        // account with it, and the rest of the handback is the failed job's
+        // no longer: its queues are torn down, and nothing is owed to files a
+        // terminal job will never complete.
+        let mut unblocked = unblocked.into_iter();
+        while let Some((file_id, ready, contiguous_end)) = unblocked.next() {
+            if let Err(error) = self
+                .persist_ready_segments(file_id, ready, contiguous_end)
+                .await
+            {
+                self.release_unwritten_segments(unblocked.flat_map(|(_, ready, _)| ready));
+                self.fail_job_for_disk_write(
+                    error,
+                    "failed to write the articles a demoted volume's handback unblocked",
+                );
+                return;
+            }
         }
 
         // Only files the sweep rebuilt nothing for: everything else has legacy
@@ -1454,6 +1469,7 @@ impl Pipeline {
                         continue;
                     }
                     work.push(DownloadWork {
+                        counters: None,
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(segment.message_ids.in_use()),
                         groups: std::sync::Arc::from(file.groups.as_slice()),

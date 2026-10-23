@@ -1923,6 +1923,34 @@ fn result_from_trace(
     let completion_critical = work.completion_critical;
     let (data, attempts, source_server_idx) =
         Pipeline::download_data_from_decoded_trace(segment_id, trace);
+    if let Some(counters) = &work.counters {
+        let (wire, decoded) = match &data {
+            Ok(DownloadPayload::Raw(raw)) => (raw.len() as u64, 0),
+            Ok(DownloadPayload::Decoded(decoded)) => {
+                (decoded.raw_size, decoded.data.len_bytes() as u64)
+            }
+            Err(DownloadError::Local { raw_size, .. } | DownloadError::Decode { raw_size, .. }) => {
+                (*raw_size, 0)
+            }
+            Err(DownloadError::Fetch(_)) => (0, 0),
+        };
+        counters.downloaded.fetch_add(wire, Ordering::Relaxed);
+        if let Some(totals) = counters.totals.get() {
+            totals.bandwidth.record(wire);
+            if data.is_ok() {
+                totals.articles.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        counters.record_decoded(decoded);
+        if wire > 0 {
+            counters
+                .last_byte_at_ms
+                .store(crate::jobs::epoch_ms_now() as u64, Ordering::Relaxed);
+        }
+        if data.is_ok() {
+            counters.articles_done.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     // Only outcomes that actually damaged the transport dirty the batch. A
     // 430 and the local quota/unrequested policy outcomes all leave the
     // socket exactly where the next BODY expects it.
@@ -2003,6 +2031,7 @@ use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 #[cfg(test)]
 fn tail_work(segment_number: u32, retry_count: u32) -> DownloadWork {
     DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: JobId(42),

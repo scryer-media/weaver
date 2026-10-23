@@ -526,6 +526,7 @@ mod tests {
 
     fn work() -> DownloadWork {
         DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id: JobId(1),

@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::post_processing::events::{EventContext, wait_for_event};
+use crate::post_processing::events::{EventContext, wait_for_event, wait_for_job_events};
 use crate::post_processing::model::{PipelineOutcome, QueueEvent};
 use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
 
@@ -151,7 +151,7 @@ impl Pipeline {
         // What the scripts asked for has to be in force before the first
         // article is fetched.
         self.apply_queue_script_effects(job_id);
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     // Returns true while the completion pass must yield to its queue scripts.
@@ -189,16 +189,16 @@ impl Pipeline {
         let sender = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
             let result = async {
-                if let Some(run_id) = admission.await.map_err(|error| {
+                let run_id = admission.await.map_err(|error| {
                     crate::StateError::Database(format!("queue script admission lost: {error}"))
-                })?? {
+                })??;
+                if run_id.is_some() {
                     sender
                         .send(TerminalPostProcessingEvent::QueueAdmitted(job_id))
                         .await
                         .map_err(|error| crate::StateError::Database(error.to_string()))?;
-                    wait_for_event(&db, &run_id).await?;
                 }
-                Ok(())
+                Self::wait_for_download_queue_scripts(&db, job_id, run_id.as_deref()).await
             }
             .await;
             let _ = sender
@@ -206,6 +206,20 @@ impl Pipeline {
                 .await;
         });
         true
+    }
+
+    pub(crate) async fn wait_for_download_queue_scripts(
+        db: &crate::Database,
+        job_id: JobId,
+        downloaded_run: Option<&str>,
+    ) -> Result<(), crate::StateError> {
+        if let Some(run_id) = downloaded_run {
+            wait_for_event(db, run_id).await?;
+        }
+        // Admission has already applied NZB_DOWNLOADED supersession. Even
+        // without that subscriber, FILE_DOWNLOADED runs still own their
+        // captured working directory until they finish. Drain them before move.
+        wait_for_job_events(db, job_id.0).await
     }
 
     // A job whose download is complete and that holds the queue-script
@@ -228,7 +242,7 @@ impl Pipeline {
                 Some("waiting for queue scripts"),
             );
             self.persist_active_runtime(job_id);
-            self.publish_snapshot();
+            self.report_job(job_id);
         }
     }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,22 +15,9 @@ use crate::history::types::{
 use crate::jobs::replay::QueueEventReplay;
 use crate::jobs::types::{PersistedQueueEvent, QueueEventKind};
 use weaver_server_core::{
-    AsyncOperationTargetState, Database, HistoryDeleteOperationInsertError,
-    HistoryDeleteOperationRow, SchedulerError, SchedulerHandle,
+    AsyncOperationTargetState, Database, HISTORY_DELETE_BATCH_SIZE,
+    HistoryDeleteOperationInsertError, HistoryDeleteOperationRow, SchedulerError, SchedulerHandle,
 };
-
-// How long one target waits for the pipeline to answer its history delete.
-//
-// The pipeline actor answers deletes between its other work, so a slow
-// answer is normal; no answer at all is not. Without a bound, a pipeline
-// that never replies leaves the whole operation claimed forever and every
-// target in it showing as in progress. Past this the target is failed as
-// unanswered and the operation finalises, so the rows can be retried. The
-// pipeline may still carry the delete out after the deadline; the error
-// text says so, and a retry settles which way it went.
-const HISTORY_DELETE_REPLY_DEADLINE: Duration = Duration::from_secs(300);
-
-const PIPELINE_DID_NOT_ANSWER: &str = "pipeline did not answer the history delete within the deadline; the delete may still finish, retry to confirm";
 
 #[derive(Clone)]
 pub(crate) struct HistoryDeleteManager {
@@ -201,93 +188,21 @@ impl HistoryDeleteManager {
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
 
-        for target in targets {
-            let db = self.db.clone();
-            tokio::task::spawn_blocking(move || {
-                db.mark_history_delete_target_state(
-                    target.operation_id,
-                    target.target_id,
-                    AsyncOperationTargetState::Running,
-                    None,
-                )
-            })
-            .await
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let target_ids = targets
+            .iter()
+            .map(|target| target.target_id)
+            .collect::<Vec<_>>();
+        self.mark_targets(
+            operation.id,
+            target_ids.clone(),
+            AsyncOperationTargetState::Running,
+            None,
+        )
+        .await?;
 
-            let result = tokio::time::timeout(
-                HISTORY_DELETE_REPLY_DEADLINE,
-                self.handle.delete_history(
-                    weaver_server_core::JobId(target.target_id),
-                    target.delete_files,
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    operation_id = target.operation_id,
-                    job_id = target.target_id,
-                    deadline_secs = HISTORY_DELETE_REPLY_DEADLINE.as_secs(),
-                    "pipeline did not answer the history delete in time; failing the target, the delete may still finish"
-                );
-                Err(SchedulerError::Internal(
-                    PIPELINE_DID_NOT_ANSWER.to_string(),
-                ))
-            });
-
-            let outcome = match result {
-                Ok(outcome) => Ok(outcome),
-                Err(SchedulerError::JobNotFound(_)) => Ok(Default::default()),
-                Err(error) => Err(error),
-            };
-            match outcome {
-                Ok(outcome) => {
-                    // The record is gone either way; a directory whose marker
-                    // stopped matching it was left on disk, and the target says
-                    // which rather than claiming a clean delete.
-                    let note = left_in_place_note(&outcome);
-                    let db = self.db.clone();
-                    tokio::task::spawn_blocking(move || {
-                        db.mark_history_delete_target_state(
-                            target.operation_id,
-                            target.target_id,
-                            AsyncOperationTargetState::Completed,
-                            note.as_deref(),
-                        )
-                    })
-                    .await
-                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
-                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
-
-                    self.replay
-                        .append(PersistedQueueEvent {
-                            occurred_at_ms: chrono::Utc::now().timestamp_millis(),
-                            kind: QueueEventKind::ItemRemoved,
-                            item_id: Some(target.target_id),
-                            item: None,
-                            state: None,
-                            previous_state: None,
-                            attention: None,
-                            global_state: None,
-                        })
-                        .await;
-                }
-                Err(error) => {
-                    let error_message = error.to_string();
-                    let db = self.db.clone();
-                    tokio::task::spawn_blocking(move || {
-                        db.mark_history_delete_target_state(
-                            target.operation_id,
-                            target.target_id,
-                            AsyncOperationTargetState::Failed,
-                            Some(&error_message),
-                        )
-                    })
-                    .await
-                    .map_err(|join_error| graphql_error("INTERNAL", join_error.to_string()))?
-                    .map_err(|db_error| graphql_error("INTERNAL", db_error.to_string()))?;
-                }
-            }
+        for batch in target_ids.chunks(HISTORY_DELETE_BATCH_SIZE) {
+            self.process_batch(operation.id, operation.delete_files, batch)
+                .await?;
         }
 
         let db = self.db.clone();
@@ -297,6 +212,113 @@ impl HistoryDeleteManager {
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
 
         Ok(())
+    }
+
+    // One history-store operation for the batch, then one target update per
+    // distinct result: the clean deletes together, each failure message
+    // together.
+    async fn process_batch(
+        &self,
+        operation_id: u64,
+        delete_files: bool,
+        batch: &[u64],
+    ) -> Result<()> {
+        let job_ids = batch
+            .iter()
+            .copied()
+            .map(weaver_server_core::JobId)
+            .collect::<BTreeSet<_>>();
+        let result = self
+            .handle
+            .delete_history_batch(job_ids, delete_files)
+            .await;
+
+        // Targets grouped by the state and message they end in, and every id
+        // whose record is gone, which is announced as removed whatever state
+        // its target ends in.
+        let mut settled: BTreeMap<(bool, Option<String>), Vec<u64>> = BTreeMap::new();
+        let mut removed = Vec::new();
+        match result {
+            Ok(outcome) => {
+                for (job_id, deleted) in &outcome.deleted {
+                    removed.push(job_id.0);
+                    // The record is gone either way. A directory whose marker
+                    // stopped matching it was left on disk, and the target
+                    // says which rather than claiming a clean delete; a
+                    // cleanup that failed fails the target with its error.
+                    let entry = match deleted {
+                        Ok(deleted) => (true, left_in_place_note(deleted)),
+                        Err(error) => (
+                            false,
+                            Some(format!("record deleted; cleanup did not finish: {error}")),
+                        ),
+                    };
+                    settled.entry(entry).or_default().push(job_id.0);
+                }
+                for (job_id, error) in &outcome.refused {
+                    let entry = match error {
+                        SchedulerError::JobNotFound(_) => {
+                            removed.push(job_id.0);
+                            (true, None)
+                        }
+                        error => (false, Some(error.to_string())),
+                    };
+                    settled.entry(entry).or_default().push(job_id.0);
+                }
+            }
+            Err(error) => {
+                settled
+                    .entry((false, Some(error.to_string())))
+                    .or_default()
+                    .extend_from_slice(batch);
+            }
+        }
+
+        for ((completed, message), ids) in settled {
+            let state = if completed {
+                AsyncOperationTargetState::Completed
+            } else {
+                AsyncOperationTargetState::Failed
+            };
+            self.mark_targets(operation_id, ids, state, message).await?;
+        }
+        removed.sort_unstable();
+        for id in removed {
+            self.replay
+                .append(PersistedQueueEvent {
+                    occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+                    kind: QueueEventKind::ItemRemoved,
+                    item_id: Some(id),
+                    item: None,
+                    state: None,
+                    previous_state: None,
+                    attention: None,
+                    global_state: None,
+                })
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn mark_targets(
+        &self,
+        operation_id: u64,
+        target_ids: Vec<u64>,
+        state: AsyncOperationTargetState,
+        message: Option<String>,
+    ) -> Result<()> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            db.mark_history_delete_targets_state(
+                operation_id,
+                &target_ids,
+                state,
+                message.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
 }
 
@@ -345,10 +367,7 @@ fn map_insert_error(error: HistoryDeleteOperationInsertError) -> async_graphql::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{broadcast, mpsc};
-    use weaver_server_core::JobHistoryRow;
-    use weaver_server_core::jobs::handle::SharedPipelineState;
-    use weaver_server_core::operations::metrics::PipelineMetrics;
+    use weaver_server_core::{JobHistoryRow, JobId};
 
     fn history(job_id: u64) -> JobHistoryRow {
         JobHistoryRow {
@@ -373,6 +392,186 @@ mod tests {
         }
     }
 
+    async fn manager_with_idle_pipeline(
+        db: &Database,
+    ) -> (
+        HistoryDeleteManager,
+        weaver_server_core::Pipeline,
+        tempfile::TempDir,
+    ) {
+        manager_with_idle_pipeline_announcing(db, QueueEventReplay::new(1)).await
+    }
+
+    async fn manager_with_idle_pipeline_announcing(
+        db: &Database,
+        replay: QueueEventReplay,
+    ) -> (
+        HistoryDeleteManager,
+        weaver_server_core::Pipeline,
+        tempfile::TempDir,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = db.load_config().unwrap();
+        settings.data_dir = root.path().display().to_string();
+        settings.intermediate_dir = Some(root.path().join("intermediate").display().to_string());
+        settings.complete_dir = Some(root.path().join("complete").display().to_string());
+        let config = Arc::new(tokio::sync::RwLock::new(settings));
+        let (pipeline, handle, _) =
+            weaver_server_core::pipeline::test_support::idle_pipeline(db.clone(), config).await;
+        (
+            HistoryDeleteManager::new(db.clone(), handle, replay),
+            pipeline,
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_record_deleted_before_its_cleanup_failed_is_announced_and_fails_its_target() {
+        let db = Database::open_in_memory().unwrap();
+        let replay = QueueEventReplay::new(8);
+        let (manager, _pipeline, root) =
+            manager_with_idle_pipeline_announcing(&db, replay.clone()).await;
+        // Both records go in the delete transaction; 21's directory then
+        // fails to come off disk: a script still running holds its cleanup at
+        // the script-stop barrier, and the directory is handed to another job
+        // before the barrier lifts.
+        let mut dirs = BTreeMap::new();
+        for id in [21, 22] {
+            let output_dir = root
+                .path()
+                .join("intermediate")
+                .join(format!("history-{id}"));
+            tokio::fs::create_dir_all(&output_dir).await.unwrap();
+            tokio::fs::write(
+                weaver_server_core::jobs::working_dir::working_dir_marker_path(&output_dir),
+                [],
+            )
+            .await
+            .unwrap();
+            let mut row = history(id);
+            row.output_dir = Some(output_dir.display().to_string());
+            db.insert_job_history(&row).unwrap();
+            dirs.insert(id, output_dir);
+        }
+        let running = weaver_server_core::post_processing::events::hold_test_event_run(
+            &db,
+            21,
+            "history-cleanup-barrier",
+        );
+        let operation_id = db
+            .insert_history_delete_operation(&[21, 22], false, false)
+            .unwrap();
+        let operation = db.next_history_delete_operation().unwrap().unwrap();
+
+        let processed = tokio::spawn(async move { manager.process_operation(operation).await });
+        let waited = db.clone();
+        weaver_server_core::post_processing::events::wait_for_test_script_change(&waited, || {
+            waited.get_job_history(21).unwrap().is_none()
+        })
+        .await;
+        tokio::fs::write(
+            weaver_server_core::jobs::working_dir::working_dir_marker_path(&dirs[&21]),
+            format!("weaver-job-v1:{}:{}\n", 99_999, "0".repeat(64)),
+        )
+        .await
+        .unwrap();
+        drop(running);
+        processed.await.unwrap().unwrap();
+
+        let removed: Vec<u64> = replay
+            .replay_after(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|notification| notification.event.kind == QueueEventKind::ItemRemoved)
+            .filter_map(|notification| notification.event.item_id)
+            .collect();
+        assert_eq!(
+            removed,
+            vec![21, 22],
+            "a record that is gone is announced removed, whatever its cleanup did"
+        );
+        let state = db.list_history_delete_row_states(&[21, 22]).unwrap();
+        assert!(!state.contains_key(&22));
+        assert_eq!(state[&21].state, AsyncOperationTargetState::Failed);
+        let message = state[&21].error_message.as_deref().unwrap();
+        assert!(message.contains("record deleted"), "{message}");
+        assert!(message.contains("no longer belongs"), "{message}");
+        let summaries = db.list_history_delete_operations(false).unwrap();
+        assert_eq!(summaries[0].id, operation_id);
+        assert_eq!(
+            summaries[0].state,
+            weaver_server_core::AsyncOperationState::CompletedWithErrors
+        );
+        assert!(dirs[&21].exists());
+        assert!(!dirs[&22].exists());
+    }
+
+    #[tokio::test]
+    async fn a_refused_id_fails_alone_and_the_rest_of_its_batch_completes() {
+        let db = Database::open_in_memory().unwrap();
+        for id in [11, 12, 13] {
+            db.insert_job_history(&history(id)).unwrap();
+        }
+        db.insert_history_delete_operation(&[11, 12, 13], false, false)
+            .unwrap();
+        let operation = db.next_history_delete_operation().unwrap().unwrap();
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        manager
+            .handle
+            .add_job(
+                JobId(12),
+                weaver_server_core::JobSpec {
+                    name: "Active fixture".into(),
+                    password: None,
+                    category: None,
+                    metadata: vec![],
+                    files: vec![],
+                    total_bytes: 0,
+                },
+                std::path::PathBuf::from("fixture.nzb"),
+                vec![],
+            )
+            .await
+            .unwrap();
+        db.delete_job_history(13).unwrap();
+        manager.process_operation(operation).await.unwrap();
+
+        // Completed targets drop out of the row states; only the refusal stays.
+        let state = db.list_history_delete_row_states(&[11, 12, 13]).unwrap();
+        assert!(!state.contains_key(&11));
+        assert!(!state.contains_key(&13));
+        assert_eq!(state[&12].state, AsyncOperationTargetState::Failed);
+        assert!(
+            state[&12]
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("active")
+        );
+        assert!(db.get_job_history(12).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_large_delete_finishes_all_targets_without_a_pipeline_turn() {
+        let db = Database::open_in_memory().unwrap();
+        let ids: Vec<u64> = (1..=(HISTORY_DELETE_BATCH_SIZE as u64 + 1)).collect();
+        for id in &ids {
+            db.insert_job_history(&history(*id)).unwrap();
+        }
+        db.insert_history_delete_operation(&ids, false, false)
+            .unwrap();
+        let operation = db.next_history_delete_operation().unwrap().unwrap();
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        manager.process_operation(operation).await.unwrap();
+
+        assert!(db.list_history_delete_row_states(&ids).unwrap().is_empty());
+        assert_eq!(
+            db.list_history_delete_operations(false).unwrap()[0].state,
+            weaver_server_core::AsyncOperationState::Completed
+        );
+    }
+
     #[tokio::test]
     async fn unproven_file_delete_never_reaches_the_scheduler() {
         let db = Database::open_in_memory().unwrap();
@@ -390,21 +589,10 @@ mod tests {
         db.recover_running_history_delete_operations().unwrap();
         let operation = db.next_history_delete_operation().unwrap().unwrap();
 
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
-
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        let revision = manager.handle.job_revision();
         manager.process_operation(operation).await.unwrap();
-
-        assert!(matches!(
-            command_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert_eq!(manager.handle.job_revision(), revision);
         assert!(db.get_job_history(7).unwrap().is_some());
         assert!(output_dir.join("payload.bin").is_file());
         let state = db.list_history_delete_row_states(&[7]).unwrap();
@@ -439,38 +627,9 @@ mod tests {
         let operation = db.next_history_delete_operation().unwrap().unwrap();
         assert!(operation.file_delete_authorized);
 
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let db_for_scheduler = db.clone();
-        let scheduler = tokio::spawn(async move {
-            let command = command_rx.recv().await.expect("expected history delete");
-            let weaver_server_core::SchedulerCommand::DeleteHistory {
-                job_id,
-                delete_files,
-                reply,
-            } = command
-            else {
-                panic!("expected history delete command");
-            };
-            assert!(delete_files);
-            let output_dir = db_for_scheduler
-                .get_job_history(job_id.0)
-                .unwrap()
-                .and_then(|row| row.output_dir)
-                .expect("recorded output directory");
-            std::fs::remove_dir_all(output_dir).unwrap();
-            db_for_scheduler.delete_job_history(job_id.0).unwrap();
-            reply.send(Ok(Default::default())).unwrap();
-        });
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
-
+        weaver_server_core::jobs::working_dir::mark_weaver_owned_output_dir(&output_dir).unwrap();
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
         manager.process_operation(operation).await.unwrap();
-        scheduler.await.unwrap();
 
         assert!(db.get_job_history(8).unwrap().is_none());
         assert!(!output_dir.exists());
@@ -480,52 +639,21 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_pipeline_that_never_answers_fails_the_target_and_finalises() {
+    #[tokio::test]
+    async fn deletion_finishes_when_the_pipeline_has_stopped() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(9)).unwrap();
-        let operation_id = db
-            .insert_history_delete_operation(&[9], false, false)
+        db.insert_history_delete_operation(&[9], false, false)
             .unwrap();
         let operation = db.next_history_delete_operation().unwrap().unwrap();
-
-        // The command is buffered and held, never answered: its reply sender
-        // stays alive in `command_rx`, so the only way out is the deadline.
-        let (command_tx, mut command_rx) = mpsc::channel(1);
-        let (event_tx, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            command_tx,
-            event_tx,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
-
+        let (manager, pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        drop(pipeline);
+        assert!(manager.handle.is_closed());
         manager.process_operation(operation).await.unwrap();
-
-        let Ok(weaver_server_core::SchedulerCommand::DeleteHistory { job_id, .. }) =
-            command_rx.try_recv()
-        else {
-            panic!("the delete must have reached the scheduler");
-        };
-        assert_eq!(job_id.0, 9);
-        // The message is the deadline's own, not "channel closed": the target
-        // failed because nothing answered, not because the reply was dropped.
-        let state = db.list_history_delete_row_states(&[9]).unwrap();
-        assert_eq!(state[&9].state, AsyncOperationTargetState::Failed);
+        assert!(db.get_job_history(9).unwrap().is_none());
         assert_eq!(
-            state[&9].error_message.as_deref(),
-            Some(PIPELINE_DID_NOT_ANSWER)
-        );
-        // The row may yet be deleted by the pipeline, so the message must not
-        // read as a final refusal.
-        assert!(PIPELINE_DID_NOT_ANSWER.contains("may still finish"));
-        assert!(PIPELINE_DID_NOT_ANSWER.contains("retry"));
-        let summaries = db.list_history_delete_operations(false).unwrap();
-        assert_eq!(summaries[0].id, operation_id);
-        assert_eq!(
-            summaries[0].state,
-            weaver_server_core::AsyncOperationState::CompletedWithErrors,
-            "an unanswered target must not leave the operation claimed"
+            db.list_history_delete_operations(false).unwrap()[0].state,
+            weaver_server_core::AsyncOperationState::Completed
         );
     }
     #[tokio::test]
@@ -553,38 +681,20 @@ mod tests {
         .await
         .unwrap();
         notification.notified().await;
-        let (commands, mut received) = mpsc::channel(3);
-        let (events, _) = broadcast::channel(1);
-        let handle = SchedulerHandle::new(
-            commands,
-            events,
-            SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-        );
-        let worker_db = db.clone();
-        let pipeline = tokio::spawn(async move {
-            let mut removed = std::collections::BTreeMap::new();
-            for _ in 0..3 {
-                let weaver_server_core::SchedulerCommand::DeleteHistory {
-                    job_id,
-                    delete_files,
-                    reply,
-                } = received.recv().await.unwrap()
-                else {
-                    panic!("expected manual delete path");
-                };
-                removed.insert(job_id.0, delete_files);
-                worker_db.delete_job_history(job_id.0).unwrap();
-                reply.send(Ok(Default::default())).unwrap();
-            }
-            removed
-        });
-        let manager = HistoryDeleteManager::new(db.clone(), handle, QueueEventReplay::new(1));
+        let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
+        let mut removed = BTreeMap::new();
         while let Some(operation) = db.next_history_delete_operation().unwrap() {
             assert_eq!(operation.file_delete_authorized, operation.delete_files);
+            for target in db
+                .list_history_delete_operation_targets(operation.id, operation.delete_files)
+                .unwrap()
+            {
+                removed.insert(target.target_id, operation.delete_files);
+            }
             manager.process_operation(operation).await.unwrap();
         }
         assert_eq!(
-            pipeline.await.unwrap(),
+            removed,
             [(1, false), (2, true), (4, true)].into_iter().collect()
         );
         assert!(db.get_job_history(3).unwrap().is_some());

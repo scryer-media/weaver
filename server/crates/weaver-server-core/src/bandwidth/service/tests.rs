@@ -71,13 +71,16 @@ fn monthly_window_rolls_forward_after_clamped_anchor() {
     );
 }
 
-#[test]
-fn bandwidth_ledger_flushes_lazily() {
+#[tokio::test]
+async fn bandwidth_ledger_flushes_lazily() {
     let db = crate::Database::open_in_memory().unwrap();
     let mut runtime = BandwidthLedgerRuntime::default();
 
     let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
-    runtime.record_download_bytes(&db, 512).unwrap();
+    let counters = BandwidthCounters::default();
+    counters.record(512);
+    runtime.sample(&db, &counters, false).unwrap();
+    db.flush_write_queue().await.unwrap();
     assert_eq!(
         db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
             .unwrap(),
@@ -85,6 +88,7 @@ fn bandwidth_ledger_flushes_lazily() {
     );
 
     runtime.flush_pending_usage(&db).unwrap();
+    db.flush_write_queue().await.unwrap();
     assert_eq!(
         db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
             .unwrap(),
@@ -92,21 +96,24 @@ fn bandwidth_ledger_flushes_lazily() {
     );
 }
 
-#[test]
-fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
+#[tokio::test]
+async fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
     let db = crate::Database::open_in_memory().unwrap();
     let mut runtime = BandwidthLedgerRuntime::default();
 
     let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
-    runtime
-        .record_download_bytes(&db, BANDWIDTH_USAGE_FLUSH_BYTES - 1)
-        .unwrap();
+    let counters = BandwidthCounters::default();
+    counters.record(BANDWIDTH_USAGE_FLUSH_BYTES - 1);
+    runtime.sample(&db, &counters, false).unwrap();
+    db.flush_write_queue().await.unwrap();
     assert_eq!(
         db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
             .unwrap(),
         0
     );
-    runtime.record_download_bytes(&db, 1).unwrap();
+    counters.record(1);
+    runtime.sample(&db, &counters, false).unwrap();
+    db.flush_write_queue().await.unwrap();
     assert_eq!(
         db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
             .unwrap(),
@@ -116,37 +123,34 @@ fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
 
 #[test]
 fn global_pause_origin_selects_the_block_kind() {
-    let runtime = BandwidthLedgerRuntime::default();
-
     // A schedule-driven pause must present as Scheduled even though it shares
     // the `global_paused` flag with a manual pause; a concurrent recomputation
     // must not collapse it to ManualPause.
     assert_eq!(
-        runtime.to_download_block_state(GlobalPause::Running).kind,
+        GlobalPause::Running.to_download_block_state().kind,
         crate::DownloadBlockKind::None
     );
     assert_eq!(
-        runtime.to_download_block_state(GlobalPause::Manual).kind,
+        GlobalPause::Manual.to_download_block_state().kind,
         crate::DownloadBlockKind::ManualPause
     );
     assert_eq!(
-        runtime.to_download_block_state(GlobalPause::Scheduled).kind,
+        GlobalPause::Scheduled.to_download_block_state().kind,
         crate::DownloadBlockKind::Scheduled
     );
 }
 
-#[test]
-fn quota_metering_excludes_unmetered_ledger_rows_after_reopen() {
+#[tokio::test]
+async fn quota_metering_excludes_unmetered_ledger_rows_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("quota.db");
     let db = crate::Database::open(&path).unwrap();
     let mut runtime = BandwidthLedgerRuntime::default();
-    runtime.record_pending_usage(100, 200);
-    runtime.set_metering_enabled(false);
-    runtime.record_pending_usage(100, 700);
-    runtime.set_metering_enabled(true);
-    runtime.record_pending_usage(100, 100);
+    runtime.record_pending_usage(100, 200, true);
+    runtime.record_pending_usage(100, 700, false);
+    runtime.record_pending_usage(100, 100, true);
     runtime.flush_pending_usage(&db).unwrap();
+    db.flush_write_queue().await.unwrap();
     assert_eq!(db.sum_bandwidth_usage_minutes(100, 101).unwrap(), 1000);
     assert_eq!(
         db.sum_metered_bandwidth_usage_minutes(100, 101).unwrap(),
@@ -161,6 +165,27 @@ fn quota_metering_excludes_unmetered_ledger_rows_after_reopen() {
         reopened
             .sum_metered_bandwidth_usage_minutes(100, 101)
             .unwrap(),
+        300
+    );
+}
+
+#[tokio::test]
+async fn independent_counter_sampling_preserves_metering_and_never_double_counts() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let counters = BandwidthCounters::default();
+    let mut ledger = BandwidthLedgerRuntime::default();
+    counters.record(200);
+    counters.set_metering_enabled(false);
+    counters.record(700);
+    counters.set_metering_enabled(true);
+    counters.record(100);
+    ledger.sample(&db, &counters, true).unwrap();
+    ledger.sample(&db, &counters, true).unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(counters.total(), 1000);
+    assert_eq!(db.sum_bandwidth_usage_minutes(0, i64::MAX).unwrap(), 1000);
+    assert_eq!(
+        db.sum_metered_bandwidth_usage_minutes(0, i64::MAX).unwrap(),
         300
     );
 }

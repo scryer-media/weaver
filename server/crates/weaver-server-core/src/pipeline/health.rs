@@ -1567,12 +1567,9 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
-        self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
         self.active_completion_critical_connections_by_job
             .remove(&job_id);
-        self.active_downloads_by_file
-            .retain(|file_id, _| file_id.job_id != job_id);
         self.active_decodes_by_job.remove(&job_id);
         self.active_decodes_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
@@ -1619,7 +1616,7 @@ impl Pipeline {
         if released_extract {
             self.promote_queued_extractions();
         }
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     // Spawn a dedicated STAT probe task to quickly estimate job health.

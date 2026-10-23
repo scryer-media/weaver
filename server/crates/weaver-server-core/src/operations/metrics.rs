@@ -197,12 +197,6 @@ impl RateSeries {
         }
     }
 
-    // Whether any sample has been recorded since construction.
-    #[cfg(test)]
-    pub(crate) fn has_samples(&self) -> bool {
-        !self.samples.is_empty()
-    }
-
     // Record a sample and recompute the smoothed rate.
     pub(crate) fn update(&mut self, now: Instant, cumulative: u64) -> f64 {
         if self.samples.len() < SPEED_WINDOW_SAMPLES {
@@ -469,6 +463,11 @@ pub struct PipelineMetrics {
     pub segments_failed_permanent: AtomicU64,
     pub parked_infrastructure_work: AtomicUsize,
     pub nntp_generation_recovery_requeues: AtomicU64,
+    // Download dispatch stall recoveries, by escalation: a kick clears the
+    // dispatch-side holds of a stall nothing explains; a release books the
+    // stalled jobs' queued articles missing when the kick moved no bytes.
+    pub download_dispatch_stall_kicks: AtomicU64,
+    pub download_dispatch_stall_releases: AtomicU64,
     pub download_failures_article_not_found: AtomicU64,
     pub download_failures_capacity_unavailable: AtomicU64,
     pub download_failures_transient: AtomicU64,
@@ -613,6 +612,8 @@ impl PipelineMetrics {
             segments_failed_permanent: AtomicU64::new(0),
             parked_infrastructure_work: AtomicUsize::new(0),
             nntp_generation_recovery_requeues: AtomicU64::new(0),
+            download_dispatch_stall_kicks: AtomicU64::new(0),
+            download_dispatch_stall_releases: AtomicU64::new(0),
             download_failures_article_not_found: AtomicU64::new(0),
             download_failures_capacity_unavailable: AtomicU64::new(0),
             download_failures_transient: AtomicU64::new(0),
@@ -868,6 +869,12 @@ impl PipelineMetrics {
             nntp_generation_recovery_requeues: self
                 .nntp_generation_recovery_requeues
                 .load(Ordering::Relaxed),
+            download_dispatch_stall_kicks: self
+                .download_dispatch_stall_kicks
+                .load(Ordering::Relaxed),
+            download_dispatch_stall_releases: self
+                .download_dispatch_stall_releases
+                .load(Ordering::Relaxed),
             download_failures_article_not_found: self
                 .download_failures_article_not_found
                 .load(Ordering::Relaxed),
@@ -887,19 +894,30 @@ impl PipelineMetrics {
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
-        let segments_downloaded = self.segments_downloaded.load(Ordering::Relaxed);
-        let bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
-        // One mutex acquisition per 100 ms tick, on the metrics publisher — not
-        // a per-segment path. All three published rates advance together so they
-        // describe the same window.
+        self.sample_totals(Instant::now(), 0, 0, 0)
+    }
+
+    pub(crate) fn sample_totals(
+        &self,
+        now: Instant,
+        downloaded: u64,
+        decoded: u64,
+        articles: u64,
+    ) -> MetricsSnapshot {
+        let bytes_downloaded = downloaded.max(self.bytes_downloaded.load(Ordering::Relaxed));
+        let segments_downloaded = articles.max(self.segments_downloaded.load(Ordering::Relaxed));
+        let bytes_decoded = decoded.max(self.bytes_decoded.load(Ordering::Relaxed));
+        // One independent sampling tick advances every rate on the same clock.
         let rates = self.speed_tracker.lock().unwrap().update(
-            Instant::now(),
+            now,
             bytes_downloaded,
             segments_downloaded,
             bytes_decoded,
         );
-        self.snapshot_with_speed(bytes_downloaded, rates)
+        let mut snapshot = self.snapshot_with_speed(bytes_downloaded, rates);
+        snapshot.bytes_decoded = bytes_decoded;
+        snapshot.segments_downloaded = segments_downloaded;
+        snapshot
     }
 
     // Return a fresh atomics-based metrics snapshot without advancing the
@@ -916,13 +934,6 @@ impl PipelineMetrics {
     // tick: only the intervals in which bytes arrived.
     pub fn download_time(&self) -> Duration {
         self.speed_tracker.lock().unwrap().download_time
-    }
-
-    // Forget every rate sample, so a test can start the global window at a
-    // known tick instead of at whatever moment the metrics were constructed.
-    #[cfg(test)]
-    pub(crate) fn reset_speed_tracker(&self) {
-        *self.speed_tracker.lock().unwrap() = SpeedTracker::new();
     }
 }
 
@@ -1017,6 +1028,10 @@ pub struct MetricsSnapshot {
     pub parked_infrastructure_work: usize,
     #[serde(default)]
     pub nntp_generation_recovery_requeues: u64,
+    #[serde(default)]
+    pub download_dispatch_stall_kicks: u64,
+    #[serde(default)]
+    pub download_dispatch_stall_releases: u64,
     pub download_failures_article_not_found: u64,
     pub download_failures_capacity_unavailable: u64,
     pub download_failures_transient: u64,

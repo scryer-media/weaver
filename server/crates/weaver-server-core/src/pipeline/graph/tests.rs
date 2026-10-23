@@ -659,8 +659,9 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     ) {}
 
     let finished = pipeline
-        .finished_jobs
-        .iter()
+        .finished_jobs()
+        .await
+        .into_iter()
         .find(|job| job.job_id == job_id)
         .unwrap();
     assert_eq!(finished.status, JobStatus::Partial);

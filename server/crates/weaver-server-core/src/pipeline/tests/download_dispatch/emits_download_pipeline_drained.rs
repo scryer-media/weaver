@@ -258,6 +258,7 @@ async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_
         state.restored_download_floor_bytes = 1;
     }
     let next_work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id,
             segment_number: 0,
@@ -620,6 +621,7 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         file_index: complete_files,
     };
     let next_work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: next_file_id,
             segment_number: 0,
@@ -800,6 +802,7 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         file_index: 0,
     };
     let work = |segment_number, message_id| DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id,
             segment_number,
@@ -1241,14 +1244,13 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
 
     {
         let state = pipeline.jobs.get_mut(&low_job_id).unwrap();
-        let _ = state
+        let in_flight = state
             .download_queue
             .pop()
             .expect("low-priority job should have an in-flight segment to drain");
+        pipeline.hold_test_lane_works(vec![in_flight], true);
     }
-    pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
-    pipeline.active_downloads_by_job.insert(low_job_id, 1);
     pipeline
         .active_download_connections_by_job
         .insert(low_job_id, 1);
@@ -1326,13 +1328,14 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
 
     // One lane is free while the prior completion-critical body remains active.
     // Existing work keeps running; the priority update owns only the new lane.
-    pipeline.active_downloads = 1;
+    pipeline.finish_test_lanes();
+    let mut critical_body = held_works(&[held_segment(normal_job_id, 0, 0)]);
+    critical_body[0].completion_critical = true;
+    pipeline.hold_test_lane_works(critical_body, true);
     pipeline.active_download_connections = 1;
-    pipeline.active_downloads_by_job.insert(normal_job_id, 1);
     pipeline
         .active_download_connections_by_job
         .insert(normal_job_id, 1);
-    pipeline.active_downloads_by_file.clear();
     pipeline
         .active_completion_critical_connections_by_job
         .insert(normal_job_id, 1);
@@ -1992,6 +1995,19 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
     )
     .await;
 
+    for index in 0..8 {
+        pipeline.download_lane_owners.insert(
+            Pipeline::next_download_lane_id(),
+            DownloadLaneOwner {
+                job_id: hot_job_id,
+                mode: DownloadLaneMode::Sequential,
+                completion_critical: false,
+                server_idx: Some(index % 2),
+                connection: true,
+                outstanding: HashMap::new(),
+            },
+        );
+    }
     pipeline.active_download_connections = 8;
     pipeline
         .active_download_connections_by_job
@@ -2168,11 +2184,7 @@ async fn owned_download_lane_batch_event_releases_and_acks_results() {
     };
     let decoded_payload = b"owned-decoded".to_vec();
 
-    pipeline.active_downloads = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
 
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
     let mut pending = VecDeque::new();
@@ -2276,12 +2288,7 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
     .await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let tail_work = state.download_queue.pop().unwrap();
-
-    pipeline.active_downloads = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
+    pipeline.hold_test_lane_works(vec![tail_work.clone()], false);
 
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
     let mut pending = VecDeque::new();

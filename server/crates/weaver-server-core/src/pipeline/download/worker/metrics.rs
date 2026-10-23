@@ -57,6 +57,398 @@ fn record_checkpoint_observability(result: &weaver_yenc::DecodeResult) {
 }
 
 impl Pipeline {
+    // When the timed waits behind a dispatch stall end, if every stalled job
+    // has one.
+    //
+    // A stalled job is one dispatch would serve: eligible, with queued
+    // download work. Its wait is the earliest future deadline among the
+    // holds the scheduler keeps on it — a propagation deferral, a restart
+    // durable-lead retry, a timed infrastructure retry of one of its
+    // articles — or the soft byte-pressure delay every job shares. A stalled
+    // job with none of these is waiting on nothing anyone scheduled, and the
+    // stall is unexplained: `None`. Otherwise the earliest wait across the
+    // stalled jobs, which is when the stall starts counting.
+    //
+    // Retries that sleep in their own task (a body-lane or blocked-server
+    // recheck, a server quota wait) keep no deadline here, so they do not
+    // explain a stall; their articles are not in the queue either.
+    pub(in crate::pipeline) fn earliest_explained_dispatch_wait(
+        &self,
+        now: Instant,
+    ) -> Option<Instant> {
+        let stalled = self.download_scheduler_eligible_jobs();
+        let waits = self.explained_dispatch_waits(now);
+        let mut earliest: Option<Instant> = None;
+        for job_id in stalled {
+            let wait = *waits.get(&job_id)?;
+            earliest = Some(earliest.map_or(wait, |current| current.min(wait)));
+        }
+        earliest
+    }
+
+    // A wait protects its own job even when another eligible job is wedged.
+    fn explained_dispatch_waits(&self, now: Instant) -> HashMap<JobId, Instant> {
+        let mut retry_deadlines: HashMap<JobId, Instant> = HashMap::new();
+        for (deadline, retry) in self.infrastructure_retries.iter_with_deadlines() {
+            let Some(deadline) = deadline.map(tokio::time::Instant::into_std) else {
+                continue;
+            };
+            retry_deadlines
+                .entry(retry.work.segment_id.file_id.job_id)
+                .and_modify(|earliest| *earliest = (*earliest).min(deadline))
+                .or_insert(deadline);
+        }
+        let mut waits = HashMap::new();
+        for job_id in self.download_scheduler_eligible_jobs() {
+            let job_wait = [
+                self.propagation_ready_at
+                    .get(&job_id)
+                    .map(|(ready_at, _)| *ready_at),
+                self.download_restart_durable_lead_retry_after
+                    .get(&job_id)
+                    .copied(),
+                retry_deadlines.get(&job_id).copied(),
+                self.download_pressure_soft_dispatch_after,
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|deadline| *deadline > now)
+            .min();
+            if let Some(wait) = job_wait {
+                waits.insert(job_id, wait);
+            }
+        }
+        waits
+    }
+
+    // The servers a new download lane could be sent to right now, asked the
+    // way the dispatch pass asks; 0 while the pool's health state is
+    // contended, since that answer says nothing about them.
+    fn dispatchable_server_count(&self) -> usize {
+        self.nntp
+            .blocking_body_server_order(&[])
+            .map_or(0, |order| order.len())
+    }
+
+    // Times a dispatch stall — queued work, no download or connection open
+    // at either end of a pass — and escalates one nothing explains.
+    //
+    // The stall ends when an article completes anywhere or no job is left
+    // that dispatch would serve. A timed wait behind every stalled job (see
+    // `earliest_explained_dispatch_wait`) holds the clock at the wait's
+    // end; a download quota block or no dispatchable server restarts it.
+    // Past `DOWNLOAD_DISPATCH_STALL_KICK_AFTER` the stall is kicked; past
+    // `DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER` after the kick, every stalled
+    // job whose bytes have not moved is released.
+    //
+    // Returns whether it kicked, so the pass runs again against what the
+    // kick cleared. Does nothing when recovery is switched off.
+    pub(in crate::pipeline::download::worker) fn watch_download_dispatch_stall(
+        &mut self,
+        now: Instant,
+        pressure: DownloadPressure,
+        max_connections: usize,
+        eligible_count: usize,
+    ) -> bool {
+        if !self.download_stall_recovery {
+            return false;
+        }
+        if self.active_downloads != 0
+            || self.active_download_connections != 0
+            || eligible_count == 0
+        {
+            self.download_dispatch_stall = None;
+            return false;
+        }
+        let segments_downloaded = self.metrics.segments_downloaded.load(Ordering::Relaxed);
+        if self
+            .download_dispatch_stall
+            .as_ref()
+            .is_none_or(|watch| watch.segments_downloaded != segments_downloaded)
+        {
+            self.download_dispatch_stall = Some(download::DispatchStallWatch {
+                since: now,
+                segments_downloaded,
+                kick: None,
+            });
+        }
+        if self.shared_state.server_quota_blocked()
+            || self.shared_state.egress_quota_block().is_some()
+        {
+            // A quota is a wait the operator can see and lift; it has no
+            // deadline, so the clock restarts whenever one holds.
+            if let Some(watch) = self.download_dispatch_stall.as_mut() {
+                watch.since = now;
+                watch.kick = None;
+            }
+            return false;
+        }
+        // No server to dispatch to is an outage, not a wedge: the clock
+        // restarts while every server is cooling down, disabled or
+        // unroutable, and the kick window opens only once one is back. A
+        // contended ranking says nothing about the servers and holds the
+        // clock too. Accepted narrower case: while any server is available,
+        // a stalled job whose articles only a cooled-down server holds still
+        // escalates after the windows.
+        if self.dispatchable_server_count() == 0 {
+            if let Some(watch) = self.download_dispatch_stall.as_mut() {
+                watch.since = now;
+                watch.kick = None;
+            }
+            return false;
+        }
+        let Some(watch) = self.download_dispatch_stall.as_ref() else {
+            return false;
+        };
+        let stalled_for = now.saturating_duration_since(watch.since);
+        let escalation_due = match &watch.kick {
+            None => stalled_for >= DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
+            Some((kicked_at, _)) => {
+                now.saturating_duration_since(*kicked_at) >= DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER
+            }
+        };
+        if !escalation_due {
+            return false;
+        }
+        // Asked only when an escalation is due: the walk over every stalled
+        // job and parked retry is not paid on each stalled pass.
+        if let Some(wait_ends) = self.earliest_explained_dispatch_wait(now) {
+            if let Some(watch) = self.download_dispatch_stall.as_mut() {
+                watch.since = watch.since.max(wait_ends);
+                watch.kick = None;
+            }
+            return false;
+        }
+        match self
+            .download_dispatch_stall
+            .as_ref()
+            .map(|watch| watch.kick.is_some())
+        {
+            Some(false) => {
+                self.kick_download_dispatch_stall(
+                    now,
+                    stalled_for,
+                    pressure,
+                    max_connections,
+                    eligible_count,
+                );
+                true
+            }
+            Some(true) => {
+                let kicked = self
+                    .download_dispatch_stall
+                    .take()
+                    .and_then(|watch| watch.kick)
+                    .map(|(_, bytes)| bytes)
+                    .unwrap_or_default();
+                self.release_download_dispatch_stall(
+                    now,
+                    stalled_for,
+                    kicked,
+                    pressure,
+                    max_connections,
+                    eligible_count,
+                );
+                false
+            }
+            None => false,
+        }
+    }
+
+    // Clears dispatch-side holds only for unexplained jobs: parked
+    // infrastructure retries go back to their jobs' queues, the stalled
+    // jobs' durable-lead and propagation deadlines, the rotation hints on
+    // their queued articles and the soft-pressure delay are dropped. What
+    // holds a server back (health cooldowns, quota)
+    // lives in the NNTP pool and lifts on its own clock.
+    fn kick_download_dispatch_stall(
+        &mut self,
+        now: Instant,
+        stalled_for: Duration,
+        pressure: DownloadPressure,
+        max_connections: usize,
+        eligible_count: usize,
+    ) {
+        let waits = self.explained_dispatch_waits(now);
+        let stalled = self
+            .download_scheduler_eligible_jobs()
+            .into_iter()
+            .filter(|job_id| !waits.contains_key(job_id))
+            .collect::<HashSet<_>>();
+        let requeued_retries = self.wake_infrastructure_retries_for_jobs(&stalled);
+        let mut rotation_hints_cleared = 0;
+        for job_id in &stalled {
+            self.download_restart_durable_lead_retry_after
+                .remove(job_id);
+            self.propagation_ready_at.remove(job_id);
+            // A hint only says one attempt failed on a server; exclusions are
+            // facts about the article and stay.
+            if let Some(state) = self.jobs.get_mut(job_id) {
+                rotation_hints_cleared += state.download_queue.clear_rotation_hints()
+                    + state.recovery_queue.clear_rotation_hints();
+            }
+        }
+        self.download_pressure_soft_dispatch_after = None;
+        // The pass after the kick reports what is left, not the throttle.
+        self.last_download_dispatch_stall_log_at = None;
+        self.metrics
+            .download_dispatch_stall_kicks
+            .fetch_add(1, Ordering::Relaxed);
+        let stalled = self
+            .download_scheduler_eligible_jobs()
+            .into_iter()
+            .filter(|job_id| stalled.contains(job_id))
+            .collect::<Vec<_>>();
+        let downloaded_bytes = stalled
+            .iter()
+            .filter_map(|job_id| {
+                self.jobs
+                    .get(job_id)
+                    .map(|state| (*job_id, state.downloaded_bytes))
+            })
+            .collect::<HashMap<_, _>>();
+        self.log_download_dispatch_stall_recovery(
+            "kick",
+            &stalled,
+            stalled_for,
+            requeued_retries,
+            rotation_hints_cleared,
+            pressure,
+            max_connections,
+            eligible_count,
+        );
+        if let Some(watch) = self.download_dispatch_stall.as_mut() {
+            watch.since = now;
+            watch.kick = Some((now, downloaded_bytes));
+        }
+    }
+
+    // Books every queued article of each job the kick did not move as work
+    // no server can serve, so the job leaves its download phase with them
+    // missing and its completion check decides what it becomes.
+    fn release_download_dispatch_stall(
+        &mut self,
+        now: Instant,
+        stalled_for: Duration,
+        downloaded_bytes_at_kick: HashMap<JobId, u64>,
+        pressure: DownloadPressure,
+        max_connections: usize,
+        eligible_count: usize,
+    ) {
+        let waits = self.explained_dispatch_waits(now);
+        let released = self
+            .download_scheduler_eligible_jobs()
+            .into_iter()
+            .filter(|job_id| !waits.contains_key(job_id))
+            .filter(|job_id| {
+                downloaded_bytes_at_kick
+                    .get(job_id)
+                    .zip(self.jobs.get(job_id))
+                    .is_some_and(|(at_kick, state)| *at_kick == state.downloaded_bytes)
+            })
+            .collect::<Vec<_>>();
+        if released.is_empty() {
+            return;
+        }
+        self.metrics
+            .download_dispatch_stall_releases
+            .fetch_add(1, Ordering::Relaxed);
+        self.log_download_dispatch_stall_recovery(
+            "release",
+            &released,
+            stalled_for,
+            0,
+            0,
+            pressure,
+            max_connections,
+            eligible_count,
+        );
+        for job_id in released {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                continue;
+            };
+            let queued = state.download_queue.extract_matching(|_| true);
+            for work in &queued {
+                self.book_unservable_work(work);
+            }
+            self.update_queue_metrics();
+            self.maybe_finish_download_pass(job_id);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_download_dispatch_stall_recovery(
+        &self,
+        recovery: &'static str,
+        jobs: &[JobId],
+        stalled_for: Duration,
+        requeued_retries: usize,
+        rotation_hints_cleared: usize,
+        pressure: DownloadPressure,
+        max_connections: usize,
+        eligible_count: usize,
+    ) {
+        let queue_depth = self
+            .jobs
+            .values()
+            .map(|state| state.download_queue.len() + state.recovery_queue.len())
+            .sum::<usize>();
+        let hot_job_id = self.current_hot_job().map(|id| id.0).unwrap_or_default();
+        for job_id in jobs {
+            let Some(state) = self.jobs.get(job_id) else {
+                continue;
+            };
+            let backlog = self.download_pipeline_backlog_for_job(*job_id);
+            if recovery == "release" {
+                error!(
+                    recovery,
+                    job_id = job_id.0,
+                    status = ?state.status,
+                    download_queue_len = state.download_queue.len(),
+                    recovery_queue_len = state.recovery_queue.len(),
+                    downloaded_bytes = state.downloaded_bytes,
+                    stalled_secs = stalled_for.as_secs(),
+                    eligible_count,
+                    queue_depth,
+                    active_downloads = self.active_downloads,
+                    active_connections = self.active_download_connections,
+                    max_connections,
+                    pressure_state = pressure.state.as_str(),
+                    pressure_reason = pressure.reason.as_str(),
+                    hot_job_id,
+                    delayed_retries_by_job = backlog.delayed_retries,
+                    pending_decodes_by_job = backlog.pending_decodes,
+                    "download dispatch stall: no bytes moved after the kick; booking the job's \
+                     queued articles missing so its completion check can run"
+                );
+            } else {
+                warn!(
+                    recovery,
+                    job_id = job_id.0,
+                    status = ?state.status,
+                    download_queue_len = state.download_queue.len(),
+                    recovery_queue_len = state.recovery_queue.len(),
+                    downloaded_bytes = state.downloaded_bytes,
+                    stalled_secs = stalled_for.as_secs(),
+                    requeued_retries,
+                    rotation_hints_cleared,
+                    eligible_count,
+                    queue_depth,
+                    active_downloads = self.active_downloads,
+                    active_connections = self.active_download_connections,
+                    max_connections,
+                    pressure_state = pressure.state.as_str(),
+                    pressure_reason = pressure.reason.as_str(),
+                    hot_job_id,
+                    delayed_retries_by_job = backlog.delayed_retries,
+                    pending_decodes_by_job = backlog.pending_decodes,
+                    "download dispatch stall: nothing explains it; clearing dispatch holds and \
+                     dispatching again"
+                );
+            }
+        }
+    }
+
     pub(in crate::pipeline::download::worker) fn log_download_dispatch_liveness_stall(
         &mut self,
         now: Instant,
@@ -88,6 +480,14 @@ impl Pipeline {
 
         self.last_download_dispatch_stall_log_at = Some(now);
         let hot_job_id = self.current_hot_job().map(|id| id.0).unwrap_or_default();
+        // How long until the timed waits behind the stall end; 0 when nothing
+        // scheduled explains it, which is the stall the watchdog escalates.
+        let explained_wait_ms = self
+            .earliest_explained_dispatch_wait(now)
+            .map(|ends| ends.saturating_duration_since(now).as_millis() as u64)
+            .unwrap_or_default();
+        let stall_recovery = self.download_stall_recovery;
+        let servers_available = self.dispatchable_server_count();
         if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
             self.jobs.get(job_id).is_some_and(|state| {
                 !state.download_queue.is_empty() || !state.recovery_queue.is_empty()
@@ -118,6 +518,9 @@ impl Pipeline {
                 pressure_reason = pressure.reason.as_str(),
                 hot_job_id,
                 restart_durable_lead_retry_ms = durable_retry_ms,
+                explained_wait_ms,
+                servers_available,
+                stall_recovery,
                 active_downloads_by_job = backlog.active_downloads,
                 active_connections_by_job = backlog.active_connections,
                 active_decodes_by_job = backlog.active_decodes,
@@ -139,6 +542,9 @@ impl Pipeline {
                 pressure_state = pressure.state.as_str(),
                 pressure_reason = pressure.reason.as_str(),
                 hot_job_id,
+                explained_wait_ms,
+                servers_available,
+                stall_recovery,
                 "download dispatch liveness stall: queued work but no active downloads"
             );
         }

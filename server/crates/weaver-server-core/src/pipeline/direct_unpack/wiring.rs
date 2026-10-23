@@ -550,6 +550,15 @@ impl DirectUnpackRuntime {
             || !self.pending_virtual_refresh.is_empty()
     }
 
+    pub(crate) fn has_job_work_in_flight(&self, id: JobId) -> bool {
+        self.armed.keys().any(|(job, _)| *job == id)
+            || self.draining.iter().any(|((job, _), _)| *job == id)
+            || self
+                .pending_virtual_refresh
+                .iter()
+                .any(|(job, _)| *job == id)
+    }
+
     // Outcome counters, as a snapshot.
     //
     // The exported metric surface is the per-event `direct_unpack.*` records

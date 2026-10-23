@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 
 // The switch for new jobs. It is read once per process so a job admitted
 // mid-run never sees a different answer from one admitted at start-up.
-const ENGINE_VARIABLE: &str = "WEAVER_ENGINE";
+pub(crate) const ENGINE_VARIABLE: &str = "WEAVER_ENGINE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine {

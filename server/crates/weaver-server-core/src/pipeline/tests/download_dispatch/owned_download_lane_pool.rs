@@ -833,6 +833,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         soft_timeout: Duration::from_secs(1),
     }));
     let work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id,
@@ -882,6 +883,7 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let work = DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: JobId(40141),
@@ -1064,13 +1066,7 @@ async fn shutdown_drain_consumes_inflight_download_results() {
         segment_number: 1,
     };
 
-    pipeline.active_downloads = 1;
-    pipeline
-        .active_downloads_by_job
-        .insert(segment_id.file_id.job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
 
     pipeline
         .download_done_tx
@@ -1123,9 +1119,8 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -1181,9 +1176,8 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .expect("transport retry should remain in the batched infrastructure queue");
     assert_eq!(retry.retry_count, 0);
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -1255,9 +1249,8 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -1318,9 +1311,8 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -1405,9 +1397,8 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -1457,9 +1448,8 @@ async fn fail_segment_on_transport(
     retry_count: u32,
 ) -> (Duration, u32) {
     let job_id = segment_id.file_id.job_id;
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     let before = tokio::time::Instant::now();
     pipeline
         .handle_download_done(DownloadResult {
@@ -1631,9 +1621,8 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.download_queue = DownloadQueue::new();
     state.recovery_queue = DownloadQueue::new();
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -1732,9 +1721,8 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -1835,9 +1823,8 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -1958,6 +1945,7 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
                 scheduled_pool_generation: pipeline.pool_generation,
                 infrastructure_retry: true,
                 work: DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new(&format!(
                         "<batch-{segment_number}>"
@@ -1975,13 +1963,29 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
         );
     }
 
+    pipeline.report_job(job_id);
+    assert!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .download_wait_reason
+            .is_some()
+    );
     let mut job_changes = pipeline.shared_state.subscribe_job_changes();
     let previous_revision = *job_changes.borrow();
     assert_eq!(pipeline.wake_all_infrastructure_retries(), RETRY_COUNT);
-    pipeline.publish_snapshot();
     job_changes.changed().await.unwrap();
 
     assert_eq!(*job_changes.borrow(), previous_revision.wrapping_add(1));
+    assert!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .download_wait_reason
+            .is_none()
+    );
     assert_eq!(
         pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
         RETRY_COUNT
@@ -2022,8 +2026,7 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
         state.recovery_queue = DownloadQueue::new();
     }
     pipeline.pool_generation = 2;
-    pipeline.active_downloads = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -2073,7 +2076,7 @@ async fn stale_generation_success_does_not_update_new_lane_health() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     pipeline.pool_generation = 2;
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(JobId(20017), 0, 0)]);
     pipeline.active_download_connections = 1;
 
     pipeline.release_download_result(&DownloadResult {
@@ -2160,12 +2163,24 @@ async fn terminal_accounting_is_idempotent() {
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
 
-    // Reprocessing a job that is still resident rebuilds its assembly with
-    // every segment already committed, so the ledger has nothing left to book:
-    // delivery is a terminal state too, and it outranks a failure result.
+    // A reprocess is a new admission on the engine the switch names now. The
+    // classic engine trusts the working directory, so every segment is already
+    // committed and the ledger has nothing left to book: delivery is a
+    // terminal state too, and it outranks a failure result. The graph fetches
+    // every article again, so the article is pending and its loss books its
+    // declared bytes afresh.
+    let booked = match crate::pipeline::graph::Engine::from_environment() {
+        crate::pipeline::graph::Engine::Classic => 0,
+        crate::pipeline::graph::Engine::Graph => {
+            u64::from(pipeline.jobs[&job_id].spec.files[0].segments[0].bytes)
+        }
+    };
     pipeline.book_failed_segment(segment_id);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
-    assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, booked);
+    assert_eq!(
+        pipeline.segment_terminal_states.contains_key(&segment_id),
+        booked != 0
+    );
     pipeline.purge_terminal_job_runtime(job_id);
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
 }
@@ -2468,9 +2483,8 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
     let control = transfers.configure(
@@ -2566,9 +2580,8 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 2;
+    hold_on_test_lane(&mut pipeline, &[large_segment, tail_segment]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 2);
 
     let policy = std::sync::Arc::new(
         crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
@@ -2732,9 +2745,8 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     let policy = std::sync::Arc::new(
         crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
@@ -2814,9 +2826,8 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
     let control = transfers.configure(
@@ -2960,9 +2971,8 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
     let control = transfers.configure(
@@ -3069,9 +3079,8 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     let policy = std::sync::Arc::new(
         crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
@@ -3279,9 +3288,8 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     // A miss on the deep server (index 1) plus the retention-excluded
     // short server (index 0) exhausts both servers: the article books
@@ -3351,6 +3359,7 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
     };
 
     pipeline.enqueue_download_work(DownloadWork {
+        counters: None,
         segment_id,
         message_id: crate::jobs::ids::MessageId::new("unservable@example.com"),
         groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
@@ -3431,9 +3440,8 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     // Every server is retention-excluded, so the lane path never fetches —
     // the failure surfaces as LaneUnavailable. It must be booked as a
@@ -3496,9 +3504,8 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -3568,9 +3575,8 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 2, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -3630,9 +3636,8 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
         state.recovery_queue = DownloadQueue::new();
     }
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -3674,9 +3679,8 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
         0
     );
 
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 1)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -3736,6 +3740,7 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
         state.status = JobStatus::Downloading;
         state.download_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -3808,6 +3813,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
             outstanding: HashMap::from([(
                 segment_id,
                 DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: MessageId::new("carried-article@example.com"),
                     groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
@@ -3822,8 +3828,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
             )]),
         },
     );
-    pipeline.active_downloads = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_connections = 1;
     pipeline
         .active_download_connections_by_job
@@ -3886,9 +3891,8 @@ async fn article_not_found_exhausts_when_the_work_already_failed_elsewhere() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -3953,9 +3957,8 @@ async fn article_not_found_that_learns_no_new_server_books_instead_of_retrying()
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {
@@ -4016,9 +4019,8 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     let db = Database::open_in_memory().unwrap();
     let mut system = db
@@ -4044,9 +4046,8 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
         Some(policy.clone()),
     )
     .unwrap();
-    let (commands, _) = tokio::sync::mpsc::channel(1);
     let (events, _) = tokio::sync::broadcast::channel(1);
-    let handle = crate::SchedulerHandle::new(commands, events, pipeline.shared_state.clone());
+    let handle = crate::SchedulerHandle::new(events, pipeline.shared_state.clone());
     handle.set_proxy_runtime(runtime.clone());
     pipeline.shared_state.set_server_transfer_policy(policy);
 

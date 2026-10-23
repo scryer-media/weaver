@@ -1835,31 +1835,14 @@ async fn a_run_of_a_job_still_in_the_queue_shows_the_jobs_name() {
     assert_no_errors(&named);
     let name = response_data(&named)["job"]["name"].clone();
     assert!(name.is_string());
-    // The job's row, as the pipeline writes it, keeps the run from being
-    // trimmed as an orphan; its name lives only in the queue.
-    harness
-        .db
-        .create_active_job(&weaver_server_core::ActiveJob {
-            engine: weaver_server_core::pipeline::graph::Engine::Classic,
-            job_id: weaver_server_core::JobId(job_id),
-            nzb_hash: [7; 32],
-            nzb_path: "queued-release.nzb".into(),
-            nzb_zstd: Vec::new(),
-            output_dir: "queued-release".into(),
-            created_at: 1,
-            category: None,
-            metadata: Vec::new(),
-            status: "queued",
-            download_state: "queued",
-            post_state: "idle",
-            run_state: "active",
-            paused_resume_status: None,
-            paused_resume_download_state: None,
-            paused_resume_post_state: None,
-            password_override: None,
-            supplied_password_candidates: Vec::new(),
-        })
-        .unwrap();
+    // Real admission already persisted the active row used for retention.
+    assert!(
+        harness
+            .db
+            .load_active_jobs()
+            .unwrap()
+            .contains_key(&weaver_server_core::JobId(job_id))
+    );
     retain_output(
         harness.db.clone(),
         Some(job_id),

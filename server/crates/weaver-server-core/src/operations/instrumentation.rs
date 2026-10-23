@@ -114,6 +114,41 @@ impl AtomicHistogram {
     }
 }
 
+/// Measures one pipeline turn, excluding the idle select wait. Awaited work
+/// inside a handler remains part of the observation, including slow I/O.
+pub(crate) struct TurnTimer<'a> {
+    histogram: &'a AtomicHistogram,
+    started: Option<std::time::Instant>,
+    elapsed: Duration,
+}
+
+impl<'a> TurnTimer<'a> {
+    pub(crate) fn new(histogram: &'a AtomicHistogram) -> Self {
+        Self {
+            histogram,
+            started: Some(std::time::Instant::now()),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn pause(&mut self) {
+        if let Some(started) = self.started.take() {
+            self.elapsed += started.elapsed();
+        }
+    }
+
+    pub(crate) fn resume(&mut self) {
+        self.started.get_or_insert_with(std::time::Instant::now);
+    }
+}
+
+impl Drop for TurnTimer<'_> {
+    fn drop(&mut self) {
+        self.pause();
+        self.histogram.observe(self.elapsed);
+    }
+}
+
 // Point-in-time copy of an [`AtomicHistogram`].
 //
 // `counts` holds **per-bucket** (not cumulative) counts and is always
@@ -838,6 +873,7 @@ impl JobLifecycleMetrics {
 // struct starts a clock.
 #[derive(Debug)]
 pub struct PipelineHistograms {
+    pub turn_duration: AtomicHistogram,
     pub disk_write_duration: AtomicHistogram,
     pub decode_task_duration: AtomicHistogram,
     pub extract_member_duration: AtomicHistogram,
@@ -858,6 +894,7 @@ impl PipelineHistograms {
     pub const fn new() -> Self {
         Self {
             disk_write_duration: AtomicHistogram::new(DISK_WRITE_DURATION_BOUNDS),
+            turn_duration: AtomicHistogram::new(&[0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 60.0]),
             decode_task_duration: AtomicHistogram::new(DECODE_TASK_DURATION_BOUNDS),
             extract_member_duration: AtomicHistogram::new(EXTRACT_MEMBER_DURATION_BOUNDS),
             decode_task_observed: AtomicU64::new(0),
@@ -885,6 +922,7 @@ impl PipelineHistograms {
 
     pub fn snapshot(&self) -> PipelineHistogramsSnapshot {
         PipelineHistogramsSnapshot {
+            turn_duration: self.turn_duration.snapshot(),
             disk_write_duration: self.disk_write_duration.snapshot(),
             decode_task_duration: (self.decode_task_observed.load(Ordering::Relaxed) != 0)
                 .then(|| self.decode_task_duration.snapshot()),
@@ -901,6 +939,7 @@ impl PipelineHistograms {
 // rather than reporting a fabricated empty series.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PipelineHistogramsSnapshot {
+    pub turn_duration: HistogramSnapshot,
     pub disk_write_duration: HistogramSnapshot,
     pub decode_task_duration: Option<HistogramSnapshot>,
     pub extract_member_duration: Option<HistogramSnapshot>,

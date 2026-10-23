@@ -688,7 +688,6 @@ async fn drive_graph_schedule(
         if pipeline.write_buffered_bytes > 0 {
             pipeline.flush_quiescent_write_backlog().await;
         }
-        pipeline.settle_all_segment_writes().await;
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }

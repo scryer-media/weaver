@@ -258,7 +258,7 @@ impl ServerHealth {
         if is_auth {
             let Some(until) = self
                 .recovery
-                .quarantine(self.config.auth_disable_duration, self.recovery_event)
+                .quarantine_for_credentials(self.config.auth_disable_duration, self.recovery_event)
             else {
                 return;
             };

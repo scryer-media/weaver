@@ -42,6 +42,13 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     // exclusions, or its rotation hint — which is what keeps backfill traffic
     // to what the fill tier has already given up on.
     fill_servers: Option<Vec<usize>>,
+    // The fill servers a hinted article could go to instead of its hinted
+    // one: the dispatch attempt's available fill servers, or a fresh ranking
+    // when the handout is not part of one. The rotation hint is a
+    // preference: it refuses the hinted server only while one of these the
+    // article may use is available, so an article whose only alternative is
+    // down is still served by the server it failed on.
+    hint_alternatives: Vec<usize>,
     retention_excludes: Arc<Vec<usize>>,
     bootstrap_files: Option<&'a [u32]>,
     uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
@@ -99,7 +106,7 @@ impl ServableWorkFilter<'_> {
             return Some(SchedulerBlockClause::SweepHeld);
         }
         if work.exclude_servers.contains(&self.server_idx)
-            || work.avoid_server == Some(self.server_idx)
+            || (work.avoid_server == Some(self.server_idx) && self.hint_has_alternative(work))
         {
             return Some(SchedulerBlockClause::ServerExclusion);
         }
@@ -133,6 +140,16 @@ impl ServableWorkFilter<'_> {
             return Some(SchedulerBlockClause::Checkpoint);
         }
         None
+    }
+
+    // Whether a server other than this one could take `work` now: available,
+    // not excluded by the article, not ruled out by the job's retention.
+    fn hint_has_alternative(&self, work: &DownloadWork) -> bool {
+        self.hint_alternatives.iter().any(|server| {
+            *server != self.server_idx
+                && !work.exclude_servers.contains(server)
+                && !self.retention_excludes.contains(server)
+        })
     }
 
     pub(in crate::pipeline::download) fn checkpoint_blocked(&self) -> bool {
@@ -380,6 +397,7 @@ impl Pipeline {
         ServableWork::Scan(ServableWorkFilter {
             server_idx,
             fill_servers: self.backfill_fill_gate(server_idx),
+            hint_alternatives: self.rotation_hint_alternatives(job_id),
             retention_excludes,
             bootstrap_files,
             uu_cursor_ordinals,
@@ -457,6 +475,35 @@ impl Pipeline {
         Err(blocked)
     }
 
+    // The fill servers a hinted article of `job_id` could be sent to instead
+    // of its hinted one. Inside a dispatch attempt this is the attempt's own
+    // ranking; outside one the pool is asked, but only when the job's queue
+    // holds steered work, since nothing else reads the answer. A contended
+    // ranking answers with every fill server, which keeps the hint, the
+    // strict answer, for at most one pass.
+    fn rotation_hint_alternatives(&self, job_id: JobId) -> Vec<usize> {
+        if let Some(fill) = &self.download_pass_fill_servers {
+            return fill.clone();
+        }
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| state.download_queue.excluded_work_count() == 0)
+        {
+            return Vec::new();
+        }
+        let flags = self.nntp.pool().server_backfill_flags();
+        let is_fill = |idx: &usize| !flags.get(*idx).copied().unwrap_or(false);
+        match self.nntp.blocking_body_server_order(&[]) {
+            Some(order) => order
+                .into_iter()
+                .map(|server| server.0)
+                .filter(is_fill)
+                .collect(),
+            None => (0..flags.len()).filter(is_fill).collect(),
+        }
+    }
+
     // The fill servers a backfill server must see exhausted before it takes
     // an article; `None` for a fill server, and for a backfill server once
     // the pool has already unlocked the backfill tier for everyone.
@@ -513,7 +560,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn activate_download_batch_lease(
+    pub(in crate::pipeline) fn activate_download_batch_lease(
         &mut self,
         lease: &DownloadBatchLease,
         activation_items: &[(SegmentId, NzbFileId, u64)],
@@ -526,7 +573,6 @@ impl Pipeline {
         self.book_download_lane_owner(lease, starts_connection);
         self.activate_download_batch(
             lease.job_id,
-            lease.works.iter().filter(|work| work.is_recovery).count(),
             lease.completion_critical,
             lease.lane_mode,
             activation_items,
@@ -537,7 +583,6 @@ impl Pipeline {
     pub(in crate::pipeline) fn activate_download_batch(
         &mut self,
         job_id: JobId,
-        recovery_count: usize,
         completion_critical: bool,
         lane_mode: DownloadLaneMode,
         activation_items: &[(SegmentId, NzbFileId, u64)],
@@ -548,7 +593,8 @@ impl Pipeline {
             return;
         }
 
-        self.active_downloads += work_count;
+        // The in-flight article gauges were raised when the lane's record
+        // took these articles (see `hold_lane_works`).
         self.metrics
             .download_lane_lease_items_total
             .fetch_add(work_count as u64, Ordering::Relaxed);
@@ -563,10 +609,7 @@ impl Pipeline {
                 self.book_completion_critical_connection(job_id);
             }
         }
-        self.active_recovery += recovery_count;
-        *self.active_downloads_by_job.entry(job_id).or_default() += work_count;
-        for (segment_id, file_id, estimate) in activation_items {
-            *self.active_downloads_by_file.entry(*file_id).or_default() += 1;
+        for (segment_id, _, estimate) in activation_items {
             self.reserve_rate_limit_for_dispatch(*segment_id, *estimate);
         }
         self.mark_download_pass_started(job_id);

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast};
 use weaver_model::files::FileRole;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
 use weaver_server_core::ingest::{
@@ -23,8 +23,8 @@ use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::watch_folder::WatchFolderConfig;
 use weaver_server_core::{
     Database, DuplicateAdmission, DuplicateAdmissionRequest, DuplicateMode, DuplicatePolicy,
-    FileSpec, FingerprintEvidence, JobId, JobSpec, Pipeline, PipelineMetrics, SchedulerCommand,
-    SchedulerError, SchedulerHandle, SegmentSpec, SemanticCandidateSource, SemanticCandidateState,
+    FileSpec, FingerprintEvidence, JobId, JobSpec, Pipeline, PipelineMetrics, SchedulerError,
+    SchedulerHandle, SegmentSpec, SemanticCandidateSource, SemanticCandidateState,
     SemanticDuplicate, SemanticPromotionState, SharedPipelineState, SubmissionOrigin,
     semantic_duplicate_lifecycle_metrics_snapshot,
 };
@@ -65,10 +65,9 @@ impl Harness {
             metrics: Default::default(),
             config_path: None,
         }));
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
         let (event_tx, _) = broadcast::channel(1024);
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-        let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), state.clone());
+        let handle = SchedulerHandle::new(event_tx.clone(), state.clone());
         let nntp = NntpClient::new(NntpClientConfig {
             servers: vec![],
             max_idle_age: Duration::from_secs(1),
@@ -101,7 +100,6 @@ impl Harness {
             large_count: 2,
         });
         let mut pipeline = Pipeline::new(
-            cmd_rx,
             event_tx,
             nntp,
             buffers,

@@ -7,7 +7,7 @@ use crate::StateError;
 use crate::history::model::HistoryFilter;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, max_rows_for_engine};
 
 type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
 
@@ -70,6 +70,41 @@ impl Database {
             self.cache_job_history_at(row.clone(), observed_generation);
         }
         Ok(row)
+    }
+
+    // The recorded output directory of every id that has a history row, read
+    // in bind-sized chunks. An id without a row is absent from the map.
+    pub fn list_job_history_output_dirs(
+        &self,
+        job_ids: &[crate::JobId],
+    ) -> Result<std::collections::BTreeMap<crate::JobId, Option<String>>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let datastore = self.datastore();
+        let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+        self.run_sql_blocking_read(async move {
+            let mut dirs = std::collections::BTreeMap::new();
+            for chunk in ids.chunks(max_rows_for_engine(datastore.engine(), 1)) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, output_dir FROM job_history WHERE job_id IN ({placeholders})"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    dirs.insert(
+                        crate::JobId(row.i64("job_id")? as u64),
+                        row.opt_text("output_dir")?,
+                    );
+                }
+            }
+            Ok(dirs)
+        })
     }
 
     pub fn list_job_history(

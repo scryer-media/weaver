@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::RwLock;
 
 use super::fixture::{
     FixtureArticle, HttpFixture, NntpFixture, SilentFixture, librespeed_list, loopback_tls, nzb,
@@ -13,7 +13,7 @@ use super::fixture::{
 use super::*;
 use crate::proxies::{Consumer, Failover, LegPath, ProxyRuntime, Route, RouteLeg};
 use crate::settings::Config;
-use crate::{Database, PipelineMetrics, SchedulerCommand, SchedulerHandle, SharedPipelineState};
+use crate::{Database, PipelineMetrics, SchedulerHandle, SharedPipelineState};
 
 struct Rig {
     service: SpeedTestService,
@@ -46,31 +46,10 @@ async fn rig() -> Rig {
         metrics: Default::default(),
         config_path: None,
     }));
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let (event_tx, _) = tokio::sync::broadcast::channel(8);
     let metrics = PipelineMetrics::new();
     let state = SharedPipelineState::new(metrics.clone(), vec![]);
-    let scheduler_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(command) = cmd_rx.recv().await {
-            match command {
-                SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                    scheduler_state.set_speed_test_paused(paused);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::PauseAll { reply } => {
-                    scheduler_state.set_paused(true);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::ResumeAll { reply } => {
-                    scheduler_state.set_paused(false);
-                    let _ = reply.send(());
-                }
-                _ => {}
-            }
-        }
-    });
-    let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
+    let handle = SchedulerHandle::new(event_tx, state);
     handle.set_proxy_runtime(
         ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap(),
     );

@@ -206,8 +206,9 @@ exit {exit_code}
     assert_eq!(report.results[0].exit_code, Some(exit_code));
     pipeline.handle_terminal_post_processing_done(done);
     let finished = pipeline
-        .finished_jobs
-        .iter()
+        .finished_jobs()
+        .await
+        .into_iter()
         .find(|job| job.job_id == job_id)
         .unwrap();
     if exit_code == 93 {
@@ -232,6 +233,91 @@ exit {exit_code}
     );
     assert_eq!(std::fs::read_dir(&complete_dir).unwrap().count(), 1);
     assert!(pipeline.inflight_terminal_post_processing.is_empty());
+}
+
+#[tokio::test]
+async fn final_move_applies_pending_delivery_fields_without_an_actor_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp).await;
+    let id = JobId(10081);
+    let spec = minimal_job_state(id, "original delivery", PathBuf::new()).spec;
+    let working_dir = insert_active_job(&mut pipeline, id, spec).await;
+    tokio::fs::write(working_dir.join("payload.bin"), b"payload")
+        .await
+        .unwrap();
+    pipeline.report_all_for_test();
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .update_job(
+            id,
+            crate::JobUpdate {
+                name: Some("renamed delivery".into()),
+                category: crate::jobs::FieldUpdate::Set("series".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pipeline.jobs[&id].spec.category, None);
+
+    // This is the existing boundary reached by a stage that awaited I/O.
+    // It must consume updates without depending on a new orchestrator turn.
+    pipeline.start_move_to_complete(id).await.unwrap();
+    let destination = complete_dir.join("series").join("renamed delivery");
+    assert_eq!(pipeline.reserved_complete_destinations[&id], destination);
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    assert_eq!(done.job_id, id);
+    pipeline.handle_move_to_complete_done(done).await;
+    assert_eq!(
+        tokio::fs::read(destination.join("payload.bin"))
+            .await
+            .unwrap(),
+        b"payload"
+    );
+    pipeline.db.flush_write_queue().await.unwrap();
+}
+
+#[tokio::test]
+async fn post_processing_resume_applies_pending_category_before_a_deferred_move() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp).await;
+    let id = JobId(10082);
+    let spec = minimal_job_state(id, "deferred delivery", PathBuf::new()).spec;
+    let working_dir = insert_active_job(&mut pipeline, id, spec).await;
+    tokio::fs::write(working_dir.join("payload.bin"), b"payload")
+        .await
+        .unwrap();
+    pipeline.report_all_for_test();
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.pause_post_processing().await.unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.start_move_to_complete(id).await.unwrap();
+    assert!(pipeline.deferred_moves.contains(&id));
+    handle
+        .update_job(
+            id,
+            crate::JobUpdate {
+                category: crate::jobs::FieldUpdate::Set("series".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    handle.resume_post_processing().await.unwrap();
+
+    pipeline.apply_queue_intents().await;
+    let destination = complete_dir.join("series").join("deferred delivery");
+    assert_eq!(pipeline.reserved_complete_destinations[&id], destination);
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    assert_eq!(done.job_id, id);
+    pipeline.handle_move_to_complete_done(done).await;
+    assert_eq!(
+        tokio::fs::read(destination.join("payload.bin"))
+            .await
+            .unwrap(),
+        b"payload"
+    );
+    pipeline.db.flush_write_queue().await.unwrap();
 }
 
 // Point `pipeline` at a script directory holding one script that records the
@@ -421,8 +507,9 @@ async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivere
     }
 
     let finished = restored
-        .finished_jobs
-        .iter()
+        .finished_jobs()
+        .await
+        .into_iter()
         .find(|job| job.job_id == job_id)
         .unwrap();
     assert_eq!(finished.status, JobStatus::Complete);
@@ -495,8 +582,9 @@ async fn queue_scripts_hold_a_job_without_post_processing_instances() {
         if !with_queue_script {
             assert!(!pipeline.jobs.contains_key(&job_id));
             let finished = pipeline
-                .finished_jobs
-                .iter()
+                .finished_jobs()
+                .await
+                .into_iter()
                 .find(|job| job.job_id == job_id)
                 .unwrap();
             assert_eq!(finished.status, JobStatus::Complete);
@@ -527,8 +615,9 @@ async fn queue_scripts_hold_a_job_without_post_processing_instances() {
         );
         pipeline.handle_terminal_post_processing_done(done);
         let finished = pipeline
-            .finished_jobs
-            .iter()
+            .finished_jobs()
+            .await
+            .into_iter()
             .find(|job| job.job_id == job_id)
             .unwrap();
         assert_eq!(finished.status, JobStatus::Complete);
@@ -747,8 +836,9 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
     assert_eq!(observed.len(), 5);
     assert_eq!(observed, expected);
     let finished = restored
-        .finished_jobs
-        .iter()
+        .finished_jobs()
+        .await
+        .into_iter()
         .find(|job| job.job_id == job_id)
         .unwrap();
     assert!(

@@ -4,6 +4,7 @@
 import type { APIRequestContext } from "@playwright/test";
 
 import { graphql, submitProbeNzb } from "../../helpers";
+import { waitTerminal } from "../downloads";
 
 export async function makeRestoreTargetNonPristine(
   request: APIRequestContext,
@@ -40,5 +41,6 @@ export async function seedRestorableHistoryMetadata(
   if (!cancelled.cancelJob) {
     throw new Error(`failed to cancel backup history seed job ${result.jobId}`);
   }
+  await waitTerminal(request, result.jobId);
   return result.jobId;
 }

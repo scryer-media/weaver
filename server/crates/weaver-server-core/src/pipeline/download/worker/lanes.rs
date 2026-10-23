@@ -415,7 +415,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn activation_items(
+    pub(in crate::pipeline) fn activation_items(
         lease: &DownloadBatchLease,
     ) -> Vec<(SegmentId, NzbFileId, u64)> {
         lease
@@ -773,7 +773,7 @@ impl Pipeline {
     // an answer about the articles, so nothing here is reported as a download
     // failure: the works return to the queue and the lane parks on the error
     // reason so the dispatcher stops counting it as live.
-    pub(in crate::pipeline::download::worker) fn restore_stopped_owned_lane_lease(
+    pub(in crate::pipeline) fn restore_stopped_owned_lane_lease(
         &mut self,
         lease: DownloadBatchLease,
     ) {
@@ -794,6 +794,16 @@ impl Pipeline {
     }
 
     pub(crate) fn handle_owned_download_lane_event(
+        &mut self,
+        event: OwnedDownloadLaneEvent,
+        pending: &mut VecDeque<DownloadResult>,
+    ) {
+        self.ingest_owned_download_lane_event(event, pending);
+        #[cfg(test)]
+        self.audit_lane_holdings();
+    }
+
+    fn ingest_owned_download_lane_event(
         &mut self,
         event: OwnedDownloadLaneEvent,
         pending: &mut VecDeque<DownloadResult>,
@@ -829,8 +839,9 @@ impl Pipeline {
                         1,
                     );
                     for work in works {
-                        self.accept_lane_work(lane_id, work.segment_id);
-                        self.restore_owned_lane_unrequested_work(lane_id, work);
+                        if self.accept_lane_work(lane_id, work.segment_id) {
+                            self.restore_owned_lane_unrequested_work(lane_id, work);
+                        }
                     }
                     self.handle_download_lane_parked(DownloadLaneParked {
                         lane_id,
@@ -858,6 +869,9 @@ impl Pipeline {
                     1,
                 );
                 let failure = DownloadFailure::from_lane_acquire_failure(error.nntp_error());
+                // A refusal one server gave is that server's answer for the
+                // articles, so the result names it the way a fetch would.
+                let source_server_idx = error.server().map(|server| server.0);
                 let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
                 let DownloadBatchLease {
                     lane_id,
@@ -900,7 +914,7 @@ impl Pipeline {
                             unresolved_count: u64::from(!policy_outcome),
                             connection_discarded: false,
                         }),
-                        source_server_idx: None,
+                        source_server_idx,
                         origin: DownloadResultOrigin::from_work(
                             work.is_recovery,
                             work.completion_critical,
@@ -1015,6 +1029,7 @@ impl Pipeline {
             "provider_capacity" => "download.owned_lane.acquire_failed.provider_capacity",
             "local_capacity" => "download.owned_lane.acquire_failed.local_capacity",
             "server_recovering" => "download.owned_lane.acquire_failed.server_recovering",
+            "credentials_refused" => "download.owned_lane.acquire_failed.credentials_refused",
             "no_eligible_server" => "download.owned_lane.acquire_failed.no_eligible_server",
             "selection_contended" => "download.owned_lane.acquire_failed.selection_contended",
             _ => "download.owned_lane.acquire_failed.other",
@@ -1080,6 +1095,9 @@ impl Pipeline {
         );
     }
 
+    // Put an article a lane has given back, unrequested, into its queue. The
+    // lane's record has already let go of it (see
+    // [`Self::accept_lane_work`]), which is what lowered the in-flight gauges.
     pub(in crate::pipeline::download::worker) fn restore_owned_lane_unrequested_work(
         &mut self,
         lane_id: u64,
@@ -1088,32 +1106,12 @@ impl Pipeline {
         self.finish_checkpoint_progress_article(lane_id, work.segment_id);
         self.reconcile_rate_limit_for_download(work.segment_id, None);
         let job_id = work.segment_id.file_id.job_id;
-        self.active_downloads = self.active_downloads.saturating_sub(1);
-        if work.is_recovery {
-            self.active_recovery = self.active_recovery.saturating_sub(1);
-        }
         if self
             .jobs
             .get(&job_id)
             .is_some_and(|state| !is_terminal_status(&state.status))
         {
             self.note_download_activity(job_id);
-        }
-        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_job.remove(&job_id);
-            }
-        }
-        if let Some(in_flight) = self
-            .active_downloads_by_file
-            .get_mut(&work.segment_id.file_id)
-        {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_file
-                    .remove(&work.segment_id.file_id);
-            }
         }
 
         let parks = self.requeue_parks(&work);
@@ -1193,5 +1191,7 @@ impl Pipeline {
             }
         }
         self.publish_active_stage_metrics();
+        #[cfg(test)]
+        self.audit_lane_holdings();
     }
 }

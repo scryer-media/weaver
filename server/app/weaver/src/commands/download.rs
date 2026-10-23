@@ -7,7 +7,7 @@ use std::path::Path;
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::{error, info};
 
 use crate::{shutdown, wiring};
@@ -16,7 +16,7 @@ use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::ingest::{self, SubmissionOptions, SubmitNzbError};
 use weaver_server_core::jobs::{DuplicateMode, JobId, JobStatus, SubmissionOrigin};
 use weaver_server_core::settings::Config;
-use weaver_server_core::{Pipeline, SchedulerCommand, SchedulerHandle};
+use weaver_server_core::{Pipeline, SchedulerHandle};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
@@ -76,13 +76,12 @@ pub(crate) async fn run(
     let nntp = wiring::build_nntp_client(config, &profile, &server_transfer_policy, &proxies)?;
     let initial_global_paused = weaver_server_core::runtime::load_global_pause_from_db(db).await?;
 
-    // Set up scheduler channels and shared control-plane state.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
+    // Set up events and shared control-plane state.
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let mut completion_rx = event_tx.subscribe();
     let metrics = weaver_server_core::PipelineMetrics::new();
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
-    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+    let handle = SchedulerHandle::new(event_tx.clone(), shared_state.clone());
     handle.set_server_transfer_policy(std::sync::Arc::clone(&server_transfer_policy));
     handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(std::sync::Arc::clone(nntp.pool()));
@@ -133,7 +132,6 @@ pub(crate) async fn run(
         std::sync::Arc::new(tokio::sync::RwLock::new(config.clone()));
     let submission_config = standalone_config.clone();
     let mut pipeline = Pipeline::new(
-        cmd_rx,
         event_tx,
         nntp,
         buffers,

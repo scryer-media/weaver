@@ -1580,7 +1580,6 @@ async fn drive_schedule(
         // Drive the actor's quiescent-write action explicitly. A demoted
         // partial volume can leave a short write behind after the queue drains.
         pipeline.flush_quiescent_write_backlog().await;
-        pipeline.settle_all_segment_writes().await;
         pipeline.check_job_completion(job).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
         if matches!(
