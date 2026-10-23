@@ -60,7 +60,8 @@ use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{
-    NetworkRoutes, RouteKey, SessionEnv, SessionError, SessionView, Sessions, encryption_policy,
+    NetworkRoutes, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView, Sessions,
+    encryption_policy,
 };
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
@@ -1387,6 +1388,13 @@ impl TorrentService {
 
     async fn turn(&self, on: bool) {
         self.inner.sessions.turn(on).await;
+        self.run(on).await;
+    }
+
+    // While torrents are on the tick runs, putting each torrent in its
+    // route's session; while they are off every torrent is out of its
+    // session, held off.
+    async fn run(&self, on: bool) {
         if on {
             self.spawn_tick();
         } else {
@@ -1515,12 +1523,11 @@ impl TorrentService {
     }
 
     /// Bring back every stored torrent, then keep them: the job mail, the
-    /// settling of what jobs did, and, while torrents are on, the tick.
+    /// settling of what jobs did, and, while torrents are on, the tick,
+    /// which puts them in their routes' sessions as the routes answer.
     pub async fn start(&self) -> Result<(), String> {
         self.open().await?;
-        if self.inner.sessions.on() {
-            self.spawn_tick();
-        }
+        self.run(self.inner.sessions.on()).await;
         Ok(())
     }
 
@@ -2018,7 +2025,7 @@ impl TorrentService {
                 let terms = PeerTerms::of(torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
-                self.spawn_resolve(job_id, session, uri, None, identity, terms);
+                self.spawn_resolve(job_id, plan, uri, None, identity, terms);
                 self.publish().await;
                 Ok(job_id)
             }
@@ -2145,11 +2152,13 @@ impl TorrentService {
         }
     }
 
-    // Fetch a magnet's metainfo on its session, then admit it as any other.
+    // Fetch a magnet's metainfo on its route's session, once the route has
+    // one, then admit it as any other. A route that gives no session holds
+    // the magnet, which resolves again at a later tick.
     fn spawn_resolve(
         &self,
         job_id: JobId,
-        session: Arc<Session>,
+        plan: RoutePlan,
         uri: String,
         trackers: Option<Vec<String>>,
         identity: Identity,
@@ -2157,6 +2166,12 @@ impl TorrentService {
     ) {
         let service = self.clone();
         self.keep(tokio::spawn(async move {
+            let session = match service.inner.sessions.session(&plan).await {
+                Ok(session) => session,
+                Err(error) => {
+                    return service.held(job_id, Some(plan.key), held_by(error)).await;
+                }
+            };
             let mut options = AddTorrentOptions {
                 list_only: true,
                 trackers,
@@ -2268,12 +2283,8 @@ impl TorrentService {
             Ok(plan) => plan,
             Err(reason) => return self.held(job_id, None, Held::RouteDown(reason)).await,
         };
-        let session = match self.inner.sessions.session(&plan).await {
-            Ok(session) => session,
-            Err(error) => return self.held(job_id, Some(plan.key), held_by(error)).await,
-        };
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
-            torrent.route = Some(plan.key);
+            torrent.route = Some(plan.key.clone());
             torrent.held = None;
         }
         let uri = Magnet::of(hashes_of(&record), None, Vec::new()).to_string();
@@ -2287,7 +2298,7 @@ impl TorrentService {
             .collect();
         self.spawn_resolve(
             job_id,
-            session,
+            plan,
             uri,
             Some(trackers),
             identity_of(rule),
@@ -3141,7 +3152,10 @@ impl TorrentService {
         }
     }
 
-    // Bring back every stored torrent.
+    // Bring back every stored torrent. Nothing here waits on a route: a
+    // torrent goes into its route's session at the tick, as one whose route
+    // changed does, and a magnet waits for its session on the task that
+    // fetches its metainfo.
     async fn restore(&self) -> Result<(), String> {
         self.load_rules()?;
         let records = self.inner.db.list_torrents().map_err(state_error)?;
@@ -3183,10 +3197,6 @@ impl TorrentService {
             }
         }
         self.apply_queue().await;
-        let attach: Vec<JobId> = self.inner.live.lock().await.keys().copied().collect();
-        for job_id in attach {
-            self.attach(job_id).await;
-        }
         self.publish().await;
         Ok(())
     }

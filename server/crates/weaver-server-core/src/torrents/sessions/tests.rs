@@ -49,12 +49,17 @@ fn ladder(proxy: u32) -> LegPath {
 
 // Routes whose legs are ladders that reach no one, unless a leg of another
 // kind is given. Each scope maps to a proxy id, so scopes with the same id
-// share a route; a leg can be set down, or refuse to open.
+// share a route; a leg can be set down, refuse to open, or wait to open
+// until the route answers.
 #[derive(Default)]
 pub(crate) struct FakeRoutes {
     pub(crate) proxies: Mutex<BTreeMap<String, u32>>,
     pub(crate) down: Mutex<Option<String>>,
     pub(crate) refuse: Mutex<Option<String>>,
+    // While true, the route has not answered: a leg asked to open waits.
+    pub(crate) unanswered: tokio::sync::watch::Sender<bool>,
+    // The legs asked to open, answered or not.
+    pub(crate) asked: tokio::sync::watch::Sender<usize>,
     pub(crate) leg: Mutex<Option<(LegKind, Arc<dyn SocketFactory>)>>,
     // The peer limit each leg was opened for, in order.
     pub(crate) peers: Mutex<Vec<usize>>,
@@ -117,6 +122,9 @@ impl Routes for FakeRoutes {
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
+        let mut unanswered = self.unanswered.subscribe();
+        self.asked.send_modify(|asked| *asked += 1);
+        let _ = unanswered.wait_for(|unanswered| !unanswered).await;
         self.opened.fetch_add(1, Ordering::SeqCst);
         self.peers.lock().unwrap().push(peers);
         if let Some(error) = self.refuse.lock().unwrap().clone() {

@@ -165,6 +165,13 @@ fn service_on(
     TorrentService::new(db.clone(), sessions, settings, job_env, clock)
 }
 
+// A restarted service opened, its tick having put the torrents it restored
+// in their routes' sessions.
+async fn reopen(service: &TorrentService) {
+    service.open().await.unwrap();
+    service.tick().await;
+}
+
 fn set_clock() -> Arc<SetClock> {
     Arc::new(SetClock(AtomicI64::new(EPOCH_MS)))
 }
@@ -1386,7 +1393,7 @@ async fn a_restart_restores_the_intent_not_the_state() {
     rig.service.stop().await;
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     assert_eq!(
         rig.db.get_torrent(job_id).unwrap().unwrap().intent,
         TorrentIntent::Resumed
@@ -1711,7 +1718,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     let handle = queue();
     let mut changes = handle.state().subscribe_job_changes();
     again.publish_to(handle);
-    again.open().await.unwrap();
+    reopen(&again).await;
     handle_of(&again, job_id)
         .await
         .wait_until_completed()
@@ -1727,6 +1734,53 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     assert_eq!(uploaded(&seeding), sent);
     again.stop().await;
     seeding.stop().await;
+}
+
+// Starting never waits on a route. After a restart whose route has not
+// answered, the service starts with its torrents waiting: the torrent at
+// the tick, the magnet on the task that fetches its metainfo. Once the
+// route answers, the torrent goes into its session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_starts_before_the_torrents_route_answers() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let hash = "0123456789abcdef0123456789abcdef01234567";
+    let magnet = rig
+        .service
+        .add(request(AddSource::Magnet(format!(
+            "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce"
+        ))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+
+    rig.routes.unanswered.send_replace(true);
+    let before = *rig.routes.asked.borrow();
+    let mut asked = rig.routes.asked.subscribe();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let mut ticks = again.ticks();
+    // As the server starts it.
+    again.inner.sessions.turn(true).await;
+    again.start().await.unwrap();
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Queued);
+    assert!(again.inner.live.lock().await[&job_id].attached.is_none());
+    assert_eq!(
+        again.torrent(magnet).await.unwrap().state,
+        TorrentState::FetchingMetadata
+    );
+
+    rig.routes.unanswered.send_replace(false);
+    ticks.wait_for(|ticks| *ticks >= 1).await.unwrap();
+    assert!(again.inner.live.lock().await[&job_id].attached.is_some());
+    assert!(again.torrent(job_id).await.unwrap().route.is_some());
+    again.stop().await;
 }
 
 // A peer on `listener` that says it saw a complete copy `ago` seconds ago,
@@ -2071,7 +2125,7 @@ async fn a_restart_after_a_recheck_does_not_have_the_piece_it_lost() {
     rig.db.prune_orphan_active_state().unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     let handle = handle_of(&again, job_id).await;
     handle.wait_until_initialized().await.unwrap();
     let stats = handle.stats();
@@ -2148,7 +2202,7 @@ async fn a_stop_before_a_recheck_found_every_piece_checks_every_piece_on_the_nex
     rig.db.prune_orphan_active_state().unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     let handle = handle_of(&again, job_id).await;
     handle.wait_until_initialized().await.unwrap();
     let stats = handle.stats();
@@ -2860,7 +2914,7 @@ async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
     assert!(rig.db.save_torrent_peers(job_id, &saved).unwrap());
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     assert_eq!(
         handle_of(&again, job_id).await.resume_peers(),
         Some(saved.clone())
@@ -3050,7 +3104,7 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
 
     // The ban made in the session holds in the next one.
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     assert_eq!(
         handle_of(&again, job_id)
             .await
@@ -3075,7 +3129,7 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
     again.stop().await;
 
     let third = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    third.open().await.unwrap();
+    reopen(&third).await;
     assert_eq!(
         handle_of(&third, job_id).await.resume_peers(),
         Some(saved.clone())
@@ -3153,7 +3207,7 @@ async fn a_second_checkpoint_writes_only_what_changed() {
     rig.service.stop().await;
 
     let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    restarted.open().await.unwrap();
+    reopen(&restarted).await;
     let restored = job(&restarted).await;
     restarted.save_checkpoint(job_id, &restored).await;
     assert_eq!(restored.with(|job| job.pending().tally()).rows, 0);
@@ -3252,7 +3306,7 @@ async fn a_torrents_rate_limits_reach_its_session_and_outlive_a_restart() {
     rig.service.stop().await;
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     assert_eq!(handle_of(&again, job_id).await.ratelimits(), limited);
     let view = again.torrent(job_id).await.unwrap();
     assert_eq!(
@@ -3591,7 +3645,7 @@ async fn file_levels_and_picking_toggles_reach_the_session_and_outlive_a_restart
     rig.service.stop().await;
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     let handle = handle_of(&again, job_id).await;
     assert_eq!(handle.file_priorities(), [Ignored, High]);
     assert!(!handle.sequential());
@@ -3698,7 +3752,7 @@ async fn tracker_edits_outlive_a_restart() {
     rig.service.stop().await;
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     assert_eq!(listed_trackers(&again, job_id).await, [(0, c.into())]);
     assert_eq!(
         handle_of(&again, job_id).await.shared().tracker_tiers(),
@@ -3870,7 +3924,7 @@ async fn resumes_with_its_pieces(fetched: PartlyFetched) {
     rig.db.prune_orphan_active_state().unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     let handle = handle_of(&again, job_id).await;
     handle.wait_until_completed().await.unwrap();
     assert_eq!(job_have(&again, job_id).await, 3);
@@ -3949,7 +4003,7 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
         tracing::Level::WARN,
     );
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    again.open().await.unwrap();
+    reopen(&again).await;
     let heard = lines.of("a torrent's checkpoint did not restore; it starts fresh");
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert!(
