@@ -1811,17 +1811,18 @@ impl Pipeline {
 
     // The contiguous, verified prefix the download has committed for a part.
     //
-    // The same value [`Pipeline::note_file_progress_floor`] maintains: the
-    // in-memory floor if there is one, else the persisted floor a restart
-    // would resume from.
+    // Read from the assembly's written coverage: the decoded bytes its first
+    // run holds from offset zero, including a run a restart restored.
     fn direct_unpack_progress_floor(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
         let file_id = self.direct_unpack_file_id_for_part(job_id, path)?;
         Some(
-            self.pending_file_progress
-                .get(&file_id)
-                .copied()
-                .or_else(|| self.persisted_file_progress.get(&file_id).copied())
-                .unwrap_or(0),
+            self.jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map_or(
+                    0,
+                    crate::jobs::assembly::FileAssembly::committed_decoded_prefix,
+                ),
         )
     }
 

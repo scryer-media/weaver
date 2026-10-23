@@ -2683,6 +2683,25 @@ impl Pipeline {
         cancellation
     }
 
+    // Shutdown stops every PAR2 read this process still owns.
+    //
+    // A damaged-path analysis runs detached on a blocking worker, carrying
+    // the retained session and the job's token. The runtime waits for that
+    // worker before the process can exit, so an uncancelled scan holds the
+    // exit for as long as the scan takes. Firing each job's own token stops
+    // it at the scan's next poll; forgetting the ticket means the cancelled
+    // verdict is never read as the job's answer. Nothing is recorded: the job
+    // keeps the state it had, and a restart runs its read again.
+    pub(crate) fn cancel_par2_work_for_shutdown(&mut self) {
+        for cancellation in self.par2_cancellations.values() {
+            cancellation.cancel();
+        }
+        let in_flight: Vec<JobId> = self.par2_analysis_in_flight.keys().copied().collect();
+        for job_id in in_flight {
+            self.forget_par2_analysis_work(job_id);
+        }
+    }
+
     pub(crate) fn restore_par2_repair_session(
         &mut self,
         job_id: JobId,

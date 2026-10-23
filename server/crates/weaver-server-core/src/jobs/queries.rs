@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::StateError;
-use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
+use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind, FileCoverage};
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::{
     ActiveFileIdentity, ActivePar2File, ExtractionChunk, FileIdentitySource, RarVolumeFactsBySet,
@@ -361,18 +361,29 @@ impl Database {
 
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, file_index, contiguous_bytes_written
+                "SELECT job_id, file_index, coverage
                  FROM active_file_progress",
                 &[],
             )
             .await?;
             for row in rows {
                 let job_id = JobId(row.i64("job_id")? as u64);
-                if let Some(job) = jobs.get_mut(&job_id) {
-                    job.file_progress.insert(
-                        row.i64("file_index")? as u32,
-                        row.i64("contiguous_bytes_written")? as u64,
-                    );
+                let file_index = row.i64("file_index")? as u32;
+                let Some(job) = jobs.get_mut(&job_id) else {
+                    continue;
+                };
+                // Refused whole, never half-trusted: the file downloads from
+                // nothing, which is always correct.
+                match FileCoverage::decode(&row.bytes("coverage")?) {
+                    Ok(coverage) => {
+                        job.file_progress.insert(file_index, coverage);
+                    }
+                    Err(error) => tracing::warn!(
+                        job_id = job_id.0,
+                        file_index,
+                        %error,
+                        "file coverage checkpoint refused; the file redownloads"
+                    ),
                 }
             }
 
@@ -571,9 +582,9 @@ impl Database {
         .transpose()
     }
 
-    // Load the per-file runtime view for one active job: contiguous bytes
-    // written per incomplete file plus the set of fully completed file
-    // indices. Used by integration facades that expose per-file listings
+    // Load the per-file runtime view for one active job: the bytes each
+    // incomplete file's coverage checkpoint holds, plus the set of fully
+    // completed file indices. Used by integration facades that expose per-file listings
     // without loading the full recovery snapshot.
     pub fn load_active_file_runtime(
         &self,
@@ -583,7 +594,7 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT file_index, contiguous_bytes_written
+                "SELECT file_index, coverage
                  FROM active_file_progress
                  WHERE job_id = {}",
                 &[SqlArg::I64(job_id.0 as i64)],
@@ -591,10 +602,9 @@ impl Database {
             .await?;
             let mut progress = HashMap::with_capacity(rows.len());
             for row in rows {
-                progress.insert(
-                    row.i64("file_index")? as u32,
-                    row.i64("contiguous_bytes_written")? as u64,
-                );
+                let covered = FileCoverage::decode(&row.bytes("coverage")?)
+                    .map_or(0, |coverage| coverage.covered_bytes());
+                progress.insert(row.i64("file_index")? as u32, covered);
             }
 
             let rows = SqlRuntime::fetch_all(

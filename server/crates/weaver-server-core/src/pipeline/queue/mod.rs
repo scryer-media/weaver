@@ -223,13 +223,29 @@ impl JobRow {
             job.download_wait_reason = Some(crate::jobs::handle::PROPAGATION_WAIT_REASON.into());
             job.download_retry_at_epoch_ms = propagation;
         }
-        if globals.paused
-            || globals.speed_test_paused
-            || self.intents.paused == Some(true)
-            || propagation.is_some()
-        {
+        // A pause or resume the pipeline has not applied yet is already the
+        // state the queue holds the job to.
+        if self.intents.pause_seq > self.report.seen_intent_seq {
+            if self.intents.paused == Some(true) {
+                job.status = crate::JobStatus::Paused;
+                job.run_state = crate::RunState::Paused;
+            } else if self.intents.paused == Some(false) && job.status == crate::JobStatus::Paused {
+                job.status = crate::JobStatus::Queued;
+                job.run_state = crate::RunState::Active;
+            }
+        }
+        let global_pause = globals.paused || globals.speed_test_paused;
+        if global_pause || self.intents.paused == Some(true) || propagation.is_some() {
             if job.download_state == crate::DownloadState::Downloading {
                 job.download_state = crate::DownloadState::Queued;
+            }
+            // The global pause holds every job whose download it stops.
+            if global_pause
+                && job.download_state == crate::DownloadState::Queued
+                && job.post_state == crate::PostState::Idle
+                && job.status != crate::JobStatus::AwaitingQueueScripts
+            {
+                job.run_state = crate::RunState::Paused;
             }
         } else if activity
             && matches!(
@@ -238,6 +254,13 @@ impl JobRow {
             )
         {
             job.download_state = crate::DownloadState::Downloading;
+        } else if !activity
+            && job.download_state == crate::DownloadState::Downloading
+            && self.report.download_work_pending
+            && !job.finalizing_download
+        {
+            // Work is owed but no lane holds the job: it waits for lanes.
+            job.download_state = crate::DownloadState::Queued;
         }
         if !self.phases.is_empty() {
             job.phase_progress = self.sampled_phases.clone();
@@ -363,5 +386,166 @@ impl Queue {
             }
             Change::changed(())
         });
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::{DownloadState, JobStatus, PostState, RunState};
+
+    fn downloading(id: u64) -> JobInfo {
+        JobInfo {
+            job_id: JobId(id),
+            job_hash: None,
+            name: format!("job-{id}"),
+            status: JobStatus::Downloading,
+            download_state: DownloadState::Downloading,
+            finalizing_download: false,
+            fetching_repair_data: false,
+            post_state: PostState::Idle,
+            run_state: RunState::Active,
+            progress: 0.0,
+            total_bytes: 100,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            phase_progress: Vec::new(),
+            failed_bytes: 0,
+            health: 1000,
+            terminal_discards: Vec::new(),
+            total_files: 1,
+            completed_files: 0,
+            remaining_par_files: 0,
+            password: None,
+            category: None,
+            metadata: Vec::new(),
+            output_dir: None,
+            error: None,
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
+            server_attribution: Vec::new(),
+            created_at_epoch_ms: 0.0,
+        }
+    }
+
+    // A row the pipeline last reported with a lane holding it.
+    fn active_row(id: u64) -> JobRow {
+        let mut row = JobRow::new(downloading(id));
+        row.report.download_active = true;
+        row.report.download_work_pending = true;
+        row
+    }
+
+    #[test]
+    fn queue_global_pause_reports_every_held_download_as_paused() {
+        let globals = Globals {
+            paused: true,
+            ..Globals::default()
+        };
+        for row in [active_row(1), JobRow::new(downloading(2))] {
+            let job = row.info(&globals);
+            assert_eq!(job.run_state, RunState::Paused);
+            assert_eq!(job.download_state, DownloadState::Queued);
+        }
+
+        let speed_test = Globals {
+            speed_test_paused: true,
+            ..Globals::default()
+        };
+        assert_eq!(active_row(3).info(&speed_test).run_state, RunState::Paused);
+
+        // Post-processing is not a download the global pause stops.
+        let mut extracting = downloading(4);
+        extracting.status = JobStatus::Extracting;
+        extracting.download_state = DownloadState::Complete;
+        extracting.post_state = PostState::Extracting;
+        assert_eq!(
+            JobRow::new(extracting).info(&globals).run_state,
+            RunState::Active
+        );
+        assert_eq!(
+            active_row(5).info(&Globals::default()).run_state,
+            RunState::Active
+        );
+    }
+
+    #[test]
+    fn queue_job_holding_no_lane_while_work_is_owed_reads_queued() {
+        let mut row = active_row(1);
+        row.report.download_active = false;
+        let job = row.info(&Globals::default());
+        assert_eq!(job.download_state, DownloadState::Queued);
+        assert_eq!(job.run_state, RunState::Active);
+
+        // A lane holds it: Downloading.
+        assert_eq!(
+            active_row(2).info(&Globals::default()).download_state,
+            DownloadState::Downloading
+        );
+
+        // Payload in and the pipeline draining: not a wait for lanes.
+        let mut finalizing = active_row(3);
+        finalizing.report.download_active = false;
+        finalizing.report.job.finalizing_download = true;
+        assert_eq!(
+            finalizing.info(&Globals::default()).download_state,
+            DownloadState::Downloading
+        );
+    }
+
+    #[test]
+    fn queue_job_waiting_for_lanes_keeps_the_dispatcher_wait_reason() {
+        let mut row = active_row(1);
+        row.report.download_active = false;
+        row.report.job.download_wait_reason = Some("checkpoint".into());
+        let job = row.info(&Globals::default());
+        assert_eq!(job.download_state, DownloadState::Queued);
+        assert_eq!(job.download_wait_reason.as_deref(), Some("checkpoint"));
+    }
+
+    #[test]
+    fn queue_pause_then_resume_report_the_intent_before_the_pipeline_applies_it() {
+        let queue = Queue::new(vec![downloading(1)]);
+        queue.write(|inner| {
+            inner.jobs[0].report.download_active = true;
+            inner.jobs[0].report.download_work_pending = true;
+            Change::changed(())
+        });
+        let view = |queue: &Queue| queue.read(|inner| inner.jobs[0].info(&inner.globals));
+
+        queue.set_job_paused(JobId(1), true).unwrap();
+        let paused = view(&queue);
+        assert_eq!(paused.status, JobStatus::Paused);
+        assert_eq!(paused.run_state, RunState::Paused);
+        assert_eq!(paused.download_state, DownloadState::Queued);
+
+        // The pipeline applies the pause and reports it.
+        queue.write(|inner| {
+            let row = &mut inner.jobs[0];
+            row.report.seen_intent_seq = row.intents.seq;
+            row.report.job.status = JobStatus::Paused;
+            row.report.job.download_state = DownloadState::Queued;
+            row.report.job.run_state = RunState::Paused;
+            row.report.download_active = false;
+            Change::changed(())
+        });
+        assert_eq!(view(&queue).run_state, RunState::Paused);
+
+        queue.set_job_paused(JobId(1), false).unwrap();
+        let resumed = view(&queue);
+        assert_eq!(resumed.status, JobStatus::Queued);
+        assert_eq!(resumed.run_state, RunState::Active);
+        assert_eq!(resumed.download_state, DownloadState::Queued);
+
+        // A resume under the global pause is still held by it.
+        let held = queue.read(|inner| {
+            let globals = Globals {
+                paused: true,
+                ..inner.globals.clone()
+            };
+            inner.jobs[0].info(&globals)
+        });
+        assert_eq!(held.run_state, RunState::Paused);
     }
 }

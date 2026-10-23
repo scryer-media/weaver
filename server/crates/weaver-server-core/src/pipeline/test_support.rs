@@ -109,15 +109,23 @@ pub async fn seed_job(pipeline: &mut Pipeline, job: crate::JobInfo) {
         state.paused_resume_download_state = Some(crate::DownloadState::Queued);
         state.paused_resume_post_state = Some(crate::PostState::Idle);
     }
+    // The row carries what the dispatcher would report for it, so a dispatch
+    // pass finds nothing stale and never replaces the seeded job with the
+    // pipeline's own report: no lane holds it, and its queued fixture segment
+    // waits on whatever the dispatcher says.
+    let id = job.job_id;
+    let mut job = job;
+    if job.download_wait_reason.is_none() {
+        job.download_wait_reason = pipeline.job_dispatch_hold_reason(id).map(str::to_owned);
+    }
     pipeline.shared_state.queue.write(|inner| {
-        let id = job.job_id;
-        inner
+        let row = inner
             .jobs
             .iter_mut()
             .find(|row| row.id == id)
-            .expect("admitted fixture")
-            .report
-            .job = job;
+            .expect("admitted fixture");
+        row.report.job = job;
+        row.report.download_active = false;
         queue::Change::changed(())
     });
 }

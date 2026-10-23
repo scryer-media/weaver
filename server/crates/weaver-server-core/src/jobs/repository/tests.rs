@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::StateError;
-use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind};
+use crate::jobs::assembly::{
+    CoverageRun, DetectedArchiveIdentity, DetectedArchiveKind, FileCoverage,
+};
 use crate::jobs::{ActiveFileIdentity, FileIdentitySource};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{
@@ -158,6 +160,20 @@ fn create_active_job_with_file_identities_roundtrips_initial_state() {
     assert_eq!(job.file_identities.get(&1), Some(&identities[1]));
 }
 
+// A coverage checkpoint of one run from offset zero, `bytes` long.
+fn coverage_of(bytes: u64) -> FileCoverage {
+    FileCoverage::from_ordered_runs([CoverageRun {
+        first_ordinal: 0,
+        ordinals: 1,
+        start: 0,
+        end: bytes,
+    }])
+}
+
+fn covered(progress: &HashMap<u32, FileCoverage>, file_index: u32) -> Option<u64> {
+    progress.get(&file_index).map(FileCoverage::covered_bytes)
+}
+
 #[test]
 fn upsert_and_load_file_progress() {
     let db = Database::open_in_memory().unwrap();
@@ -166,55 +182,97 @@ fn upsert_and_load_file_progress() {
         ActiveFileProgress {
             job_id: JobId(1),
             file_index: 0,
-            contiguous_bytes_written: 8 * 1024 * 1024,
+            coverage: coverage_of(8 * 1024 * 1024),
         },
         ActiveFileProgress {
             job_id: JobId(1),
             file_index: 1,
-            contiguous_bytes_written: 1024,
+            coverage: coverage_of(1024),
         },
     ])
     .unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
     assert_eq!(
-        jobs[&JobId(1)].file_progress.get(&0).copied(),
+        covered(&jobs[&JobId(1)].file_progress, 0),
         Some(8 * 1024 * 1024)
     );
-    assert_eq!(jobs[&JobId(1)].file_progress.get(&1).copied(), Some(1024));
+    assert_eq!(covered(&jobs[&JobId(1)].file_progress, 1), Some(1024));
 }
 
 #[test]
-fn bulk_file_progress_cross_sqlite_bind_chunk_boundary_and_keeps_max() {
+fn file_coverage_of_another_schema_is_refused_and_the_file_downloads_again() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.upsert_file_progress_batch(&[ActiveFileProgress {
+        job_id: JobId(1),
+        file_index: 0,
+        coverage: coverage_of(4096),
+    }])
+    .unwrap();
+    let mut newer = coverage_of(4096).encode();
+    newer[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+    for (file_index, row) in [
+        // A checkpoint from a schema this binary does not read.
+        (1i64, newer),
+        // The prefix floor's old shape: a bare byte count.
+        (2, 4096u64.to_le_bytes().to_vec()),
+    ] {
+        execute_sql(
+            &db,
+            "INSERT INTO active_file_progress (job_id, file_index, coverage)
+             VALUES (1, {}, {})",
+            vec![SqlArg::I64(file_index), SqlArg::Bytes(row)],
+        );
+    }
+
+    let jobs = db.load_active_jobs().unwrap();
+    let progress = &jobs[&JobId(1)].file_progress;
+    // Refused whole, never half-trusted: no coverage means a full fetch.
+    assert_eq!(covered(progress, 0), Some(4096));
+    assert!(progress.get(&1).is_none());
+    assert!(progress.get(&2).is_none());
+    let (runtime, _) = db.load_active_file_runtime(JobId(1)).unwrap();
+    assert_eq!(runtime.get(&1).copied(), Some(0));
+}
+
+#[test]
+fn bulk_file_progress_cross_sqlite_bind_chunk_boundary_and_replaces() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
     let low_progress = (0..325)
         .map(|file_index| ActiveFileProgress {
             job_id: JobId(1),
             file_index,
-            contiguous_bytes_written: 1024,
+            coverage: coverage_of(1024),
         })
         .collect::<Vec<_>>();
     let high_progress = (0..325)
         .map(|file_index| ActiveFileProgress {
             job_id: JobId(1),
             file_index,
-            contiguous_bytes_written: 2048 + u64::from(file_index),
+            coverage: coverage_of(2048 + u64::from(file_index)),
         })
         .collect::<Vec<_>>();
 
-    db.upsert_file_progress_batch(&high_progress).unwrap();
     db.upsert_file_progress_batch(&low_progress).unwrap();
+    db.upsert_file_progress_batch(&high_progress).unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
     let progress = &jobs[&JobId(1)].file_progress;
     assert_eq!(progress.len(), 325);
-    assert_eq!(progress.get(&0).copied(), Some(2048));
-    assert_eq!(progress.get(&324).copied(), Some(2048 + 324));
+    assert_eq!(covered(progress, 0), Some(2048));
+    assert_eq!(covered(progress, 324), Some(2048 + 324));
+
+    // Coverage is replaced, never merged by size: a barrier that recorded
+    // less (a retracted article) is the truth from then on.
+    db.upsert_file_progress_batch(&low_progress).unwrap();
+    let jobs = db.load_active_jobs().unwrap();
+    assert_eq!(covered(&jobs[&JobId(1)].file_progress, 324), Some(1024));
 }
 
 #[test]
-fn bulk_file_progress_same_batch_duplicates_keep_max() {
+fn bulk_file_progress_same_batch_duplicates_keep_the_last() {
     let db = Database::open_in_memory().unwrap();
     db.create_active_job(&sample_job(1)).unwrap();
 
@@ -222,18 +280,18 @@ fn bulk_file_progress_same_batch_duplicates_keep_max() {
         ActiveFileProgress {
             job_id: JobId(1),
             file_index: 0,
-            contiguous_bytes_written: 2048,
+            coverage: coverage_of(2048),
         },
         ActiveFileProgress {
             job_id: JobId(1),
             file_index: 0,
-            contiguous_bytes_written: 1024,
+            coverage: coverage_of(1024),
         },
     ])
     .unwrap();
 
     let jobs = db.load_active_jobs().unwrap();
-    assert_eq!(jobs[&JobId(1)].file_progress.get(&0).copied(), Some(2048));
+    assert_eq!(covered(&jobs[&JobId(1)].file_progress, 0), Some(1024));
 }
 
 #[test]
@@ -245,7 +303,7 @@ fn perf_upsert_10k_file_progress_rows() {
         .map(|file_index| ActiveFileProgress {
             job_id: JobId(1),
             file_index,
-            contiguous_bytes_written: 4096 + u64::from(file_index),
+            coverage: coverage_of(4096 + u64::from(file_index)),
         })
         .collect::<Vec<_>>();
 
@@ -268,7 +326,7 @@ fn complete_file_and_load() {
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
-        contiguous_bytes_written: 4096,
+        coverage: coverage_of(4096),
     }])
     .unwrap();
     db.complete_file(JobId(1), 0, "data.rar", &[0x11; 16])
@@ -692,7 +750,7 @@ fn delete_active_job_cleans_all() {
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
-        contiguous_bytes_written: 4096,
+        coverage: coverage_of(4096),
     }])
     .unwrap();
     db.complete_file(JobId(1), 0, "f.rar", &[0; 16]).unwrap();
@@ -710,7 +768,7 @@ fn mark_file_incomplete_clears_progress_rows() {
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
-        contiguous_bytes_written: 1234,
+        coverage: coverage_of(1234),
     }])
     .unwrap();
 
@@ -1241,7 +1299,7 @@ fn late_active_state_writes_noop_after_archive() {
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
-        contiguous_bytes_written: 4096,
+        coverage: coverage_of(4096),
     }])
     .unwrap();
     db.complete_file(JobId(1), 0, "late.rar", &[0x11; 16])
@@ -1320,15 +1378,15 @@ fn prune_orphan_active_state_removes_only_orphans() {
     db.upsert_file_progress_batch(&[ActiveFileProgress {
         job_id: JobId(1),
         file_index: 0,
-        contiguous_bytes_written: 2048,
+        coverage: coverage_of(2048),
     }])
     .unwrap();
 
     execute_sql(
         &db,
         "INSERT INTO active_file_progress
-         (job_id, file_index, contiguous_bytes_written)
-         VALUES (100, 0, 1024)",
+         (job_id, file_index, coverage)
+         VALUES (100, 0, x'00')",
         vec![],
     );
     execute_sql(

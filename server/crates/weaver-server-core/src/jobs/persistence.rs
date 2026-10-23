@@ -194,24 +194,21 @@ async fn bulk_upsert_file_progress_tx(
     }
 
     let chunk_size = max_rows_for_tx(tx, 3);
+    // Replaced, never merged: each barrier writes the file's whole coverage,
+    // which may also have shrunk (a withdrawn or reset article).
     let conflict_sql = " ON CONFLICT(job_id, file_index)
-                         DO UPDATE SET contiguous_bytes_written =
-                            CASE
-                                WHEN active_file_progress.contiguous_bytes_written > excluded.contiguous_bytes_written
-                                THEN active_file_progress.contiguous_bytes_written
-                                ELSE excluded.contiguous_bytes_written
-                            END";
+                         DO UPDATE SET coverage = excluded.coverage";
     match tx {
         SqlTx::Sqlite(tx) => {
             for chunk in progress.chunks(chunk_size) {
                 let mut builder = QueryBuilder::<Sqlite>::new(
                     "INSERT INTO active_file_progress
-                     (job_id, file_index, contiguous_bytes_written) ",
+                     (job_id, file_index, coverage) ",
                 );
                 builder.push_values(chunk, |mut row, entry| {
                     row.push_bind(entry.job_id.0 as i64)
                         .push_bind(entry.file_index as i64)
-                        .push_bind(entry.contiguous_bytes_written as i64);
+                        .push_bind(entry.coverage.encode());
                 });
                 builder.push(conflict_sql);
                 builder.build().execute(&mut **tx).await.map_err(db_err)?;
@@ -221,12 +218,12 @@ async fn bulk_upsert_file_progress_tx(
             for chunk in progress.chunks(chunk_size) {
                 let mut builder = QueryBuilder::<Postgres>::new(
                     "INSERT INTO active_file_progress
-                     (job_id, file_index, contiguous_bytes_written) ",
+                     (job_id, file_index, coverage) ",
                 );
                 builder.push_values(chunk, |mut row, entry| {
                     row.push_bind(entry.job_id.0 as i64)
                         .push_bind(entry.file_index as i64)
-                        .push_bind(entry.contiguous_bytes_written as i64);
+                        .push_bind(entry.coverage.encode());
                 });
                 builder.push(conflict_sql);
                 builder.build().execute(&mut **tx).await.map_err(db_err)?;
@@ -1286,16 +1283,10 @@ impl Database {
         }
 
         let datastore = self.datastore();
+        // The last entry for a file is its latest coverage.
         let mut deduped = HashMap::<(JobId, u32), ActiveFileProgress>::new();
         for entry in progress {
-            deduped
-                .entry((entry.job_id, entry.file_index))
-                .and_modify(|existing| {
-                    if entry.contiguous_bytes_written > existing.contiguous_bytes_written {
-                        *existing = entry.clone();
-                    }
-                })
-                .or_insert_with(|| entry.clone());
+            deduped.insert((entry.job_id, entry.file_index), entry.clone());
         }
         let progress = deduped.into_values().collect::<Vec<_>>();
         self.run_sql_blocking(async move {

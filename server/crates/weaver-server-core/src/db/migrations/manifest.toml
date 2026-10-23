@@ -730,102 +730,119 @@ scope = "upgrade_only"
 
 [[migration]]
 version = 65
-description = "every job is stamped with the engine that runs it"
+description = "a file's restart checkpoint is its written coverage"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0065_job_engine_stamp/sqlite.sql"
+file = "migrations/0065_file_coverage_checkpoint/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0065_job_engine_stamp/postgres.sql"
+file = "migrations/0065_file_coverage_checkpoint/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
 version = 66
-description = "a graph job's tree is checkpointed as rows a restart rebuilds it from"
+description = "every job is stamped with the engine that runs it"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0066_graph_checkpoint/sqlite.sql"
+file = "migrations/0066_job_engine_stamp/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0066_graph_checkpoint/postgres.sql"
+file = "migrations/0066_job_engine_stamp/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
 version = 67
-description = "a graph checkpoint keeps which given-up members were buried"
+description = "a graph job's tree is checkpointed as rows a restart rebuilds it from"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0067_graph_member_buried/sqlite.sql"
+file = "migrations/0067_graph_checkpoint/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0067_graph_member_buried/postgres.sql"
+file = "migrations/0067_graph_checkpoint/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
 version = 68
-description = "a graph checkpoint keeps each sealed part of a node's facts as its own row"
+description = "a graph checkpoint keeps which given-up members were buried"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0068_graph_facts_parts/sqlite.sql"
+file = "migrations/0068_graph_member_buried/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0068_graph_facts_parts/postgres.sql"
+file = "migrations/0068_graph_member_buried/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
 version = 69
-description = "a graph checkpoint keeps which member each further posting of one was folded into"
+description = "a graph checkpoint keeps each sealed part of a node's facts as its own row"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0069_graph_member_copy_of/sqlite.sql"
+file = "migrations/0069_graph_facts_parts/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0069_graph_member_copy_of/postgres.sql"
+file = "migrations/0069_graph_facts_parts/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
 version = 70
-description = "a graph checkpoint no longer records members carrying recovery data nothing reads"
+description = "a graph checkpoint keeps which member each further posting of one was folded into"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0070_graph_member_unusable_dropped/sqlite.sql"
+file = "migrations/0070_graph_member_copy_of/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0070_graph_member_unusable_dropped/postgres.sql"
+file = "migrations/0070_graph_member_copy_of/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 71
+description = "a graph checkpoint no longer records members carrying recovery data nothing reads"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0071_graph_member_unusable_dropped/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0071_graph_member_unusable_dropped/postgres.sql"
 engine = "postgres"
 scope = "all"

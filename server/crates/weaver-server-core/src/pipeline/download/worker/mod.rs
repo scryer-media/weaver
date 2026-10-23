@@ -547,6 +547,7 @@ impl Pipeline {
     // watchdog measure against.
     pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
         self.dispatch_download_pass(now);
+        self.report_changed_dispatch_holds();
         #[cfg(test)]
         self.audit_lane_holdings();
     }

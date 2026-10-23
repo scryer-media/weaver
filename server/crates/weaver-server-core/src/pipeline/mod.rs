@@ -2015,7 +2015,7 @@ pub(super) struct UuFileAssembly {
     // released and the completion warning has already been issued.
     //
     // The entry outlives completion on purpose. It is what
-    // [`Pipeline::note_file_progress_floor`] reads to keep a restart
+    // [`Pipeline::note_file_coverage`] reads to keep a restart
     // checkpoint from ever being written for a uuencode file, and that
     // suppression has to hold for the final write of the file as much as for
     // every write before it.
@@ -2711,14 +2711,19 @@ pub struct Pipeline {
     pub(super) complete_dir: PathBuf,
     // Legacy logical NZB path base retained for compatibility with existing rows and tests.
     pub(super) nzb_dir: PathBuf,
-    // Per-file contiguous write floors awaiting persistence.
+    // Files whose written coverage changed since the restart barrier last
+    // persisted it, with the bytes that coverage now holds. The coverage
+    // itself is the assembly's; the barrier encodes it from there.
     pub(super) pending_file_progress: HashMap<NzbFileId, u64>,
+    // How far coverage has moved, over every file, since the barrier last
+    // ran. The barrier runs again once this reaches one checkpoint interval.
+    pub(super) unpersisted_coverage_bytes: u64,
     // Jobs whose provider shares have moved since the last checkpoint.
     pub(super) dirty_server_attribution: HashSet<JobId>,
     // Jobs whose support facts changed since the last checkpoint.
     pub(super) dirty_support_facts: HashSet<JobId>,
     pub(super) server_attribution_checkpoint_at: Instant,
-    // Last queued/persisted contiguous write floor per file.
+    // Bytes of written coverage per file as the barrier last persisted it.
     pub(super) persisted_file_progress: HashMap<NzbFileId, u64>,
     // Streaming checksum state for files whose decoded bytes have been observed in order.
     pub(super) file_hash_states: HashMap<NzbFileId, CompletedFileChecksumState>,

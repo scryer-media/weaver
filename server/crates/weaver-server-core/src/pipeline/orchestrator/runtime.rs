@@ -313,6 +313,7 @@ impl Pipeline {
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
             pending_file_progress: HashMap::new(),
+            unpersisted_coverage_bytes: 0,
             dirty_server_attribution: HashSet::new(),
             dirty_support_facts: HashSet::new(),
             server_attribution_checkpoint_at: Instant::now(),
@@ -739,64 +740,68 @@ impl Pipeline {
         state.assembly.progress().max(byte_progress).clamp(0.0, 1.0)
     }
 
-    pub(crate) fn note_file_progress_floor(
-        &mut self,
-        file_id: NzbFileId,
-        contiguous_bytes_written: u64,
-        force_flush: bool,
-    ) {
-        // A direct set's source volume has no file, so its legacy
-        // floor stays at zero — an older binary then sees no coverage and
+    // A conventional file's written coverage moved: some of its articles
+    // reached disk, wherever in the file they sit.
+    //
+    // Coverage is the assembly's committed articles, so nothing is copied
+    // here; the file is only marked for the restart barrier, which encodes its
+    // coverage and replaces the file's one checkpoint row. The barrier runs
+    // once coverage over every file has moved by one checkpoint interval, on
+    // demand when the restart guard needs it, and at drain, so a restart loses
+    // at most one interval of written work. A gap anywhere in a file never
+    // holds that back: an article written past it is coverage the moment its
+    // write returns.
+    pub(crate) fn note_file_coverage(&mut self, file_id: NzbFileId, force_flush: bool) {
+        // A direct set's source volume has no file, so it never carries a
+        // conventional checkpoint — an older binary then sees no coverage and
         // redownloads instead of trusting bytes that were never written there.
         // The routing seam already returns before this is reached; the guard is
         // here so any *other* caller inherits the same rule.
         if self.is_direct_source_file(file_id) {
             return;
         }
-        // A uuencode file has no resumable checkpoint, so it must never write
-        // one. The floor is a count of DECODED bytes, and the restart path that
-        // reads it back (`segments_covered_by_floor`) walks the NZB's DECLARED
-        // segment sizes to decide which ordinals those bytes cover. Declared
-        // sizes are ENCODED: yEnc runs ~1.03x its decoded bytes, so the walk
-        // stops a little early and a yEnc file merely re-fetches a segment or
-        // two. uuencode runs ~1.38x, so the walk marks a prefix of ordinals
-        // received whose decoded end nobody can compute — and a uuencode part's
-        // offset is precisely the decoded length of its whole prefix. The
-        // resumed cursor would start at ordinal 0 with every arriving part
-        // parked forever behind ordinals that were never queued.
+        // A uuencode file has no resumable checkpoint, so it never writes one.
+        // Its parts are assembled through a sequential cursor that only
+        // decoding from ordinal 0 builds — a part's offset is the decoded
+        // length of its whole prefix, and the cursor naming it lives in memory
+        // only — so a restart cannot resume a uuencode file at any ordinal but
+        // the first, whatever its coverage says.
         //
         // Suppressing the checkpoint costs a partial uuencode file its resume
-        // and nothing else: with no floor recorded, the restart finds nothing to
-        // skip and the file downloads from ordinal 0 with a cursor that agrees.
-        // That is the honest price of sequential assembly — an offset is only
-        // knowable from the whole prefix, so a prefix nobody measured cannot be
-        // resumed from. The tombstone left by `finish_uu_file` keeps this
+        // and nothing else: with no coverage recorded, the restart finds
+        // nothing to skip and the file downloads from ordinal 0 with a cursor
+        // that agrees. The tombstone left by `finish_uu_file` keeps this
         // holding for the file's final write too, which lands after the
         // completion branch has run.
         if self.uu_files.contains_key(&file_id) {
             return;
         }
-        let contiguous_bytes_written = self
+        // Retained damage is never coverage: a damaged ordinal is not
+        // committed until a clean copy replaces it, and nothing at or past the
+        // retained-damage floor is coverage either, so a restart refetches it.
+        let Some(covered) = self
             .jobs
             .get(&file_id.job_id)
             .and_then(|state| state.assembly.file(file_id))
-            .and_then(|file| file.retained_damage_floor())
-            .map_or(contiguous_bytes_written, |floor| {
-                contiguous_bytes_written.min(floor)
-            });
+            .map(crate::jobs::assembly::FileAssembly::durable_received_bytes)
+        else {
+            return;
+        };
         let current = self
             .pending_file_progress
             .get(&file_id)
             .copied()
             .or_else(|| self.persisted_file_progress.get(&file_id).copied())
             .unwrap_or(0);
-        if contiguous_bytes_written <= current {
+        if covered == current && !force_flush {
             return;
         }
-        self.pending_file_progress
-            .insert(file_id, contiguous_bytes_written);
+        self.pending_file_progress.insert(file_id, covered);
+        self.unpersisted_coverage_bytes = self
+            .unpersisted_coverage_bytes
+            .saturating_add(covered.abs_diff(current));
         let threshold_flush =
-            contiguous_bytes_written.saturating_sub(current) >= download_restart_checkpoint_bytes();
+            self.unpersisted_coverage_bytes >= download_restart_checkpoint_bytes();
         if force_flush || threshold_flush {
             let label = if force_flush {
                 "download.file_progress.flush.force"
@@ -810,26 +815,42 @@ impl Pipeline {
         }
     }
 
+    // The restart barrier's rows: each marked file's coverage, encoded from
+    // its assembly, with the persisted byte account moved up to match.
+    fn take_file_coverage_batch(&mut self) -> Vec<ActiveFileProgress> {
+        let pending = std::mem::take(&mut self.pending_file_progress);
+        self.unpersisted_coverage_bytes = 0;
+        let mut batch = Vec::with_capacity(pending.len());
+        for (file_id, covered_bytes) in pending {
+            let Some(file) = self
+                .jobs
+                .get(&file_id.job_id)
+                .and_then(|state| state.assembly.file(file_id))
+            else {
+                continue;
+            };
+            self.persisted_file_progress.insert(file_id, covered_bytes);
+            batch.push(ActiveFileProgress {
+                job_id: file_id.job_id,
+                file_index: file_id.file_index,
+                coverage: file.durable_coverage(),
+            });
+        }
+        batch
+    }
+
     pub(crate) fn flush_file_progress_batch(&mut self, label: &'static str) {
         if self.pending_file_progress.is_empty() {
             return;
         }
         let _probe = crate::runtime::perf_probe::scope(label);
-        let pending = std::mem::take(&mut self.pending_file_progress);
-        for (file_id, bytes) in &pending {
-            self.persisted_file_progress.insert(*file_id, *bytes);
+        let batch = self.take_file_coverage_batch();
+        if batch.is_empty() {
+            return;
         }
-        let batch: Vec<ActiveFileProgress> = pending
-            .into_iter()
-            .map(|(file_id, contiguous_bytes_written)| ActiveFileProgress {
-                job_id: file_id.job_id,
-                file_index: file_id.file_index,
-                contiguous_bytes_written,
-            })
-            .collect();
         self.db_fire_and_forget(move |db| {
             if let Err(error) = db.upsert_file_progress_batch(&batch) {
-                tracing::error!(count = batch.len(), error = %error, "failed to persist file progress floors");
+                tracing::error!(count = batch.len(), error = %error, "failed to persist file coverage checkpoints");
             }
         });
     }
@@ -842,18 +863,10 @@ impl Pipeline {
             return Ok(());
         }
         let _probe = crate::runtime::perf_probe::scope(label);
-        let pending = std::mem::take(&mut self.pending_file_progress);
-        for (file_id, bytes) in &pending {
-            self.persisted_file_progress.insert(*file_id, *bytes);
+        let batch = self.take_file_coverage_batch();
+        if batch.is_empty() {
+            return Ok(());
         }
-        let batch: Vec<ActiveFileProgress> = pending
-            .into_iter()
-            .map(|(file_id, contiguous_bytes_written)| ActiveFileProgress {
-                job_id: file_id.job_id,
-                file_index: file_id.file_index,
-                contiguous_bytes_written,
-            })
-            .collect();
         self.db_blocking(move |db| db.upsert_file_progress_batch(&batch))
             .await
     }
@@ -1141,6 +1154,7 @@ impl Pipeline {
                 &turn_metrics.pipeline_histograms.turn_duration,
             );
             if queue.read(|inner| inner.globals.shutting_down) {
+                self.cancel_par2_work_for_shutdown();
                 // Readmission can wait for cancellation cleanup, whose terminal
                 // completion event releases the last script cancellation sender.
                 // Keep servicing those events while accepted admissions settle.
@@ -1197,6 +1211,11 @@ impl Pipeline {
             if self.has_direct_end_header_verdicts() {
                 turn_active = true;
                 self.settle_direct_end_header_verdicts().await;
+            }
+            // So does a set whose holds nothing left to arrive can place.
+            if !self.direct_store.unplaceable_verdicts.is_empty() {
+                turn_active = true;
+                self.settle_direct_unplaceable_sets().await;
             }
 
             let pending_completion_checks = self.pending_completion_checks.len();

@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::events::model::PipelineEvent;
 use crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
-use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
+use crate::jobs::assembly::{DetectedArchiveIdentity, FileCoverage, JobAssembly};
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
@@ -30,7 +30,25 @@ struct RestoreSkipStats {
 struct RestoreSkipPlan {
     skip: HashSet<SegmentId>,
     file_progress: HashMap<u32, u64>,
+    // The written runs each file resumes with, as the checkpoint recorded
+    // them, after the restore dropped any the file on disk cannot hold.
+    coverage: HashMap<u32, FileCoverage>,
     stats: RestoreSkipStats,
+}
+
+// The declared bytes of the articles a file's coverage holds: what the job
+// counts as downloaded for them, in the same unit the queue charges.
+fn covered_declared_bytes(
+    file_spec: &crate::jobs::model::FileSpec,
+    coverage: &FileCoverage,
+) -> u64 {
+    let ordinals: HashSet<u32> = coverage.ordinals().collect();
+    file_spec
+        .segments
+        .iter()
+        .filter(|segment| ordinals.contains(&segment.ordinal))
+        .map(|segment| u64::from(segment.bytes))
+        .sum()
 }
 
 // Whole segments that a contiguous byte floor covers, and the floor those
@@ -47,10 +65,9 @@ pub(crate) struct FloorCoveredSegments {
 // `floor`, together with the contiguous byte floor those whole segments
 // account for.
 //
-// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
-// to the declared file size and the partial file's on-disk length before
-// calling. Direct-store coverage floors deliberately do not: for a direct set
-// the source volume has no file at all, and file length never implies coverage.
+// Only direct-store coverage floors use this, and deliberately without a
+// length clamp: for a direct set the source volume has no file at all, and
+// file length never implies coverage.
 pub(crate) fn segments_covered_by_floor(
     file_id: NzbFileId,
     segments: &[crate::jobs::model::SegmentSpec],
@@ -349,12 +366,13 @@ impl Pipeline {
         job_id: JobId,
         spec: &JobSpec,
         complete_files: &HashSet<NzbFileId>,
-        recovered_file_progress: &HashMap<u32, u64>,
+        recovered_file_progress: &HashMap<u32, FileCoverage>,
         file_identities: &HashMap<u32, ActiveFileIdentity>,
         working_dir: &std::path::Path,
     ) -> RestoreSkipPlan {
         let mut skip = HashSet::new();
         let mut file_progress = HashMap::new();
+        let mut restored_coverage = HashMap::new();
         let mut stats = RestoreSkipStats::default();
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
@@ -381,10 +399,10 @@ impl Pipeline {
                 continue;
             }
 
-            let Some(raw_floor) = recovered_file_progress.get(&file_index).copied() else {
+            let Some(recorded) = recovered_file_progress.get(&file_index) else {
                 continue;
             };
-            if raw_floor == 0 {
+            if recorded.is_empty() {
                 file_progress.insert(file_index, 0);
                 continue;
             }
@@ -399,28 +417,35 @@ impl Pipeline {
                 }
             };
 
-            let clamped_floor = raw_floor.min(file_total_bytes).min(metadata.len());
-            if clamped_floor < raw_floor.min(file_total_bytes) {
+            // A run is trusted only where the file can still hold it: ordinals
+            // the NZB declares, bytes inside the file as it is on disk now.
+            let mut coverage = recorded.clone();
+            coverage.retain_restorable(file_spec.segments.len() as u32, metadata.len());
+            if coverage.runs().len() < recorded.runs().len() {
                 stats.clamped_checkpoint_files += 1;
             }
 
-            let covered = segments_covered_by_floor(file_id, &file_spec.segments, clamped_floor);
-            for segment_id in covered.segments {
-                if skip.insert(segment_id) {
+            for segment_number in coverage.ordinals() {
+                if skip.insert(SegmentId {
+                    file_id,
+                    segment_number,
+                }) {
                     stats.checkpoint_segments += 1;
                 }
             }
-            let checkpoint_floor = covered.floor;
+            let checkpoint_bytes = covered_declared_bytes(file_spec, &coverage);
 
             stats.checkpoint_floor_bytes = stats
                 .checkpoint_floor_bytes
-                .saturating_add(checkpoint_floor);
-            file_progress.insert(file_index, checkpoint_floor);
+                .saturating_add(checkpoint_bytes);
+            file_progress.insert(file_index, checkpoint_bytes);
+            restored_coverage.insert(file_index, coverage);
         }
 
         RestoreSkipPlan {
             skip,
             file_progress,
+            coverage: restored_coverage,
             stats,
         }
     }
@@ -1081,7 +1106,7 @@ impl Pipeline {
                 }
             }
 
-            file_assembly.note_restored_prefix(file_assembly.received_bytes());
+            file_assembly.note_restored_ordinals();
             assembly.add_file(file_assembly);
         }
 
@@ -1397,8 +1422,7 @@ impl Pipeline {
                     request
                         .file_progress
                         .get(&(index as u32))
-                        .copied()
-                        .unwrap_or(0)
+                        .map_or(0, |coverage| covered_declared_bytes(file, coverage))
                         .min(total)
                 }
             })
@@ -1674,6 +1698,14 @@ impl Pipeline {
         };
         let (mut assembly, download_queue, recovery_queue) =
             Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip, engine);
+        for (file_index, coverage) in &restore_skip_plan.coverage {
+            if let Some(file) = assembly.file_mut(NzbFileId {
+                job_id,
+                file_index: *file_index,
+            }) {
+                file.note_restored_coverage(coverage);
+            }
+        }
         let repair_outputs = self
             .db
             .load_repair_outputs(job_id)
@@ -2089,6 +2121,17 @@ mod tests {
         }
     }
 
+    fn coverage(runs: &[(u32, u32, u64, u64)]) -> FileCoverage {
+        FileCoverage::from_ordered_runs(runs.iter().map(
+            |&(first_ordinal, ordinals, start, end)| crate::jobs::assembly::CoverageRun {
+                first_ordinal,
+                ordinals,
+                start,
+                end,
+            },
+        ))
+    }
+
     #[tokio::test]
     async fn restore_skip_plan_uses_complete_files_without_segment_rows() {
         let job_id = JobId(43);
@@ -2131,7 +2174,7 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashMap::from([(0u32, 30u64)]),
+            &HashMap::from([(0u32, coverage(&[(0, 2, 0, 30)]))]),
             &HashMap::new(),
             temp_dir.path(),
         )
@@ -2141,12 +2184,13 @@ mod tests {
         assert!(plan.skip.contains(&sparse_segment_id(job_id, 0)));
         assert!(plan.skip.contains(&sparse_segment_id(job_id, 1)));
         assert!(!plan.skip.contains(&sparse_segment_id(job_id, 2)));
+        // Downloaded bytes are counted in the queue's declared unit.
         assert_eq!(plan.file_progress.get(&0), Some(&30));
         assert_eq!(plan.stats.checkpoint_segments, 2);
     }
 
     #[tokio::test]
-    async fn restore_skip_plan_does_not_skip_partial_segment_floor() {
+    async fn restore_skip_plan_skips_every_covered_article_past_a_gap() {
         let job_id = JobId(45);
         let spec = sparse_segment_job_spec();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2158,15 +2202,20 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashMap::from([(0u32, 25u64)]),
+            &HashMap::from([(0u32, coverage(&[(0, 1, 0, 10), (2, 1, 20, 30)]))]),
             &HashMap::new(),
             temp_dir.path(),
         )
         .await;
 
-        assert_eq!(plan.skip, HashSet::from([sparse_segment_id(job_id, 0)]));
-        assert_eq!(plan.file_progress.get(&0), Some(&10));
-        assert_eq!(plan.stats.checkpoint_segments, 1);
+        // Only the gap is owed: the article after it was written and stays.
+        assert_eq!(
+            plan.skip,
+            HashSet::from([sparse_segment_id(job_id, 0), sparse_segment_id(job_id, 2)])
+        );
+        assert_eq!(plan.file_progress.get(&0), Some(&40));
+        assert_eq!(plan.stats.checkpoint_segments, 2);
+        assert_eq!(plan.coverage[&0].runs().len(), 2);
     }
 
     #[tokio::test]
@@ -2182,7 +2231,7 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashMap::from([(0u32, 50u64)]),
+            &HashMap::from([(0u32, coverage(&[(0, 1, 0, 10), (1, 2, 11, 50)]))]),
             &HashMap::new(),
             temp_dir.path(),
         )
@@ -2203,7 +2252,7 @@ mod tests {
             job_id,
             &spec,
             &HashSet::new(),
-            &HashMap::from([(0u32, 50u64)]),
+            &HashMap::from([(0u32, coverage(&[(0, 1, 0, 10)]))]),
             &HashMap::new(),
             temp_dir.path(),
         )

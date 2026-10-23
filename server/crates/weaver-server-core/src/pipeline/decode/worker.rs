@@ -1478,6 +1478,71 @@ impl Pipeline {
         }
     }
 
+    // Withdraw the placement `other` was accepted at when `segment_id`, whose
+    // claim it contradicts, is the one the NZB's declared sizes vouch for and
+    // `other` is not. The withdrawn article is fetched again like any other
+    // that failed to decode, and when its copy carries the same bad header it
+    // meets placed neighbours and fails on arrival. Returns whether it was
+    // withdrawn; when it was not, `segment_id` is the one that fails.
+    //
+    // Only bytes the conventional writer owns can be withdrawn. An accepted
+    // placement is all an article header can be judged by, so a placement
+    // reconstructed from durable coverage is never withdrawn, and a file a
+    // direct set or its demotion sweep owns keeps the arrival-order verdict.
+    fn withdraw_contradicted_placement(
+        &mut self,
+        segment_id: SegmentId,
+        offset: u64,
+        len: u32,
+        expected: ExpectedSegmentLayout,
+        other: u32,
+    ) -> bool {
+        let file_id = segment_id.file_id;
+        if !placement_within_nzb_envelope(expected, offset, len)
+            || self.is_direct_source_file(file_id)
+            || self.demotion_sweep_owns_file(file_id)
+        {
+            return false;
+        }
+        let Some(file) = self
+            .jobs
+            .get_mut(&file_id.job_id)
+            .and_then(|state| state.assembly.file_mut(file_id))
+        else {
+            return false;
+        };
+        let Some((other_offset, other_len)) = file.placement_of(other) else {
+            return false;
+        };
+        let Ok(other_expected) = expected_segment_layout(file, other) else {
+            return false;
+        };
+        if placement_within_nzb_envelope(other_expected, other_offset, other_len) {
+            return false;
+        }
+        file.withdraw_placement(other);
+        let other_id = SegmentId {
+            file_id,
+            segment_number: other,
+        };
+        let withdrawn = self.write_buffers.get_mut(&file_id).and_then(|buffer| {
+            buffer.withdraw_at(other_offset, |held| held.segment_id == other_id)
+        });
+        if let Some(held) = withdrawn {
+            self.release_write_buffered(held.len_bytes(), 1);
+        }
+        self.invalidate_par2_session_for_file_write(file_id);
+        self.mark_file_hash_reread_required_for(file_id, "layout_conflict_withdrawn");
+        let error = format!(
+            "yEnc layout conflict: segment {other} claims [{other_offset}, {}) past what the NZB declares for it, which segment {} contradicts",
+            other_offset.saturating_add(u64::from(other_len)),
+            segment_id.segment_number,
+        );
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.handle_decode_failure(other_id, &error, &[], None);
+        true
+    }
+
     // Commit a decoded segment, then release any parked parts its arrival
     // unblocked: uuencode parts behind the sequential cursor, and yEnc parts
     // that could not say where they start.
@@ -1850,7 +1915,7 @@ impl Pipeline {
             // Where this article said its range ends, which is where the next
             // ordinal starts even if these bytes are kept only for repair.
             let declared_end = declared_part_end(expected_layout, yenc_layout);
-            let conflict = match self
+            let mut conflict = match self
                 .jobs
                 .get_mut(&job_id)
                 .and_then(|state| state.assembly.file_mut(file_id))
@@ -1892,6 +1957,42 @@ impl Pipeline {
                 }
                 None => None,
             };
+            // Two accepted claims that contradict each other cannot both be
+            // right, and the one that fails is the one the NZB cannot vouch
+            // for: a bad extent costs only the article that carries it, in
+            // whichever order its neighbours arrive.
+            while let Some(other) = conflict
+                && self.withdraw_contradicted_placement(
+                    segment_id,
+                    file_offset,
+                    decoded_size,
+                    expected_layout,
+                    other,
+                )
+            {
+                conflict = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|state| state.assembly.file_mut(file_id))
+                    .and_then(|file| {
+                        let other = file.placement_conflict(
+                            segment_id.segment_number,
+                            file_offset,
+                            decoded_size,
+                        );
+                        if other.is_none() {
+                            file.record_placement(
+                                segment_id.segment_number,
+                                file_offset,
+                                decoded_size,
+                            );
+                            if anchored_on_settled_damage {
+                                file.require_geometry_verification();
+                            }
+                        }
+                        other
+                    });
+            }
             if let Some(other) = conflict {
                 let error = format!(
                     "yEnc layout conflict: segment {} claims [{file_offset}, {}) which runs into segment {other}",
@@ -3166,7 +3267,7 @@ impl Pipeline {
     // The entry is left in place as a tombstone rather than removed: parked
     // bytes are released, but the fact that this file is uuencode has to
     // outlive completion so the restart-checkpoint suppression in
-    // [`Self::note_file_progress_floor`] still holds for the file's final
+    // [`Self::note_file_coverage`] still holds for the file's final
     // write. Teardown drops it with the rest of the job's per-file state.
     fn finish_uu_file(&mut self, file_id: NzbFileId) -> Option<String> {
         self.uu_park_requeues
@@ -3398,7 +3499,7 @@ impl Pipeline {
         if let Some(source) = write_error {
             return Err(SegmentWriteError::new(file_id, source));
         }
-        self.note_file_progress_floor(file_id, contiguous_end_after_ready, false);
+        self.note_file_coverage(file_id, false);
         // The write syscalls above returned, so bytes `0..contiguous_end` are
         // on disk and a direct-unpack chase may read them. Costs one `is_empty`
         // when nothing is being chased, which is the overwhelmingly common
@@ -3690,6 +3791,9 @@ impl Pipeline {
             )
             .await;
         }
+        // Out-of-order writes are coverage too: a file whose early article is
+        // still missing holds every later article it wrote.
+        self.note_file_coverage(file_id, false);
         if let Some(source) = write_error {
             return Err(SegmentWriteError::new(file_id, source));
         }
@@ -3704,11 +3808,10 @@ impl Pipeline {
     // after a restart already holds its leading parts on disk and never
     // fetches them again, so a buffer whose cursor started at zero would
     // never release anything in order. Its bytes would only ever reach disk
-    // through backlog eviction, whose out-of-order writes record no contiguous
-    // coverage — and the contiguous coverage is what the file's durable floor,
-    // and with it the restart guard's lead, is made of. The offset where the
-    // resumed prefix ends is knowable only from the part that directly follows
-    // it, so the buffer adopts that part's offset the first time it decodes.
+    // through backlog eviction. A restored run of parts sits wherever its
+    // articles landed, so the buffer jumps over it: the part that directly
+    // follows a restored run adopts the run's end as the cursor the first
+    // time it decodes, which is its own offset.
     pub(in crate::pipeline) fn write_buffer_for_article(
         &mut self,
         file_id: NzbFileId,
@@ -3719,8 +3822,7 @@ impl Pipeline {
             .jobs
             .get(&file_id.job_id)
             .and_then(|state| state.assembly.file(file_id))
-            .and_then(crate::jobs::assembly::FileAssembly::resume_anchor_ordinal)
-            .filter(|anchor| *anchor == segment_number)
+            .filter(|file| file.follows_restored_run(segment_number))
             .map(|_| file_offset);
         let max_pending = self.write_buf_max_pending;
         let write_buf = self

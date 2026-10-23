@@ -443,6 +443,31 @@ impl Pipeline {
         self.update_queue_metrics();
     }
 
+    // Whether a batch that ended unclean is evidence about its server.
+    //
+    // A batch weaver itself cut short — shutdown, a job cancel, a pause —
+    // ended because the lanes were being stopped, and its torn connections say
+    // nothing about the depth the server sustains. Only a batch that failed
+    // while the job was still meant to be downloading lowers depth, pins the
+    // server, or is reported as a failed fetch.
+    pub(in crate::pipeline) fn unclean_batch_is_server_fault(&self, job_id: JobId) -> bool {
+        self.shared_state.queue.read(|inner| {
+            let globals = &inner.globals;
+            let stopping = globals.shutting_down
+                || globals.paused
+                || globals.scheduled_pause
+                || globals.speed_test_paused;
+            let job_stopped = inner
+                .jobs
+                .iter()
+                .find(|row| row.id == job_id)
+                .is_none_or(|row| {
+                    row.intents.cancelled.is_some() || row.intents.paused == Some(true)
+                });
+            !stopping && !job_stopped
+        })
+    }
+
     pub(in crate::pipeline::download::worker) fn record_download_lane_observation(
         &mut self,
         result: &DownloadResult,
@@ -456,6 +481,11 @@ impl Pipeline {
 
         let now = Instant::now();
         let pressure_clear = observation.pressure_clear;
+        // Asked only of an unclean batch, which is rare: the answer reads the
+        // control plane.
+        let unclean_server_fault = observation.batch_complete
+            && !observation.batch_clean
+            && self.unclean_batch_is_server_fault(result.job_id);
         // Every configured server is seeded when the pool is activated, so
         // this is only the fallback for a server that answered before the
         // seeding ran or that the pool grew underneath it. Seeding needs the
@@ -512,7 +542,7 @@ impl Pipeline {
                 self.metrics
                     .download_pipeline_trial_success_total
                     .fetch_add(1, Ordering::Relaxed);
-            } else {
+            } else if unclean_server_fault {
                 change = explorer.note_unclean_batch(now).or(change);
                 self.metrics
                     .download_pipeline_trial_failure_total
