@@ -209,6 +209,73 @@ async fn retiring_jobs_refuse_new_mutations_before_archive_acknowledgement() {
     );
 }
 
+// A cancelled job leaves the queue only when its row does: on the done event
+// after its history row has committed. Until then every queue reader still
+// lists it as it was, and mutations against it stay refused.
+#[tokio::test]
+async fn a_cancelled_job_stays_listed_until_its_history_row_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = handle(&pipeline);
+    let id = JobId(9210);
+    insert_active_job(
+        &mut pipeline,
+        id,
+        segmented_job_spec("cancel visibility fixture", "payload.bin", &[100]),
+    )
+    .await;
+    pipeline.report_all_for_test();
+    let listed = |pipeline: &Pipeline| {
+        pipeline
+            .shared_state
+            .queue
+            .read(|inner| inner.visible_jobs().any(|job| job.job_id == id))
+    };
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    pipeline
+        .db
+        .try_queue_write("hold_cancel_archive", move |_| {
+            let _ = released.recv();
+            Ok(())
+        })
+        .unwrap();
+    let mut events = handle.subscribe_events();
+
+    handle.cancel_job(id).await.unwrap();
+    assert!(
+        listed(&pipeline),
+        "the cancel intent alone must not hide the job"
+    );
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.shared_state.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .any(|row| row.id == id && row.report.retiring)
+    }));
+    assert!(
+        listed(&pipeline),
+        "the job stays listed while its archive is held"
+    );
+    assert!(handle.list_jobs().iter().any(|job| job.job_id == id));
+    assert_eq!(handle.get_job(id).unwrap().job_id, id);
+    assert!(matches!(
+        handle.pause_job(id).await,
+        Err(SchedulerError::JobNotFound(_))
+    ));
+
+    drop(release);
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    assert!(!listed(&pipeline), "the done event drops the row");
+    assert!(
+        pipeline.db.get_job_history(id.0).unwrap().is_some(),
+        "the row leaves only once its history row exists"
+    );
+}
+
 #[tokio::test]
 async fn extraction_pause_uses_current_download_activity() {
     let temp = tempfile::tempdir().unwrap();

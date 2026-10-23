@@ -194,13 +194,9 @@ impl SharedPipelineState {
     // lock without copying a job.
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.queue.read(|inner| {
-            inner.history_summary.with_statuses(
-                inner
-                    .jobs
-                    .iter()
-                    .filter(|row| row.intents.cancelled.is_none())
-                    .map(|row| &row.report.job.status),
-            )
+            inner
+                .history_summary
+                .with_statuses(inner.jobs.iter().map(|row| &row.report.job.status))
         })
     }
 
@@ -245,7 +241,7 @@ impl SharedPipelineState {
             inner
                 .jobs
                 .iter()
-                .find(|row| row.id == job_id && row.intents.cancelled.is_none())
+                .find(|row| row.id == job_id)
                 .map(|row| row.info(&inner.globals))
                 .or_else(|| {
                     self.queue

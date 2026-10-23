@@ -273,11 +273,10 @@ impl JobRow {
 }
 
 impl QueueInner {
+    // Every row the queue holds. A cancelled job stays listed, as it was,
+    // until its history row has committed and the done event drops the row.
     pub fn visible_jobs(&self) -> impl Iterator<Item = JobInfo> + '_ {
-        self.jobs
-            .iter()
-            .filter(|row| row.intents.cancelled.is_none())
-            .map(|row| row.info(&self.globals))
+        self.jobs.iter().map(|row| row.info(&self.globals))
     }
 }
 

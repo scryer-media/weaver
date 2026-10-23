@@ -1430,7 +1430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hidden_cancelled_row_is_not_history_until_retirement() {
+    async fn a_cancelled_row_is_not_history_until_retirement() {
         let db = Database::open_in_memory().unwrap();
         seed(&db);
         let row = history_row(3, "cancelled", 1_200);
@@ -1442,7 +1442,8 @@ mod tests {
             .cancel_job(weaver_server_core::JobId(3))
             .await
             .unwrap();
-        assert!(handle.list_jobs().is_empty());
+        // Still listed: the job leaves the queue only once its history row commits.
+        assert!(handle.list_jobs().iter().any(|job| job.job_id.0 == 3));
         let live = live_job_ids(&handle);
         assert!(live.contains(&3));
         let page = load_history_page(db, live, page_input(0, 25, None))

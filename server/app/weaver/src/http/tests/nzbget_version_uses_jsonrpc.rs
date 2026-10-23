@@ -2075,8 +2075,8 @@ async fn nzbget_group_final_delete_does_not_resurface_cancelled_history() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
-    assert!(handle.list_jobs().is_empty());
     wait_for_cancelled(&mut events, JobId(77)).await;
+    assert!(handle.list_jobs().is_empty());
     loop {
         revisions.mark_unchanged();
         if db.get_job_history(77).unwrap().is_none() {
@@ -2133,8 +2133,8 @@ async fn nzbget_editqueue_maps_arr_actions() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
-    assert!(handle.list_jobs().is_empty());
     wait_for_cancelled(&mut events, JobId(77)).await;
+    assert!(handle.list_jobs().is_empty());
 
     let (status, payload) = post_nzbget(
         app.clone(),

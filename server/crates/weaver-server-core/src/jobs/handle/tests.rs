@@ -258,7 +258,12 @@ async fn cancel_job() {
         .unwrap();
     assert_eq!(handle.list_jobs().len(), 1);
 
+    let mut events = handle.subscribe_events();
     handle.cancel_job(JobId(1)).await.unwrap();
+    // The job leaves the list with its row, once its history row commits.
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == JobId(1))
+    {
+    }
     assert_eq!(handle.list_jobs().len(), 0);
 
     handle.shutdown().await.unwrap();

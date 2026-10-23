@@ -1632,7 +1632,7 @@ async fn repeated_uuencode_articles_preserve_each_file_and_wire_accounting() {
 }
 
 #[tokio::test]
-async fn cancel_mid_download_hides_immediately_then_archives_and_cleans_up() {
+async fn cancel_mid_download_archives_then_cleans_up() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1681,13 +1681,6 @@ async fn cancel_mid_download_hides_immediately_then_archives_and_cleans_up() {
     let watermark = harness.handle.job_revision();
     harness.handle.cancel_job(id).await.unwrap();
     assert!(harness.handle.job_revision() > watermark);
-    assert!(
-        !harness
-            .handle
-            .list_jobs()
-            .iter()
-            .any(|job| job.job_id == id)
-    );
     assert!(path.exists());
     release_tx.send(()).unwrap();
     server.await.unwrap();

@@ -644,7 +644,7 @@ async fn history_facades_wait_for_queue_retirement_after_a_terminal_archive() {
         h.shared_state.publish_jobs(vec![job.clone()]);
         if cancelled {
             h.handle.cancel_job(id).await.unwrap();
-            assert!(h.handle.get_job(id).is_err());
+            assert!(h.handle.get_job(id).is_ok());
         }
         let response = h.execute(&query).await;
         assert_no_errors(&response);
