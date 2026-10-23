@@ -17,7 +17,7 @@ use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, StoredLayoutBuilder,
     StoredMember,
 };
-use weaver_graph::{ByteRange, Emit, MemberId, RecoveryKind, VolumeIndex, Why};
+use weaver_graph::{ByteRange, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
 use super::{Entry, Lock, Piece, RarStore, claim};
 use crate::runs::CrcRuns;
@@ -228,8 +228,14 @@ impl RarStore {
         }
     }
 
-    // Each volume's recovery record, once.
+    // Each volume's recovery record, once, handed the candidate that opened
+    // the headers it was found under, or nothing when they are open to
+    // anyone: the record reads its volume under it and proves no candidate
+    // of its own.
     fn say_recovery(&mut self, layout: &StoredLayoutBuilder, out: &mut Vec<Emit>) {
+        let handed = self
+            .header_password()
+            .map_or_else(Handed::default, Handed::new);
         for (volume, found) in &self.volumes {
             let Some(facts) = found.walk.facts.as_ref() else {
                 continue;
@@ -243,6 +249,7 @@ impl RarStore {
                         volume: *volume,
                         range: ByteRange::at(service.data_offset, service.data_size),
                         kind: RecoveryKind::Rar,
+                        handed: handed.clone(),
                     });
                 }
             }

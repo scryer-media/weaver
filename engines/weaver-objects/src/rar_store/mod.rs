@@ -21,8 +21,6 @@ mod place;
 mod record;
 mod walk;
 
-pub(crate) use self::lock::rar4_unseals;
-
 #[cfg(test)]
 mod tests;
 

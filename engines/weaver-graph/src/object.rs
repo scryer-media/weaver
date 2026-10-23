@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::deliver::{Delivery, Emit};
+use crate::deliver::{Delivery, Emit, Handed};
 use crate::facts::Facts;
 use crate::member::MemberId;
 use crate::seek::Seek;
@@ -358,6 +358,11 @@ pub trait Object: Send + Sync {
     // sibling asks to be claimed: the same name, front and length a claim
     // reads.
     fn bound(&mut self, _volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {}
+
+    // I am a window on recovery data another object found, and this is
+    // what it handed me to read the range by: at my building, and again
+    // each time it hands it anew.
+    fn handed(&mut self, _handed: &Handed) {}
 
     // A new member appeared beside the one I am bound to. Is it one of my
     // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z

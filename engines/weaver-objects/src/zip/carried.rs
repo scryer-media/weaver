@@ -10,7 +10,7 @@
 // local headers instead, or neither has yet. It is offered over the rest
 // of the container, which it covers, and repairs it in place.
 
-use weaver_graph::{ByteRange, Emit, VolumeIndex};
+use weaver_graph::{ByteRange, Emit, Handed, VolumeIndex};
 
 use super::Zip;
 use super::records::{self, END64_LEN, LOCATOR_LEN, TAIL};
@@ -49,6 +49,7 @@ impl Zip {
             volume,
             range,
             kind: *kind,
+            handed: Handed::default(),
         }));
     }
 

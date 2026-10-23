@@ -369,92 +369,59 @@ fn a_rar3_volume_rebuilds_one_sector_per_slot_and_no_more() {
     );
 }
 
-// An enciphered volume asks for a candidate once closed, and the next while
-// its front refutes the ones offered; the one that unseals the front ends
-// the asking, and the ruling reads under it.
+// What the volume's store hands the record: the candidate its headers
+// opened on.
+fn hand(object: &mut dyn Object, secret: &str) {
+    object.handed(&Handed::new(Zeroizing::new(secret.to_owned())));
+}
+
+// The store hands the candidate that opened the headers; the record reads
+// under it and asks for none.
 #[test]
-fn a_volume_with_enciphered_headers_is_rebuilt_under_the_candidate_that_opens_them() {
+fn a_volume_with_enciphered_headers_is_rebuilt_under_the_candidate_its_store_hands() {
     let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
     let (mut job, member) = job(&volume);
-    job.object
-        .bound(VolumeIndex(0), VOLUME, &volume[..256], None);
+    hand(&mut job.object, PASSWORD);
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     let mut asked = Vec::new();
     job.object.volume_closed(VolumeIndex(0), &mut asked);
-    assert_eq!(asked, vec![Emit::NeedsPassword]);
-    for (secret, more) in [("not-the-key", true), (PASSWORD, false)] {
-        let mut asked = Vec::new();
-        job.object.offer_password(secret, &mut asked);
-        assert_eq!(asked.contains(&Emit::NeedsPassword), more, "{secret}");
-    }
-    assert_eq!(
-        job.object.repair(&mut job.store),
-        RepairOutcome::Repaired { slices: 1 }
-    );
-    assert!(job.store.members[&member] == volume, "rebuilt bytes");
-}
-
-// A front too short to tell a candidate by holds each one offered and asks
-// for the next, so the ruling reads under whichever leads to the record.
-#[test]
-fn a_front_too_short_to_tell_holds_every_candidate_offered() {
-    let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
-    let (mut job, member) = job(&volume);
-    job.object
-        .bound(VolumeIndex(0), VOLUME, &volume[..24], None);
-    job.store.members.get_mut(&member).unwrap()[700] ^= 1;
-    close(&mut job);
-    for secret in ["not-the-key", PASSWORD] {
-        let mut asked = Vec::new();
-        job.object.offer_password(secret, &mut asked);
-        assert_eq!(asked, vec![Emit::NeedsPassword], "{secret}");
-    }
-    assert_eq!(
-        job.object.repair(&mut job.store),
-        RepairOutcome::Repaired { slices: 1 }
-    );
-}
-
-// The front is kept with what the record said, so a restored record offered
-// again the candidate that unsealed it holds it and asks for no other.
-#[test]
-fn a_restored_record_offered_its_candidate_again_holds_it_and_asks_no_more() {
-    let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
-    let (mut job, member) = job(&volume);
-    job.object
-        .bound(VolumeIndex(0), VOLUME, &volume[..256], None);
-    close(&mut job);
-    job.object.offer_password(PASSWORD, &mut Vec::new());
-    let mut restored = crate::restore(&job.object.facts()).expect("restores");
-    let mut asked = Vec::new();
-    restored.offer_password(PASSWORD, &mut asked);
     assert!(asked.is_empty(), "{asked:?}");
-    job.store.members.get_mut(&member).unwrap()[700] ^= 1;
-    restored
-        .recovery_mut()
-        .expect("a recovery object")
-        .bind(&mut job.namespace, &mut Vec::new());
     assert_eq!(
-        restored
-            .recovery_mut()
-            .expect("a recovery object")
-            .repair(&mut job.store),
+        job.object.repair(&mut job.store),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert!(job.store.members[&member] == volume, "rebuilt bytes");
 }
 
-// No candidate that opens the headers leads to no record: the record could
-// not be read, and says nothing of its volume.
+// The candidate is never kept: a restored record reads under the one its
+// store hands it again.
+#[test]
+fn a_restored_record_reads_under_the_candidate_its_store_hands_again() {
+    let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
+    let (mut job, member) = job(&volume);
+    hand(&mut job.object, PASSWORD);
+    close(&mut job);
+    let mut restored = crate::restore(&job.object.facts()).expect("restores");
+    hand(restored.as_mut(), PASSWORD);
+    job.store.members.get_mut(&member).unwrap()[700] ^= 1;
+    let recovery = restored.recovery_mut().expect("a recovery object");
+    recovery.bind(&mut job.namespace, &mut Vec::new());
+    assert_eq!(
+        recovery.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&member] == volume, "rebuilt bytes");
+}
+
+// Enciphered headers and nothing handed that opens them lead to no record:
+// the record could not be read, and says nothing of its volume.
 #[test]
 fn a_volume_with_enciphered_headers_and_no_candidate_that_opens_them_says_nothing() {
     let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
     let (mut job, member) = job(&volume);
-    job.object
-        .bound(VolumeIndex(0), VOLUME, &volume[..64], None);
+    hand(&mut job.object, "not-the-key");
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     close(&mut job);
-    job.object.offer_password("not-the-key", &mut Vec::new());
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
     assert!(!job.object.covers(member));
     assert!(verdicts(&job, member).is_empty());

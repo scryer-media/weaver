@@ -28,8 +28,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Object,
-    Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex, Weight, Why, signed,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Handed, Kind, MemberId,
+    Object, Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex, Weight, Why,
+    signed,
 };
 use zeroize::Zeroizing;
 
@@ -475,6 +476,7 @@ impl SevenZipStore {
                 volume: last,
                 range: ByteRange::new(after, length),
                 kind: *kind,
+                handed: Handed::default(),
             });
         }
     }

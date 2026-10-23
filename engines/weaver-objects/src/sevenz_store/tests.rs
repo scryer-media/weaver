@@ -513,6 +513,7 @@ fn recovery_data_after_the_container_is_said() {
             volume: VolumeIndex(0),
             range: ByteRange::new(total, length),
             kind: RecoveryKind::Par3,
+            handed: weaver_graph::Handed::default(),
         }
     ));
     no_trouble(&owner);

@@ -760,7 +760,7 @@ fn the_recovery_record_is_announced() {
             let announced = owner.said.iter().any(|emit| {
                 matches!(
                     emit,
-                    Emit::RecoveryAt { volume: found, range, kind: RecoveryKind::Rar }
+                    Emit::RecoveryAt { volume: found, range, kind: RecoveryKind::Rar, .. }
                         if found.0 as usize == volume && range.contains(at)
                 )
             });

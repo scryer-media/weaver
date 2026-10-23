@@ -47,6 +47,7 @@ impl Object for Carrier {
                 volume: delivery.volume,
                 range: TRAILER,
                 kind: self.kind,
+                handed: weaver_graph::Handed::default(),
             });
         }
         let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);

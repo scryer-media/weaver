@@ -15,7 +15,7 @@ use std::ops::Bound;
 use bytes::Bytes;
 
 use crate::deliver::Posted;
-use crate::deliver::{Emit, Provenance, Why};
+use crate::deliver::{Emit, Handed, Provenance, Why};
 use crate::engine::Engine;
 use crate::member::{Member, MemberId, Namespace};
 use crate::names::{Moved, NameLedger, Position};
@@ -202,12 +202,14 @@ pub enum Effect {
         node: NodeId,
     },
     // The object at `node` reports its own recovery data at this range of
-    // its volume; the owner builds a recovery object over it.
+    // its volume, with what it hands the recovery object over it; the owner
+    // builds that object, or hands the one already built what was handed.
     RecoveryAt {
         node: NodeId,
         volume: VolumeIndex,
         range: ByteRange,
         kind: crate::deliver::RecoveryKind,
+        handed: Handed,
     },
     // Damage reached `node`'s namespace at this member range and nothing
     // there covers it; the owner asks the recovery objects of that
@@ -2120,39 +2122,45 @@ impl Tree {
     }
 
     // Bind `range` of a member of `node`'s namespace, as volume 0, to a
-    // freshly built object of `kind`: a window beside the member's owner,
-    // which keeps the member. `passed` is what of the range arrived before,
-    // read back by the owner, in the member's offsets; the window takes it
-    // now, and the rest as it passes. `None`, and nothing bound, when no
-    // object of that kind can be built or the range already has a window.
+    // freshly built object of `kind`, handed what the member's owner
+    // handed it: a window beside the member's owner, which keeps the
+    // member. `passed` is what of the range arrived before, read back by
+    // the owner, in the member's offsets; the window takes it now, and the
+    // rest as it passes. `None`, and nothing bound, when no object of that
+    // kind can be built or the range already has a window, which takes
+    // what was handed in place of what it held.
     pub fn attach_window(
         &mut self,
         node: NodeId,
         (member, range): (MemberId, ByteRange),
-        kind: Kind,
+        (kind, handed): (Kind, &Handed),
         passed: Vec<(u64, Bytes, Provenance)>,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) -> Option<NodeId> {
-        let found = self.nodes.get(&node)?;
-        let record = found.namespace.get(member)?;
+        let record = self.nodes.get(&node)?.namespace.get(member)?;
         let (name, closed, length) = (record.name.clone(), record.closed, record.length);
-        let front = found.namespace.first_bytes(member).to_vec();
-        let taken = self.windows_on(node, member).into_iter().any(|window| {
+        let taken = self.windows_on(node, member).into_iter().find(|window| {
             self.nodes
-                .get(&window)
+                .get(window)
                 .and_then(|found| found.binding.as_ref())
                 .is_some_and(|binding| binding.window == Some(range))
         });
-        if taken {
+        if let Some(window) = taken {
+            if let Some(object) = self
+                .nodes
+                .get_mut(&window)
+                .and_then(|found| found.object.as_mut())
+            {
+                object.handed(handed);
+            }
             return None;
         }
         let child = NodeId(self.next_node);
         let mut object = builder.build(kind, ObjectId(child.0))?;
         self.next_node += 1;
-        // A window is bound under its member's front: what the member is
-        // tells the window how to read the range it sits on.
-        object.bound(VolumeIndex(0), &name, &front, length);
+        object.bound(VolumeIndex(0), &name, &[], length);
+        object.handed(handed);
         let binding = Binding {
             parent: node,
             volumes: BTreeMap::from([(VolumeIndex(0), member)]),
@@ -2319,12 +2327,14 @@ impl Tree {
                     volume,
                     range,
                     kind,
+                    handed,
                 } => {
                     effects.push(Effect::RecoveryAt {
                         node,
                         volume,
                         range,
                         kind,
+                        handed,
                     });
                 }
                 Emit::Damaged { volume, range } => self.damaged(node, volume, range, effects),

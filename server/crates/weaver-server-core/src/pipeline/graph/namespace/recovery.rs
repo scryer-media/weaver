@@ -14,8 +14,8 @@
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
 use weaver_graph::{
-    Builder, ByteRange, Effect, Kind, MemberId, NodeId, Provenance, RecoveryKind, Restore, Segment,
-    Tree, VolumeIndex,
+    Builder, ByteRange, Effect, Handed, Kind, MemberId, NodeId, Provenance, RecoveryKind, Restore,
+    Segment, Tree, VolumeIndex,
 };
 
 use super::{
@@ -796,15 +796,16 @@ impl NamespaceWriter {
     // An object found its own recovery data at a range of its volume. The
     // set for it is built over that range of the member the volume is, as a
     // window beside the object, so it lives in the namespace of the members
-    // it covers. What of the range has passed is read back through the
-    // inverse map and handed to it; the rest reaches it as it passes.
+    // it covers, and takes what the object handed it. What of the range
+    // has passed is read back through the inverse map and handed to it;
+    // the rest reaches it as it passes.
     pub(super) fn recovery_at(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
         segments: &dyn Segments,
         (node, volume, range): (NodeId, VolumeIndex, ByteRange),
-        kind: RecoveryKind,
+        (kind, handed): (RecoveryKind, &Handed),
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let Some((parent, member)) = tree
@@ -837,7 +838,7 @@ impl NamespaceWriter {
         let window = tree.attach_window(
             parent,
             (member, range),
-            object,
+            (object, handed),
             passed,
             &mut self.placing(builder),
             &mut effects,

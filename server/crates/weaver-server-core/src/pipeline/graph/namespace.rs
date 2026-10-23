@@ -858,13 +858,14 @@ impl NamespaceWriter {
                 volume,
                 range,
                 kind,
+                handed,
             } => {
                 self.recovery_at(
                     tree,
                     builder,
                     segments,
                     (*node, *volume, *range),
-                    *kind,
+                    (*kind, handed),
                     out,
                 )?;
             }

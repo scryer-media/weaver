@@ -43,7 +43,7 @@ pub mod tree;
 pub mod volume;
 mod wire;
 
-pub use deliver::{Delivery, Emit, Posted, Provenance, RecoveryKind, Why};
+pub use deliver::{Delivery, Emit, Handed, Posted, Provenance, RecoveryKind, Why};
 pub use engine::{Engine, Extraction, Sink, Volumes};
 pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,

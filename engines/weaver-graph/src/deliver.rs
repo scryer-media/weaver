@@ -4,6 +4,10 @@
 // Receiving down. The parent hands bytes to a child in the child's own
 // coordinates, and the child says what they turned out to be.
 
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::member::MemberId;
@@ -76,6 +80,48 @@ impl RecoveryKind {
             RecoveryKind::Par3 => Kind::Par3,
             RecoveryKind::Rar => Kind::RarRecord,
         }
+    }
+}
+
+// What the object that found its own recovery data hands the recovery
+// object built over it: what it learned opening its headers that the
+// recovery object reads its range by. Opaque to the tree, which only
+// carries it; only the kind built over the range reads it. Most hand
+// nothing. Two are the same when they are one value.
+#[derive(Clone, Default)]
+pub struct Handed(Option<Arc<dyn Any + Send + Sync>>);
+
+impl Handed {
+    pub fn new(value: impl Any + Send + Sync) -> Self {
+        Self(Some(Arc::new(value)))
+    }
+
+    // What was handed, when it is a `T`.
+    pub fn read<T: Any>(&self) -> Option<&T> {
+        self.0.as_deref()?.downcast_ref()
+    }
+}
+
+impl PartialEq for Handed {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(one), Some(other)) => Arc::ptr_eq(one, other),
+            (one, other) => one.is_none() && other.is_none(),
+        }
+    }
+}
+
+impl Eq for Handed {}
+
+// What was handed may be a secret: Debug says only whether there is one.
+impl fmt::Debug for Handed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let said = if self.0.is_some() {
+            "Handed(..)"
+        } else {
+            "Handed"
+        };
+        formatter.write_str(said)
     }
 }
 
@@ -191,11 +237,15 @@ pub enum Emit {
     // "What I said about member M was built on bytes that were wrong; forget
     // it, I am starting M over." Everything under M is dropped.
     Retract(MemberId),
-    // "My own recovery data lies in my volume at this range."
+    // "My own recovery data lies in my volume at this range, and this is
+    // what reading it takes." Said again with what was handed anew, the
+    // recovery object built over the range takes it in place of what it
+    // held.
     RecoveryAt {
         volume: VolumeIndex,
         range: ByteRange,
         kind: RecoveryKind,
+        handed: Handed,
     },
     // "My volume is bad at this range": a header checksum failed.
     Damaged {

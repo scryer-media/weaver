@@ -188,9 +188,12 @@ impl RarStore {
         self.ask(out);
     }
 
-    // Every walk reads the headers again under the candidate at `index`.
+    // Every walk reads the headers again under the candidate at `index`,
+    // and every recovery record is said again, handed it: after a restore
+    // too, when the record built before holds no candidate.
     fn open_on(&mut self, index: usize) {
         self.headers_open = Some(index);
+        self.recovery_said.clear();
         for volume in self.volumes.values_mut() {
             volume.walk.touch();
         }
@@ -327,7 +330,7 @@ const AES_BLOCK: usize = 16;
 // so whichever of its size or CRC fails first refutes it. `read` gives the
 // volume's bytes over a range when they are here whole; `None` while one
 // the proof needs is not.
-pub(crate) fn rar4_unseals(
+fn rar4_unseals(
     read: &mut dyn FnMut(ByteRange) -> Option<Vec<u8>>,
     length: Option<u64>,
     password: &str,

@@ -17,12 +17,12 @@
 // cannot be read says nothing of the volume: it covers nothing, and, as a
 // recovery object with nothing to rule on does, rules clean on nothing.
 //
-// A RAR3 volume with enciphered headers is walked to its record under a
-// password, taken as the volume's store takes one: each candidate the job
-// offers is held against the volume's first enciphered header, the next is
-// asked for while the ones offered are refuted or cannot be told yet, and
-// none once one unseals it. The one that did is the last the record was
-// offered, which is the one a restore offers it again.
+// The volume's store says where the record lies and hands it the
+// candidate that opened the volume's headers, or nothing when they are open
+// to anyone; a RAR3 volume with enciphered headers is walked to its record
+// under it. The record proves no candidate of its own and asks for none.
+// The candidate is never kept: a store whose headers open again after a
+// restore hands it again.
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod encode;
@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 use unrar_rs::{ArchiveFormat, RarError, RecoveryRecordAssessment, RecoveryRecordLayout};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Namespace, Object,
-    Placement, Provenance, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Handed, Kind, MemberId, Namespace,
+    Object, Placement, Provenance, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
 };
 use zeroize::Zeroizing;
 
@@ -56,13 +56,10 @@ pub struct RarRecord {
     // How many bytes at the front of the volume the record protects, as
     // the last ruling that read it found.
     protected: Option<u64>,
-    // The volume's front as it was bound, kept when it says the headers
-    // after it are enciphered: a candidate is held against it, after a
-    // restore too.
-    front: Vec<u8>,
-    // The job's candidates the front did not refute, in the order offered.
+    // The candidate the store opened the volume's headers on, as it
+    // handed it.
     #[serde(skip)]
-    passwords: Vec<Zeroizing<String>>,
+    password: Option<Zeroizing<String>>,
     // The volume's bytes that passed whole, as the namespace fed them. A
     // restart feeds them again.
     #[serde(skip)]
@@ -87,30 +84,14 @@ enum Said {
 }
 
 impl Durable for RarRecord {
-    // 2: the front a sealed volume's candidates are held against, where
-    // only whether it was sealed was kept.
-    const VERSION: u16 = 2;
+    // 3: no front, where a sealed volume's was kept: the store hands the
+    // candidate its headers opened on.
+    const VERSION: u16 = 3;
 }
 
 impl RarRecord {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn sealed(&self) -> bool {
-        !self.front.is_empty()
-    }
-
-    // Whether `password` unseals the volume's first enciphered header, as
-    // far as the front reaches.
-    fn unseals(&self, password: &str) -> Option<bool> {
-        let front = &self.front;
-        let mut read = |range: ByteRange| {
-            front
-                .get(range.start as usize..range.end as usize)
-                .map(<[u8]>::to_vec)
-        };
-        crate::rar_store::rar4_unseals(&mut read, None, password)
     }
 
     fn proven_whole(&self, length: u64) -> bool {
@@ -135,62 +116,40 @@ impl RarRecord {
             return Said::Intact;
         }
         let mut volume = Volume::new(access, member, length);
-        let passwords: Vec<Option<&str>> = match self.sealed() {
-            true => self
-                .passwords
-                .iter()
-                .map(|secret| Some(secret.as_str()))
-                .collect(),
-            false => vec![None],
-        };
-        let (said, protected) = examine(&mut volume, &passwords);
+        let password = self.password.as_ref().map(|secret| secret.as_str());
+        let (said, protected) = examine(&mut volume, password);
         self.protected = protected;
         said
     }
 }
 
-// The volume checked against its record, read under the first of
-// `passwords` that leads to one, and how many bytes the record protects
-// when one was read. Under a wrong key an enciphered header is noise, so a
-// password that finds no record says only that it is not the one. The
-// rebuilt units are written back only when the record vouches for every
-// protected byte.
-fn examine(volume: &mut Volume<'_>, passwords: &[Option<&str>]) -> (Said, Option<u64>) {
-    for password in passwords {
-        let assessment = match unrar_rs::repair_from_recovery_record(&mut *volume, *password) {
-            Ok(Some(repair)) => {
-                let said = said(&repair.assessment, repair.patches.len() as u64);
-                found_damaged(volume, &repair.assessment);
-                if matches!(said, Said::Rebuilt { .. }) {
-                    for patch in &repair.patches {
-                        volume.write_repaired(patch.offset, &patch.bytes);
-                    }
+// The volume checked against its record, read under `password`, and how
+// many bytes the record protects when one was read. The rebuilt units are
+// written back only when the record vouches for every protected byte.
+fn examine(volume: &mut Volume<'_>, password: Option<&str>) -> (Said, Option<u64>) {
+    let assessment = match unrar_rs::repair_from_recovery_record(&mut *volume, password) {
+        Ok(Some(repair)) => {
+            let said = said(&repair.assessment, repair.patches.len() as u64);
+            found_damaged(volume, &repair.assessment);
+            if matches!(said, Said::Rebuilt { .. }) {
+                for patch in &repair.patches {
+                    volume.write_repaired(patch.offset, &patch.bytes);
                 }
-                return (said, Some(repair.assessment.layout.protected_size));
             }
-            Err(RarError::RecoveryRecordInsufficient { .. }) => {
-                unrar_rs::assess_recovery_record(&mut *volume, *password)
-            }
-            Ok(None) | Err(_) => continue,
-        };
-        if let Ok(Some(assessment)) = assessment {
-            found_damaged(volume, &assessment);
-            return (said(&assessment, 0), Some(assessment.layout.protected_size));
+            return (said, Some(repair.assessment.layout.protected_size));
         }
+        Err(RarError::RecoveryRecordInsufficient { .. }) => {
+            unrar_rs::assess_recovery_record(&mut *volume, password)
+        }
+        Ok(None) | Err(_) => return (Said::Unread, None),
+    };
+    match assessment {
+        Ok(Some(assessment)) => {
+            found_damaged(volume, &assessment);
+            (said(&assessment, 0), Some(assessment.layout.protected_size))
+        }
+        Ok(None) | Err(_) => (Said::Unread, None),
     }
-    (Said::Unread, None)
-}
-
-// Whether a volume's front is a RAR3 main header whose headers after it
-// are enciphered: the signature, then the header's CRC and type, then its
-// flags.
-fn sealed(front: &[u8]) -> bool {
-    const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
-    const ENCRYPTED_HEADERS: u16 = 0x0080;
-    front.starts_with(SIGNATURE)
-        && front
-            .get(10..12)
-            .is_some_and(|flags| u16::from_le_bytes([flags[0], flags[1]]) & ENCRYPTED_HEADERS != 0)
 }
 
 // What the record's check says, with `rebuilt` units it can rebuild. A
@@ -273,32 +232,8 @@ impl Object for RarRecord {
     ) {
     }
 
-    // An enciphered volume asks for the job's candidates once it is closed,
-    // which is when a ruling reads it.
-    fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
+    fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {
         self.closed = true;
-        if self.sealed() && self.passwords.is_empty() {
-            out.push(Emit::NeedsPassword);
-        }
-    }
-
-    // A candidate the front refutes is dropped and the next asked for; one
-    // it cannot tell yet is held and the next asked for too, so the ruling
-    // holds every one that may open the headers; one that unseals them is
-    // held and nothing more is asked. What the record said before a
-    // candidate it holds came is said again.
-    fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
-        if !self.sealed() || self.passwords.iter().any(|held| held.as_str() == secret) {
-            return;
-        }
-        let unseals = self.unseals(secret);
-        if unseals != Some(false) {
-            self.passwords.push(Zeroizing::new(secret.to_owned()));
-            self.said = None;
-        }
-        if unseals != Some(true) {
-            out.push(Emit::NeedsPassword);
-        }
     }
 
     // A lost range of the record is found when the ruling reads it.
@@ -337,13 +272,12 @@ impl Object for RarRecord {
         None
     }
 
-    fn bound(&mut self, _volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
+    fn bound(&mut self, _volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         self.name = name.to_owned();
-        self.front = if sealed(front) {
-            front.to_vec()
-        } else {
-            Vec::new()
-        };
+    }
+
+    fn handed(&mut self, handed: &Handed) {
+        self.password = handed.read::<Zeroizing<String>>().cloned();
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {
