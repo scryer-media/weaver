@@ -1452,6 +1452,71 @@ impl Pipeline {
         }
     }
 
+    // Withdraw the placement `other` was accepted at when `segment_id`, whose
+    // claim it contradicts, is the one the NZB's declared sizes vouch for and
+    // `other` is not. The withdrawn article is fetched again like any other
+    // that failed to decode, and when its copy carries the same bad header it
+    // meets placed neighbours and fails on arrival. Returns whether it was
+    // withdrawn; when it was not, `segment_id` is the one that fails.
+    //
+    // Only bytes the conventional writer owns can be withdrawn. An accepted
+    // placement is all an article header can be judged by, so a placement
+    // reconstructed from durable coverage is never withdrawn, and a file a
+    // direct set or its demotion sweep owns keeps the arrival-order verdict.
+    fn withdraw_contradicted_placement(
+        &mut self,
+        segment_id: SegmentId,
+        offset: u64,
+        len: u32,
+        expected: ExpectedSegmentLayout,
+        other: u32,
+    ) -> bool {
+        let file_id = segment_id.file_id;
+        if !placement_within_nzb_envelope(expected, offset, len)
+            || self.is_direct_source_file(file_id)
+            || self.demotion_sweep_owns_file(file_id)
+        {
+            return false;
+        }
+        let Some(file) = self
+            .jobs
+            .get_mut(&file_id.job_id)
+            .and_then(|state| state.assembly.file_mut(file_id))
+        else {
+            return false;
+        };
+        let Some((other_offset, other_len)) = file.placement_of(other) else {
+            return false;
+        };
+        let Ok(other_expected) = expected_segment_layout(file, other) else {
+            return false;
+        };
+        if placement_within_nzb_envelope(other_expected, other_offset, other_len) {
+            return false;
+        }
+        file.withdraw_placement(other);
+        let other_id = SegmentId {
+            file_id,
+            segment_number: other,
+        };
+        let withdrawn = self.write_buffers.get_mut(&file_id).and_then(|buffer| {
+            buffer.withdraw_at(other_offset, |held| held.segment_id == other_id)
+        });
+        if let Some(held) = withdrawn {
+            self.release_write_buffered(held.len_bytes(), 1);
+        }
+        self.invalidate_par2_session_for_file_write(file_id);
+        self.mark_file_hash_reread_required_for(file_id, "layout_conflict_withdrawn");
+        let error = format!(
+            "yEnc layout conflict: segment {other} claims [{other_offset}, {}) past what the NZB declares for it, which segment {} contradicts",
+            other_offset.saturating_add(u64::from(other_len)),
+            segment_id.segment_number,
+        );
+        self.metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.handle_decode_failure(other_id, &error, &[], None);
+        true
+    }
+
     // Commit a decoded segment, then release any parked parts its arrival
     // unblocked: uuencode parts behind the sequential cursor, and yEnc parts
     // that could not say where they start.
@@ -1824,7 +1889,7 @@ impl Pipeline {
             // Where this article said its range ends, which is where the next
             // ordinal starts even if these bytes are kept only for repair.
             let declared_end = declared_part_end(expected_layout, yenc_layout);
-            let conflict = match self
+            let mut conflict = match self
                 .jobs
                 .get_mut(&job_id)
                 .and_then(|state| state.assembly.file_mut(file_id))
@@ -1866,6 +1931,42 @@ impl Pipeline {
                 }
                 None => None,
             };
+            // Two accepted claims that contradict each other cannot both be
+            // right, and the one that fails is the one the NZB cannot vouch
+            // for: a bad extent costs only the article that carries it, in
+            // whichever order its neighbours arrive.
+            while let Some(other) = conflict
+                && self.withdraw_contradicted_placement(
+                    segment_id,
+                    file_offset,
+                    decoded_size,
+                    expected_layout,
+                    other,
+                )
+            {
+                conflict = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|state| state.assembly.file_mut(file_id))
+                    .and_then(|file| {
+                        let other = file.placement_conflict(
+                            segment_id.segment_number,
+                            file_offset,
+                            decoded_size,
+                        );
+                        if other.is_none() {
+                            file.record_placement(
+                                segment_id.segment_number,
+                                file_offset,
+                                decoded_size,
+                            );
+                            if anchored_on_settled_damage {
+                                file.require_geometry_verification();
+                            }
+                        }
+                        other
+                    });
+            }
             if let Some(other) = conflict {
                 let error = format!(
                     "yEnc layout conflict: segment {} claims [{file_offset}, {}) which runs into segment {other}",

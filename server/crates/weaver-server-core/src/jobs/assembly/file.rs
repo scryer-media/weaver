@@ -692,6 +692,14 @@ impl FileAssembly {
         true
     }
 
+    // Withdraw an accepted article whose placement a neighbour has since shown
+    // to be wrong, whether or not its bytes have been committed yet.
+    pub(crate) fn withdraw_placement(&mut self, segment_number: u32) {
+        if !self.retract_segment(segment_number) {
+            self.placements.remove(&segment_number);
+        }
+    }
+
     // Whether one specific segment has been received.
     //
     // Out-of-range segment numbers read as not received rather than panicking:

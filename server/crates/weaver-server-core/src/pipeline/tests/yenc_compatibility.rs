@@ -1937,3 +1937,106 @@ async fn a_body_cut_short_without_a_range_anchors_nothing() {
     assert_eq!(file.placement_of(1), None);
     assert!(file.segment_damage_is_truncation_only(0));
 }
+
+// A four-part file of four-byte parts whose NZB declares eight encoded bytes
+// a part. The bad article is ordinal 0 carrying a header that places it at
+// 12, where part 3 belongs: its own declared file size admits that, but the
+// NZB cannot, since nothing comes before ordinal 0.
+async fn deliver_part(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    number: u32,
+    offset: u64,
+    bytes: &[u8],
+) {
+    deliver_declared(
+        pipeline,
+        file_id,
+        number,
+        offset,
+        bytes,
+        weaver_yenc::CrcVerification::Verified,
+        None,
+        16,
+        None,
+        false,
+    )
+    .await;
+}
+
+async fn assert_only_the_bad_part_is_fetched_again(
+    pipeline: &mut Pipeline,
+    file_id: NzbFileId,
+    path: &std::path::Path,
+) {
+    let bad = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert_eq!(
+        file.placement_of(0),
+        None,
+        "a contradicted placement is not kept"
+    );
+    assert!(!file.has_segment(0));
+    for number in 1..4u32 {
+        assert_eq!(file.placement_of(number), Some((u64::from(number) * 4, 4)));
+    }
+    assert_eq!(
+        pipeline.decode_retries.keys().copied().collect::<Vec<_>>(),
+        vec![bad],
+        "only the article with the bad header fails"
+    );
+    assert!(pipeline.segment_terminal_states.is_empty());
+    let retry = pipeline.retry_rx.recv().await.unwrap();
+    assert_eq!(retry.work.segment_id, bad);
+    deliver_part(pipeline, file_id, 0, 0, b"aaaa").await;
+    let file = pipeline.jobs[&file_id.job_id]
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert!(file.is_complete());
+    assert_eq!(std::fs::read(path).unwrap(), b"aaaabbbbccccdddd");
+    assert_eq!(pipeline.write_buffered_bytes, 0);
+}
+
+// Its neighbour is already placed, so the bad article is refused on arrival
+// and recorded nowhere; every later part still places.
+#[tokio::test(start_paused = true)]
+async fn a_bad_extent_after_its_neighbour_is_refused_and_not_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40230, &[8; 4]).await;
+    deliver_part(&mut pipeline, file_id, 1, 4, b"bbbb").await;
+    deliver_part(&mut pipeline, file_id, 0, 12, b"XXXX").await;
+    for (number, offset, bytes) in [(2u32, 8u64, b"cccc"), (3, 12, b"dddd")] {
+        deliver_part(&mut pipeline, file_id, number, offset, bytes).await;
+    }
+    assert_only_the_bad_part_is_fetched_again(&mut pipeline, file_id, &path).await;
+}
+
+// After a restart nothing of the file is placed yet, so the bad article can be
+// the first to arrive and be accepted. Its neighbours, which the NZB vouches
+// for, then contradict it: it is withdrawn and fetched again, and none of them
+// fails.
+#[tokio::test(start_paused = true)]
+async fn a_bad_extent_that_arrives_first_fails_alone_and_its_neighbours_place() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40231, &[8; 4]).await;
+    deliver_part(&mut pipeline, file_id, 0, 12, b"XXXX").await;
+    assert_eq!(
+        pipeline.jobs[&file_id.job_id]
+            .assembly
+            .file(file_id)
+            .unwrap()
+            .placement_of(0),
+        Some((12, 4))
+    );
+    for (number, offset, bytes) in [(1u32, 4u64, b"bbbb"), (2, 8, b"cccc"), (3, 12, b"dddd")] {
+        deliver_part(&mut pipeline, file_id, number, offset, bytes).await;
+    }
+    assert_only_the_bad_part_is_fetched_again(&mut pipeline, file_id, &path).await;
+}
