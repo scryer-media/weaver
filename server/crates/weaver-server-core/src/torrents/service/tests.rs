@@ -1035,6 +1035,81 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
     assert_eq!(*retired.borrow(), 1);
 }
 
+// After a restart, before the tick restores its job, a torrent unpacking
+// refused reads as failed, as its history keeps it, and a removal then
+// goes to history as failed, as it would once the job is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_torrent_reads_and_is_removed_as_failed_before_its_job_is_back() {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_post_processing_settings(&PostProcessingSettings {
+            unacceptable_extensions: vec!["txt".into()],
+            ..PostProcessingSettings::default()
+        })
+        .unwrap();
+    let bytes = metainfo("set.rar", &[("set.rar", archive)], 128, false);
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let (layout, intake) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let mut retired = rig.service.retired();
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
+    let lengths = Lengths::new(
+        layout.files().map(|file| file.length).sum(),
+        layout.piece_length() as u32,
+    )
+    .unwrap();
+    for piece in 0..layout.piece_count() {
+        let range = layout.piece_range(piece);
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
+        for span in layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            storage
+                .pwrite_all(
+                    span.file,
+                    span.range.start,
+                    &archive[at..at + span.range.len() as usize],
+                )
+                .unwrap();
+        }
+        let _ = storage.on_piece_completed(index);
+    }
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Stopped);
+    assert!(view.detail.unwrap().contains("txt"));
+
+    again.remove(job_id, false, false).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "failed");
+    assert!(history.error_message.unwrap().contains("txt"));
+    again.stop().await;
+}
+
 // The metainfo's own word on who made it, when, and why stays with the
 // torrent; a torrent without it says nothing.
 #[test]
@@ -1711,7 +1786,16 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     let handle = queue();
     let mut changes = handle.state().subscribe_job_changes();
     again.publish_to(handle);
-    reopen(&again).await;
+    again.open().await.unwrap();
+    // Before the tick restores its job, it shows what was stored: complete,
+    // so its file whole and every piece.
+    let kept = again.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (kept.have_bytes, kept.progress, kept.file_have),
+        (total, 1.0, vec![total])
+    );
+    assert_eq!(kept.pieces.map(|pieces| pieces.have), Some(4));
+    again.tick().await;
     handle_of(&again, job_id)
         .await
         .wait_until_completed()
@@ -4031,6 +4115,54 @@ async fn a_torrent_that_crashed_part_way_restarts_with_its_pieces() {
     // written.
     fetched.rig.service.inner.sessions.stop_all().await;
     resumes_with_its_pieces(fetched).await;
+}
+
+// Starting never reads a torrent's files. The service opens with each
+// torrent's record, and its view is served from what was kept, before its
+// job is restored from its checkpoint; the job is restored at the tick, as
+// the torrent goes into its session, with every piece it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_restores_a_torrents_job_at_the_tick_not_at_start() {
+    let PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        sizes,
+        ..
+    } = partly_fetched().await;
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+    let ledger = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let written = again.written();
+    let reads = || written.borrow().checkpoints_read;
+    again.open().await.unwrap();
+    // The tick has not run: the job's checkpoint is unread, and the torrent
+    // shows what was stored of it: its ledger and its files. It is not
+    // complete, so nothing stored says which pieces it has.
+    assert_eq!(reads(), 0);
+    let kept = again.torrent(job_id).await.unwrap();
+    assert_eq!(
+        lifetime(&kept),
+        (
+            ledger.downloaded_bytes,
+            ledger.uploaded_bytes,
+            ledger.active_duration_s
+        )
+    );
+    assert_eq!(kept.total_bytes, sizes.iter().sum::<u64>());
+    assert_eq!(kept.files.len(), 2);
+    assert_eq!(kept.pieces, None);
+
+    again.tick().await;
+    assert_eq!(reads(), 1);
+    assert!(again.inner.live.lock().await[&job_id].attached.is_some());
+    assert_eq!(job_have(&again, job_id).await, 3);
+    let ticked = again.torrent(job_id).await.unwrap();
+    assert_eq!(ticked.pieces.map(|pieces| pieces.have), Some(3));
+    again.stop().await;
+    seeding.stop().await;
 }
 
 // What a torrent's view shows of its ledger: the figures that outlive a

@@ -101,6 +101,23 @@ impl PieceLayout {
         self.total.div_ceil(self.piece_length) as u32
     }
 
+    // How many pieces carry a byte of a file `over` picks, by its index in
+    // the torrent. Padding carries none.
+    pub(crate) fn pieces_over(&self, over: impl Fn(usize) -> bool) -> u32 {
+        let mut count = 0;
+        let mut reached = 0;
+        for (index, placed) in self.files.iter().enumerate() {
+            if placed.file.padding || placed.file.length == 0 || !over(index) {
+                continue;
+            }
+            let first = (placed.start / self.piece_length) as u32;
+            let end = (placed.start + placed.file.length).div_ceil(self.piece_length) as u32;
+            count += end.saturating_sub(first.max(reached));
+            reached = reached.max(end);
+        }
+        count
+    }
+
     // The piece's bytes in the torrent's coordinates.
     pub(crate) fn piece_range(&self, piece: u32) -> ByteRange {
         let start = (u64::from(piece) * self.piece_length).min(self.total);

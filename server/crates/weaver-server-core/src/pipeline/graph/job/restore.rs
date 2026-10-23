@@ -2,14 +2,18 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A graph job back from its checkpoint. The promise is no refetch: what the
-// checkpoint says is on disk is read back and delivered down the tree again,
-// and only what is not there is fetched. In the plan's order:
+// checkpoint says is on disk and the tree rebuilds from is read back and
+// delivered down the tree again, the rest is found in its file, and only
+// what is not there is fetched. In the plan's order:
 //
 //   2. every node is rebuilt from its facts, and each node that was offered
 //      a candidate is offered it again, so its keys are derived anew
-//   3. every unit the root had in hand is read back through the inverse
-//      map and checked against what the root was handed; one that reads but
-//      does not match is damaged, one that does not read is fetched again
+//   3. every unit the root had in hand that it reads back is read through
+//      the inverse map and checked against what the root was handed; one
+//      that reads but does not match is damaged, one that does not read is
+//      fetched again. A unit it does not read back is trusted as the
+//      checkpoint left it once its file reaches past it, and only what it
+//      holds of the member's front is read, back into the namespace
 //   4. each unit read is delivered down the tree before the next is
 //      read, as it first came, so every object is where it was and a stream
 //      replays from its start
@@ -22,6 +26,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, RestoreError, Tree, VolumeIndex};
 
 use super::loans::Loans;
@@ -53,6 +58,8 @@ pub(crate) struct Restored<R: Root = ArticleRoot> {
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
     // Units the checkpoint had that were not on disk.
     pub(crate) refetched: Vec<(VolumeIndex, u32)>,
+    // The bytes the restore read back from disk.
+    pub(crate) read: u64,
 }
 
 // An article read back, and how each of its pieces is delivered again.
@@ -132,7 +139,7 @@ impl<R: Root> GraphJob<R> {
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
         }
-        let refetched = job.read_back()?;
+        let (refetched, read) = job.read_back()?;
         job.mark_damage()?;
         for volume in 0..job.root.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
@@ -142,6 +149,7 @@ impl<R: Root> GraphJob<R> {
         Ok(Restored {
             settled: job.root.settled(),
             refetched,
+            read,
             job,
         })
     }
@@ -162,21 +170,32 @@ impl<R: Root> GraphJob<R> {
         self.settle(effects)
     }
 
-    // Every article the root had in hand, read back and delivered before the
-    // next is read: an object's inverse map for a later article can lean on
-    // what the earlier ones rebuilt, as a cipher's chain does. What does not
-    // read is the root's to fetch again: the article waits, and the bytes
+    // Every unit the root had in hand that it reads back, read and delivered
+    // before the next is read: an object's inverse map for a later unit can
+    // lean on what the earlier ones rebuilt, as a cipher's chain does. A
+    // unit the root does not read back is only found in its file, and what
+    // it holds of the member's front goes back into the namespace. What is
+    // not there is the root's to fetch again: the unit waits, and the bytes
     // it covered are no longer covered, or said at any depth they reached.
     // A restore starts with no holds, so any it reads through are bytes an
-    // earlier article's delivery moved there from disk, as a member bound
-    // by its bytes moves its file.
-    fn read_back(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
+    // earlier unit's delivery moved there from disk, as a member bound by
+    // its bytes moves its file. Also returns how many bytes it read.
+    fn read_back(&mut self) -> Result<(Vec<(VolumeIndex, u32)>, u64), GraphError> {
         let mut missing = Vec::new();
         let mut bytes = Vec::new();
+        let mut read = 0;
         for index in 0..self.root.volume_count() {
             let volume = VolumeIndex(index as u32);
             let member = MemberId(volume.0);
+            let reads_back = self.root.reads_back(&self.tree, member);
             for (ordinal, range) in self.root.arrived_ranges(volume) {
+                if !reads_back {
+                    match self.keep_front(member, range) {
+                        Some(kept) => read += kept,
+                        None => missing.push((volume, ordinal, Some(range))),
+                    }
+                    continue;
+                }
                 bytes.clear();
                 if !self
                     .writer
@@ -186,8 +205,9 @@ impl<R: Root> GraphJob<R> {
                     missing.push((volume, ordinal, Some(range)));
                     continue;
                 }
-                let read = Bytes::copy_from_slice(&bytes);
-                let pieces = self.pieces(volume, range, &read);
+                read += bytes.len() as u64;
+                let bytes = Bytes::copy_from_slice(&bytes);
+                let pieces = self.pieces(volume, range, &bytes);
                 self.deliver_again(ReadBack { volume, pieces })?;
             }
         }
@@ -202,7 +222,46 @@ impl<R: Root> GraphJob<R> {
             self.unarrive(volume, ordinal, range);
             refetched.push((volume, ordinal));
         }
-        Ok(refetched)
+        Ok((refetched, read))
+    }
+
+    // A unit not read back, found in its file without reading it, and what
+    // it holds of the member's front read and kept in the namespace,
+    // unchecked, with the provenance each run arrived with: a recovery
+    // object knows a member by its front. None when its file does not hold
+    // it; else the bytes read.
+    fn keep_front(&mut self, member: MemberId, range: ByteRange) -> Option<u64> {
+        let access = self.writer.access(&self.tree);
+        if !access.written(NodeId::ROOT, member, range) {
+            return None;
+        }
+        let Some(front) = range.intersect(ByteRange::new(0, FIRST_BYTES as u64)) else {
+            return Some(0);
+        };
+        let mut bytes = Vec::new();
+        if !access.read_at(NodeId::ROOT, member, front, &mut bytes) {
+            return None;
+        }
+        let runs: Vec<(ByteRange, Provenance)> = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .and_then(|namespace| namespace.get(member))
+            .map(|record| {
+                record
+                    .coverage
+                    .overlapping(front)
+                    .filter_map(|run| Some((run.range.intersect(front)?, run.provenance)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+            for (run, provenance) in runs {
+                let from = (run.start - front.start) as usize;
+                let slice = &bytes[from..from + run.len() as usize];
+                namespace.keep_first_bytes(member, run.start, slice, provenance);
+            }
+        }
+        Some(front.len())
     }
 
     // The article's bytes cut at its coverage runs, each with the

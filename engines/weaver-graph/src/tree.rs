@@ -1015,6 +1015,12 @@ impl Tree {
             .is_some_and(|found| found.undecided.contains(&found.namespace.resolve(member)))
     }
 
+    // Whether a window reads the member: a stretch of it is a volume of an
+    // object that has not claimed the member whole.
+    pub fn is_windowed(&self, node: NodeId, member: MemberId) -> bool {
+        !self.windows_on(node, member).is_empty()
+    }
+
     // Whether damage at `range` of the member stops its front for good: it
     // starts where the bytes in hand from the member's start run out, so the
     // front can grow no further unless a repair brings those bytes back.

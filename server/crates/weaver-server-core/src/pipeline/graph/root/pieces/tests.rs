@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{ByteRange, MemberId, NodeId, Pull, Purpose, Seek, VolumeIndex, Weight};
 
 use super::layout::Span;
@@ -16,6 +17,7 @@ use crate::pipeline::graph::job::{GraphJob, Storage};
 use crate::pipeline::graph::limits::Caps;
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::facts::RootFactsError;
+use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::{Ask, Root};
 use crate::pipeline::graph::status::RepairSlots;
 
@@ -240,12 +242,8 @@ fn receive_delivers_each_file_share_in_its_own_coordinates() {
     assert!(root.volume_waiting(VolumeIndex(1)));
     assert!(!root.waiting(VolumeIndex(1), 0));
     assert!(root.waiting(VolumeIndex(1), 1));
-    // Bytes that read back as they were handed over match; others do not.
-    let bytes = torrent_bytes(&layout);
-    assert!(root.matches(VolumeIndex(1), ByteRange::new(0, 24), &bytes[1000..1024]));
-    assert!(!root.matches(VolumeIndex(1), ByteRange::new(0, 24), &[0; 24]));
-    // A range holding only part of a share is taken as read.
-    assert!(root.matches(VolumeIndex(1), ByteRange::new(0, 10), &[0; 10]));
+    // A checkpoint is trusted: whatever reads back is taken as read.
+    assert!(root.matches(VolumeIndex(1), ByteRange::new(0, 24), &[0; 24]));
     assert!(root.unseen().is_empty());
 }
 
@@ -515,6 +513,196 @@ fn a_piece_that_fails_its_hash_waits_to_be_fetched_again() {
         bytes[3500..]
     );
     assert!(job.namespace().members().all(|member| member.closed));
+}
+
+// A torrent's checkpoint is trusted: a restore reads no piece back and
+// hashes none, so a file whose bytes changed under it still has every piece
+// the checkpoint says, and nothing of it is damaged. A file that no longer
+// reaches a piece's share is found short without reading it: that share
+// waits to be fetched again.
+#[test]
+fn a_torrents_restore_reads_no_piece_back_and_finds_a_short_file() {
+    let layout = layout();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    for piece in 0..5 {
+        job.verified(shares(&layout, piece), &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    assert!(job.have().all());
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    drop(job);
+    // a's bytes no longer hash as piece 0's share: a read and a hash would
+    // find them damaged.
+    std::fs::write(dir.path().join("a.bin"), [0x5a; 1000]).unwrap();
+    // b's shares of pieces 2 (1048..2072) and 3 (2072..2500) lie past its
+    // end now; its share of piece 1 (24..1048) does not.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("b.bin"))
+        .unwrap()
+        .set_len(1500)
+        .unwrap();
+
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
+            .unwrap();
+    assert_eq!(
+        restored.refetched,
+        vec![(VolumeIndex(1), 2), (VolumeIndex(1), 3)]
+    );
+    assert_eq!(
+        restored.job.have().iter_ones().collect::<Vec<_>>(),
+        vec![0, 1, 4]
+    );
+    let damaged = |member: u32| {
+        restored
+            .job
+            .namespace()
+            .get(MemberId(member))
+            .unwrap()
+            .coverage
+            .damaged_ranges()
+            .count()
+    };
+    assert_eq!((damaged(0), damaged(1), damaged(2)), (0, 0, 0));
+    assert_eq!(
+        std::fs::read(dir.path().join("a.bin")).unwrap(),
+        [0x5a; 1000]
+    );
+    // Only each file's front was read: a whole, b up to its end, c whole.
+    assert_eq!(restored.read, 1000 + 1048 + 700);
+}
+
+// A plain file's restore reads its front and nothing past it: the front
+// goes back into the namespace unchecked, and every piece is in hand.
+#[test]
+fn a_torrents_restore_reads_only_a_plain_files_front() {
+    let layout = Arc::new(PieceLayout::new(PIECE, vec![file("big.bin", 40_000)]).unwrap());
+    let bytes: Vec<u8> = (0..40_000u32).map(|at| (at % 251) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    for piece in 0..layout.piece_count() {
+        job.verified(
+            shares_of(&layout, &bytes, piece),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    assert!(job.have().all());
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    drop(job);
+
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
+            .unwrap();
+    assert!(restored.refetched.is_empty());
+    assert!(restored.job.have().all());
+    assert_eq!(restored.read, FIRST_BYTES as u64);
+    assert_eq!(
+        restored.job.namespace().first_bytes(MemberId(0)),
+        &bytes[..FIRST_BYTES]
+    );
+}
+
+// A plain file whose first piece has not come: its front has yet to say
+// what it is. Its restore reads only what it holds of the front, past the
+// missing first piece, and nothing after it.
+#[test]
+fn a_torrents_restore_of_an_undecided_file_reads_only_its_front() {
+    let layout = Arc::new(PieceLayout::new(PIECE, vec![file("big.bin", 40_000)]).unwrap());
+    let bytes: Vec<u8> = (0..40_000u32).map(|at| (at % 251) as u8).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    for piece in 1..layout.piece_count() {
+        job.verified(
+            shares_of(&layout, &bytes, piece),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    assert!(job.tree().is_undecided(NodeId::ROOT, MemberId(0)));
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    drop(job);
+
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
+            .unwrap();
+    assert!(restored.refetched.is_empty());
+    assert_eq!(
+        restored.job.have().iter_ones().collect::<Vec<_>>(),
+        (1..layout.piece_count() as usize).collect::<Vec<_>>()
+    );
+    assert_eq!(restored.read, FIRST_BYTES as u64 - PIECE);
+}
+
+// A RAR volume whose first bytes end its first piece, too few to say what
+// it is: the checkpoint holds that piece alone. The restore reads the front
+// back and delivers it again, so the pieces still to come bind the volume
+// and its member unpacks.
+#[tokio::test]
+async fn an_archive_whose_front_straddles_a_piece_binds_and_unpacks_after_a_restore() {
+    let archive = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let member = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/originals/small.txt"
+    ));
+    // pad.bin ends 4 bytes before piece 0 does: those are the archive's.
+    let pad: Vec<u8> = (0..124u32).map(|at| (at % 251) as u8 | 0x80).collect();
+    let layout = Arc::new(
+        PieceLayout::new(
+            128,
+            vec![
+                file("pad.bin", pad.len() as u64),
+                file("set.rar", archive.len() as u64),
+            ],
+        )
+        .unwrap(),
+    );
+    let torrent = [pad.as_slice(), archive.as_slice()].concat();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    job.verified(
+        shares_of(&layout, &torrent, 0),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    assert!(job.tree().is_undecided(NodeId::ROOT, MemberId(1)));
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    drop(job);
+
+    let mut mail = RunMail::default();
+    let restored = GraphJob::restore_torrent(
+        &snapshot,
+        Arc::clone(&layout),
+        1,
+        Storage {
+            mail: mail.sender(),
+            ..storage(dir.path())
+        },
+        1,
+    )
+    .unwrap();
+    assert!(restored.refetched.is_empty());
+    let mut job = restored.job;
+    let mut slots = RepairSlots::default();
+    for piece in 1..layout.piece_count() {
+        job.verified(shares_of(&layout, &torrent, piece), &mut slots, 1)
+            .unwrap();
+    }
+    assert!(job.tree().child_of(NodeId::ROOT, MemberId(1)).is_some());
+    while job.phase() != RootPhase::Done {
+        let said = mail.recv().await.expect("the run speaks before it ends");
+        job.run_said(said, &mut slots, 1).unwrap();
+    }
+    assert_eq!(std::fs::read(dir.path().join("small.txt")).unwrap(), member);
+    assert_eq!(std::fs::read(dir.path().join("pad.bin")).unwrap(), pad);
 }
 
 // libtorrent `torrent::force_recheck` forgets every piece before checking,

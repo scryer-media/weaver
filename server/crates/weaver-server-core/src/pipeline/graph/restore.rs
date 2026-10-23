@@ -81,6 +81,7 @@ impl Pipeline {
             job,
             settled,
             refetched,
+            ..
         } = tokio::task::spawn_blocking(move || {
             GraphJob::restore(&snapshot, &files, job_id.0, storage, limit)
         })

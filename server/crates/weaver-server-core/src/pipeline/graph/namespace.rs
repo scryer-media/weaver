@@ -1604,6 +1604,24 @@ impl Access<'_> {
         }
         read
     }
+
+    // Whether the range of a member no object reads is in its own file,
+    // found without reading it: its coverage says it was written, and the
+    // file reaches past it.
+    pub(crate) fn written(&self, node: NodeId, member: MemberId, range: ByteRange) -> bool {
+        let covered = self
+            .tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .is_some_and(|record| record.coverage.covered(range));
+        covered
+            && self
+                .writer
+                .files
+                .get(&node)
+                .and_then(|files| files.leaves.get(&member))
+                .is_some_and(|leaf| leaf.len().is_ok_and(|length| length >= range.end))
+    }
 }
 
 impl Source for Access<'_> {

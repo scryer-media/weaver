@@ -32,7 +32,6 @@ use std::sync::Arc;
 use bitvec::prelude::{BitVec, Msb0};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 use weaver_graph::{
     ByteRange, MemberId, NodeId, Part, Provenance, Pull, Segment, Tree, VolumeIndex,
 };
@@ -154,9 +153,8 @@ impl PieceRoot {
     // A verified piece's share: record what it was, and hand back the
     // delivery for the namespace.
     pub(crate) fn receive(&mut self, verified: Verified) -> Arrival {
-        let digest: [u8; 20] = Sha1::digest(&verified.bytes).into();
         if let Some(unit) = self.unit_mut(verified.volume, verified.piece) {
-            *unit = Unit::Arrived(Some(digest));
+            *unit = Unit::Arrived(None);
         }
         Arrival {
             node: NodeId::ROOT,
@@ -464,25 +462,19 @@ impl Root for PieceRoot {
             .collect()
     }
 
-    // Each share wholly inside the range must hash as it did when handed
-    // over; one this run never saw, or only partly in the range, is taken
-    // as read.
-    fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool {
-        self.layout
-            .pieces(volume, range)
-            .filter_map(|piece| match self.unit(volume, piece) {
-                Some(Unit::Arrived(Some(digest)) | Unit::Unchecked(Some(digest))) => {
-                    Some((self.layout.span(volume, piece)?, *digest))
-                }
-                _ => None,
-            })
-            .filter(|(span, _)| range.covers(*span))
-            .all(|(span, digest)| {
-                let from = (span.start - range.start) as usize;
-                bytes
-                    .get(from..from + span.len() as usize)
-                    .is_some_and(|share| <[u8; 20]>::from(Sha1::digest(share)) == digest)
-            })
+    // A checkpoint is trusted: what it says verified is taken as read.
+    // Checking every piece again is the session's recheck, when one is
+    // asked for.
+    fn matches(&self, _volume: VolumeIndex, _range: ByteRange, _bytes: &[u8]) -> bool {
+        true
+    }
+
+    // A piece's share rebuilds nothing but an object that reads it: one
+    // that claimed the member, or a window on it. A file no object reads is
+    // the output itself, and one whose front has yet to decide it needs
+    // only its front back.
+    fn reads_back(&self, tree: &Tree, member: MemberId) -> bool {
+        tree.child_of(NodeId::ROOT, member).is_some() || tree.is_windowed(NodeId::ROOT, member)
     }
 }
 

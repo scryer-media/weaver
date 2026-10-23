@@ -1036,3 +1036,43 @@ fn an_article_job_restores_from_its_checkpoint_rows() {
     assert_eq!(again.root, taken.root);
     assert_eq!(again.job.read_backs, taken.job.read_backs);
 }
+
+// An article job's restore reads every article back and checks it: one
+// whose bytes on disk no longer match its checksums is damaged.
+#[test]
+fn an_article_jobs_restore_reads_its_articles_back_and_checks_them() {
+    let files = [file("lantern.bin", &[90])];
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    let crc = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &[7; 90]) as u32;
+    job.intake(
+        with_segments(decoded(0, 0, 0, &[7; 90], Some(90)), &[(0, 90, crc)]),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    drop(job);
+    std::fs::write(dir.path().join("lantern.bin"), [9; 90]).unwrap();
+    let storage = crate::pipeline::graph::job::Storage {
+        working_dir: dir.path().to_path_buf(),
+        accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: u64::MAX,
+            scratch_total: u64::MAX,
+            scratch_ceiling: u64::MAX,
+            disk_reserve: 0,
+        })),
+        free_disk: CapacityReader::unknown(),
+        slots: 1,
+        mail: RunMail::default().sender(),
+        passwords: Vec::new(),
+        caps: crate::pipeline::graph::limits::Caps::unbounded(),
+        nesting: u32::MAX,
+        unpack: true,
+    };
+    let restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
+    assert!(restored.refetched.is_empty());
+    assert_eq!(
+        damaged_ranges(&restored.job, 0),
+        vec![ByteRange::new(0, 90)]
+    );
+}

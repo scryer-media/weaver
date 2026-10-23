@@ -44,6 +44,7 @@ use crate::persistence::Database;
 use crate::pipeline::claim_complete_destination_path;
 use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{Hears, Outside, RunMail, Said};
+use crate::pipeline::graph::job::restore::Restored;
 use crate::pipeline::graph::job::{GraphJob, Storage};
 use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
@@ -823,6 +824,9 @@ struct Live {
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
+    // Why unpacking refused it, as its history kept it when it was
+    // restored: a restored job does not say.
+    failed: Option<String>,
 }
 
 // `torrent` as the download queue and its holds see it. A complete torrent
@@ -911,11 +915,34 @@ impl Live {
             peers: (0, 0),
             moving: None,
             file_have: Vec::new(),
+            failed: None,
         }
     }
 
     fn complete(&self) -> bool {
         self.record.completed_at_ms.is_some()
+    }
+
+    // Whether the operator wants the file of this index fetched.
+    fn wanted(&self, file: usize) -> bool {
+        self.levels.get(file) != Some(&FilePriority::Ignored)
+    }
+
+    // What it shows until its job is back, from what was stored: a complete
+    // torrent holds every file it wanted whole, and a failure is the one
+    // its history keeps.
+    fn kept(&mut self, failed: Option<String>) {
+        if self.complete() {
+            let have: Vec<u64> = self
+                .layout
+                .iter()
+                .flat_map(|layout| layout.files())
+                .enumerate()
+                .map(|(index, file)| if self.wanted(index) { file.length } else { 0 })
+                .collect();
+            self.file_have = have;
+        }
+        self.failed = failed;
     }
 
     // Fold what the session moved since the last reading into the ledger,
@@ -986,13 +1013,19 @@ impl Live {
         self.run_error = result.err().map(|error| format!("{error:#}"));
     }
 
-    // Why unpacking refused the torrent's output, while that stands.
+    // Why unpacking refused the torrent's output, while that stands: the
+    // job's word, or the one its history keeps.
     fn refusal(&self) -> Option<String> {
-        self.job.as_ref()?.with(|job| {
-            job.writer()
-                .refusal()
-                .map(|refusal| refusal.job_failure_reason())
-        })
+        self.job
+            .as_ref()
+            .and_then(|job| {
+                job.with(|job| {
+                    job.writer()
+                        .refusal()
+                        .map(|refusal| refusal.job_failure_reason())
+                })
+            })
+            .or_else(|| self.failed.clone())
     }
 
     // A write found no room: the session fetches nothing for the torrent
@@ -1007,13 +1040,19 @@ impl Live {
         )
     }
 
-    // The pieces, and how many of them the job holds verified.
+    // The pieces, and how many of them the job holds verified. Until its
+    // job is back, a complete torrent holds every piece of a file it wanted.
     fn pieces(&self) -> Option<TorrentPieces> {
-        let (layout, job) = (self.layout.as_ref()?, self.job.as_ref()?);
+        let layout = self.layout.as_ref()?;
+        let have = match &self.job {
+            Some(job) => job.with(|job| job.have().count_ones()) as u32,
+            None if self.complete() => layout.pieces_over(|file| self.wanted(file)),
+            None => return None,
+        };
         Some(TorrentPieces {
             count: layout.piece_count(),
             size: layout.piece_length(),
-            have: job.with(|job| job.have().count_ones()) as u32,
+            have,
         })
     }
 
@@ -1255,11 +1294,12 @@ impl Hears for Hearer {
     }
 }
 
-/// What the service has written so far.
+/// What the service has written so far, and the checkpoints it has read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Written {
     pub ledgers: u64,
     pub checkpoints: u64,
+    pub checkpoints_read: u64,
 }
 
 struct Inner {
@@ -1271,6 +1311,10 @@ struct Inner {
     env: JobEnv,
     clock: Arc<dyn Clock>,
     live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
+    // Held while a torrent's job is restored, from the check that it waits
+    // for one to the job given: one restore at a time. The blocking restore
+    // owns it, so a restore whose awaiting task ends still holds it.
+    restoring: Arc<tokio::sync::Mutex<()>>,
     signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
     retired: watch::Sender<u64>,
@@ -1304,6 +1348,7 @@ impl TorrentService {
                 env,
                 clock,
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
+                restoring: Arc::new(tokio::sync::Mutex::new(())),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
                 retired: watch::channel(0).0,
@@ -1332,6 +1377,19 @@ impl TorrentService {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    // The failure a torrent's history keeps for it: unpacking refused it.
+    fn stored_failure(&self, job_id: JobId) -> Option<String> {
+        match self.inner.db.get_job_history(job_id.0) {
+            Ok(row) => row
+                .filter(|row| row.status == "failed")
+                .and_then(|row| row.error_message),
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's history");
+                None
+            }
+        }
     }
 
     // The rule a torrent announcing to `trackers` follows.
@@ -1573,7 +1631,8 @@ impl TorrentService {
         self.inner.retired.subscribe()
     }
 
-    /// Counts the ledgers and checkpoints written.
+    /// Counts the ledgers and checkpoints written, and the checkpoints
+    /// read.
     pub fn written(&self) -> watch::Receiver<Written> {
         self.inner.written.subscribe()
     }
@@ -1833,22 +1892,23 @@ impl TorrentService {
         }
     }
 
-    // The torrent's job as its checkpoint left it, or none when it has no
-    // checkpoint. A checkpoint that does not restore is said, with why, and
-    // the torrent starts as a new one.
+    // What the torrent's checkpoint gives back. It reads the checkpoint and
+    // the files it covers, so it runs off the tick's task.
     fn restored(
         &self,
         job_id: JobId,
         dir: PathBuf,
         layout: &Arc<PieceLayout>,
         unpack: bool,
-    ) -> Option<GraphJob<PieceRoot>> {
-        let rows = match self.inner.db.load_graph_checkpoint(job_id) {
-            Ok(rows) => rows?,
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint could not be read; it starts fresh");
-                return None;
-            }
+    ) -> FromCheckpoint {
+        let loaded = self.inner.db.load_graph_checkpoint(job_id);
+        self.inner
+            .written
+            .send_modify(|written| written.checkpoints_read += 1);
+        let rows = match loaded {
+            Ok(Some(rows)) => rows,
+            Ok(None) => return FromCheckpoint::Nothing,
+            Err(error) => return FromCheckpoint::Unread(error.to_string()),
         };
         let restored = checkpoint::snapshot(&rows)
             .map_err(|error| error.to_string())
@@ -1867,32 +1927,52 @@ impl TorrentService {
                 // The database holds these rows: the next checkpoint writes
                 // only what changes from them.
                 restored.job.pending().written(rows);
-                Some(restored.job)
+                FromCheckpoint::Restored(restored)
             }
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint did not restore; it starts fresh");
-                None
-            }
+            Err(error) => FromCheckpoint::Failed(error),
         }
     }
 
-    // The job of a torrent with metainfo, from its checkpoint when it has one.
-    fn job(
+    // The job of a torrent with metainfo: the one its checkpoint gave back,
+    // or a new one. A checkpoint that does not restore is said, with why,
+    // and the torrent starts as a new one.
+    fn graph_job(
         &self,
         job_id: JobId,
         dir: PathBuf,
         layout: &Arc<PieceLayout>,
         unpack: bool,
-    ) -> (Arc<TorrentJob>, Arc<Intake>) {
+        checkpoint: FromCheckpoint,
+    ) -> GraphJob<PieceRoot> {
+        match checkpoint {
+            FromCheckpoint::Restored(restored) => {
+                tracing::debug!(
+                    job_id = job_id.0,
+                    read_bytes = restored.read,
+                    refetched = restored.refetched.len(),
+                    "a torrent's job is restored from its checkpoint"
+                );
+                return restored.job;
+            }
+            FromCheckpoint::Nothing => {}
+            FromCheckpoint::Unread(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint could not be read; it starts fresh");
+            }
+            FromCheckpoint::Failed(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint did not restore; it starts fresh");
+            }
+        }
+        GraphJob::for_torrent(
+            job_id.0,
+            Arc::clone(layout),
+            self.storage(dir, layout, unpack),
+        )
+    }
+
+    // The job joined to what feeds it: the runs' mail, and the intake the
+    // session hands its pieces to.
+    fn job(&self, job_id: JobId, job: GraphJob<PieceRoot>) -> (Arc<TorrentJob>, Arc<Intake>) {
         let slots = self.inner.env.slots;
-        let job = match self.restored(job_id, dir.clone(), layout, unpack) {
-            Some(job) => job,
-            None => GraphJob::for_torrent(
-                job_id.0,
-                Arc::clone(layout),
-                self.storage(dir, layout, unpack),
-            ),
-        };
         let env = &self.inner.env;
         let job = Arc::new(TorrentJob::new(
             job,
@@ -1928,21 +2008,40 @@ impl TorrentService {
         }
     }
 
-    // The torrent's job, over the metainfo. Whether it unpacks is fixed
-    // here and kept, so a restart builds the same tree.
+    // The torrent's metainfo and its job over it, at once.
     fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) {
+        self.describe(torrent, parsed);
+        let (job_id, dir, unpack) = (
+            torrent.record.job_id,
+            storage_dir(torrent),
+            unpacks(torrent),
+        );
+        let checkpoint = self.restored(job_id, dir.clone(), &parsed.layout, unpack);
+        let job = self.graph_job(job_id, dir, &parsed.layout, unpack, checkpoint);
+        self.give_job(torrent, job);
+    }
+
+    // The job joined, and what the torrent shows of it.
+    fn give_job(&self, torrent: &mut Live, job: GraphJob<PieceRoot>) {
+        let (job, intake) = self.job(torrent.record.job_id, job);
+        torrent.file_have = job.with(|job| job.file_have());
+        torrent.job = Some(job);
+        torrent.intake = Some(intake);
+    }
+
+    // What the metainfo says of the torrent, without its job. Whether it
+    // unpacks is fixed here and kept, so a restart builds the same tree.
+    fn describe(&self, torrent: &mut Live, parsed: &Parsed) {
         let job_id = torrent.record.job_id;
-        let unpack = self
-            .settings()
-            .unpack(&torrent.record, torrent.rule(&self.rules()));
         if torrent.record.unpack.is_none() {
+            let unpack = self
+                .settings()
+                .unpack(&torrent.record, torrent.rule(&self.rules()));
             if let Err(error) = self.inner.db.set_torrent_unpack(job_id, unpack) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
             }
             torrent.record.unpack = Some(unpack);
         }
-        let dir = PathBuf::from(torrent.record.storage_dir.clone().unwrap_or_default());
-        let (job, intake) = self.job(job_id, dir, &parsed.layout, unpack);
         torrent.names = parsed.manifest.paths.clone();
         torrent.total = parsed.total;
         torrent.layout = Some(Arc::clone(&parsed.layout));
@@ -1959,11 +2058,74 @@ impl TorrentService {
                 level.held_by(file.padding)
             })
             .collect();
-        torrent.file_have = job.with(|job| job.file_have());
-        torrent.job = Some(job);
-        torrent.intake = Some(intake);
         torrent.about = parsed.about.clone();
         torrent.private = parsed.private;
+    }
+
+    // The jobs of the torrents brought back at start with their records
+    // only, each restored from its checkpoint in turn. A torrent reads as it
+    // was kept until its job is back.
+    async fn restore_jobs(&self) {
+        let waiting: Vec<JobId> = self
+            .inner
+            .live
+            .lock()
+            .await
+            .values()
+            .filter(|torrent| torrent.job.is_none() && torrent.layout.is_some())
+            .map(|torrent| torrent.record.job_id)
+            .collect();
+        for job_id in waiting {
+            self.restore_job(job_id).await;
+        }
+    }
+
+    // The job of a torrent that waits for one, restored on a blocking thread
+    // under no lock but the one that keeps restores one at a time, and given
+    // to the torrent if it still waits: one removed meanwhile drops it. A
+    // restore that panics is a checkpoint that does not restore.
+    async fn restore_job(&self, job_id: JobId) {
+        let guard = Arc::clone(&self.inner.restoring).lock_owned().await;
+        let waiting = {
+            let live = self.inner.live.lock().await;
+            live.get(&job_id)
+                .filter(|torrent| torrent.job.is_none())
+                .and_then(|torrent| {
+                    Some((
+                        storage_dir(torrent),
+                        Arc::clone(torrent.layout.as_ref()?),
+                        unpacks(torrent),
+                    ))
+                })
+        };
+        let Some((dir, layout, unpack)) = waiting else {
+            return;
+        };
+        let restoring = {
+            let (service, dir, layout) = (self.clone(), dir.clone(), Arc::clone(&layout));
+            tokio::task::spawn_blocking(move || {
+                let checkpoint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.restored(job_id, dir, &layout, unpack)
+                }))
+                .unwrap_or_else(|_| FromCheckpoint::Failed("the restore panicked".to_string()));
+                (guard, checkpoint)
+            })
+        };
+        // The blocking task ends only with its result, or with the runtime.
+        let Ok((_restoring, checkpoint)) = restoring.await else {
+            return;
+        };
+        let job = self.graph_job(job_id, dir, &layout, unpack, checkpoint);
+        if let Some(torrent) = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get_mut(&job_id)
+            .filter(|torrent| torrent.job.is_none())
+        {
+            self.give_job(torrent, job);
+        }
     }
 
     // Add a torrent. A metainfo becomes a job at once; a magnet needs its
@@ -2681,6 +2843,9 @@ impl TorrentService {
         delete_files: bool,
         confirm_unmet_goal: bool,
     ) -> Result<(), ActionError> {
+        // Its outcome is its job's: a job still waiting for the tick is
+        // restored first.
+        self.restore_job(job_id).await;
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
         let mut live = self.inner.live.lock().await;
@@ -3235,8 +3400,9 @@ impl TorrentService {
         }
     }
 
-    // Bring back every stored torrent. Nothing here waits on a route: a
-    // torrent goes into its route's session at the tick, as one whose route
+    // Bring back every stored torrent, its record only. Nothing here waits
+    // on a route or reads a torrent's files: a torrent's job is restored
+    // and it goes into its route's session at the tick, as one whose route
     // changed does, and a magnet waits for its session on the task that
     // fetches its metainfo.
     async fn restore(&self) -> Result<(), String> {
@@ -3268,7 +3434,8 @@ impl TorrentService {
             torrent.rule_id = self.rule_id(&trackers);
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
-                    self.give_metainfo(&mut torrent, &parsed);
+                    self.describe(&mut torrent, &parsed);
+                    torrent.kept(self.stored_failure(job_id));
                     self.inner.live.lock().await.insert(job_id, torrent);
                 }
                 Some(Err(error)) => {
@@ -3332,6 +3499,7 @@ impl TorrentService {
     pub async fn tick(&self) {
         let now = self.inner.clock.now_ms();
         let elapsed_s = self.elapsed_s(now);
+        self.restore_jobs().await;
         self.follow_routes().await;
         self.read(now, elapsed_s, false).await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
@@ -4052,6 +4220,26 @@ fn raised_levels(levels: &[FilePriority], raised: Vec<usize>) -> Vec<FilePriorit
         }
     }
     levels
+}
+
+// What a torrent's checkpoint gave back.
+enum FromCheckpoint {
+    // It has none.
+    Nothing,
+    Restored(Restored<PieceRoot>),
+    // It could not be read, or did not restore, and why.
+    Unread(String),
+    Failed(String),
+}
+
+// Where the torrent's job keeps its files.
+fn storage_dir(torrent: &Live) -> PathBuf {
+    PathBuf::from(torrent.record.storage_dir.clone().unwrap_or_default())
+}
+
+// Whether the torrent's job unpacks, as its metainfo fixed it.
+fn unpacks(torrent: &Live) -> bool {
+    torrent.record.unpack.unwrap_or_default()
 }
 
 // The bytes in hand of the files that go to disk: the progress over the

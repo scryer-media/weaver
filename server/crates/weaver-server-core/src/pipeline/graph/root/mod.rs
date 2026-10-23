@@ -31,7 +31,7 @@ pub(super) mod tests;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use weaver_graph::{
-    ByteRange, NodeId, Part, Pull, Purpose, Seek, Segment, Tree, VolumeIndex, Weight,
+    ByteRange, MemberId, NodeId, Part, Pull, Purpose, Seek, Segment, Tree, VolumeIndex, Weight,
 };
 
 use self::facts::{Parts, PostFacts, RootFactsError};
@@ -118,6 +118,11 @@ pub(crate) trait Root: Segments {
     fn settled(&self) -> Vec<(VolumeIndex, u32)>;
     // Whether bytes read back still match what the root was handed.
     fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool;
+    // Whether a restore reads the member's units back and delivers them
+    // down the tree again. A unit not read back is trusted as the
+    // checkpoint left it and only found in its file; the member's front
+    // still goes back into the namespace.
+    fn reads_back(&self, tree: &Tree, member: MemberId) -> bool;
 }
 
 #[derive(Debug)]
@@ -286,6 +291,13 @@ impl Root for ArticleRoot {
 
     fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool {
         ArticleRoot::matches(self, volume, range, bytes)
+    }
+
+    // Every article, whatever reads it: its delivery gives the recovery
+    // objects its blocks' checksums again, and the decoder's checksums find
+    // what went bad on disk.
+    fn reads_back(&self, _tree: &Tree, _member: MemberId) -> bool {
+        true
     }
 }
 
