@@ -97,13 +97,23 @@ impl QuotaWindow {
 // It records every BODY byte once, tagged with whether quota metering was on
 // when it arrived, and flushes in batches. Download quotas themselves live on
 // each egress and server; nothing here refuses work.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BandwidthLedgerRuntime {
     sampled: [u64; 2],
     last_pruned_bucket_epoch_minute: Option<i64>,
     pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
     pending_usage_bytes: u64,
     pending_usage_started_at: Option<Instant>,
+    // Batches handed to the writer whose write has not answered yet. A batch
+    // stays here until its write commits; a failed or dropped write puts its
+    // bytes back in the pending ledger.
+    unacknowledged_usage: Vec<UnacknowledgedUsage>,
+}
+
+#[derive(Debug)]
+struct UnacknowledgedUsage {
+    entries: Vec<(i64, bool, u64)>,
+    committed: tokio::sync::oneshot::Receiver<bool>,
 }
 
 impl BandwidthLedgerRuntime {
@@ -156,10 +166,13 @@ impl BandwidthLedgerRuntime {
     // independent counter ticker, so the write itself never runs here; a
     // batch lost to a crash only shortens the usage graph, and the queue's
     // order keeps the shutdown flush behind every batch handed over before it.
+    // A handed-over batch leaves the ledger only once its write commits: a
+    // write that fails returns its bytes to the next flush.
     pub(crate) fn flush_pending_usage(
         &mut self,
         db: &crate::Database,
     ) -> Result<(), crate::StateError> {
+        self.settle_unacknowledged_usage();
         if self.pending_usage_by_minute.is_empty() {
             return Ok(());
         }
@@ -168,16 +181,40 @@ impl BandwidthLedgerRuntime {
             .iter()
             .map(|((bucket, metered), bytes)| (*bucket, *metered, *bytes))
             .collect::<Vec<_>>();
+        let (committed_tx, committed) = tokio::sync::oneshot::channel();
+        let written = entries.clone();
         db.try_queue_write("bandwidth_usage_flush", move |db| {
             let started = std::time::Instant::now();
-            let result = db.add_metered_bandwidth_usage_minutes(&entries);
+            let result = db.add_metered_bandwidth_usage_minutes(&written);
             crate::runtime::perf_probe::record("bandwidth.flush_pending_usage", started.elapsed());
+            let _ = committed_tx.send(result.is_ok());
             result
         })?;
+        self.unacknowledged_usage
+            .push(UnacknowledgedUsage { entries, committed });
         self.pending_usage_by_minute.clear();
         self.pending_usage_bytes = 0;
         self.pending_usage_started_at = None;
         Ok(())
+    }
+
+    // Drops every batch whose write committed and merges back the bytes of
+    // every batch whose write failed or was dropped unrun. A batch whose write
+    // has not run yet stays.
+    fn settle_unacknowledged_usage(&mut self) {
+        let mut returned = Vec::new();
+        self.unacknowledged_usage
+            .retain_mut(|batch| match batch.committed.try_recv() {
+                Ok(true) => false,
+                Ok(false) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    returned.append(&mut batch.entries);
+                    false
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            });
+        for (bucket_epoch_minute, metered, bytes) in returned {
+            self.record_pending_usage(bucket_epoch_minute, bytes, metered);
+        }
     }
 
     fn record_pending_usage(

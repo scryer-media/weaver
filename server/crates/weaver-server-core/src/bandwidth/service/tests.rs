@@ -96,6 +96,76 @@ async fn bandwidth_ledger_flushes_lazily() {
     );
 }
 
+fn rename_usage_table(db: &crate::Database, from: &'static str, to: &'static str) {
+    let datastore = db.datastore();
+    db.run_sql_blocking(async move {
+        crate::persistence::sql_runtime::SqlRuntime::execute(
+            datastore.read_exec(),
+            &format!("ALTER TABLE {from} RENAME TO {to}"),
+            &[],
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_usage_batch_whose_write_fails_is_written_once_by_the_next_flush() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut runtime = BandwidthLedgerRuntime::default();
+    let now_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
+    let counters = BandwidthCounters::default();
+    counters.record(512);
+    runtime.sample(&db, &counters, false).unwrap();
+
+    rename_usage_table(&db, "bandwidth_usage_minute_buckets", "unavailable_usage");
+    runtime.flush_pending_usage(&db).unwrap();
+    db.flush_write_queue().await.unwrap();
+    rename_usage_table(&db, "unavailable_usage", "bandwidth_usage_minute_buckets");
+    assert_eq!(
+        db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
+            .unwrap(),
+        0
+    );
+
+    runtime.flush_pending_usage(&db).unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
+            .unwrap(),
+        512
+    );
+    // Committed now: a further flush has nothing left to write.
+    runtime.flush_pending_usage(&db).unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        db.sum_bandwidth_usage_minutes(now_minute, now_minute + 1)
+            .unwrap(),
+        512
+    );
+    assert!(runtime.pending_usage_by_minute.is_empty());
+    assert!(runtime.unacknowledged_usage.is_empty());
+}
+
+#[tokio::test]
+async fn a_usage_batch_whose_write_commits_leaves_the_ledger() {
+    let db = crate::Database::open_in_memory().unwrap();
+    let mut runtime = BandwidthLedgerRuntime::default();
+    let counters = BandwidthCounters::default();
+    counters.record(512);
+    runtime.sample(&db, &counters, false).unwrap();
+
+    runtime.flush_pending_usage(&db).unwrap();
+    assert!(runtime.pending_usage_by_minute.is_empty());
+    assert_eq!(runtime.unacknowledged_usage.len(), 1);
+    db.flush_write_queue().await.unwrap();
+    runtime.flush_pending_usage(&db).unwrap();
+    assert!(runtime.pending_usage_by_minute.is_empty());
+    assert_eq!(runtime.pending_usage_bytes, 0);
+    assert!(runtime.unacknowledged_usage.is_empty());
+}
+
 #[tokio::test]
 async fn bandwidth_ledger_flushes_once_the_byte_threshold_is_reached() {
     let db = crate::Database::open_in_memory().unwrap();

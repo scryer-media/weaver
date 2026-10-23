@@ -278,6 +278,27 @@ func restartCases() []restartCase {
 			Slugs:       []string{conventional7zRepairSlug},
 			Run:         runConventional7zDamagedBlockRepairsOnce,
 		},
+		{
+			Name:        "early_gap_restart_refetches_only_the_gap",
+			Description: "A restart after an early missing article keeps every covered ordinal past it and fetches only what the checkpoint did not cover",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     15 * time.Minute,
+			Run:         runEarlyGapRestartRefetchesOnlyTheGap,
+		},
+		{
+			Name:        "interrupt_during_verifying_refetches_nothing",
+			Description: "A Ctrl-C while a job verifies restarts verification from the files without a single fetch",
+			Slugs:       []string{"par2-small-repair"},
+			Timeout:     10 * time.Minute,
+			Run:         runInterruptDuringVerifyingRefetchesNothing,
+		},
+		{
+			Name:        "interrupt_during_par2_pass_stops_the_pass",
+			Description: "A Ctrl-C during a PAR2 pass stops the pass before the process exits, and the restart scans again and repairs",
+			Slugs:       []string{"par2-heavy-damage"},
+			Timeout:     15 * time.Minute,
+			Run:         runInterruptDuringPar2PassStopsThePass,
+		},
 	}
 }
 
@@ -1119,15 +1140,23 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 		query string
 		apply func(*restartJobMetrics, int64, int64)
 	}
+	// A file's restart checkpoint is a coverage blob (migration 65), so its
+	// bytes are summed here from the decoded runs rather than in SQL.
+	coverage, err := readFileCoverageRows(db, datastore)
+	if err != nil {
+		return snapshot, err
+	}
+	for _, row := range coverage {
+		metrics := snapshot.JobMetrics[row.JobID]
+		metrics.Segments++
+		if row.Err == nil {
+			metrics.SegmentBytes += row.Coverage.CoveredBytes()
+			metrics.FileProgressBytes += row.Coverage.CoveredBytes()
+		}
+		snapshot.JobMetrics[row.JobID] = metrics
+	}
+
 	aggregates := []aggregateSpec{
-		{
-			query: `SELECT job_id, COUNT(*), COALESCE(SUM(contiguous_bytes_written), 0) FROM active_file_progress GROUP BY job_id`,
-			apply: func(m *restartJobMetrics, count, sum int64) {
-				m.Segments = int(count)
-				m.SegmentBytes = uint64(sum)
-				m.FileProgressBytes = uint64(sum)
-			},
-		},
 		{
 			query: `SELECT job_id, COUNT(*), 0 FROM active_files GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {

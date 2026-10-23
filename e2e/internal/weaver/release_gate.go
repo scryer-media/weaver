@@ -96,6 +96,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	proxyRoutingReleaseFlow(),
 	encryptionKeyReleaseFlow(),
 	behaviorReleaseFlow("duplicate-and-queue-policy", 7*time.Minute),
+	behaviorReleaseFlow("queue-state-and-control", 14*time.Minute),
 	{
 		Name:             "ui-backup-restore-sqlite-to-sqlite",
 		Kind:             weaverReleaseFlowBrowser,
