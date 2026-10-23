@@ -301,6 +301,13 @@ struct Opening {
     upnp: bool,
 }
 
+/// The external port a session on a leg of `shape`, listening on `port`
+/// under `torrent`, asks a gateway to map: its announce port, else its listen
+/// port, when it maps at all.
+fn maps(torrent: &TorrentConfig, shape: Shape, port: u16) -> Option<u16> {
+    (shape.listen && shape.upnp && torrent.upnp).then(|| torrent.announce_port.unwrap_or(port))
+}
+
 impl Opening {
     fn of(env: &SessionEnv, torrent: &TorrentConfig, shape: Shape) -> Self {
         Self {
@@ -458,6 +465,8 @@ enum Slot {
         session: Arc<Session>,
         leg: Option<Arc<TorrentLeg>>,
         port: u16,
+        // The external port its session asks a gateway to map, when it maps.
+        maps: Option<u16>,
         kind: LegKind,
         mappings: PortMappings,
         opening: Opening,
@@ -549,6 +558,8 @@ pub struct Sessions {
     port_slots: Arc<Mutex<()>>,
     // The torrents' download rate, laid over every open session.
     rates: SessionRates,
+    // The sessions closing off the open path, each until it has stopped.
+    closing: Closing,
 }
 
 impl Sessions {
@@ -564,6 +575,7 @@ impl Sessions {
             applied: Arc::new(tokio::sync::watch::Sender::new(0)),
             port_slots: Arc::default(),
             rates: SessionRates::default(),
+            closing: Closing::default(),
         }
     }
 
@@ -598,6 +610,7 @@ impl Sessions {
             Arc::clone(&self.slots),
             Arc::clone(&self.loading),
             Arc::clone(&self.applied),
+            self.closing.clone(),
             given,
         ));
     }
@@ -691,6 +704,7 @@ impl Sessions {
         self.on.store(on, Ordering::Release);
         if !on {
             close_all(std::mem::take(&mut *slots)).await;
+            self.closing.all_stopped().await;
         }
     }
 
@@ -738,7 +752,7 @@ impl Sessions {
         let peers = self.config().max_peers_total as usize;
         let mappings = PortMappings::default();
         match self.build(plan, port_slot, peers, &mappings).await {
-            Ok((session, leg, port, opening)) => {
+            Ok((session, leg, port, maps, opening)) => {
                 self.rates.add(&session);
                 self.configured().add(&session);
                 slots.insert(
@@ -747,6 +761,7 @@ impl Sessions {
                         session: Arc::clone(&session),
                         leg,
                         port,
+                        maps,
                         kind: plan.kind.clone(),
                         mappings,
                         opening,
@@ -773,7 +788,16 @@ impl Sessions {
         slot: Result<(u16, Option<u16>), String>,
         peers: usize,
         mappings: &PortMappings,
-    ) -> Result<(Arc<Session>, Option<Arc<TorrentLeg>>, u16, Opening), String> {
+    ) -> Result<
+        (
+            Arc<Session>,
+            Option<Arc<TorrentLeg>>,
+            u16,
+            Option<u16>,
+            Opening,
+        ),
+        String,
+    > {
         let (slot, mapped) = slot?;
         let mut torrent = self.config();
         let port = slot_port(&torrent, slot).ok_or("no listen port is left for this route")?;
@@ -793,6 +817,14 @@ impl Sessions {
         } else {
             None
         };
+        // A session that closed off the open path may still hold one of the
+        // ports this one takes, or still have a gateway's mapping of the
+        // external port this one maps to remove: only then does it wait, for
+        // that session.
+        let maps = maps(&torrent, leg.shape, port);
+        self.closing
+            .released(plan, [Some(port), ssl_port, maps].into_iter().flatten())
+            .await;
         let mut options = SessionOptions {
             port_map_events: Some(mappings.follow()),
             ..session_options(&self.env, &leg, port, &dir, peers, &torrent, ip_filter)
@@ -804,7 +836,7 @@ impl Sessions {
         }
         Session::new_with_opts(dir.join("output"), options)
             .await
-            .map(|session| (session, leg.leg, port, opening))
+            .map(|session| (session, leg.leg, port, maps, opening))
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -836,9 +868,13 @@ impl Sessions {
         };
         let kind = match slot {
             Slot::Open {
-                session, leg, kind, ..
+                session,
+                leg,
+                maps,
+                kind,
+                ..
             } => {
-                close(session, leg).await;
+                self.closing.close(key, session, leg, maps);
                 kind
             }
             Slot::Held { kind, .. } => kind,
@@ -846,11 +882,15 @@ impl Sessions {
         slots.insert(key.clone(), Slot::Held { reason, kind });
     }
 
-    /// Drop `key`'s session, open or held. The route keeps its port slot.
+    /// Drop `key`'s session, open or held. The route keeps its port slot,
+    /// and may open again at once: the session stops off the open path.
     pub async fn drop_route(&self, key: &RouteKey) {
         let mut slots = self.slots.lock().await;
-        if let Some(Slot::Open { session, leg, .. }) = slots.remove(key) {
-            close(session, leg).await;
+        if let Some(Slot::Open {
+            session, leg, maps, ..
+        }) = slots.remove(key)
+        {
+            self.closing.close(key, session, leg, maps);
         }
     }
 
@@ -867,6 +907,7 @@ impl Sessions {
     pub async fn stop_all(&self) {
         let mut slots = self.slots.lock().await;
         close_all(std::mem::take(&mut *slots)).await;
+        self.closing.all_stopped().await;
     }
 }
 
@@ -995,6 +1036,7 @@ async fn refilter(
     slots: Arc<tokio::sync::Mutex<BTreeMap<RouteKey, Slot>>>,
     loading: Arc<tokio::sync::Mutex<()>>,
     applied: Arc<tokio::sync::watch::Sender<u64>>,
+    closing: Closing,
     given: u64,
 ) {
     let loaded = {
@@ -1015,10 +1057,14 @@ async fn refilter(
                 .collect();
             for key in open {
                 if let Some(Slot::Open {
-                    session, leg, kind, ..
+                    session,
+                    leg,
+                    maps,
+                    kind,
+                    ..
                 }) = slots.remove(&key)
                 {
-                    close(session, leg).await;
+                    closing.close(&key, session, leg, maps);
                     let reason = reason.clone();
                     slots.insert(key, Slot::Held { reason, kind });
                 }
@@ -1031,9 +1077,9 @@ async fn refilter(
 
 async fn close_all(slots: BTreeMap<RouteKey, Slot>) {
     let mut closing = tokio::task::JoinSet::new();
-    for slot in slots.into_values() {
+    for (key, slot) in slots {
         if let Slot::Open { session, leg, .. } = slot {
-            closing.spawn(close(session, leg));
+            closing.spawn(async move { close(&key, session, leg).await });
         }
     }
     closing.join_all().await;
@@ -1071,12 +1117,106 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
 }
 
 // Stop a session; its leg's bridge stops with the leg. The leg's stage is
-// the route's, and stays. Held under the slots' lock until the session holds
-// no sockets, so the route's next session finds its port free.
-async fn close(session: Arc<Session>, leg: Option<Arc<TorrentLeg>>) {
+// the route's, and stays. The session's own steps log as it takes them.
+async fn close(key: &RouteKey, session: Arc<Session>, leg: Option<Arc<TorrentLeg>>) {
+    tracing::info!(route = key.as_str(), "stopping a route's session");
     session.stop().await;
     drop(session);
     drop(leg);
+    tracing::info!(route = key.as_str(), "a route's session stopped");
+}
+
+/// The sessions stopping off the open path: a route opens again while its
+/// last session's trackers hear `stopped` and its port mappings are removed.
+/// Each holds its listen ports until it has stopped.
+#[derive(Clone, Default)]
+struct Closing(Arc<Mutex<Vec<Stopping>>>);
+
+struct Stopping {
+    route: RouteKey,
+    ports: Vec<u16>,
+    stopped: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Closing {
+    // Stop `session`, which maps `maps` when it maps, in the background.
+    fn close(
+        &self,
+        key: &RouteKey,
+        session: Arc<Session>,
+        leg: Option<Arc<TorrentLeg>>,
+        maps: Option<u16>,
+    ) {
+        // The ports it listens on, and the external port whose mapping it
+        // removes as it stops: a gateway knows a mapping by that port alone.
+        let ports: Vec<u16> = [session.listen_addr(), session.ssl_listen_addr()]
+            .into_iter()
+            .flatten()
+            .map(|addr| addr.port())
+            .chain(maps)
+            .collect();
+        tracing::info!(
+            route = key.as_str(),
+            ?ports,
+            "a route's session closes off the open path; the route may open again at once"
+        );
+        let (stopped, waiting) = tokio::sync::watch::channel(false);
+        self.lock().push(Stopping {
+            route: key.clone(),
+            ports,
+            stopped: waiting,
+        });
+        let closing = self.clone();
+        let key = key.clone();
+        tokio::spawn(async move {
+            close(&key, session, leg).await;
+            stopped.send_replace(true);
+            closing
+                .lock()
+                .retain(|stopping| !*stopping.stopped.borrow());
+        });
+    }
+
+    // Resolves once no session stopping holds any of `ports`.
+    async fn released(&self, plan: &RoutePlan, ports: impl Iterator<Item = u16>) {
+        let ports: Vec<u16> = ports.filter(|port| *port != 0).collect();
+        let holding: Vec<_> = self
+            .lock()
+            .iter()
+            .filter(|stopping| stopping.ports.iter().any(|port| ports.contains(port)))
+            .map(|stopping| (stopping.route.clone(), stopping.stopped.clone()))
+            .collect();
+        for (holder, mut stopped) in holding {
+            tracing::info!(
+                route = plan.key.as_str(),
+                holder = holder.as_str(),
+                ?ports,
+                "a route's session waits on a stopping session to release its port"
+            );
+            let _ = stopped.wait_for(|stopped| *stopped).await;
+            tracing::info!(
+                route = plan.key.as_str(),
+                holder = holder.as_str(),
+                "the stopping session released the port"
+            );
+        }
+    }
+
+    // Resolves once every session stopping has stopped.
+    async fn all_stopped(&self) {
+        let waiting: Vec<_> = self
+            .lock()
+            .iter()
+            .map(|stopping| stopping.stopped.clone())
+            .collect();
+        for mut stopped in waiting {
+            let _ = stopped.wait_for(|stopped| *stopped).await;
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Stopping>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 fn load_slots(db: &Database) -> Result<BTreeMap<String, u16>, StateError> {

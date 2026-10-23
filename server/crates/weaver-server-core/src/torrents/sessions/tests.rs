@@ -461,6 +461,233 @@ async fn a_route_listens_for_ssl_peers_while_turned_on() {
     sessions.stop_all().await;
 }
 
+// The next announce the tracker on `listener` hears, unanswered, and its
+// request line.
+async fn heard_announce(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
+    use tokio::io::AsyncReadExt;
+
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+        let read = stream.read(&mut buf).await.unwrap();
+        assert!(read > 0, "the announce ended before its request was read");
+        request.extend_from_slice(&buf[..read]);
+    }
+    let line = String::from_utf8_lossy(&request)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    (stream, line)
+}
+
+// The tracker answers `stream`'s announce with no peers.
+async fn answer(mut stream: tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+
+    let body = b"d8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(&[head.as_bytes(), body].concat())
+        .await
+        .unwrap();
+}
+
+// A one-piece torrent that announces to `url`.
+fn announcing(url: &str) -> Vec<u8> {
+    let mut metainfo = format!("d8:announce{}:{url}4:info", url.len()).into_bytes();
+    metainfo.extend_from_slice(b"d6:lengthi16384e4:name5:a.bin12:piece lengthi16384e6:pieces20:");
+    metainfo.extend_from_slice(&[7; 20]);
+    metainfo.extend_from_slice(b"ee");
+    metainfo
+}
+
+// Two loopback ports free as this is called.
+fn two_free_ports() -> (u16, u16) {
+    let first = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        first.local_addr().unwrap().port(),
+        second.local_addr().unwrap().port(),
+    )
+}
+
+// A base port change opens the route on its new port at once: its last
+// session stops off the open path, its tracker still to hear `stopped`, and
+// each step of that stop logs.
+#[tokio::test]
+async fn a_base_port_change_listens_on_the_new_port_while_the_old_stopped_announce_waits() {
+    let (lines, _guard) =
+        crate::pipeline::graph::lines::Lines::capture_at("weaver", tracing::Level::INFO);
+    let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.route(TorrentScope::Default, 1);
+    loopback_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let (first, second) = two_free_ports();
+    // A day: the stopped announce waits on the tracker, not on its timeout.
+    let on = |base_port| TorrentConfig {
+        base_port,
+        stop_tracker_timeout_secs: 86_400,
+        ..TorrentConfig::default()
+    };
+    sessions.set_config(on(first));
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let old = sessions.session(&plan).await.unwrap();
+    assert_eq!(old.listen_addr().map(|addr| addr.port()), Some(first));
+
+    // The torrent announces, and leaves its session: the tracker hears
+    // `stopped`, and does not answer.
+    let added = old
+        .add_torrent(
+            weaver_torrent::AddTorrent::from_bytes(announcing(&url)),
+            None,
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    let (started, line) = heard_announce(&tracker).await;
+    assert!(line.contains("event=started"), "{line}");
+    answer(started).await;
+    // Only a tracker that took `started` is sent `stopped`.
+    added
+        .tracker_status()
+        .expect("a live run with trackers")
+        .subscribe()
+        .wait_for(|announces| {
+            announces[0]
+                .last
+                .as_ref()
+                .is_some_and(|last| last.result.is_ok())
+        })
+        .await
+        .unwrap();
+    old.delete(weaver_torrent::api::TorrentIdOrHash::Id(added.id()), false)
+        .await
+        .unwrap();
+    let (stopped, line) = heard_announce(&tracker).await;
+    assert!(line.contains("event=stopped"), "{line}");
+
+    sessions.set_config(on(second));
+    sessions.settled().await;
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    let new = sessions.session(&plan).await.unwrap();
+    assert_eq!(new.listen_addr().map(|addr| addr.port()), Some(second));
+    // The old session still waits on its tracker.
+    assert!(!old.cancellation_token().is_cancelled());
+
+    answer(stopped).await;
+    sessions.stop_all().await;
+    let route = format!(" route={:?}", plan.key.as_str());
+    let heard = |message: &str| lines.of(message);
+    let closed_off =
+        heard("a route's session closes off the open path; the route may open again at once");
+    assert_eq!(closed_off.len(), 1, "{closed_off:?}");
+    assert!(closed_off[0].contains(&route), "{closed_off:?}");
+    // The old session and, at the end, the new one.
+    for message in ["stopping a route's session", "a route's session stopped"] {
+        let heard = heard(message);
+        assert_eq!(heard.len(), 2, "{message}: {heard:?}");
+    }
+    for message in [
+        "stopping the session: pausing its torrents",
+        "stopping the session: waiting on its trackers' stopped announces",
+        "stopping the session: closing its listeners, DHT and trackers, and removing its port mappings",
+        "the session stopped",
+    ] {
+        let heard = heard(message);
+        assert_eq!(heard.len(), 2, "{message}: {heard:?}");
+    }
+}
+
+// A mapping session asks the gateway for its announce port, else its
+// listen port; one that does not map asks for none.
+#[test]
+fn a_session_maps_its_announce_port_when_it_maps() {
+    let upnp = TorrentConfig {
+        upnp: true,
+        announce_port: Some(51_413),
+        ..TorrentConfig::default()
+    };
+    let system = LegKind::System.shape(None);
+    assert_eq!(maps(&upnp, system, 6881), Some(51_413));
+    let own = TorrentConfig {
+        announce_port: None,
+        ..upnp.clone()
+    };
+    assert_eq!(maps(&own, system, 6881), Some(6881));
+    let off = TorrentConfig {
+        upnp: false,
+        ..upnp.clone()
+    };
+    assert_eq!(maps(&off, system, 6881), None);
+    let address = LegKind::SourceAddress("192.0.2.4".parse().unwrap()).shape(None);
+    assert_eq!(maps(&upnp, address, 6881), None);
+}
+
+// `future` polled once: its output, if it is ready.
+fn polled<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.poll(&mut cx) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
+}
+
+// A gateway knows a mapping by its external port alone: a new session that
+// maps the port a stopping one still has mapped waits for that one to
+// remove it, and one that maps another port does not wait.
+#[tokio::test]
+async fn a_new_session_waits_on_a_stopping_one_only_for_a_port_it_shares() {
+    let (lines, _guard) =
+        crate::pipeline::graph::lines::Lines::capture_at("weaver", tracing::Level::INFO);
+    let routes = FakeRoutes::default();
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let closing = Closing::default();
+    let (stopped, waiting) = tokio::sync::watch::channel(false);
+    // Listening on 6881 and 6882, it maps 51413.
+    closing.lock().push(Stopping {
+        route: plan.key.clone(),
+        ports: vec![6881, 6882, 51_413],
+        stopped: waiting,
+    });
+
+    let elsewhere = std::pin::pin!(closing.released(&plan, [6883, 51_414].into_iter()));
+    assert_eq!(polled(elsewhere), Some(()));
+    assert!(
+        lines
+            .of("a route's session waits on a stopping session to release its port")
+            .is_empty()
+    );
+
+    let mut shared = std::pin::pin!(closing.released(&plan, [6883, 51_413].into_iter()));
+    assert_eq!(polled(shared.as_mut()), None);
+    assert_eq!(
+        lines
+            .of("a route's session waits on a stopping session to release its port")
+            .len(),
+        1
+    );
+    stopped.send_replace(true);
+    shared.await;
+    assert_eq!(lines.of("the stopping session released the port").len(), 1);
+}
+
 #[test]
 fn a_host_without_ipv6_listens_on_every_ipv4_address() {
     assert_eq!(
@@ -684,7 +911,7 @@ async fn a_blocklist_that_does_not_load_holds_the_open_sessions_closed() {
     sessions.settled().await;
     let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
     assert!(held.contains("the blocklist did not load"), "{held}");
-    assert!(session.cancellation_token().is_cancelled());
+    session.cancellation_token().cancelled().await;
 
     *routes.blocklist.lock().unwrap() = Some("test:192.0.2.1-192.0.2.1\n".to_owned());
     let reopened = sessions.session(&plan).await.unwrap();
@@ -1069,7 +1296,7 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
     let before = sessions.session(&plan).await.unwrap();
 
     sessions.hold(&plan.key, "link down".into()).await;
-    assert!(before.cancellation_token().is_cancelled());
+    before.cancellation_token().cancelled().await;
     let view = sessions.view(&plan.key).await.unwrap();
     assert_eq!(view.held.as_deref(), Some("link down"));
     assert_eq!(view.port, None);

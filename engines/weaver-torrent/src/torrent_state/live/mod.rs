@@ -242,7 +242,13 @@ pub struct TorrentStateLive {
     places: Mutex<HashMap<PeerHandle, Place>>,
 
     finished_notify: Notify,
-    new_pieces_notify: Arc<Notify>,
+    // Rings when the pieces a peer may be handed change: pieces queued
+    // again, or the wanted ones changed.
+    new_pieces_notify: Notify,
+    // The storage rings it when it has room again after refusing a piece.
+    // Only a requester that was refused room waits on it: the storage gives
+    // room back with every piece it takes.
+    room_notify: Arc<Notify>,
     layer_fetch: hash_fetch::LayerFetch,
     // Whether every wanted piece was already present when this run began.
     finished_at_start: bool,
@@ -380,7 +386,8 @@ impl TorrentStateLive {
             peer_semaphore: Arc::new(Semaphore::new(peer_limit)),
             peer_limit,
             places: Mutex::new(HashMap::new()),
-            new_pieces_notify: Arc::new(Notify::new()),
+            new_pieces_notify: Notify::new(),
+            room_notify: Arc::new(Notify::new()),
             layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
             finished_notify: Notify::new(),
             finished_at_start,
@@ -1876,6 +1883,27 @@ impl PeerFlowControl {
     }
 }
 
+/// What a pick hands a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// The piece to request blocks of.
+    Piece(ValidPieceIndex),
+    /// Nothing the peer may fetch now.
+    Nothing,
+    /// The piece the peer would fetch waits on room the storage refused.
+    NoRoom,
+}
+
+impl Pick {
+    #[cfg(test)]
+    fn piece(self) -> Option<ValidPieceIndex> {
+        match self {
+            Self::Piece(piece) => Some(piece),
+            Self::Nothing | Self::NoRoom => None,
+        }
+    }
+}
+
 // All peer state that would never be used by other actors should pe put here.
 // This state tracks a live peer.
 struct PeerHandler {
@@ -2562,15 +2590,16 @@ impl PeerHandler {
     }
 
     /// Acquire a piece for this peer: try steal (10x) → reserve → steal (3x).
-    ///
-    /// Returns the piece index to download, or None if no pieces are available.
-    fn acquire_next_piece(&self) -> crate::Result<Option<ValidPieceIndex>> {
+    fn acquire_next_piece(&self) -> crate::Result<Pick> {
         // While the peer chokes us we may fetch only the pieces it allows
         // (libtorrent `request_a_block` masks the peer's bitfield with them).
         let choked = self.choked_by_peer();
 
         // Steal info to process after releasing the peer lock
         let mut steal_info: Option<(SocketAddr, ValidPieceIndex)> = None;
+        // Whether this pick started the last queued piece, so the end game
+        // began: peers with nothing to ask may now double blocks.
+        let mut end_game_began = false;
 
         // A peer on parole downloads whole pieces alone until one passes
         // (libtorrent `peer_connection::picker_options`).
@@ -2592,7 +2621,7 @@ impl PeerHandler {
                 // give back the peer's pieces: a piece is picked before and
                 // given back there, or not picked.
                 if self.state.upload_mode() {
-                    return Ok(None);
+                    return Ok(Pick::Nothing);
                 }
                 let pieces = g.pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
                 // A piece we have is no longer the peer's to offer (libtorrent
@@ -2603,7 +2632,8 @@ impl PeerHandler {
                     .retain(|p| !pieces.chunks().is_piece_have(*p));
                 let bf = &live.bitfield;
                 let allowed_fast = &live.allowed_fast_from_peer;
-                // A piece the storage has no room for waits on new_pieces_notify,
+                let was_end_game = pieces.chunks().every_queued_piece_started();
+                // A piece the storage has no room for waits on room_notify,
                 // which the storage rings when it has room again.
                 let result = pieces.acquire_admitted_piece(
                     AcquireRequest {
@@ -2641,37 +2671,38 @@ impl PeerHandler {
                                 .is_some()
                         },
                     },
-                    |p| {
-                        self.state
-                            .files
-                            .reserve_piece(p, &self.state.new_pieces_notify)
-                    },
+                    |p| self.state.files.reserve_piece(p, &self.state.room_notify),
                 );
+                end_game_began = !was_end_game && pieces.chunks().every_queued_piece_started();
 
                 match result {
                     AcquireResult::Reserved(piece) => {
                         trace!("reserved piece {}", piece);
-                        Ok(Some(piece))
+                        Ok(Pick::Piece(piece))
                     }
                     AcquireResult::Stolen { piece, from_peer } => {
                         debug!("stole piece {} from {}", piece, from_peer);
                         // Store steal info to process after releasing peer lock to avoid deadlock
                         steal_info = Some((from_peer, piece));
-                        Ok(Some(piece))
+                        Ok(Pick::Piece(piece))
                     }
                     AcquireResult::EndGame { piece, chunk } => {
                         debug!("end game: asking for {chunk:?}, asked of another peer too");
-                        Ok(Some(piece))
+                        Ok(Pick::Piece(piece))
                     }
-                    AcquireResult::NoneAvailable => Ok(None),
+                    AcquireResult::NoneAvailable => Ok(Pick::Nothing),
+                    AcquireResult::NoRoom => Ok(Pick::NoRoom),
                 }
             })
             .transpose()
-            .map(|r| r.flatten());
+            .map(|r| r.unwrap_or(Pick::Nothing));
 
         // Process steal notification outside the peer lock to avoid deadlock
         if let Some((from_peer, piece)) = steal_info {
             self.state.peers.on_steal(from_peer, self.addr, piece);
+        }
+        if end_game_began {
+            self.state.new_pieces_notify.notify_waiters();
         }
 
         result
@@ -3195,11 +3226,12 @@ impl PeerHandler {
             // lets us fetch another piece while it chokes us.
             let slots_changed = self.request_slots_changed();
             let slot_notify = slots_changed.as_deref().map(Notify::notified);
+            let room = self.state.room_notify.notified();
             let side = self.request_side();
             let next = match self.acquire_next_piece()? {
-                Some(next) => next,
-                None => {
-                    debug!("no pieces to request");
+                Pick::Piece(next) => next,
+                pick @ (Pick::Nothing | Pick::NoRoom) => {
+                    debug!(?pick, "no pieces to request");
                     // The request slots change with every block the peer
                     // delivers and every request sent; the pick reads only
                     // the peer's side of them, so only a change of that
@@ -3219,6 +3251,16 @@ impl PeerHandler {
                             }
                         }
                     };
+                    // Room the storage gives back matters only to a peer it
+                    // was refused: it is given back with every piece the
+                    // storage takes.
+                    let room = async {
+                        if pick == Pick::NoRoom {
+                            room.await;
+                        } else {
+                            std::future::pending().await
+                        }
+                    };
                     // Nothing changes while a piece another peer holds grows
                     // old enough to take over, or blocks asked of others
                     // become ones to double: the peer picks again after
@@ -3227,6 +3269,7 @@ impl PeerHandler {
                     tokio::select! {
                         () = wants_changed => debug!("woken up, new pieces might be available"),
                         () = slot_changed => debug!("woken up, request slots changed"),
+                        () = room => debug!("woken up, the storage has room"),
                         () = tokio::time::sleep(REPICK_INTERVAL) => debug!("picking again"),
                     }
                     continue;

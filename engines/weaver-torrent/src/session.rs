@@ -2040,8 +2040,10 @@ impl Session {
         self.root_span.as_ref().and_then(|s| s.id())
     }
 
-    /// Stop the session and all managed tasks.
+    /// Stop the session and all managed tasks. Each step logs as it starts,
+    /// naming what it waits on.
     pub async fn stop(&self) {
+        let listen = self.listen_addr();
         let torrents = self
             .db
             .read()
@@ -2049,6 +2051,11 @@ impl Session {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        info!(
+            ?listen,
+            torrents = torrents.len(),
+            "stopping the session: pausing its torrents"
+        );
         for torrent in torrents {
             if let Err(e) = torrent.pause() {
                 debug!("error pausing torrent: {e:#}");
@@ -2056,15 +2063,28 @@ impl Session {
         }
         // Let the trackers hear `stopped` before the UDP tracker client goes away.
         let stopped = &self.stopped_announces;
+        info!(
+            ?listen,
+            timeout = ?stopped.timeout(),
+            "stopping the session: waiting on its trackers' stopped announces"
+        );
         if tokio::time::timeout(stopped.timeout(), stopped.wait_idle())
             .await
             .is_err()
         {
-            debug!("not every tracker heard stopped before shutdown");
+            info!(
+                ?listen,
+                "stopping the session: not every tracker heard stopped in time"
+            );
         }
+        info!(
+            ?listen,
+            "stopping the session: closing its listeners, DHT and trackers, and removing its port mappings"
+        );
         self.cancellation_token.cancel();
         self.tasks.close();
         self.tasks.wait().await;
+        info!(?listen, "the session stopped");
     }
 
     fn start_peer_turnover(self: &Arc<Self>) {

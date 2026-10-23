@@ -4,7 +4,12 @@
 //! peer, calling the handler as the connection would, and reads what the
 //! handler queues for the wire.
 
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::atomic::AtomicU32};
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize},
+};
 
 use tempfile::TempDir;
 
@@ -688,7 +693,7 @@ async fn a_snubbed_peer_keeps_the_requests_of_pieces_that_still_have_free_blocks
     let h = Harness::new("a_snub_keeps_free_pieces").await;
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     peer.on_i_am_unchoked();
-    let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+    let piece = peer.acquire_next_piece().unwrap().piece().unwrap().get();
     let ask = |blocks: std::ops::Range<u32>| {
         for block in blocks {
             h.peers
@@ -727,7 +732,7 @@ async fn a_snub_gives_back_one_piece_the_newest_that_waits_on_the_peer_alone() {
     tokio::time::pause();
     peer.on_i_am_unchoked();
     let mut take_and_ask = || {
-        let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+        let piece = peer.acquire_next_piece().unwrap().piece().unwrap().get();
         for block in 0..CHUNKS_PER_PIECE {
             h.peers
                 .with_live_mut(peer.addr, "test", |live| {
@@ -766,7 +771,7 @@ async fn a_parole_peer_is_not_snubbed_of_its_requests() {
         .with_peer_mut(peer.addr, "test", |p| p.piece_failed(false))
         .unwrap();
     peer.on_i_am_unchoked();
-    let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+    let piece = peer.acquire_next_piece().unwrap().piece().unwrap().get();
     for block in 0..CHUNKS_PER_PIECE {
         h.peers
             .with_live_mut(peer.addr, "test", |live| {
@@ -901,8 +906,8 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
     tokio::time::pause();
     let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
     owner.on_i_am_unchoked();
-    assert!(owner.acquire_next_piece().unwrap().is_some());
-    assert!(owner.acquire_next_piece().unwrap().is_some());
+    assert!(owner.acquire_next_piece().unwrap().piece().is_some());
+    assert!(owner.acquire_next_piece().unwrap().piece().is_some());
     assert_eq!(h.queued_pieces(), Vec::<u32>::new());
 
     // Two peers that take a second a piece; the owner has held both pieces
@@ -921,7 +926,7 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
 
     // In the end game it may double a block, but both pieces stay the
     // owner's.
-    snubbed.acquire_next_piece().unwrap();
+    snubbed.acquire_next_piece().unwrap().piece();
     let owned = |p| {
         h.live
             .lock_read("test")
@@ -930,7 +935,7 @@ async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
             .is_owned_by(h.piece(p), owner.addr)
     };
     assert!(owned(0) && owned(1));
-    assert!(fast.acquire_next_piece().unwrap().is_some());
+    assert!(fast.acquire_next_piece().unwrap().piece().is_some());
 }
 
 #[tokio::test]
@@ -2144,6 +2149,7 @@ impl Harness {
         while peer
             .acquire_next_piece()
             .unwrap()
+            .piece()
             .expect("the piece is not free")
             .get()
             != index
@@ -2452,10 +2458,10 @@ mod v2 {
 
         // Only the one-piece file, which its root proves, may be fetched.
         assert_eq!(
-            peer.acquire_next_piece().unwrap().map(|p| p.get()),
+            peer.acquire_next_piece().unwrap().piece().map(|p| p.get()),
             Some(PIECES)
         );
-        assert_eq!(peer.acquire_next_piece().unwrap(), None);
+        assert_eq!(peer.acquire_next_piece().unwrap().piece(), None);
 
         // The peer is asked for both runs of the layer, from the piece
         // layer, each proven to the root (libtorrent
@@ -2470,7 +2476,7 @@ mod v2 {
         // The second run proven: its pieces may be fetched, the first's not.
         peer.on_hashes(answer(&torrent, second).as_borrowed())
             .unwrap();
-        let piece = peer.acquire_next_piece().unwrap().unwrap().get();
+        let piece = peer.acquire_next_piece().unwrap().piece().unwrap().get();
         assert!((512..PIECES).contains(&piece), "{piece}");
         assert_eq!(h.expected(0), None);
 
@@ -3284,7 +3290,7 @@ async fn a_full_disk_puts_the_torrent_in_upload_mode_and_it_keeps_seeding() {
         })
         .collect();
     assert_eq!(cancelled, chunks(1, 0..CHUNKS_PER_PIECE));
-    assert_eq!(asked.acquire_next_piece().unwrap(), None);
+    assert_eq!(asked.acquire_next_piece().unwrap().piece(), None);
 
     // The piece it has is served.
     leecher
@@ -5327,7 +5333,7 @@ async fn a_have_and_a_peer_leaving_move_a_piece_in_the_pick_order() {
     for peer in [&a, &g, &k] {
         peer.on_i_am_unchoked();
     }
-    let pick = |peer: &PeerHandler| peer.acquire_next_piece().unwrap().map(|p| p.get());
+    let pick = |peer: &PeerHandler| peer.acquire_next_piece().unwrap().piece().map(|p| p.get());
 
     // Three peers have piece 4, four 5, five 6, seven 7.
     assert_eq!(pick(&a), Some(4));
@@ -5490,7 +5496,7 @@ async fn a_web_seed_that_fails_a_piece_loses_its_file_and_serves_the_rest() {
 
     // It goes on serving "b", and is asked for nothing of "a": what is
     // left to take of it is piece 2, unless taking piece 1 took it first.
-    let left: Vec<u32> = std::iter::from_fn(|| seed.acquire_next_piece().unwrap())
+    let left: Vec<u32> = std::iter::from_fn(|| seed.acquire_next_piece().unwrap().piece())
         .map(|p| p.get())
         .collect();
     assert!(left.iter().all(|&p| p == 2), "{left:?}");
@@ -5717,4 +5723,227 @@ async fn a_checked_torrent_keeps_its_peer_list_until_its_state_changes() {
     let paused = init.check().await.unwrap();
     assert_eq!(handle.resume_peers().unwrap(), saved);
     drop(paused);
+}
+
+/// A memory storage that gives back room each time it takes a piece, and
+/// rings whoever last waited on room when it does.
+#[derive(Clone, Default)]
+struct RoomStorageFactory {
+    inner: MemoryStorageFactory,
+    room: Arc<Mutex<Option<Arc<Notify>>>>,
+}
+
+struct RoomStorage {
+    inner: Box<dyn TorrentStorage>,
+    room: Arc<Mutex<Option<Arc<Notify>>>>,
+}
+
+impl StorageFactory for RoomStorageFactory {
+    type Storage = RoomStorage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<RoomStorage> {
+        Ok(RoomStorage {
+            inner: Box::new(self.inner.create(shared, metadata)?),
+            room: self.room.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+impl TorrentStorage for RoomStorage {
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(RoomStorage {
+            inner: self.inner.take()?,
+            room: self.room.clone(),
+        }))
+    }
+
+    fn reserve_piece(&self, _piece: ValidPieceIndex, room: &Arc<Notify>) -> bool {
+        *self.room.lock() = Some(Arc::clone(room));
+        true
+    }
+
+    fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.inner.on_piece_completed(piece)?;
+        if let Some(room) = &*self.room.lock() {
+            room.notify_waiters();
+        }
+        Ok(())
+    }
+}
+
+/// A requester polled by hand, and whether it was woken since it was last
+/// polled.
+struct Polled<'a> {
+    task: Task<'a>,
+    waker: Arc<WakeCount>,
+}
+
+/// Counts a requester's wakes, and marks it woken.
+#[derive(Default)]
+struct WakeCount {
+    woken: AtomicBool,
+    wakes: AtomicUsize,
+}
+
+impl std::task::Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        self.woken.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Polls each requester that was woken until none is: every one waits on
+/// something again.
+fn settle(requesters: &mut [Polled<'_>]) {
+    while let Some(r) = requesters
+        .iter_mut()
+        .find(|r| r.waker.woken.swap(false, Ordering::SeqCst))
+    {
+        let waker = std::task::Waker::from(r.waker.clone());
+        let poll = r
+            .task
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker));
+        assert!(poll.is_pending(), "a requester ended: {poll:?}");
+    }
+}
+
+// The requester wakes only for what it can act on: a block delivered or
+// cancelled frees one of its request slots, an unchoke opens them, a piece
+// may become one it can ask for, and the torrent finishing ends its wants.
+// A piece the storage takes, and the room it gives back, is none of these
+// for a requester that was not refused room. Eight peers download eight
+// pieces, one block at a time, each requester settling before the next
+// block; the first peer never answers, so the end game fetches its piece
+// from the others.
+#[tokio::test]
+async fn a_requester_in_the_end_game_wakes_only_for_what_it_can_act_on() {
+    const PEERS: usize = 8;
+    const PIECES_HERE: u32 = 8;
+    let add = AddTorrentOptions {
+        storage_factory: Some(RoomStorageFactory::default().clone_box()),
+        ..Default::default()
+    };
+    let h = Harness::build_added(
+        "end_game_wakes",
+        PIECES_HERE,
+        0x00,
+        isolated_session_opts(false),
+        add,
+    )
+    .await;
+    tokio::time::pause();
+
+    let (peers, mut rxs): (Vec<_>, Vec<_>) = (0..PEERS)
+        .map(|i| h.peer(&format!("127.0.0.{}:6881", i + 1)))
+        .unzip();
+    let mut requesters: Vec<Polled<'_>> = peers
+        .iter()
+        .map(|peer| {
+            peer.on_i_am_unchoked();
+            let waker = Arc::new(WakeCount::default());
+            waker.woken.store(true, Ordering::SeqCst);
+            Polled {
+                task: Box::pin(peer.request_chunks()),
+                waker,
+            }
+        })
+        .collect();
+    let wakes = |requesters: &[Polled<'_>]| {
+        requesters
+            .iter()
+            .map(|r| r.waker.wakes.load(Ordering::SeqCst))
+            .sum::<usize>()
+    };
+
+    // Every request but the first peer's is answered, in the order asked,
+    // unless cancelled first.
+    let mut pending = std::collections::VecDeque::new();
+    let mut asked = BTreeSet::new();
+    let mut doubled = BTreeSet::new();
+    let mut delivered = 0;
+    let mut cancelled = 0;
+    while !(0..PIECES_HERE).all(|p| h.have(p)) {
+        settle(&mut requesters);
+        for (i, rx) in rxs.iter_mut().enumerate() {
+            while let Ok(sent) = rx.try_recv() {
+                match sent {
+                    WriterRequest::Message(Message::Request(r)) => {
+                        if !asked.insert((r.index, r.begin)) {
+                            doubled.insert((r.index, r.begin));
+                        }
+                        if i != 0 {
+                            pending.push_back((i, (r.index, r.begin)));
+                        }
+                    }
+                    WriterRequest::Message(Message::Cancel(r)) => {
+                        cancelled += 1;
+                        pending.retain(|&(j, b)| (j, b) != (i, (r.index, r.begin)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (i, block) = pending
+            .pop_front()
+            .expect("the requesters wait while no request is outstanding");
+        h.deliver(&peers[i], block).await;
+        delivered += 1;
+    }
+    let before_finish = wakes(&requesters);
+    settle(&mut requesters);
+
+    // The first peer's piece came from another peer: its blocks were asked
+    // twice.
+    assert!(!doubled.is_empty());
+    let wakes = wakes(&requesters);
+    // Each block delivered or cancelled frees a slot of one requester, each
+    // is unchoked once, each piece may become one to ask for, and each
+    // hears once that the end game began and once that the torrent finished.
+    let actionable = delivered + cancelled + PEERS + PIECES_HERE as usize + PEERS + PEERS;
+    assert!(
+        wakes <= actionable,
+        "{wakes} wakes ({before_finish} before the finish) for {actionable} actionable events \
+         ({delivered} delivered, {cancelled} cancelled)"
+    );
 }

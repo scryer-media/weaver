@@ -1346,6 +1346,8 @@ struct Inner {
     queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    // Rung by a settings change: the tick runs then, not at its next turn.
+    settings_changed: Notify,
 }
 
 #[derive(Clone)]
@@ -1380,6 +1382,7 @@ impl TorrentService {
                 queue: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
+                settings_changed: Notify::new(),
             }),
         }
     }
@@ -1521,6 +1524,8 @@ impl TorrentService {
         // the next tick.
         self.apply_queue().await;
         self.publish().await;
+        // The routes follow the settings now too: the tick runs at once.
+        self.inner.settings_changed.notify_one();
     }
 
     async fn turn(&self, on: bool) {
@@ -1675,7 +1680,10 @@ impl TorrentService {
             let mut interval = tokio::time::interval(TICK);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    () = service.inner.settings_changed.notified() => {}
+                }
                 service.tick().await;
             }
         });

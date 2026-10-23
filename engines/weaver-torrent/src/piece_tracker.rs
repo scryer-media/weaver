@@ -116,6 +116,9 @@ pub enum AcquireResult {
     },
     /// No pieces are available for this peer.
     NoneAvailable,
+    /// The piece the peer would be handed waits on room the storage
+    /// refused: it is handed out once the storage has room again.
+    NoRoom,
 }
 
 /// How a peer is picked for, besides the pieces it has.
@@ -306,6 +309,8 @@ impl PieceTracker {
         {
             return self.reserve_piece(piece, req.peer);
         }
+        // Past here, a piece to hand out is one the storage refused.
+        let refused = needed.is_some();
 
         // 3. The end game: every wanted piece has a block asked for or
         // received, and the peer has no request outstanding (libtorrent
@@ -324,7 +329,11 @@ impl PieceTracker {
             }
         }
 
-        AcquireResult::NoneAvailable
+        if refused {
+            AcquireResult::NoRoom
+        } else {
+            AcquireResult::NoneAvailable
+        }
     }
 
     /// The end game's pick for the peer `req` asks for, after libtorrent
@@ -1082,7 +1091,7 @@ mod tests {
             asked.push(piece.get());
             false
         });
-        assert!(matches!(result, AcquireResult::NoneAvailable), "{result:?}");
+        assert!(matches!(result, AcquireResult::NoRoom), "{result:?}");
         assert_eq!(asked, vec![2]);
         assert_eq!(tracker.inflight_count(), 0);
 

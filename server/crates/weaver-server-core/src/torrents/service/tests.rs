@@ -822,7 +822,7 @@ async fn a_new_listen_port_reopens_the_torrents_route_on_it() {
     rig.service.tick().await;
     let after = session_of(&rig.service, job_id).await;
     assert!(!Arc::ptr_eq(&before, &after));
-    assert!(before.cancellation_token().is_cancelled());
+    before.cancellation_token().cancelled().await;
     assert_eq!(listening().await, Some(41_000));
     assert_eq!(
         after.listen_addr().map(|listen| listen.port()),
@@ -834,6 +834,45 @@ async fn a_new_listen_port_reopens_the_torrents_route_on_it() {
                 handle_of(&rig.service, job_id).await.id()
             ))
             .is_some()
+    );
+    rig.service.stop().await;
+}
+
+// A listen port given while the tick runs reopens the route there at once:
+// the settings change wakes the tick, and the paused clock never reaches the
+// tick's next turn.
+#[tokio::test(start_paused = true)]
+async fn a_new_listen_port_reaches_the_route_without_waiting_for_the_tick() {
+    let clock = Arc::new(RuntimeClock(tokio::time::Instant::now()));
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
+    unbound_leg(&rig.routes);
+    let mut ticks = rig.service.ticks();
+    rig.service.start().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    // The tick's first turn, at its start, is behind it.
+    ticks.wait_for(|ticks| *ticks > 0).await.unwrap();
+    let before = session_of(&rig.service, job_id).await;
+    assert_eq!(before.listen_addr().map(|listen| listen.port()), Some(6881));
+
+    let changed = tokio::time::Instant::now();
+    let base = *ticks.borrow_and_update();
+    let mut settings = rig.service.settings();
+    settings.torrent.base_port = 41_000;
+    rig.service.set_settings(settings).await;
+    ticks.wait_for(|ticks| *ticks > base).await.unwrap();
+    assert!(tokio::time::Instant::now() < changed + TICK);
+    let after = session_of(&rig.service, job_id).await;
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert_eq!(
+        after.listen_addr().map(|listen| listen.port()),
+        Some(41_000)
     );
     rig.service.stop().await;
 }

@@ -230,8 +230,15 @@ impl PersistentDht {
                         .dump_interval
                         .unwrap_or_else(|| Duration::from_secs(60));
                     async move {
+                        // Each DHT dumps through a temp file of its own, so a
+                        // rename always moves in one whole dump, even while
+                        // two DHTs share the directory.
+                        static INSTANCES: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let instance = INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let tempfile_name = {
-                            let file_name = format!("dht.json.tmp.{}", std::process::id());
+                            let file_name =
+                                format!("dht.json.tmp.{}.{instance}", std::process::id());
                             let mut tmp = config_filename.clone();
                             tmp.set_file_name(file_name);
                             tmp
