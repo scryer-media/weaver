@@ -191,6 +191,19 @@ pub enum Effect {
         from: NodeId,
         volume: VolumeIndex,
     },
+    // The object at `child` placed these bytes of its `volume`, the member
+    // of `node`'s namespace, in its envelope at `at`, and its map puts them
+    // elsewhere now. The owner reads them back from where it kept them and
+    // hands them to the object again, as it hands any bytes it held.
+    Unkept {
+        node: NodeId,
+        member: MemberId,
+        child: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        envelope: u32,
+        at: u64,
+    },
     // A member and everything under it was retracted; the owner drops the
     // files it wrote for that subtree.
     Retracted {
@@ -2327,6 +2340,12 @@ impl Tree {
                         kind,
                     });
                 }
+                Emit::Unkept {
+                    volume,
+                    range,
+                    envelope,
+                    at,
+                } => self.unkept(node, (volume, range), (envelope, at), effects),
                 Emit::Damaged { volume, range } => self.damaged(node, volume, range, effects),
                 Emit::NeedsPassword => effects.push(Effect::NeedsPassword { node }),
                 Emit::NeedsEngine(why) => self.unbind(node, why, true, builder, effects),
@@ -2612,6 +2631,34 @@ impl Tree {
             }
             None => self.damage(node, volume, range, effects),
         }
+    }
+
+    // An object's map puts bytes it kept in its envelope elsewhere now: the
+    // owner hears which member of the parent's namespace they are of.
+    fn unkept(
+        &self,
+        child: NodeId,
+        (volume, range): (VolumeIndex, ByteRange),
+        (envelope, at): (u32, u64),
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((node, member)) = self
+            .nodes
+            .get(&child)
+            .and_then(|found| found.binding.as_ref())
+            .and_then(|binding| Some((binding.parent, *binding.volumes.get(&volume)?)))
+        else {
+            return;
+        };
+        effects.push(Effect::Unkept {
+            node,
+            member,
+            child,
+            volume,
+            range,
+            envelope,
+            at,
+        });
     }
 
     // Some of the range of the member is marked damaged already.

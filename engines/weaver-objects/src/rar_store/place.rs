@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use unrar_rs::{MappedSlice, StoredLayoutBuilder};
-use weaver_graph::{ByteRange, Extent, MemberId, Placement, Placements, Posting, VolumeIndex};
+use weaver_graph::{
+    ByteRange, Emit, Extent, MemberId, Placement, Placements, Posting, VolumeIndex,
+};
 
 use super::{Entry, Lock, Out, RarStore, Volume};
 use crate::crypt::{BLOCK, Cbc};
@@ -126,6 +128,13 @@ fn place_unlinked(found: &Volume, envelope: u32, range: ByteRange, out: &mut Vec
     }
 }
 
+// The parts of `range` outside `cut`, in order.
+fn outside(range: ByteRange, cut: ByteRange) -> impl Iterator<Item = ByteRange> {
+    let before = ByteRange::new(range.start, range.end.min(cut.start).max(range.start));
+    let after = ByteRange::new(range.start.max(cut.end).min(range.end), range.end);
+    [before, after].into_iter().filter(|part| !part.is_empty())
+}
+
 // One run of a volume range as the layout maps it.
 enum Run {
     Member { id: usize, stream: ByteRange },
@@ -191,6 +200,75 @@ impl RarStore {
         if range.end > reach {
             let above = ByteRange::new(range.start.max(reach), range.end);
             held_or_kept(found, envelope, above, out);
+        }
+    }
+
+    // The bytes in hand of every volume that the map puts in the envelope:
+    // the volume, its range, and where in which envelope it lies.
+    pub(super) fn enveloped(&self) -> Vec<(VolumeIndex, ByteRange, u32, u64)> {
+        let mut out = Vec::new();
+        let mut placements = Vec::new();
+        for (volume, found) in &self.volumes {
+            for (range, _, _) in found.kept.runs() {
+                placements.clear();
+                self.place(*volume, range, &mut placements);
+                let mut cursor = range.start;
+                for placement in &placements {
+                    let piece = ByteRange::at(cursor, placement.len());
+                    cursor = piece.end;
+                    if let Placement::Envelope {
+                        envelope,
+                        range: kept,
+                    } = placement
+                    {
+                        out.push((*volume, piece, *envelope, kept.start));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // Of what `enveloped` answered before, what the map places anywhere
+    // else now, in a volume the store still holds, past `fresh`.
+    pub(super) fn unkept(
+        &self,
+        kept: &[(VolumeIndex, ByteRange, u32, u64)],
+        fresh: Option<(VolumeIndex, ByteRange)>,
+        out: &mut Vec<Emit>,
+    ) {
+        let mut placements = Vec::new();
+        for &(volume, range, envelope, at) in kept {
+            if !self.volumes.contains_key(&volume) {
+                continue;
+            }
+            placements.clear();
+            self.place(volume, range, &mut placements);
+            let mut cursor = range.start;
+            for placement in &placements {
+                let piece = ByteRange::at(cursor, placement.len());
+                cursor = piece.end;
+                let kept_at = at + (piece.start - range.start);
+                if *placement
+                    == (Placement::Envelope {
+                        envelope,
+                        range: ByteRange::at(kept_at, piece.len()),
+                    })
+                {
+                    continue;
+                }
+                let cut = fresh
+                    .filter(|(delivered, _)| *delivered == volume)
+                    .map_or(ByteRange::new(piece.end, piece.end), |(_, cut)| cut);
+                for part in outside(piece, cut) {
+                    out.push(Emit::Unkept {
+                        volume,
+                        range: part,
+                        envelope,
+                        at: kept_at + (part.start - piece.start),
+                    });
+                }
+            }
         }
     }
 

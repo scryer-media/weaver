@@ -221,19 +221,29 @@ impl RarStore {
         }
     }
 
-    // Look again at everything, after anything changed.
-    fn settle(&mut self, out: &mut Vec<Emit>) {
+    // Look again at everything, after anything changed. What the store kept
+    // in its envelope and its map places elsewhere now is no longer its own,
+    // and is said so ahead of any giving up, past `fresh`, a volume range
+    // being delivered, which is placed afresh.
+    fn settle(&mut self, fresh: Option<(VolumeIndex, ByteRange)>, out: &mut Vec<Emit>) {
+        if self.gone || !self.stale {
+            return;
+        }
+        let kept = self.enveloped();
         while !self.gone && std::mem::take(&mut self.stale) {
             self.walk_all(out);
-            if self.gone {
-                return;
+            if !self.gone {
+                self.sync(out);
             }
-            self.sync(out);
-            if self.gone {
-                return;
+            if !self.gone {
+                self.open_files(out);
             }
-            self.open_files(out);
         }
+        let mut unkept = Vec::new();
+        self.unkept(&kept, fresh, &mut unkept);
+        let last = self.gone.then(|| out.pop()).flatten();
+        out.extend(unkept);
+        out.extend(last);
     }
 
     // Walk every volume's headers as far as its bytes go.
@@ -398,7 +408,7 @@ impl Object for RarStore {
                 found.walk.touch();
                 self.stale = true;
             }
-            self.settle(out);
+            self.settle(Some((volume, range)), out);
             if self.gone {
                 // The delivery that made the store give its set up still
                 // reaches the members announced before it, so what the
@@ -447,7 +457,7 @@ impl Object for RarStore {
             found.walk.touch();
         }
         self.stale = true;
-        self.settle(out);
+        self.settle(None, out);
         if self.gone {
             return;
         }
@@ -559,7 +569,7 @@ impl Object for RarStore {
         found.length = Some(length);
         found.walk.touch();
         self.stale = true;
-        self.settle(out);
+        self.settle(None, out);
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
@@ -571,7 +581,7 @@ impl Object for RarStore {
             volume.walk.touch();
         }
         self.stale = true;
-        self.settle(out);
+        self.settle(None, out);
     }
 
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes> {

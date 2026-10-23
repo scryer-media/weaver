@@ -197,6 +197,15 @@ pub enum Emit {
         range: ByteRange,
         kind: RecoveryKind,
     },
+    // "The bytes of my volume at `range`, which I placed in my envelope at
+    // `at`, are no longer mine": a header that came since says whose they
+    // are. They come to me again, and go where my map puts them now.
+    Unkept {
+        volume: VolumeIndex,
+        range: ByteRange,
+        envelope: u32,
+        at: u64,
+    },
     // "My volume is bad at this range": a header checksum failed.
     Damaged {
         volume: VolumeIndex,

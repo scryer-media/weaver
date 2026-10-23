@@ -4,7 +4,8 @@
 // The store's owner, in miniature: it binds volumes, delivers their bytes,
 // holds what the store cannot place yet and hands it back once the store
 // places it, keeps envelope bytes as they pass the way a namespace's shelf
-// does, answers seeks, and writes members the way a namespace does.
+// does and holds them again when the store says they are no longer its own,
+// answers seeks, and writes members the way a namespace does.
 
 use std::collections::BTreeMap;
 
@@ -351,6 +352,29 @@ impl Owner {
                     self.members.remove(&member.0);
                     self.next = self.next.min(member.0);
                     self.said.push(Emit::Retract(member));
+                }
+                Emit::Unkept {
+                    volume,
+                    range,
+                    envelope,
+                    at,
+                } => {
+                    // Read back from the shelf they were kept on, and held
+                    // until the store places them again.
+                    let shelf = &self.shelves[&envelope];
+                    let kept = ByteRange::at(at, range.len());
+                    for run in shelf.coverage.overlapping(kept) {
+                        let piece = run.range.intersect(kept).expect("overlapping");
+                        let bytes = shelf.bytes[piece.start as usize..piece.end as usize].to_vec();
+                        let start = range.start + (piece.start - at);
+                        self.held.push((
+                            volume,
+                            ByteRange::at(start, piece.len()),
+                            run.provenance,
+                            bytes,
+                        ));
+                    }
+                    self.said.push(emit);
                 }
                 other => self.said.push(other),
             }
