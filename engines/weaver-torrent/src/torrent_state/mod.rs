@@ -879,7 +879,6 @@ impl ManagedTorrent {
                                 .context("bug: concurrent init semaphore was closed")?;
 
                             let check_result = init.check().await;
-                            init.finish_check();
 
                             match check_result {
                                 Ok(mut paused) => {
@@ -899,6 +898,13 @@ impl ManagedTorrent {
                                 }
                                 Err(err) => {
                                     if init.is_pause_requested() {
+                                        // The torrent stays initializing
+                                        // and checks again once started.
+                                        // A check that ends otherwise
+                                        // leaves the state with the
+                                        // torrent it read for, so no
+                                        // reader sees it end early.
+                                        init.finish_check();
                                         debug!("initial check paused");
                                         t.state_change_notify.notify_waiters();
                                         return Ok(());
@@ -1214,7 +1220,10 @@ impl ManagedTorrent {
             let g = self.locked.read();
             match &g.state {
                 ManagedTorrentState::Initializing(i) => {
-                    resp.state = S::Initializing { paused: g.paused };
+                    resp.state = S::Initializing {
+                        paused: g.paused,
+                        checking: i.is_reading_pieces(),
+                    };
                     resp.progress_bytes = i.checked_bytes.load(Ordering::Relaxed);
                 }
                 ManagedTorrentState::Paused(p) => {

@@ -8,7 +8,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -39,6 +39,13 @@ use super::{
     paused::TorrentStatePaused,
 };
 
+// Where a torrent's check stands: none is under way; one began, and reads
+// what was saved or vouched for; or one reads every piece back, its progress
+// in `checked_bytes`.
+const CHECK_IDLE: u8 = 0;
+const CHECK_STARTED: u8 = 1;
+const CHECK_READING: u8 = 2;
+
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -46,7 +53,7 @@ pub struct TorrentStateInitializing {
     pub(crate) only_files: Option<Vec<usize>>,
     pub(crate) checked_bytes: AtomicU64,
     pause_requested: AtomicBool,
-    check_running: AtomicBool,
+    check: AtomicU8,
     // Every piece is read back and nothing saved is trusted: after an
     // error, and on a forced recheck.
     full_check: bool,
@@ -153,7 +160,7 @@ impl TorrentStateInitializing {
             files,
             checked_bytes: AtomicU64::new(0),
             pause_requested: AtomicBool::new(false),
-            check_running: AtomicBool::new(false),
+            check: AtomicU8::new(CHECK_IDLE),
             full_check,
             checkpoint,
             piece_priorities,
@@ -197,13 +204,24 @@ impl TorrentStateInitializing {
     }
 
     pub(crate) fn try_start_check(&self) -> bool {
-        self.check_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        self.check
+            .compare_exchange(
+                CHECK_IDLE,
+                CHECK_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
     pub(crate) fn finish_check(&self) {
-        self.check_running.store(false, Ordering::Release);
+        self.check.store(CHECK_IDLE, Ordering::Release);
+    }
+
+    /// Whether the check reads every piece back now; one that starts from
+    /// a checkpoint or from saved pieces that hold up does not.
+    pub(crate) fn is_reading_pieces(&self) -> bool {
+        self.check.load(Ordering::Acquire) == CHECK_READING
     }
 
     async fn validate_fastresume(
@@ -406,6 +424,7 @@ impl TorrentStateInitializing {
             .block_in_place_with_permits(
                 self.metadata.lengths().total_pieces() as usize,
                 |threads| {
+                    self.check.store(CHECK_READING, Ordering::Release);
                     FileOps::new(
                         &self.metadata,
                         &self.files,
@@ -812,6 +831,167 @@ mod tests {
             assert!(handle.with_state(|s| matches!(s, ManagedTorrentState::Live(_))));
             assert_eq!(have(&handle), [0, 1, 2, 3, 4, 6, 7]);
             assert!(!handle.is_paused());
+            Ok(())
+        }
+    }
+
+    mod checking_in_the_stats {
+        use std::path::Path;
+        use std::sync::Arc;
+
+        use anyhow::Context;
+        use parking_lot::Mutex;
+        use tempfile::TempDir;
+        use tokio::sync::mpsc::UnboundedSender;
+
+        use crate::{
+            AddTorrent, AddTorrentOptions, Session, TorrentStatsState,
+            core::lengths::ValidPieceIndex,
+            storage::{BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage},
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+            torrent_state::{ManagedTorrentShared, TorrentMetadata},
+        };
+
+        /// A memory storage whose first read says so on `reading` and
+        /// waits for a word on `gate`.
+        #[derive(Clone)]
+        struct GatedStorageFactory {
+            inner: MemoryStorageFactory,
+            reading: UnboundedSender<()>,
+            gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        }
+
+        struct GatedStorage {
+            inner: Box<dyn TorrentStorage>,
+            reading: UnboundedSender<()>,
+            gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        }
+
+        impl StorageFactory for GatedStorageFactory {
+            type Storage = GatedStorage;
+
+            fn create(
+                &self,
+                shared: &ManagedTorrentShared,
+                metadata: &TorrentMetadata,
+            ) -> anyhow::Result<GatedStorage> {
+                Ok(GatedStorage {
+                    inner: Box::new(self.inner.create(shared, metadata)?),
+                    reading: self.reading.clone(),
+                    gate: self.gate.clone(),
+                })
+            }
+
+            fn clone_box(&self) -> BoxStorageFactory {
+                self.clone().boxed()
+            }
+        }
+
+        impl TorrentStorage for GatedStorage {
+            fn init(
+                &mut self,
+                shared: &ManagedTorrentShared,
+                metadata: &TorrentMetadata,
+            ) -> anyhow::Result<()> {
+                self.inner.init(shared, metadata)
+            }
+
+            fn pread_exact(
+                &self,
+                file_id: usize,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<()> {
+                let gate = self.gate.lock().take();
+                if let Some(gate) = gate {
+                    let _ = self.reading.send(());
+                    gate.recv()?;
+                }
+                self.inner.pread_exact(file_id, offset, buf)
+            }
+
+            fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+                self.inner.pwrite_all(file_id, offset, buf)
+            }
+
+            fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+                self.inner.remove_file(file_id, filename)
+            }
+
+            fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
+                self.inner.remove_directory_if_empty(path)
+            }
+
+            fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+                self.inner.ensure_file_length(file_id, length)
+            }
+
+            fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+                Ok(Box::new(GatedStorage {
+                    inner: self.inner.take()?,
+                    reading: self.reading.clone(),
+                    gate: self.gate.clone(),
+                }))
+            }
+
+            fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+                self.inner.on_piece_completed(piece)
+            }
+        }
+
+        // A torrent initializing reads as checking only while its check
+        // reads pieces back: not while it waits its turn to check, and
+        // until its check is done once it reads.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_torrent_reads_as_checking_only_while_it_reads_pieces_back() -> anyhow::Result<()>
+        {
+            let name = "reads_as_checking";
+            let t = TestTorrent::new(name, 8 * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let session =
+                Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+            let checks = session.concurrent_initialize_semaphore.clone();
+            let held = checks
+                .clone()
+                .acquire_many_owned(checks.available_permits() as u32)
+                .await?;
+            let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
+            let (go, gate) = std::sync::mpsc::channel();
+            let storage = GatedStorageFactory {
+                inner: MemoryStorageFactory::default(),
+                reading: reading_tx,
+                gate: Arc::new(Mutex::new(Some(gate))),
+            };
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(storage.clone_box()),
+                        paused: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            assert!(matches!(
+                handle.stats().state,
+                TorrentStatsState::Initializing {
+                    checking: false,
+                    ..
+                }
+            ));
+
+            drop(held);
+            reading.recv().await.context("the check read nothing")?;
+            assert!(matches!(
+                handle.stats().state,
+                TorrentStatsState::Initializing { checking: true, .. }
+            ));
+            go.send(())?;
+            handle.wait_until_initialized().await?;
+            assert!(matches!(handle.stats().state, TorrentStatsState::Paused));
+            session.stop().await;
             Ok(())
         }
     }

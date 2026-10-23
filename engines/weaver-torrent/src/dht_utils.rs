@@ -149,7 +149,7 @@ where
                 Err(e) => {
                     debug!("{e:#}");
                     peers.with_peer_mut(addr, "metadata_failed", |peer| {
-                        peers.connection_closed(peer, Instant::now(), true, true)
+                        peers.connection_closed(peer, Instant::now(), true, false)
                     });
                 }
             },

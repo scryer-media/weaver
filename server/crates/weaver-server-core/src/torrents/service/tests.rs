@@ -2639,7 +2639,9 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
 
     started_and_answered(&listener, &mut updates).await;
-    let table = rig.service.inner.live.lock().await[&job_id].fetching.clone();
+    let table = rig.service.inner.live.lock().await[&job_id]
+        .fetching
+        .clone();
 
     rig.service.pause(job_id).await.unwrap();
     let (stream, event) = heard_event(&listener).await;
@@ -2648,7 +2650,11 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     // The ended fetch's table, given late, is not the paused magnet's.
     assert!(table.is_some());
     rig.service.fetching(job_id, table).await;
-    assert!(rig.service.inner.live.lock().await[&job_id].fetching.is_none());
+    assert!(
+        rig.service.inner.live.lock().await[&job_id]
+            .fetching
+            .is_none()
+    );
     // Paused, the magnet shows no fetch's table, so the rows read from here
     // on are the next fetch's.
     while updates.next().await[0].trackers[0].status != TrackerStatus::NotContacted {}

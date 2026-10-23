@@ -4853,6 +4853,68 @@ async fn a_torrent_that_stops_wanting_says_so_at_once_and_lets_a_seed_go() {
     assert_eq!(tokio::time::Instant::now(), start);
 }
 
+// A seed let go because the torrent wanted nothing of it is no failed
+// peer: once a priority change makes a piece wanted again it is dialled at
+// once, not a reconnect time after the close. A seed whose connection
+// failed while nothing was wanted still waits as its failure has it wait.
+#[tokio::test]
+async fn a_seed_let_go_while_nothing_was_wanted_is_dialled_once_a_piece_is_wanted() {
+    let h = Harness::new("redial_let_go").await;
+    h.set_piece_priorities([
+        (h.piece(0), PiecePriority::Skip),
+        (h.piece(1), PiecePriority::Skip),
+    ])
+    .unwrap();
+    tokio::time::pause();
+    let listens = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        hs.p = Some(u32::from(peer.addr.port()));
+        peer.on_extended_handshake(&hs).unwrap();
+    };
+
+    let (seed, mut seed_rx) = h.peer("127.0.0.1:6881");
+    listens(&seed);
+    let mut requester: Task<'_> = Box::pin(seed.request_chunks());
+    loop {
+        match next_queued(&mut requester, &mut seed_rx).await {
+            WriterRequest::Disconnect(Ok(())) => break,
+            WriterRequest::Message(_) => {}
+            other => panic!("unexpected writer request {other:?}"),
+        }
+    }
+    drop(requester);
+    seed.on_peer_died(Some(crate::Error::Disconnect)).unwrap();
+
+    let (broken, _broken_rx) = h.peer("127.0.0.2:6881");
+    listens(&broken);
+    broken
+        .on_peer_died(Some(crate::Error::TestDisconnect))
+        .unwrap();
+
+    // Both had every piece, so both are let go while we only upload.
+    for addr in ["127.0.0.1:6881", "127.0.0.2:6881"] {
+        assert_eq!(
+            h.peers.with_peer(sock(addr), |p| p.get_state().name()),
+            Some("not needed")
+        );
+    }
+    let now = tokio::time::Instant::now();
+    assert!(h.peers.connect_next(now).is_none());
+    h.set_piece_priorities([(h.piece(1), PiecePriority::Normal)])
+        .unwrap();
+    assert_eq!(
+        h.peers.connect_next(now).map(|(addr, ..)| addr),
+        Some(sock("127.0.0.1:6881"))
+    );
+    assert!(h.peers.connect_next(now).is_none());
+    assert_eq!(
+        h.peers
+            .with_peer(sock("127.0.0.2:6881"), |p| p.reconnect_at())
+            .unwrap(),
+        Some(now + peer::MIN_RECONNECT_TIME * 2)
+    );
+}
+
 // libtorrent `peer_connection::send_allowed_set` sends nothing to a peer
 // that only uploads (`peer_connection::upload_only`).
 #[tokio::test]

@@ -344,17 +344,18 @@ impl PeerStates {
         self
     }
 
-    /// Every connection on the list closes at `closed_at`, in no error, by
-    /// the one close rule ([`Peer::connection_closing`]): what it showed of
+    /// Every connection on the list closes at `closed_at`, in no error,
+    /// while we are `finished` or not, by the one close rule
+    /// ([`Peer::connection_closing`]): what it showed of
     /// its peer is kept and its peer's wait to reconnect starts then. A
     /// pause runs it before taking the list (libtorrent `torrent::do_pause`
     /// disconnects every peer with `torrent_paused`, an error too mild to
     /// mark the peer failed, through `peer_list::connection_closed`; a peer
     /// already idle keeps the wait it had).
-    pub fn close_all(&self, closed_at: Instant) {
+    pub fn close_all(&self, closed_at: Instant, finished: bool) {
         for mut e in self.states.iter_mut() {
             if e.value().connected_out().is_some() {
-                e.value_mut().connection_closing(closed_at, false);
+                e.value_mut().connection_closing(closed_at, false, finished);
             }
         }
     }
@@ -852,9 +853,9 @@ impl PeerStates {
         peer: &mut Peer,
         closed_at: Instant,
         failed: bool,
-        needed: bool,
+        finished: bool,
     ) {
-        peer.connection_closed(closed_at, failed, needed, self);
+        peer.connection_closed(closed_at, failed, finished, self);
         self.candidates_changed.notify_one();
     }
 
@@ -1304,14 +1305,14 @@ mod tests {
         peers
             .with_peer_mut(a, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, Instant::now(), false, true);
+                peers.connection_closed(peer, Instant::now(), false, false);
             })
             .unwrap();
         assert_eq!(availability(&peers), [0, 1, 0, 0, 0, 0, 0, 0]);
 
         peers
             .with_peer_mut(a, "test", |peer| {
-                peers.connection_closed(peer, Instant::now(), false, true)
+                peers.connection_closed(peer, Instant::now(), false, false)
             })
             .unwrap();
         assert_eq!(availability(&peers), [0, 1, 0, 0, 0, 0, 0, 0]);
@@ -1398,7 +1399,7 @@ mod tests {
         peers
             .with_peer_mut(addr, "test", |peer| {
                 peer.connect_if_due(at, peers).expect("a due candidate");
-                peers.connection_closed(peer, at, true, true);
+                peers.connection_closed(peer, at, true, false);
             })
             .unwrap();
     }
@@ -1582,7 +1583,7 @@ mod tests {
         let t3 = t2 + Duration::from_secs(600);
         peers
             .with_peer_mut(a, "test", |peer| {
-                peers.connection_closed(peer, t3, true, true)
+                peers.connection_closed(peer, t3, true, false)
             })
             .unwrap();
         assert_eq!(state_of(&peers, a), Some("queued"));
@@ -1592,6 +1593,47 @@ mod tests {
         );
     }
 
+    // A seed we let go while we only upload is no failed peer: once we want
+    // pieces again it is due at once. A seed whose connection failed then
+    // waits as its failure has it wait.
+    #[test]
+    fn a_seed_we_let_go_is_due_at_once_when_wanted_again() {
+        let peers = make_peer_states();
+        let let_go = peer_addr(1);
+        let failed = peer_addr(2);
+        let t0 = Instant::now();
+        for (addr, fails) in [(let_go, false), (failed, true)] {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+            peers
+                .with_peer_mut(addr, "test", |peer| {
+                    peer.connect_if_due(t0, &peers).unwrap();
+                    assert!(
+                        peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp)
+                            .is_some()
+                    );
+                })
+                .unwrap();
+            peers.update_bitfield(addr, full_bitfield()).unwrap();
+            peers
+                .with_peer_mut(addr, "test", |peer| {
+                    peers.connection_closed(peer, t0, fails, true);
+                })
+                .unwrap();
+            assert_eq!(state_of(&peers, addr), Some("not needed"));
+        }
+        assert_eq!(peers.next_candidate(t0), NextCandidate::None);
+
+        peers.requeue_not_needed();
+        assert_eq!(peers.connect_next(t0).map(|(addr, ..)| addr), Some(let_go));
+        assert!(peers.connect_next(t0).is_none());
+        assert_eq!(
+            peers.next_candidate(t0),
+            NextCandidate::At(t0 + reconnect_wait(1))
+        );
+    }
+
+    // A connection we close while we want the peer is no failure, and the
+    // peer waits one reconnect time from the close.
     #[test]
     fn a_connection_we_close_is_not_a_failure() {
         let peers = make_peer_states();
@@ -1604,12 +1646,6 @@ mod tests {
                 peers.connection_closed(peer, t0, false, false);
             })
             .unwrap();
-        assert_eq!(state_of(&peers, a), Some("not needed"));
-        assert_eq!(peers.next_candidate(t0), NextCandidate::None);
-
-        // Wanted again, it waits one reconnect time from the close, as a
-        // peer that never failed does.
-        peers.requeue_not_needed();
         assert_eq!(state_of(&peers, a), Some("queued"));
         assert_eq!(
             peers.next_candidate(t0),
@@ -1666,7 +1702,7 @@ mod tests {
         peers
             .with_peer_mut(unconnectable, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, t0, true, true);
+                peers.connection_closed(peer, t0, true, false);
             })
             .unwrap();
         for addr in [distrusted, trusted] {
@@ -1893,7 +1929,7 @@ mod tests {
         peers
             .with_peer_mut(closed, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, t0, false, true);
+                peers.connection_closed(peer, t0, false, false);
             })
             .unwrap();
         while closed_rx.try_recv().is_ok() {}
@@ -2014,7 +2050,7 @@ mod tests {
         let idle_wait = peers.with_peer(idle, |p| p.reconnect_at()).unwrap();
 
         let paused_at = t0 + Duration::from_secs(10);
-        peers.close_all(paused_at);
+        peers.close_all(paused_at, false);
         let next =
             PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
@@ -2025,6 +2061,46 @@ mod tests {
         assert_eq!(reconnect_at(live), Some(paused_at + MIN_RECONNECT_TIME));
         assert_eq!(reconnect_at(idle), idle_wait);
         assert_eq!(idle_wait, Some(t0 + MIN_RECONNECT_TIME * 2));
+    }
+
+    // A pause of a finished torrent lets the seeds it disconnects go
+    // without the wait to reconnect, since we want nothing of them; a
+    // leecher it disconnects waits one reconnect time from the pause. A run
+    // that resumes finished does not connect to the seeds.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_of_a_finished_torrent_starts_no_wait_for_its_seeds() {
+        let peers = make_peer_states();
+        let seed = peer_addr(1);
+        let leecher = peer_addr(2);
+        let t0 = Instant::now();
+        for addr in [seed, leecher] {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+            peers
+                .with_peer_mut(addr, "test", |peer| {
+                    peer.connect_if_due(t0, &peers).unwrap();
+                    assert!(
+                        peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp)
+                            .is_some()
+                    );
+                })
+                .unwrap();
+        }
+        peers.update_bitfield(seed, full_bitfield()).unwrap();
+        peers.update_bitfield(leecher, empty_bitfield()).unwrap();
+
+        let paused_at = t0 + Duration::from_secs(10);
+        peers.close_all(paused_at, true);
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
+        assert_eq!(reconnect_at(seed), Some(paused_at));
+        assert_eq!(reconnect_at(leecher), Some(paused_at + MIN_RECONNECT_TIME));
+
+        for mut peer in next.states.iter_mut() {
+            peer.value_mut().finished(true, &next);
+        }
+        assert_eq!(state_of(&next, seed), Some("not needed"));
+        assert_eq!(state_of(&next, leecher), Some("queued"));
     }
 
     // libtorrent `peer_list::set_seed`, as the pause closes a seed's
@@ -2038,7 +2114,7 @@ mod tests {
         peers.update_bitfield(seed, full_bitfield()).unwrap();
         assert_eq!(peers.with_peer(seed, |p| p.needed(true)), Some(true));
 
-        peers.close_all(Instant::now());
+        peers.close_all(Instant::now(), false);
         let next =
             PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         assert_eq!(next.with_peer(seed, |p| p.needed(true)), Some(false));
@@ -2079,7 +2155,7 @@ mod tests {
         peers
             .with_peer_mut(live, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, Instant::now(), false, true);
+                peers.connection_closed(peer, Instant::now(), false, false);
             })
             .unwrap();
         peers.refuse_at(live, refused);
@@ -2114,7 +2190,7 @@ mod tests {
         peers
             .with_peer_mut(live, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, t0, true, true);
+                peers.connection_closed(peer, t0, true, false);
             })
             .unwrap();
         assert_eq!(state_of(&peers, live), Some("dead"));
@@ -2210,7 +2286,7 @@ mod tests {
             .with_peer_mut(failed, "test", |peer| {
                 assert!(peer.holepunched());
                 assert_eq!(peer.transports(), Transports::Utp);
-                peers.connection_closed(peer, last, true, true);
+                peers.connection_closed(peer, last, true, false);
                 assert!(!peer.holepunched());
                 assert_eq!(peer.transports(), Transports::Any);
             })
@@ -2362,7 +2438,7 @@ mod tests {
         peers
             .with_peer_mut(from, "test", |peer| {
                 peer.take_state(&peers);
-                peers.connection_closed(peer, t0, false, true);
+                peers.connection_closed(peer, t0, false, false);
             })
             .unwrap();
         assert_eq!(peers.connect_candidates(), 1);
@@ -2463,7 +2539,7 @@ mod tests {
                     peer.connecting_to_live(Id20::default(), peers, ConnectionKind::Tcp);
                     peer.handshake_encryption(handshake(encrypted));
                 }
-                peers.connection_closed(peer, at, matches!(ends, Ends::Failed), true);
+                peers.connection_closed(peer, at, matches!(ends, Ends::Failed), false);
                 encrypted
             })
             .unwrap()
@@ -2636,7 +2712,7 @@ mod tests {
             assert_eq!(advertised.unwrap() & PEX_ENCRYPTION, flag);
 
             peers.with_peer_mut(addr, "test", |peer| {
-                peers.connection_closed(peer, Instant::now(), false, true)
+                peers.connection_closed(peer, Instant::now(), false, false)
             });
             assert!(peers.encrypt_outgoing(addr), "{addr}");
         }

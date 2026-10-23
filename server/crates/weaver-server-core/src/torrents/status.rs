@@ -29,6 +29,9 @@ pub const OFF: &str = "torrents are off";
 pub enum Engine {
     /// Not in a session.
     Absent,
+    /// In a session, starting from what was saved; no check reads pieces.
+    Starting,
+    /// Reading every piece back.
     Checking,
     Live {
         finished: bool,
@@ -47,7 +50,10 @@ pub enum Engine {
 impl Engine {
     pub fn of(stats: &TorrentStats) -> Self {
         match &stats.state {
-            TorrentStatsState::Initializing { .. } => Self::Checking,
+            TorrentStatsState::Initializing { checking: true, .. } => Self::Checking,
+            TorrentStatsState::Initializing {
+                checking: false, ..
+            } => Self::Starting,
             TorrentStatsState::Live => Self::Live {
                 finished: stats.finished,
                 peers: stats
@@ -167,7 +173,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         return (TorrentState::Queued, None);
     }
     match &seen.engine {
-        Engine::Absent => (TorrentState::Queued, None),
+        Engine::Absent | Engine::Starting => (TorrentState::Queued, None),
         Engine::Checking => (TorrentState::CheckingFiles, None),
         Engine::Live { .. } | Engine::Paused { .. } if seen.complete => {
             (TorrentState::Seeding, None)
@@ -515,6 +521,10 @@ mod tests {
                 upload_mode: false,
             })),
             (TorrentState::Stalled, None)
+        );
+        assert_eq!(
+            project(&seen(Engine::Starting)),
+            (TorrentState::Queued, None)
         );
         assert_eq!(
             project(&seen(Engine::Checking)),

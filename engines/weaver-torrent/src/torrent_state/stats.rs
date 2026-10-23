@@ -62,6 +62,11 @@ pub enum TorrentStatsState {
         // avoid confusion with the `paused` state once flattened into the JSON.
         #[serde(rename = "initializing_paused")]
         paused: bool,
+        /// Every piece is being read back to check it. Starting from a
+        /// checkpoint, or from saved pieces that hold up, reads only a
+        /// sample, not every piece.
+        #[serde(rename = "initializing_checking")]
+        checking: bool,
     },
     Live,
     Paused,
@@ -180,10 +185,14 @@ mod tests {
 
     #[test]
     fn state_flattens_to_string_with_optional_paused() {
-        let init =
-            serde_json::to_value(sample(TorrentStatsState::Initializing { paused: true })).unwrap();
+        let init = serde_json::to_value(sample(TorrentStatsState::Initializing {
+            paused: true,
+            checking: false,
+        }))
+        .unwrap();
         assert_eq!(init["state"], "initializing");
         assert_eq!(init["initializing_paused"], true);
+        assert_eq!(init["initializing_checking"], false);
 
         let live = serde_json::to_value(sample(TorrentStatsState::Live)).unwrap();
         assert_eq!(live["state"], "live");

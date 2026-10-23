@@ -412,10 +412,21 @@ impl Peer {
     }
 
     /// The peer's connection closes at `closed_at`, in an error when
-    /// `failed`; see [`Peer::closed`].
-    pub(crate) fn connection_closing(&mut self, closed_at: Instant, failed: bool) {
-        let shown = self.get_live().map(|live| live.is_upload_only());
-        self.closed(shown, closed_at, failed);
+    /// `failed`, while we are `finished` or not; see [`Peer::closed`].
+    /// Whether the connection showed the peer only uploads is kept past
+    /// it. Returns whether we still want the peer ([`Peer::needed`]).
+    pub(crate) fn connection_closing(
+        &mut self,
+        closed_at: Instant,
+        failed: bool,
+        finished: bool,
+    ) -> bool {
+        if let Some(live) = self.get_live() {
+            self.upload_only = live.is_upload_only();
+        }
+        let needed = self.needed(finished);
+        self.closed(closed_at, failed, needed);
+        needed
     }
 
     /// How long a connection to the peer may take to open: `base`, and
@@ -555,16 +566,16 @@ impl Peer {
     }
 
     /// The peer's connection closed at `closed_at`, in an error when
-    /// `failed` (see [`Peer::closed`]), and the peer settles; `needed` says
-    /// whether we still want it.
+    /// `failed`, while we are `finished` or not (see
+    /// [`Peer::connection_closing`]), and the peer settles.
     pub(crate) fn connection_closed(
         &mut self,
         closed_at: Instant,
         failed: bool,
-        needed: bool,
+        finished: bool,
         counters: &PeerStates,
     ) {
-        self.connection_closing(closed_at, failed);
+        let needed = self.connection_closing(closed_at, failed, finished);
         self.settle_closed(needed, counters);
     }
 
@@ -580,23 +591,27 @@ impl Peer {
     }
 
     /// What a connection's close at `closed_at` leaves on the peer, in an
-    /// error when `failed`. Whether the connection `shown` the peer only
-    /// uploads is kept (libtorrent `peer_list::set_seed`, `set_upload_only`,
-    /// as the connection closes). Every close starts the wait to reconnect,
-    /// and a failure lengthens it (libtorrent `peer_list::connection_closed`),
-    /// but for an encrypted handshake that did not complete: its close is
-    /// dated back by the longest wait a candidate has, so the next
-    /// connection is due at once (libtorrent `peer_connection::
-    /// fast_reconnect`). Holepunch mode ends with the connection.
-    fn closed(&mut self, shown: Option<bool>, closed_at: Instant, failed: bool) {
-        if let Some(upload_only) = shown {
-            self.upload_only = upload_only;
-        }
+    /// error when `failed`; `needed` says whether we still want the peer.
+    /// Every close starts the wait to reconnect, and a failure lengthens
+    /// it, but for two. An encrypted handshake that did not complete: its
+    /// close is dated back by the longest wait a candidate has, so the next
+    /// connection is due at once. And a peer we let go without a failure
+    /// because we want nothing of it: no wait spaces connections to a peer
+    /// we do not connect to, so its close is dated back by the one
+    /// reconnect time a close starts, and once we want it again it waits
+    /// only for the failures in a row it had. A close too near the clock's
+    /// origin to date back keeps its time. Holepunch mode ends with the
+    /// connection.
+    fn closed(&mut self, closed_at: Instant, failed: bool, needed: bool) {
         self.last_connected = if std::mem::take(&mut self.fast_reconnect) {
             self.fast_reconnects += 1;
             closed_at.checked_sub(MIN_RECONNECT_TIME * MAX_FAILCOUNT)
-        } else {
+        } else if failed || needed {
             Some(closed_at)
+        } else {
+            closed_at
+                .checked_sub(MIN_RECONNECT_TIME)
+                .or(Some(closed_at))
         };
         if failed {
             self.failcount = self.failcount.saturating_add(1);
