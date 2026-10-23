@@ -95,6 +95,37 @@ async fn cancel_batch_of_queued_jobs_archives_every_row() {
 }
 
 #[tokio::test]
+async fn an_operator_cancel_is_recorded_as_cancelled_by_the_operator() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31_051);
+    insert_queued_jobs(&mut pipeline, &[job_id]).await;
+
+    let outcome = cancel_batch(&mut pipeline, &[job_id]).await;
+
+    assert!(outcome[&job_id].is_ok());
+    let row = pipeline
+        .db
+        .get_job_history(job_id.0)
+        .unwrap()
+        .expect("archived");
+    assert_eq!(row.status, "cancelled");
+    assert_eq!(
+        row.error_message.as_deref(),
+        Some(crate::jobs::model::OPERATOR_CANCELLED_ERROR)
+    );
+    assert_eq!(
+        crate::jobs::model::job_status_from_persisted_str(
+            &row.status,
+            row.error_message.as_deref()
+        ),
+        JobStatus::Failed {
+            error: "cancelled by operator".to_string()
+        }
+    );
+}
+
+#[tokio::test]
 async fn cancel_batch_refusal_of_one_id_leaves_the_rest_cancelled() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;

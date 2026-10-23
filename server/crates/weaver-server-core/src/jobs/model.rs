@@ -517,6 +517,9 @@ pub fn derive_legacy_job_status(
     }
 }
 
+// The error a job the operator cancelled carries in history.
+pub const OPERATOR_CANCELLED_ERROR: &str = "cancelled by operator";
+
 pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobStatus {
     match status {
         "awaiting_queue_scripts" => JobStatus::AwaitingQueueScripts,
@@ -537,7 +540,7 @@ pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobSt
         },
         "paused" => JobStatus::Paused,
         "cancelled" => JobStatus::Failed {
-            error: "cancelled".to_string(),
+            error: error.unwrap_or("cancelled").to_string(),
         },
         other => JobStatus::Failed {
             error: format!("unknown status: {other}"),

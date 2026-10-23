@@ -529,7 +529,11 @@ impl Pipeline {
             job_hash: Some(state.job_hash.to_vec()),
             name: state.spec.name.clone(),
             status: "cancelled".to_string(),
-            error_message: None,
+            // History has no Cancelled state: the row reads Failed, so it
+            // names who ended it.
+            error_message: origin
+                .is_user()
+                .then(|| crate::jobs::model::OPERATOR_CANCELLED_ERROR.to_string()),
             total_bytes: total,
             downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
