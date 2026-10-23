@@ -10,7 +10,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -1179,38 +1179,53 @@ impl DhtWorker {
         v4.or(v6)
     }
 
-    async fn bootstrap_hostname_with_backoff(&self, addr: &str) -> crate::dht::Result<()> {
+    // Bootstrap from `addr` until it answers, at most a minute apart. The first
+    // failure of the whole bootstrap is logged at WARN, every later one at
+    // DEBUG: `warned` is shared by every host of it.
+    async fn bootstrap_hostname_with_backoff(
+        &self,
+        addr: &str,
+        warned: &AtomicBool,
+    ) -> crate::dht::Result<()> {
         let backoff = ExponentialBuilder::new()
             .with_max_delay(Duration::from_secs(60))
             .with_jitter()
-            .with_total_delay(Some(Duration::from_secs(86400)))
             .without_max_times();
 
         (|| self.bootstrap_hostname(addr))
             .retry(backoff)
             .notify(|error, retry_in| {
-                warn!(?retry_in, ?addr, "error in bootstrap: {error:#}");
+                if warned.swap(true, Ordering::Relaxed) {
+                    debug!(?retry_in, ?addr, "error in bootstrap: {error:#}");
+                } else {
+                    warn!(
+                        ?retry_in,
+                        ?addr,
+                        "error in bootstrap: {error:#}; the DHT runs from its saved nodes and the nodes peers name, and keeps retrying"
+                    );
+                }
             })
             .instrument(debug_span!("bootstrap", hostname = addr))
             .await
     }
 
-    async fn bootstrap(&self, bootstrap_addrs: &[String]) -> crate::dht::Result<()> {
-        let mut futs = FuturesUnordered::new();
-
-        for addr in bootstrap_addrs.iter() {
-            futs.push(self.bootstrap_hostname_with_backoff(addr));
+    // Bootstrap hosts are one way to seed the routing table; the table saved
+    // from an earlier run and the nodes peers name (`add_node`) are the
+    // others. So the DHT runs whatever the bootstrap does: each host is
+    // retried until it answers, and with none the table seeds from the rest.
+    async fn bootstrap(&self, bootstrap_addrs: &[String]) {
+        if bootstrap_addrs.is_empty() {
+            info!(
+                "no DHT bootstrap hosts: the DHT runs from its saved nodes and the nodes peers name"
+            );
+            return;
         }
-        let mut successes = 0;
-        while let Some(resp) = futs.next().await {
-            if resp.is_ok() {
-                successes += 1
-            }
-        }
-        if successes == 0 {
-            return Err(Error::BootstrapFailed);
-        }
-        Ok(())
+        let warned = AtomicBool::new(false);
+        let mut futs = bootstrap_addrs
+            .iter()
+            .map(|addr| self.bootstrap_hostname_with_backoff(addr, &warned))
+            .collect::<FuturesUnordered<_>>();
+        while futs.next().await.is_some() {}
     }
 
     async fn bucket_refresher(&self, is_v4: bool) -> crate::dht::Result<()> {
@@ -1441,9 +1456,8 @@ impl DhtWorker {
                 err = &mut framer => {
                     return Error::task_finished(&"framer", err);
                 },
-                result = &mut bootstrap, if !bootstrap_done => {
+                () = &mut bootstrap, if !bootstrap_done => {
                     bootstrap_done = true;
-                    result?;
                 },
                 err = &mut pinger_v4 => {
                     return Error::task_finished(&"pinger_v4", err);
@@ -1859,6 +1873,55 @@ mod tests {
         let request = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
         assert!(matches!(request.kind, MessageKind::FindNodeRequest(_)));
         assert!(resolver.calls.load(Ordering::SeqCst) >= 1);
+        dht.cancellation_token().cancel();
+    }
+
+    // With no bootstrap host the DHT still runs: it answers, a node a peer
+    // names enters its table, and a torrent's search, asked for while the
+    // table was empty, goes to that node.
+    #[tokio::test]
+    async fn test_a_dht_with_no_bootstrap_host_runs_from_the_nodes_peers_name() {
+        use crate::core::hash_id::Id20;
+        use futures::StreamExt;
+
+        let dht = DhtState::with_config(DhtConfig {
+            listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            bootstrap_addrs: Some(Vec::new()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let info_hash = Id20::new([0x22; 20]);
+        let mut peers = dht.get_peers(info_hash, None);
+        assert!(futures::poll!(peers.next()).is_pending());
+
+        // A node a peer named (BEP 5 PORT).
+        let node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        dht.add_node(node.local_addr().unwrap());
+        let ping = recv_message_from(&node, dht.listen_addr()).await;
+        assert!(matches!(ping.kind, MessageKind::PingRequest(_)));
+        let mut answer = Vec::new();
+        bprotocol::serialize_message(
+            &mut answer,
+            ping.transaction_id,
+            None,
+            None,
+            MessageKind::<ByteBufOwned>::Response(bprotocol::Response {
+                id: Id20::new([0x33; 20]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        node.send_to(&answer, dht.listen_addr()).await.unwrap();
+
+        let search = loop {
+            let m = recv_message_from(&node, dht.listen_addr()).await;
+            if let MessageKind::GetPeersRequest(r) = m.kind {
+                break r;
+            }
+        };
+        assert_eq!(search.info_hash, info_hash);
+        assert_eq!(dht.stats().routing_table_size, 1);
         dht.cancellation_token().cancel();
     }
 

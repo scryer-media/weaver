@@ -22,9 +22,6 @@ pub enum Error {
     #[error("error binding UDP socket: {0:#}")]
     Bind(#[source] Box<librqbit_dualstack_sockets::Error>),
 
-    #[error("bootstrapping failed")]
-    BootstrapFailed,
-
     #[error("{0} failed: {1:?}")]
     TaskFailed(&'static &'static str, #[source] Box<Error>),
 

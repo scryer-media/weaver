@@ -658,6 +658,12 @@ pub struct AddTorrentOptions {
     /// until one is set. Not read for any other torrent.
     #[serde(skip)]
     pub ssl_identity: Option<SslIdentity>,
+    /// For a magnet: receives the announce table its metadata fetch
+    /// announces from, as the fetch starts, so the trackers' answers can be
+    /// read while the metadata is fetched. Not sent when the metadata is
+    /// given or trackers are off.
+    #[serde(skip)]
+    pub metadata_trackers: Option<tokio::sync::oneshot::Sender<crate::tracker::TrackerStatus>>,
 }
 
 const fn v1_hashes_disabled_by_default() -> bool {
@@ -696,6 +702,7 @@ impl Default for AddTorrentOptions {
             super_seeding: false,
             trackers_only: false,
             ssl_identity: None,
+            metadata_trackers: None,
         }
     }
 }
@@ -2392,6 +2399,11 @@ impl Session {
                     let PeerSource { peers, trackers } = make_peer_rx(false).context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
+                    if let (Some(tx), Some(table)) =
+                        (opts.metadata_trackers.take(), trackers.as_ref())
+                    {
+                        let _ = tx.send(table.clone());
+                    }
                     let resolved_magnet = self
                         .resolve_magnet(
                             info_hashes,

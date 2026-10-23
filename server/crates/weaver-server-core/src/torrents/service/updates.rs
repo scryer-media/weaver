@@ -55,7 +55,10 @@ impl TorrentService {
         let live = self.inner.live.lock().await;
         live.iter()
             .filter(|(id, _)| job_id.is_none_or(|job_id| **id == job_id))
-            .filter_map(|(_, torrent)| torrent.attached.as_ref()?.handle.tracker_status())
+            .filter_map(|(_, torrent)| match &torrent.attached {
+                Some(attached) => attached.handle.tracker_status(),
+                None => torrent.fetching.clone(),
+            })
             .map(|table| table.subscribe())
             .collect()
     }

@@ -2374,6 +2374,67 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
     rig.service.stop().await;
 }
 
+// A magnet's trackers are announced to while its metainfo is fetched, and
+// its rows say so: updating while the announce waits, working once the
+// tracker answers, with the next announce due at the tracker's interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnets_trackers_read_as_announced_while_its_metainfo_is_fetched() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/announce");
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(format!(
+            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
+            "fe".repeat(20)
+        ))))
+        .await
+        .unwrap();
+    // A fetch's table is followed like a run's; the beat covers the view
+    // changes nothing pushes.
+    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+
+    let mut started = heard_announce(&listener).await;
+    let updating = loop {
+        let views = updates.next().await;
+        if views[0].trackers[0].updating {
+            break views[0].clone();
+        }
+    };
+    assert_eq!(updating.state, TorrentState::FetchingMetadata);
+    assert_eq!(updating.trackers[0].url, url);
+
+    let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    started
+        .write_all(&[head.as_bytes(), body].concat())
+        .await
+        .unwrap();
+    let working = loop {
+        let views = updates.next().await;
+        if views[0].trackers[0].status == TrackerStatus::Working {
+            break views[0].clone();
+        }
+    };
+    assert_eq!(working.state, TorrentState::FetchingMetadata);
+    let tracker = &working.trackers[0];
+    assert!(!tracker.updating);
+    assert_eq!((tracker.seeders, tracker.leechers), (Some(3), Some(5)));
+    let at = tracker.last_announce_ms.unwrap();
+    assert_eq!(tracker.next_announce_ms, Some(at + 1_800_000));
+    // Gone, the tracker refuses the stopped announce at once.
+    drop(listener);
+    rig.service.stop().await;
+}
+
 // A torrent under a tracker rule that names a client names itself as that
 // client to its peers and trackers; a torrent under no rule names itself as
 // Weaver.

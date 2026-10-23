@@ -797,6 +797,9 @@ struct Live {
     job: Option<Arc<TorrentJob>>,
     intake: Option<Arc<Intake>>,
     attached: Option<Attached>,
+    // The announce table of a magnet's metadata fetch, while the fetch runs:
+    // its trackers are announced to before the torrent is in a session.
+    fetching: Option<weaver_torrent::TrackerStatus>,
     route: Option<RouteKey>,
     held: Option<Held>,
     about: About,
@@ -893,6 +896,7 @@ impl Live {
             job: None,
             intake: None,
             attached: None,
+            fetching: None,
             route: None,
             held: None,
             about: About::default(),
@@ -1013,12 +1017,17 @@ impl Live {
         })
     }
 
-    // How announcing to each tracker of the session's latest run went.
+    // How announcing to each tracker went: in the session's latest run, or
+    // while a magnet's metadata is fetched, in the fetch.
     fn announces(&self) -> Vec<TrackerAnnounce> {
-        self.attached
-            .as_ref()
-            .map(|attached| attached.handle.tracker_announces())
-            .unwrap_or_default()
+        match &self.attached {
+            Some(attached) => attached.handle.tracker_announces(),
+            None => self
+                .fetching
+                .as_ref()
+                .map(|table| table.announces())
+                .unwrap_or_default(),
+        }
     }
 
     // What the session says of the torrent now, over what was kept of it:
@@ -2226,9 +2235,18 @@ impl TorrentService {
                 ..Default::default()
             };
             terms.apply(&mut options);
-            let listed = session
-                .add_torrent(AddTorrent::from_url(uri), Some(options))
-                .await;
+            // The fetch's announce table is the torrent's while the fetch
+            // runs, and no longer once it ends.
+            let (table_tx, table_rx) = oneshot::channel();
+            options.metadata_trackers = Some(table_tx);
+            let fetch = session.add_torrent(AddTorrent::from_url(uri), Some(options));
+            let fetching = async {
+                if let Ok(table) = table_rx.await {
+                    service.fetching(job_id, Some(table)).await;
+                }
+            };
+            let (listed, ()) = tokio::join!(fetch, fetching);
+            service.fetching(job_id, None).await;
             let bytes = match listed {
                 Ok(AddTorrentResponse::ListOnly(listed)) => listed.torrent_bytes,
                 Ok(_) => {
@@ -2246,6 +2264,14 @@ impl TorrentService {
                 service.fail(job_id, error.to_string()).await;
             }
         }));
+    }
+
+    // The announce table a magnet's metadata fetch announces from becomes
+    // `table`.
+    async fn fetching(&self, job_id: JobId, table: Option<weaver_torrent::TrackerStatus>) {
+        if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
+            torrent.fetching = table;
+        }
     }
 
     async fn resolved(&self, job_id: JobId, bytes: Bytes) -> Result<(), AddError> {
