@@ -222,14 +222,15 @@ impl RarStore {
     // Look again at everything, after anything changed. What the store kept
     // in its envelope and its map places elsewhere now is no longer its own,
     // and is said so ahead of any giving up, past `fresh`, a volume range
-    // being delivered, which is placed afresh.
+    // being delivered, which is placed afresh. Only a volume whose headers
+    // moved can say so, of the bytes they newly reach.
     fn settle(&mut self, fresh: Option<(VolumeIndex, ByteRange)>, out: &mut Vec<Emit>) {
         if self.gone || !self.stale {
             return;
         }
-        let kept = self.enveloped();
+        let mut reached = BTreeMap::new();
         while !self.gone && std::mem::take(&mut self.stale) {
-            self.walk_all(out);
+            self.walk_all(&mut reached, out);
             if !self.gone {
                 self.sync(out);
             }
@@ -238,20 +239,24 @@ impl RarStore {
             }
         }
         let mut unkept = Vec::new();
-        self.unkept(&kept, fresh, &mut unkept);
+        for (volume, from) in reached {
+            self.unkept(volume, from, fresh, &mut unkept);
+        }
         let last = self.gone.then(|| out.pop()).flatten();
         out.extend(unkept);
         out.extend(last);
     }
 
-    // Walk every volume's headers as far as its bytes go.
-    fn walk_all(&mut self, out: &mut Vec<Emit>) {
+    // Walk every volume's headers as far as its bytes go, noting for each
+    // volume whose headers moved how far they reached before.
+    fn walk_all(&mut self, reached: &mut BTreeMap<VolumeIndex, u64>, out: &mut Vec<Emit>) {
         let indices: Vec<VolumeIndex> = self.volumes.keys().copied().collect();
         for volume in indices {
             let password = self.header_password();
             let Some(found) = self.volumes.get_mut(&volume) else {
                 continue;
             };
+            let before = found.walk.reach().unwrap_or(0);
             let step = found.walk.step(
                 &mut found.kept,
                 found.length,
@@ -261,6 +266,9 @@ impl RarStore {
             );
             match step {
                 Step::Walked { moved, damaged } => {
+                    if moved {
+                        reached.entry(volume).or_insert(before);
+                    }
                     self.stale |= moved;
                     if let Some(range) = damaged {
                         let crc = found.kept.read(range).map_or(0, crc32);

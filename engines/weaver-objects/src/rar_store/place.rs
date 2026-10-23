@@ -203,56 +203,41 @@ impl RarStore {
         }
     }
 
-    // The bytes in hand of every volume that the map puts in the envelope:
-    // the volume, its range, and where in which envelope it lies.
-    pub(super) fn enveloped(&self) -> Vec<(VolumeIndex, ByteRange, u32, u64)> {
-        let mut out = Vec::new();
-        let mut placements = Vec::new();
-        for (volume, found) in &self.volumes {
-            for (range, _, _) in found.kept.runs() {
-                placements.clear();
-                self.place(*volume, range, &mut placements);
-                let mut cursor = range.start;
-                for placement in &placements {
-                    let piece = ByteRange::at(cursor, placement.len());
-                    cursor = piece.end;
-                    if let Placement::Envelope {
-                        envelope,
-                        range: kept,
-                    } = placement
-                    {
-                        out.push((*volume, piece, *envelope, kept.start));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    // Of what `enveloped` answered before, what the map places anywhere
-    // else now, in a volume the store still holds, past `fresh`.
+    // Of the bytes a volume the store still holds keeps from `from`, where
+    // its headers reached before they moved, to where they reach now, what
+    // the map places anywhere but the volume's own envelope, past `fresh`.
+    // Every byte past the reach is kept in the envelope as itself, and the
+    // map keeps what it placed below it, so no other kept byte leaves.
     pub(super) fn unkept(
         &self,
-        kept: &[(VolumeIndex, ByteRange, u32, u64)],
+        volume: VolumeIndex,
+        from: u64,
         fresh: Option<(VolumeIndex, ByteRange)>,
         out: &mut Vec<Emit>,
     ) {
+        let Some(found) = self.volumes.get(&volume) else {
+            return;
+        };
+        let reach = found.walk.reach().unwrap_or(0);
+        if reach <= from {
+            return;
+        }
+        let window = ByteRange::new(from, reach);
         let mut placements = Vec::new();
-        for &(volume, range, envelope, at) in kept {
-            if !self.volumes.contains_key(&volume) {
+        for (range, _, _) in found.kept.runs() {
+            let Some(range) = range.intersect(window) else {
                 continue;
-            }
+            };
             placements.clear();
             self.place(volume, range, &mut placements);
             let mut cursor = range.start;
             for placement in &placements {
                 let piece = ByteRange::at(cursor, placement.len());
                 cursor = piece.end;
-                let kept_at = at + (piece.start - range.start);
                 if *placement
                     == (Placement::Envelope {
-                        envelope,
-                        range: ByteRange::at(kept_at, piece.len()),
+                        envelope: volume.0,
+                        range: piece,
                     })
                 {
                     continue;
@@ -264,8 +249,8 @@ impl RarStore {
                     out.push(Emit::Unkept {
                         volume,
                         range: part,
-                        envelope,
-                        at: kept_at + (part.start - piece.start),
+                        envelope: volume.0,
+                        at: part.start,
                     });
                 }
             }
