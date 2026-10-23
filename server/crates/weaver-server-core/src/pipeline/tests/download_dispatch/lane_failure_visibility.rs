@@ -18,6 +18,7 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
     let works = state.download_queue.drain_all();
     assert!(!works.is_empty(), "the fixture job has queued work");
     let completion_critical = works.iter().any(|work| work.completion_critical);
+    pipeline.hold_test_lane_works(works.clone(), false);
     DownloadBatchLease {
         lane_id: 0,
         job_id,
@@ -51,8 +52,6 @@ async fn a_contended_acquire_requeues_its_work_and_asks_for_another_pass() {
 
     let lease = lease_for(&mut pipeline, job_id);
     let leased = lease.works.len();
-    pipeline.active_downloads = leased;
-    pipeline.active_downloads_by_job.insert(job_id, leased);
     pipeline.active_download_connections = 1;
     pipeline
         .active_download_connections_by_job

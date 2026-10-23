@@ -3200,10 +3200,26 @@ async fn cancel_job_clears_promoted_recovery_runtime_state() {
         .entry(1)
         .or_default()
         .promoted = true;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(recovery_file_id, 1);
+    // A lane holds the next promoted block when the cancel lands.
+    pipeline.hold_test_lane_works(
+        vec![DownloadWork {
+            counters: None,
+            segment_id: SegmentId {
+                file_id: recovery_file_id,
+                segment_number: 4,
+            },
+            message_id: MessageId::new("cancel-promoted-in-flight@example.com"),
+            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+            priority: 1000,
+            byte_estimate: 64,
+            retry_count: 0,
+            is_recovery: true,
+            completion_critical: false,
+            exclude_servers: Vec::new(),
+            avoid_server: None,
+        }],
+        false,
+    );
     pipeline.active_decodes_by_job.insert(job_id, 1);
     pipeline.active_decodes_by_file.insert(recovery_file_id, 1);
     pipeline.pending_retries_by_job.insert(job_id, 1);

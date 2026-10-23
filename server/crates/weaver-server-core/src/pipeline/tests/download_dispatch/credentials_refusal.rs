@@ -69,7 +69,7 @@ async fn lease_and_acquire(pipeline: &mut Pipeline, job_id: JobId) -> VecDeque<D
         .download_queue
         .pop()
         .unwrap();
-    let segment_id = work.segment_id;
+    pipeline.hold_test_lane_works(vec![work.clone()], false);
     let effective_exclude_servers =
         pipeline.effective_exclude_servers(job_id, &work.exclude_servers);
     let Err(error) = pipeline
@@ -91,16 +91,11 @@ async fn lease_and_acquire(pipeline: &mut Pipeline, job_id: JobId) -> VecDeque<D
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .active_download_connections_by_job
         .insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
     pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
     let mut pending = VecDeque::new();
     pipeline.handle_owned_download_lane_event(
@@ -195,9 +190,8 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
     }
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
 
     pipeline
         .handle_download_done(DownloadResult {

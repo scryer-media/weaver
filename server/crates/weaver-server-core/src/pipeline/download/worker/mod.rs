@@ -546,6 +546,12 @@ impl Pipeline {
     // One dispatch pass at `now`, the instant the pass's timers and the stall
     // watchdog measure against.
     pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
+        self.dispatch_download_pass(now);
+        #[cfg(test)]
+        self.audit_lane_holdings();
+    }
+
+    fn dispatch_download_pass(&mut self, now: Instant) {
         self.download_dispatch_wake = false;
         // Every early return below except an operator pause is a gate that
         // can lift with no event to announce it, so the pass is retried on

@@ -434,6 +434,8 @@ impl Pipeline {
             download_restart_durable_lead_retry_after: HashMap::new(),
             checkpoint_progress_articles: HashMap::new(),
             download_lane_owners: HashMap::new(),
+            #[cfg(test)]
+            audit_lane_holdings: false,
             propagation_ready_at: HashMap::new(),
             propagation_delay,
             #[cfg(test)]

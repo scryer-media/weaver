@@ -447,7 +447,6 @@ impl Pipeline {
         if !policy_outcome && !stale_generation {
             self.record_download_lane_observation(result);
         }
-        self.active_downloads = self.active_downloads.saturating_sub(1);
         if result.release_connection_slot {
             if let Some(observation) = result.lane_observation.as_ref() {
                 let reason = if observation.connection_discarded || !observation.batch_clean {
@@ -481,28 +480,7 @@ impl Pipeline {
                 }
             }
         }
-        if result.origin.is_recovery() {
-            self.active_recovery = self.active_recovery.saturating_sub(1);
-        }
-
-        let job_id = result.job_id;
-        self.note_download_activity(job_id);
-        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_job.remove(&job_id);
-            }
-        }
-        if let Some(in_flight) = self
-            .active_downloads_by_file
-            .get_mut(&result.segment_id.file_id)
-        {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_file
-                    .remove(&result.segment_id.file_id);
-            }
-        }
+        self.note_download_activity(result.job_id);
         self.publish_active_stage_metrics();
         let actual_raw_bytes = match &result.data {
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
@@ -517,7 +495,10 @@ impl Pipeline {
     }
 
     pub(crate) async fn handle_download_done(&mut self, result: DownloadResult) {
-        if self.release_download_result(&result) {
+        let released = self.release_download_result(&result);
+        #[cfg(test)]
+        self.audit_lane_holdings();
+        if released {
             self.process_download_done(result).await;
         }
     }

@@ -3080,6 +3080,11 @@ pub struct Pipeline {
     // The one over-limit article reserved until its result is processed or returned.
     pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
     pub(super) download_lane_owners: HashMap<u64, DownloadLaneOwner>,
+    // Set by the download-dispatch test fixtures: every dispatch pass and
+    // every lane result batch then checks that the in-flight gauges are what
+    // the lane records hold (see `Pipeline::audit_lane_holdings`).
+    #[cfg(test)]
+    pub(super) audit_lane_holdings: bool,
     // When each deferred job's articles become old enough to fetch.
     //
     // Absent means the question has not been asked yet or was answered

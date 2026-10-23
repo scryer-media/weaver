@@ -24,6 +24,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         .pop()
         .unwrap();
     let segment_id = work.segment_id;
+    pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
         lane_id: 0,
         job_id,
@@ -37,15 +38,10 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .active_download_connections_by_job
         .insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
     pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
 
     let resets_before = pipeline.owned_download_lane_pool.reset_calls();
@@ -108,6 +104,7 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         .pop()
         .unwrap();
     let segment_id = work.segment_id;
+    pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
         lane_id: 0,
         job_id,
@@ -121,15 +118,10 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .active_download_connections_by_job
         .insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
     pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
 
     let resets_before = pipeline.owned_download_lane_pool.reset_calls();
@@ -520,10 +512,7 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
     );
     settle_lane_dials(&mut pipeline).await;
 
-    pipeline.active_downloads = 0;
-    pipeline.active_download_connections = 0;
-    pipeline.active_downloads_by_job.clear();
-    pipeline.active_download_connections_by_job.clear();
+    pipeline.finish_test_lanes();
     pipeline.active_download_passes.clear();
     pipeline
         .jobs
@@ -1131,7 +1120,7 @@ async fn streamed_decoded_download_bypasses_decode_backlog() {
         segment_number: 0,
     };
     let raw_size = 256;
-    pipeline.active_downloads += 1;
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
