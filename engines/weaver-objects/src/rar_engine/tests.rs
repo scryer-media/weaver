@@ -426,11 +426,10 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     engine.wants(&mut seeks);
     assert!(
         seeks.is_empty(),
-        "nothing is bid before the run says where it is"
+        "nothing is bid but where the owner says the run is"
     );
 
-    engine.reached(VolumeIndex(0), 10);
-    engine.wants(&mut seeks);
+    engine.bid(VolumeIndex(0), &mut seeks);
     let bids: Vec<_> = seeks
         .iter()
         .map(|seek| (seek.volume.0, seek.weight.0, seek.purpose))
@@ -439,8 +438,7 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
 
     seeks.clear();
     engine.bound(VolumeIndex(3), "set.part4.rar", &[], None);
-    engine.reached(VolumeIndex(1), 0);
-    engine.wants(&mut seeks);
+    engine.bid(VolumeIndex(1), &mut seeks);
     let bids: Vec<_> = seeks
         .iter()
         .map(|seek| (seek.volume.0, seek.weight.0))

@@ -5,8 +5,9 @@
 // extraction of a set that sits on disk as files, whole or still growing.
 // The object itself keeps almost nothing: the set's names, and what its
 // volumes' fronts state of their places, so it can claim the set's other
-// volumes, which volumes it has, a password the job offered, and how far
-// the run has read, so it can bid for the volumes the run reaches next.
+// volumes, which volumes it has, and a password the job offered. How far
+// the run has read is the owner's, which hands it in to bid for the
+// volumes the run reaches next.
 // Every byte of its volumes is envelope, kept by the owner; the run reads
 // them back. A format supplies only how its volumes are named, what their
 // fronts say of their places, and what a run of it is.
@@ -90,10 +91,8 @@ pub trait SetName: Send + Sync + Sized + Serialize + DeserializeOwned {
     }
 }
 
-// Its facts are the volumes it has, by name and front. Never the password, which the owner
-// offers again, and never how far its run read, which is a run's live
-// progress and no durable byte: a restored engine is one whose run has not
-// started, and the run it starts tells it again where it is.
+// Its facts are the volumes it has, by name and front. Never the password,
+// which the owner offers again.
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
 pub struct EngineObject<F: Format> {
@@ -112,12 +111,6 @@ pub struct EngineObject<F: Format> {
     bound: BTreeSet<u32>,
     #[serde(skip)]
     password: Option<String>,
-    // The furthest volume the run has read.
-    #[serde(skip)]
-    reached: Option<VolumeIndex>,
-    // The live run asked for a password and no offer has answered it since.
-    #[serde(skip)]
-    asking: bool,
     // The set was refused: what it claims after goes where the set went.
     #[serde(skip)]
     gone: bool,
@@ -146,8 +139,6 @@ impl<F: Format> Default for EngineObject<F> {
             lengths: BTreeMap::new(),
             bound: BTreeSet::new(),
             password: None,
-            reached: None,
-            asking: false,
             gone: false,
         }
     }
@@ -238,7 +229,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     // and its volumes go back as they stand.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
         let why = crate::quiet::damaged(standing)
-            .or_else(|| self.asking.then_some(Why::EncryptedHeader))
+            .or_else(|| standing.asking().then_some(Why::EncryptedHeader))
             .or_else(|| {
                 crate::quiet::unordered(standing, |beside| {
                     self.placed(beside.name, beside.front, beside.length)
@@ -248,22 +239,8 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         out.extend(why.map(Emit::Refuse));
     }
 
-    // The volumes after the one the run is on, the nearest first: weighed
-    // by how many bound volumes lie between, since an index orders the
-    // volumes and need not be dense.
-    fn wants(&self, out: &mut Vec<Seek>) {
-        let Some(reached) = self.reached else {
-            return;
-        };
-        let after = (Bound::Excluded(reached.0), Bound::Unbounded);
-        for (distance, &volume) in (1..).zip(self.bound.range(after)) {
-            out.push(Seek::data(
-                VolumeIndex(volume),
-                ByteRange::new(0, u64::MAX),
-                Weight(distance),
-            ));
-        }
-    }
+    // It wants nothing of itself: what it bids for follows its run.
+    fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
@@ -282,7 +259,6 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     fn offer_password(&mut self, secret: &str, _out: &mut Vec<Emit>) {
         self.password = Some(secret.to_owned());
-        self.asking = false;
     }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
@@ -353,17 +329,20 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
 impl<F: Format + 'static> Engine for EngineObject<F> {
     fn start(&mut self) -> Box<dyn Extraction> {
-        self.asking = false;
         F::run(self.password.clone())
     }
 
-    fn reached(&mut self, volume: VolumeIndex, _offset: u64) {
-        if self.reached.is_none_or(|reached| volume > reached) {
-            self.reached = Some(volume);
+    // The volumes after the one the run is on, the nearest first: weighed
+    // by how many bound volumes lie between, since an index orders the
+    // volumes and need not be dense.
+    fn bid(&self, reached: VolumeIndex, out: &mut Vec<Seek>) {
+        let after = (Bound::Excluded(reached.0), Bound::Unbounded);
+        for (distance, &volume) in (1..).zip(self.bound.range(after)) {
+            out.push(Seek::data(
+                VolumeIndex(volume),
+                ByteRange::new(0, u64::MAX),
+                Weight(distance),
+            ));
         }
-    }
-
-    fn asked(&mut self) {
-        self.asking = true;
     }
 }

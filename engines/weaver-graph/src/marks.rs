@@ -94,13 +94,6 @@ impl<K: Ord + Copy, V> Marked<K, V> {
         Some(removed)
     }
 
-    // An entry handed out to change only what no reader of the marks
-    // reads: the owner names that part of the entry, and a change to it is
-    // no change to what a reader since an earlier generation asks again.
-    pub fn get_mut_unread(&mut self, key: &K) -> Option<&mut V> {
-        self.map.get_mut(key)
-    }
-
     // An entry changed by what is kept beside the map: an owner whose
     // entries are read together with other state marks the entry that
     // state changed for.

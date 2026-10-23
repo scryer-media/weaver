@@ -5,13 +5,15 @@
 // every way to change a node, or what it gave up, marks the node, so a
 // snapshot asks again only the nodes marked since the generation it took
 // last. Nothing outside reaches a node to change it but through here.
+// Beside them, unmarked, how each node's run goes: a run's progress is the
+// tree's, read live and kept in no record, so a snapshot never asks for it
+// and a rebuilt tree hears it again from the runs it starts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 use super::{Node, NodeId};
 use crate::deliver::Why;
-use crate::engine::Engine;
 use crate::marks::Marked;
 use crate::member::MemberId;
 use crate::volume::VolumeIndex;
@@ -19,6 +21,15 @@ use crate::volume::VolumeIndex;
 // What a member given up was to the retired object that gave it up: its
 // node, and which of its volumes; `None` once the owner buried it.
 pub(super) type GivenUp = Option<(NodeId, VolumeIndex)>;
+
+// How far a node's run has gone: the furthest volume it reached, and
+// whether it asked for a password that no offer, and no run started since,
+// has answered.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Progress {
+    pub(super) reached: Option<VolumeIndex>,
+    pub(super) asking: bool,
+}
 
 #[derive(Default)]
 pub(super) struct Nodes {
@@ -31,6 +42,8 @@ pub(super) struct Nodes {
     // The refused nodes, each under the node it is bound in. Filed where a
     // node comes, goes, or is refused, the only paths that change it.
     refused: BTreeSet<(NodeId, NodeId)>,
+    // Each node's run progress, from its first report until the node goes.
+    progress: BTreeMap<NodeId, Progress>,
 }
 
 impl Deref for Nodes {
@@ -46,18 +59,19 @@ impl Nodes {
         self.nodes.get_mut(node)
     }
 
-    // The engine face of a node's object, to tell it how its run goes: how
-    // far it read, and that it asked for a password. An object keeps no
-    // run's progress in its facts, so this marks nothing a snapshot reads.
-    pub(super) fn run_progress(&mut self, node: &NodeId) -> Option<&mut dyn Engine> {
+    pub(super) fn progress(&self, node: NodeId) -> Progress {
+        self.progress.get(&node).copied().unwrap_or_default()
+    }
+
+    // The progress of a node's run, to change: it marks nothing.
+    pub(super) fn progress_mut(&mut self, node: NodeId) -> Option<&mut Progress> {
         self.nodes
-            .get_mut_unread(node)?
-            .object
-            .as_mut()?
-            .engine_mut()
+            .contains_key(&node)
+            .then(|| self.progress.entry(node).or_default())
     }
 
     pub(super) fn insert(&mut self, node: NodeId, found: Node) {
+        self.progress.remove(&node);
         if let (Some(_), Some(binding)) = (found.refused, &found.binding) {
             self.refused.insert((binding.parent, node));
         }
@@ -84,6 +98,7 @@ impl Nodes {
     // A node goes, and what it gave up with it.
     pub(super) fn remove(&mut self, node: &NodeId) -> Option<Node> {
         let removed = self.nodes.remove(node)?;
+        self.progress.remove(node);
         self.retired.retain(|(at, _), _| at != node);
         if let Some(binding) = &removed.binding {
             self.refused.remove(&(binding.parent, *node));

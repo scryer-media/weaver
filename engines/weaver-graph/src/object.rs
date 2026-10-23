@@ -243,6 +243,10 @@ pub trait Standing {
     // `volume_lost` told just before.
     fn lost(&self) -> bool;
 
+    // My run asked for a password, and no offer, nor a run started since,
+    // has answered it.
+    fn asking(&self) -> bool;
+
     // The members beside my volumes that no object owns, as a claim reads
     // them: what I can say of them is mine to say.
     fn beside(&self) -> Vec<Beside<'_>>;

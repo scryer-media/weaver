@@ -22,20 +22,22 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
     ];
     let (facts, mut live, mut again) = restores_alike(engine, &steps, 3, &[]);
     assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
-    for object in [&mut live, &mut again] {
-        if let Some(engine) = object.engine_mut() {
-            engine.reached(VolumeIndex(1), 0);
-        }
-    }
     let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[], None);
     assert_eq!(claim(&mut live), claim(&mut again));
     assert_eq!(claim(&mut live), Some(VolumeIndex(1)));
-    let wants = |object: &mut Box<dyn Object>| {
+    let bids = |object: &mut Box<dyn Object>| {
         let mut out: Vec<Seek> = Vec::new();
         object.wants(&mut out);
+        if let Some(engine) = object.engine() {
+            engine.bid(VolumeIndex(1), &mut out);
+        }
         out
     };
-    assert_eq!(wants(&mut live), wants(&mut again));
+    assert_eq!(bids(&mut live), bids(&mut again));
+    assert!(
+        !bids(&mut live).is_empty(),
+        "the run past the first is bid past"
+    );
 }
 
 #[test]

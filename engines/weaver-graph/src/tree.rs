@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 use crate::deliver::Posted;
 use crate::deliver::{Emit, Handed, Provenance, Why};
-use crate::engine::Engine;
+use crate::engine::{Engine, Extraction};
 use crate::member::{Member, MemberId, Namespace};
 use crate::names::{Moved, NameLedger, Position};
 use crate::object::{Carried, Extent, Kind, Object, ObjectId, Placement, Posting};
@@ -689,23 +689,35 @@ impl Tree {
         self.object(node)?.engine()
     }
 
-    pub fn engine_mut(&mut self, node: NodeId) -> Option<&mut dyn Engine> {
-        self.nodes.get_mut(&node)?.object.as_mut()?.engine_mut()
+    // A run of the engine at `node`, from its object's present state. A
+    // question an earlier run asked is the new run's to ask again.
+    pub fn start(&mut self, node: NodeId) -> Option<Box<dyn Extraction>> {
+        let extraction = self
+            .nodes
+            .get_mut(&node)?
+            .object
+            .as_mut()?
+            .engine_mut()?
+            .start();
+        if let Some(progress) = self.nodes.progress_mut(node) {
+            progress.asking = false;
+        }
+        Some(extraction)
     }
 
-    // How far the engine's run read, told to its object so it bids for what
-    // comes next. A run's progress is no part of the object's facts.
-    pub fn run_reached(&mut self, node: NodeId, volume: VolumeIndex, offset: u64) {
-        if let Some(engine) = self.nodes.run_progress(&node) {
-            engine.reached(volume, offset);
+    // How far the engine's run at `node` read: the tree keeps the furthest
+    // volume, so the object bids for the volumes after it.
+    pub fn run_reached(&mut self, node: NodeId, volume: VolumeIndex) {
+        if let Some(progress) = self.nodes.progress_mut(node) {
+            progress.reached = progress.reached.max(Some(volume));
         }
     }
 
-    // The engine's run asked for a password, told to its object; as
-    // progress, no part of its facts.
+    // The engine's run at `node` asked for a password: the object rules on
+    // it when the job is quiet, unless an offer or a new run answers first.
     pub fn run_asked(&mut self, node: NodeId) {
-        if let Some(engine) = self.nodes.run_progress(&node) {
-            engine.asked();
+        if let Some(progress) = self.nodes.progress_mut(node) {
+            progress.asking = true;
         }
     }
 
@@ -777,6 +789,9 @@ impl Tree {
             .and_then(|found| found.object.as_mut())
         {
             object.offer_password(secret, &mut emits);
+            if let Some(progress) = self.nodes.progress_mut(node) {
+                progress.asking = false;
+            }
         }
         self.apply(node, &mut emits, builder, effects);
         self.emits = emits;
@@ -2824,14 +2839,20 @@ impl Tree {
         }
     }
 
-    // Every standing seek of every object, lifted. Returns each object's
-    // seeks with their answers so the caller can feed `pulled` back.
+    // Every standing seek of every object, lifted, an engine's bids for
+    // what its run reads next among them. Returns each object's seeks with
+    // their answers so the caller can feed `pulled` back.
     pub fn collect_wants(&self, out: &mut Vec<(NodeId, Seek)>) {
         let mut seeks = Vec::new();
         for (id, node) in self.nodes.iter().filter(|(_, node)| !node.retired) {
             if let Some(object) = node.object.as_ref() {
                 seeks.clear();
                 object.wants(&mut seeks);
+                if let (Some(engine), Some(reached)) =
+                    (object.engine(), self.nodes.progress(*id).reached)
+                {
+                    engine.bid(reached, &mut seeks);
+                }
                 out.extend(seeks.iter().map(|seek| (*id, *seek)));
             }
         }

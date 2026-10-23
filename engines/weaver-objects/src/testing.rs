@@ -32,6 +32,9 @@ impl Standing for Quiet<'_> {
     fn lost(&self) -> bool {
         false
     }
+    fn asking(&self) -> bool {
+        false
+    }
     fn beside(&self) -> Vec<Beside<'_>> {
         self.0
             .iter()

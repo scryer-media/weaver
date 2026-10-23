@@ -4,8 +4,8 @@
 // The job as the owner of its engines' runs. After every step it brings each
 // engine node's shelf up to what the tree knows, retracts and restarts a run
 // whose bytes a repair replaced, starts one whose object has bytes and no run,
-// and tells each object how far its run has read, so it bids for what comes
-// next. What a run says is applied here, at the node it speaks for.
+// and tells the tree how far each run has read, so its object bids for what
+// comes next. What a run says is applied here, at the node it speaks for.
 
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
@@ -30,8 +30,8 @@ impl GraphJob {
             }
             _ if !self.runs.current(node, said.generation) => return Ok(()),
             Heard::Emit(emit) => {
-                // The object is told its run is asking, as it is told how
-                // far the run read: it rules on it when the job is quiet.
+                // The tree is told the run is asking, as it is told how far
+                // the run read: the object rules on it when the job is quiet.
                 if emit == Emit::NeedsPassword {
                     self.tree.run_asked(node);
                 }
@@ -120,8 +120,8 @@ impl GraphJob {
                 if asks {
                     admitted.extend(self.runs.ask(node, limit));
                 }
-                if let Some((volume, offset)) = shelf.reached() {
-                    self.tree.run_reached(node, volume, offset);
+                if let Some((volume, _)) = shelf.reached() {
+                    self.tree.run_reached(node, volume);
                 }
             }
             // With every run started, a damaged namespace nothing will
@@ -157,7 +157,7 @@ impl GraphJob {
                 return Ok(Vec::new());
             }
         }
-        if let Some(extraction) = self.tree.engine_mut(node).map(Engine::start) {
+        if let Some(extraction) = self.tree.start(node) {
             let shelf = self.writer.shelf(node);
             self.runs.start(node, extraction, shelf);
         }

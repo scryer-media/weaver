@@ -216,6 +216,10 @@ impl Standing for Stood<'_> {
         !self.tree.lost(self.node).is_empty()
     }
 
+    fn asking(&self) -> bool {
+        self.tree.nodes.progress(self.node).asking
+    }
+
     fn beside(&self) -> Vec<Beside<'_>> {
         let tree = self.tree;
         let Some((parent, _)) = tree.volumes(self.node) else {
