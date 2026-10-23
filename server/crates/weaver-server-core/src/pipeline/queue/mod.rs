@@ -223,13 +223,18 @@ impl JobRow {
             job.download_wait_reason = Some(crate::jobs::handle::PROPAGATION_WAIT_REASON.into());
             job.download_retry_at_epoch_ms = propagation;
         }
-        if globals.paused
-            || globals.speed_test_paused
-            || self.intents.paused == Some(true)
-            || propagation.is_some()
-        {
+        let global_pause = globals.paused || globals.speed_test_paused;
+        if global_pause || self.intents.paused == Some(true) || propagation.is_some() {
             if job.download_state == crate::DownloadState::Downloading {
                 job.download_state = crate::DownloadState::Queued;
+            }
+            // The global pause holds every job whose download it stops.
+            if global_pause
+                && job.download_state == crate::DownloadState::Queued
+                && job.post_state == crate::PostState::Idle
+                && job.status != crate::JobStatus::AwaitingQueueScripts
+            {
+                job.run_state = crate::RunState::Paused;
             }
         } else if activity
             && matches!(
@@ -238,6 +243,13 @@ impl JobRow {
             )
         {
             job.download_state = crate::DownloadState::Downloading;
+        } else if !activity
+            && job.download_state == crate::DownloadState::Downloading
+            && self.report.download_work_pending
+            && !job.finalizing_download
+        {
+            // Work is owed but no lane holds the job: it waits for lanes.
+            job.download_state = crate::DownloadState::Queued;
         }
         if !self.phases.is_empty() {
             job.phase_progress = self.sampled_phases.clone();
@@ -363,5 +375,121 @@ impl Queue {
             }
             Change::changed(())
         });
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::{DownloadState, JobStatus, PostState, RunState};
+
+    fn downloading(id: u64) -> JobInfo {
+        JobInfo {
+            job_id: JobId(id),
+            job_hash: None,
+            name: format!("job-{id}"),
+            status: JobStatus::Downloading,
+            download_state: DownloadState::Downloading,
+            finalizing_download: false,
+            fetching_repair_data: false,
+            post_state: PostState::Idle,
+            run_state: RunState::Active,
+            progress: 0.0,
+            total_bytes: 100,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            phase_progress: Vec::new(),
+            failed_bytes: 0,
+            health: 1000,
+            terminal_discards: Vec::new(),
+            total_files: 1,
+            completed_files: 0,
+            remaining_par_files: 0,
+            password: None,
+            category: None,
+            metadata: Vec::new(),
+            output_dir: None,
+            error: None,
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
+            server_attribution: Vec::new(),
+            created_at_epoch_ms: 0.0,
+        }
+    }
+
+    // A row the pipeline last reported with a lane holding it.
+    fn active_row(id: u64) -> JobRow {
+        let mut row = JobRow::new(downloading(id));
+        row.report.download_active = true;
+        row.report.download_work_pending = true;
+        row
+    }
+
+    #[test]
+    fn queue_global_pause_reports_every_held_download_as_paused() {
+        let globals = Globals {
+            paused: true,
+            ..Globals::default()
+        };
+        for row in [active_row(1), JobRow::new(downloading(2))] {
+            let job = row.info(&globals);
+            assert_eq!(job.run_state, RunState::Paused);
+            assert_eq!(job.download_state, DownloadState::Queued);
+        }
+
+        let speed_test = Globals {
+            speed_test_paused: true,
+            ..Globals::default()
+        };
+        assert_eq!(active_row(3).info(&speed_test).run_state, RunState::Paused);
+
+        // Post-processing is not a download the global pause stops.
+        let mut extracting = downloading(4);
+        extracting.status = JobStatus::Extracting;
+        extracting.download_state = DownloadState::Complete;
+        extracting.post_state = PostState::Extracting;
+        assert_eq!(
+            JobRow::new(extracting).info(&globals).run_state,
+            RunState::Active
+        );
+        assert_eq!(
+            active_row(5).info(&Globals::default()).run_state,
+            RunState::Active
+        );
+    }
+
+    #[test]
+    fn queue_job_holding_no_lane_while_work_is_owed_reads_queued() {
+        let mut row = active_row(1);
+        row.report.download_active = false;
+        let job = row.info(&Globals::default());
+        assert_eq!(job.download_state, DownloadState::Queued);
+        assert_eq!(job.run_state, RunState::Active);
+
+        // A lane holds it: Downloading.
+        assert_eq!(
+            active_row(2).info(&Globals::default()).download_state,
+            DownloadState::Downloading
+        );
+
+        // Payload in and the pipeline draining: not a wait for lanes.
+        let mut finalizing = active_row(3);
+        finalizing.report.download_active = false;
+        finalizing.report.job.finalizing_download = true;
+        assert_eq!(
+            finalizing.info(&Globals::default()).download_state,
+            DownloadState::Downloading
+        );
+    }
+
+    #[test]
+    fn queue_job_waiting_for_lanes_keeps_the_dispatcher_wait_reason() {
+        let mut row = active_row(1);
+        row.report.download_active = false;
+        row.report.job.download_wait_reason = Some("checkpoint".into());
+        let job = row.info(&Globals::default());
+        assert_eq!(job.download_state, DownloadState::Queued);
+        assert_eq!(job.download_wait_reason.as_deref(), Some("checkpoint"));
     }
 }

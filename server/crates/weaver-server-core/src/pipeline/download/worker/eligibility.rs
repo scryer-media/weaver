@@ -86,6 +86,92 @@ impl Pipeline {
         self.job_has_dispatchable_work(job_id)
     }
 
+    // The gate the dispatcher stops this job at while it holds no lane: no
+    // server, byte pressure, a direct-store hold or the restart checkpoint.
+    // None while a lane holds the job or none of its queued work is gated, so
+    // a job only waiting its turn behind another reads as plain queued.
+    pub(in crate::pipeline) fn job_dispatch_hold_reason(
+        &self,
+        job_id: JobId,
+    ) -> Option<&'static str> {
+        let state = self.jobs.get(&job_id)?;
+        if state.download_queue.is_empty()
+            || !Self::status_allows_download_dispatch(&state.status)
+            || self.job_has_current_download_activity(job_id)
+        {
+            return None;
+        }
+        // In the order the dispatch pass meets them.
+        if crate::DownloadPressureState::from_code(
+            self.metrics.download_pressure_state.load(Ordering::Relaxed),
+        ) == crate::DownloadPressureState::Hard
+        {
+            return Some("byte_pressure");
+        }
+        if self.nntp.pool().server_count() == 0 {
+            return Some("no_server");
+        }
+        let direct_admission = self.direct_store_admission(job_id);
+        let checkpoint = self.checkpoint_admission(job_id);
+        if direct_admission.is_empty() && !checkpoint.enforced {
+            return None;
+        }
+        let mut reason = None;
+        let open = state.download_queue.peek_first_matching(|work| {
+            if !direct_admission.iter().all(|set| set.allows(work)) {
+                reason.get_or_insert("direct_store");
+                false
+            } else if !checkpoint.decision(work, &[]).allows() {
+                reason.get_or_insert("checkpoint");
+                false
+            } else {
+                true
+            }
+        });
+        if open.is_some() { None } else { reason }
+    }
+
+    // A hold lands or lifts, and a job gains or loses its lanes, with no job
+    // event of its own, so each dispatch pass re-reports the jobs whose queue
+    // row no longer says what the dispatcher sees.
+    pub(in crate::pipeline) fn report_changed_dispatch_holds(&self) {
+        let current: Vec<(JobId, Option<&'static str>, bool)> = self
+            .job_order
+            .iter()
+            .map(|job_id| {
+                let reason = self
+                    .download_wait_by_job
+                    .get(job_id)
+                    .map(|wait| wait.reason)
+                    .or_else(|| self.job_dispatch_hold_reason(*job_id));
+                (
+                    *job_id,
+                    reason,
+                    self.job_has_current_download_activity(*job_id),
+                )
+            })
+            .collect();
+        let stale: Vec<JobId> = self.shared_state.queue.read(|inner| {
+            current
+                .iter()
+                .filter(|(job_id, reason, active)| {
+                    inner
+                        .jobs
+                        .iter()
+                        .find(|row| row.id == *job_id)
+                        .is_some_and(|row| {
+                            row.report.job.download_wait_reason.as_deref() != *reason
+                                || row.report.download_active != *active
+                        })
+                })
+                .map(|(job_id, _, _)| *job_id)
+                .collect()
+        });
+        for job_id in stale {
+            self.report_job(job_id);
+        }
+    }
+
     pub(in crate::pipeline::download) fn job_dispatch_priority(state: &JobState) -> u8 {
         state
             .spec

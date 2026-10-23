@@ -1978,13 +1978,16 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
     job_changes.changed().await.unwrap();
 
     assert_eq!(*job_changes.borrow(), previous_revision.wrapping_add(1));
-    assert!(
+    // The infrastructure wait is gone; what is left is the dispatcher's own
+    // gate on the requeued work, and this pipeline has no server.
+    assert_eq!(
         pipeline
             .shared_state
             .get_job(job_id)
             .unwrap()
             .download_wait_reason
-            .is_none()
+            .as_deref(),
+        Some("no_server")
     );
     assert_eq!(
         pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
@@ -4290,5 +4293,73 @@ async fn a_batch_cut_short_by_cancellation_is_not_an_unclean_batch() {
             .download_pipeline_trial_failure_total
             .load(Ordering::Relaxed),
         1
+    );
+}
+
+// The dispatcher's own gate is the item's wait reason, and a job it holds
+// off every lane reads as queued rather than downloading.
+#[tokio::test]
+async fn a_job_the_dispatcher_holds_off_every_lane_reports_why_on_the_queue() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20032);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Pressure Hold", "pressure-hold.bin", &[1024]),
+    )
+    .await;
+    pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Downloading;
+    pipeline.report_job(job_id);
+    // This pipeline has no server to dispatch to.
+    assert_eq!(pipeline.job_dispatch_hold_reason(job_id), Some("no_server"));
+
+    pipeline.metrics.download_pressure_state.store(
+        crate::DownloadPressureState::Hard.as_code(),
+        Ordering::Relaxed,
+    );
+    assert_eq!(
+        pipeline
+            .job_report(job_id)
+            .unwrap()
+            .download_wait_reason
+            .as_deref(),
+        Some("byte_pressure")
+    );
+    pipeline.report_changed_dispatch_holds();
+    let view = |pipeline: &Pipeline| {
+        pipeline.shared_state.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .find(|row| row.id == job_id)
+                .map(|row| row.info(&inner.globals))
+                .unwrap()
+        })
+    };
+    let held = view(&pipeline);
+    assert_eq!(held.download_wait_reason.as_deref(), Some("byte_pressure"));
+    assert_eq!(held.download_state, crate::DownloadState::Queued);
+
+    // A lane holding the job is not a hold.
+    pipeline
+        .active_download_connections_by_job
+        .insert(job_id, 1);
+    assert_eq!(pipeline.job_dispatch_hold_reason(job_id), None);
+    pipeline.report_changed_dispatch_holds();
+    let held_lane = view(&pipeline);
+    assert_eq!(held_lane.download_wait_reason, None);
+    assert_eq!(held_lane.download_state, crate::DownloadState::Downloading);
+    pipeline.active_download_connections_by_job.remove(&job_id);
+
+    // The pressure lifts: the next pass reports the gate still standing.
+    pipeline.metrics.download_pressure_state.store(
+        crate::DownloadPressureState::Clear.as_code(),
+        Ordering::Relaxed,
+    );
+    pipeline.report_changed_dispatch_holds();
+    assert_eq!(
+        view(&pipeline).download_wait_reason.as_deref(),
+        Some("no_server")
     );
 }

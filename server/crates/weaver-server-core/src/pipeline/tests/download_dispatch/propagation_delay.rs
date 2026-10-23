@@ -666,8 +666,10 @@ async fn list_jobs_keeps_a_lane_less_download_downloading_and_rewarms_its_phase_
         now + Duration::from_secs(2),
     );
     let inactive = pipeline.shared_state.get_job(job_id).unwrap();
+    // Started, so its status stays Downloading; no lane holds it, so its
+    // download lane reads as waiting for one.
     assert_eq!(inactive.status, JobStatus::Downloading);
-    assert_eq!(inactive.download_state, crate::DownloadState::Downloading);
+    assert_eq!(inactive.download_state, crate::DownloadState::Queued);
     assert!(inactive.phase_progress.is_empty());
 
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -724,10 +726,12 @@ async fn a_started_download_with_only_queued_work_lists_as_downloading() {
         .find(|info| info.job_id == job_id)
         .expect("job should be listed");
 
+    // Started, so its status stays Downloading; no lane holds it, so its
+    // download lane reads as waiting for one.
     assert_eq!(info.status, JobStatus::Downloading);
     assert_eq!(
         info.download_state,
-        crate::jobs::model::DownloadState::Downloading
+        crate::jobs::model::DownloadState::Queued
     );
 }
 

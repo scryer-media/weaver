@@ -201,6 +201,23 @@ impl Pipeline {
                 .any(|id| id.job_id == job_id && self.file_is_completion_critical(*id))
     }
 
+    // Every payload article is in: nothing ordinary is queued, retrying or
+    // out on a lane, so whatever the job still fetches is recovery.
+    fn job_payload_fetched(&self, job_id: JobId) -> bool {
+        self.jobs_finalizing_download.contains(&job_id)
+            || (self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| !state.download_queue.has_noncritical_work())
+                && !self.pending_retries_by_segment.keys().any(|id| {
+                    id.file_id.job_id == job_id && !self.segment_is_completion_critical(*id)
+                })
+                && !self
+                    .active_downloads_by_file
+                    .keys()
+                    .any(|id| id.job_id == job_id && !self.file_is_completion_critical(*id)))
+    }
+
     pub(super) fn loaded_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
         let Some(state) = self.jobs.get(&job_id) else {
             return HashSet::new();
@@ -1388,13 +1405,18 @@ impl Pipeline {
             } else {
                 None
             },
-            download_wait_reason: download_wait.map(|wait| wait.reason.to_owned()),
+            download_wait_reason: download_wait
+                .map(|wait| wait.reason)
+                .or_else(|| self.job_dispatch_hold_reason(state.job_id))
+                .map(str::to_owned),
             download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
             status,
             download_state,
             finalizing_download: !native_verifying
                 && self.jobs_finalizing_download.contains(&state.job_id),
-            fetching_repair_data: !native_verifying && self.job_fetching_repair_data(state.job_id),
+            fetching_repair_data: !native_verifying
+                && self.job_fetching_repair_data(state.job_id)
+                && self.job_payload_fetched(state.job_id),
             post_state,
             run_state,
             progress: Self::effective_progress(state),

@@ -1616,6 +1616,20 @@ fn resolve_queue_item_state(
         }
     }
 
+    // The pipeline sets `fetching_repair_data` only once the payload is in,
+    // so recovery articles still on the wire are the work the row names.
+    if include_finalization_states
+        && info.fetching_repair_data
+        && matches!(
+            info.post_state,
+            weaver_server_core::PostState::Idle
+                | weaver_server_core::PostState::WaitingForVolumes
+                | weaver_server_core::PostState::AwaitingRepair
+        )
+    {
+        return QueueItemState::FetchingRepairData;
+    }
+
     match info.download_state {
         weaver_server_core::DownloadState::Downloading => return QueueItemState::Downloading,
         weaver_server_core::DownloadState::Checking => return QueueItemState::Verifying,
@@ -1664,6 +1678,15 @@ fn resolve_queue_item_state(
 pub fn queue_item_state_from_job_info_for_download_accounting(
     info: &weaver_server_core::JobInfo,
 ) -> QueueItemState {
+    // A started download that holds no lane right now has still started for
+    // the counters, unless propagation holds it.
+    if info.status == weaver_server_core::JobStatus::Downloading
+        && info.download_state == weaver_server_core::DownloadState::Queued
+        && info.download_wait_reason.as_deref()
+            != Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON)
+    {
+        return QueueItemState::Downloading;
+    }
     resolve_queue_item_state(info, false)
 }
 
