@@ -1147,6 +1147,7 @@ impl Pipeline {
                 &turn_metrics.pipeline_histograms.turn_duration,
             );
             if queue.read(|inner| inner.globals.shutting_down) {
+                self.cancel_par2_work_for_shutdown();
                 // Readmission can wait for cancellation cleanup, whose terminal
                 // completion event releases the last script cancellation sender.
                 // Keep servicing those events while accepted admissions settle.
