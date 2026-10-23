@@ -223,6 +223,17 @@ impl JobRow {
             job.download_wait_reason = Some(crate::jobs::handle::PROPAGATION_WAIT_REASON.into());
             job.download_retry_at_epoch_ms = propagation;
         }
+        // A pause or resume the pipeline has not applied yet is already the
+        // state the queue holds the job to.
+        if self.intents.pause_seq > self.report.seen_intent_seq {
+            if self.intents.paused == Some(true) {
+                job.status = crate::JobStatus::Paused;
+                job.run_state = crate::RunState::Paused;
+            } else if self.intents.paused == Some(false) && job.status == crate::JobStatus::Paused {
+                job.status = crate::JobStatus::Queued;
+                job.run_state = crate::RunState::Active;
+            }
+        }
         let global_pause = globals.paused || globals.speed_test_paused;
         if global_pause || self.intents.paused == Some(true) || propagation.is_some() {
             if job.download_state == crate::DownloadState::Downloading {
@@ -491,5 +502,50 @@ mod label_tests {
         let job = row.info(&Globals::default());
         assert_eq!(job.download_state, DownloadState::Queued);
         assert_eq!(job.download_wait_reason.as_deref(), Some("checkpoint"));
+    }
+
+    #[test]
+    fn queue_pause_then_resume_report_the_intent_before_the_pipeline_applies_it() {
+        let queue = Queue::new(vec![downloading(1)]);
+        queue.write(|inner| {
+            inner.jobs[0].report.download_active = true;
+            inner.jobs[0].report.download_work_pending = true;
+            Change::changed(())
+        });
+        let view = |queue: &Queue| queue.read(|inner| inner.jobs[0].info(&inner.globals));
+
+        queue.set_job_paused(JobId(1), true).unwrap();
+        let paused = view(&queue);
+        assert_eq!(paused.status, JobStatus::Paused);
+        assert_eq!(paused.run_state, RunState::Paused);
+        assert_eq!(paused.download_state, DownloadState::Queued);
+
+        // The pipeline applies the pause and reports it.
+        queue.write(|inner| {
+            let row = &mut inner.jobs[0];
+            row.report.seen_intent_seq = row.intents.seq;
+            row.report.job.status = JobStatus::Paused;
+            row.report.job.download_state = DownloadState::Queued;
+            row.report.job.run_state = RunState::Paused;
+            row.report.download_active = false;
+            Change::changed(())
+        });
+        assert_eq!(view(&queue).run_state, RunState::Paused);
+
+        queue.set_job_paused(JobId(1), false).unwrap();
+        let resumed = view(&queue);
+        assert_eq!(resumed.status, JobStatus::Queued);
+        assert_eq!(resumed.run_state, RunState::Active);
+        assert_eq!(resumed.download_state, DownloadState::Queued);
+
+        // A resume under the global pause is still held by it.
+        let held = queue.read(|inner| {
+            let globals = Globals {
+                paused: true,
+                ..inner.globals.clone()
+            };
+            inner.jobs[0].info(&globals)
+        });
+        assert_eq!(held.run_state, RunState::Paused);
     }
 }

@@ -615,3 +615,33 @@ fn queue_item_waiting_for_lanes_is_queued_with_the_dispatcher_wait_reason() {
         QueueItemState::Queued
     );
 }
+
+#[tokio::test]
+async fn queue_pause_then_resume_return_the_state_the_queue_holds() {
+    let job = base_job(JobStatus::Downloading);
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+    let state = weaver_server_core::SharedPipelineState::new(
+        weaver_server_core::PipelineMetrics::new(),
+        vec![job.clone()],
+    );
+    let handle = weaver_server_core::SchedulerHandle::new(event_tx, state.clone());
+
+    // The mutation reads the job right after writing the intent, before the
+    // pipeline has applied it.
+    handle.pause_job(job.job_id).await.unwrap();
+    let paused = queue_item_from_job(&handle.get_job(job.job_id).unwrap());
+    assert_eq!(paused.state, QueueItemState::Paused);
+
+    // The pipeline applied the pause and reported it.
+    state.publish_jobs(vec![base_job(JobStatus::Paused)]);
+    handle.resume_job(job.job_id).await.unwrap();
+    let resumed = queue_item_from_job(&handle.get_job(job.job_id).unwrap());
+    assert!(
+        matches!(
+            resumed.state,
+            QueueItemState::Queued | QueueItemState::Downloading
+        ),
+        "{:?}",
+        resumed.state
+    );
+}

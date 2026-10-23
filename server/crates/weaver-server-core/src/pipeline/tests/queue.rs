@@ -37,7 +37,9 @@ async fn admission_and_intents_answer_without_a_running_pipeline() {
     let watermark = handle.job_revision();
     handle.pause_job(id).await.unwrap();
     assert!(handle.job_revision() > watermark);
-    assert_eq!(handle.get_job(id).unwrap().status, JobStatus::Queued);
+    // The queue already holds the job paused; the pipeline has not acted yet.
+    assert_eq!(handle.get_job(id).unwrap().status, JobStatus::Paused);
+    assert!(!pipeline.jobs.contains_key(&id));
     pipeline.apply_queue_intents().await;
     assert_eq!(handle.get_job(id).unwrap().status, JobStatus::Paused);
     assert_eq!(pipeline.jobs[&id].status, JobStatus::Paused);
