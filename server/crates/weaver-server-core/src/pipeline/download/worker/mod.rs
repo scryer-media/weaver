@@ -259,6 +259,28 @@ impl Pipeline {
     // it, so a job retrying hard on a low-priority server quietly handed it
     // everyone else's work. The sort is stable, so the pool's own ranking
     // survives inside each group.
+    // The fill servers this pass may send a hinted article to instead of its
+    // hinted one, for the rotation hint: the article stays off its server
+    // only while one of these could take it now. A fill server takes an
+    // article now only through an idle lane, the same fact the candidate
+    // order prefers; one whose every lane is busy would leave the hinted
+    // server idle for as long as its current body runs. Unknown when the
+    // pass never ranked.
+    pub(in crate::pipeline) fn rotation_alternatives_for_pass(
+        ranked: Option<&[usize]>,
+        backfill_flags: &[bool],
+        idle_by_server: &HashMap<usize, usize>,
+    ) -> Option<Vec<usize>> {
+        ranked.map(|order| {
+            order
+                .iter()
+                .copied()
+                .filter(|server| !backfill_flags.get(*server).copied().unwrap_or(false))
+                .filter(|server| idle_by_server.contains_key(server))
+                .collect()
+        })
+    }
+
     pub(in crate::pipeline) fn order_dispatch_candidates(
         servers: &mut [usize],
         groups: &[u32],
@@ -322,16 +344,11 @@ impl Pipeline {
                 None => idle_by_server.keys().copied().collect(),
             },
         };
-        // The fill servers this pass may send work to, for the rotation
-        // hint: a hinted article stays off its server only while one of
-        // these could take it instead. Unknown when the pass never ranked.
-        self.download_pass_fill_servers = ranked_this_pass.as_ref().map(|order| {
-            order
-                .iter()
-                .copied()
-                .filter(|server| !backfill_flags.get(*server).copied().unwrap_or(false))
-                .collect()
-        });
+        self.download_pass_fill_servers = Self::rotation_alternatives_for_pass(
+            ranked_this_pass.as_deref(),
+            backfill_flags,
+            &idle_by_server,
+        );
         let groups = self.nntp.pool().server_groups().to_vec();
         Self::order_dispatch_candidates(&mut servers, &groups, backfill_flags, &idle_by_server);
         // The backfill tier comes last, and only for what the fill tier has
