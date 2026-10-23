@@ -381,3 +381,274 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A magnet for `torrent`'s hashes, naming nothing else.
+fn magnet_of(torrent: &[u8]) -> anyhow::Result<String> {
+    let hashes = crate::core::torrent_metainfo::torrent_from_bytes(torrent)?.info_hashes;
+    Ok(crate::core::magnet::Magnet::of(hashes, None, Vec::new()).to_string())
+}
+
+/// This client under a peer id of `byte` alone, which an announce's query
+/// names as is.
+fn identity_of(byte: u8) -> crate::Identity {
+    crate::Identity {
+        peer_id: crate::core::hash_id::Id20::new([byte; 20]),
+        ..Default::default()
+    }
+}
+
+/// Fetches `magnet`'s metadata as a list-only add under `identity`,
+/// answering the tracker's `started` with `peer`, which serves it. Returns
+/// the fetch's answer and its announce table.
+async fn fetch_metadata(
+    session: &std::sync::Arc<Session>,
+    tracker: &TcpListener,
+    url: &str,
+    magnet: String,
+    identity: crate::Identity,
+    peer: SocketAddr,
+) -> anyhow::Result<(crate::ListOnlyResponse, crate::TrackerStatus)> {
+    let peer_id = String::from_utf8(identity.peer_id.0.to_vec())?;
+    let (table_tx, table_rx) = tokio::sync::oneshot::channel();
+    let fetch = session.add_torrent(
+        AddTorrent::from_url(magnet),
+        Some(AddTorrentOptions {
+            list_only: true,
+            tracker_tiers: Some(vec![vec![url.to_owned()]]),
+            identity: Some(identity),
+            metadata_trackers: Some(table_tx),
+            ..Default::default()
+        }),
+    );
+    let tracker = async {
+        let (conn, query) = read_announce_query(tracker).await?;
+        assert_eq!(param(&query, "event"), Some("started"));
+        assert_eq!(param(&query, "peer_id"), Some(peer_id.as_str()));
+        respond_bytes(conn, &answer_with_peer(peer)?).await
+    };
+    let (listed, answered) = tokio::join!(fetch, tracker);
+    answered?;
+    let crate::AddTorrentResponse::ListOnly(listed) = listed? else {
+        anyhow::bail!("a list-only add lists");
+    };
+    Ok((listed, table_rx.await?))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_magnets_fetch_and_its_run_are_one_torrent_to_its_tracker() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_magnet_handover", 4096, 1024).await?;
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_magnet_handover_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+
+    let fetched_as = identity_of(b'f');
+    let peer_id = String::from_utf8(fetched_as.peer_id.0.to_vec())?;
+    let (mut listed, table) = fetch_metadata(
+        &session,
+        &tracker,
+        &url,
+        magnet_of(&t.torrent)?,
+        fetched_as.clone(),
+        seeder_addr,
+    )
+    .await?;
+
+    // The torrent added from the fetched metainfo, taking over the fetch's
+    // trackers under the identity they heard `started` from.
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(listed.torrent_bytes.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url.clone()]),
+                identity: Some(fetched_as),
+                initial_peers: Some(vec![seeder_addr]),
+                tracker_handover: listed.trackers.take(),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    handle.wait_until_completed().await?;
+
+    // No second `started` and no `stopped` came before this: the run's
+    // first announce is `completed`, from the fetch's task.
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    assert_eq!(param(&query, "peer_id"), Some(peer_id.as_str()));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    table
+        .subscribe()
+        .wait_for(|a| !a[0].in_flight && a[0].last.is_some())
+        .await?;
+    // One table, the fetch's, read through the run.
+    let run_table = handle.tracker_status().context("the run's table")?;
+    assert!(run_table.subscribe().same_channel(&table.subscribe()));
+
+    // Paused: one `stopped`, under the same peer id.
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "peer_id"), Some(peer_id.as_str()));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_magnet_paused_once_its_metadata_is_fetched_sends_stopped_once() -> anyhow::Result<()>
+{
+    setup_test_logging();
+    let t = TestTorrent::new("test_magnet_paused_handover", 4096, 1024).await?;
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_magnet_paused_handover_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+
+    let fetched_as = identity_of(b'p');
+    let peer_id = String::from_utf8(fetched_as.peer_id.0.to_vec())?;
+    let (mut listed, _table) = fetch_metadata(
+        &session,
+        &tracker,
+        &url,
+        magnet_of(&t.torrent)?,
+        fetched_as,
+        seeder_addr,
+    )
+    .await?;
+
+    // Added paused: no run takes the fetch's task over, and the add lets go
+    // of it, which stops the torrent at its tracker.
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(listed.torrent_bytes.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url.clone()]),
+                identity: Some(identity_of(b'r')),
+                paused: true,
+                tracker_handover: listed.trackers.take(),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "peer_id"), Some(peer_id.as_str()));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+
+    // Its first run is a new presence: `started`, under its own peer id.
+    handle.wait_until_initialized().await?;
+    session.unpause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "peer_id"), Some("r".repeat(20).as_str()));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_magnet_removed_while_its_metadata_is_fetched_sends_stopped_once()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_magnet_removed_fetch", 4096, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_magnet_removed_fetch_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+
+    let (table_tx, table_rx) = tokio::sync::oneshot::channel();
+    let fetch = tokio::spawn({
+        let session = session.clone();
+        let magnet = magnet_of(&t.torrent)?;
+        let url = url.clone();
+        async move {
+            session
+                .add_torrent(
+                    AddTorrent::from_url(magnet),
+                    Some(AddTorrentOptions {
+                        list_only: true,
+                        tracker_tiers: Some(vec![vec![url]]),
+                        identity: Some(identity_of(b'x')),
+                        metadata_trackers: Some(table_tx),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map(|_| ())
+        }
+    });
+    // The tracker knows no peer: the metadata never comes.
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    // The tracker took `started`: it is owed `stopped`.
+    let table = table_rx.await?;
+    table
+        .subscribe()
+        .wait_for(|a| !a[0].in_flight && a[0].last.is_some())
+        .await?;
+
+    // Removed while fetching: the fetch is dropped, and with it the
+    // torrent's one presence at its tracker.
+    fetch.abort();
+    assert!(fetch.await.is_err_and(|e| e.is_cancelled()));
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "peer_id"), Some("x".repeat(20).as_str()));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_magnets_run_starts_from_the_peers_its_fetchs_tracker_gave() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_magnet_handover_peers", 4096, 1024).await?;
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_magnet_handover_peers_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+
+    let fetched_as = identity_of(b'g');
+    let peer_id = String::from_utf8(fetched_as.peer_id.0.to_vec())?;
+    let (mut listed, _table) = fetch_metadata(
+        &session,
+        &tracker,
+        &url,
+        magnet_of(&t.torrent)?,
+        fetched_as.clone(),
+        seeder_addr,
+    )
+    .await?;
+
+    // No initial peers and no DHT: the seeder is known to the run only as
+    // the peer the tracker gave the fetch, and the tracker is not asked
+    // again before the run completes.
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(listed.torrent_bytes.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url.clone()]),
+                identity: Some(fetched_as),
+                tracker_handover: listed.trackers.take(),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    handle.wait_until_completed().await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    assert_eq!(param(&query, "peer_id"), Some(peer_id.as_str()));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}

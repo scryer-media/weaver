@@ -49,8 +49,9 @@ pub struct TrackerComms {
     /// The port peers reach this session on, read when each announce goes
     /// out (see [`announced_port`]).
     announce_port: ListenPort,
-    /// Our own addresses an HTTP announce names (see [`AnnounceIps`]).
-    announce_ips: AnnounceIps,
+    /// Our own addresses an HTTP announce names (see [`AnnounceIps`]): the
+    /// run's that announces now (see [`TrackerTask::take_over`]).
+    announce_ips: Mutex<AnnounceIps>,
     /// Where an accepted announce's `external ip` goes.
     vote: ExternalIpVote,
     http_clients: Arc<dyn HttpClients>,
@@ -66,6 +67,11 @@ pub struct TrackerComms {
     // Wakes the announce loop when the list changed under it: trackers
     // replaced or an announce forced.
     poke: tokio::sync::Notify,
+    /// Bounds the `stopped` announces this hash sends.
+    stopped: StoppedAnnounces,
+    /// Hands the task an announce loop for another hash the torrent goes by
+    /// (see [`TrackerTask::take_over`]).
+    grow: tokio::sync::mpsc::UnboundedSender<Arc<TrackerComms>>,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,8 +356,9 @@ impl TrackerList {
     /// twice kept where first named (libtorrent `tracker_list::replace`). A
     /// tracker kept keeps what announcing to it has done, so it is not sent
     /// `started` again nor let off its back-off; libtorrent starts every
-    /// entry afresh. A tracker that is gone is forgotten, with no `stopped`.
-    fn replace(&mut self, tiers: &[Vec<SupportedTracker>], now: Instant) {
+    /// entry afresh. A tracker that is gone is forgotten; those of them that
+    /// accepted `started` are returned.
+    fn replace(&mut self, tiers: &[Vec<SupportedTracker>], now: Instant) -> Vec<SupportedTracker> {
         let mut old = std::mem::take(&mut self.entries);
         for (tier, trackers) in tiers.iter().enumerate() {
             for tracker in trackers {
@@ -371,6 +378,10 @@ impl TrackerList {
         let entries = &self.entries;
         self.forced
             .retain(|t| entries.iter().any(|e| &e.tracker == t));
+        old.into_iter()
+            .filter(|e| e.start_sent)
+            .map(|e| e.tracker)
+            .collect()
     }
 
     /// Brings the next announce forward to `at` (libtorrent
@@ -933,7 +944,7 @@ impl AutoScrape {
 
 /// Scrapes a torrent's trackers under every hash it announces.
 struct Scraper {
-    info_hashes: Vec<Id20>,
+    info_hashes: Mutex<Vec<Id20>>,
     user_agent: String,
     // In table order, one per URL.
     trackers: Mutex<Vec<SupportedTracker>>,
@@ -946,10 +957,11 @@ impl Scraper {
     /// The counts `tracker` gives under any of the torrent's hashes, the
     /// larger of each when both are answered.
     async fn scrape(&self, tracker: &SupportedTracker) -> anyhow::Result<ScrapeOk> {
+        let info_hashes = self.info_hashes.lock().clone();
         let results = futures::future::join_all(
-            self.info_hashes
-                .iter()
-                .map(|info_hash| self.scrape_hash(tracker, *info_hash)),
+            info_hashes
+                .into_iter()
+                .map(|info_hash| self.scrape_hash(tracker, info_hash)),
         )
         .await;
         results
@@ -1099,7 +1111,7 @@ impl TrackerStatus {
             announces: tokio::sync::watch::channel(announces).0,
             scrapes: tokio::sync::watch::channel(scrapes).0,
             scraper: Scraper {
-                info_hashes,
+                info_hashes: Mutex::new(info_hashes),
                 user_agent: identity.user_agent.clone(),
                 trackers: Mutex::new(unique),
                 http_clients,
@@ -1115,7 +1127,15 @@ impl TrackerStatus {
     /// running task announces to them from now on. An announce waiting on a
     /// tracker that is gone is abandoned.
     pub fn replace(&self, tiers: Vec<Vec<Url>>) {
-        let tiers = supported_tiers(tiers);
+        self.replace_tiers(&supported_tiers(tiers));
+    }
+
+    /// [`Self::replace`], with each running hash and the trackers gone from
+    /// it that accepted `started`.
+    fn replace_tiers(
+        &self,
+        tiers: &[Vec<SupportedTracker>],
+    ) -> Vec<(Arc<TrackerComms>, Vec<SupportedTracker>)> {
         let trackers = unique(tiers.iter().flatten());
         self.0.announces.send_modify(|announces| {
             *announces = trackers
@@ -1150,11 +1170,15 @@ impl TrackerStatus {
                 .collect();
         });
         *self.0.scraper.trackers.lock() = trackers;
-        for comms in self.runs() {
-            comms.list.lock().replace(&tiers, Instant::now());
-            comms.publish(Instant::now(), SystemTime::now());
-            comms.poke.notify_one();
-        }
+        self.runs()
+            .into_iter()
+            .map(|comms| {
+                let gone = comms.list.lock().replace(tiers, Instant::now());
+                comms.publish(Instant::now(), SystemTime::now());
+                comms.poke.notify_one();
+                (comms, gone)
+            })
+            .collect()
     }
 
     /// Brings the next announce forward to `after` from now, to every
@@ -1351,6 +1375,49 @@ pub struct TrackerTask {
     pub status: TrackerStatus,
 }
 
+impl TrackerTask {
+    /// The task, taken over by the run that follows the one that started it
+    /// (a magnet's metadata fetch, then its download): it announces to
+    /// `tiers` under every one of `info_hashes` and names `announce_ips` as
+    /// ours from now on, and keeps what the trackers heard from it,
+    /// `started`, their intervals and their tracker ids, so they hear one
+    /// torrent. A tracker the run leaves out that accepted `started` is sent
+    /// `stopped`, as dropping the task would send it. A hash the task did
+    /// not announce under is announced under from now on, as one more hash
+    /// of the same torrent. A task that announced under none of
+    /// `info_hashes` was another torrent's: it is dropped, which sends
+    /// `stopped`, and `None` is returned.
+    pub(crate) fn take_over(
+        self,
+        info_hashes: InfoHashes,
+        tiers: Vec<Vec<Url>>,
+        announce_ips: AnnounceIps,
+    ) -> Option<Self> {
+        let runs = self.status.runs();
+        if !runs
+            .iter()
+            .any(|comms| info_hashes.answers_to(comms.info_hash))
+        {
+            return None;
+        }
+        let tiers = supported_tiers(tiers);
+        for comms in &runs {
+            *comms.announce_ips.lock() = announce_ips.clone();
+        }
+        for (comms, gone) in self.status.replace_tiers(&tiers) {
+            comms.send_stopped(gone, comms.stopped.register());
+        }
+        if let Some(first) = runs.first() {
+            for info_hash in info_hashes.ids20() {
+                if runs.iter().all(|comms| comms.info_hash != info_hash) {
+                    first.grow(info_hash, &tiers);
+                }
+            }
+        }
+        Some(self)
+    }
+}
+
 /// Bounds the `stopped` announce (BEP 3) a tracker task sends when its peer
 /// stream is dropped, and lets a shutdown wait for those announces.
 ///
@@ -1422,41 +1489,23 @@ impl Drop for RunningGuard {
 /// `stop_tracker_timeout <= 0`).
 struct StopOnDrop {
     comms: Arc<TrackerComms>,
-    timeout: Duration,
     running: Option<RunningGuard>,
+}
+
+impl StopOnDrop {
+    fn new(comms: Arc<TrackerComms>) -> Self {
+        let running = Some(comms.stopped.register());
+        Self { comms, running }
+    }
 }
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        let running = self.running.take();
         let trackers = self.comms.list.lock().stop();
         self.comms.publish(Instant::now(), SystemTime::now());
-        if self.timeout.is_zero() || trackers.is_empty() {
-            return;
+        if let Some(running) = self.running.take() {
+            self.comms.send_stopped(trackers, running);
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            debug!("no runtime to send the stopped announce on");
-            return;
-        };
-        let comms = self.comms.clone();
-        let timeout = self.timeout;
-        let span = debug_span!(parent: None, "tracker_stopped", info_hash = ?comms.info_hash);
-        runtime.spawn(
-            async move {
-                let _running = running;
-                let stats = comms.stats.get();
-                let announces = trackers.into_iter().map(|tracker| {
-                    comms.announce_recorded(tracker, Some(TrackerRequestEvent::Stopped), stats)
-                });
-                if tokio::time::timeout(timeout, futures::future::join_all(announces))
-                    .await
-                    .is_err()
-                {
-                    debug!(?timeout, "stopped announce timed out");
-                }
-            }
-            .instrument(span),
-        );
     }
 }
 
@@ -1616,6 +1665,7 @@ impl TrackerComms {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
+        let (grow, mut grown) = tokio::sync::mpsc::unbounded_channel::<Arc<TrackerComms>>();
 
         let stats: Arc<dyn TorrentStatsProvider> = stats.into();
         // One key for the torrent, whatever hash it announces under
@@ -1631,7 +1681,7 @@ impl TrackerComms {
                     force_tracker_interval: force_interval,
                     tx: tx.clone(),
                     announce_port: listen_port.clone(),
-                    announce_ips: announce_ips.clone(),
+                    announce_ips: Mutex::new(announce_ips.clone()),
                     vote: vote.clone(),
                     http_clients: http_clients.clone(),
                     reachable: reachable.clone(),
@@ -1641,27 +1691,26 @@ impl TrackerComms {
                     tracker_ids: Default::default(),
                     status: status.clone(),
                     poke: tokio::sync::Notify::new(),
+                    stopped: stopped.clone(),
+                    grow: grow.clone(),
                 })
             })
             .collect::<Vec<_>>();
         drop(tx);
+        drop(grow);
         *status.0.runs.lock() = comms.iter().map(Arc::downgrade).collect();
         let stop_on_drop = comms
             .iter()
-            .map(|comms| StopOnDrop {
-                comms: comms.clone(),
-                timeout: stopped.timeout(),
-                running: Some(stopped.register()),
-            })
+            .cloned()
+            .map(StopOnDrop::new)
             .collect::<Vec<_>>();
 
         let s = async_stream::stream! {
             use futures::StreamExt;
-            let _stop_on_drop = stop_on_drop;
+            let mut stop_on_drop = stop_on_drop;
             let mut futures = FuturesUnordered::new();
-            for comms in &comms {
-                let span = debug_span!(parent: None, "tracker", info_hash = ?comms.info_hash);
-                futures.push(comms.run().instrument(span));
+            for comms in comms {
+                futures.push(comms.running());
             }
             while !(futures.is_empty()) {
                 tokio::select! {
@@ -1670,6 +1719,10 @@ impl TrackerComms {
                             yield addr;
                         }
                     }
+                    Some(comms) = grown.recv() => {
+                        stop_on_drop.push(StopOnDrop::new(comms.clone()));
+                        futures.push(comms.running());
+                    }
                     e = futures.next(), if !futures.is_empty() => {
                         if let Some(Err(e)) = e {
                             debug!("error: {e:#}");
@@ -1677,12 +1730,83 @@ impl TrackerComms {
                     }
                 }
             }
+            drop(stop_on_drop);
         };
 
         TrackerTask {
             peers: s.boxed(),
             status,
         }
+    }
+
+    /// [`Self::run`] in its own span, owning its hash.
+    fn running(self: Arc<Self>) -> impl std::future::Future<Output = anyhow::Result<()>> {
+        let span = debug_span!(parent: None, "tracker", info_hash = ?self.info_hash);
+        async move { self.run().await }.instrument(span)
+    }
+
+    /// Announces under `info_hash` too, to `tiers`, as one more hash of this
+    /// torrent: the same key, identity, counters and peer stream, in the
+    /// same task, stopped with it.
+    fn grow(&self, info_hash: Id20, tiers: &[Vec<SupportedTracker>]) {
+        let comms = Arc::new(Self {
+            info_hash,
+            identity: self.identity.clone(),
+            stats: self.stats.clone(),
+            force_tracker_interval: self.force_tracker_interval,
+            tx: self.tx.clone(),
+            announce_port: self.announce_port.clone(),
+            announce_ips: Mutex::new(self.announce_ips.lock().clone()),
+            vote: self.vote.clone(),
+            http_clients: self.http_clients.clone(),
+            reachable: self.reachable.clone(),
+            udp_client: self.udp_client.clone(),
+            key: self.key,
+            list: Mutex::new(TrackerList::new(tiers, Instant::now())),
+            tracker_ids: Default::default(),
+            status: self.status.clone(),
+            poke: tokio::sync::Notify::new(),
+            stopped: self.stopped.clone(),
+            grow: self.grow.clone(),
+        });
+        if self.grow.send(comms.clone()).is_err() {
+            return;
+        }
+        self.status.0.runs.lock().push(Arc::downgrade(&comms));
+        self.status.0.scraper.info_hashes.lock().push(info_hash);
+    }
+
+    /// Sends `stopped` to `trackers`, which accepted `started`, with the
+    /// counters as they are, each recorded in the table as any announce is,
+    /// within the stopped announces' bound; none when that bound is zero.
+    /// `running` is held until they end.
+    fn send_stopped(self: &Arc<Self>, trackers: Vec<SupportedTracker>, running: RunningGuard) {
+        let timeout = self.stopped.timeout();
+        if timeout.is_zero() || trackers.is_empty() {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            debug!("no runtime to send the stopped announce on");
+            return;
+        };
+        let comms = self.clone();
+        let span = debug_span!(parent: None, "tracker_stopped", info_hash = ?comms.info_hash);
+        runtime.spawn(
+            async move {
+                let _running = running;
+                let stats = comms.stats.get();
+                let announces = trackers.into_iter().map(|tracker| {
+                    comms.announce_recorded(tracker, Some(TrackerRequestEvent::Stopped), stats)
+                });
+                if tokio::time::timeout(timeout, futures::future::join_all(announces))
+                    .await
+                    .is_err()
+                {
+                    debug!(?timeout, "stopped announce timed out");
+                }
+            }
+            .instrument(span),
+        );
     }
 
     /// Writes each tracker's failures and next announce to the table, `now`
@@ -1862,7 +1986,8 @@ impl TrackerComms {
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
-        let ips = (self.announce_ips)();
+        let announce_ips = self.announce_ips.lock().clone();
+        let ips = announce_ips();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
@@ -2548,6 +2673,141 @@ mod tests {
             query_param(&announced[1], "key")
         );
         drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_task_taken_over_stops_the_trackers_left_out_and_announces_under_every_hash() {
+        let (a, a_url) = http_listener().await;
+        let (b, b_url) = http_listener().await;
+        let v1 = InfoHashes {
+            v1: Some(Id20::new([b'a'; 20])),
+            v2: None,
+        };
+        let hybrid = InfoHashes {
+            v2: Some(Id32::new([b'b'; 32])),
+            ..v1
+        };
+        let stopped = StoppedAnnounces::default();
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            v1,
+            identity(),
+            vec![vec![a_url.clone()]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            no_vote(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        );
+        let (conn, started) = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent peers"),
+            r = read_announce(&a) => r,
+        };
+        assert_eq!(query_param(&started, "event"), Some("started"));
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+        table_once(&status, &mut peers, |t| t[0].last.is_some()).await;
+
+        // Taken over by a run that announces to b alone, under both hashes.
+        let TrackerTask { mut peers, status } = TrackerTask { peers, status }
+            .take_over(hybrid, vec![vec![b_url.clone()]], no_ips())
+            .expect("the task announced under one of the run's hashes");
+        let left_out = async {
+            let (conn, q) = read_announce(&a).await;
+            respond(conn, "d8:intervali1800e5:peers0:e").await;
+            q
+        };
+        let kept = async { (next_announce(&b).await, next_announce(&b).await) };
+        let (stopped_a, (first, second)) = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent peers"),
+            r = async { tokio::join!(left_out, kept) } => r,
+        };
+        // a, which took `started`, is sent `stopped`, under the same hash.
+        assert_eq!(query_param(&stopped_a, "event"), Some("stopped"));
+        assert_eq!(
+            query_param(&stopped_a, "info_hash"),
+            Some("a".repeat(20).as_str())
+        );
+        // b hears one torrent under both its hashes: one key, one peer id.
+        let mut hashes = [&first, &second].map(|q| query_param(q, "info_hash").unwrap());
+        hashes.sort();
+        assert_eq!(hashes, ["a".repeat(20), "b".repeat(20)]);
+        for q in [&stopped_a, &first, &second] {
+            assert_eq!(query_param(q, "key"), query_param(&started, "key"));
+            assert_eq!(query_param(q, "peer_id"), query_param(&started, "peer_id"));
+        }
+        for q in [&first, &second] {
+            assert_eq!(query_param(q, "event"), Some("started"));
+        }
+        assert_eq!(
+            status
+                .announces()
+                .iter()
+                .map(|a| a.url.clone())
+                .collect::<Vec<_>>(),
+            [b_url.to_string()]
+        );
+        drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_task_another_torrents_run_takes_over_is_dropped_with_stopped() {
+        let (a, a_url) = http_listener().await;
+        let mine = InfoHashes {
+            v1: Some(Id20::new([b'a'; 20])),
+            v2: None,
+        };
+        let other = InfoHashes {
+            v1: Some(Id20::new([b'c'; 20])),
+            v2: None,
+        };
+        let stopped = StoppedAnnounces::default();
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
+            mine,
+            identity(),
+            vec![vec![a_url.clone()]],
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_ips(),
+            no_vote(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        );
+        let (conn, started) = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent peers"),
+            r = read_announce(&a) => r,
+        };
+        assert_eq!(query_param(&started, "event"), Some("started"));
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+        table_once(&status, &mut peers, |t| t[0].last.is_some()).await;
+
+        // A run under hashes the task never announced under does not take
+        // it: the task ends, and a hears it stop.
+        let taken =
+            TrackerTask { peers, status }.take_over(other, vec![vec![a_url.clone()]], no_ips());
+        assert!(taken.is_none());
+        let (conn, q) = read_announce(&a).await;
+        respond(conn, "d8:intervali1800e5:peers0:e").await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        assert_eq!(query_param(&q, "info_hash"), Some("a".repeat(20).as_str()));
+        assert_eq!(query_param(&q, "peer_id"), query_param(&started, "peer_id"));
         token.cancel();
     }
 
@@ -4270,6 +4530,20 @@ mod tests {
             list.start_due(t0 + s(10), None, &stats),
             [(http("c"), STARTED)]
         );
+    }
+
+    #[test]
+    fn replaced_trackers_gone_that_accepted_started_are_returned() {
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"], &["b"], &["c"]], t0);
+        let stats = live(0, 90, false);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+
+        // a heard `started` and is owed `stopped`; b never heard from us.
+        let gone = list.replace(&[vec![http("c")]], t0);
+        assert_eq!(gone, [http("a")]);
+        assert_eq!(order(&list), [http("c")]);
     }
 
     #[test]

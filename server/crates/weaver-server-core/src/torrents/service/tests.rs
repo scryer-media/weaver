@@ -2519,6 +2519,151 @@ async fn a_magnets_trackers_read_as_announced_while_its_metainfo_is_fetched() {
     rig.service.stop().await;
 }
 
+// The next announce the tracker on `listener` hears, unanswered, and its
+// event.
+async fn heard_event(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, Option<String>) {
+    use tokio::io::AsyncReadExt;
+
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+        let read = stream.read(&mut buf).await.unwrap();
+        assert!(read > 0, "the announce ended before its request was read");
+        request.extend_from_slice(&buf[..read]);
+    }
+    let request = String::from_utf8_lossy(&request);
+    let path = request.split(' ').nth(1).unwrap();
+    let event = path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default()
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("event="))
+        .map(str::to_owned);
+    (stream, event)
+}
+
+// Answers an announce with no peers.
+async fn answer_no_peers(mut stream: tokio::net::TcpStream) {
+    use tokio::io::AsyncWriteExt;
+
+    let body = b"d8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(&[head.as_bytes(), body].concat())
+        .await
+        .unwrap();
+}
+
+// A magnet's fetch announces `started`, held unanswered until its row reads
+// updating, then answered: the tracker is owed `stopped`.
+async fn started_and_answered(
+    listener: &tokio::net::TcpListener,
+    updates: &mut updates::TorrentUpdates,
+) {
+    let (stream, event) = heard_event(listener).await;
+    assert_eq!(event.as_deref(), Some("started"));
+    while !updates.next().await[0].trackers[0].updating {}
+    answer_no_peers(stream).await;
+    loop {
+        let views = updates.next().await;
+        let tracker = &views[0].trackers[0];
+        if !tracker.updating && tracker.status == TrackerStatus::Working {
+            break;
+        }
+    }
+}
+
+// A magnet paused while its metainfo is fetched stops at its tracker, once,
+// and fetches again when resumed; removed while fetching, it stops again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_tracker() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(format!(
+            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
+            "fd".repeat(20)
+        ))))
+        .await
+        .unwrap();
+    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+
+    started_and_answered(&listener, &mut updates).await;
+    let table = rig.service.inner.live.lock().await[&job_id].fetching.clone();
+
+    rig.service.pause(job_id).await.unwrap();
+    let (stream, event) = heard_event(&listener).await;
+    assert_eq!(event.as_deref(), Some("stopped"));
+    answer_no_peers(stream).await;
+    // The ended fetch's table, given late, is not the paused magnet's.
+    assert!(table.is_some());
+    rig.service.fetching(job_id, table).await;
+    assert!(rig.service.inner.live.lock().await[&job_id].fetching.is_none());
+    // Paused, the magnet shows no fetch's table, so the rows read from here
+    // on are the next fetch's.
+    while updates.next().await[0].trackers[0].status != TrackerStatus::NotContacted {}
+
+    rig.service.resume(job_id).await.unwrap();
+    started_and_answered(&listener, &mut updates).await;
+
+    rig.service.remove(job_id, false, false).await.unwrap();
+    let (stream, event) = heard_event(&listener).await;
+    assert_eq!(event.as_deref(), Some("stopped"));
+    answer_no_peers(stream).await;
+    rig.service.stop().await;
+}
+
+// A magnet added paused fetches nothing and announces nothing until it is
+// resumed; resumed, its fetch announces `started` once, and removed, it
+// stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnet_added_paused_announces_only_once_resumed() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Magnet(format!(
+                "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
+                "fe".repeat(20)
+            )))
+        })
+        .await
+        .unwrap();
+    // The add started no fetch: the magnet waits for its resume.
+    assert!(matches!(
+        rig.service.inner.live.lock().await[&job_id].resolving,
+        Some(Resolving::Paused)
+    ));
+    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+
+    rig.service.resume(job_id).await.unwrap();
+    started_and_answered(&listener, &mut updates).await;
+
+    // The next announce the tracker hears is the remove's `stopped`: one
+    // fetch, one presence.
+    rig.service.remove(job_id, false, false).await.unwrap();
+    let (stream, event) = heard_event(&listener).await;
+    assert_eq!(event.as_deref(), Some("stopped"));
+    answer_no_peers(stream).await;
+    rig.service.stop().await;
+}
+
 // A torrent under a tracker rule that names a client names itself as that
 // client to its peers and trackers; a torrent under no rule names itself as
 // Weaver.
@@ -3308,7 +3453,7 @@ async fn a_ban_made_in_no_session_holds_once_the_torrent_is_in_one() {
     assert_eq!(rig.db.torrent_peers(job_id).unwrap().banned, [early]);
     rig.routes.set_down(None);
     on_loopback(&rig.routes);
-    rig.service.attach(job_id).await;
+    rig.service.attach(job_id, None).await;
     assert_eq!(
         handle_of(&rig.service, job_id)
             .await

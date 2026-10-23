@@ -44,7 +44,7 @@ use crate::torrent_state::live::{
 };
 use crate::tracker::{
     AnnounceIps, AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerComms,
-    UdpTrackerClient, Unreachable,
+    TrackerHandover, TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
     PortMapEvents, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
@@ -664,6 +664,13 @@ pub struct AddTorrentOptions {
     /// given or trackers are off.
     #[serde(skip)]
     pub metadata_trackers: Option<tokio::sync::oneshot::Sender<crate::tracker::TrackerStatus>>,
+    /// The tracker task a metadata fetch of this torrent on this session
+    /// announced from (see [`ListOnlyResponse::trackers`]): a run started
+    /// by this add takes it over, so its trackers hear one torrent, and
+    /// should go by the [`Self::identity`] the fetch announced under. A
+    /// paused add, or one that fails, drops it, which sends `stopped`.
+    #[serde(skip)]
+    pub tracker_handover: Option<TrackerHandover>,
 }
 
 const fn v1_hashes_disabled_by_default() -> bool {
@@ -703,6 +710,7 @@ impl Default for AddTorrentOptions {
             trackers_only: false,
             ssl_identity: None,
             metadata_trackers: None,
+            tracker_handover: None,
         }
     }
 }
@@ -717,6 +725,11 @@ pub struct ListOnlyResponse {
     pub output_folder: PathBuf,
     pub seen_peers: Vec<SocketAddr>,
     pub torrent_bytes: Bytes,
+    /// The tracker task the metadata fetch announced from, held for the run
+    /// that follows on this session (see
+    /// [`AddTorrentOptions::tracker_handover`]). Dropping it first sends
+    /// `stopped`. None when the metadata was given or trackers are off.
+    pub trackers: Option<TrackerHandover>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -2349,10 +2362,13 @@ impl Session {
             .unwrap_or_else(|| self.identity.clone());
         let dht_announce = tokio::sync::watch::channel(()).0;
 
-        let make_peer_rx = |private: bool| {
+        let make_peer_rx = |info_hashes: InfoHashes,
+                            identity: &Identity,
+                            private: bool,
+                            trackers: Option<TrackerTask>| {
             self.make_peer_rx(
                 info_hashes,
-                &identity,
+                identity,
                 tracker_tiers.clone(),
                 !opts.paused && !opts.list_only,
                 opts.force_tracker_interval,
@@ -2360,6 +2376,7 @@ impl Session {
                 trackers_only(private, opts.trackers_only),
                 dht_announce.subscribe(),
                 None,
+                trackers,
             )
         };
 
@@ -2373,76 +2390,80 @@ impl Session {
             opts.banned_peers.iter().copied(),
         );
 
-        let (metadata, peer_rx, peer_list) = {
-            match metadata {
-                Some(metadata) => {
-                    // An SSL torrent's peers are found as it goes live, under
-                    // its identity.
-                    let mut peer_rx = None;
-                    if !opts.paused && !opts.list_only && metadata.info.info().ssl_cert.is_none() {
-                        peer_rx = make_peer_rx(metadata.info.info().private);
-                    }
-                    (metadata, peer_rx, peer_list)
+        // The tracker task of this torrent's metadata fetch, for the run
+        // that follows: the caller's, or this magnet's own.
+        let mut handover = opts.tracker_handover.take();
+        let (metadata, peer_list) = match metadata {
+            Some(metadata) => (metadata, peer_list),
+            None => {
+                if (opts.trackers_only || (self.dht.is_none() && self.lsd.is_none()))
+                    && tracker_tiers.is_empty()
+                    && opts.initial_peers.as_ref().is_none_or(Vec::is_empty)
+                {
+                    bail!("no known way to resolve peers (no DHT, no trackers, no initial_peers)");
                 }
-                None => {
-                    if (opts.trackers_only || (self.dht.is_none() && self.lsd.is_none()))
-                        && tracker_tiers.is_empty()
-                        && opts.initial_peers.as_ref().is_none_or(Vec::is_empty)
-                    {
-                        bail!(
-                            "no known way to resolve peers (no DHT, no trackers, no initial_peers)"
-                        );
-                    }
-                    // Whether the torrent is private is known only once its
-                    // metadata arrives.
-                    let fetched_trackers_only = trackers_only(false, opts.trackers_only);
-                    let PeerSource { peers, trackers } = make_peer_rx(false).context(
+                // Whether the torrent is private is known only once its
+                // metadata arrives.
+                handover = handover.or_else(|| {
+                    self.start_trackers(
+                        info_hashes,
+                        &identity,
+                        tracker_tiers.clone(),
+                        opts.force_tracker_interval,
+                        trackers_only(false, opts.trackers_only),
+                        None,
+                    )
+                    .map(TrackerHandover::new)
+                });
+                let fetched = handover.as_ref().map(TrackerHandover::task);
+                if let (Some(tx), Some(fetched)) = (opts.metadata_trackers.take(), &fetched) {
+                    let _ = tx.send(fetched.status.clone());
+                }
+                let PeerSource { peers, .. } = make_peer_rx(info_hashes, &identity, false, fetched)
+                    .context(
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
-                    if let (Some(tx), Some(table)) =
-                        (opts.metadata_trackers.take(), trackers.as_ref())
-                    {
-                        let _ = tx.send(table.clone());
-                    }
-                    let resolved_magnet = self
-                        .resolve_magnet(
-                            info_hashes,
-                            &identity,
-                            peers,
-                            peer_list,
-                            &tracker_tiers,
-                            opts.peer_opts,
-                        )
-                        .await?;
+                let resolved_magnet = self
+                    .resolve_magnet(
+                        info_hashes,
+                        &identity,
+                        peers,
+                        peer_list,
+                        &tracker_tiers,
+                        opts.peer_opts,
+                    )
+                    .await?;
 
-                    seen_peers = resolved_magnet.seen_peers;
-                    let peer_rx = if resolved_magnet.metadata.info.info().ssl_cert.is_some() {
-                        // The metadata came over plain connections; an SSL
-                        // torrent's own are TLS, found as it goes live.
-                        drop(resolved_magnet.peer_rx);
-                        None
-                    } else if trackers_only(
-                        resolved_magnet.metadata.info.info().private,
-                        opts.trackers_only,
-                    ) != fetched_trackers_only
-                    {
-                        // A private torrent takes peers only from its own
-                        // trackers from here on (BEP 27): drop the discovery
-                        // used to fetch the metadata.
-                        drop(resolved_magnet.peer_rx);
-                        make_peer_rx(true)
-                    } else {
-                        Some(PeerSource {
-                            peers: resolved_magnet.peer_rx,
-                            trackers,
-                        })
-                    };
-                    // The peers the fetch found stay on the list it wrote
-                    // into, with what their connections left there.
-                    (resolved_magnet.metadata, peer_rx, resolved_magnet.peers)
-                }
+                seen_peers = resolved_magnet.seen_peers;
+                // The fetch's own discovery ends with it; its trackers carry
+                // on into the run.
+                drop(resolved_magnet.peer_rx);
+                // The peers the fetch found stay on the list it wrote
+                // into, with what their connections left there.
+                (resolved_magnet.metadata, resolved_magnet.peers)
             }
         };
+
+        // A running torrent finds its peers from the start; an SSL torrent's
+        // are found as it goes live, under its identity. Its trackers hear
+        // it as the torrent its metadata fetch announced: that fetch's task
+        // carries on, starting from the peers it found.
+        let mut peer_rx = None;
+        if !opts.paused && !opts.list_only && metadata.info.info().ssl_cert.is_none() {
+            let private = metadata.info.info().private;
+            let trackers_only = trackers_only(private, opts.trackers_only);
+            let trackers = handover
+                .take()
+                .and_then(TrackerHandover::take)
+                .and_then(|task| {
+                    task.take_over(
+                        metadata.info_hashes,
+                        self.announce_tiers(tracker_tiers.clone(), trackers_only),
+                        self.announce_ips(trackers_only),
+                    )
+                });
+            peer_rx = make_peer_rx(metadata.info_hashes, &identity, private, trackers);
+        }
 
         trace!("Torrent metadata: {:#?}", &metadata.info.info());
         // A magnet link names some of the hashes; the metadata has them all.
@@ -2516,6 +2537,7 @@ impl Session {
                 first_last_piece_first: opts.first_last_piece_first,
                 output_folder,
                 seen_peers,
+                trackers: handover,
             }));
         }
 
@@ -2759,6 +2781,7 @@ impl Session {
             t.takes_peers_from_trackers_only(),
             t.shared().dht_announce.subscribe(),
             t.shared().ssl.as_ref(),
+            None,
         )
     }
 
@@ -2821,6 +2844,61 @@ impl Session {
         })
     }
 
+    // A torrent's tracker task, under every hash it goes by. The task runs
+    // with no tracker too, so trackers added later are announced to; a
+    // session without trackers starts none.
+    fn start_trackers(
+        self: &Arc<Self>,
+        info_hashes: InfoHashes,
+        identity: &Identity,
+        tracker_tiers: Vec<Vec<url::Url>>,
+        force_tracker_interval: Option<Duration>,
+        trackers_only: bool,
+        ssl: Option<&Arc<SslTorrent>>,
+    ) -> Option<TrackerTask> {
+        if self.disable_trackers {
+            return None;
+        }
+        let stats = PeerRxTorrentInfo {
+            info_hashes,
+            session: Arc::downgrade(self),
+            torrent: Default::default(),
+        };
+        Some(TrackerComms::start_with_tiers(
+            info_hashes,
+            identity.clone(),
+            self.announce_tiers(tracker_tiers, trackers_only),
+            Box::new(stats),
+            force_tracker_interval,
+            match ssl {
+                Some(_) => self.ssl_port.subscribe(),
+                None => self.announce_port.subscribe(),
+            },
+            self.announce_ips(trackers_only),
+            self.external_ips.tracker_vote(),
+            match ssl {
+                Some(ssl) => Arc::new(SslHttpClients {
+                    inner: self.http_clients.clone(),
+                    ssl: ssl.clone(),
+                }),
+                None => self.http_clients.clone(),
+            },
+            self.reachable(),
+            self.udp_tracker_client.clone(),
+            self.stopped_announces.clone(),
+        ))
+    }
+
+    // Only a torrent that takes peers from its trackers alone tells them our
+    // addresses.
+    fn announce_ips(&self, trackers_only: bool) -> AnnounceIps {
+        if trackers_only {
+            self.own_ips.clone()
+        } else {
+            Arc::new(Vec::new)
+        }
+    }
+
     // Get a peer stream from both DHT and trackers, under every hash the
     // torrent goes by (libtorrent `torrent::dht_announce`, `lsd_announce`
     // and `announce_with_tracker` each loop over `info_hash_t::for_each`).
@@ -2835,6 +2913,7 @@ impl Session {
         trackers_only: bool,
         dht_announce: tokio::sync::watch::Receiver<()>,
         ssl: Option<&Arc<SslTorrent>>,
+        trackers: Option<TrackerTask>,
     ) -> Option<PeerSource> {
         // An SSL torrent with no identity asks no one for peers.
         if ssl.is_some_and(|ssl| !ssl.has_identity()) {
@@ -2891,41 +2970,15 @@ impl Session {
             })
         };
 
-        let tracker_rx_stats = PeerRxTorrentInfo {
-            info_hashes,
-            session: Arc::downgrade(self),
-            torrent: Default::default(),
-        };
-        // The task runs with no tracker too, so trackers added later are
-        // announced to; a session without trackers starts none.
-        let (tracker_rx, trackers) = (!self.disable_trackers)
-            .then(|| {
-                TrackerComms::start_with_tiers(
+        let (tracker_rx, trackers) = trackers
+            .or_else(|| {
+                self.start_trackers(
                     info_hashes,
-                    identity.clone(),
-                    self.announce_tiers(tracker_tiers, trackers_only),
-                    Box::new(tracker_rx_stats),
+                    identity,
+                    tracker_tiers,
                     force_tracker_interval,
-                    port(),
-                    // Only a torrent that takes peers from its trackers alone
-                    // tells them our addresses (libtorrent
-                    // `torrent::build_tracker_request`, for a private one).
-                    if trackers_only {
-                        self.own_ips.clone()
-                    } else {
-                        Arc::new(Vec::new)
-                    },
-                    self.external_ips.tracker_vote(),
-                    match ssl {
-                        Some(ssl) => Arc::new(SslHttpClients {
-                            inner: self.http_clients.clone(),
-                            ssl: ssl.clone(),
-                        }),
-                        None => self.http_clients.clone(),
-                    },
-                    self.reachable(),
-                    self.udp_tracker_client.clone(),
-                    self.stopped_announces.clone(),
+                    trackers_only,
+                    ssl,
                 )
             })
             .map(|task| (task.peers, task.status))

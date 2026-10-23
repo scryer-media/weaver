@@ -598,6 +598,8 @@ struct Parsed {
     manifest: Manifest,
     layout: Arc<PieceLayout>,
     private: bool,
+    // The metainfo names a CA its peers' certificates are signed by.
+    ssl: bool,
     trackers: Vec<TrackerEntry>,
     total: u64,
     about: About,
@@ -741,6 +743,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed, AddError> {
             .map(|file| file.length)
             .sum(),
         private: info.info().private,
+        ssl: info.info().ssl_cert.is_some(),
         layout,
         trackers,
         about: About {
@@ -778,6 +781,23 @@ struct OnLeg {
     own_sockets: bool,
 }
 
+// A magnet's metadata fetch on its route's session, for the run that
+// follows it: the session, the identity its trackers heard `started` under,
+// and its tracker task.
+struct Fetched {
+    session: Arc<Session>,
+    identity: Identity,
+    trackers: weaver_torrent::tracker::TrackerHandover,
+}
+
+// A magnet's metadata fetch: running, or ended by a pause, which a resume
+// starts again. Removing or pausing the torrent aborts a running fetch,
+// which lets its trackers go with one `stopped`.
+enum Resolving {
+    Fetching(tokio::task::AbortHandle),
+    Paused,
+}
+
 // What the service keeps of each torrent while it lives.
 struct Live {
     record: TorrentRecord,
@@ -801,6 +821,8 @@ struct Live {
     // The announce table of a magnet's metadata fetch, while the fetch runs:
     // its trackers are announced to before the torrent is in a session.
     fetching: Option<weaver_torrent::TrackerStatus>,
+    // A magnet's metadata fetch, until it ends.
+    resolving: Option<Resolving>,
     route: Option<RouteKey>,
     held: Option<Held>,
     about: About,
@@ -901,6 +923,7 @@ impl Live {
             intake: None,
             attached: None,
             fetching: None,
+            resolving: None,
             route: None,
             held: None,
             about: About::default(),
@@ -2186,7 +2209,7 @@ impl TorrentService {
                 self.give_metainfo(&mut torrent, &parsed);
                 self.inner.live.lock().await.insert(job_id, torrent);
                 self.apply_queue().await;
-                self.attach(job_id).await;
+                self.attach(job_id, None).await;
                 self.publish().await;
                 Ok(job_id)
             }
@@ -2243,7 +2266,8 @@ impl TorrentService {
                 let terms = PeerTerms::of(torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
-                self.spawn_resolve(job_id, plan, uri, None, identity, terms);
+                self.spawn_resolve(job_id, plan, uri, None, identity, terms)
+                    .await;
                 self.publish().await;
                 Ok(job_id)
             }
@@ -2372,71 +2396,138 @@ impl TorrentService {
 
     // Fetch a magnet's metainfo on its route's session, once the route has
     // one, then admit it as any other. A route that gives no session holds
-    // the magnet, which resolves again at a later tick.
-    fn spawn_resolve(
+    // the magnet, which resolves again at a later tick. Until the fetch
+    // ends, removing or pausing the torrent ends it (see `Resolving`). A
+    // magnet already fetching goes on with that fetch; a paused one waits
+    // for its resume to fetch.
+    async fn spawn_resolve(
         &self,
         job_id: JobId,
         plan: RoutePlan,
         uri: String,
-        trackers: Option<Vec<String>>,
+        tracker_tiers: Option<Vec<Vec<String>>>,
         identity: Identity,
         terms: PeerTerms,
     ) {
         let service = self.clone();
-        self.keep(tokio::spawn(async move {
-            let session = match service.inner.sessions.session(&plan).await {
-                Ok(session) => session,
-                Err(error) => {
-                    return service.held(job_id, Some(plan.key), held_by(error)).await;
-                }
-            };
-            let mut options = AddTorrentOptions {
-                list_only: true,
-                trackers,
-                identity: Some(identity),
-                ..Default::default()
-            };
-            terms.apply(&mut options);
-            // The fetch's announce table is the torrent's while the fetch
-            // runs, and no longer once it ends.
-            let (table_tx, table_rx) = oneshot::channel();
-            options.metadata_trackers = Some(table_tx);
-            let fetch = session.add_torrent(AddTorrent::from_url(uri), Some(options));
-            let fetching = async {
-                if let Ok(table) = table_rx.await {
-                    service.fetching(job_id, Some(table)).await;
-                }
-            };
-            let (listed, ()) = tokio::join!(fetch, fetching);
-            service.fetching(job_id, None).await;
-            let bytes = match listed {
-                Ok(AddTorrentResponse::ListOnly(listed)) => listed.torrent_bytes,
-                Ok(_) => {
-                    service
-                        .fail(job_id, "the session did not return the metainfo".into())
-                        .await;
-                    return;
-                }
-                Err(error) => {
-                    service.fail(job_id, format!("{error:#}")).await;
-                    return;
-                }
-            };
-            if let Err(error) = service.resolved(job_id, bytes).await {
-                service.fail(job_id, error.to_string()).await;
+        let mut live = self.inner.live.lock().await;
+        let Some(torrent) = live.get_mut(&job_id) else {
+            return;
+        };
+        match torrent.resolving {
+            Some(Resolving::Fetching(_)) => return,
+            _ if !torrent.resumed() => {
+                torrent.resolving = Some(Resolving::Paused);
+                return;
             }
-        }));
+            _ => {}
+        }
+        let task = tokio::spawn(async move {
+            service
+                .resolve_on(job_id, plan, uri, tracker_tiers, identity, terms)
+                .await;
+            // The fetch's announce table is the torrent's until it is
+            // attached, which reads the same table, or the fetch's
+            // trackers are let go.
+            service.fetching(job_id, None).await;
+        });
+        torrent.resolving = Some(Resolving::Fetching(task.abort_handle()));
+        drop(live);
+        self.keep(task);
+    }
+
+    async fn resolve_on(
+        &self,
+        job_id: JobId,
+        plan: RoutePlan,
+        uri: String,
+        tracker_tiers: Option<Vec<Vec<String>>>,
+        identity: Identity,
+        terms: PeerTerms,
+    ) {
+        let session = match self.inner.sessions.session(&plan).await {
+            Ok(session) => session,
+            Err(error) => {
+                self.fetch_ended(job_id).await;
+                return self.held(job_id, Some(plan.key), held_by(error)).await;
+            }
+        };
+        let mut options = AddTorrentOptions {
+            list_only: true,
+            tracker_tiers,
+            identity: Some(identity.clone()),
+            ..Default::default()
+        };
+        terms.apply(&mut options);
+        let (table_tx, table_rx) = oneshot::channel();
+        options.metadata_trackers = Some(table_tx);
+        let fetch = session.add_torrent(AddTorrent::from_url(uri), Some(options));
+        let fetching = async {
+            if let Ok(table) = table_rx.await {
+                self.fetching(job_id, Some(table)).await;
+            }
+        };
+        let (listed, ()) = tokio::join!(fetch, fetching);
+        if !self.fetch_ended(job_id).await {
+            return;
+        }
+        let listed = match listed {
+            Ok(AddTorrentResponse::ListOnly(listed)) => listed,
+            Ok(_) => {
+                self.fail(job_id, "the session did not return the metainfo".into())
+                    .await;
+                return;
+            }
+            Err(error) => {
+                self.fail(job_id, format!("{error:#}")).await;
+                return;
+            }
+        };
+        // The fetch's trackers go to the attach, which takes them over or
+        // lets them go.
+        let fetched = listed.trackers.map(|trackers| Fetched {
+            session,
+            identity,
+            trackers,
+        });
+        if let Err(error) = self.resolved(job_id, listed.torrent_bytes, fetched).await {
+            self.fail(job_id, error.to_string()).await;
+        }
+    }
+
+    // A magnet's metadata fetch has ended: false when the torrent is gone,
+    // or a pause ended the fetch first.
+    async fn fetch_ended(&self, job_id: JobId) -> bool {
+        let mut live = self.inner.live.lock().await;
+        let Some(torrent) = live.get_mut(&job_id) else {
+            return false;
+        };
+        match torrent.resolving.take() {
+            Some(Resolving::Fetching(_)) => true,
+            paused => {
+                torrent.resolving = paused;
+                false
+            }
+        }
     }
 
     // The announce table a magnet's metadata fetch announces from becomes
-    // `table`.
+    // `table`. A table is the torrent's only while a fetch runs: one a fetch
+    // the pause ended still gives is not shown.
     async fn fetching(&self, job_id: JobId, table: Option<weaver_torrent::TrackerStatus>) {
-        if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
+        if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id)
+            && (table.is_none() || matches!(torrent.resolving, Some(Resolving::Fetching(_))))
+        {
             torrent.fetching = table;
         }
     }
 
-    async fn resolved(&self, job_id: JobId, bytes: Bytes) -> Result<(), AddError> {
+    async fn resolved(
+        &self,
+        job_id: JobId,
+        bytes: Bytes,
+        fetched: Option<Fetched>,
+    ) -> Result<(), AddError> {
         let parsed = parse(&bytes)?;
         self.admit(&parsed.manifest)?;
         let settings = self.settings();
@@ -2495,7 +2586,10 @@ impl TorrentService {
             .map_err(|error| AddError::State(state_error(error)))?;
         self.give_metainfo(torrent, &parsed);
         drop(live);
-        self.attach(job_id).await;
+        // An SSL torrent's trackers hear it only as it goes live, under its
+        // own identity: the fetch's trackers are let go here.
+        let fetched = fetched.filter(|_| !parsed.ssl);
+        self.attach(job_id, fetched).await;
         Ok(())
     }
 
@@ -2523,27 +2617,36 @@ impl TorrentService {
             torrent.held = None;
         }
         let uri = Magnet::of(hashes_of(&record), None, Vec::new()).to_string();
-        let trackers = self
-            .inner
-            .db
-            .list_torrent_trackers(job_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tracker| tracker.url)
-            .collect();
+        // The trackers it lists, in their tiers: a magnet's fetch announces
+        // to tiers, not to a bare list.
+        let tiers = tracker_tiers(
+            &self
+                .inner
+                .db
+                .list_torrent_trackers(job_id)
+                .unwrap_or_default(),
+        )
+        .into_iter()
+        .map(|tier| tier.into_iter().map(String::from).collect())
+        .collect();
         self.spawn_resolve(
             job_id,
             plan,
             uri,
-            Some(trackers),
+            Some(tiers),
             identity_of(rule),
             PeerTerms::of(rule),
-        );
+        )
+        .await;
     }
 
     // Put a torrent in its route's session, or hold it while the route is
-    // down.
-    async fn attach(&self, job_id: JobId) {
+    // down. A torrent whose metadata was just `fetched` takes over the
+    // fetch's trackers when it starts running now, on the fetch's session
+    // as the client the fetch named, under the identity they heard `started` from, so
+    // they hear one torrent; otherwise the fetch's trackers are let go,
+    // which sends them `stopped`, and the run starts its own.
+    async fn attach(&self, job_id: JobId, fetched: Option<Fetched>) {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
@@ -2636,6 +2739,17 @@ impl TorrentService {
                 return;
             }
         };
+        let (identity, tracker_handover) = match fetched {
+            Some(fetched)
+                if !paused
+                    && Arc::ptr_eq(&fetched.session, &session)
+                    && (&fetched.identity.version, &fetched.identity.user_agent)
+                        == (&identity.version, &identity.user_agent) =>
+            {
+                (fetched.identity, Some(fetched.trackers))
+            }
+            _ => (identity, None),
+        };
         let factory =
             PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>, self.resident(job_id));
         let mut options = AddTorrentOptions {
@@ -2651,6 +2765,7 @@ impl TorrentService {
             file_priorities: Some(picking.0),
             sequential: picking.1,
             first_last_piece_first: picking.2,
+            tracker_handover,
             ..Default::default()
         };
         terms.apply(&mut options);
@@ -2860,6 +2975,9 @@ impl TorrentService {
         }
         let mut torrent = live.remove(&job_id).ok_or(ActionError::NotFound(job_id))?;
         drop(live);
+        if let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
+            fetch.abort();
+        }
         self.detach(&mut torrent).await;
         if delete_files && let Some(dir) = torrent.record.storage_dir.clone() {
             match tokio::fs::remove_dir_all(&dir).await {
@@ -3098,6 +3216,17 @@ impl TorrentService {
 
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {
         self.set_intent(job_id, TorrentIntent::Paused).await?;
+        self.with_torrent(job_id, |torrent| {
+            if let Some(Resolving::Fetching(fetch)) = &torrent.resolving {
+                fetch.abort();
+                torrent.resolving = Some(Resolving::Paused);
+                // A paused magnet shows no fetch's table, as one paused
+                // before its fetch began.
+                torrent.fetching = None;
+            }
+            Ok(())
+        })
+        .await?;
         self.apply_queue().await;
         self.publish().await;
         Ok(())
@@ -3106,6 +3235,18 @@ impl TorrentService {
     /// Resume a paused torrent, or one its seeding goal stopped.
     pub async fn resume(&self, job_id: JobId) -> Result<(), ActionError> {
         self.set_intent(job_id, TorrentIntent::Resumed).await?;
+        // A fetch the pause ended starts again.
+        let refetch = self
+            .with_torrent(job_id, |torrent| {
+                Ok(torrent
+                    .resolving
+                    .take_if(|fetch| matches!(fetch, Resolving::Paused))
+                    .is_some())
+            })
+            .await?;
+        if refetch {
+            self.resolve(job_id).await;
+        }
         self.apply_queue().await;
         self.publish().await;
         Ok(())
@@ -3350,7 +3491,7 @@ impl TorrentService {
             moved
         };
         if moved {
-            self.attach(job_id).await;
+            self.attach(job_id, None).await;
         }
         self.publish().await;
         Ok(())
@@ -3583,7 +3724,7 @@ impl TorrentService {
             self.inner.sessions.hold(&key, reason).await;
         }
         for job_id in reattach {
-            self.attach(job_id).await;
+            self.attach(job_id, None).await;
         }
         for job_id in unresolved {
             self.resolve(job_id).await;
