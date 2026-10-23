@@ -23,6 +23,9 @@ pub const DIRECT_STORE_BARRIER_PUBLISH: &str = "direct_store.barrier.publish";
 // A segment batch's disk write on the owner thread, before any byte lands.
 pub const DISK_WRITE: &str = "download.disk_write";
 
+// A PAR2 repair on its blocking worker, before the session reads anything.
+pub const PAR2_REPAIR_RUN: &str = "repair.par2_run";
+
 struct ConfiguredFailpoint {
     name: String,
     fired: AtomicBool,

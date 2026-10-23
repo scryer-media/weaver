@@ -672,13 +672,18 @@ impl Pipeline {
                     .collect::<Vec<_>>();
                 (repair_placement_overrides.unwrap_or_default(), evidence)
             });
+            let hold_dir = working_dir.clone();
             let repair_task = tokio::task::spawn_blocking(move || {
                 if repair {
                     crate::e2e_failpoint::maybe_delay("repair.task_start");
+                    crate::e2e_failpoint::maybe_hold(
+                        crate::e2e_failpoint::PAR2_REPAIR_RUN,
+                        &hold_dir,
+                    );
                 }
                 run_retained_par2_session(session, candidates, slice_evidence, repair)
             });
-            let repair_result = repair_task.await;
+            let repair_result = self.await_inline_par2_run(repair_task).await;
             let retained_outcome = match repair_result {
                 Ok((session, Ok((outcome, admitted_file_ids, retried_source_change)))) => {
                     #[cfg(test)]
@@ -759,7 +764,7 @@ impl Pipeline {
                             fallback_progress,
                         )
                     });
-                    let fallback_result = fallback_task.await;
+                    let fallback_result = self.await_inline_par2_run(fallback_task).await;
                     match fallback_result {
                         Ok(result) => result,
                         Err(error) => Err(format!(
@@ -843,7 +848,7 @@ impl Pipeline {
             ensure_par2_repair_completed(&outcome, repair)?;
             Ok((outcome, scan_carry))
         });
-        let repair_result = repair_task.await;
+        let repair_result = self.await_inline_par2_run(repair_task).await;
 
         if repair {
             self.phase_end(job_id, JobPhase::Repairing);
