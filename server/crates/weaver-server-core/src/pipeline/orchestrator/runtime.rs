@@ -1203,6 +1203,11 @@ impl Pipeline {
                 turn_active = true;
                 self.settle_direct_end_header_verdicts().await;
             }
+            // So does a set whose holds nothing left to arrive can place.
+            if !self.direct_store.unplaceable_verdicts.is_empty() {
+                turn_active = true;
+                self.settle_direct_unplaceable_sets().await;
+            }
 
             let pending_completion_checks = self.pending_completion_checks.len();
             turn_active |= pending_completion_checks > 0;

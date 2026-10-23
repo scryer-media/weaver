@@ -322,6 +322,12 @@ impl Pipeline {
         }
         let sweep_held = self.demotion_sweep_held_file_indices(job_id);
         let direct_admission = self.direct_store_admission(job_id);
+        if direct_admission
+            .iter()
+            .any(DirectStoreAdmission::unplaceable)
+        {
+            self.direct_store.unplaceable_verdicts.insert(job_id);
+        }
         if let Err(blocked) = self.queued_file_may_pass(
             job_id,
             &direct_admission,

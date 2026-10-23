@@ -234,6 +234,10 @@ pub(crate) struct DirectStoreRuntime {
     // to be handed over on the next turn. The booking that rules an article
     // missing cannot demote a set itself, so it notes the job here.
     end_header_verdicts: std::collections::BTreeSet<JobId>,
+    // Jobs a download admission pass found holding a set that cannot place
+    // another byte, to be handed over on the next turn. See
+    // `DirectStoreAdmission::unplaceable`.
+    pub(crate) unplaceable_verdicts: std::collections::BTreeSet<JobId>,
     // Destinations already created and marked sparse, per job. A member stored
     // inside a directory names a partial inside that directory and nothing
     // else creates it, and every destination has to carry the sparse attribute
