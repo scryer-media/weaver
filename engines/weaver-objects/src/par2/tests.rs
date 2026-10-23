@@ -397,11 +397,11 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
 
 // An object that has found no set has not ruled while its volume's bytes
 // may still hold one: the front of an index is only a packet header. Once
-// the volume is read through with no set in it, there is nothing to rule
-// on: it is Clean, not due again every step, and a set found later makes it
-// due once.
+// the volume is read through with no set in it, nothing was checked: it is
+// Unread, no verdict on any member, not due again every step, and a set
+// found later makes it due once.
 #[test]
-fn an_object_with_no_sets_rules_clean_once_a_volume_is_read_through() {
+fn an_object_with_no_sets_rules_unread_once_a_volume_is_read_through() {
     let data = payload(18, 5000);
     let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
     let mut job = Job::new(Par2::new(OWN), OWN);
@@ -423,9 +423,9 @@ fn an_object_with_no_sets_rules_clean_once_a_volume_is_read_through() {
     assert!(job.object.sets.is_empty());
     assert_eq!(job.object.outcome(), None);
     job.object.volume_closed(volume, &mut out);
-    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
-    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
     job.volume(&files[1].0, &files[1].1, ARTICLE as usize, false);
     assert_eq!(job.object.outcome(), None);
 }
@@ -881,7 +881,7 @@ fn damage_raises_the_smallest_volumes_its_shortfall_needs_and_defers_the_rest() 
     let data = payload(41, 5000);
     let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 8, 3);
     let mut volumes: Vec<_> = files[1..].to_vec();
-    let blocks = |name: &str| super::sets::named_blocks(name).unwrap_or(0);
+    let blocks = |name: &str| crate::recovery_volume::named_blocks(name, ".par2").unwrap_or(0);
     volumes.sort_by_key(|(name, _)| std::cmp::Reverse(blocks(name)));
     let mut job = job(&files[..1]);
     let sampled: Vec<_> = volumes.iter().map(|file| head(&mut job, file)).collect();

@@ -115,7 +115,8 @@ impl NamespaceWriter {
 
     // Each set of every namespace, parents first, with what it last ruled.
     // A set whose repair is out is one whose ruling is pending; what it said
-    // when it left is its lender's to tell.
+    // when it left is its lender's to tell. A set that read nothing ruled on
+    // nothing, so it is not among them.
     pub(crate) fn states(&self, tree: &Tree) -> Vec<SetState> {
         self.sets(tree)
             .into_iter()
@@ -133,11 +134,12 @@ impl NamespaceWriter {
                 outcome: None,
             });
         };
-        Some(SetState {
+        let outcome = recovery.outcome();
+        (outcome != Some(RepairOutcome::Unread)).then_some(SetState {
             node,
             namespace,
             kind,
-            outcome: recovery.outcome(),
+            outcome,
         })
     }
 
@@ -495,9 +497,10 @@ impl NamespaceWriter {
                             .any(|covering| covering == set)
                     })
                     .filter_map(|(member, range)| {
-                        let length = namespace.get(member)?.length.unwrap_or(range.end);
-                        let proves = tree.recovery(set)?.proves(member, length);
-                        Some((member, range.intersect(proves)?))
+                        Some((
+                            member,
+                            namespace.proven(member, range, tree.recovery(set)?)?,
+                        ))
                     })
                     .collect()
             })

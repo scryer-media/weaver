@@ -23,6 +23,7 @@ pub(super) fn repaired(summary: &RecoverySummary, outcomes: &[RepairOutcome]) {
             RepairOutcome::Repaired { .. } => "repaired",
             RepairOutcome::Impossible { .. } => "impossible",
             RepairOutcome::Waiting => "waiting",
+            RepairOutcome::Unread => "unread",
         };
         record_value_owned(format!("graph.repair.{reason}.{}", set.kind), 1);
     }

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::deliver::Provenance;
 use crate::object::ObjectId;
+use crate::recovery::Recovery;
 use crate::volume::ByteRange;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -648,6 +649,20 @@ impl Namespace {
     // Coverage is the one record of damage; completion reads it here.
     pub fn is_clean(&self) -> bool {
         self.members().all(|member| member.coverage.is_clean())
+    }
+
+    // What of the member's damaged `range` a recovery object that found the
+    // member whole or made it so proves: the part its checks reach, over
+    // the member's length, or up to the range's end while that length is
+    // not known.
+    pub fn proven(
+        &self,
+        member: MemberId,
+        range: ByteRange,
+        recovery: &dyn Recovery,
+    ) -> Option<ByteRange> {
+        let length = self.get(member)?.length.unwrap_or(range.end);
+        range.intersect(recovery.proves(member, length))
     }
 
     // Every damaged range of every member, in member order.

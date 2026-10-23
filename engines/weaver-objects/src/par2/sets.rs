@@ -17,6 +17,7 @@ use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Wei
 use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
+use crate::recovery_volume;
 
 const MAX_PAR2_INPUT_SLICES: u64 = 32_768;
 
@@ -243,7 +244,7 @@ pub(super) struct Volume {
 
 impl Volume {
     pub(super) fn name(&mut self, name: &str) {
-        self.named_blocks = named_blocks(name);
+        self.named_blocks = recovery_volume::named_blocks(name, ".par2");
     }
 
     // Whether the volume can bring the set blocks: it carries the set's
@@ -263,26 +264,16 @@ impl Volume {
 
     // Ask for every byte of the volume not yet in hand.
     pub(super) fn ask(&self, index: VolumeIndex, out: &mut Vec<Seek>) {
-        self.gaps(|range| out.push(Seek::recovery(index, range, Weight::FIRST)));
+        recovery_volume::gaps(&self.arrived, |range| {
+            out.push(Seek::recovery(index, range, Weight::FIRST))
+        });
     }
 
     // Say every byte of the volume not yet in hand is not wanted yet.
     pub(super) fn defer(&self, index: VolumeIndex, out: &mut Vec<Seek>) {
-        self.gaps(|range| out.push(Seek::deferred(index, range)));
-    }
-
-    // Each range of the volume not yet in hand, the last open-ended: the
-    // volume's length is the parent's to know, and the root clamps an open
-    // end to it.
-    fn gaps(&self, mut each: impl FnMut(ByteRange)) {
-        let mut cursor = 0;
-        for run in self.arrived.runs() {
-            if run.range.start > cursor {
-                each(ByteRange::new(cursor, run.range.start));
-            }
-            cursor = run.range.end;
-        }
-        each(ByteRange::new(cursor, u64::MAX));
+        recovery_volume::gaps(&self.arrived, |range| {
+            out.push(Seek::deferred(index, range))
+        });
     }
 
     // Recovery blocks still to come, by the volume's name, less what was
@@ -369,16 +360,6 @@ fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
     }
 }
 
-// `name.vol07+08.par2` carries eight recovery blocks, by the convention
-// every PAR2 creator follows.
-pub(super) fn named_blocks(name: &str) -> Option<u64> {
-    let lower = name.to_ascii_lowercase();
-    let stem = lower.strip_suffix(".par2")?;
-    let (_, tail) = stem.rsplit_once(".vol")?;
-    let (_, count) = tail.split_once('+')?;
-    count.parse().ok()
-}
-
 // What is known of an unnamed member's length. A member some byte of which
 // decoded knows its length exactly; one none of whose did is only bounded
 // by its post's encoded size.
@@ -401,18 +382,5 @@ impl Length {
         match self {
             Self::Exact(length) | Self::AtMost(length) => length,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::named_blocks;
-
-    #[test]
-    fn a_volume_name_says_how_many_blocks_it_carries() {
-        assert_eq!(named_blocks("set.vol07+08.par2"), Some(8));
-        assert_eq!(named_blocks("SET.VOL000+128.PAR2"), Some(128));
-        assert_eq!(named_blocks("set.par2"), None);
-        assert_eq!(named_blocks("set.vol1.par2"), None);
     }
 }

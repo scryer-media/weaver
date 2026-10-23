@@ -25,6 +25,7 @@ use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_rar4_store_set, encrypted_store_set, header_encrypted_store_set,
+    protected_header_encrypted_store_set,
 };
 use crate::pipeline::tests::direct_store::{
     obfuscate_volumes, protected_rar4_store_set, protected_sealed_rar4_store_set,
@@ -1166,6 +1167,41 @@ async fn a_rar4_hp_set_with_recovery_records_and_no_password_fails_for_the_passw
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
+// A RAR5 `-hp` set whose volumes each carry a recovery record, under its
+// password, the last article of the first volume wholly in the member's
+// cipher bytes served damaged: the enciphered headers still open. The store
+// opens them on the password and hands it to each volume's record; the
+// first record rebuilds the damaged unit and the second finds its volume
+// whole, so neither is a record that read nothing and the job is clean on
+// what they checked: the member is delivered whole, nothing asked again.
+#[tokio::test]
+async fn a_rar5_hp_set_with_recovery_records_and_a_damaged_article_is_repaired_from_the_record_under_graph()
+ {
+    let body = body();
+    let set = protected_header_encrypted_store_set(MEMBER, &body, 2, SECRET, 1);
+    let layout = unrar_rs::locate_recovery_record(&mut std::io::Cursor::new(&set[0].1), None)
+        .unwrap()
+        .unwrap();
+    let in_data = (layout.protected_size / ARTICLE as u64 - 1) as u32;
+    let scenario = Scenario::new(posts(set))
+        .damaged(0, in_data)
+        .password(SECRET);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_delivers(&graph, MEMBER, &body);
+    assert_eq!(
+        graph.graph().rulings,
+        vec![
+            (
+                "rar_record".to_string(),
+                Some(RepairOutcome::Repaired { slices: 1 })
+            ),
+            ("rar_record".to_string(), Some(RepairOutcome::Clean)),
+        ]
+    );
+    assert_volumes_complete(&graph);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
 // One RAR4 volume whose record of one parity sector cannot rebuild two
 // damaged sectors: the record rules past repair rather than waiting, and
 // the job fails for the repair.
@@ -1274,12 +1310,13 @@ async fn one_file_whose_middle_volume_is_lost_and_its_record_unreadable_fails_un
     assert_record_said_nothing(view);
 }
 
-// Every volume's record ruled clean, the third's on nothing: it vouched for
-// none of its volume, whose damage stands.
+// Every other volume's record ruled clean; the third's read nothing, so it
+// gives no ruling and is no set the job reads: it vouched for none of its
+// volume, whose damage stands.
 fn assert_record_said_nothing(view: &GraphView) {
     assert_eq!(
         view.rulings,
-        vec![("rar_record".to_string(), Some(RepairOutcome::Clean)); 5]
+        vec![("rar_record".to_string(), Some(RepairOutcome::Clean)); 4]
     );
     assert_eq!(view.claims["silver.horizon.part03.rar"], Claim::Damaged);
 }

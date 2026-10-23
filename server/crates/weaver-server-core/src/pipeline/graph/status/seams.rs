@@ -123,7 +123,7 @@ fn log_set_rulings(job_id: JobId, job: &GraphJob) {
                 continue;
             };
             let (outcome, slices_repaired, verification) = match *outcome {
-                RepairOutcome::Waiting => continue,
+                RepairOutcome::Waiting | RepairOutcome::Unread => continue,
                 RepairOutcome::Clean if ruling.read => ("clean", 0, "read"),
                 RepairOutcome::Clean => ("clean", 0, "grid"),
                 RepairOutcome::Repaired { slices } => ("repaired", slices, ""),
