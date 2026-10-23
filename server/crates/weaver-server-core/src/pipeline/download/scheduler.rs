@@ -423,7 +423,7 @@ impl Pipeline {
                 // it as missing now rather than leave the job waiting.
                 let server_count = self.nntp.pool().server_count();
                 let retention = self.job_retention_excludes(job_id);
-                if Self::unavailable_server_count_from_excludes(server_count, &[], &retention)
+                if Self::unavailable_server_count_from_excludes(self.nntp.pool(), &[], &retention)
                     >= server_count
                 {
                     self.retire_unservable_queued_work(job_id);

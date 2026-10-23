@@ -956,7 +956,7 @@ impl Pipeline {
             );
             if server_count > 0
                 && Self::unavailable_server_count_from_excludes(
-                    server_count,
+                    self.nntp.pool(),
                     &exclude_servers,
                     &retention_excludes,
                 ) >= server_count

@@ -90,6 +90,11 @@ pub enum BlockingBodyLaneAcquireError {
     // thing: the permits are free and the sockets are idle, and reporting it
     // as saturation points the reader at a leak that is not there.
     ServerRecovering,
+    // The server refuses this pool's credentials, either on this dial or by
+    // the disable an earlier refusal left (`NntpPool::refuses_credentials`).
+    // A verdict, not a wait: the leased articles take the failure, so the
+    // server leaves their candidates instead of holding them in the queue.
+    CredentialsRefused { server: ServerId, error: NntpError },
     NoEligibleServer,
     // The health mutex was held elsewhere, so candidates could not be ranked.
     // This says nothing about server availability — the caller should hand
@@ -100,14 +105,24 @@ pub enum BlockingBodyLaneAcquireError {
 }
 
 impl BlockingBodyLaneAcquireError {
-    fn from_connect_error(error: NntpError) -> Self {
+    fn from_connect_error(server: ServerId, error: NntpError) -> Self {
         if matches!(
             error,
             NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
         ) {
             Self::ProviderCapacity(error)
+        } else if error.is_credentials_refusal() {
+            Self::CredentialsRefused { server, error }
         } else {
             Self::Other(error)
+        }
+    }
+
+    // The server whose answer this is, where the refusal is one server's.
+    pub fn server(&self) -> Option<ServerId> {
+        match self {
+            Self::CredentialsRefused { server, .. } => Some(*server),
+            _ => None,
         }
     }
 
@@ -123,7 +138,9 @@ impl BlockingBodyLaneAcquireError {
     // lane's own bookkeeping and carry no server answer to report.
     pub fn nntp_error(&self) -> Option<&NntpError> {
         match self {
-            Self::ProviderCapacity(error) | Self::Other(error) => Some(error),
+            Self::ProviderCapacity(error)
+            | Self::Other(error)
+            | Self::CredentialsRefused { error, .. } => Some(error),
             Self::LocalCapacity
             | Self::ServerRecovering
             | Self::NoEligibleServer
@@ -148,6 +165,7 @@ impl BlockingBodyLaneAcquireError {
             Self::ProviderCapacity(_) => "provider_capacity",
             Self::LocalCapacity => "local_capacity",
             Self::ServerRecovering => "server_recovering",
+            Self::CredentialsRefused { .. } => "credentials_refused",
             Self::NoEligibleServer => "no_eligible_server",
             Self::SelectionContended => "selection_contended",
             Self::Other(_) => "other",
@@ -162,6 +180,13 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
             Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
             Self::ServerRecovering => formatter
                 .write_str("server is recovering; the recovery probe connection is already out"),
+            Self::CredentialsRefused { server, error } => {
+                write!(
+                    formatter,
+                    "server {} refuses credentials: {error}",
+                    server.0
+                )
+            }
             Self::NoEligibleServer => formatter.write_str("no eligible blocking BODY server"),
             Self::SelectionContended => {
                 formatter.write_str("blocking BODY server selection contended on server health")
@@ -2505,12 +2530,15 @@ impl NntpClient {
                 Some(rejection) => {
                     BlockingBodyLaneAcquireError::Other(NntpError::quota_blocked(rejection))
                 }
-                None => BlockingBodyLaneAcquireError::NoEligibleServer,
+                None => self
+                    .credentials_refusal(exclude)
+                    .unwrap_or(BlockingBodyLaneAcquireError::NoEligibleServer),
             });
         }
 
         let mut saw_local_capacity = false;
         let mut saw_recovery_gate = false;
+        let mut credentials_refused = None;
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
@@ -2524,6 +2552,12 @@ impl NntpClient {
                 // single probe.
                 Err(NntpError::ServerRecovering) => {
                     saw_recovery_gate = true;
+                    continue;
+                }
+                Err(error) if error.is_credentials_refusal() => {
+                    credentials_refused.get_or_insert(
+                        BlockingBodyLaneAcquireError::CredentialsRefused { server, error },
+                    );
                     continue;
                 }
                 Err(_) => {
@@ -2596,12 +2630,15 @@ impl NntpClient {
                             "blocking BODY lane connect failed"
                         );
                     }
-                    match BlockingBodyLaneAcquireError::from_connect_error(error) {
+                    match BlockingBodyLaneAcquireError::from_connect_error(server, error) {
                         BlockingBodyLaneAcquireError::ProviderCapacity(error) => {
                             provider_capacity_error = Some(error);
                         }
                         BlockingBodyLaneAcquireError::Other(error) => {
                             other_error = Some(error);
+                        }
+                        refused @ BlockingBodyLaneAcquireError::CredentialsRefused { .. } => {
+                            credentials_refused.get_or_insert(refused);
                         }
                         BlockingBodyLaneAcquireError::LocalCapacity
                         | BlockingBodyLaneAcquireError::ServerRecovering
@@ -2619,9 +2656,36 @@ impl NntpClient {
             Err(BlockingBodyLaneAcquireError::LocalCapacity)
         } else if saw_recovery_gate {
             Err(BlockingBodyLaneAcquireError::ServerRecovering)
+        } else if let Some(refused) = credentials_refused {
+            // Last of the refusals that name a server: any wait above means
+            // another server may still serve the work.
+            Err(refused)
         } else {
-            Err(BlockingBodyLaneAcquireError::NoEligibleServer)
+            Err(self
+                .credentials_refusal(exclude)
+                .unwrap_or(BlockingBodyLaneAcquireError::NoEligibleServer))
         }
+    }
+
+    // The refusal of the first server this request could otherwise be sent to
+    // that refuses this pool's credentials, if one does. Health keeps such a
+    // server out of the ranking, so without this its refusal would read as
+    // "no eligible server", which waits: the work it alone may serve would
+    // sit in the queue for as long as the credentials stay wrong.
+    fn credentials_refusal(&self, exclude: &[usize]) -> Option<BlockingBodyLaneAcquireError> {
+        let backfill_flags = self.pool.server_backfill_flags();
+        let backfill_unlocked = self.pool.fill_servers_exhausted_or_auth_disabled(exclude);
+        (0..self.pool.server_count())
+            .find(|idx| {
+                !exclude.contains(idx)
+                    && self.pool.route_available(*idx)
+                    && (!backfill_flags[*idx] || backfill_unlocked)
+                    && self.pool.refuses_credentials(*idx)
+            })
+            .map(|idx| BlockingBodyLaneAcquireError::CredentialsRefused {
+                server: ServerId(idx),
+                error: NntpError::AuthenticationRejected,
+            })
     }
 
     // Whether the owned blocking lanes could take this work, and whether the
@@ -2764,9 +2828,7 @@ impl NntpClient {
         }
         let mut health = health?;
         health.check_reenable_all();
-        let backfill_unlocked = self
-            .pool
-            .fill_servers_exhausted_or_auth_disabled(exclude, &health);
+        let backfill_unlocked = self.pool.fill_servers_exhausted_or_auth_disabled(exclude);
 
         let mut candidates = Vec::with_capacity(server_count);
         let mut quota_blocked = None;
@@ -3057,9 +3119,7 @@ impl NntpClient {
         // Check health to skip disabled servers.
         let mut health = self.pool.health().lock().await;
         health.check_reenable_all();
-        let backfill_unlocked = self
-            .pool
-            .fill_servers_exhausted_or_auth_disabled(exclude, &health);
+        let backfill_unlocked = self.pool.fill_servers_exhausted_or_auth_disabled(exclude);
 
         #[derive(Default)]
         struct GroupCandidates {

@@ -185,37 +185,49 @@ impl Pipeline {
     }
 
     // Number of distinct, currently-valid pool indices unavailable to this
-    // article: the union of its failure exclusions and the job's retention
-    // exclusions. Indices outside the current pool are ignored — a server
-    // config rebuild can shrink or reorder the pool, and stale indices must
-    // not inflate exhaustion math into spurious "article missing" verdicts.
+    // article (see [`Self::server_may_serve`]). Indices outside the current
+    // pool are ignored — a server config rebuild can shrink or reorder the
+    // pool, and stale indices must not inflate exhaustion math into spurious
+    // "article missing" verdicts.
     pub(in crate::pipeline) fn unavailable_server_count(
         &mut self,
         job_id: JobId,
         failure_excludes: &[usize],
     ) -> usize {
-        let server_count = self.nntp.pool().server_count();
         let retention = self.job_retention_excludes(job_id);
-        Self::unavailable_server_count_from_excludes(server_count, failure_excludes, &retention)
+        Self::unavailable_server_count_from_excludes(self.nntp.pool(), failure_excludes, &retention)
     }
 
     pub(in crate::pipeline) fn unavailable_server_count_from_excludes(
-        server_count: usize,
+        pool: &weaver_nntp::NntpPool,
         failure_excludes: &[usize],
         retention_excludes: &[usize],
     ) -> usize {
-        failure_excludes
-            .iter()
-            .filter(|idx| **idx < server_count)
+        (0..pool.server_count())
+            .filter(|idx| !Self::server_may_serve(pool, *idx, failure_excludes, retention_excludes))
             .count()
-            + retention_excludes
-                .iter()
-                .filter(|idx| **idx < server_count && !failure_excludes.contains(idx))
-                .count()
+    }
+
+    // Whether pool server `idx` may serve an article carrying
+    // `failure_excludes`, in a job whose retention rules out
+    // `retention_excludes`. The one answer every "is this article servable"
+    // question reads: the server must not be excluded by the article, must
+    // hold the post within its retention, and must not be refusing this
+    // pool's credentials. A refusal is a verdict, like the other two; a
+    // quarantine for transport or capacity is a wait and keeps the server.
+    pub(in crate::pipeline) fn server_may_serve(
+        pool: &weaver_nntp::NntpPool,
+        idx: usize,
+        failure_excludes: &[usize],
+        retention_excludes: &[usize],
+    ) -> bool {
+        !failure_excludes.contains(&idx)
+            && !retention_excludes.contains(&idx)
+            && !pool.refuses_credentials(idx)
     }
 
     // Whether an article carrying `failure_excludes` has no server left
-    // that may fetch it, once the job's retention exclusions are counted.
+    // that may fetch it ([`Self::server_may_serve`]).
     // An unconfigured pool answers no: nothing can be booked against
     // servers that do not exist yet.
     pub(in crate::pipeline) fn no_server_can_serve(
@@ -231,36 +243,62 @@ impl Pipeline {
     // article is not necessarily gone from Usenet, but nothing configured
     // can prove otherwise, and leaving it queued would hold the job at
     // downloading forever with nothing in flight.
+    //
+    // When a server refusing this pool's credentials is among those that
+    // would otherwise serve it, the refusal is why: the job's terminal cause
+    // says so, not that the article is missing from Usenet.
     pub(in crate::pipeline) fn book_unservable_work(&mut self, work: &DownloadWork) {
+        self.book_unservable_segment(work.segment_id, &work.exclude_servers);
+    }
+
+    pub(in crate::pipeline) fn book_unservable_segment(
+        &mut self,
+        segment_id: SegmentId,
+        exclude_servers: &[usize],
+    ) {
+        let job_id = segment_id.file_id.job_id;
+        let retention = self.job_retention_excludes(job_id);
+        let pool = self.nntp.pool();
+        let refused_by = (0..pool.server_count())
+            .filter(|idx| {
+                !exclude_servers.contains(idx)
+                    && !retention.contains(idx)
+                    && pool.refuses_credentials(*idx)
+            })
+            .collect::<Vec<_>>();
         warn!(
-            segment = %work.segment_id,
-            exclude_servers = ?work.exclude_servers,
+            segment = %segment_id,
+            exclude_servers = ?exclude_servers,
+            refusing_credentials = ?refused_by,
             "no server may fetch this article; booking it as missing so repair can proceed"
         );
+        if !refused_by.is_empty() {
+            self.semantic_terminal_causes.insert(
+                job_id,
+                crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage,
+            );
+        }
         self.metrics
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
-        let segment_id = work.segment_id;
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
         if self.book_failed_segment(segment_id) {
-            self.note_gap_servers_support_fact(segment_id.file_id.job_id, &work.exclude_servers);
+            self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
     }
 
     // Book as missing every queued article of `job_id` that no server may
     // fetch. Returns how many were retired.
     pub(in crate::pipeline) fn retire_unservable_queued_work(&mut self, job_id: JobId) -> usize {
-        let server_count = self.nntp.pool().server_count();
+        let pool = Arc::clone(self.nntp.pool());
+        let server_count = pool.server_count();
         if server_count == 0 {
             return 0;
         }
         let retention = self.job_retention_excludes(job_id);
         let unservable = |work: &DownloadWork| {
-            Self::unavailable_server_count_from_excludes(
-                server_count,
-                &work.exclude_servers,
-                &retention,
-            ) >= server_count
+            Self::unavailable_server_count_from_excludes(&pool, &work.exclude_servers, &retention)
+                >= server_count
         };
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return 0;

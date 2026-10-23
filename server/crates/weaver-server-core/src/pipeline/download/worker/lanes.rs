@@ -855,6 +855,9 @@ impl Pipeline {
                     1,
                 );
                 let failure = DownloadFailure::from_lane_acquire_failure(error.nntp_error());
+                // A refusal one server gave is that server's answer for the
+                // articles, so the result names it the way a fetch would.
+                let source_server_idx = error.server().map(|server| server.0);
                 let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
                 let DownloadBatchLease {
                     lane_id,
@@ -897,7 +900,7 @@ impl Pipeline {
                             unresolved_count: u64::from(!policy_outcome),
                             connection_discarded: false,
                         }),
-                        source_server_idx: None,
+                        source_server_idx,
                         origin: DownloadResultOrigin::from_work(
                             work.is_recovery,
                             work.completion_critical,
@@ -1012,6 +1015,7 @@ impl Pipeline {
             "provider_capacity" => "download.owned_lane.acquire_failed.provider_capacity",
             "local_capacity" => "download.owned_lane.acquire_failed.local_capacity",
             "server_recovering" => "download.owned_lane.acquire_failed.server_recovering",
+            "credentials_refused" => "download.owned_lane.acquire_failed.credentials_refused",
             "no_eligible_server" => "download.owned_lane.acquire_failed.no_eligible_server",
             "selection_contended" => "download.owned_lane.acquire_failed.selection_contended",
             _ => "download.owned_lane.acquire_failed.other",

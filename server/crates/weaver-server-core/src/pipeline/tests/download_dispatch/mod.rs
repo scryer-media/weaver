@@ -22,6 +22,7 @@ fn posted_job_spec(name: &str, posted_at: Option<u64>) -> JobSpec {
 
 mod article_scheduler;
 mod checkpoint_progress;
+mod credentials_refusal;
 mod dispatch_ineligible_log;
 mod dispatch_server_order;
 mod emits_download_pipeline_drained;
