@@ -911,10 +911,10 @@ async fn pause_resume_and_force_are_kept() {
     assert!(rig.db.get_torrent(job_id).unwrap().unwrap().forced);
 }
 
-// The tick writes a ledger that changed once a minute has passed since it
-// was last written, and nothing while it stands still.
+// The tick writes a ledger whenever it changed, as it writes the
+// checkpoint, and nothing while it stands still.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_ledger_is_written_once_a_minute_while_it_changes() {
+async fn the_ledger_is_written_at_each_tick_it_changed() {
     let clock = set_clock();
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
     // No session is built while the route is down.
@@ -939,13 +939,6 @@ async fn the_ledger_is_written_once_a_minute_while_it_changes() {
         .uploaded_bytes = 5;
     clock.0.fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
     rig.service.tick().await;
-    assert_eq!(written.borrow().ledgers, base);
-    assert_eq!(
-        rig.db.get_torrent_counters(job_id).unwrap().unwrap(),
-        TorrentCounters::default()
-    );
-    clock.0.fetch_add(LEDGER_EVERY_MS, Ordering::SeqCst);
-    rig.service.tick().await;
     assert_eq!(written.borrow().ledgers, base + 1);
     assert_eq!(
         rig.db
@@ -955,7 +948,7 @@ async fn the_ledger_is_written_once_a_minute_while_it_changes() {
             .uploaded_bytes,
         5
     );
-    clock.0.fetch_add(LEDGER_EVERY_MS, Ordering::SeqCst);
+    clock.0.fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
     rig.service.tick().await;
     assert_eq!(written.borrow().ledgers, base + 1);
 }
@@ -1693,14 +1686,14 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
         })
     );
     // The ledger as the running tick keeps it: the time between two ticks
-    // the torrent ran in its session is active, and it ran complete. Inside
-    // a minute of the last write nothing is written, and a clean stop
-    // writes the ledger as it stands.
+    // the torrent ran in its session is active, and it ran complete. The
+    // tick writes the ledger it changed, and a clean stop writes the ledger
+    // as it stands.
     rig.service.tick().await;
     clock.0.fetch_add(30_000, Ordering::SeqCst);
     rig.service.tick().await;
     let kept = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
-    assert_eq!(kept.active_duration_s, 0);
+    assert_eq!(kept.active_duration_s, 30);
     rig.service.stop().await;
     let ledger = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
     assert_eq!(
@@ -3853,6 +3846,7 @@ const SPLIT_PIECE: usize = 16_384;
 
 struct PartlyFetched {
     rig: Rig,
+    clock: Arc<SetClock>,
     job_id: JobId,
     seeding: Arc<Session>,
     _seeds: tempfile::TempDir,
@@ -3881,7 +3875,8 @@ async fn partly_fetched() -> PartlyFetched {
     };
     let bytes = announcing(&private, &tracker(peer).await);
 
-    let rig = rig(set_clock());
+    let clock = set_clock();
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let job_id = rig
@@ -3908,6 +3903,7 @@ async fn partly_fetched() -> PartlyFetched {
     let sent = uploaded(&seeding);
     PartlyFetched {
         rig,
+        clock,
         job_id,
         seeding,
         _seeds: seeds,
@@ -3974,6 +3970,75 @@ async fn a_torrent_that_crashed_part_way_restarts_with_its_pieces() {
     // written.
     fetched.rig.service.inner.sessions.stop_all().await;
     resumes_with_its_pieces(fetched).await;
+}
+
+// What a torrent's view shows of its ledger: the figures that outlive a
+// run.
+fn lifetime(view: &TorrentView) -> (u64, u64, u64) {
+    (
+        view.downloaded_bytes,
+        view.uploaded_bytes,
+        view.active_seconds,
+    )
+}
+
+// A partly fetched torrent read at two ticks a tick apart: what it shows of
+// its ledger then.
+async fn ticked(fetched: &PartlyFetched) -> (u64, u64, u64) {
+    let service = &fetched.rig.service;
+    service.tick().await;
+    fetched
+        .clock
+        .0
+        .fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    service.tick().await;
+    let shown = lifetime(&service.torrent(fetched.job_id).await.unwrap());
+    assert!(shown.0 >= 3 * SPLIT_PIECE as u64, "{shown:?}");
+    assert_eq!(shown.2, TICK.as_secs(), "{shown:?}");
+    shown
+}
+
+// The restart of a partly fetched torrent shows `shown` of its ledger.
+async fn restarts_showing(fetched: PartlyFetched, shown: (u64, u64, u64)) {
+    let PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        ..
+    } = fetched;
+    // What the server's recovery clears before anything starts.
+    rig.db.prune_orphan_active_state().unwrap();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    handle_of(&again, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    assert_eq!(lifetime(&again.torrent(job_id).await.unwrap()), shown);
+    again.stop().await;
+    seeding.stop().await;
+}
+
+// A clean stop keeps the ledger exactly as the torrent showed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_stopped_part_way_restarts_with_its_ledger() {
+    let fetched = partly_fetched().await;
+    let shown = ticked(&fetched).await;
+    fetched.rig.service.stop().await;
+    restarts_showing(fetched, shown).await;
+}
+
+// As its pieces do, a torrent's ledger outlives a crash: the restart shows
+// what the last tick knew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_that_crashed_part_way_restarts_with_its_last_ticks_ledger() {
+    let fetched = partly_fetched().await;
+    let shown = ticked(&fetched).await;
+    // The process ends here: its sessions go with it, and nothing else is
+    // written.
+    fetched.rig.service.inner.sessions.stop_all().await;
+    restarts_showing(fetched, shown).await;
 }
 
 // A checkpoint that does not restore says so, naming the job and why, and

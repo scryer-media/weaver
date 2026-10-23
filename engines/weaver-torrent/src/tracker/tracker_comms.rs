@@ -1792,7 +1792,19 @@ impl TrackerComms {
                     announced.min_interval,
                     self.force_tracker_interval,
                 );
-                debug!(?tracker, ?delay, "tracker answered");
+                debug!(
+                    ?tracker,
+                    ?event,
+                    peers = announced.peers.len(),
+                    peers6 = announced.peers.iter().filter(|p| p.is_ipv6()).count(),
+                    seeders = ?announced.seeders,
+                    leechers = ?announced.leechers,
+                    interval = ?announced.interval,
+                    min_interval = ?announced.min_interval,
+                    external_ip = announced.seen_as.is_some(),
+                    ?delay,
+                    "tracker answered"
+                );
                 self.list.lock().on_success(&tracker, event, now, &delay);
                 if let Some((ours, by)) = announced.seen_as {
                     (self.vote)(ours, by);
@@ -2622,12 +2634,15 @@ mod tests {
     }
 
     /// Answers an HTTP request with `body`.
-    async fn respond(conn: tokio::net::TcpStream, body: &str) {
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    async fn respond(conn: tokio::net::TcpStream, body: impl AsRef<[u8]>) {
+        let body = body.as_ref();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
-        );
-        let mut response = response.as_bytes();
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        let mut response = response.as_slice();
         while !response.is_empty() {
             conn.writable().await.unwrap();
             match conn.try_write(response) {
@@ -3010,6 +3025,78 @@ mod tests {
         token.cancel();
     }
 
+    /// An announce asks for 200 peers, compact; an answer naming many of
+    /// both families hands every one on, in the order named, and the
+    /// tracker's row counts them all with the swarm it gave.
+    #[tokio::test]
+    async fn an_answer_hands_on_every_peer_it_names_of_both_families() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+
+        let v4: Vec<SocketAddr> = (1..=120u16)
+            .map(|i| (Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8), 6000 + i).into())
+            .collect();
+        let v6: Vec<SocketAddr> = (1..=40u16)
+            .map(|i| (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i), 7000 + i).into())
+            .collect();
+        let compact = |peers: &[SocketAddr]| -> Vec<u8> {
+            peers
+                .iter()
+                .flat_map(|peer| {
+                    let ip = match peer.ip() {
+                        IpAddr::V4(ip) => ip.octets().to_vec(),
+                        IpAddr::V6(ip) => ip.octets().to_vec(),
+                    };
+                    [ip, peer.port().to_be_bytes().to_vec()].concat()
+                })
+                .collect()
+        };
+        let (v4_bytes, v6_bytes) = (compact(&v4), compact(&v6));
+        let mut body = b"d8:completei7e10:incompletei12e8:intervali1800e".to_vec();
+        body.extend(format!("5:peers{}:", v4_bytes.len()).bytes());
+        body.extend(&v4_bytes);
+        body.extend(format!("6:peers6{}:", v6_bytes.len()).bytes());
+        body.extend(&v6_bytes);
+        body.push(b'e');
+
+        let q = answer(&listener, &mut peers, body).await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        assert_eq!(query_param(&q, "compact"), Some("1"));
+        assert_eq!(query_param(&q, "no_peer_id"), Some("0"));
+        assert_eq!(query_param(&q, "numwant"), Some("200"));
+        assert!(query_param(&q, "key").is_some(), "{q}");
+
+        let expected: Vec<SocketAddr> = v4.iter().chain(&v6).copied().collect();
+        let got: Vec<SocketAddr> = peers.by_ref().take(expected.len()).collect().await;
+        assert_eq!(got, expected);
+
+        let mut rx = status.subscribe();
+        rx.wait_for(|announces| announces.iter().all(|a| !a.in_flight && a.last.is_some()))
+            .await
+            .unwrap();
+        let announces = status.announces();
+        assert_eq!(
+            announce_of(&announces, &url).last.as_ref().unwrap().result,
+            Ok(AnnounceOk {
+                interval: Duration::from_secs(1800),
+                min_interval: Duration::from_secs(30),
+                seeders: Some(7),
+                leechers: Some(12),
+                downloaded: None,
+                peers: 160,
+                warning: None,
+            })
+        );
+
+        drop(peers);
+        let q = next_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
     #[tokio::test]
     async fn test_stream_dropped_before_any_announce_sends_nothing() {
         let token = CancellationToken::new();
@@ -3194,7 +3281,7 @@ mod tests {
     async fn answer(
         listener: &tokio::net::TcpListener,
         peers: &mut (impl futures::Stream<Item = SocketAddr> + Unpin),
-        body: &str,
+        body: impl AsRef<[u8]>,
     ) -> String {
         tokio::select! {
             _ = peers.next() => panic!("the tracker sent no peers"),

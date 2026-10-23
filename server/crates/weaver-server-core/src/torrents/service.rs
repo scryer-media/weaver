@@ -77,8 +77,9 @@ pub mod updates;
 /// How often torrents are read and their routes checked.
 pub const TICK: Duration = Duration::from_secs(10);
 
-/// The longest a torrent's ledger goes unwritten.
-pub const LEDGER_EVERY_MS: i64 = 60_000;
+/// The longest a torrent's peers go unwritten while they change. Its ledger
+/// is written at every tick it changed, as its checkpoint is.
+pub const PEERS_EVERY_MS: i64 = 60_000;
 
 /// The time torrents are stamped with.
 pub trait Clock: Send + Sync {
@@ -882,7 +883,7 @@ impl Live {
             private: false,
             ledger: Ledger {
                 written: Some((counters, resume.clone())),
-                at_ms: now,
+                peers_at_ms: now,
                 lost: Arc::default(),
             },
             resume,
@@ -934,23 +935,25 @@ impl Live {
     }
 
     // What of the ledger and peers the database does not hold yet, taken
-    // as written: none before a minute has passed since the last write
-    // unless `at_once`, and none when nothing changed. The peers are the
-    // session's while it runs the torrent; one stopped by an error keeps
-    // those last taken.
+    // as written, and none when nothing changed. The ledger goes whenever
+    // it changed, so after a crash the torrent shows what its last tick
+    // knew, as its pieces do. The peers go once a minute has passed since
+    // they were last taken, or at once when `at_once`; they are the
+    // session's while it runs the torrent, and one stopped by an error
+    // keeps those last taken.
     fn take_resume(&mut self, now: i64, at_once: bool) -> Option<Resume> {
-        if !at_once && now - self.ledger.at_ms < LEDGER_EVERY_MS {
-            return None;
-        }
-        if let Some(peers) = self
-            .attached
-            .as_ref()
-            .and_then(|attached| attached.handle.resume_peers())
-        {
-            self.resume = peers;
-        }
         if self.ledger.lost.swap(false, Ordering::AcqRel) {
             self.ledger.written = None;
+        }
+        if at_once || now - self.ledger.peers_at_ms >= PEERS_EVERY_MS {
+            if let Some(peers) = self
+                .attached
+                .as_ref()
+                .and_then(|attached| attached.handle.resume_peers())
+            {
+                self.resume = peers;
+            }
+            self.ledger.peers_at_ms = now;
         }
         let (counters, peers) = match &self.ledger.written {
             Some((counters, peers)) => (
@@ -960,7 +963,6 @@ impl Live {
             None => (Some(self.counters), Some(self.resume.clone())),
         };
         self.ledger.written = Some((self.counters, self.resume.clone()));
-        self.ledger.at_ms = now;
         (counters.is_some() || peers.is_some()).then(|| Resume {
             counters,
             peers,
@@ -1144,12 +1146,13 @@ impl Seen {
     }
 }
 
-// What the database holds of a torrent's ledger and peers, and when it was
-// last written.
+// What the database holds of a torrent's ledger and peers, and when its
+// peers were last taken.
 struct Ledger {
     // `None` while what it holds is not known: the next write is all of it.
     written: Option<(TorrentCounters, ResumePeers)>,
-    at_ms: i64,
+    // When the peers were last taken from the session to be written.
+    peers_at_ms: i64,
     // Set by a write that failed, so the next one writes all of it.
     lost: Arc<AtomicBool>,
 }
@@ -3220,8 +3223,10 @@ impl TorrentService {
                 .inner
                 .db
                 .get_torrent_counters(job_id)
-                .ok()
-                .flatten()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's ledger");
+                    None
+                })
                 .unwrap_or_default();
             let resume = self.inner.db.torrent_peers(job_id).unwrap_or_else(|error| {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
@@ -3392,7 +3397,8 @@ impl TorrentService {
     }
 
     // The session's figures for each torrent, and the ledger kept from
-    // them: written once a minute while it changes, or now when `at_once`.
+    // them: written whenever it changed, with its peers once a minute while
+    // they change, or now when `at_once`.
     async fn read(&self, now: i64, elapsed_s: u64, at_once: bool) {
         let mut landings = Vec::new();
         {
