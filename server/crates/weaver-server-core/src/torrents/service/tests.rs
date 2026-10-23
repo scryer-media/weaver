@@ -2363,8 +2363,9 @@ async fn trackers_once(
 }
 
 // A tracker reads as the torrent's session last heard it: updating while an
-// announce waits, working with its counts once it answers, and not working
-// once it stops answering.
+// announce waits, working with its counts once it answers and once its
+// `stopped` is answered as the torrent pauses, and not working once it
+// stops answering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_trackers_status_follows_its_announces() {
     use tokio::io::AsyncWriteExt;
@@ -2398,17 +2399,14 @@ async fn a_trackers_status_follows_its_announces() {
         [(0, url.as_str(), TrackerStatus::NotContacted, true)]
     );
 
-    // The tracker stops once it has answered.
-    drop(listener);
-    let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    started
-        .write_all(&[head.as_bytes(), body].concat())
-        .await
-        .unwrap();
+    let answer = |complete: u32| {
+        let body = format!("d8:completei{complete}e10:incompletei5e8:intervali1800e5:peers0:e");
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    started.write_all(answer(3).as_bytes()).await.unwrap();
     let trackers = trackers_once(&rig.service, job_id, |announces| {
         announces[0].last.is_some()
     })
@@ -2421,26 +2419,44 @@ async fn a_trackers_status_follows_its_announces() {
     let at = working.last_announce_ms.unwrap();
     assert_eq!(working.next_announce_ms, Some(at + 1_800_000));
 
-    // Paused, the stopped announce is the row's last outcome (refused: the
-    // tracker is gone) and nothing is due until the torrent runs again.
+    // Paused, the stopped announce is the row's last outcome: nothing is
+    // due until the torrent runs again, and no floor stands for a next
+    // announce.
     rig.service.pause(job_id).await.unwrap();
+    let mut stopped = heard_announce(&listener).await;
+    stopped.write_all(answer(7).as_bytes()).await.unwrap();
+    let trackers = trackers_once(&rig.service, job_id, |announces| {
+        !announces[0].in_flight
+            && announces[0]
+                .last
+                .as_ref()
+                .and_then(|last| last.result.as_ref().ok())
+                .is_some_and(|accepted| accepted.seeders == Some(7))
+    })
+    .await;
+    let paused = &trackers[0];
+    assert_eq!(paused.status, TrackerStatus::Working);
+    assert!(!paused.updating);
+    assert_eq!(
+        (
+            paused.next_announce_ms,
+            paused.min_announce_ms,
+            paused.fails
+        ),
+        (None, None, 0)
+    );
+    assert_eq!((paused.seeders, paused.peers), (Some(7), Some(0)));
+    assert!(paused.last_announce_ms >= Some(at));
+
+    // The tracker is gone: the next run's first announce finds no tracker.
+    drop(listener);
+    rig.service.resume(job_id).await.unwrap();
     let trackers = trackers_once(&rig.service, job_id, |announces| {
         !announces[0].in_flight
             && announces[0]
                 .last
                 .as_ref()
                 .is_some_and(|last| last.result.is_err())
-    })
-    .await;
-    let paused = &trackers[0];
-    assert_eq!(paused.status, TrackerStatus::NotWorking);
-    assert!(!paused.updating);
-    assert_eq!((paused.next_announce_ms, paused.fails), (None, 1));
-
-    // The next run's first announce finds no tracker.
-    rig.service.resume(job_id).await.unwrap();
-    let trackers = trackers_once(&rig.service, job_id, |announces| {
-        announces[0].last.is_some() && !announces[0].in_flight
     })
     .await;
     let failed = &trackers[0];
@@ -4248,8 +4264,11 @@ async fn partly_fetched() -> PartlyFetched {
 }
 
 // The restart of a partly fetched torrent: it has every piece it had, and
-// once the first file is wanted it fetches that file's three missing pieces
-// and nothing else.
+// with the first file wanted it fetches that file's three missing pieces
+// and nothing else. The file is wanted before the torrent goes into its
+// session, so the seeder is of use from its first connection: a session
+// that wants nothing of a seed drops it, and dials it again only much
+// later.
 async fn resumes_with_its_pieces(fetched: PartlyFetched) {
     use FilePriority::*;
     let PartlyFetched {
@@ -4264,16 +4283,14 @@ async fn resumes_with_its_pieces(fetched: PartlyFetched) {
     rig.db.prune_orphan_active_state().unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
-    reopen(&again).await;
-    let handle = handle_of(&again, job_id).await;
-    handle.wait_until_completed().await.unwrap();
+    again.open().await.unwrap();
     assert_eq!(job_have(&again, job_id).await, 3);
-    assert_eq!(uploaded(&seeding), sent);
-
     again
         .set_file_priorities(job_id, &[(0, Normal)])
         .await
         .unwrap();
+    again.tick().await;
+    let handle = handle_of(&again, job_id).await;
     handle.wait_until_completed().await.unwrap();
     assert_eq!(job_have(&again, job_id).await, 6);
     assert_eq!(again.torrent(job_id).await.unwrap().file_have, sizes);
@@ -4329,8 +4346,8 @@ async fn a_restart_restores_a_torrents_job_at_the_tick_not_at_start() {
     let reads = || written.borrow().checkpoints_read;
     again.open().await.unwrap();
     // The tick has not run: the job's checkpoint is unread, and the torrent
-    // shows what was stored of it: its ledger and its files. It is not
-    // complete, so nothing stored says which pieces it has.
+    // shows what was stored of it: its ledger, its files, and what its
+    // checkpoint has in hand of them.
     assert_eq!(reads(), 0);
     let kept = again.torrent(job_id).await.unwrap();
     assert_eq!(
@@ -4343,14 +4360,123 @@ async fn a_restart_restores_a_torrents_job_at_the_tick_not_at_start() {
     );
     assert_eq!(kept.total_bytes, sizes.iter().sum::<u64>());
     assert_eq!(kept.files.len(), 2);
-    assert_eq!(kept.pieces, None);
+    assert_eq!(in_hand(&kept), checkpointed(sizes));
 
     again.tick().await;
     assert_eq!(reads(), 1);
     assert!(again.inner.live.lock().await[&job_id].attached.is_some());
     assert_eq!(job_have(&again, job_id).await, 3);
     let ticked = again.torrent(job_id).await.unwrap();
-    assert_eq!(ticked.pieces.map(|pieces| pieces.have), Some(3));
+    assert_eq!(in_hand(&ticked), checkpointed(sizes));
+    again.stop().await;
+    seeding.stop().await;
+}
+
+// A restart while a check of every piece had found only some of them: the
+// torrent shows before its job is back exactly what the job restored from
+// its checkpoint holds, the pieces the check found and none it had yet to
+// find.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
+    let PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        sizes,
+        ..
+    } = partly_fetched().await;
+    // The process ends while its session checks every piece and has found
+    // piece 4 of the three the job held.
+    rig.service.inner.sessions.stop_all().await;
+    let (intake, job) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.intake.clone().unwrap(),
+            torrent.job.clone().unwrap(),
+        )
+    };
+    assert!(intake.checking().unwrap());
+    assert!(intake.found(4).unwrap());
+    rig.service.save_checkpoint(job_id, &job).await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let written = again.written();
+    again.open().await.unwrap();
+    assert_eq!(written.borrow().checkpoints_read, 0);
+    let kept = in_hand(&again.torrent(job_id).await.unwrap());
+    let found = SPLIT_PIECE as u64;
+    assert_eq!(
+        kept,
+        (
+            vec![0, found],
+            found,
+            found as f64 / sizes.iter().sum::<u64>() as f64,
+            Some(1)
+        )
+    );
+
+    again.restore_jobs().await;
+    assert_eq!(written.borrow().checkpoints_read, 1);
+    assert!(again.inner.live.lock().await[&job_id].job.is_some());
+    assert_eq!(in_hand(&again.torrent(job_id).await.unwrap()), kept);
+    again.stop().await;
+    seeding.stop().await;
+}
+
+// What a view shows it has in hand: each file's bytes, all of them, the
+// progress, and the pieces.
+fn in_hand(view: &TorrentView) -> (Vec<u64>, u64, f64, Option<u32>) {
+    (
+        view.file_have.clone(),
+        view.have_bytes,
+        view.progress,
+        view.pieces.map(|pieces| pieces.have),
+    )
+}
+
+// What a partly fetched torrent of files `sizes` has in hand: pieces 3, 4
+// and 5, the first file's last half piece and the second file whole.
+fn checkpointed(sizes: [u64; 2]) -> (Vec<u64>, u64, f64, Option<u32>) {
+    let have = [SPLIT_PIECE as u64 / 2, sizes[1]];
+    let all = have.iter().sum::<u64>();
+    (
+        have.to_vec(),
+        all,
+        all as f64 / sizes.iter().sum::<u64>() as f64,
+        Some(3),
+    )
+}
+
+// A paused torrent restarts paused, showing what its checkpoint has in hand
+// before its job is back, and the same once it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_torrent_restarts_showing_what_it_has() {
+    let PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        sizes,
+        ..
+    } = partly_fetched().await;
+    rig.service.pause(job_id).await.unwrap();
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let written = again.written();
+    again.open().await.unwrap();
+    assert_eq!(written.borrow().checkpoints_read, 0);
+    let kept = again.torrent(job_id).await.unwrap();
+    assert_eq!(kept.state, TorrentState::Paused);
+    assert_eq!(in_hand(&kept), checkpointed(sizes));
+
+    again.tick().await;
+    assert_eq!(written.borrow().checkpoints_read, 1);
+    let ticked = again.torrent(job_id).await.unwrap();
+    assert_eq!(ticked.state, TorrentState::Paused);
+    assert_eq!(in_hand(&ticked), checkpointed(sizes));
     again.stop().await;
     seeding.stop().await;
 }

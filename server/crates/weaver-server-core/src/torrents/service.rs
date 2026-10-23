@@ -846,6 +846,8 @@ struct Live {
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
+    // The pieces its checkpoint has in hand, until its job is back.
+    kept_pieces: u32,
     // Why unpacking refused it, as its history kept it when it was
     // restored: a restored job does not say.
     failed: Option<String>,
@@ -938,6 +940,7 @@ impl Live {
             peers: (0, 0),
             moving: None,
             file_have: Vec::new(),
+            kept_pieces: 0,
             failed: None,
         }
     }
@@ -946,24 +949,13 @@ impl Live {
         self.record.completed_at_ms.is_some()
     }
 
-    // Whether the operator wants the file of this index fetched.
-    fn wanted(&self, file: usize) -> bool {
-        self.levels.get(file) != Some(&FilePriority::Ignored)
-    }
-
-    // What it shows until its job is back, from what was stored: a complete
-    // torrent holds every file it wanted whole, and a failure is the one
-    // its history keeps.
-    fn kept(&mut self, failed: Option<String>) {
-        if self.complete() {
-            let have: Vec<u64> = self
-                .layout
-                .iter()
-                .flat_map(|layout| layout.files())
-                .enumerate()
-                .map(|(index, file)| if self.wanted(index) { file.length } else { 0 })
-                .collect();
-            self.file_have = have;
+    // What it shows until its job is back, from what was stored: what the
+    // root its checkpoint keeps has in hand, as the job restored from it
+    // will, and the failure its history keeps.
+    fn kept(&mut self, failed: Option<String>, root: Option<PieceRoot>) {
+        if let Some(root) = root {
+            self.file_have = root.file_have();
+            self.kept_pieces = root.have().count_ones() as u32;
         }
         self.failed = failed;
     }
@@ -1063,14 +1055,13 @@ impl Live {
         )
     }
 
-    // The pieces, and how many of them the job holds verified. Until its
-    // job is back, a complete torrent holds every piece of a file it wanted.
+    // The pieces, and how many of them the job holds verified; until its
+    // job is back, how many its checkpoint has.
     fn pieces(&self) -> Option<TorrentPieces> {
         let layout = self.layout.as_ref()?;
         let have = match &self.job {
             Some(job) => job.with(|job| job.have().count_ones()) as u32,
-            None if self.complete() => layout.pieces_over(|file| self.wanted(file)),
-            None => return None,
+            None => self.kept_pieces,
         };
         Some(TorrentPieces {
             count: layout.piece_count(),
@@ -1962,6 +1953,33 @@ impl TorrentService {
             }
             Err(error) => FromCheckpoint::Failed(error),
         }
+    }
+
+    // The root the torrent's checkpoint keeps, from the database alone: what
+    // its job holds once restored from it. None without a checkpoint, or
+    // with one that does not restore: the job then starts fresh, and its
+    // restore says why.
+    fn kept_root(&self, job_id: JobId, layout: &Arc<PieceLayout>) -> Option<PieceRoot> {
+        let root = self
+            .inner
+            .db
+            .load_graph_root(job_id)
+            .map_err(|error| error.to_string())
+            .and_then(|rows| {
+                let Some(rows) = rows else { return Ok(None) };
+                let facts = checkpoint::root(&rows)
+                    .map_err(|error| error.to_string())?
+                    .root
+                    .read::<PieceRoot>()
+                    .map_err(|error| error.to_string())?;
+                PieceRoot::restore(Arc::clone(layout), &facts)
+                    .map(Some)
+                    .map_err(|error| error.to_string())
+            });
+        root.unwrap_or_else(|error| {
+            tracing::debug!(job_id = job_id.0, %error, "a torrent's stored root does not read");
+            None
+        })
     }
 
     // The job of a torrent with metainfo: the one its checkpoint gave back,
@@ -3584,7 +3602,8 @@ impl TorrentService {
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
                     self.describe(&mut torrent, &parsed);
-                    torrent.kept(self.stored_failure(job_id));
+                    let root = self.kept_root(job_id, &parsed.layout);
+                    torrent.kept(self.stored_failure(job_id), root);
                     self.inner.live.lock().await.insert(job_id, torrent);
                 }
                 Some(Err(error)) => {

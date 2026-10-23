@@ -550,13 +550,29 @@ fn envelope_rows(kept: &[KeptRecord]) -> Vec<EnvelopeRow> {
     out
 }
 
-pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
+// The root's row of a checkpoint: its facts blob, with the facts parts it
+// names. The whole checkpoint and the root's rows alone read the same.
+pub(crate) fn root(rows: &GraphCheckpoint) -> Result<RootRow, CheckpointError> {
     let root = rows
         .nodes
         .iter()
         .find(|row| row.node == i64::from(NodeId::ROOT.0))
         .filter(|row| row.kind == ROOT_KIND)
         .ok_or(CheckpointError::NoRoot)?;
+    let parts: Vec<Part> = rows
+        .parts
+        .iter()
+        .filter(|row| row.node == root.node)
+        .map(|row| Part {
+            key: row.part as u64,
+            bytes: Arc::clone(&row.bytes),
+        })
+        .collect();
+    Ok(facts::decode(version(root)?, &root.facts, &parts)?)
+}
+
+pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
+    let root = root(rows)?;
     let mut parts: BTreeMap<i64, Vec<Part>> = BTreeMap::new();
     for row in &rows.parts {
         parts.entry(row.node).or_default().push(Part {
@@ -573,11 +589,6 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             reason: "facts parts of a node not in the checkpoint",
         });
     }
-    let root = facts::decode(
-        version(root)?,
-        &root.facts,
-        parts.get(&root.node).map_or(&[], Vec::as_slice),
-    )?;
     let mut nodes: BTreeMap<NodeId, NodeRecord> = BTreeMap::new();
     let mut passwords = BTreeMap::new();
     for row in &rows.nodes {

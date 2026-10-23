@@ -310,8 +310,11 @@ pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet
 ///
 /// The announce loop answers every accepted announce by announcing again
 /// once the interval has passed, and retries a failed one without end, so
-/// the latest outcome stands until the next one replaces it: an accepted
-/// announce reads as working however long ago it was.
+/// while the run announces to the tracker the latest outcome stands until
+/// the next one replaces it: an accepted announce reads as working however
+/// long ago it was. A tracker the run no longer announces to, nothing due
+/// and nothing in flight, keeps its last outcome, with no floor for a next
+/// announce that is not coming.
 pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
     let ms = |at: std::time::SystemTime| {
         at.duration_since(std::time::UNIX_EPOCH)
@@ -320,6 +323,7 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
     };
     let last = announce.last.as_ref();
     let accepted = last.and_then(|last| last.result.as_ref().ok());
+    let announcing = announce.in_flight || announce.next_announce.is_some();
     TorrentTracker {
         tier,
         url: announce.url.clone(),
@@ -339,6 +343,7 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
         next_announce_ms: announce.next_announce.and_then(ms),
         min_announce_ms: last
             .zip(accepted)
+            .filter(|_| announcing)
             .and_then(|(last, accepted)| ms(last.at + accepted.min_interval)),
         // libtorrent `announce_entry::message`, the tracker's warning, else
         // the error (qBittorrent shows one, then the other).
@@ -1051,12 +1056,45 @@ mod tests {
     }
 
     // An answer whose interval has long passed with no announce in flight
-    // belongs to a run that has stopped announcing: it stands until the
-    // next run's first answer.
+    // stands while the run still announces to the tracker.
     #[test]
     fn an_answer_stands_past_its_interval() {
         let stale = announce(false, Some(Ok(accepted(1, 30))));
         assert_eq!(tracker_view(0, &stale).status, TrackerStatus::Working);
+    }
+
+    // The run has stopped announcing to the tracker: its `stopped` answer,
+    // or the failure of it, is the last outcome the row reads, with no
+    // floor for an announce that is not coming.
+    #[test]
+    fn a_tracker_the_run_stopped_announcing_to_keeps_its_last_outcome() {
+        let stopped = TrackerAnnounce {
+            next_announce: None,
+            ..announce(false, Some(Ok(accepted(1800, 30))))
+        };
+        let view = tracker_view(0, &stopped);
+        assert_eq!(
+            (
+                view.status,
+                view.updating,
+                view.next_announce_ms,
+                view.min_announce_ms
+            ),
+            (TrackerStatus::Working, false, None, None)
+        );
+        assert_eq!(
+            (view.last_announce_ms, view.peers, view.seeders),
+            (Some(1_000_000), Some(2), Some(3))
+        );
+        let failed = TrackerAnnounce {
+            next_announce: None,
+            ..announce(false, Some(Err(refused(AnnounceErrorKind::Failed))))
+        };
+        let view = tracker_view(0, &failed);
+        assert_eq!(
+            (view.status, view.message.as_deref(), view.min_announce_ms),
+            (TrackerStatus::NotWorking, Some("refused"), None)
+        );
     }
 
     #[test]
