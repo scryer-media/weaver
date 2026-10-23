@@ -708,6 +708,60 @@ fn a_damaged_member_byte_is_reported_at_its_volume_range() {
     }
 }
 
+// An article delivered damaged runs from the first file's data over the
+// next file's header, intact, into that file's data. The walk reads damaged
+// bytes only once the volume closes, so until then the store keeps the
+// article from that header on as its own. The close names the file whose
+// first bytes it kept, with no byte arriving: the store says they are no
+// longer its own, and the file gets them, as they came, from where the
+// owner kept them.
+#[test]
+fn bytes_kept_behind_a_header_read_at_close_reach_the_file_it_names() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let real = write(&items(), &Options::new(version)).remove(0);
+        let [(_, alpha), (_, beta), _] = &files()[..] else {
+            unreachable!("three files")
+        };
+        let alpha_end = (find(&real, &alpha[..64]) + alpha.len()) as u64;
+        let beta_at = find(&real, &beta[..64]) as u64;
+        let article = ByteRange::new(alpha_end - 100, beta_at + 100);
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), vec![real]);
+        owner.deliver(0, ByteRange::new(0, article.start));
+        owner.deliver_as(0, article, Provenance::Damaged, None);
+        owner.deliver(0, ByteRange::new(article.end, length));
+        assert_eq!(
+            owner.members.len(),
+            1,
+            "{version:?} only the file before it"
+        );
+        owner.close(0);
+        let got = owner.member("beta.bin");
+        assert!(got.bytes == *beta, "{version:?}");
+        assert!(
+            got.coverage.covered(ByteRange::new(0, beta.len() as u64)),
+            "{version:?}"
+        );
+        assert!(
+            got.coverage.damaged(ByteRange::new(0, 100)),
+            "{version:?} the kept bytes came damaged"
+        );
+        assert!(
+            got.coverage
+                .verified(ByteRange::new(100, beta.len() as u64)),
+            "{version:?}"
+        );
+        assert!(
+            owner.said.iter().any(|emit| matches!(
+                emit,
+                Emit::Unkept { volume: VolumeIndex(0), range, .. } if range.start == beta_at
+            )),
+            "{version:?} {:?}",
+            owner.said
+        );
+    }
+}
+
 // A damaged article inside the first part of a split file: the namespace
 // already marks it where it lies, so neither the part's own CRC nor the
 // file's blames anything, and the repair is what they judge.

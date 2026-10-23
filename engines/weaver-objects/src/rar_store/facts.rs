@@ -215,7 +215,7 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
     // The walk reads the kept headers again; what it says now was said
     // before the checkpoint, so it goes nowhere.
     store.stale = !store.gone;
-    store.settle(&mut Vec::new());
+    store.settle(None, &mut Vec::new());
     // Nor is a question it asked while no password was on hand yet: the
     // server offers the winning one again, and one never asked is asked
     // by the next look.
