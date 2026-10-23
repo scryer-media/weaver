@@ -16,7 +16,10 @@ use tokio::{net::UdpSocket, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use crate::upnp::{PortMapEvents, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport};
+use crate::{
+    route_interface::RouteInterface,
+    upnp::{PortMapEvents, PortMapReports, PortMapRequest, PortmapProtocol, PortmapTransport},
+};
 
 /// The port a NAT-PMP or PCP server listens on.
 pub const NATPMP_PORT: u16 = 5351;
@@ -104,9 +107,6 @@ struct Mapping {
     outstanding: bool,
     /// Cleared once the gateway closed the mapping.
     live: bool,
-    /// The gateway granted the mapping and its last answer still stands:
-    /// only such a mapping is reported removed on close.
-    granted: bool,
 }
 
 impl Mapping {
@@ -124,7 +124,6 @@ impl Mapping {
             map_sent: false,
             outstanding: false,
             live: true,
-            granted: false,
         }
     }
 }
@@ -247,7 +246,7 @@ impl State {
 
     /// libtorrent `resend_request`. A mapping the gateway never answered is
     /// reported failed, as one it refused is.
-    async fn resend_request(&mut self, i: usize, socket: &UdpSocket, events: &PortMapEvents) {
+    async fn resend_request(&mut self, i: usize, socket: &UdpSocket, reports: &PortMapReports) {
         let Some(flight) = self.in_flight.filter(|f| f.index == i) else {
             return;
         };
@@ -257,17 +256,8 @@ impl State {
             m.action = Action::None;
             // Counted from when the last resend fell due.
             m.expires = Some(flight.resend_at + RETRY_FAILED_AFTER);
-            m.granted = false;
             debug!(protocol = ?m.request.protocol, "the gateway never answered");
-            // Nobody listening is no reason to stop mapping.
-            let _ = events.send(PortMapped {
-                transport: PortmapTransport::NatPmp,
-                protocol: m.request.protocol,
-                local_port: m.request.local_port,
-                external_port: None,
-                external_ip: None,
-                error: Some("the gateway never answered".to_owned()),
-            });
+            reports.failed(m.request, "the gateway never answered".to_owned());
             return;
         }
         self.send_map_request(i, socket).await;
@@ -309,11 +299,11 @@ impl State {
     }
 
     /// libtorrent `on_resend_request` and `mapping_expired`.
-    async fn on_timer(&mut self, socket: &UdpSocket, events: &PortMapEvents) {
+    async fn on_timer(&mut self, socket: &UdpSocket, reports: &PortMapReports) {
         let now = Instant::now();
         if let Some(flight) = self.in_flight {
             if flight.resend_at <= now {
-                self.resend_request(flight.index, socket, events).await;
+                self.resend_request(flight.index, socket, reports).await;
             }
             return;
         }
@@ -328,8 +318,8 @@ impl State {
     /// Ask the gateway to drop every mapping it may hold, with a lifetime-0
     /// MAP each, sent once without waiting for an answer, and report each
     /// gone (libtorrent `natpmp::close_impl`; `send_map_request` under
-    /// `m_abort`).
-    async fn close(&mut self, socket: &UdpSocket, events: &PortMapEvents) {
+    /// `m_abort`). One last reported failed stays as reported.
+    async fn close(&mut self, socket: &UdpSocket, reports: &PortMapReports) {
         self.in_flight = None;
         for i in 0..self.mappings.len() {
             let m = &mut self.mappings[i];
@@ -345,19 +335,8 @@ impl State {
             }
             let m = &mut self.mappings[i];
             m.live = false;
-            // A mapping last reported failed stays as reported.
-            if !std::mem::take(&mut m.granted) {
-                continue;
-            }
             trace!(protocol = ?m.request.protocol, external_port = m.external_port, "port mapping removed");
-            let _ = events.send(PortMapped {
-                transport: PortmapTransport::NatPmp,
-                protocol: m.request.protocol,
-                local_port: m.request.local_port,
-                external_port: None,
-                external_ip: None,
-                error: None,
-            });
+            reports.removed(m.request, None);
         }
     }
 
@@ -374,7 +353,7 @@ impl State {
     }
 
     /// libtorrent `on_reply`.
-    async fn on_reply(&mut self, p: &[u8], socket: &UdpSocket, events: &PortMapEvents) {
+    async fn on_reply(&mut self, p: &[u8], socket: &UdpSocket, reports: &PortMapReports) {
         if p.len() < 4 {
             return;
         }
@@ -403,7 +382,7 @@ impl State {
                 debug!("the gateway speaks NAT-PMP, not PCP");
                 self.version = VERSION_NATPMP;
                 if let Some(flight) = self.in_flight {
-                    self.resend_request(flight.index, socket, events).await;
+                    self.resend_request(flight.index, socket, reports).await;
                 }
                 self.send_public_address_request(socket).await;
             }
@@ -480,70 +459,103 @@ impl State {
             }
         }
 
-        let report = |external_port, external_ip, error| {
-            // Nobody listening is no reason to stop mapping.
-            let _ = events.send(PortMapped {
-                transport: PortmapTransport::NatPmp,
-                protocol: m.request.protocol,
-                local_port: m.request.local_port,
-                external_port,
-                external_ip,
-                error,
-            });
-        };
         if result != 0 {
             m.expires = Some(now + RETRY_FAILED_AFTER);
-            m.granted = false;
-            report(None, None, Some(result_message(version, result)));
+            reports.failed(m.request, result_message(version, result));
         } else if m.action == Action::Add {
-            m.granted = m.live;
             let external_ip = if pcp { m.external_ip } else { self.external_ip };
-            report(m.live.then_some(m.external_port), external_ip, None);
+            reports.send(
+                m.request,
+                m.live.then_some(m.external_port),
+                external_ip,
+                None,
+            );
         }
         m.action = Action::None;
         self.in_flight = None;
     }
 }
 
+/// Where a mapper asks: from an address on the route's interface to the
+/// NAT-PMP / PCP server of the gateway on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayRoute {
+    pub local_ip: IpAddr,
+    pub gateway: SocketAddr,
+}
+
+impl GatewayRoute {
+    /// The default gateway on `interface`, the route's interface.
+    pub fn of(interface: &RouteInterface) -> anyhow::Result<Self> {
+        let routes = routes().context("error reading the routing table")?;
+        gateway_route(&routes, interface)
+    }
+}
+
+fn gateway_route(routes: &[Route], interface: &RouteInterface) -> anyhow::Result<GatewayRoute> {
+    let gateway = default_gateway_of(routes, &interface.name)
+        .with_context(|| format!("no gateway on the route's interface {}", interface.name))?;
+    Ok(GatewayRoute {
+        local_ip: interface.ip.into(),
+        gateway: (gateway, NATPMP_PORT).into(),
+    })
+}
+
 /// Keeps ports mapped on the gateway over PCP, or NAT-PMP when the gateway
 /// only speaks that (libtorrent `natpmp`).
 pub struct NatPmpMapper {
-    gateway: SocketAddr,
+    /// Where to ask, or why there is nowhere to.
+    route: Result<GatewayRoute, String>,
     mappings: Vec<PortMapRequest>,
     opts: NatPmpOptions,
 }
 
 impl NatPmpMapper {
-    /// A mapper for the NAT-PMP / PCP server at `gateway`, normally the
-    /// default gateway on [`NATPMP_PORT`].
+    /// A mapper asking over `route`, or failing every mapping for why there
+    /// is no route to ask over.
     pub fn new(
-        gateway: SocketAddr,
+        route: Result<GatewayRoute, String>,
         mappings: Vec<PortMapRequest>,
         opts: Option<NatPmpOptions>,
     ) -> Self {
         Self {
-            gateway,
+            route,
             mappings,
             opts: opts.unwrap_or_default(),
         }
     }
 
-    /// Keep every port mapped until cancelled, then remove the mappings.
-    pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
-        let unspecified: IpAddr = match self.gateway {
-            SocketAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
-            SocketAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
-        };
-        let socket = UdpSocket::bind((unspecified, 0))
+    /// The socket the mapper asks the gateway over, connected so only the
+    /// gateway's answers come through, and the address it asks from.
+    async fn connect(route: Result<GatewayRoute, String>) -> anyhow::Result<(UdpSocket, IpAddr)> {
+        let route = route.map_err(anyhow::Error::msg)?;
+        let socket = UdpSocket::bind((route.local_ip, 0))
             .await
-            .context("error binding the NAT-PMP socket")?;
-        // Connected: only the gateway's answers come through.
+            .with_context(|| format!("error binding the NAT-PMP socket to {}", route.local_ip))?;
         socket
-            .connect(self.gateway)
+            .connect(route.gateway)
             .await
-            .with_context(|| format!("error connecting to the gateway at {}", self.gateway))?;
+            .with_context(|| format!("error connecting to the gateway at {}", route.gateway))?;
         let local_ip = socket.local_addr()?.ip();
-        debug!(gateway = %self.gateway, %local_ip, "NAT-PMP / PCP mapper started");
+        Ok((socket, local_ip))
+    }
+
+    /// Keep every port mapped until cancelled, then remove the mappings. A
+    /// mapper with no gateway to ask fails every mapping, as one the gateway
+    /// never answers does.
+    pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
+        let reports = PortMapReports::new(PortmapTransport::NatPmp, events);
+        let (socket, local_ip) = match Self::connect(self.route).await {
+            Ok(connected) => connected,
+            Err(e) => {
+                debug!("NAT-PMP / PCP mapper has no gateway to ask: {e:#}");
+                for request in &self.mappings {
+                    reports.failed(*request, format!("{e:#}"));
+                }
+                return Ok(());
+            }
+        };
+        debug!(gateway = ?socket.peer_addr(), %local_ip, "NAT-PMP / PCP mapper started");
 
         let mut state = State {
             // libtorrent `natpmp::start`: assume PCP, fall back to NAT-PMP.
@@ -567,13 +579,13 @@ impl NatPmpMapper {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 r = socket.recv(&mut buf) => match r {
-                    Ok(n) => state.on_reply(&buf[..n], &socket, &events).await,
+                    Ok(n) => state.on_reply(&buf[..n], &socket, &reports).await,
                     Err(e) => debug!("error receiving from the gateway: {e:#}"),
                 },
-                _ = timer => state.on_timer(&socket, &events).await,
+                _ = timer => state.on_timer(&socket, &reports).await,
             }
         }
-        state.close(&socket, &events).await;
+        state.close(&socket, &reports).await;
         Ok(())
     }
 }
@@ -582,31 +594,25 @@ impl NatPmpMapper {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Route {
     destination: Ipv4Addr,
-    gateway: Ipv4Addr,
+    mask: Ipv4Addr,
+    /// The router the route goes through; `None` for a route straight out
+    /// of the interface, as a tunnel's are.
+    gateway: Option<Ipv4Addr>,
     interface: String,
     /// Lower wins.
     metric: u32,
 }
 
-/// The gateway of the default route, on `device` when one is named
-/// (libtorrent `get_gateway`).
-fn default_gateway_of(routes: &[Route], device: Option<&str>) -> Option<Ipv4Addr> {
+/// The gateway of the default route on `interface` (libtorrent
+/// `get_gateway`). A route over half the address space or more is a
+/// default: 0/0, or either half of a 0/1 + 128/1 pair.
+fn default_gateway_of(routes: &[Route], interface: &str) -> Option<Ipv4Addr> {
     routes
         .iter()
-        .filter(|r| {
-            r.destination.is_unspecified()
-                && !r.gateway.is_unspecified()
-                && device.is_none_or(|d| r.interface == d)
-        })
-        .min_by_key(|r| r.metric)
-        .map(|r| r.gateway)
-}
-
-/// The IPv4 default gateway, read from the routing table (libtorrent
-/// `enum_routes` / `get_gateway`), on `device` when one is named.
-pub fn default_gateway(device: Option<&str>) -> anyhow::Result<Ipv4Addr> {
-    let routes = routes().context("error reading the routing table")?;
-    default_gateway_of(&routes, device).context("no default route")
+        .filter(|r| r.interface == interface && r.mask.to_bits().leading_ones() <= 1)
+        .filter_map(|r| Some((r.metric, r.gateway?)))
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, gateway)| gateway)
 }
 
 /// `/proc/net/route`: every address is the kernel's network-order word
@@ -614,18 +620,22 @@ pub fn default_gateway(device: Option<&str>) -> anyhow::Result<Ipv4Addr> {
 #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
 fn parse_proc_net_route(text: &str) -> Vec<Route> {
     const RTF_UP: u32 = 0x1;
+    const RTF_GATEWAY: u32 = 0x2;
     let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    let address = |s: &str| Some(Ipv4Addr::from(hex(s)?.to_ne_bytes()));
     text.lines()
         .skip(1)
         .filter_map(|line| {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 7 || hex(f[3])? & RTF_UP == 0 {
+            let flags = hex(f.get(3)?)?;
+            if f.len() < 8 || flags & RTF_UP == 0 {
                 return None;
             }
             Some(Route {
                 interface: f[0].to_owned(),
-                destination: Ipv4Addr::from(hex(f[1])?.to_ne_bytes()),
-                gateway: Ipv4Addr::from(hex(f[2])?.to_ne_bytes()),
+                destination: address(f[1])?,
+                mask: address(f[7])?,
+                gateway: (flags & RTF_GATEWAY != 0).then(|| address(f[2])).flatten(),
                 metric: f[6].parse().ok()?,
             })
         })
@@ -658,6 +668,18 @@ fn parse_route_dump(buf: &[u8], interface_name: impl Fn(u16) -> String) -> Vec<R
         }
         Some(Ipv4Addr::new(sa[4], sa[5], sa[6], sa[7]))
     }
+    // A netmask is cut after its last non-zero byte, whatever its family;
+    // a route without one is a host route.
+    fn mask(sa: Option<&[u8]>) -> Ipv4Addr {
+        let Some(sa) = sa else {
+            return Ipv4Addr::BROADCAST;
+        };
+        let mut octets = [0u8; 4];
+        for (o, b) in octets.iter_mut().zip(sa.iter().skip(4)) {
+            *o = *b;
+        }
+        octets.into()
+    }
 
     let header = std::mem::size_of::<libc::rt_msghdr>();
     let mut routes = Vec::new();
@@ -688,14 +710,16 @@ fn parse_route_dump(buf: &[u8], interface_name: impl Fn(u16) -> String) -> Vec<R
             *addr = msg.get(p..p + sa_len);
             p += padded(sa_len);
         }
-        let (Some(destination), Some(gateway)) = (
-            addrs[libc::RTAX_DST as usize].and_then(ipv4),
-            addrs[libc::RTAX_GATEWAY as usize].and_then(ipv4),
-        ) else {
+        let Some(destination) = addrs[libc::RTAX_DST as usize].and_then(ipv4) else {
             continue;
         };
+        // A gateway that is a link, as a tunnel's is, is no router.
+        let gateway = addrs[libc::RTAX_GATEWAY as usize]
+            .filter(|_| rtm.rtm_flags & libc::RTF_GATEWAY != 0)
+            .and_then(ipv4);
         routes.push(Route {
             destination,
+            mask: mask(addrs[libc::RTAX_NETMASK as usize]),
             gateway,
             interface: interface_name(rtm.rtm_index),
             // The primary default route is the one not scoped to an interface.
@@ -786,14 +810,24 @@ fn routes() -> io::Result<Vec<Route>> {
     if r != 0 {
         return Err(io::Error::from_raw_os_error(r as i32));
     }
+    // A route through a router, not straight out of the interface.
+    const FORWARD_TYPE_INDIRECT: u32 = 4;
+    use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+    let names: std::collections::HashMap<u32, String> = NetworkInterface::show()
+        .map_err(io::Error::other)?
+        .into_iter()
+        .map(|i| (i.index, i.name))
+        .collect();
     let count = table[0] as usize;
     Ok(table[1..]
         .chunks_exact(ROW_WORDS)
         .take(count)
         .map(|row| Route {
             destination: Ipv4Addr::from(row[0].to_ne_bytes()),
-            gateway: Ipv4Addr::from(row[3].to_ne_bytes()),
-            interface: row[4].to_string(),
+            mask: Ipv4Addr::from(row[1].to_ne_bytes()),
+            gateway: (row[5] == FORWARD_TYPE_INDIRECT)
+                .then(|| Ipv4Addr::from(row[3].to_ne_bytes())),
+            interface: names.get(&row[4]).cloned().unwrap_or_default(),
             metric: row[9],
         })
         .collect())
@@ -825,9 +859,13 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use super::{NatPmpMapper, Route, default_gateway_of, parse_proc_net_route};
-    use crate::upnp::{
-        PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, tests::hold_clock,
+    use super::{
+        GatewayRoute, NATPMP_PORT, NatPmpMapper, Route, default_gateway_of, gateway_route,
+        parse_proc_net_route,
+    };
+    use crate::{
+        route_interface::RouteInterface,
+        upnp::{PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, tests::hold_clock},
     };
 
     /// A gateway the test answers by hand.
@@ -866,6 +904,19 @@ mod tests {
     }
 
     fn run_mapper(gateway: &Gateway, protocols: &[PortmapProtocol]) -> Running {
+        run_mapper_over(
+            Ok(GatewayRoute {
+                local_ip: Ipv4Addr::LOCALHOST.into(),
+                gateway: gateway.socket.local_addr().unwrap(),
+            }),
+            protocols,
+        )
+    }
+
+    fn run_mapper_over(
+        route: Result<GatewayRoute, String>,
+        protocols: &[PortmapProtocol],
+    ) -> Running {
         let mappings = protocols
             .iter()
             .map(|&protocol| PortMapRequest {
@@ -874,7 +925,7 @@ mod tests {
                 external_port: 6881,
             })
             .collect();
-        let mapper = NatPmpMapper::new(gateway.socket.local_addr().unwrap(), mappings, None);
+        let mapper = NatPmpMapper::new(route, mappings, None);
         let cancel = CancellationToken::new();
         let (events_tx, events) = unbounded_channel();
         let task = tokio::spawn(mapper.run(cancel.clone(), events_tx));
@@ -916,6 +967,17 @@ mod tests {
         assert_eq!(&request[44..60], &suggested.to_ipv6_mapped().octets());
     }
 
+    fn failed(protocol: PortmapProtocol, error: &str) -> PortMapped {
+        PortMapped {
+            transport: PortmapTransport::NatPmp,
+            protocol,
+            local_port: 6881,
+            external_port: None,
+            external_ip: None,
+            error: Some(error.into()),
+        }
+    }
+
     fn mapped(protocol: PortmapProtocol, external_ip: Ipv4Addr) -> PortMapped {
         PortMapped {
             transport: PortmapTransport::NatPmp,
@@ -930,6 +992,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn pcp_maps_tcp_and_udp_refreshes_at_three_quarters_of_the_granted_lifetime_and_removes_them_on_close()
      {
+        // A refresh the gateway grants as before reports nothing new: the
+        // next reports are the removals.
         let _hold = hold_clock();
         let mut gateway = Gateway::new().await;
         let mut running = run_mapper(&gateway, &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
@@ -957,10 +1021,6 @@ mod tests {
         gateway
             .send(&pcp_answer(&refresh, 0, 7200, 1000 + 5400, 6881))
             .await;
-        assert_eq!(
-            running.events.recv().await.unwrap(),
-            mapped(PortmapProtocol::Tcp, EXTERNAL)
-        );
         let refresh = gateway.recv().await;
         assert_pcp_map(&refresh, 17, 3600, EXTERNAL);
         assert_eq!(&refresh[24..36], &udp[24..36]);
@@ -1110,6 +1170,80 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_gateway_that_never_answers_again_is_not_reported_again() {
+        let _hold = hold_clock();
+        let mut gateway = Gateway::new().await;
+        let mut running = run_mapper(&gateway, &[PortmapProtocol::Tcp]);
+
+        // Two rounds of nine unanswered sends, two hours apart.
+        for _ in 0..2 {
+            let first = gateway.recv().await;
+            for n in 1..9 {
+                tokio::time::advance(Duration::from_millis(250 * n)).await;
+                assert_eq!(gateway.recv().await, first, "send {}", n + 1);
+            }
+            tokio::time::advance(Duration::from_millis(250 * 9)).await;
+            tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+        }
+        // The third round is answered: the grant is the next report, so the
+        // second round's failure, the same as the first's, sent nothing.
+        let retry = gateway.recv().await;
+        gateway.send(&pcp_answer(&retry, 0, 7200, 1000, 6881)).await;
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            failed(PortmapProtocol::Tcp, "the gateway never answered")
+        );
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            mapped(PortmapProtocol::Tcp, EXTERNAL)
+        );
+        running.cancel.cancel();
+        running.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_interface_without_a_gateway_fails_each_mapping_once() {
+        let routes = [route([0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], "utun8", 0)];
+        let tunnel = RouteInterface {
+            name: "utun8".into(),
+            ip: Ipv4Addr::new(10, 44, 0, 2),
+            point_to_point: true,
+        };
+        let route = gateway_route(&routes, &tunnel).map_err(|e| format!("{e:#}"));
+        let mut running = run_mapper_over(route, &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
+        for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
+            assert_eq!(
+                running.events.recv().await.unwrap(),
+                failed(protocol, "no gateway on the route's interface utun8")
+            );
+        }
+        // The mapper is done: nothing more comes.
+        assert_eq!(running.events.recv().await, None);
+        running.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_will_not_bind_fails_each_mapping() {
+        // An address this host does not hold.
+        let route = GatewayRoute {
+            local_ip: Ipv4Addr::new(192, 0, 2, 1).into(),
+            gateway: (Ipv4Addr::LOCALHOST, NATPMP_PORT).into(),
+        };
+        let mut running = run_mapper_over(Ok(route), &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
+        for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
+            let report = running.events.recv().await.unwrap();
+            assert_eq!((report.protocol, report.external_port), (protocol, None));
+            let error = report.error.unwrap();
+            assert!(
+                error.starts_with("error binding the NAT-PMP socket to 192.0.2.1"),
+                "{error}"
+            );
+        }
+        assert_eq!(running.events.recv().await, None);
+        running.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_refused_mapping_is_reported_and_the_next_one_goes_ahead() {
         let _hold = hold_clock();
         let mut gateway = Gateway::new().await;
@@ -1165,32 +1299,77 @@ mod tests {
         running.task.await.unwrap().unwrap();
     }
 
-    fn route(destination: [u8; 4], gateway: [u8; 4], interface: &str, metric: u32) -> Route {
+    /// A route; a gateway of 0.0.0.0 is a route straight out of the
+    /// interface.
+    fn route(
+        destination: [u8; 4],
+        mask: [u8; 4],
+        gateway: [u8; 4],
+        interface: &str,
+        metric: u32,
+    ) -> Route {
+        let gateway = Ipv4Addr::from(gateway);
         Route {
             destination: destination.into(),
-            gateway: gateway.into(),
+            mask: mask.into(),
+            gateway: (!gateway.is_unspecified()).then_some(gateway),
             interface: interface.into(),
             metric,
         }
     }
 
     #[test]
-    fn the_default_gateway_is_the_cheapest_default_route_on_the_device() {
+    fn the_gateway_is_the_cheapest_default_route_on_the_route_interface() {
         let routes = [
-            route([10, 0, 0, 0], [10, 0, 0, 1], "eth0", 0),
-            route([0, 0, 0, 0], [0, 0, 0, 0], "tun0", 0),
-            route([0, 0, 0, 0], [192, 168, 1, 1], "eth0", 100),
-            route([0, 0, 0, 0], [192, 168, 2, 1], "wlan0", 50),
+            // The host's primary default goes into a tunnel, its two halves
+            // too; the LAN's default is scoped to en0.
+            route([0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], "utun8", 0),
+            route([0, 0, 0, 0], [128, 0, 0, 0], [0, 0, 0, 0], "utun8", 0),
+            route([128, 0, 0, 0], [128, 0, 0, 0], [0, 0, 0, 0], "utun8", 0),
+            route([10, 0, 0, 0], [255, 0, 0, 0], [10, 44, 0, 1], "utun8", 0),
+            route([0, 0, 0, 0], [0, 0, 0, 0], [172, 16, 4, 1], "en0", 1),
+            route([172, 16, 4, 0], [255, 255, 254, 0], [0, 0, 0, 0], "en0", 0),
+            // A 0/1 + 128/1 pair through a router is a default.
+            route([0, 0, 0, 0], [128, 0, 0, 0], [10, 8, 0, 1], "wg0", 0),
+            route([128, 0, 0, 0], [128, 0, 0, 0], [10, 8, 0, 1], "wg0", 0),
+            route([0, 0, 0, 0], [0, 0, 0, 0], [192, 168, 1, 1], "eth0", 100),
+            route([0, 0, 0, 0], [0, 0, 0, 0], [192, 168, 1, 254], "eth0", 50),
         ];
         assert_eq!(
-            default_gateway_of(&routes, None),
-            Some(Ipv4Addr::new(192, 168, 2, 1))
+            default_gateway_of(&routes, "en0"),
+            Some(Ipv4Addr::new(172, 16, 4, 1))
+        );
+        assert_eq!(default_gateway_of(&routes, "utun8"), None);
+        assert_eq!(
+            default_gateway_of(&routes, "wg0"),
+            Some(Ipv4Addr::new(10, 8, 0, 1))
         );
         assert_eq!(
-            default_gateway_of(&routes, Some("eth0")),
-            Some(Ipv4Addr::new(192, 168, 1, 1))
+            default_gateway_of(&routes, "eth0"),
+            Some(Ipv4Addr::new(192, 168, 1, 254))
         );
-        assert_eq!(default_gateway_of(&routes, Some("tun0")), None);
+
+        let en0 = RouteInterface {
+            name: "en0".into(),
+            ip: Ipv4Addr::new(172, 16, 5, 85),
+            point_to_point: false,
+        };
+        assert_eq!(
+            gateway_route(&routes, &en0).unwrap(),
+            GatewayRoute {
+                local_ip: Ipv4Addr::new(172, 16, 5, 85).into(),
+                gateway: (Ipv4Addr::new(172, 16, 4, 1), NATPMP_PORT).into(),
+            }
+        );
+        let utun8 = RouteInterface {
+            name: "utun8".into(),
+            ip: Ipv4Addr::new(10, 44, 0, 2),
+            point_to_point: true,
+        };
+        assert_eq!(
+            format!("{:#}", gateway_route(&routes, &utun8).unwrap_err()),
+            "no gateway on the route's interface utun8"
+        );
     }
 
     #[test]
@@ -1214,8 +1393,14 @@ mod tests {
         assert_eq!(
             parse_proc_net_route(&text),
             vec![
-                route([0, 0, 0, 0], [192, 168, 1, 1], "eth0", 100),
-                route([192, 168, 1, 0], [0, 0, 0, 0], "eth0", 100),
+                route([0, 0, 0, 0], [0, 0, 0, 0], [192, 168, 1, 1], "eth0", 100),
+                route(
+                    [192, 168, 1, 0],
+                    [255, 255, 255, 0],
+                    [0, 0, 0, 0],
+                    "eth0",
+                    100
+                ),
             ]
         );
     }
@@ -1254,7 +1439,7 @@ mod tests {
             sa.resize(16, 0);
             sa
         }
-        // A link-layer gateway (sockaddr_dl) is not an IPv4 route.
+        // A link-layer gateway (sockaddr_dl) is no router.
         let link = vec![
             20,
             libc::AF_LINK as u8,
@@ -1290,20 +1475,32 @@ mod tests {
         dump.extend(message(
             0,
             4,
-            &[&sin([192, 168, 1, 0]), &link, &[0, 0, 0, 0]],
+            &[&sin([192, 168, 1, 0]), &link, &sin([255, 255, 255, 0])],
+        ));
+        // A tunnel's default and its 0/1 half: a link for a gateway, the
+        // half's mask cut after its one non-zero byte.
+        dump.extend(message(0, 9, &[&sin([0, 0, 0, 0]), &link, &[0, 0, 0, 0]]));
+        dump.extend(message(
+            0,
+            9,
+            &[&sin([0, 0, 0, 0]), &link, &[5, 0, 0, 0, 128]],
         ));
 
         let routes = super::parse_route_dump(&dump, |index| format!("if{index}"));
         assert_eq!(
             routes,
             vec![
-                route([0, 0, 0, 0], [10, 8, 0, 1], "if7", 1),
-                route([0, 0, 0, 0], [192, 168, 1, 1], "if4", 0),
+                route([0, 0, 0, 0], [0, 0, 0, 0], [10, 8, 0, 1], "if7", 1),
+                route([0, 0, 0, 0], [0, 0, 0, 0], [192, 168, 1, 1], "if4", 0),
+                route([192, 168, 1, 0], [255, 255, 255, 0], [0, 0, 0, 0], "if4", 0),
+                route([0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], "if9", 0),
+                route([0, 0, 0, 0], [128, 0, 0, 0], [0, 0, 0, 0], "if9", 0),
             ]
         );
         assert_eq!(
-            default_gateway_of(&routes, None),
+            default_gateway_of(&routes, "if4"),
             Some(Ipv4Addr::new(192, 168, 1, 1))
         );
+        assert_eq!(default_gateway_of(&routes, "if9"), None);
     }
 }

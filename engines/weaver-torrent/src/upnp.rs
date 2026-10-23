@@ -8,7 +8,6 @@
 use anyhow::{Context, bail};
 use bstr::BStr;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use reqwest::{Client, StatusCode};
 use serde_derive::Deserialize;
@@ -24,6 +23,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, debug_span, trace, warn};
 use url::Url;
+
+use crate::route_interface::RouteInterface;
 
 /// What a mapping forwards (libtorrent `portmap_protocol`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -73,17 +74,70 @@ pub struct PortMapped {
 /// Where a mapper sends its reports. A mapper keeps working when nobody listens.
 pub type PortMapEvents = UnboundedSender<PortMapped>;
 
-/// A mapping failed for `error`.
-fn report_failed(events: &PortMapEvents, request: PortMapRequest, error: String) {
-    // Nobody listening is no reason to stop mapping.
-    let _ = events.send(PortMapped {
-        transport: PortmapTransport::Upnp,
-        protocol: request.protocol,
-        local_port: request.local_port,
-        external_port: None,
-        external_ip: None,
-        error: Some(error),
-    });
+/// One mapper's reports: a mapping is reported when its outcome changes,
+/// and an outcome its last report already gave is not sent again.
+pub(crate) struct PortMapReports {
+    transport: PortmapTransport,
+    events: PortMapEvents,
+    /// The last report of each mapping.
+    standing: parking_lot::Mutex<Vec<PortMapped>>,
+}
+
+impl PortMapReports {
+    pub(crate) fn new(transport: PortmapTransport, events: PortMapEvents) -> Self {
+        Self {
+            transport,
+            events,
+            standing: Default::default(),
+        }
+    }
+
+    pub(crate) fn send(
+        &self,
+        request: PortMapRequest,
+        external_port: Option<u16>,
+        external_ip: Option<IpAddr>,
+        error: Option<String>,
+    ) {
+        let report = PortMapped {
+            transport: self.transport,
+            protocol: request.protocol,
+            local_port: request.local_port,
+            external_port,
+            external_ip,
+            error,
+        };
+        let mut standing = self.standing.lock();
+        let last = standing
+            .iter_mut()
+            .find(|r| r.protocol == request.protocol && r.local_port == request.local_port);
+        match last {
+            Some(last) if *last == report => return,
+            Some(last) => *last = report.clone(),
+            None => standing.push(report.clone()),
+        }
+        // Nobody listening is no reason to stop mapping.
+        let _ = self.events.send(report);
+    }
+
+    /// A mapping failed for `error`.
+    pub(crate) fn failed(&self, request: PortMapRequest, error: String) {
+        self.send(request, None, None, Some(error));
+    }
+
+    /// A mapping was removed on close, with the gateway's error if it
+    /// refused. Only a standing grant is reported removed: a teardown never
+    /// replaces a failure.
+    pub(crate) fn removed(&self, request: PortMapRequest, error: Option<String>) {
+        let granted = self.standing.lock().iter().any(|r| {
+            r.protocol == request.protocol
+                && r.local_port == request.local_port
+                && r.external_port.is_some()
+        });
+        if granted {
+            self.send(request, None, None, error);
+        }
+    }
 }
 
 /// The services a gateway maps ports through (libtorrent `find_control_url`).
@@ -334,22 +388,31 @@ pub fn parse_upnp_discover_response(
     })
 }
 
-/// Search for devices of `kind` for `timeout`, sending each that answers
-/// to `tx`; returns how many answered.
+/// The SSDP socket: bound to `from` and sending its multicast out of the
+/// interface holding it, whatever interface the host routes multicast to.
+fn ssdp_socket(from: Ipv4Addr) -> anyhow::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("error creating the SSDP socket")?;
+    socket
+        .set_multicast_if_v4(&from)
+        .with_context(|| format!("error searching from {from}"))?;
+    socket
+        .bind(&SocketAddr::from((from, 0)).into())
+        .with_context(|| format!("error binding the SSDP socket to {from}"))?;
+    socket.set_nonblocking(true)?;
+    Ok(tokio::net::UdpSocket::from_std(socket.into())?)
+}
+
+/// Search for devices of `kind` from the interface holding `from` for
+/// `timeout`, sending each that answers to `tx`; returns how many answered.
 pub async fn discover_once(
     tx: &UnboundedSender<Discovered>,
     kind: &str,
     timeout: Duration,
-    bind_device: Option<&BindDevice>,
+    from: Ipv4Addr,
 ) -> anyhow::Result<usize> {
-    // TODO: do we need IPv6 support here? I can't test it, don't have the hardware for it (router / IPv6 provider).
-    let socket = UdpSocket::bind_udp(
-        (Ipv4Addr::UNSPECIFIED, 0).into(),
-        librqbit_dualstack_sockets::BindOpts {
-            device: bind_device,
-            ..Default::default()
-        },
-    )?;
+    let socket = ssdp_socket(from)?;
 
     let message = make_ssdp_search_request(kind);
     socket
@@ -475,15 +538,31 @@ impl GatewayMapping {
 pub struct UpnpPortForwarder {
     mappings: Vec<PortMapRequest>,
     opts: UpnpPortForwarderOptions,
-    bind_device: Option<BindDevice>,
+    /// The address on the route's interface the search goes out from, or
+    /// why there is none to search from.
+    search_from: Result<Ipv4Addr, String>,
     client: Client,
 }
 
+/// Where to search for a gateway on the route's interface: a
+/// point-to-point link has no network behind it to search.
+fn search_from(interface: &RouteInterface) -> Result<Ipv4Addr, String> {
+    if interface.point_to_point {
+        return Err(format!(
+            "the route's interface {} is a point-to-point link: no network on it to search for a UPnP gateway",
+            interface.name
+        ));
+    }
+    Ok(interface.ip)
+}
+
 impl UpnpPortForwarder {
+    /// A forwarder searching from `interface`, the route's interface, or
+    /// failing every mapping for why there is none.
     pub fn new(
         mappings: Vec<PortMapRequest>,
         opts: Option<UpnpPortForwarderOptions>,
-        bind_device: Option<BindDevice>,
+        interface: Result<RouteInterface, String>,
     ) -> anyhow::Result<Self> {
         if mappings.is_empty() {
             bail!("empty ports")
@@ -496,7 +575,7 @@ impl UpnpPortForwarder {
         Ok(Self {
             mappings,
             opts: opts.unwrap_or_default(),
-            bind_device,
+            search_from: interface.and_then(|i| search_from(&i)),
             client,
         })
     }
@@ -507,20 +586,20 @@ impl UpnpPortForwarder {
 
         loop {
             discover_interval.tick().await;
-            let none = match discover_once(
-                &tx,
-                SSDP_SEARCH_ROOT_ST,
-                self.opts.discover_timeout,
-                self.bind_device.as_ref(),
-            )
-            .await
-            {
-                Ok(0) => "no UPnP device answered the search".to_owned(),
-                Ok(_) => continue,
-                Err(e) => {
-                    warn!("failed to run SSDP/UPNP discovery: {e:#}");
-                    format!("{e:#}")
+            let none = match &self.search_from {
+                Ok(from) => {
+                    match discover_once(&tx, SSDP_SEARCH_ROOT_ST, self.opts.discover_timeout, *from)
+                        .await
+                    {
+                        Ok(0) => "no UPnP device answered the search".to_owned(),
+                        Ok(_) => continue,
+                        Err(e) => {
+                            debug!("failed to run SSDP/UPNP discovery: {e:#}");
+                            format!("{e:#}")
+                        }
+                    }
                 }
+                Err(none) => none.clone(),
             };
             if tx.send(Err(none)).is_err() {
                 return;
@@ -530,24 +609,19 @@ impl UpnpPortForwarder {
 
     fn report(
         &self,
-        events: &PortMapEvents,
+        reports: &PortMapReports,
         gateway: &Gateway,
         mapping: &GatewayMapping,
         result: Result<(), String>,
     ) {
         match result {
-            Ok(()) => {
-                // Nobody listening is no reason to stop mapping.
-                let _ = events.send(PortMapped {
-                    transport: PortmapTransport::Upnp,
-                    protocol: mapping.request.protocol,
-                    local_port: mapping.request.local_port,
-                    external_port: Some(mapping.external_port),
-                    external_ip: gateway.external_ip,
-                    error: None,
-                });
-            }
-            Err(e) => report_failed(events, mapping.request, e),
+            Ok(()) => reports.send(
+                mapping.request,
+                Some(mapping.external_port),
+                gateway.external_ip,
+                None,
+            ),
+            Err(e) => reports.failed(mapping.request, e),
         }
     }
 
@@ -657,12 +731,12 @@ impl UpnpPortForwarder {
         &self,
         gateway: &mut Gateway,
         mapping: &mut GatewayMapping,
-        events: &PortMapEvents,
+        reports: &PortMapReports,
     ) -> anyhow::Result<()> {
         mapping.next_add = None;
         loop {
             if mapping.failcount > MAX_FAILCOUNT {
-                self.report(events, gateway, mapping, Err("gave up".into()));
+                self.report(reports, gateway, mapping, Err("gave up".into()));
                 return Ok(());
             }
             let lease = if gateway.use_lease_duration {
@@ -689,7 +763,7 @@ impl UpnpPortForwarder {
             let (status, body) = match self.soap(gateway, "AddPortMapping", &arguments).await {
                 Ok(r) => r,
                 Err(e) => {
-                    self.report(events, gateway, mapping, Err(format!("{e:#}")));
+                    self.report(reports, gateway, mapping, Err(format!("{e:#}")));
                     return Err(e);
                 }
             };
@@ -707,11 +781,11 @@ impl UpnpPortForwarder {
                     mapping.failcount += 1;
                 }
                 Some(code) => {
-                    self.report(events, gateway, mapping, Err(format!("UPnP error {code}")));
+                    self.report(reports, gateway, mapping, Err(format!("UPnP error {code}")));
                     return Ok(());
                 }
                 None if !status.is_success() => {
-                    self.report(events, gateway, mapping, Err(format!("HTTP {status}")));
+                    self.report(reports, gateway, mapping, Err(format!("HTTP {status}")));
                     return Ok(());
                 }
                 None => {
@@ -727,7 +801,7 @@ impl UpnpPortForwarder {
                     if !lease.is_zero() {
                         mapping.next_add = Some(Instant::now() + lease * 3 / 4);
                     }
-                    self.report(events, gateway, mapping, Ok(()));
+                    self.report(reports, gateway, mapping, Ok(()));
                     return Ok(());
                 }
             }
@@ -739,12 +813,12 @@ impl UpnpPortForwarder {
         &self,
         gateway: &mut Gateway,
         mappings: &mut [GatewayMapping],
-        events: &PortMapEvents,
+        reports: &PortMapReports,
     ) -> anyhow::Result<()> {
         let now = Instant::now();
         for mapping in mappings {
             if mapping.next_add.is_some_and(|t| t <= now) {
-                self.add_port_mapping(gateway, mapping, events).await?;
+                self.add_port_mapping(gateway, mapping, reports).await?;
             }
         }
         Ok(())
@@ -752,12 +826,13 @@ impl UpnpPortForwarder {
 
     /// Remove every mapping the gateway granted (libtorrent `upnp::close`,
     /// `delete_port_mapping`, `on_upnp_unmap_response`) and report each
-    /// gone, with the gateway's error if it refused.
+    /// gone, with the gateway's error if it refused; one whose last renewal
+    /// failed is removed and stays reported failed.
     async fn delete_port_mappings(
         &self,
         gateway: &Gateway,
         mappings: &mut [GatewayMapping],
-        events: &PortMapEvents,
+        reports: &PortMapReports,
     ) {
         for mapping in mappings {
             let Some(external_port) = mapping.granted.take() else {
@@ -784,14 +859,7 @@ impl UpnpPortForwarder {
                 ?error,
                 "port mapping removed"
             );
-            let _ = events.send(PortMapped {
-                transport: PortmapTransport::Upnp,
-                protocol: mapping.request.protocol,
-                local_port: mapping.request.local_port,
-                external_port: None,
-                external_ip: None,
-                error,
-            });
+            reports.removed(mapping.request, error);
         }
     }
 
@@ -801,7 +869,7 @@ impl UpnpPortForwarder {
         &self,
         mut gateway: Gateway,
         cancel: &CancellationToken,
-        events: &PortMapEvents,
+        reports: &PortMapReports,
     ) -> anyhow::Result<()> {
         debug!(control_url = %gateway.control_url, service = gateway.service_type, "found port mapping service");
         let mut mappings: Vec<GatewayMapping> = self
@@ -812,7 +880,7 @@ impl UpnpPortForwarder {
             .collect();
         loop {
             tokio::select! {
-                r = self.add_due_mappings(&mut gateway, &mut mappings, events) => r?,
+                r = self.add_due_mappings(&mut gateway, &mut mappings, reports) => r?,
                 _ = cancel.cancelled() => break,
             }
             let next_add = mappings.iter().filter_map(|m| m.next_add).min();
@@ -825,15 +893,15 @@ impl UpnpPortForwarder {
                 _ = cancel.cancelled() => break,
             }
         }
-        self.delete_port_mappings(&gateway, &mut mappings, events)
+        self.delete_port_mappings(&gateway, &mut mappings, reports)
             .await;
         Ok(())
     }
 
     /// Every mapping failed for `error`.
-    fn report_unmapped(&self, events: &PortMapEvents, error: &str) {
+    fn report_unmapped(&self, reports: &PortMapReports, error: &str) {
         for request in &self.mappings {
-            report_failed(events, *request, error.to_owned());
+            reports.failed(*request, error.to_owned());
         }
     }
 
@@ -847,6 +915,7 @@ impl UpnpPortForwarder {
         cancel: CancellationToken,
         events: PortMapEvents,
     ) -> anyhow::Result<()> {
+        let reports = PortMapReports::new(PortmapTransport::Upnp, events);
         let mut known = HashSet::<Url>::new();
         let mut opening = FuturesUnordered::new();
         let mut gateways = FuturesUnordered::new();
@@ -868,16 +937,16 @@ impl UpnpPortForwarder {
                     }
                     Err(none) => {
                         if opening.is_empty() && gateways.is_empty() {
-                            self.report_unmapped(&events, &none);
+                            self.report_unmapped(&reports, &none);
                         }
                     }
                 },
                 Some((location, r)) = opening.next(), if !opening.is_empty() => match r {
                     Ok(gateway) => {
                         let span = debug_span!("upnp_gateway", location = %location);
-                        let (cancel, events) = (&cancel, &events);
+                        let (cancel, reports) = (&cancel, &reports);
                         gateways.push(async move {
-                            let r = self.manage_gateway(gateway, cancel, events).await;
+                            let r = self.manage_gateway(gateway, cancel, reports).await;
                             (location, r)
                         }.instrument(span));
                     }
@@ -885,7 +954,7 @@ impl UpnpPortForwarder {
                         debug!(%location, "UPnP device did not open: {e:#}");
                         known.remove(&location);
                         if opening.is_empty() && gateways.is_empty() {
-                            self.report_unmapped(&events, &format!("{e:#}"));
+                            self.report_unmapped(&reports, &format!("{e:#}"));
                         }
                     }
                 },
@@ -931,6 +1000,16 @@ pub(crate) mod tests {
         UpnpPortForwarder, UpnpPortForwarderOptions, parse_upnp_discover_response,
         xml_element_text,
     };
+    use crate::route_interface::RouteInterface;
+
+    /// The loopback interface, as the route's interface.
+    fn loopback() -> RouteInterface {
+        RouteInterface {
+            name: "lo".into(),
+            ip: std::net::Ipv4Addr::LOCALHOST,
+            point_to_point: false,
+        }
+    }
 
     /// Keeps the paused clock from moving on its own while a test waits on
     /// loopback I/O: tokio does not auto-advance while a blocking task runs,
@@ -1180,9 +1259,12 @@ pub(crate) mod tests {
 
     /// Run a forwarder that finds what the test sends to `found`.
     fn start_forwarder(mappings: Vec<PortMapRequest>) -> Running {
-        let forwarder =
-            UpnpPortForwarder::new(mappings, Some(UpnpPortForwarderOptions::default()), None)
-                .unwrap();
+        let forwarder = UpnpPortForwarder::new(
+            mappings,
+            Some(UpnpPortForwarderOptions::default()),
+            Ok(loopback()),
+        )
+        .unwrap();
         let (found, found_rx) = unbounded_channel();
         let cancel = CancellationToken::new();
         let (events_tx, events) = unbounded_channel();
@@ -1218,14 +1300,17 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_search_that_finds_no_gateway_fails_each_mapping_until_a_gateway_maps_it() {
+    async fn a_search_that_finds_no_gateway_fails_each_mapping_once_until_a_gateway_maps_it() {
         let _hold = hold_clock();
         let mut running = start_forwarder(tcp_and_udp(6881));
 
-        running
-            .found
-            .send(Err("no UPnP device answered the search".into()))
-            .unwrap();
+        // Two searches find nothing: only the first is reported.
+        for _ in 0..2 {
+            running
+                .found
+                .send(Err("no UPnP device answered the search".into()))
+                .unwrap();
+        }
         for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
             assert_eq!(
                 running.events.recv().await.unwrap(),
@@ -1234,7 +1319,7 @@ pub(crate) mod tests {
         }
 
         // A later search finds a gateway: its mappings are the next reports.
-        let (location, _calls) = mock_gateway(
+        let (location, mut calls) = mock_gateway(
             |_| {
                 gateway_description(
                     "InternetGatewayDevice:1",
@@ -1256,18 +1341,20 @@ pub(crate) mod tests {
             );
         }
 
+        for action in ["GetExternalIPAddress", "AddPortMapping", "AddPortMapping"] {
+            assert_eq!(calls.recv().await.unwrap().action(), action);
+        }
+
         // While a gateway is managed, a search that finds none says nothing
-        // of the mappings it holds: the renewals are the next reports.
+        // of the mappings it holds, and renewals the gateway grants as
+        // before report nothing new: the removals are the next reports.
         running
             .found
             .send(Err("no UPnP device answered the search".into()))
             .unwrap();
         tokio::time::advance(Duration::from_secs(2700)).await;
-        for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
-            assert_eq!(
-                running.events.recv().await.unwrap(),
-                mapped(protocol, 6881, 6881)
-            );
+        for _ in 0..2 {
+            assert_eq!(calls.recv().await.unwrap().action(), "AddPortMapping");
         }
         running.cancel.cancel();
         for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
@@ -1410,9 +1497,9 @@ pub(crate) mod tests {
             assert_eq!(call.arg("NewProtocol"), protocol);
             assert_eq!(call.arg("NewLeaseDuration"), "3600");
         }
-        running.events.recv().await.unwrap();
-        running.events.recv().await.unwrap();
 
+        // The renewals granted as before report nothing new: the removals
+        // are the next reports.
         running.cancel.cancel();
         for (protocol, name) in [(PortmapProtocol::Tcp, "TCP"), (PortmapProtocol::Udp, "UDP")] {
             let call = calls.recv().await.unwrap();
@@ -1605,6 +1692,91 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_renewal_that_failed_stays_reported_failed_through_close() {
+        let _hold = hold_clock();
+        let adds = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (location, mut calls) = mock_gateway(
+            |_| {
+                gateway_description(
+                    "InternetGatewayDevice:1",
+                    "urn:schemas-upnp-org:service:WANIPConnection:1",
+                    "",
+                )
+            },
+            Arc::new(move |call: &SoapCall| match call.action() {
+                "GetExternalIPAddress" => external_ip_answer(),
+                "AddPortMapping" if adds.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 => {
+                    fault(727)
+                }
+                _ => ok(""),
+            }),
+        )
+        .await;
+        let request = PortMapRequest {
+            protocol: PortmapProtocol::Tcp,
+            local_port: 6881,
+            external_port: 6881,
+        };
+        let mut running = run_forwarder(location, vec![request]);
+
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            mapped(PortmapProtocol::Tcp, 6881, 6881)
+        );
+        tokio::time::advance(Duration::from_secs(2700)).await;
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            unmapped(PortmapProtocol::Tcp, "UPnP error 727")
+        );
+
+        // Closing still removes the port the gateway granted, and the
+        // failure stays the mapping's last report.
+        // The gateway records each call before it answers, so every call
+        // made is recorded once the forwarder is done.
+        running.cancel.cancel();
+        running.task.await.unwrap().unwrap();
+        let actions: Vec<String> = std::iter::from_fn(|| calls.try_recv().ok())
+            .map(|c| c.action().to_owned())
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                "GetExternalIPAddress",
+                "AddPortMapping",
+                "AddPortMapping",
+                "DeletePortMapping"
+            ]
+        );
+        assert_eq!(running.events.recv().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_point_to_point_route_interface_fails_each_mapping_without_searching() {
+        let _hold = hold_clock();
+        let tunnel = RouteInterface {
+            name: "utun8".into(),
+            ip: std::net::Ipv4Addr::new(10, 44, 0, 2),
+            point_to_point: true,
+        };
+        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(tunnel)).unwrap();
+        let cancel = CancellationToken::new();
+        let (events_tx, mut events) = unbounded_channel();
+        let task = tokio::spawn(forwarder.run(cancel.clone(), events_tx));
+        for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
+            assert_eq!(
+                events.recv().await.unwrap(),
+                unmapped(
+                    protocol,
+                    "the route's interface utun8 is a point-to-point link: no network on it to search for a UPnP gateway"
+                )
+            );
+        }
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+        assert_eq!(events.recv().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_control_url_on_another_host_is_refused() {
         let _hold = hold_clock();
         let (location, _calls) = mock_gateway(
@@ -1618,7 +1790,7 @@ pub(crate) mod tests {
             Arc::new(|_: &SoapCall| ok("")),
         )
         .await;
-        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, None).unwrap();
+        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(loopback())).unwrap();
         let found = UpnpDiscoverResponse {
             received_from: "127.0.0.1:1900".parse().unwrap(),
             location,
@@ -1652,7 +1824,7 @@ pub(crate) mod tests {
                 (status, body + &" ".repeat(pad))
             })
         };
-        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, None).unwrap();
+        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(loopback())).unwrap();
         let open = |location| {
             let found = UpnpDiscoverResponse {
                 received_from: "127.0.0.1:1900".parse().unwrap(),

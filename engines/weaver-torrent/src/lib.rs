@@ -56,6 +56,7 @@ pub mod peer_protocol;
 mod piece_priority;
 mod piece_tracker;
 mod read_buf;
+pub mod route_interface;
 mod session;
 mod session_persistence;
 pub mod session_stats;

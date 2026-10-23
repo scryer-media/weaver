@@ -35,7 +35,7 @@ use crate::dht::{
 };
 use crate::lsd::{LocalServiceDiscovery, LocalServiceDiscoveryOptions};
 use crate::meter::Meter;
-use crate::natpmp::{NATPMP_PORT, NatPmpMapper};
+use crate::natpmp::{GatewayRoute, NatPmpMapper};
 use crate::peer_protocol::Handshake;
 use crate::ssl::{SslHttpClients, SslIdentity, SslTorrent};
 use crate::torrent_state::live::{
@@ -1539,7 +1539,6 @@ impl Session {
                         .collect();
                     session.start_port_mapping(
                         requests,
-                        bind_device.clone(),
                         opts.bind_device_name.as_deref(),
                         opts.port_map_events.take(),
                     );
@@ -1860,50 +1859,40 @@ impl Session {
     /// NAT-PMP at once (libtorrent `session_impl::start_upnp` and
     /// `start_natpmp`), announce the TCP port a mapper got, count the
     /// address the gateway gave as the router's vote (`on_port_mapping`),
-    /// and pass each report on to `forward`.
+    /// and pass each report on to `forward`. Both mappers work on the
+    /// interface the session's traffic leaves through: the bound device, or
+    /// the one the host routes public traffic to.
     fn start_port_mapping(
         &self,
         requests: Vec<PortMapRequest>,
-        bind_device: Option<BindDevice>,
         bind_device_name: Option<&str>,
         forward: Option<PortMapEvents>,
     ) {
-        info!(?requests, "starting UPnP and NAT-PMP / PCP port mapping");
+        let interface =
+            crate::route_interface::route_interface(bind_device_name).map_err(|e| format!("{e:#}"));
+        info!(
+            ?requests,
+            ?interface,
+            "starting UPnP and NAT-PMP / PCP port mapping"
+        );
         let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         let upnp_opts = UpnpPortForwarderOptions {
             description: self.identity.user_agent.clone(),
             ..Default::default()
         };
-        match UpnpPortForwarder::new(requests.clone(), Some(upnp_opts), bind_device) {
+        match UpnpPortForwarder::new(requests.clone(), Some(upnp_opts), interface.clone()) {
             Ok(upnp) => self.spawn_port_mapper(
                 "upnp_forward",
                 upnp.run(self.cancellation_token.clone(), events_tx.clone()),
             ),
             Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
         }
-        match crate::natpmp::default_gateway(bind_device_name) {
-            Ok(gateway) => {
-                let mapper = NatPmpMapper::new((gateway, NATPMP_PORT).into(), requests, None);
-                self.spawn_port_mapper(
-                    "natpmp_forward",
-                    mapper.run(self.cancellation_token.clone(), events_tx),
-                );
-            }
-            // No gateway to ask fails every mapping, as one that never
-            // answers does.
-            Err(e) => {
-                for request in &requests {
-                    let _ = events_tx.send(PortMapped {
-                        transport: PortmapTransport::NatPmp,
-                        protocol: request.protocol,
-                        local_port: request.local_port,
-                        external_port: None,
-                        external_ip: None,
-                        error: Some(format!("no gateway: {e:#}")),
-                    });
-                }
-            }
-        }
+        let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
+        self.spawn_port_mapper(
+            "natpmp_forward",
+            NatPmpMapper::new(route, requests, None)
+                .run(self.cancellation_token.clone(), events_tx),
+        );
         let announce_port = self.announce_port.clone();
         let external_ips = self.external_ips.clone();
         self.spawn_port_mapper("port_mapping", async move {
