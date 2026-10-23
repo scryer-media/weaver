@@ -464,9 +464,9 @@ impl Recovery for RarRecovery {
 
     // A recovery volume is spent whole. Once its front is in, the rest
     // waits deferred (what is in hand of it the root leaves be) until the
-    // set comes up short; then as many as it is
-    // short of are wanted whole. Nothing of the deferral is kept: the same
-    // ruling says it again on every round, after a restart too.
+    // set comes up short, and then as many volumes as the set is short of
+    // are wanted whole. Nothing of the deferral is kept: the same ruling
+    // says it again on every round, after a restart too.
     fn wants(&self, out: &mut Vec<Seek>) {
         let mut short = match self.last {
             Some(Ruling::Short { needed }) => needed.saturating_sub(self.usable()),

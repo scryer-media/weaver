@@ -465,8 +465,8 @@ impl Recovery for Par2 {
     }
 
     // Per set, ask for the volumes that serve it and are not yet in hand,
-    // the fewest blocks first, as the classic promotion takes the smallest
-    // files, until what they are named to carry covers its shortfall. Every
+    // the fewest blocks first, so the least recovery data is fetched, until
+    // what they are named to carry covers its shortfall. Every
     // other volume the walk has shown carries recovery blocks is deferred:
     // its head told what it is, and the rest waits until a shortfall wants
     // it. Nothing of the deferral is kept: the same walk says it again on
@@ -510,7 +510,7 @@ impl Recovery for Par2 {
     }
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
-        let mut outcome = RepairOutcome::Clean;
+        let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
             let coming = self.coming(&key);
             let Some(state) = self.sets.get_mut(&key) else {
@@ -529,18 +529,18 @@ impl Recovery for Par2 {
         outcome
     }
 
-    // What the sets ruled, folded from Clean as `repair` folds it, each
+    // What the sets ruled, folded from Unread as `repair` folds it, each
     // that came up short waiting while it still does. `None` while a set
     // has not ruled since its bindings changed, or once one no longer waits,
-    // so it is tried again. With no set found there is nothing to rule on
-    // once a volume of its own is read through: Clean. Before that a set
-    // may still be found in the bytes to come, and it has not ruled.
+    // so it is tried again. With no set found once a volume of its own is
+    // read through, nothing was checked: Unread. Before that a set may
+    // still be found in the bytes to come, and it has not ruled.
     fn outcome(&self) -> Option<RepairOutcome> {
         if self.sets.is_empty() {
             let read_through = self.volumes.iter().any(|volume| volume.closed);
-            return read_through.then_some(RepairOutcome::Clean);
+            return read_through.then_some(RepairOutcome::Unread);
         }
-        let mut outcome = RepairOutcome::Clean;
+        let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
             let last = self.sets[&key].last?;
             let ruled = match last.outcome {
@@ -569,14 +569,15 @@ impl Recovery for Par2 {
 }
 
 // Several sets' outcomes as one: the worst kind wins, and outcomes of one
-// kind add up.
+// kind add up. A set that read nothing gives way to any verdict.
 pub(crate) fn combine(left: RepairOutcome, right: RepairOutcome) -> RepairOutcome {
     fn rank(outcome: RepairOutcome) -> u8 {
         match outcome {
-            RepairOutcome::Clean => 0,
-            RepairOutcome::Repaired { .. } => 1,
-            RepairOutcome::Waiting => 2,
-            RepairOutcome::Impossible { .. } => 3,
+            RepairOutcome::Unread => 0,
+            RepairOutcome::Clean => 1,
+            RepairOutcome::Repaired { .. } => 2,
+            RepairOutcome::Waiting => 3,
+            RepairOutcome::Impossible { .. } => 4,
         }
     }
     match (left, right) {

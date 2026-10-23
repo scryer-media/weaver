@@ -119,10 +119,10 @@ impl Tree {
     // found it whole or made it so proves of it: a set vouches only for
     // the bytes its checks reach.
     fn unproven(&self, node: NodeId, member: MemberId) -> Vec<ByteRange> {
-        let Some(record) = self
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
-        else {
+        let Some(namespace) = self.namespace(node) else {
+            return Vec::new();
+        };
+        let Some(record) = namespace.get(member) else {
             return Vec::new();
         };
         let proving: Vec<_> = self
@@ -143,10 +143,7 @@ impl Tree {
         for recovery in proving {
             left = left
                 .into_iter()
-                .flat_map(|range| {
-                    let length = record.length.unwrap_or(range.end);
-                    without(range, recovery.proves(member, length))
-                })
+                .flat_map(|range| without(range, namespace.proven(member, range, recovery)))
                 .collect();
         }
         left
@@ -191,7 +188,9 @@ impl Standing for Stood<'_> {
                     && member.coverage.damaged_ranges().next().is_some()
                     && !tree.nodes.retired().contains_key(&(node, member.id))
                     && !tree.given_back(node, member.id)
-                    && !tree.ruled(node, member.id, |outcome| outcome != RepairOutcome::Waiting)
+                    && !tree.ruled(node, member.id, |outcome| {
+                        !matches!(outcome, RepairOutcome::Waiting | RepairOutcome::Unread)
+                    })
             })
     }
 
@@ -238,11 +237,11 @@ impl Standing for Stood<'_> {
     }
 }
 
-// What of `range` lies outside `proven`.
-fn without(range: ByteRange, proven: ByteRange) -> Vec<ByteRange> {
-    if range.intersect(proven).is_none() {
+// What of `range` lies outside the part of it `proven`.
+fn without(range: ByteRange, proven: Option<ByteRange>) -> Vec<ByteRange> {
+    let Some(proven) = proven else {
         return vec![range];
-    }
+    };
     [
         ByteRange::new(range.start, proven.start.max(range.start)),
         ByteRange::new(proven.end.min(range.end), range.end),

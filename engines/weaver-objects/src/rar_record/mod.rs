@@ -14,8 +14,8 @@
 // written back into the member, impossible when the record cannot rebuild
 // them all or cannot vouch for every protected byte. A clean or repaired
 // ruling proves the protected bytes only. A record that is not there or
-// cannot be read says nothing of the volume: it covers nothing, and, as a
-// recovery object with nothing to rule on does, rules clean on nothing.
+// cannot be read says nothing of the volume: it covers nothing and rules
+// unread, which is no verdict on it.
 //
 // The volume's store says where the record lies and hands it the
 // candidate that opened the volume's headers, or nothing when they are open
@@ -356,15 +356,15 @@ impl Recovery for RarRecord {
     }
 
     // A ruling made while the volume was open waits for it to close, and
-    // is due again once it has. One that could not read the record has
-    // nothing to rule on, so it is clean on the nothing it covers.
+    // is due again once it has. One that could not read the record checked
+    // nothing, so it rules unread.
     fn outcome(&self) -> Option<RepairOutcome> {
         Some(match self.said? {
             Said::Waiting => return (!self.closed).then_some(RepairOutcome::Waiting),
             Said::Intact => RepairOutcome::Clean,
             Said::Rebuilt { units } => RepairOutcome::Repaired { slices: units },
             Said::Short { damaged, reachable } => RepairOutcome::Impossible { damaged, reachable },
-            Said::Unread => RepairOutcome::Clean,
+            Said::Unread => RepairOutcome::Unread,
         })
     }
 }

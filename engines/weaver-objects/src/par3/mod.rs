@@ -39,6 +39,7 @@ use weaver_graph::{
 };
 
 use crate::par2::combine;
+use crate::recovery_volume;
 
 // How much of each volume's front is kept to read the index from. An index
 // file is metadata only; a recovery volume repeats it ahead of its blocks.
@@ -120,20 +121,6 @@ impl Volume {
             at = at.saturating_add(header.length);
         }
         at > 0 && self.named_blocks.unwrap_or(0) > 0
-    }
-
-    // Each range of the volume not yet in hand, the last open-ended: the
-    // volume's length is the parent's to know, and the root clamps an open
-    // end to it.
-    fn gaps(&self, mut each: impl FnMut(ByteRange)) {
-        let mut cursor = 0;
-        for run in self.arrived.runs() {
-            if run.range.start > cursor {
-                each(ByteRange::new(cursor, run.range.start));
-            }
-            cursor = run.range.end;
-        }
-        each(ByteRange::new(cursor, u64::MAX));
     }
 }
 
@@ -306,16 +293,6 @@ fn scan(bytes: &[u8], into: &mut Vec<Packet>) {
     }
 }
 
-// The recovery blocks a volume's name says it carries, as the creator names
-// a volume: `<stem>.vol<start>+<count>.par3`.
-fn named_blocks(name: &str) -> Option<u64> {
-    let lower = name.to_ascii_lowercase();
-    let (_, tail) = lower.strip_suffix(".par3")?.rsplit_once(".vol")?;
-    let (start, count) = tail.split_once('+')?;
-    start.parse::<u64>().ok()?;
-    count.parse().ok()
-}
-
 // Every set the packets describe; a job of more sets than the limit has none.
 fn sets(packets: Vec<Packet>) -> Vec<Par3Set> {
     let sets = Par3Set::from_packets(packets).unwrap_or_default();
@@ -409,7 +386,7 @@ impl Object for Par3 {
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
-        self.volume(volume).named_blocks = named_blocks(name);
+        self.volume(volume).named_blocks = recovery_volume::named_blocks(name, ".par3");
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {
@@ -530,7 +507,9 @@ impl Recovery for Par3 {
             }
             if self.needed == 0 {
                 if volume.shows_recovery() {
-                    volume.gaps(|range| out.push(Seek::deferred(VolumeIndex(index as u32), range)));
+                    recovery_volume::gaps(&volume.arrived, |range| {
+                        out.push(Seek::deferred(VolumeIndex(index as u32), range))
+                    });
                 }
                 continue;
             }
@@ -567,7 +546,7 @@ impl Recovery for Par3 {
         let sets = sets(packets);
         self.identify(&sets, access);
         let coming = self.coming();
-        let mut outcome = RepairOutcome::Clean;
+        let mut outcome = RepairOutcome::Unread;
         let mut waiting = 0;
         self.ruled.clear();
         for set in sets {

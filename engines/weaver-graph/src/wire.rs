@@ -75,6 +75,7 @@ enum RepairOutcomeMirror {
     Repaired { slices: u64 },
     Impossible { damaged: u64, reachable: u64 },
     Waiting,
+    Unread,
 }
 through!(RepairOutcome, RepairOutcomeMirror);
 

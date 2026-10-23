@@ -327,8 +327,8 @@ fn a_record_that_never_finds_its_volume_waits_and_once_closed_says_nothing() {
     bind(&mut job);
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
-    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
 }
 
 #[test]
@@ -422,14 +422,13 @@ fn a_volume_with_enciphered_headers_and_no_candidate_that_opens_them_says_nothin
     hand(&mut job.object, "not-the-key");
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
     assert!(!job.object.covers(member));
     assert!(verdicts(&job, member).is_empty());
     assert!(job.store.members[&member] != volume, "nothing written");
 }
 
-// A record that cannot be read covers nothing and rules clean on that
-// nothing, as a recovery object with nothing to rule on does: it vouches
+// A record that cannot be read covers nothing and rules unread: it vouches
 // for no byte of its volume.
 #[test]
 fn a_volume_whose_record_cannot_be_read_says_nothing_of_it() {
@@ -439,9 +438,28 @@ fn a_volume_whose_record_cannot_be_read_says_nothing_of_it() {
     volume[record..end].fill(0);
     let (mut job, member) = job(&volume);
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
     assert!(!job.object.covers(member));
     assert!(verdicts(&job, member).is_empty());
+}
+
+// A closed volume, damaged, in which no record is found: the record read
+// nothing, so it gives no verdict. It is not clean on the damage it never
+// checked, and it is not waiting: nothing more will come for it to read.
+#[test]
+fn an_unread_record_gives_no_verdict() {
+    let mut volume = b"Rar!\x1a\x07\x01\x00".to_vec();
+    volume.extend(payload(14, 5000));
+    volume.extend_from_slice(&[0x1d, 0x77, 0x56, 0x51, 0x03, 0x05, 0x04, 0x00]);
+    let (mut job, member) = job(&volume);
+    job.store.members.get_mut(&member).unwrap()[900] ^= 1;
+    close(&mut job);
+    let ruled = job.object.repair(&mut job.store);
+    assert_eq!(ruled, RepairOutcome::Unread);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    assert!(!job.object.covers(member));
+    assert!(verdicts(&job, member).is_empty());
+    assert_eq!(job.store.writes, 0);
 }
 
 #[test]
