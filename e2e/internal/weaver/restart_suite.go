@@ -299,6 +299,48 @@ func restartCases() []restartCase {
 			Timeout:     15 * time.Minute,
 			Run:         runInterruptDuringPar2PassStopsThePass,
 		},
+		{
+			Name:        "credentials_refused_mid_job_settles",
+			Description: "The only server refuses the account mid-job; the queued articles are retired in one sweep and the job settles",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     10 * time.Minute,
+			Run:         runCredentialsRefusedMidJobSettles,
+		},
+		{
+			Name:        "shutdown_mid_batch_is_not_an_unclean_batch",
+			Description: "A Ctrl-C mid-batch records no unclean batch, keeps the persisted depth and dumps no stall diagnostics",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     10 * time.Minute,
+			Run:         runShutdownMidBatchIsNotAnUncleanBatch,
+		},
+		{
+			Name:        "early_gap_does_not_throttle",
+			Description: "With one early article missing, the rest of the file downloads while it is missing",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     10 * time.Minute,
+			Run:         runEarlyGapDoesNotThrottle,
+		},
+		{
+			Name:        "pre_65_checkpoint_row_refused",
+			Description: "A prefix floor left by a pre-65 database is dropped by the upgrade, and the file downloads again from nothing",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     15 * time.Minute,
+			Run:         runPre65CheckpointRowRefused,
+		},
+		{
+			Name:        "poison_extent_does_not_spread",
+			Description: "An article whose yEnc extent runs into its neighbour stays its own failure across a restart",
+			Slugs:       []string{"par2-small-repair"},
+			Timeout:     10 * time.Minute,
+			Run:         runPoisonExtentDoesNotSpread,
+		},
+		{
+			Name:        "repair_data_wait_reads_fetching_repair_data",
+			Description: "A damaged job whose recovery data the server lacks reads FETCHING_REPAIR_DATA, then repairs once it is back",
+			Slugs:       []string{"par2-small-repair"},
+			Timeout:     10 * time.Minute,
+			Run:         runRepairDataWaitReadsFetchingRepairData,
+		},
 	}
 }
 
