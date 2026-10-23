@@ -20,6 +20,10 @@ pub struct StatsSnapshot {
     /// Bytes received and sent that were not block payload.
     pub fetched_protocol_bytes: u64,
     pub uploaded_protocol_bytes: u64,
+    /// Bytes of the pieces that failed their check.
+    pub failed_bytes: u64,
+    /// Bytes of the blocks received and not used.
+    pub redundant_bytes: u64,
 
     pub downloaded_and_checked_pieces: u64,
     pub total_piece_download_ms: u64,

@@ -729,6 +729,12 @@ impl ServerTransferControl {
         self.record_lifetime_bytes(bytes as u64);
     }
 
+    // Bytes received over the holder by a carrier that keeps its own pacing:
+    // counted in its lifetime total, and nowhere else.
+    pub fn record_received_bytes(&self, bytes: u64) {
+        self.record_lifetime_bytes(bytes);
+    }
+
     // Read-path pacing without quota admission, shared by all connections on an egress.
     pub async fn pace_read_async(&self, bytes: usize) -> Duration {
         self.record_lifetime_bytes(bytes as u64);

@@ -28,7 +28,7 @@ mod draft;
 pub use draft::DraftNetworkRoute;
 #[path = "network_torrent.rs"]
 mod torrent;
-pub use torrent::TorrentLeg;
+pub use torrent::{SessionTraffic, TorrentLeg};
 #[path = "network_test_via.rs"]
 mod test_via;
 pub use test_via::{
@@ -207,6 +207,9 @@ pub struct NetworkRuntime {
     // republishes only when one of these moved; an idle daemon otherwise
     // recomputes nothing.
     health_inputs: Mutex<Option<(InterfaceSnapshot, HashSet<u32>)>>,
+    // What torrent sessions hold on the legs they run on their own sockets,
+    // by consumer key and leg position.
+    torrent_legs: Mutex<HashMap<(String, usize), SessionTraffic>>,
 }
 
 impl NetworkRuntime {
@@ -264,6 +267,7 @@ impl NetworkRuntime {
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
             health_inputs: Mutex::new(None),
+            torrent_legs: Mutex::default(),
         });
         let weak = Arc::downgrade(&runtime);
         *runtime.poll.lock().expect("network health task") = Some(handle.spawn(async move {
@@ -971,6 +975,7 @@ impl NetworkRuntime {
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
             health_inputs: Mutex::new(None),
+            torrent_legs: Mutex::default(),
             egress_controls: self.egress_controls.clone(),
             quota_policy: None,
             #[cfg(test)]

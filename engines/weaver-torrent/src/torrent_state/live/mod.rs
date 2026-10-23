@@ -1252,6 +1252,8 @@ impl TorrentStateLive {
             uploaded_bytes: self.stats.uploaded_bytes.load(Relaxed),
             fetched_protocol_bytes: self.stats.fetched_protocol_bytes.load(Relaxed),
             uploaded_protocol_bytes: self.stats.uploaded_protocol_bytes.load(Relaxed),
+            failed_bytes: self.get_failed_bytes(),
+            redundant_bytes: self.get_redundant_bytes(),
             total_piece_download_ms: self.stats.total_piece_download_ms.load(Relaxed),
             peer_stats: self.peers.stats(),
         }
@@ -2485,8 +2487,13 @@ impl PeerHandler {
                 let mut g = self.state.lock_write("mark_chunk_requests_canceled");
 
                 // Release all pieces owned by this peer (fixes the bug where pieces
-                // could be in both queue_pieces AND inflight_pieces after peer death)
-                let released = g.get_pieces_mut()?.release_pieces_owned_by(self.addr);
+                // could be in both queue_pieces AND inflight_pieces after peer death).
+                // A paused torrent has no pieces in flight: pausing queued
+                // them all again.
+                let released = g
+                    .pieces
+                    .as_mut()
+                    .map_or(0, |pieces| pieces.release_pieces_owned_by(self.addr));
                 if released > 0 {
                     trace!(
                         "peer dead, released {} in-flight pieces back to queue",
@@ -2883,13 +2890,26 @@ impl PeerHandler {
             );
         };
         trace!(have, "peer has piece");
-        self.state.peers.peer_has(self.addr, piece);
+        let have = self.state.peers.peer_has(self.addr, piece);
         if self.state.super_seeding {
             self.state
                 .peers
                 .super_seed_have(self.addr, piece, &self.state.lengths);
         }
-        self.on_bitfield_notify.notify_waiters();
+        // Only a piece we lack, or the peer now holding every piece, can
+        // change what we ask of it; a HAVE for a piece we hold wakes no one.
+        let changed = match have {
+            None | Some(peers::Have::Known) => false,
+            Some(peers::Have::Completed) => true,
+            Some(peers::Have::Gained) => self
+                .state
+                .lock_read("on_have")
+                .get_chunks()
+                .map_or(true, |chunks| !chunks.is_piece_have(piece)),
+        };
+        if changed {
+            self.on_bitfield_notify.notify_waiters();
+        }
         Ok(())
     }
 
@@ -3175,14 +3195,28 @@ impl PeerHandler {
             // lets us fetch another piece while it chokes us.
             let slots_changed = self.request_slots_changed();
             let slot_notify = slots_changed.as_deref().map(Notify::notified);
+            let side = self.request_side();
             let next = match self.acquire_next_piece()? {
                 Some(next) => next,
                 None => {
                     debug!("no pieces to request");
+                    // The request slots change with every block the peer
+                    // delivers and every request sent; the pick reads only
+                    // the peer's side of them, so only a change of that
+                    // side wakes it.
                     let slot_changed = async {
-                        match slot_notify {
-                            Some(notified) => notified.await,
-                            None => std::future::pending().await,
+                        let (Some(notify), Some(notified)) =
+                            (slots_changed.as_deref(), slot_notify)
+                        else {
+                            return std::future::pending().await;
+                        };
+                        let mut notified = std::pin::pin!(notified);
+                        loop {
+                            notified.as_mut().await;
+                            notified.set(notify.notified());
+                            if self.request_side() != side {
+                                return;
+                            }
                         }
                     };
                     // Nothing changes while a piece another peer holds grows
@@ -3801,6 +3835,19 @@ impl PeerHandler {
         self.state
             .peers
             .with_live(self.addr, |live| live.request_slots_changed())
+    }
+
+    /// What a pick reads of the peer's side of the requests: whether it
+    /// chokes us, the pieces it lets us fetch while it does, and whether a
+    /// request to it is outstanding, which keeps the end game from it.
+    fn request_side(&self) -> Option<(bool, usize, bool)> {
+        self.state.peers.with_live(self.addr, |live| {
+            (
+                live.choked_by_peer,
+                live.allowed_fast_from_peer.len(),
+                live.requested_inflight_count() == 0,
+            )
+        })
     }
 
     fn notify_request_slots_changed(&self) {

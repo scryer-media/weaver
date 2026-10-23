@@ -630,6 +630,12 @@ impl ServerTransferPolicyRegistry {
         Some(after)
     }
 
+    // Bytes ever uploaded over an egress.
+    pub fn egress_upload_bytes(&self, egress_id: u32) -> Option<u64> {
+        let policies = self.egresses.policies();
+        Some(policies.get(&egress_id)?.upload.lifetime_bytes)
+    }
+
     // Where an egress stands against its quota in each direction.
     pub fn egress_quota_states(&self, egress_id: u32) -> Option<EgressQuotaStates> {
         let policies = self.egresses.policies();

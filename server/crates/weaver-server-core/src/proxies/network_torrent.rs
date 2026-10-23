@@ -122,7 +122,65 @@ impl TunnelProvider for TorrentProvider {
         "torrent route".into()
     }
 }
+/// What torrent sessions hold on a leg they run on their own sockets, which
+/// no route carries: their peer connections, and the bytes per second they
+/// receive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionTraffic {
+    pub open: u64,
+    pub bytes_per_second: u64,
+}
+
 impl NetworkRuntime {
+    /// Count bytes a torrent session moved over `egress_id` as every byte
+    /// through an egress is counted: those received in its download total,
+    /// those sent in its upload count.
+    pub fn record_torrent_bytes(&self, egress_id: u32, received: u64, sent: u64) {
+        if let Some(control) = self
+            .egress_controls
+            .get(weaver_nntp::transfer::StableServerId(egress_id))
+        {
+            control.record_received_bytes(received);
+        }
+        if sent > 0
+            && let Some(policy) = &self.quota_policy
+        {
+            policy.record_egress_upload(egress_id, sent);
+        }
+    }
+
+    /// What torrent sessions hold now on the legs they run on their own
+    /// sockets, by consumer and leg position, in place of what they held
+    /// before.
+    pub fn hold_torrent_traffic(
+        &self,
+        legs: impl IntoIterator<Item = ((Consumer, usize), SessionTraffic)>,
+    ) {
+        let legs = legs
+            .into_iter()
+            .map(|((consumer, position), traffic)| ((consumer.key(), position), traffic))
+            .collect();
+        *self
+            .torrent_legs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = legs;
+    }
+
+    pub(crate) fn torrent_traffic(&self) -> HashMap<(String, usize), SessionTraffic> {
+        self.torrent_legs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Bytes ever uploaded over `egress_id`, as its upload count holds them.
+    pub fn egress_upload_bytes(&self, egress_id: u32) -> u64 {
+        self.quota_policy
+            .as_ref()
+            .and_then(|policy| policy.egress_upload_bytes(egress_id))
+            .unwrap_or(0)
+    }
+
     /// The leg a torrent scope's session runs on: the scope's live route's
     /// leg at `position`, which allows it `peers` connections.
     pub fn torrent_leg(

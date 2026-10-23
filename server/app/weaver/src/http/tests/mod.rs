@@ -1295,6 +1295,7 @@ fn sample_network() -> weaver_server_core::proxies::network_metrics::NetworkMetr
             health_since_epoch_ms: 1_700_000_010_000,
             dials: LegDialResult::ALL.map(|result| (result, 3)),
             cooldowns: 2,
+            upload_bytes: 4_096,
         }],
         pools: vec![PoolMetrics {
             pool_id: 4,

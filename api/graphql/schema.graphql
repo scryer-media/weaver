@@ -5000,7 +5000,9 @@ type Torrent {
 	downloadAvgBps: Int!
 	uploadAvgBps: Int!
 	"""
-	Fetched bytes whose pieces did not verify.
+	Bytes received and thrown away this run: pieces that failed their
+	check, and blocks that arrived when already in hand. Counts from zero
+	each time the torrent starts.
 	"""
 	wastedBytes: Int!
 	"""

@@ -282,6 +282,17 @@ pub(crate) enum NextCandidate {
     None,
 }
 
+/// What a HAVE told us that we did not know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Have {
+    /// The peer already had the piece.
+    Known,
+    /// The peer has a piece it did not have.
+    Gained,
+    /// The peer has a piece it did not have, and now has them all.
+    Completed,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IncomingRefused {
     AlreadyActive,
@@ -955,13 +966,19 @@ impl PeerStates {
     /// The peer sent HAVE for `piece`. A peer that sent no bitfield had
     /// nothing until now. A HAVE for a piece the peer already has changes
     /// nothing.
-    pub fn peer_has(&self, handle: PeerHandle, piece: ValidPieceIndex) -> Option<()> {
+    pub(crate) fn peer_has(&self, handle: PeerHandle, piece: ValidPieceIndex) -> Option<Have> {
         self.with_live_mut(handle, "peer_has", |live| {
             if live.bitfield.replace(piece.get_usize(), true) {
-                return;
+                return Have::Known;
             }
             self.availability.peer_has(piece.get_usize());
+            let seeder = live.seeder;
             self.update_seeder_flag(live);
+            if live.seeder != seeder {
+                Have::Completed
+            } else {
+                Have::Gained
+            }
         })
     }
 
@@ -1239,6 +1256,28 @@ mod tests {
         peers.peer_has(a, piece(TOTAL_PIECES as u32, 5)).unwrap();
         peers.peer_has(a, piece(TOTAL_PIECES as u32, 0)).unwrap();
         assert_eq!(availability(&peers), [1, 0, 0, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn a_have_says_whether_it_told_us_anything() {
+        let peers = make_peer_states();
+        let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
+        let all_but_last: Vec<usize> = (0..TOTAL_PIECES - 1).collect();
+        peers
+            .update_bitfield(a, bitfield_of(&all_but_last))
+            .unwrap();
+
+        let have = |index: usize| peers.peer_has(a, piece(TOTAL_PIECES as u32, index as u32));
+        assert_eq!(have(0), Some(Have::Known));
+        assert_eq!(have(TOTAL_PIECES - 1), Some(Have::Completed));
+        assert_eq!(have(TOTAL_PIECES - 1), Some(Have::Known));
+
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
+        peers.update_bitfield(b, bitfield_of(&[])).unwrap();
+        assert_eq!(
+            peers.peer_has(b, piece(TOTAL_PIECES as u32, 3)),
+            Some(Have::Gained)
+        );
     }
 
     #[test]

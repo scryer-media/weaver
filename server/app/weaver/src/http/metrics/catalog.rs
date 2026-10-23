@@ -480,7 +480,9 @@ metric_families! {
     NETWORK_EGRESS_COOLDOWNS = ("weaver_network_egress_cooldowns_total", Counter, ["egress_id"],
         "Times a route leg on the egress entered a cooldown.");
     EGRESS_DOWNLOAD_BYTES = ("weaver_egress_download_bytes_total", Counter, ["egress_id"],
-        "Raw NNTP BODY bytes received over each egress.");
+        "Bytes received over each egress, whatever carried them.");
+    EGRESS_UPLOAD_BYTES = ("weaver_egress_upload_bytes_total", Counter, ["egress_id"],
+        "Bytes sent over each egress, whatever carried them.");
     EGRESS_DOWNLOAD_RATE_LIMIT = ("weaver_egress_download_rate_limit_bytes_per_second", Gauge,
         ["egress_id"], "Configured download rate limit of each egress; 0 means unlimited.");
     EGRESS_DOWNLOAD_THROTTLE_SECONDS = ("weaver_egress_download_throttle_seconds_total", Counter,

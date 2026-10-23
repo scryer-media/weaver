@@ -6,7 +6,9 @@
 // Leg dial outcomes are counted per egress on the dial path with a relaxed
 // atomic add. The registry entry for an egress is created once, the first
 // time a leg on it dials; every later dial takes the read lock and adds.
-// Everything else here is read from the network runtime at scrape time.
+// Everything else here is read from the network runtime at scrape time. A
+// leg's connections and throughput are those its route carries and those
+// torrent sessions hold on its own sockets, whatever carried them.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,6 +219,8 @@ pub struct EgressMetrics {
     pub health_since_epoch_ms: u64,
     pub dials: [(LegDialResult, u64); 4],
     pub cooldowns: u64,
+    // Bytes ever uploaded over the egress.
+    pub upload_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -330,6 +334,7 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
             });
         }
     }
+    let sessions = runtime.torrent_traffic();
     for dormant in runtime.dormant_legs() {
         legs.push(LegMetrics {
             consumer: dormant.consumer.key(),
@@ -346,6 +351,13 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
             rungs: Vec::new(),
         });
     }
+    for leg in &mut legs {
+        if let Some(traffic) = sessions.get(&(leg.consumer.clone(), leg.position)) {
+            leg.live = true;
+            leg.open += traffic.open;
+            leg.bytes_per_second += traffic.bytes_per_second;
+        }
+    }
     legs.sort_by(|a, b| (&a.consumer, a.position).cmp(&(&b.consumer, b.position)));
 
     let (egress_config, profiles, _) = runtime.configuration_snapshot();
@@ -361,6 +373,7 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
                 health_since_epoch_ms: 0,
                 dials,
                 cooldowns,
+                upload_bytes: runtime.egress_upload_bytes(egress.id),
             }
         })
         .collect();
@@ -467,6 +480,85 @@ mod tests {
             ]
         );
         assert_eq!(cooldowns, 1);
+    }
+
+    #[tokio::test]
+    async fn a_torrent_session_on_its_legs_own_sockets_counts_on_that_leg() {
+        let runtime = NetworkRuntime::new(
+            crate::Database::open_in_memory().unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let consumer = super::super::Consumer::Torrent(super::super::TorrentScope::Default);
+        let leg = |snapshot: &NetworkMetricsSnapshot| {
+            let leg = snapshot
+                .legs
+                .iter()
+                .find(|leg| leg.consumer == consumer.key() && leg.position == 0)
+                .unwrap();
+            (leg.live, leg.open, leg.bytes_per_second)
+        };
+        assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0));
+
+        runtime.hold_torrent_traffic([(
+            (consumer, 0),
+            super::super::SessionTraffic {
+                open: 63,
+                bytes_per_second: 31_000_000,
+            },
+        )]);
+        assert_eq!(leg(&snapshot(&runtime)), (true, 63, 31_000_000));
+
+        // The sessions let the leg go: it holds nothing.
+        runtime.hold_torrent_traffic([]);
+        assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn torrent_bytes_count_in_the_egress_totals_and_not_its_download_quota() {
+        let db = crate::Database::open_in_memory().unwrap();
+        let egress = db
+            .create_egress_interface(&super::super::EgressInterface {
+                id: 0,
+                name: "Metered link".into(),
+                binding: super::super::EgressBinding::SourceAddress {
+                    address: "127.0.0.1".parse().unwrap(),
+                },
+                enabled: true,
+                download_bps: None,
+                upload_bps: None,
+                quota: super::super::EgressQuota {
+                    download_bytes: Some(1_000_000),
+                    period: crate::servers::ServerDownloadQuotaPeriod::OneTime,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let policy = Arc::new(
+            crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+                .unwrap(),
+        );
+        let runtime =
+            NetworkRuntime::with_quota_policy(db, tokio::runtime::Handle::current(), Some(policy))
+                .unwrap();
+
+        runtime.record_torrent_bytes(egress.id, 1_270_000, 300);
+        runtime.record_torrent_bytes(egress.id, 30_000, 0);
+
+        let transfer = runtime
+            .egress_controls
+            .snapshot(weaver_nntp::transfer::StableServerId(egress.id));
+        assert_eq!(
+            (transfer.lifetime_body_bytes, transfer.quota_used_bytes),
+            (1_300_000, 0)
+        );
+        let metrics = snapshot(&runtime);
+        let row = metrics
+            .egresses
+            .iter()
+            .find(|row| row.egress_id == egress.id)
+            .unwrap();
+        assert_eq!(row.upload_bytes, 300);
     }
 
     #[test]

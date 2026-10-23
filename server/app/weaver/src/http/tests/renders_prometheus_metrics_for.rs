@@ -1565,6 +1565,7 @@ fn networking_renders_leg_egress_pool_and_tunnel_families() {
     assert!(!rendered.contains("member_id=\"12\""));
     assert!(rendered.contains("weaver_network_proxies{kind=\"wireguard\",enabled=\"true\"} 1"));
     assert!(rendered.contains("weaver_network_leg_revocations_total 3"));
+    assert!(rendered.contains("weaver_egress_upload_bytes_total{egress_id=\"2\"} 4096"));
 }
 
 #[test]

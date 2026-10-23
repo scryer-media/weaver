@@ -414,7 +414,9 @@ pub struct Torrent {
     pub active_seconds: u64,
     pub download_avg_bps: u64,
     pub upload_avg_bps: u64,
-    /// Fetched bytes whose pieces did not verify.
+    /// Bytes received and thrown away this run: pieces that failed their
+    /// check, and blocks that arrived when already in hand. Counts from zero
+    /// each time the torrent starts.
     pub wasted_bytes: u64,
     /// The last time a complete copy was in reach.
     pub last_seen_complete_ms: Option<i64>,

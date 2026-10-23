@@ -2029,6 +2029,13 @@ pub(crate) fn render_network(out: &mut Encoder, metrics: &NetworkMetricsSnapshot
             egress.cooldowns,
         );
     }
+    for (id, egress) in &egresses {
+        out.sample(
+            &f::EGRESS_UPLOAD_BYTES,
+            &[("egress_id", id)],
+            egress.upload_bytes,
+        );
+    }
 
     let pools: Vec<(String, String, &PoolMetrics)> = metrics
         .pools

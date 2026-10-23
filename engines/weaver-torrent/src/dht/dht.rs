@@ -1632,11 +1632,17 @@ impl DhtState {
             "dht_add_node",
             self.cancellation_token.clone(),
             async move {
-                if let ResponseOrError::Response(r) = dht.request(Request::Ping, addr).await? {
-                    let mut table = dht.get_table_for_addr(addr).write();
-                    if !matches!(table.add_node(r.id, addr), InsertResult::Ignored) {
-                        table.mark_response(&r.id, now());
+                // A node that does not answer, or answers with an error, is
+                // simply not added: most nodes a peer names are gone.
+                match dht.request(Request::Ping, addr).await {
+                    Ok(ResponseOrError::Response(r)) => {
+                        let mut table = dht.get_table_for_addr(addr).write();
+                        if !matches!(table.add_node(r.id, addr), InsertResult::Ignored) {
+                            table.mark_response(&r.id, now());
+                        }
                     }
+                    Ok(ResponseOrError::Error(e)) => debug!(?e, "node refused the ping"),
+                    Err(e) => debug!(error = %e, "node did not answer the ping"),
                 }
                 Ok::<_, Error>(())
             },

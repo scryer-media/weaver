@@ -50,7 +50,7 @@ use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::{PieceLayout, PieceRoot};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::proxies::TorrentScope;
+use crate::proxies::{Consumer, NetworkRuntime, SessionTraffic, TorrentScope};
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{
     Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption,
@@ -504,7 +504,9 @@ pub struct TorrentView {
     /// The bytes moved over the time active.
     pub download_avg_bps: u64,
     pub upload_avg_bps: u64,
-    /// Fetched bytes whose pieces did not verify.
+    /// Bytes received and thrown away this run: pieces that failed their
+    /// check, and blocks that arrived when already in hand. Counts from zero
+    /// each time the torrent starts.
     pub wasted_bytes: u64,
     /// The last time a complete copy was in reach.
     pub last_seen_complete_ms: Option<i64>,
@@ -759,6 +761,19 @@ struct Attached {
     terms: PeerTerms,
     // The certificate an SSL torrent was given from its rule.
     ssl: Option<TrackerCertificate>,
+    // The leg the session runs it on, which counts what it moves.
+    leg: Option<OnLeg>,
+}
+
+// The leg of a scope's route a session runs on.
+struct OnLeg {
+    network: Arc<NetworkRuntime>,
+    scope: TorrentScope,
+    position: usize,
+    egress_id: u32,
+    // A session on the leg's own sockets passes no route, so the leg hears
+    // its connections and throughput from the session.
+    own_sockets: bool,
 }
 
 // What the service keeps of each torrent while it lives.
@@ -902,6 +917,17 @@ impl Live {
     // as it leaves the session or is written at once.
     fn settle(&mut self, now: i64) {
         let reading = self.reading(now);
+        self.keep(reading);
+    }
+
+    // Keep a reading as what the session last said; the bytes it moved
+    // since the reading before are counted on the egress its leg runs on.
+    fn keep(&mut self, reading: Reading) {
+        let (received, sent) = reading.moved;
+        if let Some(leg) = self.attached.as_ref().and_then(|a| a.leg.as_ref()) {
+            leg.network
+                .record_torrent_bytes(leg.egress_id, received, sent);
+        }
         self.file_have = reading.file_have;
         self.counters = reading.counters;
         self.seen = reading.seen;
@@ -1002,6 +1028,7 @@ impl Live {
                 file_have: self.file_have.clone(),
                 counters: self.counters,
                 seen: self.seen,
+                moved: (0, 0),
                 speeds: (0, 0),
                 peers: (0, 0),
             };
@@ -1014,13 +1041,22 @@ impl Live {
         let seen = Seen {
             uploaded: stats.uploaded_bytes,
             fetched: live.map_or(0, |live| live.snapshot.fetched_bytes),
-            checked: live.map_or(0, |live| live.snapshot.downloaded_and_checked_bytes),
+            uploaded_protocol: live.map_or(0, |live| live.snapshot.uploaded_protocol_bytes),
+            fetched_protocol: live.map_or(0, |live| live.snapshot.fetched_protocol_bytes),
+            discarded: live.map_or(0, |live| {
+                live.snapshot.failed_bytes + live.snapshot.redundant_bytes
+            }),
         };
         // The session counts from zero each time it takes the torrent.
         let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
         let (up, down) = (
             delta(seen.uploaded, self.seen.uploaded),
             delta(seen.fetched, self.seen.fetched),
+        );
+        // On the wire: the blocks and every other message around them.
+        let moved = (
+            down + delta(seen.fetched_protocol, self.seen.fetched_protocol),
+            up + delta(seen.uploaded_protocol, self.seen.uploaded_protocol),
         );
         let mut counters = self.counters;
         counters.uploaded_bytes += up;
@@ -1043,6 +1079,7 @@ impl Live {
             file_have,
             counters,
             seen,
+            moved,
             speeds: live.map_or((0, 0), |live| {
                 (live.download_speed.as_bytes(), live.upload_speed.as_bytes())
             }),
@@ -1081,6 +1118,8 @@ struct Reading {
     counters: TorrentCounters,
     // The session's own totals, which the ledger's deltas are taken from.
     seen: Seen,
+    // The bytes received and sent on the wire since the last kept reading.
+    moved: (u64, u64),
     speeds: (u64, u64),
     peers: (u32, u32),
 }
@@ -1090,13 +1129,18 @@ struct Reading {
 struct Seen {
     uploaded: u64,
     fetched: u64,
-    checked: u64,
+    // What the messages around the blocks took, each way.
+    uploaded_protocol: u64,
+    fetched_protocol: u64,
+    // Received and thrown away: pieces that failed their check, and blocks
+    // that arrived when already in hand.
+    discarded: u64,
 }
 
 impl Seen {
-    // Fetched bytes whose pieces did not verify, this run.
+    // Bytes received and thrown away this run.
     fn wasted(&self) -> u64 {
-        self.fetched.saturating_sub(self.checked)
+        self.discarded
     }
 }
 
@@ -2456,6 +2500,16 @@ impl TorrentService {
                     handle,
                     terms,
                     ssl,
+                    leg: self
+                        .queue()
+                        .and_then(|queue| queue.proxy_runtime())
+                        .map(|proxies| OnLeg {
+                            network: proxies.network.clone(),
+                            scope,
+                            position: plan.leg,
+                            egress_id: plan.egress_id,
+                            own_sockets: plan.kind.own_sockets(),
+                        }),
                 });
                 torrent.route = Some(plan.key);
                 torrent.held = None;
@@ -3345,12 +3399,10 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 let reading = torrent.reading(now);
-                torrent.engine = reading.engine;
-                torrent.file_have = reading.file_have;
-                torrent.counters = reading.counters;
-                torrent.seen = reading.seen;
+                torrent.engine = reading.engine.clone();
                 torrent.speeds = reading.speeds;
                 torrent.peers = reading.peers;
+                torrent.keep(reading);
                 let (state, _) = status::project(&torrent.observed(torrent.engine.clone()));
                 if state == TorrentState::Seeding {
                     torrent.counters.finished_duration_s += elapsed_s;
@@ -3362,6 +3414,27 @@ impl TorrentService {
                 // Queued in the step that took it, so ledgers land in the
                 // order they were read.
                 landings.extend(self.queue_resume(torrent, now, at_once));
+            }
+            // What the sessions hold on the legs they run on their own
+            // sockets, which no route sees.
+            let mut legs = std::collections::HashMap::<_, SessionTraffic>::new();
+            for torrent in live.values() {
+                let Some(leg) = torrent
+                    .attached
+                    .as_ref()
+                    .and_then(|attached| attached.leg.as_ref())
+                    .filter(|leg| leg.own_sockets)
+                else {
+                    continue;
+                };
+                let traffic = legs
+                    .entry((Consumer::Torrent(leg.scope), leg.position))
+                    .or_default();
+                traffic.open += u64::from(torrent.peers.0);
+                traffic.bytes_per_second += torrent.speeds.0;
+            }
+            if let Some(proxies) = self.queue().and_then(|queue| queue.proxy_runtime()) {
+                proxies.network.hold_torrent_traffic(legs);
             }
         }
         for landing in landings {
