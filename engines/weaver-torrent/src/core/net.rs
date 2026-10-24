@@ -98,6 +98,43 @@ impl DatagramSocket for tokio::net::UdpSocket {
     }
 }
 
+/// Who named a tracker or a web seed. What came with the torrent, from its
+/// metainfo, its magnet link or a peer, is asked only at public addresses,
+/// on every hop; what the operator named is asked wherever the session
+/// reaches.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum NamedBy {
+    #[default]
+    Torrent,
+    Operator,
+}
+
+impl NamedBy {
+    /// Whether an endpoint so named may be asked at `ip`.
+    pub fn may_ask(self, ip: IpAddr) -> bool {
+        match self {
+            NamedBy::Torrent => is_public(ip),
+            NamedBy::Operator => true,
+        }
+    }
+}
+
+/// Whether `ip` is a public internet address: global, so neither loopback,
+/// private, link-local, unique local, multicast nor unspecified, and
+/// outside the documentation ranges.
+pub(crate) fn is_public(ip: IpAddr) -> bool {
+    let documentation = match ip.to_canonical() {
+        IpAddr::V4(a) => matches!(a.octets(), [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]),
+        IpAddr::V6(a) => {
+            let s = a.segments();
+            (s[0], s[1]) == (0x2001, 0xdb8) || (s[0] & 0xfff0) == 0x3ff0
+        }
+    };
+    crate::torrent_state::live::peers::holepunch::is_global(ip) && !documentation
+}
+
 /// What a name resolves to on the session's network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {

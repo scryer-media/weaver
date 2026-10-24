@@ -21,7 +21,7 @@ use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
     ManagedTorrent, PeerConnectionOptions, ResumePeers, Session, SslIdentity, TorrentVersion,
-    TrackerAnnounce, torrent_from_bytes,
+    TrackerAnnounce, torrent_from_bytes, tracker::Tracker,
 };
 
 use crate::SchedulerError;
@@ -68,7 +68,7 @@ use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
     FilePriority, Infohash, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent,
-    TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
+    NamedBy, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
 };
 
 #[cfg(test)]
@@ -619,18 +619,19 @@ fn text(bytes: Option<&[u8]>) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+// A tracker the torrent's metainfo names.
 fn tracker(tier: u32, url: &[u8]) -> Option<TrackerEntry> {
     let url = std::str::from_utf8(url).ok()?.trim();
     (!url.is_empty()).then(|| TrackerEntry {
         tier,
         url: url.to_owned(),
+        named_by: NamedBy::Torrent,
     })
 }
 
 // `trackers` as a torrent lists them: by tier, in the order given within a
-// tier, each URL once where it is first named (libtorrent
-// `torrent::replace_trackers`). A tracker that is no URL is left out, as a
-// session leaves it out.
+// tier, each URL once where, and as whoever, first named it. A tracker that
+// is no URL is left out, as a session leaves it out.
 fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     let mut tidy: Vec<TrackerEntry> = Vec::with_capacity(trackers.len());
     for entry in trackers {
@@ -642,6 +643,7 @@ fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
             tidy.push(TrackerEntry {
                 tier: entry.tier,
                 url: url.to_owned(),
+                named_by: entry.named_by,
             });
         }
     }
@@ -662,19 +664,24 @@ fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
         })
 }
 
-// The tiers of `trackers`, listed by tier, as a session announces to them.
-fn tracker_tiers(trackers: &[TrackerEntry]) -> Vec<Vec<weaver_torrent::Url>> {
-    let mut tiers: Vec<(u32, Vec<weaver_torrent::Url>)> = Vec::new();
+// The tiers of `trackers`, listed by tier, as a session announces to them,
+// each with who named it.
+fn tracker_tiers(trackers: &[TrackerEntry]) -> Vec<Vec<Tracker>> {
+    let mut tiers: Vec<(u32, Vec<Tracker>)> = Vec::new();
     for entry in trackers {
         let Ok(url) = weaver_torrent::Url::parse(&entry.url) else {
             continue;
         };
+        let tracker = Tracker {
+            url,
+            named_by: entry.named_by,
+        };
         match tiers.last_mut() {
-            Some((tier, urls)) if *tier == entry.tier => urls.push(url),
-            _ => tiers.push((entry.tier, vec![url])),
+            Some((tier, named)) if *tier == entry.tier => named.push(tracker),
+            _ => tiers.push((entry.tier, vec![tracker])),
         }
     }
-    tiers.into_iter().map(|(_, urls)| urls).collect()
+    tiers.into_iter().map(|(_, named)| named).collect()
 }
 
 // The hashes a duplicate of a torrent going by `hashes` would share.
@@ -2516,7 +2523,7 @@ impl TorrentService {
         job_id: JobId,
         plan: RoutePlan,
         uri: String,
-        tracker_tiers: Option<Vec<Vec<String>>>,
+        tracker_tiers: Option<Vec<Vec<Tracker>>>,
         identity: Identity,
         terms: PeerTerms,
     ) {
@@ -2552,7 +2559,7 @@ impl TorrentService {
         job_id: JobId,
         plan: RoutePlan,
         uri: String,
-        tracker_tiers: Option<Vec<Vec<String>>>,
+        tracker_tiers: Option<Vec<Vec<Tracker>>>,
         identity: Identity,
         terms: PeerTerms,
     ) {
@@ -2672,8 +2679,9 @@ impl TorrentService {
         torrent.record.name = parsed.manifest.name.clone();
         torrent.record.storage_dir = Some(dir.clone());
         torrent.record.metainfo = Some(bytes.clone());
-        // libtorrent `torrent::set_metadata` keeps the trackers the magnet
-        // listed, edits included; the metainfo's own join after them.
+        // The trackers the magnet listed stay, edits included, each as
+        // whoever named it; the metainfo's own join after them as the
+        // torrent's.
         let mut trackers = self
             .inner
             .db
@@ -2735,10 +2743,7 @@ impl TorrentService {
                 .db
                 .list_torrent_trackers(job_id)
                 .unwrap_or_default(),
-        )
-        .into_iter()
-        .map(|tier| tier.into_iter().map(String::from).collect())
-        .collect();
+        );
         self.spawn_resolve(
             job_id,
             plan,
@@ -2837,13 +2842,10 @@ impl TorrentService {
                 return;
             }
         };
-        // libtorrent `torrent::read_resume_data`: the trackers the torrent
-        // lists now stand in for its metainfo's.
+        // The trackers the torrent lists now, each with who named it, stand
+        // in for its metainfo's.
         let trackers = match self.inner.db.list_torrent_trackers(job_id) {
-            Ok(trackers) => tracker_tiers(&trackers)
-                .into_iter()
-                .map(|tier| tier.into_iter().map(String::from).collect())
-                .collect(),
+            Ok(trackers) => tracker_tiers(&trackers),
             Err(error) => {
                 self.fail(job_id, state_error(error)).await;
                 return;
@@ -3203,9 +3205,8 @@ impl TorrentService {
             .ok_or(ActionError::NotFound(job_id))
     }
 
-    /// Add `tiers` after the torrent's last tier, leaving out the trackers
-    /// it already lists (libtorrent `torrent::add_tracker`; qBittorrent
-    /// `TorrentImpl::addTrackers`).
+    /// Add `tiers`, which the operator names, after the torrent's last tier,
+    /// leaving out the trackers it already lists.
     pub async fn add_trackers(
         &self,
         job_id: JobId,
@@ -3219,25 +3220,36 @@ impl TorrentService {
                 .unwrap_or(0);
             let added = tiers.into_iter().filter(|tier| !tier.is_empty());
             for (tier, urls) in (next..).zip(added) {
-                trackers.extend(urls.into_iter().map(|url| TrackerEntry { tier, url }));
+                trackers.extend(urls.into_iter().map(|url| TrackerEntry {
+                    tier,
+                    url,
+                    named_by: NamedBy::Operator,
+                }));
             }
             Ok(trackers)
         })
         .await
     }
 
-    /// List `trackers` in place of the torrent's own (libtorrent
-    /// `torrent::replace_trackers`): announces to a tracker it no longer
-    /// lists stop.
+    /// List `urls`, which the operator names, in their tiers, in place of
+    /// the torrent's own: announces to a tracker it no longer lists stop.
     pub async fn replace_trackers(
         &self,
         job_id: JobId,
-        trackers: Vec<TrackerEntry>,
+        urls: Vec<(u32, String)>,
     ) -> Result<(), ActionError> {
+        let trackers = urls
+            .into_iter()
+            .map(|(tier, url)| TrackerEntry {
+                tier,
+                url,
+                named_by: NamedBy::Operator,
+            })
+            .collect();
         self.edit_trackers(job_id, |_| Ok(trackers)).await
     }
 
-    /// Stop listing each of `urls` (qBittorrent `TorrentImpl::removeTrackers`).
+    /// Stop listing each of `urls`.
     pub async fn remove_trackers(&self, job_id: JobId, urls: &[String]) -> Result<(), ActionError> {
         self.edit_trackers(job_id, |mut trackers| {
             trackers.retain(|tracker| !urls.iter().any(|url| url.trim() == tracker.url));
@@ -3247,8 +3259,9 @@ impl TorrentService {
     }
 
     // Write the trackers `edit` makes of the torrent's list and hand them
-    // to its session. The rule they match is picked again in memory only:
-    // the stored rule is not this path's to write.
+    // to its session. A tracker the list already held keeps who named it;
+    // the operator names any other. The rule they match is picked again in
+    // memory only: the stored rule is not this path's to write.
     async fn edit_trackers(
         &self,
         job_id: JobId,
@@ -3262,9 +3275,18 @@ impl TorrentService {
                 .db
                 .list_torrent_trackers(job_id)
                 .map_err(|error| ActionError::State(state_error(error)))?;
-            let trackers = edit(listed)?;
+            let trackers = edit(listed.clone())?;
             tracker_urls(&trackers)?;
-            let trackers = tidy_trackers(trackers);
+            let trackers: Vec<TrackerEntry> = tidy_trackers(trackers)
+                .into_iter()
+                .map(|tracker| TrackerEntry {
+                    named_by: listed
+                        .iter()
+                        .find(|known| known.url == tracker.url)
+                        .map_or(NamedBy::Operator, |known| known.named_by),
+                    ..tracker
+                })
+                .collect();
             let stored = self
                 .inner
                 .db

@@ -20,7 +20,8 @@ pub use model::{
 };
 pub use weaver_torrent::tracker::redacted_tracker_url;
 pub use weaver_torrent::{
-    ConnectionKind, Encryption, PeerFlags, PeerInfo, PeerSourceFlag, PeerSources, TorrentVersion,
+    ConnectionKind, Encryption, NamedBy, PeerFlags, PeerInfo, PeerSourceFlag, PeerSources,
+    TorrentVersion,
 };
 
 #[cfg(test)]

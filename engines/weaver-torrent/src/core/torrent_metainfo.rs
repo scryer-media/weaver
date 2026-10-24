@@ -167,19 +167,24 @@ pub enum WebSeedKind {
 pub struct WebSeed {
     pub url: String,
     pub kind: WebSeedKind,
+    #[serde(default)]
+    pub named_by: crate::core::net::NamedBy,
 }
 
 impl WebSeed {
-    /// The seed at `url`, escaped where it must be ([`maybe_url_encode`]);
-    /// a BEP 19 one ends in `/` when the torrent has more than one file
-    /// (libtorrent `load_torrent`, and `torrent::torrent` for one added by
-    /// hand).
+    /// The seed at `url`, as the torrent names it, escaped where it must be
+    /// ([`maybe_url_encode`]); a BEP 19 one ends in `/` when the torrent has
+    /// more than one file.
     pub fn new(url: &[u8], kind: WebSeedKind, multi_file: bool) -> Self {
         let mut url = maybe_url_encode(url);
         if kind == WebSeedKind::Url && multi_file && !url.ends_with('/') {
             url.push('/');
         }
-        Self { url, kind }
+        Self {
+            url,
+            kind,
+            named_by: crate::core::net::NamedBy::Torrent,
+        }
     }
 }
 

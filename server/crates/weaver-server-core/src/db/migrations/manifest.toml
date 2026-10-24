@@ -1128,3 +1128,20 @@ kind = "sql"
 file = "migrations/0087_tracker_rule_ssl/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 88
+description = "a torrent's tracker records whether the torrent or the operator named it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_tracker_named_by/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_tracker_named_by/postgres.sql"
+engine = "postgres"
+scope = "all"

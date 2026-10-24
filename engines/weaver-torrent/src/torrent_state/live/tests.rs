@@ -5627,6 +5627,7 @@ impl Harness {
         assert!(seeds.add(WebSeed {
             url: "http://192.0.2.1/s/".into(),
             kind: WebSeedKind::Url,
+            named_by: crate::core::net::NamedBy::Operator,
         }));
         // The torrent's metainfo names no seed: this one is the first.
         let link = seeds.link(0).unwrap();

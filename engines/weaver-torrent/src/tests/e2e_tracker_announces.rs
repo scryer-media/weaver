@@ -28,6 +28,19 @@ use crate::{
     },
 };
 
+/// Tiers of trackers the operator named: the test trackers listen on
+/// loopback.
+fn named<S: AsRef<str>>(tiers: Vec<Vec<S>>) -> Vec<Vec<crate::tracker::Tracker>> {
+    tiers
+        .iter()
+        .map(|tier| {
+            tier.iter()
+                .map(|u| crate::tracker::Tracker::operator(url::Url::parse(u.as_ref()).unwrap()))
+                .collect()
+        })
+        .collect()
+}
+
 /// The next HTTP request to the tracker, unanswered, and its `event`.
 async fn read_announce(listener: &TcpListener) -> anyhow::Result<(TcpStream, Option<String>)> {
     let (conn, query) = read_announce_query(listener).await?;
@@ -220,7 +233,7 @@ async fn trackers_only_started_query(opts: SessionOptions) -> anyhow::Result<Str
             AddTorrent::from_bytes(t.torrent.clone()),
             Some(AddTorrentOptions {
                 storage_factory: Some(MemoryStorageFactory::default().clone_box()),
-                tracker_tiers: Some(vec![vec![url]]),
+                tracker_tiers: Some(named(vec![vec![url]])),
                 trackers_only: true,
                 ..Default::default()
             }),
@@ -639,7 +652,7 @@ async fn fetch_metadata(
         AddTorrent::from_url(magnet),
         Some(AddTorrentOptions {
             list_only: true,
-            tracker_tiers: Some(vec![vec![url.to_owned()]]),
+            tracker_tiers: Some(named(vec![vec![url]])),
             identity: Some(identity),
             metadata_fetch: Some(table_tx),
             ..Default::default()
@@ -689,6 +702,9 @@ async fn test_a_magnets_fetch_and_its_run_are_one_torrent_to_its_tracker() -> an
             Some(AddTorrentOptions {
                 storage_factory: Some(MemoryStorageFactory::default().clone_box()),
                 trackers: Some(vec![url.clone()]),
+                // The fetched metainfo names the tracker as its own; the caller
+                // lists it as the operator's, as the fetch did.
+                tracker_tiers: Some(named(vec![vec![&url]])),
                 identity: Some(fetched_as),
                 initial_peers: Some(vec![seeder_addr]),
                 tracker_handover: listed.trackers.take(),
@@ -754,6 +770,9 @@ async fn test_a_magnet_paused_once_its_metadata_is_fetched_sends_stopped_once() 
             Some(AddTorrentOptions {
                 storage_factory: Some(MemoryStorageFactory::default().clone_box()),
                 trackers: Some(vec![url.clone()]),
+                // The fetched metainfo names the tracker as its own; the caller
+                // lists it as the operator's, as the fetch did.
+                tracker_tiers: Some(named(vec![vec![&url]])),
                 identity: Some(identity_of(b'r')),
                 paused: true,
                 tracker_handover: listed.trackers.take(),
@@ -799,7 +818,7 @@ async fn test_a_magnet_removed_while_its_metadata_is_fetched_sends_stopped_once(
                     AddTorrent::from_url(magnet),
                     Some(AddTorrentOptions {
                         list_only: true,
-                        tracker_tiers: Some(vec![vec![url]]),
+                        tracker_tiers: Some(named(vec![vec![url]])),
                         identity: Some(identity_of(b'x')),
                         metadata_fetch: Some(table_tx),
                         ..Default::default()
@@ -862,6 +881,9 @@ async fn test_a_magnets_run_starts_from_the_peers_its_fetchs_tracker_gave() -> a
             Some(AddTorrentOptions {
                 storage_factory: Some(MemoryStorageFactory::default().clone_box()),
                 trackers: Some(vec![url.clone()]),
+                // The fetched metainfo names the tracker as its own; the caller
+                // lists it as the operator's, as the fetch did.
+                tracker_tiers: Some(named(vec![vec![&url]])),
                 identity: Some(fetched_as),
                 tracker_handover: listed.trackers.take(),
                 ..Default::default()
@@ -949,7 +971,7 @@ async fn start_fetch(
                     AddTorrent::from_url(magnet),
                     Some(AddTorrentOptions {
                         list_only: true,
-                        tracker_tiers: Some(tiers),
+                        tracker_tiers: Some(named(tiers)),
                         trackers_only,
                         metadata_fetch: Some(fetch_tx),
                         ..Default::default()
@@ -1157,7 +1179,7 @@ async fn test_a_private_torrent_found_on_the_dht_takes_peers_from_its_trackers_a
                     AddTorrent::from_url(magnet),
                     Some(AddTorrentOptions {
                         storage_factory: Some(MemoryStorageFactory::default().clone_box()),
-                        tracker_tiers: Some(vec![vec![url]]),
+                        tracker_tiers: Some(named(vec![vec![url]])),
                         metadata_fetch: Some(fetch_tx),
                         ..Default::default()
                     }),

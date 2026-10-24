@@ -970,9 +970,16 @@ async fn file_levels_and_picking_toggles_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrents_trackers_are_listed_and_edited() {
     let rig = rig().await;
-    let response = rig
-        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
-        .await;
+    // The metainfo names a tracker of its own.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(metainfo("one.mkv", 3000, false))
+        .unwrap();
+    let mut announcing = b"d".to_vec();
+    bstr(&mut announcing, b"announce");
+    bstr(&mut announcing, b"http://own.invalid/announce");
+    announcing.extend_from_slice(&bytes[1..]);
+    let announcing = base64::engine::general_purpose::STANDARD.encode(announcing);
+    let response = rig.execute(&submit(&announcing, "")).await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
     let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
         .as_u64()
@@ -987,8 +994,8 @@ async fn a_torrents_trackers_are_listed_and_edited() {
     };
     let listed = || {
         run(format!(
-            "{{ torrentTrackers(id: {id}) {{ tier url status updating message seeders \
-             leechers downloaded peers fails nextAnnounceMs }} }}"
+            "{{ torrentTrackers(id: {id}) {{ tier url source status updating message \
+             seeders leechers downloaded peers fails nextAnnounceMs }} }}"
         ))
     };
 
@@ -1001,7 +1008,7 @@ async fn a_torrents_trackers_are_listed_and_edited() {
     ))
     .await;
     let trackers = listed().await;
-    let rows: Vec<(u64, &str, &str)> = trackers["torrentTrackers"]
+    let rows: Vec<(u64, &str, &str, &str)> = trackers["torrentTrackers"]
         .as_array()
         .unwrap()
         .iter()
@@ -1009,6 +1016,7 @@ async fn a_torrents_trackers_are_listed_and_edited() {
             (
                 tracker["tier"].as_u64().unwrap(),
                 tracker["url"].as_str().unwrap(),
+                tracker["source"].as_str().unwrap(),
                 tracker["status"].as_str().unwrap(),
             )
         })
@@ -1016,9 +1024,10 @@ async fn a_torrents_trackers_are_listed_and_edited() {
     assert_eq!(
         rows,
         [
-            (0, "http://a.invalid/announce", "NOT_CONTACTED"),
-            (0, "udp://b.invalid:80", "NOT_CONTACTED"),
-            (1, "http://c.invalid/announce", "NOT_CONTACTED"),
+            (0, "http://own.invalid/announce", "TORRENT", "NOT_CONTACTED"),
+            (1, "http://a.invalid/announce", "OPERATOR", "NOT_CONTACTED"),
+            (1, "udp://b.invalid:80", "OPERATOR", "NOT_CONTACTED"),
+            (2, "http://c.invalid/announce", "OPERATOR", "NOT_CONTACTED"),
         ]
     );
     assert_eq!(trackers["torrentTrackers"][0]["updating"], false);
@@ -1039,6 +1048,7 @@ async fn a_torrents_trackers_are_listed_and_edited() {
         trackers["torrentTrackers"][0]["url"],
         "http://c.invalid/announce"
     );
+    assert_eq!(trackers["torrentTrackers"][0]["source"], "OPERATOR");
 
     run(format!("mutation {{ reannounceTorrent(id: {id}) }}")).await;
     run(format!(

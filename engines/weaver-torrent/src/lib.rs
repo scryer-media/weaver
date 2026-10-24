@@ -109,7 +109,7 @@ pub use url::Url;
 pub use crate::buffers::*;
 pub use crate::clone_to_owned::CloneToOwned;
 pub use crate::core::magnet::*;
-pub use crate::core::net::{HttpClients, HttpTarget, for_target};
+pub use crate::core::net::{HttpClients, HttpTarget, NamedBy, for_target};
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;
 pub use crate::identity::Identity;

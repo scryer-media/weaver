@@ -12,6 +12,6 @@ mod tracker_comms_http;
 mod tracker_comms_udp;
 
 pub use handover::TrackerHandover;
-pub use tiers::{added_tiers, tidy_tiers, without_trackers};
+pub use tiers::{Tracker, added_tiers, tidy_tiers, without_trackers};
 pub use tracker_comms::*;
 pub use tracker_comms_udp::UdpTrackerClient;

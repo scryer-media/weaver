@@ -20,6 +20,7 @@ use bitvec::boxed::BitBox;
 use bitvec::order::Msb0;
 use tokio::sync::watch;
 use weaver_torrent::core::lengths::Lengths;
+use weaver_torrent::tracker::Tracker;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, Checkpoint, ConnectionOptions, HttpClients, ListenerMode,
     ListenerOptions, ManagedTorrent, PiecePriority, Session, SessionOptions, TrackerAnnounce,
@@ -257,12 +258,15 @@ async fn get_capped(client: &reqwest::Client, url: &reqwest::Url) -> Result<Vec<
     Ok(body)
 }
 
-// The test torrent, fetched through a path: its name and metainfo, and the
-// client its trackers are asked through, which rides the path's bridge. The
-// bridge is revoked as the torrent closes or drops.
+// The test torrent, fetched through a path: its name, metainfo and
+// trackers, and the client its trackers are asked through, which rides the
+// path's bridge. The bridge is revoked as the torrent closes or drops. Its
+// trackers are named by whoever named its source: the test's own, so they
+// are the operator's.
 pub(crate) struct TestTorrent {
     name: String,
     bytes: Vec<u8>,
+    trackers: Vec<Vec<Tracker>>,
     lengths: Lengths,
     client: Arc<dyn HttpClients>,
     bridge: Arc<weaver_tunnel::bridge::Bridge>,
@@ -285,20 +289,35 @@ impl TestTorrent {
             .join(&name)
             .map_err(|error| error.to_string())?;
         let bytes = get_capped(&fetcher, &url).await?;
-        let lengths = weaver_torrent::torrent_from_bytes(&bytes)
+        let (trackers, lengths) = weaver_torrent::torrent_from_bytes(&bytes)
             .map_err(|error| error.to_string())
             .and_then(|torrent| {
+                let tiers = if torrent.announce_list.iter().flatten().next().is_some() {
+                    torrent.announce_list.clone()
+                } else {
+                    torrent.announce.iter().map(|url| vec![url.clone()]).collect()
+                };
+                let trackers = tiers
+                    .iter()
+                    .map(|tier| {
+                        tier.iter()
+                            .filter_map(|url| std::str::from_utf8(url.as_ref()).ok()?.parse().ok())
+                            .map(Tracker::operator)
+                            .collect()
+                    })
+                    .collect();
                 torrent
                     .info
                     .data
                     .validate()
-                    .map(|info| *info.lengths())
+                    .map(|info| (trackers, *info.lengths()))
                     .map_err(|error| error.to_string())
             })
             .map_err(|error| format!("{name} is not a torrent: {error}"))?;
         Ok(Self {
             name,
             bytes,
+            trackers,
             lengths,
             client,
             bridge,
@@ -387,6 +406,7 @@ impl Joined {
                     peer_limit: Some(PEER_LIMIT),
                     storage_factory: Some(store.factory()),
                     checkpoint: Some(Checkpoint::pieces(initial_have)),
+                    tracker_tiers: Some(torrent.trackers.clone()),
                     piece_priorities: Some(
                         (0..pieces)
                             .filter(|index| !wanted.contains(index))

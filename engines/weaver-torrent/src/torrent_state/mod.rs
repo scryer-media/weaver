@@ -345,10 +345,9 @@ pub struct ManagedTorrentShared {
     /// Every hash the torrent answers to and announces under.
     pub info_hashes: InfoHashes,
     pub(crate) spawner: BlockingSpawner,
-    /// The torrent's trackers grouped into tiers (BEP 12), in announce order
-    /// (libtorrent `torrent::m_trackers`); see
-    /// [`ManagedTorrent::replace_trackers`].
-    pub(crate) tracker_tiers: parking_lot::RwLock<Vec<Vec<url::Url>>>,
+    /// The torrent's trackers grouped into tiers (BEP 12), in announce order,
+    /// each with who named it; see [`ManagedTorrent::replace_trackers`].
+    pub(crate) tracker_tiers: parking_lot::RwLock<Vec<Vec<crate::tracker::Tracker>>>,
     /// Each change starts a new DHT announce of the running torrent
     /// (libtorrent `torrent::dht_announce`).
     pub(crate) dht_announce: tokio::sync::watch::Sender<()>,
@@ -402,7 +401,7 @@ impl ManagedTorrentShared {
     }
 
     /// The torrent's trackers grouped into tiers (BEP 12), in announce order.
-    pub fn tracker_tiers(&self) -> Vec<Vec<url::Url>> {
+    pub fn tracker_tiers(&self) -> Vec<Vec<crate::tracker::Tracker>> {
         self.tracker_tiers.read().clone()
     }
 
@@ -514,7 +513,7 @@ impl ManagedTorrent {
             .tracker_tiers()
             .iter()
             .flatten()
-            .map(|t| t.to_string())
+            .map(|t| t.url.to_string())
             .collect();
         let mut magnet = Magnet::of(self.info_hashes(), self.name(), trackers);
         magnet.web_seeds = self
@@ -993,12 +992,11 @@ impl ManagedTorrent {
             .unwrap_or_default()
     }
 
-    /// The torrent's trackers become `tiers`, each kept where first named
-    /// (libtorrent `torrent::replace_trackers`): its next run announces to
-    /// them, and a running torrent does from now on (see
+    /// The torrent's trackers become `tiers`, each kept where, and as
+    /// whoever, first named it: its next run announces to them, and a running torrent does from now on (see
     /// [`crate::tracker::TrackerStatus::replace`]). The table of its latest
     /// run lists them at once.
-    pub fn replace_trackers(&self, tiers: Vec<Vec<url::Url>>) {
+    pub fn replace_trackers(&self, tiers: Vec<Vec<crate::tracker::Tracker>>) {
         let tiers = crate::tracker::tidy_tiers(tiers);
         *self.shared.tracker_tiers.write() = tiers.clone();
         let (Some(status), Some(session)) = (self.tracker_status(), self.shared.session.upgrade())
@@ -1009,14 +1007,14 @@ impl ManagedTorrent {
     }
 
     /// Adds `tiers` after the torrent's last tier, a tracker it has already
-    /// left where it is (libtorrent `torrent::add_tracker`).
-    pub fn add_trackers(&self, tiers: Vec<Vec<url::Url>>) {
+    /// left where it is, as whoever named it.
+    pub fn add_trackers(&self, tiers: Vec<Vec<crate::tracker::Tracker>>) {
         let current = self.shared.tracker_tiers();
         self.replace_trackers(crate::tracker::added_tiers(&current, tiers));
     }
 
-    /// Removes `urls` from the torrent's trackers (qBittorrent
-    /// `TorrentImpl::removeTrackers`, through `replace_trackers`).
+    /// Removes `urls` from the torrent's trackers, through
+    /// `replace_trackers`.
     pub fn remove_trackers(&self, urls: &[url::Url]) {
         let current = self.shared.tracker_tiers();
         self.replace_trackers(crate::tracker::without_trackers(&current, urls));
@@ -1039,7 +1037,7 @@ impl ManagedTorrent {
                 .read()
                 .iter()
                 .flatten()
-                .any(|u| u == t)
+                .any(|u| &u.url == t)
         });
         if known && let Some(status) = self.tracker_status() {
             status.reannounce(after, tracker, ignore_min_interval);

@@ -26,7 +26,7 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
-    net::{HttpClients, Resolver, SystemResolver},
+    net::{HttpClients, NamedBy, Resolver, SystemResolver},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
 };
@@ -43,7 +43,7 @@ use crate::torrent_state::live::{
     web_seed::WebSeeds,
 };
 use crate::tracker::{
-    AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerAnnounce, TrackerComms,
+    AutoScrape, ListenPort, Reachable, StoppedAnnounces, Tracker, TrackerAnnounce, TrackerComms,
     TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
@@ -538,11 +538,11 @@ pub struct AddTorrentOptions {
     // Custom trackers
     pub trackers: Option<Vec<String>>,
 
-    /// The torrent's trackers, in tiers, in place of those its metainfo or
-    /// magnet link names (libtorrent `add_torrent_params::trackers` and
-    /// `tracker_tiers` from resume data, which replace the .torrent's).
-    /// [`Self::trackers`] still follow them.
-    pub tracker_tiers: Option<Vec<Vec<String>>>,
+    /// The torrent's trackers, in tiers, each with who named it, in place of
+    /// those its metainfo or magnet link names, as a torrent resumed with
+    /// its edited list announces to that list. [`Self::trackers`] still
+    /// follow them.
+    pub tracker_tiers: Option<Vec<Vec<Tracker>>>,
 
     /// What the storage already holds, as a checkpoint of an earlier run
     /// recorded it (see [`Checkpoint`]). When set, the initial hash check
@@ -1037,13 +1037,13 @@ fn disconnect_candidate_rank(torrent: &TorrentStateLive) -> (bool, bool, std::cm
 
 fn torrent_file_from_info_bytes(
     info_bytes: &[u8],
-    tracker_tiers: &[Vec<url::Url>],
+    tracker_tiers: &[Vec<Tracker>],
 ) -> anyhow::Result<Bytes> {
     #[derive(Serialize)]
     struct Tmp<'a> {
         announce: &'a str,
         #[serde(rename = "announce-list")]
-        announce_list: &'a [Vec<url::Url>],
+        announce_list: Vec<Vec<&'a str>>,
         info: crate::bencode::raw_value::RawValue<&'a [u8]>,
     }
 
@@ -1054,9 +1054,12 @@ fn torrent_file_from_info_bytes(
             .iter()
             .flatten()
             .next()
-            .map(|s| s.as_str())
+            .map(|t| t.url.as_str())
             .unwrap_or(""),
-        announce_list: tracker_tiers,
+        announce_list: tracker_tiers
+            .iter()
+            .map(|tier| tier.iter().map(|t| t.url.as_str()).collect())
+            .collect(),
     };
     bencode_serialize_to_writer(&v, &mut w)?;
     Ok(w.into())
@@ -1079,7 +1082,7 @@ pub(crate) struct CheckedIncomingConnection {
 struct InternalAddResult {
     info_hashes: InfoHashes,
     metadata: Option<TorrentMetadata>,
-    tracker_tiers: Vec<Vec<url::Url>>,
+    tracker_tiers: Vec<Vec<Tracker>>,
     name: Option<String>,
 }
 
@@ -1093,15 +1096,17 @@ fn parse_tracker_url(tracker: &[u8]) -> Option<url::Url> {
     }
 }
 
-/// A torrent's own tracker tiers (BEP 12): `announce-list` when it names any
-/// tracker, otherwise `announce` as the only tier.
-fn metainfo_tracker_tiers(meta: &TorrentMetaV1Owned) -> Vec<Vec<url::Url>> {
+/// A torrent's own tracker tiers (BEP 12), which came with it:
+/// `announce-list` when it names any tracker, otherwise `announce` as the
+/// only tier.
+fn metainfo_tracker_tiers(meta: &TorrentMetaV1Owned) -> Vec<Vec<Tracker>> {
     if meta.announce_list.iter().flatten().next().is_some() {
         meta.announce_list
             .iter()
             .map(|tier| {
                 tier.iter()
                     .filter_map(|t| parse_tracker_url(t.as_ref()))
+                    .map(Tracker::torrent)
                     .collect()
             })
             .collect()
@@ -1109,23 +1114,14 @@ fn metainfo_tracker_tiers(meta: &TorrentMetaV1Owned) -> Vec<Vec<url::Url>> {
         meta.announce
             .iter()
             .filter_map(|t| parse_tracker_url(t.as_ref()))
-            .map(|t| vec![t])
+            .map(|t| vec![Tracker::torrent(t)])
             .collect()
     }
 }
 
 /// The tiers the caller gave in place of the torrent's own.
-fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<url::Url>>> {
-    opts.tracker_tiers.as_ref().map(|tiers| {
-        tiers
-            .iter()
-            .map(|tier| {
-                tier.iter()
-                    .filter_map(|t| url::Url::parse(t).ok())
-                    .collect()
-            })
-            .collect()
-    })
+fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<Tracker>>> {
+    opts.tracker_tiers.clone()
 }
 
 /// Whether a torrent takes peers from its trackers alone: its metainfo
@@ -1215,15 +1211,16 @@ async fn follow_fetch(
 }
 
 /// The tiers a torrent announces to: its own tiers in order, then each of
-/// `extra` as a tier of its own, unless the torrent takes peers from its
-/// own trackers only. A tracker listed more than once keeps its first
-/// place, and empty tiers are dropped.
+/// `extra`, which the operator named, as a tier of its own, unless the
+/// torrent takes peers from its own trackers only. A tracker listed more
+/// than once keeps its first place, and empty tiers are dropped.
 fn merge_tracker_tiers(
-    own: Vec<Vec<url::Url>>,
+    own: Vec<Vec<Tracker>>,
     extra: impl IntoIterator<Item = url::Url>,
     trackers_only: bool,
-) -> Vec<Vec<url::Url>> {
-    let extra = (!trackers_only).then(|| extra.into_iter().map(|t| vec![t]));
+) -> Vec<Vec<Tracker>> {
+    let extra =
+        (!trackers_only).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
     crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
 }
 
@@ -2295,6 +2292,7 @@ impl Session {
                         .extend(magnet.web_seeds.iter().map(|url| WebSeed {
                             url: url.clone(),
                             kind: WebSeedKind::Url,
+                            named_by: NamedBy::Torrent,
                         }));
                     if let Some(so) = magnet.get_select_only() {
                         // Only overwrite opts.only_files if user didn't specify
@@ -2313,7 +2311,7 @@ impl Session {
                                     .trackers
                                     .into_iter()
                                     .filter_map(|t| url::Url::parse(&t).ok())
-                                    .map(|t| vec![t])
+                                    .map(|t| vec![Tracker::torrent(t)])
                                     .collect()
                             }),
                             std::iter::empty(),
@@ -2887,9 +2885,9 @@ impl Session {
     /// unless it takes peers from its own trackers only.
     pub(crate) fn announce_tiers(
         &self,
-        tracker_tiers: Vec<Vec<url::Url>>,
+        tracker_tiers: Vec<Vec<Tracker>>,
         trackers_only: bool,
-    ) -> Vec<Vec<url::Url>> {
+    ) -> Vec<Vec<Tracker>> {
         if self.disable_trackers {
             return Vec::new();
         }
@@ -2949,7 +2947,7 @@ impl Session {
         self: &Arc<Self>,
         info_hashes: InfoHashes,
         identity: &Identity,
-        tracker_tiers: Vec<Vec<url::Url>>,
+        tracker_tiers: Vec<Vec<Tracker>>,
         force_tracker_interval: Option<Duration>,
         trackers_only: bool,
         ssl: Option<&Arc<SslTorrent>>,
@@ -2993,7 +2991,7 @@ impl Session {
         self: &Arc<Self>,
         info_hashes: InfoHashes,
         identity: &Identity,
-        tracker_tiers: Vec<Vec<url::Url>>,
+        tracker_tiers: Vec<Vec<Tracker>>,
         announce: bool,
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
@@ -3234,7 +3232,7 @@ impl Session {
         identity: &Identity,
         peer_rx: PeerStream,
         peer_list: PeerList,
-        tracker_tiers: &[Vec<url::Url>],
+        tracker_tiers: &[Vec<Tracker>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
@@ -3495,7 +3493,7 @@ mod tests {
 
     use super::{
         AddTorrent, AddTorrentOptions, AddTorrentResponse, IpFilter, Session, SessionOptions,
-        TorrentIdOrHash, is_bare_info_hash, merge_tracker_tiers, metainfo_tracker_tiers,
+        TorrentIdOrHash, Tracker, is_bare_info_hash, merge_tracker_tiers, metainfo_tracker_tiers,
         torrent_file_from_info_bytes, torrent_from_bytes,
     };
 
@@ -3503,10 +3501,15 @@ mod tests {
         url::Url::parse(s).unwrap()
     }
 
-    fn tiers(t: &[&[&str]]) -> Vec<Vec<url::Url>> {
+    // Tiers of trackers that came with the torrent.
+    fn tiers(t: &[&[&str]]) -> Vec<Vec<Tracker>> {
         t.iter()
-            .map(|tier| tier.iter().map(|u| url(u)).collect())
+            .map(|tier| tier.iter().map(|u| Tracker::torrent(url(u))).collect())
             .collect()
+    }
+
+    fn operator(u: &str) -> Vec<Tracker> {
+        vec![Tracker::operator(url(u))]
     }
 
     fn bstr(s: &str) -> String {
@@ -3691,7 +3694,7 @@ mod tests {
         .into()
     }
 
-    fn own_tiers() -> Vec<Vec<url::Url>> {
+    fn own_tiers() -> Vec<Vec<Tracker>> {
         tiers(&[
             &["http://a1.test/announce", "udp://a2.test:6969/announce"],
             &["http://b1.test/announce"],
@@ -3745,14 +3748,10 @@ mod tests {
             url("http://b1.test/announce"),
         ];
 
-        assert_eq!(
-            merge_tracker_tiers(own_tiers(), extra.clone(), false),
-            tiers(&[
-                &["http://a1.test/announce", "udp://a2.test:6969/announce"],
-                &["http://b1.test/announce"],
-                &["http://extra.test/announce"],
-            ])
-        );
+        // The extra trackers are the operator's.
+        let mut merged = own_tiers();
+        merged.push(operator("http://extra.test/announce"));
+        assert_eq!(merge_tracker_tiers(own_tiers(), extra.clone(), false), merged);
         assert_eq!(merge_tracker_tiers(own_tiers(), extra, true), own_tiers());
 
         // A tracker repeated in a later tier keeps only its first place, and
@@ -3831,14 +3830,11 @@ mod tests {
 
         let public = add("public", false, false).await;
         assert!(!public.takes_peers_from_trackers_only());
-        let with_added = tiers(&[
-            &["http://a1.test/announce", "udp://a2.test:6969/announce"],
-            &["http://b1.test/announce"],
-            &["http://added.test/announce"],
-        ]);
+        let mut with_added = own_tiers();
+        with_added.push(operator("http://added.test/announce"));
         assert_eq!(public.shared().tracker_tiers(), with_added);
         let mut with_session = with_added;
-        with_session.push(vec![url("http://session.test/announce")]);
+        with_session.push(operator("http://session.test/announce"));
         assert_eq!(
             session.announce_tiers(public.shared().tracker_tiers(), false),
             with_session

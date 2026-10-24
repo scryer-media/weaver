@@ -7,7 +7,7 @@
 
 use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
-use crate::core::net::{HttpClients, HttpTarget, Resolved, Resolver};
+use crate::core::net::{HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public};
 use crate::tracker::ScrapeOk;
 use crate::tracker::tracker_comms::{Reachable, only_reachable};
 use anyhow::Context;
@@ -317,8 +317,7 @@ pub(crate) enum Ask {
 }
 
 /// The arguments an announce carries. A tracker URL whose own query names
-/// one already is refused (libtorrent `has_tracker_query_string`, the names
-/// compared as given, ignoring case).
+/// one already is refused, the names compared as given, ignoring case.
 const TRACKER_ARGS: [&str; 9] = [
     "info_hash",
     "event",
@@ -339,11 +338,11 @@ fn has_tracker_query(query: &str) -> bool {
 }
 
 /// Why a GET of `url` for `ask`, whose host resolved to `addrs`, may not be
-/// sent (libtorrent `ssrf_mitigation`, `http_tracker_connection::on_filter`):
-/// a tracker at a loopback address is asked only what a standard BitTorrent
-/// tracker answers, at a path starting `/announce`, or `/scrape` for a
-/// scrape. The client picks the address it connects to, so every address
-/// must pass.
+/// sent: a tracker at a loopback address is asked only what a tracker
+/// answers, at a path starting `/announce`, or `/scrape` for a scrape. The
+/// client picks the address it connects to, so every address must pass.
+/// Only a tracker the operator named reaches it: one that came with the
+/// torrent is never asked at loopback (see [`NamedBy::may_ask`]).
 fn ssrf_refusal(url: &url::Url, ask: Ask, addrs: &[IpAddr]) -> Option<&'static str> {
     let path = match ask {
         Ask::Announce => "/announce",
@@ -380,55 +379,61 @@ async fn addresses(
     Ok((name.to_owned(), found.iter().map(SocketAddr::ip).collect()))
 }
 
-/// A client from `clients` for a GET of `url` for `ask`: it reaches the
-/// URL's host at the addresses found for it now that the session may reach
-/// (see [`only_reachable`]), in the order found, and nowhere else, and
-/// follows no redirect. Refused when none is left, or when [`ssrf_refusal`]
-/// holds the GET back from those left. Each address is filtered on its own,
-/// so the order of the checks changes only which refusal is named;
-/// [`ssrf_refusal`] refuses the GET for any loopback address the client may
-/// pick, so it judges the addresses the client is handed, after the filter.
-/// A name the session's network resolves where it exits has no address
-/// here: nothing is checked, and the client hands the name on.
+/// A client from `clients` for a GET of `url`, named by `named_by`, for
+/// `ask`, and the addresses it is held to: it reaches the URL's host at the
+/// addresses found for it now that the tracker may be asked at and the
+/// session may reach (see [`only_reachable`]), in the order found, and
+/// nowhere else, and follows no redirect. Refused when none is left, or
+/// when [`ssrf_refusal`] holds the GET back from those left. Each address is
+/// filtered on its own, so the order of the checks changes only which
+/// refusal is named; [`ssrf_refusal`] refuses the GET for any loopback
+/// address the client may pick, so it judges the addresses the client is
+/// handed, after the filter. A name the session's network resolves where it
+/// exits has no address here: nothing is checked, and the client hands the
+/// name on.
 async fn reach(
     clients: &dyn HttpClients,
     url: &url::Url,
+    named_by: NamedBy,
     ask: Ask,
     resolver: &dyn Resolver,
     reachable: &Reachable,
-) -> anyhow::Result<reqwest::Client> {
+) -> anyhow::Result<(reqwest::Client, Vec<IpAddr>)> {
     let (host, found) = addresses(url, resolver).await?;
-    let addrs = only_reachable(found, |ip| *ip, reachable)?;
+    let addrs = only_reachable(found, |ip| *ip, reachable, named_by)?;
     if let Some(why) = ssrf_refusal(url, ask, &addrs) {
         anyhow::bail!("SSRF mitigation: {why}");
     }
-    clients.client(Some(HttpTarget {
+    let client = clients.client(Some(HttpTarget {
         host: &host,
         port: url.port_or_known_default().unwrap_or(0),
         addrs: &addrs,
-    }))
+    }))?;
+    Ok((client, addrs))
 }
 
-/// The most redirects one GET follows (libtorrent
-/// `http_tracker_connection::start` hands `http_connection::get` 5).
+/// The most redirects one GET follows.
 const MAX_REDIRECTS: usize = 5;
 
-/// The body of a tracker's answer to a GET for `ask` of `tracker` with
-/// `query` added ahead of the URL's own. The GET is not sent when the
-/// URL's own query already names an announce argument (libtorrent
-/// `http_tracker_connection::start`), and goes only where [`reach`] lets it.
-/// A redirect is a GET of where it points, reached the same way before it
-/// is sent, at most [`MAX_REDIRECTS`] of them; past that the redirect is the
-/// answer (libtorrent `http_connection::on_read` restarts `get` at the new
-/// URL with one redirect fewer). The answer fails when the tracker sends
-/// nothing for [`RECEIVE_TIMEOUT`], the status is not a success, or the body
-/// passes [`MAX_RESPONSE_LENGTH`]. The bounds are the engine's own, so they
-/// hold whatever client is used.
+/// The body of a tracker's answer to a GET for `ask` of `tracker`, named by
+/// `named_by`, with `query` added ahead of the URL's own. The GET is not
+/// sent when the URL's own query already names an announce argument, and
+/// goes only where [`reach`] lets it. A redirect is a GET of where it
+/// points, reached the same way before it is sent, at most
+/// [`MAX_REDIRECTS`] of them; past that the redirect is the answer. A hop
+/// asked only at public addresses moves the GET to public addresses only,
+/// as a tracker that came with the torrent is held, whoever named the
+/// first. The answer fails when the tracker sends nothing for
+/// [`RECEIVE_TIMEOUT`], the status is not a success, or the body passes
+/// [`MAX_RESPONSE_LENGTH`]. The bounds are the engine's own, so they hold
+/// whatever client is used.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get(
     clients: &dyn HttpClients,
     resolver: &dyn Resolver,
     reachable: &Reachable,
     tracker: &url::Url,
+    mut named_by: NamedBy,
     ask: Ask,
     query: &str,
     user_agent: &str,
@@ -443,7 +448,7 @@ pub(crate) async fn get(
     }
     let mut redirects = 0;
     let response = loop {
-        let client = reach(clients, &url, ask, resolver, reachable).await?;
+        let (client, addrs) = reach(clients, &url, named_by, ask, resolver, reachable).await?;
         let response = tokio::time::timeout(
             RECEIVE_TIMEOUT,
             client
@@ -464,6 +469,9 @@ pub(crate) async fn get(
         url = url
             .join(location)
             .context("the tracker redirected to no URL")?;
+        if !addrs.is_empty() && addrs.iter().all(|a| is_public(*a)) {
+            named_by = NamedBy::Torrent;
+        }
         redirects += 1;
     };
     if !response.status().is_success() {
@@ -604,6 +612,8 @@ mod tests {
     // at its exit is handed on with no address and nothing checked.
     #[tokio::test]
     async fn a_trackers_client_carries_what_its_name_resolved_to() {
+        // The documentation addresses are not public: the operator named
+        // this tracker.
         let url = url::Url::parse("http://tracker.test:6969/announce").unwrap();
         let blocked = IpAddr::from([192, 0, 2, 2]);
         let reachable: Reachable = std::sync::Arc::new(move |ip| {
@@ -628,9 +638,16 @@ mod tests {
                 asked: Default::default(),
             };
             let clients = Targets::default();
-            reach(&clients, &url, Ask::Announce, &resolver, &reachable)
-                .await
-                .unwrap();
+            reach(
+                &clients,
+                &url,
+                NamedBy::Operator,
+                Ask::Announce,
+                &resolver,
+                &reachable,
+            )
+            .await
+            .unwrap();
             assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert_eq!(
                 *clients.0.lock().unwrap(),
@@ -638,6 +655,84 @@ mod tests {
             );
         }
     }
+    // A tracker that came with the torrent is refused at a loopback,
+    // private, link-local or unique-local address, at a tracker's path or
+    // any other, and no client is built; one the operator named is asked at
+    // loopback at a tracker's path. Under a name the network resolves at
+    // its exit nothing is refused by address, whoever named it.
+    #[tokio::test]
+    async fn a_tracker_the_torrent_named_is_asked_at_public_addresses_only() {
+        let reachable: Reachable = std::sync::Arc::new(|_| Ok(()));
+        let at = |ip: &str| Answering {
+            answer: Resolved::Addresses(vec![SocketAddr::new(ip.parse().unwrap(), 80)]),
+            asked: Default::default(),
+        };
+        for ip in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.1.1", "fd00::1"] {
+            for (path, ask) in [
+                ("/announce", Ask::Announce),
+                ("/scrape", Ask::Scrape),
+                ("/admin", Ask::Announce),
+            ] {
+                let url = url::Url::parse(&format!("http://tracker.test{path}")).unwrap();
+                let clients = Targets::default();
+                let refused = reach(
+                    &clients,
+                    &url,
+                    NamedBy::Torrent,
+                    ask,
+                    &at(ip),
+                    &reachable,
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{ip} {path} was asked"));
+                assert!(
+                    refused
+                        .downcast_ref::<crate::tracker::tracker_comms::NotPublic>()
+                        .is_some(),
+                    "{ip} {path}: {refused:#}"
+                );
+                assert!(clients.0.lock().unwrap().is_empty(), "{ip} {path}");
+            }
+        }
+
+        let url = url::Url::parse("http://tracker.test/announce").unwrap();
+        let clients = Targets::default();
+        let (_, addrs) = reach(
+            &clients,
+            &url,
+            NamedBy::Operator,
+            Ask::Announce,
+            &at("127.0.0.1"),
+            &reachable,
+        )
+        .await
+        .unwrap();
+        assert_eq!(addrs, [IpAddr::from([127, 0, 0, 1])]);
+
+        for named_by in [NamedBy::Torrent, NamedBy::Operator] {
+            let clients = Targets::default();
+            let at_exit = Answering {
+                answer: Resolved::AtExit,
+                asked: Default::default(),
+            };
+            reach(
+                &clients,
+                &url,
+                named_by,
+                Ask::Announce,
+                &at_exit,
+                &reachable,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                *clients.0.lock().unwrap(),
+                [("tracker.test".to_owned(), 80, Vec::new())]
+            );
+        }
+    }
+
     #[test]
     fn test_serialize() {
         let info_hash = Id20::new([
@@ -894,7 +989,7 @@ mod tests {
 
     #[test]
     fn a_loopback_tracker_is_asked_only_at_a_tracker_path() {
-        // libtorrent http_tracker_connection::on_filter.
+        // Only a tracker the operator named reaches this rule.
         let url = |s: &str| url::Url::parse(s).unwrap();
         let loopback: [IpAddr; 2] = ["127.0.0.2".parse().unwrap(), "::1".parse().unwrap()];
         let lan: IpAddr = "192.168.1.2".parse().unwrap();

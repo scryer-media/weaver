@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 87;
+const CURRENT_SCHEMA_VERSION: i64 = 88;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1951,6 +1951,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(left, 0);
+        pool.close().await;
+    }
+
+    // Migration 88 records who named each tracker; every row before it is
+    // the torrent's, as nothing recorded which were added by hand.
+    #[tokio::test]
+    async fn sqlite_migration_88_marks_every_existing_tracker_the_torrents() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-tracker-named-by.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(87), true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state)
+             VALUES (7, ?, 'named', 'magnet', 1, 'queued')",
+        )
+        .bind(vec![7_u8; 20])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO torrent_trackers (job_id, tier, url)
+             VALUES (7, 0, 'http://a/announce'), (7, 1, 'udp://b:80')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT tier, url, named_by FROM torrent_trackers ORDER BY tier")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, "http://a/announce".to_string(), "torrent".to_string()),
+                (1, "udp://b:80".to_string(), "torrent".to_string()),
+            ]
+        );
+        let other = sqlx::query(
+            "INSERT INTO torrent_trackers (job_id, tier, url, named_by)
+             VALUES (7, 2, 'http://c/announce', 'peer')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(other.is_err(), "{other:?}");
         pool.close().await;
     }
 

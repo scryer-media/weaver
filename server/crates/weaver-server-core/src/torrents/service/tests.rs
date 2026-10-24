@@ -1529,6 +1529,38 @@ async fn tracker(peer: std::net::SocketAddrV4) -> String {
     url
 }
 
+// `job_id` given `url` as a tracker the operator names, in place of the
+// torrent's own listing of it. A tracker on loopback is asked only when the
+// operator named it, never when the torrent did.
+async fn tracked(service: &TorrentService, job_id: JobId, url: &str) {
+    service
+        .remove_trackers(job_id, &[url.to_owned()])
+        .await
+        .unwrap();
+    service
+        .add_trackers(job_id, vec![vec![url.to_owned()]])
+        .await
+        .unwrap();
+}
+
+// The magnet of `hash` fetching its metainfo from the tracker at
+// 127.0.0.1:`port`, which the operator names: added paused, its tracker
+// named again, then resumed.
+async fn fetching_from(service: &TorrentService, hash: &str, port: u16) -> JobId {
+    let job_id = service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Magnet(format!(
+                "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce"
+            )))
+        })
+        .await
+        .unwrap();
+    tracked(service, job_id, &format!("http://127.0.0.1:{port}/announce")).await;
+    service.resume(job_id).await.unwrap();
+    job_id
+}
+
 // A session on loopback seeding `metainfo` from `files` under `dir`, with
 // no DHT, trackers or discovery.
 async fn seeder(dir: &std::path::Path, metainfo: &[u8], files: &[(&str, &[u8])]) -> Arc<Session> {
@@ -1596,7 +1628,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
         panic!("the seeder listens on IPv4 loopback");
     };
-    let bytes = announcing(&plain, &tracker(peer).await);
+    let (bytes, url) = (plain.to_vec(), tracker(peer).await);
 
     let reading = CapacityReading {
         available_bytes: 0,
@@ -1633,6 +1665,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
         .add(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
 
     // The first piece finds no room and the session enters upload mode.
     let torrent = handle_of(&rig.service, job_id).await;
@@ -2061,7 +2094,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
         panic!("the seeder listens on IPv4 loopback");
     };
-    let bytes = announcing(&private, &tracker(peer).await);
+    let (bytes, url) = (private.to_vec(), tracker(peer).await);
 
     let clock = set_clock();
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
@@ -2075,6 +2108,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
         .add(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     let total = data.len() as u64;
     handle_of(&rig.service, job_id)
         .await
@@ -2170,7 +2204,7 @@ async fn seeded() -> Seeded {
     let std::net::SocketAddr::V4(peer) = seeder.listen_addr().unwrap() else {
         panic!("the seeder listens on IPv4 loopback");
     };
-    let bytes = announcing(&private, &tracker(peer).await);
+    let (bytes, url) = (private.to_vec(), tracker(peer).await);
 
     let clock = set_clock();
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
@@ -2184,6 +2218,7 @@ async fn seeded() -> Seeded {
         .add(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     handle_of(&rig.service, job_id)
         .await
         .wait_until_completed()
@@ -2586,7 +2621,7 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
     let std::net::SocketAddr::V4(peer) = listener.local_addr().unwrap() else {
         panic!("the peer listens on IPv4 loopback");
     };
-    let bytes = announcing(&private, &tracker(peer).await);
+    let (bytes, url) = (private.to_vec(), tracker(peer).await);
 
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
@@ -2596,6 +2631,7 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
         .add(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     let seen = || {
         rig.db
             .get_torrent_counters(job_id)
@@ -2665,7 +2701,7 @@ async fn a_rechecked_torrent_loses_a_damaged_piece_and_runs_again() {
     let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
         panic!("the seeder listens on IPv4 loopback");
     };
-    let bytes = announcing(&private, &tracker(peer).await);
+    let (bytes, url) = (private.to_vec(), tracker(peer).await);
 
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
@@ -2675,6 +2711,7 @@ async fn a_rechecked_torrent_loses_a_damaged_piece_and_runs_again() {
         .add(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     let handle = handle_of(&rig.service, job_id).await;
     handle.wait_until_completed().await.unwrap();
     // Nobody is left to fetch the damaged piece from again.
@@ -2768,7 +2805,7 @@ async fn complete_then_damaged_of(pieces: usize) -> Damaged {
     let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
         panic!("the seeder listens on IPv4 loopback");
     };
-    let bytes = announcing(&private, &tracker(peer).await);
+    let (bytes, url) = (private.to_vec(), tracker(peer).await);
 
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
@@ -2778,6 +2815,7 @@ async fn complete_then_damaged_of(pieces: usize) -> Damaged {
         .add(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     let handle = handle_of(&rig.service, job_id).await;
     handle.wait_until_completed().await.unwrap();
     let dir = rig
@@ -3004,12 +3042,10 @@ async fn a_trackers_status_follows_its_announces() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(announcing(
-            &plain("set", 1),
-            &url,
-        ))))
+        .add(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
 
     let mut started = heard_announce(&listener).await;
     let trackers = rig.service.torrent(job_id).await.unwrap().trackers;
@@ -3107,12 +3143,10 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(announcing(
-            &plain("pushed", 2),
-            &url,
-        ))))
+        .add(request(AddSource::Metainfo(plain("pushed", 2))))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     let mut updates = rig
         .service
         .updates(Some(job_id), Duration::from_secs(86_400));
@@ -3153,14 +3187,7 @@ async fn a_magnets_trackers_read_as_announced_while_its_metainfo_is_fetched() {
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
-    let job_id = rig
-        .service
-        .add(request(AddSource::Magnet(format!(
-            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
-            "fe".repeat(20)
-        ))))
-        .await
-        .unwrap();
+    let job_id = fetching_from(&rig.service, &"fe".repeat(20), port).await;
     // A fetch's table is followed like a run's; the beat covers the view
     // changes nothing pushes.
     let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
@@ -3271,14 +3298,7 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
-    let job_id = rig
-        .service
-        .add(request(AddSource::Magnet(format!(
-            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
-            "fd".repeat(20)
-        ))))
-        .await
-        .unwrap();
+    let job_id = fetching_from(&rig.service, &"fd".repeat(20), port).await;
     let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
 
     started_and_answered(&listener, &mut updates).await;
@@ -3322,14 +3342,7 @@ async fn a_magnet_fetching_when_its_route_changes_fetches_again_on_the_new_route
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
-    let job_id = rig
-        .service
-        .add(request(AddSource::Magnet(format!(
-            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
-            "fc".repeat(20)
-        ))))
-        .await
-        .unwrap();
+    let job_id = fetching_from(&rig.service, &"fc".repeat(20), port).await;
     let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
     started_and_answered(&listener, &mut updates).await;
     let old = rig.service.inner.live.lock().await[&job_id]
@@ -3386,6 +3399,12 @@ async fn a_magnet_added_paused_announces_only_once_resumed() {
         rig.service.inner.live.lock().await[&job_id].resolving,
         Some(Resolving::Paused)
     ));
+    tracked(
+        &rig.service,
+        job_id,
+        &format!("http://127.0.0.1:{port}/announce"),
+    )
+    .await;
     let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
 
     rig.service.resume(job_id).await.unwrap();
@@ -4683,24 +4702,82 @@ async fn file_levels_and_picking_toggles_reach_the_session_and_outlive_a_restart
     again.stop().await;
 }
 
-// The torrent's trackers as the service lists them: tier and URL.
-async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, String)> {
+// The torrent's trackers as the service lists them: tier, URL and who
+// named it.
+async fn listed_trackers(
+    service: &TorrentService,
+    job_id: JobId,
+) -> Vec<(u32, String, NamedBy)> {
     service
         .trackers(job_id)
         .await
         .unwrap()
         .into_iter()
-        .map(|tracker| (tracker.tier, tracker.url))
+        .map(|tracker| (tracker.tier, tracker.url, tracker.named_by))
         .collect()
 }
 
+// The trackers a metainfo or a magnet link names are the torrent's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_trackers_a_torrent_comes_with_are_the_torrents() {
+    let a = "http://a.invalid/announce";
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let metainfo = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(&plain("named", 3), a)))
+        })
+        .await
+        .unwrap();
+    let magnet = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Magnet(format!(
+                "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2Fa.invalid%2Fannounce&tr=udp%3A%2F%2Fb.invalid%3A80",
+                "ab".repeat(20)
+            )))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_trackers(&rig.service, metainfo).await,
+        [(0, a.into(), NamedBy::Torrent)]
+    );
+    assert_eq!(
+        listed_trackers(&rig.service, magnet).await,
+        [
+            (0, a.into(), NamedBy::Torrent),
+            (1, "udp://b.invalid:80".into(), NamedBy::Torrent)
+        ]
+    );
+    // As stored.
+    let stored: Vec<_> = rig
+        .service
+        .inner
+        .db
+        .list_torrent_trackers(magnet)
+        .unwrap()
+        .into_iter()
+        .map(|tracker| tracker.named_by)
+        .collect();
+    assert_eq!(stored, [NamedBy::Torrent, NamedBy::Torrent]);
+    rig.service.stop().await;
+}
+
 // Added, replaced and removed trackers are written where the torrent's
-// trackers live, reach its session, and are what a restart starts with.
+// trackers live, reach its session, and are what a restart starts with. A
+// tracker an edit names that the torrent did not list is the operator's;
+// one it listed keeps who named it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tracker_edits_outlive_a_restart() {
     let a = "http://a.invalid/announce";
     let b = "http://b.invalid/announce";
     let c = "udp://c.invalid:80";
+    let d = "http://d.invalid/announce";
+    let (torrent, operator) = (NamedBy::Torrent, NamedBy::Operator);
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     // Paused, it announces to none of them.
@@ -4723,45 +4800,46 @@ async fn tracker_edits_outlive_a_restart() {
         .unwrap();
     assert_eq!(
         listed_trackers(&rig.service, job_id).await,
-        [(0, a.into()), (1, b.into()), (2, c.into())]
+        [
+            (0, a.into(), torrent),
+            (1, b.into(), operator),
+            (2, c.into(), operator)
+        ]
     );
 
     rig.service
         .replace_trackers(
             job_id,
-            vec![
-                TrackerEntry {
-                    tier: 1,
-                    url: a.into(),
-                },
-                TrackerEntry {
-                    tier: 0,
-                    url: c.into(),
-                },
-                TrackerEntry {
-                    tier: 0,
-                    url: c.into(),
-                },
-            ],
+            vec![(1, a.into()), (0, c.into()), (0, c.into()), (2, d.into())],
         )
         .await
         .unwrap();
     assert_eq!(
         listed_trackers(&rig.service, job_id).await,
-        [(0, c.into()), (1, a.into())]
+        [
+            (0, c.into(), operator),
+            (1, a.into(), torrent),
+            (2, d.into(), operator)
+        ]
     );
 
     rig.service
-        .remove_trackers(job_id, &[a.into()])
+        .remove_trackers(job_id, &[a.into(), d.into()])
         .await
         .unwrap();
-    assert_eq!(listed_trackers(&rig.service, job_id).await, [(0, c.into())]);
+    assert_eq!(
+        listed_trackers(&rig.service, job_id).await,
+        [(0, c.into(), operator)]
+    );
+    let only_c = [vec![weaver_torrent::tracker::Tracker::operator(
+        weaver_torrent::Url::parse(c).unwrap(),
+    )]];
     assert_eq!(
         handle_of(&rig.service, job_id)
             .await
             .shared()
             .tracker_tiers(),
-        [vec![weaver_torrent::Url::parse(c).unwrap()]]
+        only_c
     );
 
     // An edit naming no URL changes nothing.
@@ -4781,10 +4859,13 @@ async fn tracker_edits_outlive_a_restart() {
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&again).await;
-    assert_eq!(listed_trackers(&again, job_id).await, [(0, c.into())]);
+    assert_eq!(
+        listed_trackers(&again, job_id).await,
+        [(0, c.into(), operator)]
+    );
     assert_eq!(
         handle_of(&again, job_id).await.shared().tracker_tiers(),
-        [vec![weaver_torrent::Url::parse(c).unwrap()]]
+        only_c
     );
     again.stop().await;
 }
@@ -4802,12 +4883,10 @@ async fn a_reannounce_reaches_the_tracker_now() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(announcing(
-            &plain("again", 4),
-            &url,
-        ))))
+        .add(request(AddSource::Metainfo(plain("again", 4))))
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     let body = b"d8:completei3e10:incompletei5e8:intervali1800e12:min intervali1800e5:peers0:e";
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -4899,7 +4978,7 @@ async fn partly_fetched() -> PartlyFetched {
     let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
         panic!("the seeder listens on IPv4 loopback");
     };
-    let bytes = announcing(&private, &tracker(peer).await);
+    let (bytes, url) = (private.to_vec(), tracker(peer).await);
 
     let clock = set_clock();
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
@@ -4913,6 +4992,7 @@ async fn partly_fetched() -> PartlyFetched {
         })
         .await
         .unwrap();
+    tracked(&rig.service, job_id, &url).await;
     rig.service
         .set_file_priorities(job_id, &[(0, Ignored)])
         .await

@@ -15,7 +15,8 @@ use crate::jobs::handle::HoldTarget;
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 use crate::settings::{SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
-    TorrentCounters, TorrentIntent, TorrentState, TorrentTracker, TrackerEntry, TrackerStatus,
+    NamedBy, TorrentCounters, TorrentIntent, TorrentState, TorrentTracker, TrackerEntry,
+    TrackerStatus,
 };
 
 pub const ROUTE_DOWN_SEEDING: &str = "Not seeding: route down";
@@ -342,7 +343,8 @@ pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet
 /// the next one replaces it: an accepted announce reads as working however
 /// long ago it was. A tracker the run no longer announces to, nothing due
 /// and nothing in flight, keeps its last outcome, with no floor for a next
-/// announce that is not coming.
+/// announce that is not coming. It reads as the torrent's own until the
+/// torrent's list says who named it.
 pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
     let ms = |at: std::time::SystemTime| {
         at.duration_since(std::time::UNIX_EPOCH)
@@ -355,8 +357,9 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
     TorrentTracker {
         tier,
         url: announce.url.clone(),
-        // qBittorrent `TorrentImpl` reads the state off the entry's last
-        // outcome; an announce in flight is told apart by `updating`.
+        named_by: NamedBy::Torrent,
+        // The state is read off the last outcome; an announce in flight is
+        // told apart by `updating`.
         status: match last.map(|last| last.result.as_ref()) {
             None => TrackerStatus::NotContacted,
             Some(Ok(_)) => TrackerStatus::Working,
@@ -416,9 +419,9 @@ pub fn swarm(announces: &[TrackerAnnounce], now_ms: i64) -> Swarm {
 }
 
 /// A torrent's trackers: the ones its run announces to, each in the tier
-/// the torrent lists it in, or, before it has run, the ones it lists. A
-/// tracker the torrent does not list came with its magnet, whose trackers
-/// each take a tier of their own in the link's order.
+/// the torrent lists it in and as whoever named it there, or, before it has
+/// run, the ones it lists. A tracker the torrent does not list came with its
+/// magnet, whose trackers each take a tier of their own in the link's order.
 pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec<TorrentTracker> {
     let mut trackers: Vec<TorrentTracker> = if announces.is_empty() {
         listed
@@ -426,6 +429,7 @@ pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec
             .map(|entry| TorrentTracker {
                 tier: entry.tier,
                 url: entry.url,
+                named_by: entry.named_by,
                 status: TrackerStatus::NotContacted,
                 updating: false,
                 last_announce_ms: None,
@@ -441,18 +445,26 @@ pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec
             .collect()
     } else {
         // The run names a tracker by its parsed URL.
-        let tiers: Vec<(String, u32)> = listed
+        let tiers: Vec<(String, u32, NamedBy)> = listed
             .into_iter()
-            .filter_map(|entry| Some((reqwest::Url::parse(&entry.url).ok()?.into(), entry.tier)))
+            .filter_map(|entry| {
+                let url = reqwest::Url::parse(&entry.url).ok()?.into();
+                Some((url, entry.tier, entry.named_by))
+            })
             .collect();
         announces
             .iter()
             .map(|announce| {
-                let tier = tiers
+                let (tier, named_by) = tiers
                     .iter()
-                    .find(|(url, _)| *url == announce.url)
-                    .map_or(0, |(_, tier)| *tier);
-                tracker_view(tier, announce)
+                    .find(|(url, ..)| *url == announce.url)
+                    .map_or((0, NamedBy::Torrent), |(_, tier, named_by)| {
+                        (*tier, *named_by)
+                    });
+                TorrentTracker {
+                    named_by,
+                    ..tracker_view(tier, announce)
+                }
             })
             .collect()
     };
@@ -1203,15 +1215,17 @@ mod tests {
             TrackerEntry {
                 tier: 1,
                 url: "udp://backup.invalid:80".into(),
+                named_by: NamedBy::Operator,
             },
             TrackerEntry {
                 tier: 0,
                 url: "http://tracker.invalid".into(),
+                named_by: NamedBy::Torrent,
             },
         ];
         let never: Vec<_> = trackers(listed.clone(), &[])
             .into_iter()
-            .map(|tracker| (tracker.tier, tracker.url, tracker.status))
+            .map(|tracker| (tracker.tier, tracker.url, tracker.status, tracker.named_by))
             .collect();
         assert_eq!(
             never,
@@ -1219,12 +1233,14 @@ mod tests {
                 (
                     0,
                     "http://tracker.invalid".into(),
-                    TrackerStatus::NotContacted
+                    TrackerStatus::NotContacted,
+                    NamedBy::Torrent
                 ),
                 (
                     1,
                     "udp://backup.invalid:80".into(),
-                    TrackerStatus::NotContacted
+                    TrackerStatus::NotContacted,
+                    NamedBy::Operator
                 ),
             ]
         );
@@ -1248,14 +1264,14 @@ mod tests {
         ];
         let ran: Vec<_> = trackers(listed, &run)
             .into_iter()
-            .map(|tracker| (tracker.tier, tracker.url, tracker.updating))
+            .map(|tracker| (tracker.tier, tracker.url, tracker.updating, tracker.named_by))
             .collect();
         assert_eq!(
             ran,
             [
-                (0, "http://magnet.invalid/announce".into(), false),
-                (0, "http://tracker.invalid/".into(), true),
-                (1, "udp://backup.invalid:80".into(), false),
+                (0, "http://magnet.invalid/announce".into(), false, NamedBy::Torrent),
+                (0, "http://tracker.invalid/".into(), true, NamedBy::Torrent),
+                (1, "udp://backup.invalid:80".into(), false, NamedBy::Operator),
             ]
         );
     }

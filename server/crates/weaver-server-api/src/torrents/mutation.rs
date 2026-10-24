@@ -294,7 +294,13 @@ impl TorrentsMutation {
         trackers: Vec<TorrentTrackerInput>,
     ) -> Result<bool> {
         service(ctx)?
-            .replace_trackers(JobId(id), trackers.into_iter().map(Into::into).collect())
+            .replace_trackers(
+                JobId(id),
+                trackers
+                    .into_iter()
+                    .map(|tracker| (tracker.tier, tracker.url))
+                    .collect(),
+            )
             .await
             .map_err(action_error)?;
         Ok(true)

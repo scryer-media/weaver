@@ -5,8 +5,8 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
-    FilePriority, Infohash, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
-    TorrentSource, TrackerEntry,
+    FilePriority, Infohash, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent,
+    TorrentRecord, TorrentSource, TrackerEntry,
 };
 
 fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
@@ -38,10 +38,12 @@ fn trackers() -> Vec<TrackerEntry> {
         TrackerEntry {
             tier: 0,
             url: "udp://tracker.invalid:80/announce".to_string(),
+            named_by: NamedBy::Torrent,
         },
         TrackerEntry {
             tier: 1,
             url: "https://backup.invalid/announce".to_string(),
+            named_by: NamedBy::Operator,
         },
     ]
 }
@@ -260,6 +262,7 @@ fn the_hosts_a_torrent_announces_to_outlive_it() {
     let tracker = |tier, url: &str| TrackerEntry {
         tier,
         url: url.to_string(),
+        named_by: NamedBy::Torrent,
     };
     let more = [
         tracker(0, "UDP://Tracker.Invalid.:6969/announce"),

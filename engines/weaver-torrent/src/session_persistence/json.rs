@@ -147,7 +147,7 @@ impl JsonSessionPersistenceStore {
                 .tracker_tiers()
                 .iter()
                 .flatten()
-                .map(|u| u.to_string())
+                .map(|t| t.url.to_string())
                 .collect(),
             info_hash: torrent.info_hash(),
             // we don't serialize this here, but to a file instead.

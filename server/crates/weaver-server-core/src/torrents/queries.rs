@@ -5,7 +5,7 @@ use crate::StateError;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
-use crate::torrents::model::parse_file_priorities;
+use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
     FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord, TorrentSource,
     TrackerEntry,
@@ -225,16 +225,19 @@ impl Database {
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT tier, url FROM torrent_trackers WHERE job_id = {} ORDER BY tier, url",
+                "SELECT tier, url, named_by FROM torrent_trackers WHERE job_id = {} ORDER BY tier, url",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?;
             rows.iter()
                 .map(|row| {
                     let tier = row.i64("tier")?;
+                    let named_by = row.text("named_by")?;
                     Ok(TrackerEntry {
                         tier: u32::try_from(tier).map_err(|_| corrupt("tracker tier", tier))?,
                         url: row.text("url")?,
+                        named_by: parse_named_by(&named_by)
+                            .ok_or_else(|| corrupt("tracker naming", &named_by))?,
                     })
                 })
                 .collect()

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::JobId;
 use crate::settings::SeedingPolicy;
 pub use weaver_torrent::FilePriority;
+use weaver_torrent::NamedBy;
 
 // A hash a torrent is known by. A hybrid torrent has both, and a torrent
 // sharing either is a duplicate of it.
@@ -245,11 +246,29 @@ pub enum TrackerStatus {
     Disabled,
 }
 
-/// A tracker the torrent names, and its place in the announce list.
+/// A tracker the torrent names, its place in the announce list, and who
+/// named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackerEntry {
     pub tier: u32,
     pub url: String,
+    pub named_by: NamedBy,
+}
+
+/// How a tracker's naming is stored.
+pub(crate) fn named_by_str(named_by: NamedBy) -> &'static str {
+    match named_by {
+        NamedBy::Torrent => "torrent",
+        NamedBy::Operator => "operator",
+    }
+}
+
+pub(crate) fn parse_named_by(value: &str) -> Option<NamedBy> {
+    match value {
+        "torrent" => Some(NamedBy::Torrent),
+        "operator" => Some(NamedBy::Operator),
+        _ => None,
+    }
 }
 
 /// A tracker and how announcing to it is going.
@@ -257,6 +276,7 @@ pub struct TrackerEntry {
 pub struct TorrentTracker {
     pub tier: u32,
     pub url: String,
+    pub named_by: NamedBy,
     pub status: TrackerStatus,
     /// An announce to it waits for its answer.
     pub updating: bool,

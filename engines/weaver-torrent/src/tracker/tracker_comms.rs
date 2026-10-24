@@ -6,7 +6,6 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
@@ -33,7 +32,8 @@ use url::Url;
 
 use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
-use crate::core::net::{HttpClients, Resolved, Resolver};
+use crate::core::net::{HttpClients, NamedBy, Resolved, Resolver};
+use crate::tracker::Tracker;
 use crate::tracker::tracker_comms_http;
 use crate::tracker::tracker_comms_http::Ask;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
@@ -178,63 +178,96 @@ impl std::fmt::Display for Unreachable {
 
 impl std::error::Error for Unreachable {}
 
+/// No address of a tracker is one it may be asked at, as it came with the
+/// torrent (see [`NamedBy::may_ask`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotPublic;
+
+impl std::fmt::Display for NotPublic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not public")
+    }
+}
+
+impl std::error::Error for NotPublic {}
+
 /// The addresses the session may reach (the session's `may_reach`): every
 /// address a tracker is asked at, on every hop, passes it.
 pub type Reachable = Arc<dyn Fn(IpAddr) -> Result<(), Unreachable> + Send + Sync>;
 
-/// The addresses of `found` the session may reach, in the order found
-/// (libtorrent `http_tracker_connection::on_filter` and
-/// `udp_tracker_connection::name_lookup` drop the others before any is
-/// connected to). With none left the tracker is refused for the last rule
-/// they met, and nothing is counted: libtorrent posts no alert and bumps no
-/// counter for a tracker's address, the failed announce is the record.
+/// The addresses of `found` the session may reach that a tracker
+/// `named_by` may be asked at, in the order found; the others are dropped
+/// before any is connected to. With none left the tracker is refused for
+/// the last rule they met, its naming judged last, and nothing is counted:
+/// the failed announce is the record.
 pub(crate) fn only_reachable<A>(
     found: Vec<A>,
     ip: impl Fn(&A) -> IpAddr,
     reachable: &Reachable,
+    named_by: NamedBy,
 ) -> anyhow::Result<Vec<A>> {
-    let mut refused = None;
+    let (mut unreachable, mut not_public) = (None, false);
     let kept: Vec<A> = found
         .into_iter()
         .filter(|a| {
-            let why = reachable(ip(a)).err();
-            refused = refused.max(why);
-            why.is_none()
+            let ip = ip(a);
+            match reachable(ip) {
+                Err(why) => unreachable = unreachable.max(Some(why)),
+                Ok(()) if !named_by.may_ask(ip) => not_public = true,
+                Ok(()) => return true,
+            }
+            false
         })
         .collect();
-    match refused {
-        Some(why) if kept.is_empty() => {
-            Err(anyhow::Error::new(why).context("no address of the tracker may be reached"))
-        }
-        _ => Ok(kept),
+    let why = match (kept.is_empty(), not_public, unreachable) {
+        (true, true, _) => anyhow::Error::new(NotPublic),
+        (true, false, Some(why)) => anyhow::Error::new(why),
+        _ => return Ok(kept),
+    };
+    Err(why.context("no address of the tracker may be reached"))
+}
+
+/// A tracker of a scheme the session announces over, and who named it. A
+/// tracker is its URL: the same URL named again is the same tracker.
+#[derive(Clone)]
+struct SupportedTracker {
+    url: Url,
+    udp: bool,
+    named_by: NamedBy,
+}
+
+impl PartialEq for SupportedTracker {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum SupportedTracker {
-    Udp(Url),
-    Http(Url),
+impl Eq for SupportedTracker {}
+
+impl std::hash::Hash for SupportedTracker {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.url.hash(state)
+    }
 }
 
 impl SupportedTracker {
     fn url(&self) -> &Url {
-        match self {
-            SupportedTracker::Udp(u) | SupportedTracker::Http(u) => u,
-        }
+        &self.url
     }
 
-    fn new(url: Url) -> Option<Self> {
-        match url.scheme() {
-            "http" | "https" => Some(SupportedTracker::Http(url)),
-            "udp" => Some(SupportedTracker::Udp(url)),
+    fn new(Tracker { url, named_by }: Tracker) -> Option<Self> {
+        let udp = match url.scheme() {
+            "http" | "https" => false,
+            "udp" => true,
             _ => {
                 debug!(
                     "unsupported tracker URL: {}",
                     redacted_tracker_url(url.as_str())
                 );
-                None
+                return None;
             }
-        }
+        };
+        Some(Self { url, udp, named_by })
     }
 }
 
@@ -384,6 +417,7 @@ impl TrackerList {
                 }
                 let entry = match old.iter().position(|e| &e.tracker == tracker) {
                     Some(i) => Entry {
+                        tracker: tracker.clone(),
                         tier,
                         ..old.remove(i)
                     },
@@ -993,31 +1027,33 @@ impl Scraper {
         info_hash: Id20,
     ) -> anyhow::Result<ScrapeOk> {
         within_completion_timeout(async {
-            match tracker {
-                SupportedTracker::Http(url) => {
-                    self.scrape_http(url, info_hash)
-                        .instrument(trace_span!("http_scrape", ?tracker))
-                        .await
-                }
-                SupportedTracker::Udp(url) => {
-                    self.scrape_udp(url, info_hash)
-                        .instrument(trace_span!("udp_scrape", ?tracker))
-                        .await
-                }
+            if tracker.udp {
+                self.scrape_udp(tracker, info_hash)
+                    .instrument(trace_span!("udp_scrape", ?tracker))
+                    .await
+            } else {
+                self.scrape_http(tracker, info_hash)
+                    .instrument(trace_span!("http_scrape", ?tracker))
+                    .await
             }
         })
         .await
         .map_err(without_url)
     }
 
-    async fn scrape_http(&self, tracker_url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
+    async fn scrape_http(
+        &self,
+        tracker: &SupportedTracker,
+        info_hash: Id20,
+    ) -> anyhow::Result<ScrapeOk> {
         let url =
-            tracker_comms_http::scrape_url(tracker_url).context("the tracker offers no scrape")?;
+            tracker_comms_http::scrape_url(&tracker.url).context("the tracker offers no scrape")?;
         let answer = tracker_comms_http::get(
             &*self.http_clients,
             self.udp_client.resolver(),
             &self.reachable,
             &url,
+            tracker.named_by,
             Ask::Scrape,
             &tracker_comms_http::scrape_querystring(&info_hash),
             &self.user_agent,
@@ -1026,7 +1062,12 @@ impl Scraper {
         tracker_comms_http::parse_scrape(&answer.body, &info_hash)
     }
 
-    async fn scrape_udp(&self, url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
+    async fn scrape_udp(
+        &self,
+        tracker: &SupportedTracker,
+        info_hash: Id20,
+    ) -> anyhow::Result<ScrapeOk> {
+        let url = &tracker.url;
         let (host, port) = (
             url.host().context("missing host")?,
             url.port().context("missing port")?,
@@ -1037,9 +1078,14 @@ impl Scraper {
                 .await
                 .map(ScrapeOk::from)
         };
-        let addrs =
-            udp_tracker_to_socket_addrs(host, port, self.udp_client.resolver(), &self.reachable)
-                .await?;
+        let addrs = udp_tracker_to_socket_addrs(
+            host,
+            port,
+            self.udp_client.resolver(),
+            &self.reachable,
+            tracker.named_by,
+        )
+        .await?;
         match addrs {
             UdpTrackerResolveResult::One(addr) => scrape(addr).await,
             UdpTrackerResolveResult::Two(v4, v6) => {
@@ -1060,7 +1106,7 @@ struct StatusShared {
 
 /// One entry per tracker of `tiers` that the session can announce to, in
 /// order, a tracker named twice kept where first named.
-fn supported_tiers(tiers: Vec<Vec<Url>>) -> Vec<Vec<SupportedTracker>> {
+fn supported_tiers(tiers: Vec<Vec<Tracker>>) -> Vec<Vec<SupportedTracker>> {
     tiers
         .into_iter()
         .map(|urls| urls.into_iter().filter_map(SupportedTracker::new).collect())
@@ -1140,11 +1186,11 @@ impl TrackerStatus {
         }))
     }
 
-    /// The trackers become `tiers` (libtorrent `torrent::replace_trackers`):
-    /// the table lists them in order, a tracker kept keeping its row, and a
+    /// The trackers become `tiers`, each with who named it: the table lists
+    /// them in order, a tracker kept keeping its row, and a
     /// running task announces to them from now on. An announce waiting on a
     /// tracker that is gone is abandoned.
-    pub fn replace(&self, tiers: Vec<Vec<Url>>) {
+    pub fn replace(&self, tiers: Vec<Vec<Tracker>>) {
         self.replace_tiers(&supported_tiers(tiers));
     }
 
@@ -1213,7 +1259,8 @@ impl TrackerStatus {
         tracker: Option<&Url>,
         ignore_min_interval: bool,
     ) -> bool {
-        let tracker = match tracker.map(|url| SupportedTracker::new(url.clone())) {
+        // A tracker is its URL, whoever named it.
+        let tracker = match tracker.map(|url| SupportedTracker::new(Tracker::torrent(url.clone()))) {
             Some(None) => return false,
             Some(Some(t)) => Some(t),
             None => None,
@@ -1404,7 +1451,11 @@ impl TrackerTask {
     /// of the same torrent. A task that announced under none of
     /// `info_hashes` was another torrent's: it is dropped, which sends
     /// `stopped`, and `None` is returned.
-    pub(crate) fn take_over(self, info_hashes: InfoHashes, tiers: Vec<Vec<Url>>) -> Option<Self> {
+    pub(crate) fn take_over(
+        self,
+        info_hashes: InfoHashes,
+        tiers: Vec<Vec<Tracker>>,
+    ) -> Option<Self> {
         let runs = self.status.runs();
         if !runs
             .iter()
@@ -1538,17 +1589,29 @@ enum UdpTrackerResolveResult {
     Two(SocketAddrV4, SocketAddrV6),
 }
 
-/// Where a UDP tracker at `host` is asked: of the addresses `resolver` finds
-/// that the session may reach (see [`only_reachable`]), the first IPv4 and
-/// the first IPv6. A datagram goes to an address, so a name the session's
-/// network resolves where it exits cannot be asked over UDP.
+/// Where a UDP tracker at `host`, named by `named_by`, is asked: of the
+/// addresses `resolver` finds that it may be asked at and the session may
+/// reach (see [`only_reachable`]), the first IPv4 and the first IPv6. A
+/// `udp://` URL keeps its host as written, so a host that reads as an
+/// address is that address and is not looked up. A datagram goes to an
+/// address, so a name the session's network resolves where it exits cannot
+/// be asked over UDP.
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
     resolver: &dyn Resolver,
     reachable: &Reachable,
+    named_by: NamedBy,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
     let found: Vec<SocketAddr> = match host {
+        url::Host::Domain(name)
+            if let Ok(ip) = name
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>() =>
+        {
+            vec![(ip, port).into()]
+        }
         url::Host::Domain(name) => match resolver
             .resolve(name, port)
             .await
@@ -1564,7 +1627,7 @@ async fn udp_tracker_to_socket_addrs(
     };
     let mut v4: Option<SocketAddrV4> = None;
     let mut v6: Option<SocketAddrV6> = None;
-    for addr in only_reachable(found, SocketAddr::ip, reachable)? {
+    for addr in only_reachable(found, SocketAddr::ip, reachable, named_by)? {
         match (v4, v6, addr) {
             (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
             (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
@@ -1603,42 +1666,11 @@ fn saturating_u32(n: u64) -> u32 {
 }
 
 impl TrackerComms {
-    /// Announce to every tracker in `trackers`, each as a tier of its own.
-    ///
-    /// `stopped` announces are bounded by [`StoppedAnnounces::DEFAULT_TIMEOUT`].
-    // TODO: fix too many args
-    #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        info_hashes: InfoHashes,
-        identity: Identity,
-        trackers: HashSet<Url>,
-        stats: Box<dyn TorrentStatsProvider>,
-        force_interval: Option<Duration>,
-        listen_port: ListenPort,
-        vote: ExternalIpVote,
-        http_clients: Arc<dyn HttpClients>,
-        reachable: Reachable,
-        udp_client: UdpTrackerClient,
-    ) -> TrackerTask {
-        Self::start_with_tiers(
-            info_hashes,
-            identity,
-            trackers.into_iter().map(|t| vec![t]).collect(),
-            stats,
-            force_interval,
-            listen_port,
-            vote,
-            http_clients,
-            reachable,
-            udp_client,
-            StoppedAnnounces::default(),
-        )
-    }
-
     /// Announce to the trackers of a multitracker torrent (BEP 12): one
     /// tracker at a time, the first in tier order that works, the trackers
     /// of each tier in random order (see `TrackerList`). A failing tracker
-    /// is tried again as libtorrent backs off (`retry_delay`).
+    /// is tried again after a delay that grows with each failure
+    /// (`retry_delay`).
     ///
     /// Each tracker is sent `started`, then `completed` if the torrent
     /// becomes a seed during this run (see
@@ -1652,12 +1684,12 @@ impl TrackerComms {
     /// was reached from. `vote` takes the address an accepted answer says is
     /// ours.
     /// A tracker, HTTP or UDP, announce or scrape, every hop, is asked only
-    /// at the addresses `reachable` lets through.
+    /// at the addresses `reachable` lets through, and only at public ones
+    /// unless the operator named it (see [`NamedBy::may_ask`]).
     ///
     /// Each of `info_hashes.ids20()` is announced on its own, with its own
     /// events and failover: a hybrid under v1 and the truncated v2, a v2
-    /// torrent under the truncated v2 (libtorrent
-    /// `torrent::announce_with_tracker`, one announce per `protocol_version`).
+    /// torrent under the truncated v2: one announce per protocol version.
     ///
     /// The task runs with no tracker at all, so trackers given later through
     /// [`TrackerStatus::replace`] are announced to.
@@ -1665,7 +1697,7 @@ impl TrackerComms {
     pub fn start_with_tiers(
         info_hashes: InfoHashes,
         identity: Identity,
-        tiers: Vec<Vec<Url>>,
+        tiers: Vec<Vec<Tracker>>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
         listen_port: ListenPort,
@@ -1987,17 +2019,14 @@ impl TrackerComms {
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         within_completion_timeout(async {
-            match tracker {
-                SupportedTracker::Http(url) => {
-                    self.announce_http(url, event, stats)
-                        .instrument(trace_span!("http_tracker", ?tracker))
-                        .await
-                }
-                SupportedTracker::Udp(url) => {
-                    self.announce_udp(url, event, stats)
-                        .instrument(trace_span!("udp_tracker", ?tracker))
-                        .await
-                }
+            if tracker.udp {
+                self.announce_udp(tracker, event, stats)
+                    .instrument(trace_span!("udp_tracker", ?tracker))
+                    .await
+            } else {
+                self.announce_http(tracker, event, stats)
+                    .instrument(trace_span!("http_tracker", ?tracker))
+                    .await
             }
         })
         .await
@@ -2006,10 +2035,11 @@ impl TrackerComms {
 
     async fn announce_http(
         &self,
-        tracker_url: &Url,
+        tracker: &SupportedTracker,
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
+        let tracker_url = &tracker.url;
         let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
@@ -2033,6 +2063,7 @@ impl TrackerComms {
             self.udp_client.resolver(),
             &self.reachable,
             tracker_url,
+            tracker.named_by,
             Ask::Announce,
             &request.as_querystring(),
             &self.identity.user_agent,
@@ -2062,10 +2093,11 @@ impl TrackerComms {
 
     async fn announce_udp(
         &self,
-        url: &Url,
+        tracker: &SupportedTracker,
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
+        let url = &tracker.url;
         let (host, port) = (
             url.host().context("missing host")?,
             url.port().context("missing port")?,
@@ -2075,6 +2107,7 @@ impl TrackerComms {
             port,
             self.udp_client.resolver(),
             &self.reachable,
+            tracker.named_by,
         )
         .instrument(trace_span!("resolve", ?host))
         .await?;
@@ -2163,7 +2196,7 @@ mod tests {
 
     use crate::core::{
         hash_id::{Id20, Id32, InfoHashes},
-        net::{DatagramSocket, HttpClients, HttpTarget, Resolver},
+        net::{DatagramSocket, HttpClients, HttpTarget, NamedBy, Resolver},
     };
     use futures::{FutureExt, StreamExt, future::BoxFuture};
     use parking_lot::Mutex;
@@ -2174,7 +2207,7 @@ mod tests {
 
     use super::{
         AnnounceErrorKind, AnnounceOk, AutoScrape, MIN_ANNOUNCE_INTERVAL, Reachable,
-        ReannounceDelay, Refused, ScrapeOk, StoppedAnnounces, SupportedTracker, TrackerAnnounce,
+        ReannounceDelay, Refused, ScrapeOk, StoppedAnnounces, SupportedTracker, Tracker, TrackerAnnounce,
         TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape,
         TrackerTask, UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
         udp_tracker_to_socket_addrs,
@@ -2186,7 +2219,17 @@ mod tests {
     };
 
     fn http(name: &str) -> SupportedTracker {
-        SupportedTracker::Http(Url::parse(&format!("http://{name}/announce")).unwrap())
+        let url = Url::parse(&format!("http://{name}/announce")).unwrap();
+        SupportedTracker::new(Tracker::operator(url)).unwrap()
+    }
+
+    // Tiers of trackers the operator named: the test trackers listen on
+    // loopback.
+    fn op(tiers: Vec<Vec<Url>>) -> Vec<Vec<Tracker>> {
+        tiers
+            .into_iter()
+            .map(|tier| tier.into_iter().map(Tracker::operator).collect())
+            .collect()
     }
 
     /// A private tracker's URL: a user, a passkey in the path, one in the
@@ -2211,12 +2254,12 @@ mod tests {
     #[test]
     fn a_tracker_shows_only_its_scheme_host_and_port() {
         let url = Url::parse(PRIVATE).unwrap();
-        let shown = format!("{:?}", SupportedTracker::new(url.clone()).unwrap());
+        let shown = format!("{:?}", SupportedTracker::new(Tracker::operator(url.clone())).unwrap());
         assert_eq!(shown, "https://tracker.example:8443/…");
         assert!(!leaks(&shown, &url), "{shown}");
         let udp = Url::parse("udp://tracker.example:6969/0123passkey/announce").unwrap();
         assert_eq!(
-            format!("{:?}", SupportedTracker::new(udp).unwrap()),
+            format!("{:?}", SupportedTracker::new(Tracker::operator(udp)).unwrap()),
             "udp://tracker.example:6969/…"
         );
         assert_eq!(
@@ -2343,7 +2386,7 @@ mod tests {
     }
 
     fn http_of(url: &Url) -> SupportedTracker {
-        SupportedTracker::Http(url.clone())
+        SupportedTracker::new(Tracker::operator(url.clone())).unwrap()
     }
 
     fn live(downloaded: u64, left: u64, completed_during_run: bool) -> TrackerCommsStats {
@@ -2763,7 +2806,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             hashes,
             identity(),
-            vec![vec![url]],
+            op(vec![vec![url]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -2819,7 +2862,7 @@ mod tests {
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             v1,
             identity(),
-            vec![vec![a_url.clone()]],
+            op(vec![vec![a_url.clone()]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -2839,7 +2882,7 @@ mod tests {
 
         // Taken over by a run that announces to b alone, under both hashes.
         let TrackerTask { mut peers, status } = TrackerTask { peers, status }
-            .take_over(hybrid, vec![vec![b_url.clone()]])
+            .take_over(hybrid, op(vec![vec![b_url.clone()]]))
             .expect("the task announced under one of the run's hashes");
         let left_out = async {
             let (conn, q) = read_announce(&a).await;
@@ -2900,7 +2943,7 @@ mod tests {
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             mine,
             identity(),
-            vec![vec![a_url.clone()]],
+            op(vec![vec![a_url.clone()]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -2920,7 +2963,7 @@ mod tests {
 
         // A run under hashes the task never announced under does not take
         // it: the task ends, and a hears it stop.
-        let taken = TrackerTask { peers, status }.take_over(other, vec![vec![a_url.clone()]]);
+        let taken = TrackerTask { peers, status }.take_over(other, op(vec![vec![a_url.clone()]]));
         assert!(taken.is_none());
         let (conn, q) = read_announce(&a).await;
         respond(conn, "d8:intervali1800e5:peers0:e").await;
@@ -3053,7 +3096,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![url]],
+            op(vec![vec![url]]),
             Box::new(()),
             None,
             listen_port,
@@ -3105,7 +3148,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![url]],
+            op(vec![vec![url]]),
             Box::new(stats.clone()),
             None,
             listen_port,
@@ -3162,7 +3205,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![tracker]],
+            op(vec![vec![tracker]]),
             Box::new(stats.clone()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -3237,7 +3280,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![url]],
+            op(vec![vec![url]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -3279,7 +3322,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![url]],
+            op(vec![vec![url]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -3343,7 +3386,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![url]],
+            op(vec![vec![url]]),
             Box::new(stats.clone()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -3481,7 +3524,7 @@ mod tests {
         let peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]],
+            op(vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -3522,7 +3565,7 @@ mod tests {
         let task = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            tiers,
+            op(tiers),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -3792,7 +3835,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![refusing_url], vec![url]],
+            op(vec![vec![refusing_url], vec![url]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -4067,11 +4110,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_tracker_url_that_could_forge_a_request_is_never_asked() {
-        // libtorrent ssrf_mitigation: http_tracker_connection::start refuses
-        // a URL whose query names an announce argument, on_filter a loopback
-        // tracker at a path other than /announce, whatever name it is
-        // reached by. Each is refused before any request; the next tier's
-        // tracker is asked.
+        // A URL whose query names an announce argument is refused, and so is
+        // a loopback tracker the operator named at a path other than
+        // /announce, whatever name it is reached by. Each is refused before
+        // any request; the next tier's tracker is asked.
         let (refused, at) = http_listener().await;
         let port = at.port().unwrap();
         let named = |s: &str| Url::parse(&s.replace("PORT", &port.to_string())).unwrap();
@@ -4098,7 +4140,7 @@ mod tests {
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            tiers,
+            op(tiers),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -4210,10 +4252,10 @@ mod tests {
 
     #[tokio::test]
     async fn every_hop_of_a_tracker_get_goes_only_to_the_addresses_checked_for_it() {
-        // libtorrent http_connection::on_resolve hands the endpoints to
-        // on_filter, then connect tries those left; a redirect starts over
-        // at its own URL. The names are known to the engine's resolver
-        // only: a client that looked one up itself would reach nothing.
+        // Each hop's addresses are checked before its client is built, and
+        // the client tries only those left; a redirect starts over at its
+        // own URL. The names are known to the engine's resolver only: a
+        // client that looked one up itself would reach nothing.
         let (tracker, at) = http_listener().await;
         let (moved, moved_at) = http_listener().await;
         let (port, moved_port) = (at.port().unwrap(), moved_at.port().unwrap());
@@ -4231,7 +4273,7 @@ mod tests {
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![url]],
+            op(vec![vec![url]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -4269,6 +4311,242 @@ mod tests {
         );
         drop(peers);
         token.cancel();
+    }
+
+    /// The session's clients on a network where every address is the
+    /// tracker at `at`: a client built for any address reaches it there.
+    /// Records the addresses clients were built for.
+    struct Wired {
+        at: SocketAddr,
+        built: Mutex<Vec<IpAddr>>,
+    }
+
+    impl Wired {
+        fn new(at: &Url) -> Arc<Self> {
+            Arc::new(Self {
+                at: SocketAddr::new(
+                    at.host_str().unwrap().parse().unwrap(),
+                    at.port().unwrap(),
+                ),
+                built: Mutex::default(),
+            })
+        }
+    }
+
+    impl HttpClients for Wired {
+        fn builder(
+            &self,
+            target: Option<HttpTarget<'_>>,
+        ) -> anyhow::Result<reqwest::ClientBuilder> {
+            let at = [self.at.ip()];
+            let target = target.map(|t| {
+                self.built.lock().extend(t.addrs);
+                HttpTarget { addrs: &at, ..t }
+            });
+            let builder = reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(Arc::new(NoNames));
+            Ok(crate::core::net::for_target(builder, target))
+        }
+    }
+
+    /// A resolver that knows `names` and no other.
+    struct Names(Vec<(&'static str, IpAddr)>);
+
+    impl Resolver for Names {
+        fn resolve<'a>(
+            &'a self,
+            host: &'a str,
+            port: u16,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
+            let found: Vec<SocketAddr> = self
+                .0
+                .iter()
+                .filter(|(name, _)| *name == host)
+                .map(|(_, ip)| SocketAddr::new(*ip, port))
+                .collect();
+            Box::pin(async move {
+                if found.is_empty() {
+                    Err(std::io::ErrorKind::NotFound.into())
+                } else {
+                    Ok(crate::core::net::Resolved::Addresses(found))
+                }
+            })
+        }
+    }
+
+    /// Starts announcing to `tiers` through `clients`, names looked up by
+    /// `names`.
+    fn start_through(
+        tiers: Vec<Vec<Tracker>>,
+        clients: Arc<Wired>,
+        names: Names,
+        token: &CancellationToken,
+        stopped: &StoppedAnnounces,
+    ) -> TrackerTask {
+        let udp_sock = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        udp_sock.set_nonblocking(true).unwrap();
+        let udp_sock = tokio::net::UdpSocket::from_std(udp_sock).unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(
+            token.clone(),
+            Arc::new(udp_sock),
+            Some(Arc::new(names)),
+        );
+        TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            tiers,
+            Box::new(()),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_vote(),
+            clients,
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_tracker_the_torrent_named_is_refused_at_a_private_address() {
+        // A tracker that came with the torrent, at a loopback, private,
+        // link-local or unique-local address, by IP or by name, at a
+        // tracker's path or any other, over HTTP or UDP, is refused before
+        // any client is built for it or any datagram sent; the operator's
+        // own tracker on loopback, in the next tier, is asked.
+        let (tracker, at) = http_listener().await;
+        // Another tracker on loopback at /announce: one URL is one tracker,
+        // so the torrent's may not share the operator's.
+        let (_theirs, their_at) = http_listener().await;
+        let port = at.port().unwrap();
+        let named = |s: &str| Url::parse(&s.replace("PORT", &port.to_string())).unwrap();
+        let refused = [
+            their_at.clone(),
+            named("http://ten.invalid:PORT/announce"),
+            named("http://lan.invalid:PORT/admin"),
+            named("http://link.invalid:PORT/announce"),
+            named("http://ula.invalid:PORT/scrape"),
+            named("udp://ten.invalid:PORT/announce"),
+            named("udp://192.168.1.1:PORT/announce"),
+        ];
+        let names = Names(vec![
+            ("ten.invalid", Ipv4Addr::new(10, 0, 0, 1).into()),
+            ("lan.invalid", Ipv4Addr::new(192, 168, 1, 1).into()),
+            ("link.invalid", Ipv4Addr::new(169, 254, 1, 1).into()),
+            ("ula.invalid", "fd00::1".parse().unwrap()),
+        ]);
+        let mut tiers: Vec<Vec<Tracker>> = refused
+            .iter()
+            .map(|u| vec![Tracker::torrent(u.clone())])
+            .collect();
+        tiers.push(vec![Tracker::operator(at.clone())]);
+        let clients = Wired::new(&at);
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } =
+            start_through(tiers, clients.clone(), names, &token, &stopped);
+
+        for url in &refused {
+            let e = refusal_of(&status, &mut peers, url).await;
+            assert!(e.contains("not public"), "{url}: {e}");
+        }
+        let q = answer_with_a_peer(
+            &tracker,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        assert_eq!(*clients.built.lock(), [IpAddr::from(Ipv4Addr::LOCALHOST)]);
+
+        drop(peers);
+        let q = next_announce(&tracker).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_udp_tracker_is_resolved_to_the_addresses_its_naming_allows() {
+        // A UDP tracker that came with the torrent has no address to be
+        // asked at among private ones; the operator's is asked there. A
+        // `udp://` URL hands an address over as written, and it is not
+        // looked up.
+        let names = Names(vec![("ten.invalid", Ipv4Addr::new(10, 0, 0, 1).into())]);
+        for (host, at) in [
+            (url::Host::Domain("ten.invalid"), Ipv4Addr::new(10, 0, 0, 1)),
+            (
+                url::Host::Ipv4(Ipv4Addr::new(192, 168, 1, 1)),
+                Ipv4Addr::new(192, 168, 1, 1),
+            ),
+            (url::Host::Domain("192.168.1.1"), Ipv4Addr::new(192, 168, 1, 1)),
+        ] {
+            let refused =
+                udp_tracker_to_socket_addrs(host.clone(), 6969, &names, &reach_all(), NamedBy::Torrent)
+                    .await
+                    .unwrap_err();
+            assert!(refused.downcast_ref::<super::NotPublic>().is_some(), "{refused:#}");
+            let asked =
+                udp_tracker_to_socket_addrs(host, 6969, &names, &reach_all(), NamedBy::Operator)
+                    .await
+                    .unwrap();
+            assert!(
+                matches!(asked, UdpTrackerResolveResult::One(a) if a == (at, 6969).into()),
+                "{asked:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_public_tracker_may_not_move_an_announce_to_a_private_address() {
+        // A tracker reached at public addresses only that redirects to a
+        // private one is refused at the new hop, whoever named it: what it
+        // moves is held to public addresses. No client is built for the
+        // private hop.
+        for named_by in [NamedBy::Torrent, NamedBy::Operator] {
+            let (tracker, at) = http_listener().await;
+            let port = at.port().unwrap();
+            let url = Url::parse(&format!("http://public.invalid:{port}/announce")).unwrap();
+            let names = Names(vec![
+                ("public.invalid", Ipv4Addr::new(8, 8, 8, 8).into()),
+                ("private.invalid", Ipv4Addr::new(10, 0, 0, 1).into()),
+            ]);
+            let clients = Wired::new(&at);
+            let token = CancellationToken::new();
+            let stopped = StoppedAnnounces::default();
+            let TrackerTask { mut peers, status } = start_through(
+                vec![vec![Tracker {
+                    url: url.clone(),
+                    named_by,
+                }]],
+                clients.clone(),
+                names,
+                &token,
+                &stopped,
+            );
+            let serve = async {
+                let (conn, q) = read_announce(&tracker).await;
+                redirect(
+                    conn,
+                    &format!("http://private.invalid:{port}/announce?{q}"),
+                )
+                .await;
+                std::future::pending::<()>().await
+            };
+            let e = tokio::select! {
+                _ = serve => unreachable!(),
+                e = refusal_of(&status, &mut peers, &url) => e,
+            };
+            assert!(e.contains("not public"), "{named_by:?}: {e}");
+            assert_eq!(
+                *clients.built.lock(),
+                [IpAddr::from(Ipv4Addr::new(8, 8, 8, 8))],
+                "{named_by:?}"
+            );
+            drop(peers);
+            stopped.wait_idle().await;
+            token.cancel();
+        }
     }
 
     struct CountingResolver {
@@ -4323,6 +4601,7 @@ mod tests {
             url.port().unwrap(),
             client.resolver(),
             &reach_all(),
+            NamedBy::Operator,
         )
         .await
         .unwrap();
@@ -4468,6 +4747,7 @@ mod tests {
             6969,
             &resolver,
             &reach_all(),
+            NamedBy::Operator,
         )
         .await;
         assert!(found.is_err(), "{found:?}");
@@ -4519,7 +4799,7 @@ mod tests {
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            refused.iter().map(|(u, _)| vec![u.clone()]).collect(),
+            op(refused.iter().map(|(u, _)| vec![u.clone()]).collect()),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -4577,7 +4857,7 @@ mod tests {
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            vec![vec![url.clone()]],
+            op(vec![vec![url.clone()]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -4629,7 +4909,7 @@ mod tests {
         let v6 = (Ipv6Addr::LOCALHOST, 6969).into();
 
         let ipv4_only = reach_but(vec![blocked], true);
-        let found = udp_tracker_to_socket_addrs(host.clone(), 6969, &resolver, &ipv4_only)
+        let found = udp_tracker_to_socket_addrs(host.clone(), 6969, &resolver, &ipv4_only, NamedBy::Operator)
             .await
             .unwrap();
         assert!(
@@ -4638,7 +4918,7 @@ mod tests {
         );
 
         let both = reach_but(vec![blocked], false);
-        let found = udp_tracker_to_socket_addrs(host, 6969, &resolver, &both)
+        let found = udp_tracker_to_socket_addrs(host, 6969, &resolver, &both, NamedBy::Operator)
             .await
             .unwrap();
         assert!(
@@ -4836,14 +5116,14 @@ mod tests {
         assert_eq!(status.announces(), []);
 
         // Added to a task with none, a is announced to.
-        status.replace(vec![vec![a_url.clone()]]);
+        status.replace(op(vec![vec![a_url.clone()]]));
         let (conn, q) = driving!(read_announce(&a));
         assert_eq!(query_param(&q, "event"), Some("started"));
         respond(conn, "d8:intervali1800e5:peers0:e").await;
         table_once(&status, &mut peers, |t| t[0].last.is_some()).await;
 
         // b put ahead of it is announced to at once; a, kept, keeps its row.
-        status.replace(vec![vec![b_url.clone()], vec![a_url.clone()]]);
+        status.replace(op(vec![vec![b_url.clone()], vec![a_url.clone()]]));
         let urls = |t: &[TrackerAnnounce]| t.iter().map(|a| a.url.clone()).collect::<Vec<_>>();
         assert_eq!(
             urls(&status.announces()),
@@ -4855,7 +5135,7 @@ mod tests {
 
         // c replaces b while b's announce waits: it is abandoned, and c,
         // new, is asked.
-        status.replace(vec![vec![c_url.clone()], vec![a_url.clone()]]);
+        status.replace(op(vec![vec![c_url.clone()], vec![a_url.clone()]]));
         let closed = async {
             let mut byte = [0u8; 1];
             loop {
@@ -4876,7 +5156,7 @@ mod tests {
         table_once(&status, &mut peers, |t| t[0].last.is_some()).await;
 
         // c removed, a alone is left; forced, it hears no second `started`.
-        status.replace(vec![vec![a_url.clone()]]);
+        status.replace(op(vec![vec![a_url.clone()]]));
         assert_eq!(urls(&status.announces()), [a_url.to_string()]);
         assert!(!status.reannounce(Duration::ZERO, Some(&c_url), true));
         assert!(status.reannounce(Duration::ZERO, None, true));

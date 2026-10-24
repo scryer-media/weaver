@@ -39,8 +39,8 @@ use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TrackerEntry, TrackerStatus, redacted_tracker_url, status,
+    ConnectionKind, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
+    TorrentTracker, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
@@ -1130,6 +1130,10 @@ fn tracker_json(tracker: &TorrentTracker, scope: CallerScope) -> Value {
     json!({
         "url": url,
         "tier": tracker.tier,
+        "source": match tracker.named_by {
+            NamedBy::Torrent => "TORRENT",
+            NamedBy::Operator => "OPERATOR",
+        },
         "updating": tracker.updating,
         "status": tracker_status(tracker.status),
         "msg": tracker.message.clone().unwrap_or_default(),
@@ -1235,17 +1239,14 @@ async fn edit_tracker(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         if new_url.as_deref() == Some(tracker.url.as_str()) {
             return text(StatusCode::CONFLICT, "New tracker URL already exists");
         }
-        let mut entry = TrackerEntry {
-            tier: tracker.tier,
-            url: tracker.url.clone(),
-        };
+        let mut entry = (tracker.tier, tracker.url.clone());
         if tracker.url == url {
             if new_url.is_none() && new_tier == Some(tracker.tier) {
                 return ok();
             }
             found = true;
-            entry.url = new_url.clone().unwrap_or(entry.url);
-            entry.tier = new_tier.unwrap_or(entry.tier);
+            entry.1 = new_url.clone().unwrap_or(entry.1);
+            entry.0 = new_tier.unwrap_or(entry.0);
         }
         entries.push(entry);
     }

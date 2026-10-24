@@ -1,22 +1,50 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-//! Edits to a torrent's tracker tiers (BEP 12), as libtorrent's
-//! `tracker_list` makes them.
+//! Edits to a torrent's tracker tiers (BEP 12): each tracker once, where it
+//! is first named, and no tier left empty.
 
 use std::collections::HashSet;
 
 use url::Url;
 
-/// `tiers` with every tracker kept where it is first named and no tier left
-/// empty (libtorrent `tracker_list::replace` drops a repeated URL).
-pub fn tidy_tiers(tiers: impl IntoIterator<Item = Vec<Url>>) -> Vec<Vec<Url>> {
+use crate::core::net::NamedBy;
+
+/// A tracker a torrent announces to, and who named it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Tracker {
+    pub url: Url,
+    #[serde(default)]
+    pub named_by: NamedBy,
+}
+
+impl Tracker {
+    /// A tracker that came with the torrent.
+    pub fn torrent(url: Url) -> Self {
+        Self {
+            url,
+            named_by: NamedBy::Torrent,
+        }
+    }
+
+    /// A tracker the operator named.
+    pub fn operator(url: Url) -> Self {
+        Self {
+            url,
+            named_by: NamedBy::Operator,
+        }
+    }
+}
+
+/// `tiers` with every tracker kept where its URL is first named, as it was
+/// named there, and no tier left empty.
+pub fn tidy_tiers(tiers: impl IntoIterator<Item = Vec<Tracker>>) -> Vec<Vec<Tracker>> {
     let mut seen = HashSet::new();
     tiers
         .into_iter()
         .map(|tier| {
             tier.into_iter()
-                .filter(|t| seen.insert(t.clone()))
+                .filter(|t| seen.insert(t.url.clone()))
                 .collect::<Vec<_>>()
         })
         .filter(|tier| !tier.is_empty())
@@ -24,17 +52,17 @@ pub fn tidy_tiers(tiers: impl IntoIterator<Item = Vec<Url>>) -> Vec<Vec<Url>> {
 }
 
 /// `current` with `added` after its last tier, each tier of `added` a tier
-/// of its own, and a tracker `current` already has left where it is
-/// (libtorrent `tracker_list::add_tracker` with each tier past the last).
-pub fn added_tiers(current: &[Vec<Url>], added: Vec<Vec<Url>>) -> Vec<Vec<Url>> {
+/// of its own, and a tracker `current` already has left where it is, as it
+/// was named.
+pub fn added_tiers(current: &[Vec<Tracker>], added: Vec<Vec<Tracker>>) -> Vec<Vec<Tracker>> {
     tidy_tiers(current.iter().cloned().chain(added))
 }
 
-/// `current` without `removed`, a tier left empty dropped.
-pub fn without_trackers(current: &[Vec<Url>], removed: &[Url]) -> Vec<Vec<Url>> {
+/// `current` without the trackers at `removed`, a tier left empty dropped.
+pub fn without_trackers(current: &[Vec<Tracker>], removed: &[Url]) -> Vec<Vec<Tracker>> {
     tidy_tiers(current.iter().map(|tier| {
         tier.iter()
-            .filter(|t| !removed.contains(t))
+            .filter(|t| !removed.contains(&t.url))
             .cloned()
             .collect()
     }))
@@ -48,10 +76,10 @@ mod tests {
         Url::parse(&format!("http://{name}/announce")).unwrap()
     }
 
-    fn tiers(names: &[&[&str]]) -> Vec<Vec<Url>> {
+    fn tiers(names: &[&[&str]]) -> Vec<Vec<Tracker>> {
         names
             .iter()
-            .map(|tier| tier.iter().map(|n| url(n)).collect())
+            .map(|tier| tier.iter().map(|n| Tracker::torrent(url(n))).collect())
             .collect()
     }
 
@@ -63,6 +91,9 @@ mod tests {
             tiers(&[&["a", "b"], &["c"], &["d"], &["e"]])
         );
         assert_eq!(added_tiers(&current, tiers(&[&["b"]])), current);
+        // A tracker added again keeps who first named it.
+        let again = vec![vec![Tracker::operator(url("a"))]];
+        assert_eq!(added_tiers(&current, again), current);
     }
 
     #[test]

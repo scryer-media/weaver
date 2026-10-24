@@ -9,8 +9,8 @@ use weaver_server_core::torrents::service::{
 };
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TorrentVersion, TrackerEntry, TrackerStatus, redacted_tracker_url,
+    ConnectionKind, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
+    TorrentTracker, TorrentVersion, TrackerStatus, redacted_tracker_url,
 };
 
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
@@ -317,6 +317,7 @@ pub struct TorrentTrackerGql {
     pub tier: u32,
     #[graphql(skip)]
     pub url: String,
+    pub source: TrackerSourceGql,
     pub status: TrackerStatusGql,
     /// An announce to it is in flight.
     pub updating: bool,
@@ -340,6 +341,7 @@ impl From<TorrentTracker> for TorrentTrackerGql {
         Self {
             tier: tracker.tier,
             url: tracker.url,
+            source: tracker.named_by.into(),
             status: tracker.status.into(),
             updating: tracker.updating,
             message: tracker.message,
@@ -368,21 +370,29 @@ impl TorrentTrackerGql {
     }
 }
 
+/// Who named a tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TrackerSource")]
+pub enum TrackerSourceGql {
+    Torrent,
+    Operator,
+}
+
+impl From<NamedBy> for TrackerSourceGql {
+    fn from(named_by: NamedBy) -> Self {
+        match named_by {
+            NamedBy::Torrent => Self::Torrent,
+            NamedBy::Operator => Self::Operator,
+        }
+    }
+}
+
 /// A tracker in a torrent's list, by tier.
 #[derive(Clone, Debug, InputObject)]
 #[graphql(name = "TorrentTrackerInput")]
 pub struct TorrentTrackerInput {
     pub tier: u32,
     pub url: String,
-}
-
-impl From<TorrentTrackerInput> for TrackerEntry {
-    fn from(input: TorrentTrackerInput) -> Self {
-        Self {
-            tier: input.tier,
-            url: input.url,
-        }
-    }
 }
 
 #[derive(Clone, Debug, SimpleObject)]

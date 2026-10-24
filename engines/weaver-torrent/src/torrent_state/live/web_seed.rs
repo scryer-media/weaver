@@ -35,7 +35,7 @@ use crate::{
         hash_id::Id20,
         lengths::{Lengths, ValidPieceIndex},
         magnet::Escaped,
-        net::{HttpClients, HttpTarget, Resolved, Resolver},
+        net::{HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public},
         torrent_metainfo::{WebSeed, WebSeedKind, escape_path},
     },
     peer_connection::{PeerConnectionHandler, WriterRequest},
@@ -45,10 +45,7 @@ use crate::{
     type_aliases::{BF, PeerHandle},
 };
 
-use super::{
-    peer::{PeerRx, empty_bitfield},
-    peers::holepunch::{is_global, is_local},
-};
+use super::peer::{PeerRx, empty_bitfield};
 
 /// How many web seeds a torrent connects to at once (libtorrent
 /// `settings_pack::max_web_seed_connections`).
@@ -150,9 +147,10 @@ pub(crate) struct Lacks {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Redirect {
     url: String,
-    // A server at a global address moved it, so it is asked for at global
-    // addresses only (libtorrent `web_seed_t::no_local_ips`).
-    no_local_ips: bool,
+    // Who it is asked for as: a server at a public address moved it, or the
+    // seed came with the torrent, and it is asked for at public addresses
+    // only.
+    named_by: NamedBy,
 }
 
 /// A web seed the connect loop may connect to now.
@@ -201,11 +199,11 @@ impl WebSeeds {
             .collect()
     }
 
-    /// Adds `seed`, unless it is there; returns whether it was added
-    /// (libtorrent `torrent::add_web_seed`).
+    /// Adds `seed`, unless one of its URL and kind is there, whoever named
+    /// it; returns whether it was added.
     pub fn add(&self, seed: WebSeed) -> bool {
         let mut g = self.inner.lock();
-        if g.seeds.iter().any(|e| e.seed == seed) {
+        if g.seeds.iter().any(|e| same_seed(&e.seed, &seed)) {
             return false;
         }
         let id = g.next_id;
@@ -225,11 +223,11 @@ impl WebSeeds {
         true
     }
 
-    /// Removes `seed` and ends its connection; returns whether it was there
-    /// (libtorrent `torrent::remove_web_seed`).
+    /// Removes the seed of `seed`'s URL and kind and ends its connection;
+    /// returns whether it was there.
     pub fn remove(&self, seed: &WebSeed) -> bool {
         let mut g = self.inner.lock();
-        let Some(at) = g.seeds.iter().position(|e| &e.seed == seed) else {
+        let Some(at) = g.seeds.iter().position(|e| same_seed(&e.seed, seed)) else {
             return false;
         };
         remove_at(&mut g, at);
@@ -353,6 +351,11 @@ impl WebSeeds {
     }
 }
 
+// A seed is its URL and kind, whoever named it.
+fn same_seed(a: &WebSeed, b: &WebSeed) -> bool {
+    (&a.url, a.kind) == (&b.url, b.kind)
+}
+
 fn remove_at(g: &mut Inner, at: usize) {
     let entry = g.seeds.remove(at);
     if let Some(c) = entry.connection {
@@ -399,38 +402,29 @@ fn check_url(url: &str, banned: bool) -> Result<Option<SocketAddr>, Refused> {
 }
 
 /// Why a request may not go to where its URL's host resolved.
+#[derive(Debug, PartialEq, Eq)]
 enum Unreachable {
-    /// The URL may not be asked there (libtorrent `ssrf_mitigation`).
-    Refused(&'static str),
+    /// No address is one the target may be asked at (see
+    /// [`NamedBy::may_ask`]).
+    Refused,
     /// The session's IP filter blocks the address.
     Blocked(IpAddr),
 }
 
 /// The one address a request for `target`, whose host resolved to `addrs`
-/// at `port`, goes to (libtorrent `torrent::on_name_lookup`,
-/// `connect_web_seed`): the first left once a target held to global
-/// addresses drops the others (`web_peer_connection::handle_redirect` sets
-/// `no_local_ips`), which the IP filter `allowed` lets through, and which is
-/// not local when the URL carries a query.
+/// at `port`, goes to: the first its naming lets it be asked at, which the
+/// IP filter `allowed` must let through.
 fn endpoint(
     addrs: &[IpAddr],
     port: u16,
     target: &Target,
     allowed: &dyn Fn(SocketAddr) -> bool,
 ) -> Result<IpAddr, Unreachable> {
-    let Some(&addr) = addrs
-        .iter()
-        .find(|a| !target.no_local_ips || is_global(**a))
-    else {
-        return Err(Unreachable::Refused(
-            "moved from a global address to a local one",
-        ));
+    let Some(&addr) = addrs.iter().find(|a| target.named_by.may_ask(**a)) else {
+        return Err(Unreachable::Refused);
     };
     if !allowed(SocketAddr::new(addr, port)) {
         return Err(Unreachable::Blocked(addr));
-    }
-    if target.query && is_local(addr) {
-        return Err(Unreachable::Refused("a query to a local address"));
     }
     Ok(addr)
 }
@@ -649,10 +643,9 @@ struct Run {
 /// to.
 struct Target {
     url: Url,
-    // The URL is the seed's own, and carries a query.
-    query: bool,
-    // A server at a global address moved what is asked for here.
-    no_local_ips: bool,
+    // Who it is asked for as: the seed's naming, or held to public
+    // addresses once a server at one moved it here.
+    named_by: NamedBy,
     // The file moved here, when it did.
     moved: Option<usize>,
 }
@@ -832,8 +825,7 @@ impl<'a> WebSeedConnection<'a> {
         if let Some(to) = self.link.redirect(file) {
             return Ok(Target {
                 url: Url::parse(&to.url).context("bad web seed URL")?,
-                query: false,
-                no_local_ips: to.no_local_ips,
+                named_by: to.named_by,
                 moved: Some(file),
             });
         }
@@ -851,8 +843,7 @@ impl<'a> WebSeedConnection<'a> {
     fn seed_target(&self, url: String) -> anyhow::Result<Target> {
         Ok(Target {
             url: Url::parse(&url).context("bad web seed URL")?,
-            query: Url::parse(&self.link.seed.url).is_ok_and(|u| u.query().is_some()),
-            no_local_ips: false,
+            named_by: self.link.seed.named_by,
             moved: None,
         })
     }
@@ -902,12 +893,12 @@ impl<'a> WebSeedConnection<'a> {
             Some(Err(Unreachable::Blocked(addr))) => {
                 return Err(anyhow!("{url}: the IP filter blocks {addr}"));
             }
-            Some(Err(Unreachable::Refused(why))) => {
+            Some(Err(Unreachable::Refused)) => {
                 match target.moved {
                     Some(file) => self.link.file_missing(file),
                     None => self.link.disable(),
                 }
-                return Err(anyhow!("{url}: {why}"));
+                return Err(anyhow!("{url}: no address it may be asked at"));
             }
         };
         let key = (host, port, addr);
@@ -930,12 +921,10 @@ impl<'a> WebSeedConnection<'a> {
     }
 
     // Asks for `target`, its bytes in `range` when set, and follows where
-    // it moves: each redirect is a target of its own, held to global
-    // addresses when a server at one moved it (libtorrent
-    // `web_peer_connection::handle_redirect`), and reached as the first was,
-    // at most MAX_REDIRECTS of them (`http_connection`). `file` is what
-    // moves; with none, the seed itself. The answer, and the target that
-    // gave it.
+    // it moves: each redirect is a target of its own, held to public
+    // addresses when a server at one moved it, and reached as the first was,
+    // at most MAX_REDIRECTS of them. `file` is what moves; with none, the
+    // seed itself. The answer, and the target that gave it.
     async fn get(
         &self,
         mut target: Target,
@@ -964,8 +953,10 @@ impl<'a> WebSeedConnection<'a> {
             };
             target = Target {
                 url: to,
-                query: false,
-                no_local_ips: reached.addr.is_some_and(is_global),
+                named_by: match reached.addr {
+                    Some(addr) if is_public(addr) => NamedBy::Torrent,
+                    _ => target.named_by,
+                },
                 moved: file,
             };
         }
@@ -995,7 +986,7 @@ impl<'a> WebSeedConnection<'a> {
                 slice.file,
                 Redirect {
                     url: url.to_string(),
-                    no_local_ips: target.no_local_ips,
+                    named_by: target.named_by,
                 },
             );
         }
@@ -1563,8 +1554,17 @@ mod tests {
         Arc::new(Names(map))
     }
 
+    // A seed the operator named: the test servers listen on loopback.
     fn one_seed(url: String, kind: WebSeedKind) -> (Arc<WebSeeds>, SeedLink) {
-        let seeds = Arc::new(WebSeeds::new([WebSeed { url, kind }]));
+        seed_named(url, kind, NamedBy::Operator)
+    }
+
+    fn seed_named(url: String, kind: WebSeedKind, named_by: NamedBy) -> (Arc<WebSeeds>, SeedLink) {
+        let seeds = Arc::new(WebSeeds::new([WebSeed {
+            url,
+            kind,
+            named_by,
+        }]));
         let link = seeds.link(0).unwrap();
         (seeds, link)
     }
@@ -1748,8 +1748,7 @@ mod tests {
     }
 
     // A redirect is followed, and the file is asked for where it went from
-    // then on (libtorrent `web_peer_connection::handle_redirect` keeps it
-    // in `web_seed_t::redirects`).
+    // then on.
     #[tokio::test(start_paused = true)]
     async fn a_moved_file_is_asked_for_where_it_went() {
         let (a, b) = (content(40000, 3), content(10, 4));
@@ -1774,8 +1773,9 @@ mod tests {
                 0,
                 Redirect {
                     url: server.url("/moved/a"),
-                    // The seed is on loopback, which is no global address.
-                    no_local_ips: false,
+                    // The seed is on loopback, which is no public address:
+                    // the move is asked for as the seed was named.
+                    named_by: NamedBy::Operator,
                 }
             )])
         );
@@ -1790,36 +1790,44 @@ mod tests {
     }
 
     // The address a seed is asked at is known before it is asked, and is
-    // the first its host resolves to: a seed whose URL carries a query is
-    // not asked at a local address, by IP or by a name whose first address
-    // is one, and is disabled; at a global address it is asked, there only
-    // (libtorrent `torrent::on_name_lookup`, `connect_web_seed`,
-    // `ssrf_mitigation`).
+    // the first its host resolves to that the seed's naming lets it be asked
+    // at. A seed that came with the torrent is not asked at a loopback,
+    // private, link-local or unique-local address, by IP or by a name, with
+    // a query or without, and is disabled; of a name that also resolves to
+    // a public address it is asked there only. A seed the operator named is
+    // asked at a private address.
     #[tokio::test(start_paused = true)]
-    async fn a_query_is_not_asked_of_a_local_address() {
+    async fn a_seed_the_torrent_named_is_asked_at_public_addresses_only() {
         let f = content(100, 5);
         let server = Server::start(move |head| Reply::ranged(&f, head));
         let port = server.addr.port();
         let layout = layout(&[("f", 100, false)]);
         let clients = Wired::new(server.addr);
-        for (url, resolver) in [
-            (server.url("/f?x=1"), names(&[])),
-            (
-                format!("http://seed.test:{port}/f?x=1"),
-                names(&[("seed.test", "10.0.0.1"), ("seed.test", "8.8.8.8")]),
-            ),
-        ] {
-            let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
-            let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
-            let failed = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1).await;
-            assert!(failed.is_err(), "{url}");
-            assert!(entry(&seeds, |e| e.disabled), "{url}");
+        for query in ["", "?x=1"] {
+            let mut refused = vec![(server.url(&format!("/f{query}")), names(&[]))];
+            for private in ["10.0.0.1", "192.168.1.1", "169.254.1.1", "fd00::1"] {
+                refused.push((
+                    format!("http://seed.test:{port}/f{query}"),
+                    names(&[("seed.test", private)]),
+                ));
+            }
+            for (url, resolver) in refused {
+                let (seeds, link) = seed_named(url.clone(), WebSeedKind::Url, NamedBy::Torrent);
+                let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+                let failed = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1).await;
+                assert!(failed.is_err(), "{url}");
+                assert!(entry(&seeds, |e| e.disabled), "{url}");
+            }
         }
         assert!(server.seen().is_empty());
         assert!(clients.built().is_empty());
 
-        let (seeds, link) = one_seed(format!("http://seed.test:{port}/f?x=1"), WebSeedKind::Url);
-        let resolver = names(&[("seed.test", "8.8.8.8"), ("seed.test", "10.0.0.1")]);
+        let (seeds, link) = seed_named(
+            format!("http://seed.test:{port}/f"),
+            WebSeedKind::Url,
+            NamedBy::Torrent,
+        );
+        let resolver = names(&[("seed.test", "10.0.0.1"), ("seed.test", "8.8.8.8")]);
         let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
             .await
@@ -1827,17 +1835,26 @@ mod tests {
         assert!(!entry(&seeds, |e| e.disabled));
         assert_eq!(server.seen().len(), 1);
         assert_eq!(clients.built(), [ip("8.8.8.8")]);
+
+        let (seeds, link) = one_seed(format!("http://seed.test:{port}/f?x=1"), WebSeedKind::Url);
+        let resolver = names(&[("seed.test", "10.0.0.1")]);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+        drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
+            .await
+            .unwrap();
+        assert!(!entry(&seeds, |e| e.disabled));
+        assert_eq!(server.seen().len(), 2);
+        assert_eq!(clients.built(), [ip("8.8.8.8"), ip("10.0.0.1")]);
     }
 
-    // A seed at a global address may not move a file to a local one: the
-    // engine follows the redirect itself, and the local address is never
-    // asked, nor a client built for it; the file is lost to the seed
-    // (libtorrent `web_peer_connection::handle_redirect` sets
-    // `no_local_ips`, `torrent::on_name_lookup`). Moved to a global address,
-    // the file is fetched there and asked for there, at global addresses
-    // only, from then on.
+    // A seed at a public address may not move a file to a private one,
+    // whoever named the seed: the engine follows the redirect itself, and
+    // the private address is never asked, nor a client built for it; the
+    // file is lost to the seed. Moved to a public address, the file is
+    // fetched there and asked for there, at public addresses only, from
+    // then on.
     #[tokio::test(start_paused = true)]
-    async fn a_global_seed_may_not_move_a_file_to_a_local_address() {
+    async fn a_public_seed_may_not_move_a_file_to_a_private_address() {
         let a = content(100, 6);
         let port = Arc::new(Mutex::new(0u16));
         let location = port.clone();
@@ -1860,16 +1877,18 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let clients = Wired::new(server.addr);
-        let resolver = names(&[("seed.test", "8.8.8.8"), ("moved.test", "192.168.1.2")]);
-        let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
-        assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
-        assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([0]));
-        assert!(!entry(&seeds, |e| e.disabled));
-        assert!(entry(&seeds, |e| e.redirects.is_empty()));
-        assert_eq!(targets(), ["/seed/f"]);
-        assert_eq!(clients.built(), [ip("8.8.8.8")]);
+        for (n, named_by) in [NamedBy::Torrent, NamedBy::Operator].into_iter().enumerate() {
+            let clients = Wired::new(server.addr);
+            let resolver = names(&[("seed.test", "8.8.8.8"), ("moved.test", "192.168.1.2")]);
+            let (seeds, link) = seed_named(url.clone(), WebSeedKind::Url, named_by);
+            let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+            assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
+            assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([0]));
+            assert!(!entry(&seeds, |e| e.disabled));
+            assert!(entry(&seeds, |e| e.redirects.is_empty()));
+            assert_eq!(targets(), vec!["/seed/f"; n + 1]);
+            assert_eq!(clients.built(), [ip("8.8.8.8")]);
+        }
 
         let clients = Wired::new(server.addr);
         let resolver = names(&[("seed.test", "8.8.8.8"), ("moved.test", "9.9.9.9")]);
@@ -1882,11 +1901,11 @@ mod tests {
                 0,
                 Redirect {
                     url: format!("http://moved.test:{}/moved/f", server.addr.port()),
-                    no_local_ips: true,
+                    named_by: NamedBy::Torrent,
                 }
             )])
         );
-        assert_eq!(targets(), ["/seed/f", "/seed/f", "/moved/f"]);
+        assert_eq!(targets(), ["/seed/f", "/seed/f", "/seed/f", "/moved/f"]);
         assert_eq!(clients.built(), [ip("8.8.8.8"), ip("9.9.9.9")]);
     }
 
@@ -1933,7 +1952,7 @@ mod tests {
                 1,
                 Redirect {
                     url: format!("http://moved.test:{}/b", server.addr.port()),
-                    no_local_ips: false,
+                    named_by: NamedBy::Operator,
                 }
             )])
         );
@@ -1954,8 +1973,7 @@ mod tests {
     }
 
     // A request follows at most MAX_REDIRECTS redirects; one more fails the
-    // connection, and the seed and its file are kept for a later one
-    // (libtorrent `http_connection`, `m_redirects`).
+    // connection, and the seed and its file are kept for a later one.
     #[tokio::test(start_paused = true)]
     async fn a_request_follows_at_most_five_redirects() {
         let f = content(100, 9);
@@ -1986,8 +2004,7 @@ mod tests {
     }
 
     // The session's IP filter holds for the address a seed's name resolves
-    // to: a blocked address is not asked, and the seed is tried again later
-    // (libtorrent `torrent::connect_web_seed`, `m_ip_filter`).
+    // to: a blocked address is not asked, and the seed is tried again later.
     #[tokio::test(start_paused = true)]
     async fn the_ip_filter_holds_for_the_address_a_name_resolves_to() {
         let f = content(100, 10);
@@ -2014,7 +2031,8 @@ mod tests {
 
     // A seed whose name the network resolves at its exit is asked by name:
     // its client is built for no address, and no address of it is checked
-    // here, so the IP filter has nothing to hold.
+    // here, so neither the IP filter nor the seed's naming has anything to
+    // hold, even for a seed that came with the torrent.
     #[tokio::test(start_paused = true)]
     async fn a_name_resolved_at_the_exit_is_asked_by_name() {
         struct AtExit;
@@ -2031,7 +2049,7 @@ mod tests {
         let server = Server::start(move |head| Reply::ranged(&f, head));
         let url = format!("http://seed.test:{}/f", server.addr.port());
         let layout = layout(&[("f", 100, false)]);
-        let (_seeds, link) = one_seed(url, WebSeedKind::Url);
+        let (_seeds, link) = seed_named(url, WebSeedKind::Url, NamedBy::Torrent);
         let clients = Wired::new(server.addr);
         let nothing = |_: SocketAddr| false;
         let conn =
@@ -2235,6 +2253,7 @@ mod tests {
             let seeds = Arc::new(WebSeeds::new([WebSeed {
                 url: "http://h/".into(),
                 kind,
+                named_by: NamedBy::Torrent,
             }]));
             let link = seeds.link(0).unwrap();
             let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
@@ -2279,6 +2298,7 @@ mod tests {
             let seeds = Arc::new(WebSeeds::new([WebSeed {
                 url: seed.into(),
                 kind: WebSeedKind::Url,
+                named_by: NamedBy::Torrent,
             }]));
             let link = seeds.link(0).unwrap();
             WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link)
@@ -2310,6 +2330,7 @@ mod tests {
         let url = || WebSeed {
             url: "http://h/".into(),
             kind: WebSeedKind::Url,
+            named_by: NamedBy::Torrent,
         };
 
         // "a" fills piece 0 and starts piece 1, which a pad file ends.
@@ -2372,6 +2393,7 @@ mod tests {
         let seed = |url: &str| WebSeed {
             url: url.into(),
             kind: WebSeedKind::Url,
+            named_by: NamedBy::Torrent,
         };
 
         // At most MAX_WEB_SEED_CONNECTIONS, a connected seed among them.
@@ -2467,6 +2489,7 @@ mod tests {
         let seed = WebSeed {
             url: server.url("/seed/"),
             kind: WebSeedKind::Url,
+            named_by: NamedBy::Operator,
         };
         let out = tempfile::TempDir::with_prefix("test_web_seed_out")?;
         let session =
@@ -2506,6 +2529,7 @@ mod tests {
         let http_seed = WebSeed {
             url: "http://h.example/s.php".into(),
             kind: WebSeedKind::Http,
+            named_by: NamedBy::Operator,
         };
         assert!(handle.add_web_seed(http_seed.clone()));
         assert_eq!(handle.magnet().web_seeds, [seed.url.clone()]);

@@ -441,12 +441,13 @@ fn view(state: TorrentState) -> TorrentView {
 }
 
 // Each tracker status reads as the client's number for it, with the
-// tracker's own counts and message.
+// tracker's own counts and message, and who named it.
 #[test]
 fn a_trackers_status_reads_as_the_clients_number() {
     let tracker = |status: TrackerStatus| TorrentTracker {
         tier: 1,
         url: "http://tracker.invalid/announce".into(),
+        named_by: weaver_server_core::torrents::NamedBy::Torrent,
         status,
         updating: false,
         last_announce_ms: None,
@@ -490,6 +491,7 @@ fn a_trackers_status_reads_as_the_clients_number() {
         serde_json::json!({
             "url": "http://tracker.invalid/announce",
             "tier": 1,
+            "source": "TORRENT",
             "updating": true,
             "status": 2,
             "msg": "",
@@ -513,6 +515,14 @@ fn a_trackers_status_reads_as_the_clients_number() {
         (&failed["status"], &failed["num_seeds"], &failed["msg"]),
         (&Value::from(4), &Value::from(-1), &Value::from("refused"))
     );
+    let added = tracker_json(
+        &TorrentTracker {
+            named_by: weaver_server_core::torrents::NamedBy::Operator,
+            ..tracker(TrackerStatus::Working)
+        },
+        CallerScope::Admin,
+    );
+    assert_eq!(added["source"], "OPERATOR");
 }
 
 #[test]

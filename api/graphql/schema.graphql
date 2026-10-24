@@ -5355,6 +5355,7 @@ type TorrentTestRequest {
 type TorrentTracker {
 	tier: Int!
 	url: String!
+	source: TrackerSource!
 	status: TrackerStatus!
 	"""
 	An announce to it is in flight.
@@ -5484,6 +5485,14 @@ input TrackerRuleInput {
 	Absent keeps the rule's certificate; null clears it.
 	"""
 	ssl: TrackerCertificateInput
+}
+
+"""
+Who named a tracker.
+"""
+enum TrackerSource {
+	TORRENT
+	OPERATOR
 }
 
 enum TrackerStatus {

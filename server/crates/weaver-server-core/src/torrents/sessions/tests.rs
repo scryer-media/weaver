@@ -649,6 +649,17 @@ fn announcing(url: &str) -> Vec<u8> {
     metainfo
 }
 
+// Options announcing to `url` as a tracker the operator named: one on
+// loopback the torrent named would never be asked.
+fn operators(url: &str) -> weaver_torrent::AddTorrentOptions {
+    weaver_torrent::AddTorrentOptions {
+        tracker_tiers: Some(vec![vec![weaver_torrent::tracker::Tracker::operator(
+            url.parse().unwrap(),
+        )]]),
+        ..Default::default()
+    }
+}
+
 // Two loopback ports free as this is called.
 fn two_free_ports() -> (u16, u16) {
     let first = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -694,7 +705,7 @@ async fn a_base_port_change_listens_on_the_new_port_while_the_old_stopped_announ
     let added = old
         .add_torrent(
             weaver_torrent::AddTorrent::from_bytes(announcing(&url)),
-            None,
+            Some(operators(&url)),
         )
         .await
         .unwrap()
@@ -1929,7 +1940,7 @@ async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up()
                 weaver_torrent::AddTorrent::from_bytes(announcing(&url)),
                 Some(weaver_torrent::AddTorrentOptions {
                     overwrite: true,
-                    ..Default::default()
+                    ..operators(&url)
                 }),
             )
             .await

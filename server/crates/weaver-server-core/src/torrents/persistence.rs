@@ -7,16 +7,17 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::settings::SeedingPolicy;
 use crate::settings::model::tracker_host;
-use crate::torrents::model::file_priorities_str;
+use crate::torrents::model::{file_priorities_str, named_by_str};
 use crate::torrents::queries::{TORRENT_COLUMNS, torrent_by_infohash_tx};
 use crate::torrents::{
     FilePriority, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
 };
 use weaver_torrent::ResumePeers;
 
-// A tracker row holds where the tracker sits in the announce list; how
-// announcing to it goes is read from the session.
-const TRACKER_INSERT: &str = "INSERT INTO torrent_trackers (job_id, tier, url) VALUES ({}, {}, {})";
+// A tracker row holds where the tracker sits in the announce list and who
+// named it; how announcing to it goes is read from the session.
+const TRACKER_INSERT: &str =
+    "INSERT INTO torrent_trackers (job_id, tier, url, named_by) VALUES ({}, {}, {}, {})";
 // Every host a torrent has announced to stays known after the torrent is
 // gone, so a tracker rule can be picked from them. The URL is not kept: a
 // private tracker's carries the operator's passkey.
@@ -35,6 +36,7 @@ async fn insert_trackers(
             SqlArg::I64(job_id),
             SqlArg::I64(i64::from(tracker.tier)),
             SqlArg::Text(tracker.url.clone()),
+            SqlArg::Text(named_by_str(tracker.named_by).to_owned()),
         ];
         tx.execute(TRACKER_INSERT, &args).await?;
     }
