@@ -47,9 +47,55 @@ impl Template {
     }
 }
 
+// The cache's directory. A job rename moves it with the working directory,
+// so the live path is held here, behind one lock, rather than in a
+// `tempfile::TempDir`: those paths are immutable, and a stale one would
+// both miss the moved files and, on drop, remove whatever later took the
+// old path. Every cached body names its file relative to this root, so a
+// relocation is the one rewrite below and no entry has to be visited.
+struct CacheRoot {
+    path: std::sync::RwLock<PathBuf>,
+}
+
+impl CacheRoot {
+    fn new(path: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            path: std::sync::RwLock::new(path),
+        })
+    }
+
+    fn path(&self) -> PathBuf {
+        self.path
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn relocate(&self, old: &Path, new: &Path) {
+        let mut path = self
+            .path
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(relative) = path.strip_prefix(old) {
+            *path = new.join(relative);
+        }
+    }
+}
+
+impl Drop for CacheRoot {
+    fn drop(&mut self) {
+        let path = self
+            .path
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
 struct CachedBody {
     template: Template,
-    path: tempfile::TempPath,
+    root: Arc<CacheRoot>,
+    name: std::ffi::OsString,
     bytes: usize,
     hash: blake3::Hash,
     resident: Weak<SharedArticle>,
@@ -62,7 +108,7 @@ impl CachedBody {
     fn store(
         mut decoded: DecodeResult,
         source: Option<usize>,
-        root: &Path,
+        root: &Arc<CacheRoot>,
         memory: &Arc<ProcessMemoryBudget>,
         generation: u64,
     ) -> Result<(Self, DecodeResult), String> {
@@ -73,7 +119,7 @@ impl CachedBody {
             + 1024;
         let metadata = memory.try_reserve_retained(metadata_bytes as u64)?;
         let payload_memory = memory.try_reserve_retained(bytes as u64)?;
-        let mut file = tempfile::NamedTempFile::new_in(root)
+        let mut file = tempfile::NamedTempFile::new_in(root.path())
             .map_err(|error| format!("article cache creation failed: {error}"))?;
         let mut hash = blake3::Hasher::new();
         let mut written = Ok(());
@@ -84,6 +130,14 @@ impl CachedBody {
             hash.update(bytes);
         });
         written.map_err(|error| format!("article cache write failed: {error}"))?;
+        let path = file
+            .into_temp_path()
+            .keep()
+            .map_err(|error| format!("article cache keep failed: {error}"))?;
+        let name = path
+            .file_name()
+            .expect("a cache file always has a name")
+            .to_os_string();
         let body = Arc::new(SharedArticle {
             data: std::mem::replace(&mut decoded.data, DecodedChunk::from(Vec::<u8>::new())),
             _memory: payload_memory,
@@ -101,7 +155,8 @@ impl CachedBody {
                 plan: decoded.checkpoint_plan.clone(),
                 segments: decoded.segments.clone(),
             },
-            path: file.into_temp_path(),
+            root: root.clone(),
+            name,
             bytes,
             hash: hash.finalize(),
             resident: Arc::downgrade(&body),
@@ -127,7 +182,7 @@ impl CachedBody {
                 .try_reserve_exact(self.bytes)
                 .map_err(|error| format!("article cache allocation failed: {error}"))?;
             bytes.resize(self.bytes, 0);
-            let mut file = std::fs::File::open(&self.path)
+            let mut file = std::fs::File::open(self.path())
                 .map_err(|error| format!("article cache open failed: {error}"))?;
             file.read_exact(&mut bytes)
                 .map_err(|error| format!("article cache read failed: {error}"))?;
@@ -142,6 +197,16 @@ impl CachedBody {
             body
         };
         Ok(self.template.replay(id, data))
+    }
+
+    fn path(&self) -> PathBuf {
+        self.root.path().join(&self.name)
+    }
+}
+
+impl Drop for CachedBody {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.path());
     }
 }
 
@@ -163,7 +228,7 @@ enum Entry {
 
 pub(crate) struct RepeatedArticles {
     entries: HashMap<MessageId, Arc<tokio::sync::Mutex<Option<Entry>>>>,
-    root: tempfile::TempDir,
+    root: Arc<CacheRoot>,
     memory: Arc<ProcessMemoryBudget>,
     _index_memory: ProcessMemoryPermit,
 }
@@ -225,13 +290,22 @@ impl RepeatedArticles {
         let root = tempfile::Builder::new()
             .prefix("article-cache-")
             .tempdir_in(scratch_root)
-            .map_err(|error| format!("article cache directory creation failed: {error}"))?;
+            .map_err(|error| format!("article cache directory creation failed: {error}"))?
+            .keep();
+        let root = CacheRoot::new(root);
         Ok(Some(Arc::new(Self {
             entries,
             root,
             memory,
             _index_memory: index_memory,
         })))
+    }
+
+    // The job's working directory moved from `old` to `new` with this cache
+    // inside it. The caller has proven the job idle, so no read or store is
+    // between resolving a path and using it.
+    pub(crate) fn relocate_working_dir(&self, old: &Path, new: &Path) {
+        self.root.relocate(old, new);
     }
 
     async fn fetch(
@@ -316,13 +390,8 @@ impl RepeatedArticles {
                 let source = reply.source;
                 let raw_size = decoded.raw_size;
                 let result = tokio::task::spawn_blocking(move || {
-                    match CachedBody::store(
-                        decoded,
-                        source,
-                        cache.root.path(),
-                        &cache.memory,
-                        generation,
-                    ) {
+                    match CachedBody::store(decoded, source, &cache.root, &cache.memory, generation)
+                    {
                         Ok((cached, decoded)) => {
                             *state = Some(Entry::Body(cached));
                             Ok(decoded)
@@ -406,6 +475,10 @@ impl RepeatedArticles {
             .await;
         let (data, attempts, source) =
             Pipeline::download_data_from_decoded_trace(work.segment_id, trace);
+        // The one wire fetch here, credited exactly as a lane credits one.
+        if let Some(counters) = &work.counters {
+            super::owned_lane::credit_transfer(counters, &data);
+        }
         Reply {
             data,
             attempts,
@@ -522,6 +595,7 @@ mod tests {
 
     fn work() -> DownloadWork {
         DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id: JobId(1),
@@ -543,12 +617,12 @@ mod tests {
 
     #[test]
     fn cached_body_shares_memory_then_reloads_verified_disk_bytes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         let id = work().segment_id;
         let bytes = [73; 4096];
         let (mut cache, first) =
-            CachedBody::store(decoded(id, &bytes), Some(0), root.path(), &memory, 7).unwrap();
+            CachedBody::store(decoded(id, &bytes), Some(0), &root, &memory, 7).unwrap();
         let charged = memory.reserved_bytes();
         let next_id = SegmentId {
             file_id: NzbFileId {
@@ -578,14 +652,58 @@ mod tests {
         assert_eq!(memory.reserved_bytes(), 0);
     }
 
+    // A rename of an idle job moves its working directory, the cache with
+    // it. The bodies already cached must read back from the new place and
+    // the next store must land there too; nothing may still name the old
+    // directory, and dropping the cache cleans the new one up.
+    #[test]
+    fn a_renamed_working_dir_carries_the_cache_and_every_cached_body() {
+        let base = tempfile::tempdir().unwrap();
+        let old = base.path().join("old name");
+        let new = base.path().join("new name");
+        let dir = old.join(".weaver-chunks").join("article-cache-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
+        let cache = RepeatedArticles {
+            entries: HashMap::new(),
+            root: CacheRoot::new(dir),
+            _index_memory: memory.try_reserve_retained(0).unwrap(),
+            memory: memory.clone(),
+        };
+        let id = work().segment_id;
+        let (mut body, first) =
+            CachedBody::store(decoded(id, b"before"), Some(0), &cache.root, &memory, 7).unwrap();
+        drop(first);
+
+        std::fs::rename(&old, &new).unwrap();
+        cache.relocate_working_dir(&old, &new);
+
+        let moved = new.join(".weaver-chunks").join("article-cache-test");
+        assert_eq!(cache.root.path(), moved);
+        assert_eq!(body.path().parent(), Some(moved.as_path()));
+        let restored = body.read(id, &memory).unwrap();
+        let mut actual = Vec::new();
+        restored.data.write_to(&mut actual).unwrap();
+        assert_eq!(actual, b"before");
+        let (after, _replayed) =
+            CachedBody::store(decoded(id, b"after"), Some(0), &cache.root, &memory, 7).unwrap();
+        assert_eq!(after.path().parent(), Some(moved.as_path()));
+        assert_eq!(std::fs::read(after.path()).unwrap(), b"after");
+
+        drop((body, after, restored, _replayed));
+        drop(cache);
+        assert!(!moved.exists());
+        assert!(!old.exists());
+    }
+
     #[test]
     fn a_shared_article_hands_over_its_payload_as_views_of_the_one_body() {
-        let root = tempfile::tempdir().unwrap();
+        let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         let id = work().segment_id;
         let bytes = [91u8; 2048];
         let (_cache, replayed) =
-            CachedBody::store(decoded(id, &bytes), Some(0), root.path(), &memory, 7).unwrap();
+            CachedBody::store(decoded(id, &bytes), Some(0), &root, &memory, 7).unwrap();
         let DecodedChunk::Shared(body) = &replayed.data else {
             panic!("a stored body replays shared")
         };
@@ -602,14 +720,14 @@ mod tests {
 
     #[test]
     fn changed_cache_bytes_are_never_replayed_as_verified() {
-        let root = tempfile::tempdir().unwrap();
+        let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         let id = work().segment_id;
         let (mut cache, first) =
-            CachedBody::store(decoded(id, b"original"), Some(0), root.path(), &memory, 7).unwrap();
+            CachedBody::store(decoded(id, b"original"), Some(0), &root, &memory, 7).unwrap();
         drop(first);
         let metadata = memory.reserved_bytes();
-        std::fs::write(&cache.path, b"modified").unwrap();
+        std::fs::write(cache.path(), b"modified").unwrap();
         assert!(
             cache
                 .read(id, &memory)
@@ -624,13 +742,13 @@ mod tests {
 
     #[test]
     fn cache_reservation_failure_releases_partial_charges() {
-        let root = tempfile::tempdir().unwrap();
+        let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
         let memory = Arc::new(ProcessMemoryBudget::new(4096));
         assert!(
             CachedBody::store(
                 decoded(work().segment_id, &[0; 4096]),
                 Some(0),
-                root.path(),
+                &root,
                 &memory,
                 7
             )
@@ -642,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_missing_evidence_keeps_its_provider_scope_and_generation() {
-        let root = tempfile::tempdir().unwrap();
+        let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         let work = work();
         let failure = CachedFailure {
@@ -714,7 +832,7 @@ mod tests {
     // it has to leave the segment's retry budget alone.
     #[tokio::test]
     async fn a_capacity_refusal_expires_and_keeps_the_retry_budget() {
-        let root = tempfile::tempdir().unwrap();
+        let root = CacheRoot::new(tempfile::tempdir().unwrap().keep());
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         let work = work();
         let stale = CachedFailure {

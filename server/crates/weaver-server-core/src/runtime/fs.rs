@@ -38,6 +38,11 @@ pub(crate) fn rename_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
             "move source is not a regular file",
         ));
     }
+    rename_path_exclusive(src, dst)
+}
+
+// Atomic for both directories and files; never replaces an existing target.
+pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     if src == dst {
         return Ok(());
     }

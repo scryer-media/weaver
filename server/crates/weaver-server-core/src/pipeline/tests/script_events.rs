@@ -580,8 +580,9 @@ async fn a_job_marked_bad_on_arrival_fails_when_its_hold_ends() {
     pipeline.handle_added_scripts_done(job_id, Ok(()));
     assert!(!pipeline.held_for_added_scripts(job_id));
     let status = pipeline
-        .finished_jobs
-        .iter()
+        .finished_jobs()
+        .await
+        .into_iter()
         .find(|job| job.job_id == job_id)
         .map(|job| job.status.clone())
         .or_else(|| pipeline.jobs.get(&job_id).map(|state| state.status.clone()));

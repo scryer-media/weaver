@@ -1276,17 +1276,7 @@ impl Pipeline {
                 .get(&file_id)
                 .into_iter()
                 .flat_map(|buffer| buffer.persisted_ranges());
-            let floor = self
-                .pending_file_progress
-                .get(&file_id)
-                .copied()
-                .unwrap_or(0)
-                .max(
-                    self.persisted_file_progress
-                        .get(&file_id)
-                        .copied()
-                        .unwrap_or(0),
-                );
+            let floor = file.committed_decoded_prefix();
             for range in materialized
                 .iter()
                 .cloned()

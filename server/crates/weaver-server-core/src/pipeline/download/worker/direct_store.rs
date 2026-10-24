@@ -6,6 +6,8 @@ use crate::pipeline::direct_store::router::HeaderProbe as DirectHeaderProbe;
 
 pub(in crate::pipeline::download) struct DirectStoreAdmission {
     job_id: JobId,
+    // The set's index among its job's sets.
+    set_index: usize,
     files: HashSet<u32>,
     // Room the set had when the handout began: its holds admission room
     // with every byte already on its way to it counted.
@@ -24,6 +26,12 @@ pub(in crate::pipeline::download) struct DirectStoreAdmission {
     // the set's own room only, so what other sets hold can slow this set to
     // one article at a time but never stop it.
     frontier: Option<SegmentId>,
+    // The set cannot place another byte from the wire: the earliest volume
+    // whose headers are unread has nothing left to arrive, so no article can
+    // let its holds drain, and those holds leave no room for any article it
+    // still has queued. Read by [`Pipeline::settle_direct_unplaceable_sets`],
+    // which hands such a set over at once.
+    unplaceable: bool,
 }
 
 // What leasing one of the set's articles does to its header probes.
@@ -71,6 +79,11 @@ impl DirectStoreAdmission {
                 .is_some_and(|frontier| frontier.file_id.file_index == file_index)
     }
 
+    // See the field.
+    pub(in crate::pipeline::download) fn unplaceable(&self) -> bool {
+        self.unplaceable
+    }
+
     // Charge an article the handout being built has just taken, so the
     // next one is admitted against what the set will hold with it.
     pub(in crate::pipeline::download) fn note_leased(&mut self, work: &DownloadWork) {
@@ -99,6 +112,38 @@ impl DirectStoreAdmission {
 }
 
 impl Pipeline {
+    // Hands over every set an admission pass found unplaceable, judged again
+    // now: the pass that noted the job cannot demote from where it runs.
+    //
+    // Demoting is what the set's scratch ceiling would end it with anyway, so
+    // it is demoted under that reason and keeps its holds exactly as it would
+    // then; doing it now is what keeps the rest of the set from being fetched
+    // one article at a time into holds that nothing left to arrive can place.
+    pub(in crate::pipeline) async fn settle_direct_unplaceable_sets(&mut self) {
+        let jobs = std::mem::take(&mut self.direct_store.unplaceable_verdicts);
+        for job_id in jobs {
+            let unplaceable: Vec<usize> = self
+                .direct_store_admission(job_id)
+                .into_iter()
+                .filter(DirectStoreAdmission::unplaceable)
+                .map(|set| set.set_index)
+                .collect();
+            for set_index in unplaceable {
+                warn!(
+                    job_id = job_id.0,
+                    set_index,
+                    "direct-store set cannot place its holds: its earliest unread volume has nothing left to arrive"
+                );
+                self.demote_direct_set(
+                    job_id,
+                    set_index,
+                    crate::pipeline::direct_store::router::DemotionReason::HoldsScratchCeiling,
+                )
+                .await;
+            }
+        }
+    }
+
     // Per-set disk retention is separate from shared RAM pressure. Include
     // arrivals already committed to the wire/decode pipeline before allowing
     // another article to start; work leased by the handout being built is
@@ -110,8 +155,9 @@ impl Pipeline {
         self.direct_store
             .sets_for(job_id)
             .iter()
-            .filter(|set| !set.is_demoted() && !set.is_finalized())
-            .map(|set| {
+            .enumerate()
+            .filter(|(_, set)| !set.is_demoted() && !set.is_finalized())
+            .map(|(set_index, set)| {
                 let files: HashSet<u32> = set.plan().files.keys().copied().collect();
                 let owns =
                     |file: NzbFileId| file.job_id == job_id && files.contains(&file.file_index);
@@ -180,20 +226,42 @@ impl Pipeline {
                     DirectHeaderProbe::Earliest => ProbeLease::CloseAll,
                     _ => ProbeLease::CloseFile,
                 };
+                // The volume a RAR set's layout waits on: the earliest whose
+                // headers are unread, whether or not anything of it is still to
+                // come, and only when every header is read, the earliest volume
+                // still owed an article. A later volume is never asked for past
+                // the room in its place: its bytes are placed through the
+                // volumes before it, so while one of those is unread they can
+                // only be held.
+                let earliest = matches!(set.header_probe(), DirectHeaderProbe::Earliest)
+                    .then(|| {
+                        set.plan()
+                            .volumes
+                            .iter()
+                            .filter(|(volume, file)| {
+                                unresolved(file) || set.router.volume_needs_header(**volume)
+                            })
+                            .min_by_key(|(volume, _)| {
+                                (!set.router.volume_needs_header(**volume), **volume)
+                            })
+                            .map(|(volume, file)| (*volume, *file))
+                    })
+                    .flatten();
+                // That volume's headers are unread and nothing of it is queued,
+                // retrying or in flight: no article the set could still be
+                // given would let a held byte place.
+                let header_unreachable = !busy
+                    && earliest.is_some_and(|(volume, file)| {
+                        set.router.volume_needs_header(volume) && !unresolved(&file)
+                    });
                 let probes = match set.header_probe() {
                     DirectHeaderProbe::Settled => Vec::new(),
                     DirectHeaderProbe::Earliest if busy => Vec::new(),
-                    DirectHeaderProbe::Earliest => set
-                        .plan()
-                        .volumes
-                        .iter()
+                    DirectHeaderProbe::Earliest => earliest
                         .filter(|(_, file)| unresolved(file))
-                        .min_by_key(|(volume, _)| {
-                            (!set.router.volume_needs_header(**volume), **volume)
-                        })
                         .and_then(|(_, file)| {
                             state.download_queue.peek_first_matching(|work| {
-                                work.segment_id.file_id.file_index == *file
+                                work.segment_id.file_id.file_index == file
                             })
                         })
                         .map(|work| vec![work.segment_id])
@@ -271,8 +339,11 @@ impl Pipeline {
                 // is asked for. With nothing of the set in flight, the lowest
                 // article still queued in the earliest unfinished volume is
                 // the earliest byte the set lacks; while that volume has a
-                // retry pending, the retry is, and the set waits for it.
-                let frontier = (matches!(set.header_probe(), DirectHeaderProbe::Settled)
+                // retry pending, the retry is, and the set waits for it. A RAR
+                // set whose unread header cannot arrive has no probe left, so
+                // it moves the same way, held to its own room.
+                let frontier = ((matches!(set.header_probe(), DirectHeaderProbe::Settled)
+                    || header_unreachable)
                     && !busy
                     && rooms.shared < rooms.own)
                     .then(|| {
@@ -296,8 +367,25 @@ impl Pipeline {
                             .peek_lowest_matching(|work| work.segment_id.file_id.file_index == file)
                             .map(|work| work.segment_id)
                     });
+                // With no probe to resolve the layout, the set's own room is all
+                // that can admit it, and once no queued article of the set fits
+                // that room the set can neither place nor hold anything more.
+                let unplaceable = header_unreachable
+                    && files
+                        .iter()
+                        .filter_map(|file_index| {
+                            state
+                                .download_queue
+                                .min_queued_byte_estimate_for_file(NzbFileId {
+                                    job_id,
+                                    file_index: *file_index,
+                                })
+                        })
+                        .min()
+                        .is_some_and(|smallest| u64::from(smallest) > rooms.own);
                 DirectStoreAdmission {
                     job_id,
+                    set_index,
                     files,
                     room,
                     own_room: rooms.own,
@@ -307,6 +395,7 @@ impl Pipeline {
                     probes,
                     probe_lease,
                     frontier,
+                    unplaceable,
                 }
             })
             .collect()

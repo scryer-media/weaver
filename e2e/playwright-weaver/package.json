@@ -16,6 +16,7 @@
     "test:proxy-routing": "playwright test tests/proxy-routing.spec.ts",
     "test:encryption-key-lifecycle": "playwright test tests/encryption-key-lifecycle.spec.ts",
     "test:duplicate-and-queue-policy": "playwright test tests/duplicate-and-queue-policy.spec.ts",
+    "test:queue-state-and-control": "playwright test tests/queue-state-and-control.spec.ts",
     "test:advanced-networking": "playwright test tests/network- --grep-invert \"@no-net-raw|@extended\"",
     "test:advanced-networking-egress": "playwright test tests/network-egress.spec.ts tests/network-legs.spec.ts tests/network-reload.spec.ts --grep-invert \"@no-net-raw|@extended\"",
     "test:advanced-networking-egress-restarted": "playwright test tests/network-egress.spec.ts tests/network-reload.spec.ts --grep @restart --grep-invert \"@no-net-raw|@extended\"",

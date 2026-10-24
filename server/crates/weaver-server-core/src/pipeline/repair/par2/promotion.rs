@@ -182,38 +182,40 @@ impl Pipeline {
             })
     }
 
-    pub(super) fn jobs_fetching_repair_data(&self) -> HashSet<JobId> {
-        let mut fetching = self
-            .jobs
-            .iter()
-            .filter_map(|(job_id, state)| {
-                state
-                    .download_queue
-                    .has_completion_critical_work()
-                    .then_some(*job_id)
+    fn job_fetching_repair_data(&self, job_id: JobId) -> bool {
+        self.jobs
+            .get(&job_id)
+            .is_some_and(|state| state.download_queue.has_completion_critical_work())
+            || self
+                .pending_retries_by_segment
+                .keys()
+                .any(|id| id.file_id.job_id == job_id && self.segment_is_completion_critical(*id))
+            || self.pending_decode.iter().any(|work| {
+                work.segment_id.file_id.job_id == job_id
+                    && self.segment_is_completion_critical(work.segment_id)
             })
-            .collect::<HashSet<_>>();
-        for segment_id in self.pending_retries_by_segment.keys() {
-            if self.segment_is_completion_critical(*segment_id) {
-                fetching.insert(segment_id.file_id.job_id);
-            }
-        }
-        for work in &self.pending_decode {
-            if self.segment_is_completion_critical(work.segment_id) {
-                fetching.insert(work.segment_id.file_id.job_id);
-            }
-        }
-        for file_id in self.active_downloads_by_file.keys() {
-            if self.file_is_completion_critical(*file_id) {
-                fetching.insert(file_id.job_id);
-            }
-        }
-        for file_id in self.active_decodes_by_file.keys() {
-            if self.file_is_completion_critical(*file_id) {
-                fetching.insert(file_id.job_id);
-            }
-        }
-        fetching
+            || self
+                .active_downloads_by_file
+                .keys()
+                .chain(self.active_decodes_by_file.keys())
+                .any(|id| id.job_id == job_id && self.file_is_completion_critical(*id))
+    }
+
+    // Every payload article is in: nothing ordinary is queued, retrying or
+    // out on a lane, so whatever the job still fetches is recovery.
+    fn job_payload_fetched(&self, job_id: JobId) -> bool {
+        self.jobs_finalizing_download.contains(&job_id)
+            || (self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| !state.download_queue.has_noncritical_work())
+                && !self.pending_retries_by_segment.keys().any(|id| {
+                    id.file_id.job_id == job_id && !self.segment_is_completion_critical(*id)
+                })
+                && !self
+                    .active_downloads_by_file
+                    .keys()
+                    .any(|id| id.job_id == job_id && !self.file_is_completion_critical(*id)))
     }
 
     pub(super) fn loaded_recovery_file_indices(&self, job_id: JobId) -> HashSet<u32> {
@@ -898,6 +900,7 @@ impl Pipeline {
             let mut work = segments
                 .into_iter()
                 .map(|segment| DownloadWork {
+                    counters: None,
                     segment_id: SegmentId {
                         file_id: NzbFileId { job_id, file_index },
                         segment_number: segment.ordinal,
@@ -1354,153 +1357,108 @@ impl Pipeline {
         moved_segments
     }
 
-    // List the jobs still in the pipeline, without history.
-    pub(crate) fn list_live_jobs(&self) -> Vec<JobInfo> {
-        let mut list = Vec::with_capacity(self.jobs.len());
-        let mut seen = HashSet::with_capacity(self.jobs.len());
-        let jobs_fetching_repair_data = self.jobs_fetching_repair_data();
-
-        let mut push_state = |state: &JobState| {
-            let total = state.spec.total_bytes;
-            let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-                state.assembly.optional_recovery_bytes();
-            let health = health_milli(total, state.failed_bytes);
-            let native_verifying = self.show_par3_verification_wait(state.job_id);
-            let status = if native_verifying {
-                JobStatus::Verifying
-            } else if self.awaiting_queue_script_barrier(state.job_id)
-                && state.status == JobStatus::Downloading
-            {
-                // The download is complete; its queue scripts are being admitted.
-                JobStatus::AwaitingQueueScripts
-            } else {
-                state.status.clone()
-            };
-            let (mut download_state, post_state, run_state) =
-                crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
-            if matches!(download_state, crate::jobs::model::DownloadState::Complete)
-                && self.job_has_current_download_activity(state.job_id)
-            {
-                download_state = crate::jobs::model::DownloadState::Downloading;
-            }
-            let remaining_par_files = state
-                .assembly
-                .files()
-                .filter(|file| {
-                    matches!(
-                        file.role(),
-                        weaver_model::files::FileRole::Par2 {
-                            is_index: false,
-                            ..
-                        }
-                    ) && !file.is_complete()
-                })
-                .count() as u32;
-            let download_wait = self.download_wait_by_job.get(&state.job_id);
-            let propagation_retry_at = self
-                .propagation_ready_at
-                .get(&state.job_id)
-                .filter(|(deadline, _)| *deadline > Instant::now())
-                .filter(|_| matches!(state.status, JobStatus::Queued | JobStatus::Downloading))
-                .map(|(_, retry_at_epoch_ms)| *retry_at_epoch_ms as f64);
-            if propagation_retry_at.is_some() {
-                download_state = crate::jobs::model::DownloadState::Queued;
-            }
-            list.push(JobInfo {
-                job_id: state.job_id,
-                job_hash: Some(state.job_hash),
-                name: state.spec.name.clone(),
-                error: if let JobStatus::Failed { error } = &state.status {
-                    Some(error.clone())
-                } else if self.blocked_restores.contains_key(&state.job_id) {
-                    state.failure_error.clone()
-                } else {
-                    None
-                },
-                download_wait_reason: propagation_retry_at
-                    .map(|_| crate::jobs::handle::PROPAGATION_WAIT_REASON.to_owned())
-                    .or_else(|| download_wait.map(|wait| wait.reason.to_owned())),
-                download_retry_at_epoch_ms: propagation_retry_at
-                    .or_else(|| download_wait.and_then(|wait| wait.retry_at_epoch_ms)),
-                status,
-                download_state,
-                finalizing_download: !native_verifying
-                    && self.jobs_finalizing_download.contains(&state.job_id),
-                fetching_repair_data: !native_verifying
-                    && jobs_fetching_repair_data.contains(&state.job_id),
-                post_state,
-                run_state,
-                progress: Self::effective_progress(state),
-                total_bytes: total,
-                downloaded_bytes: Self::effective_downloaded_bytes(state),
-                optional_recovery_bytes,
-                optional_recovery_downloaded_bytes,
-                phase_progress: self
-                    .phase_progress_snapshots
-                    .get(&state.job_id)
-                    .cloned()
-                    .unwrap_or_default(),
-                failed_bytes: state.failed_bytes,
-                health,
-                terminal_discards: Vec::new(),
-                total_files: self.blocked_restores.get(&state.job_id).map_or_else(
-                    || state.assembly.total_file_count() as u32,
-                    |request| request.spec.files.len() as u32,
-                ),
-                completed_files: self.blocked_restores.get(&state.job_id).map_or_else(
-                    || state.assembly.complete_file_count() as u32,
-                    |request| {
-                        request
-                            .complete_files
-                            .iter()
-                            .filter(|file| {
-                                file.job_id == state.job_id
-                                    && (file.file_index as usize) < request.spec.files.len()
-                            })
-                            .count() as u32
-                    },
-                ),
-                remaining_par_files,
-                password: state.spec.password.clone(),
-                category: state.spec.category.clone(),
-                metadata: state.spec.metadata.clone(),
-                output_dir: Some(state.working_dir.display().to_string()),
-                server_attribution: state.server_attribution.contributions().to_vec(),
-                created_at_epoch_ms: state.created_at_epoch_ms,
-            });
+    // Build a report for the one job whose stage changed.
+    pub(crate) fn job_report(&self, job_id: JobId) -> Option<JobInfo> {
+        let state = self.jobs.get(&job_id)?;
+        if is_terminal_status(&state.status) {
+            return None;
+        }
+        let total = state.spec.total_bytes;
+        let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
+            state.assembly.optional_recovery_bytes();
+        let health = health_milli(total, state.failed_bytes);
+        let native_verifying = self.show_par3_verification_wait(state.job_id);
+        let status = if native_verifying {
+            JobStatus::Verifying
+        } else if self.awaiting_queue_script_barrier(state.job_id)
+            && state.status == JobStatus::Downloading
+        {
+            // The download is complete; its queue scripts are being admitted.
+            JobStatus::AwaitingQueueScripts
+        } else {
+            state.status.clone()
         };
-
-        for job_id in &self.job_order {
-            let Some(state) = self.jobs.get(job_id) else {
-                continue;
-            };
-            if is_terminal_status(&state.status) || !seen.insert(*job_id) {
-                continue;
-            }
-            push_state(state);
-        }
-
-        let mut unordered: Vec<&JobState> = self
-            .jobs
-            .values()
-            .filter(|state| !is_terminal_status(&state.status) && !seen.contains(&state.job_id))
-            .collect();
-        unordered.sort_by(|left, right| {
-            left.created_at_epoch_ms
-                .total_cmp(&right.created_at_epoch_ms)
-        });
-        for state in unordered {
-            push_state(state);
-        }
-
-        list
+        let (download_state, post_state, run_state) =
+            crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
+        let remaining_par_files = state
+            .assembly
+            .files()
+            .filter(|file| {
+                matches!(
+                    file.role(),
+                    weaver_model::files::FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                ) && !file.is_complete()
+            })
+            .count() as u32;
+        let download_wait = self.download_wait_by_job.get(&state.job_id);
+        Some(JobInfo {
+            job_id: state.job_id,
+            job_hash: Some(state.job_hash),
+            name: state.spec.name.clone(),
+            error: if let JobStatus::Failed { error } = &state.status {
+                Some(error.clone())
+            } else if self.blocked_restores.contains_key(&state.job_id) {
+                state.failure_error.clone()
+            } else {
+                None
+            },
+            download_wait_reason: download_wait
+                .map(|wait| wait.reason)
+                .or_else(|| self.job_dispatch_hold_reason(state.job_id))
+                .map(str::to_owned),
+            download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
+            status,
+            download_state,
+            finalizing_download: !native_verifying
+                && self.jobs_finalizing_download.contains(&state.job_id),
+            fetching_repair_data: !native_verifying
+                && self.job_fetching_repair_data(state.job_id)
+                && self.job_payload_fetched(state.job_id),
+            post_state,
+            run_state,
+            progress: Self::effective_progress(state),
+            total_bytes: total,
+            downloaded_bytes: Self::effective_downloaded_bytes(state),
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
+            phase_progress: Vec::new(),
+            failed_bytes: state.failed_bytes,
+            health,
+            terminal_discards: Vec::new(),
+            total_files: self.blocked_restores.get(&state.job_id).map_or_else(
+                || state.assembly.total_file_count() as u32,
+                |request| request.spec.files.len() as u32,
+            ),
+            completed_files: self.blocked_restores.get(&state.job_id).map_or_else(
+                || state.assembly.complete_file_count() as u32,
+                |request| {
+                    request
+                        .complete_files
+                        .iter()
+                        .filter(|file| {
+                            file.job_id == state.job_id
+                                && (file.file_index as usize) < request.spec.files.len()
+                        })
+                        .count() as u32
+                },
+            ),
+            remaining_par_files,
+            password: state.spec.password.clone(),
+            category: state.spec.category.clone(),
+            metadata: state.spec.metadata.clone(),
+            output_dir: Some(state.working_dir.display().to_string()),
+            server_attribution: state.server_attribution.contributions().to_vec(),
+            created_at_epoch_ms: state.created_at_epoch_ms,
+        })
     }
 
     // List all jobs: the live ones, then history.
     #[cfg(test)]
     pub(crate) fn list_jobs(&self) -> Vec<JobInfo> {
-        let mut list = self.list_live_jobs();
-        list.extend(self.finished_jobs.iter().cloned());
-        list
+        self.report_all_for_test();
+        self.shared_state.list_jobs()
     }
 }

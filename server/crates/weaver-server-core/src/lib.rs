@@ -3,6 +3,7 @@
 
 // Tests dial their own loopback fixtures.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
+#![deny(clippy::await_holding_lock)]
 
 pub mod application_upgrade;
 pub mod auth;
@@ -54,8 +55,8 @@ pub use jobs::{
     HistoryDeleteBatchOutcome, HistoryDeleteOutcome, JobFingerprint, JobId, JobInfo, JobPhase,
     JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId, NntpRuntimeActivation,
     NzbFileId, PhaseCounters, PostState, QueueMoveTarget, RecoveredJob, RestoreJobRequest,
-    RunState, SchedulerCommand, SchedulerError, SchedulerHandle, SegmentId, SegmentSpec,
-    SemanticCandidateSnapshot, SemanticCandidateSource, SemanticCandidateState, SemanticDuplicate,
+    RunState, SchedulerError, SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot,
+    SemanticCandidateSource, SemanticCandidateState, SemanticDuplicate,
     SemanticDuplicateLifecycleEvent, SemanticPromotionClaim, SemanticPromotionState,
     SemanticTerminalCause, ServerId, ServerTransportHealth, SharedPipelineState, SubmissionOrigin,
     classify_semantic_terminal_cause, derive_legacy_job_status, epoch_ms_now,

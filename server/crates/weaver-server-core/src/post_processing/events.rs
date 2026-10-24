@@ -1835,8 +1835,8 @@ pub(crate) async fn hold_test_event_queue(db: &Database) -> tokio::sync::MutexGu
 // Returns once `done` holds, re-checking it on every script-state change. The
 // change is armed before each check, so one landing between the check and the
 // wait is not missed.
-#[cfg(test)]
-pub(crate) async fn wait_for_test_script_change(db: &Database, mut done: impl FnMut() -> bool) {
+#[cfg(any(test, feature = "test-support"))]
+pub async fn wait_for_test_script_change(db: &Database, mut done: impl FnMut() -> bool) {
     loop {
         let changed = db.script_runtime.changed.notified();
         tokio::pin!(changed);
@@ -1848,8 +1848,8 @@ pub(crate) async fn wait_for_test_script_change(db: &Database, mut done: impl Fn
     }
 }
 
-#[cfg(test)]
-pub(crate) fn hold_test_event_run(db: &Database, job_id: u64, run_id: &str) -> impl Drop + use<> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn hold_test_event_run(db: &Database, job_id: u64, run_id: &str) -> impl Drop + use<> {
     let (cancel, _receiver) = watch::channel(false);
     db.script_runtime
         .cancellations

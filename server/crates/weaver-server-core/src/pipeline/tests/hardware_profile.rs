@@ -52,19 +52,21 @@ async fn pipeline_on_twelve_cores(temp_dir: &TempDir) -> Pipeline {
 }
 
 async fn choose(pipeline: &mut Pipeline, profile: HardwareProfile) {
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetHardwareProfile { profile, reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_hardware_profile(profile)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
 }
 
 async fn schedule(pipeline: &mut Pipeline, profile: Option<HardwareProfile>) {
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetScheduledHardwareProfile { profile, reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_scheduled_hardware_profile(profile)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
 }
 
 // Everything a profile decides, as the next activity would find it.
@@ -156,30 +158,26 @@ async fn a_scheduled_profile_overrides_the_choice_until_the_schedule_lets_go() {
 
     // A scheduled speed limit is a separate track the profile rule must not
     // end.
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: crate::bandwidth::ScheduleAction::SpeedLimit {
-                limits: vec![crate::bandwidth::SpeedLimitChange {
-                    target: crate::bandwidth::SpeedTarget::Global,
-                    bytes_per_sec: 128 * 1024,
-                }],
-            },
-            reply,
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .apply_schedule_action(crate::bandwidth::ScheduleAction::SpeedLimit {
+            limits: vec![crate::bandwidth::SpeedLimitChange {
+                target: crate::bandwidth::SpeedTarget::Global,
+                bytes_per_sec: 128 * 1024,
+            }],
         })
-        .await;
-    received.await.unwrap();
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
 
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: crate::bandwidth::ScheduleAction::HardwareProfile {
-                profile: HardwareProfile::Efficient,
-            },
-            reply,
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .apply_schedule_action(crate::bandwidth::ScheduleAction::HardwareProfile {
+            profile: HardwareProfile::Efficient,
         })
-        .await;
-    received.await.unwrap();
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
 
     assert_limits_of(&pipeline, HardwareProfile::Efficient);
     assert_eq!(

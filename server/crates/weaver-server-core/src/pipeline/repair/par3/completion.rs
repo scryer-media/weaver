@@ -588,7 +588,7 @@ impl Pipeline {
                             .unwrap_or(u32::MAX),
                     }
                 };
-                let _ = self.event_tx.send(event);
+                self.emit_job_event(event);
                 self.note_par3_superseded_sources(job_id, &report.installed)
                     .await;
                 self.release_direct_unpack_after_repair(job_id);

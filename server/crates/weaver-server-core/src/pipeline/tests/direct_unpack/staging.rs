@@ -342,7 +342,8 @@ async fn arming_does_not_open_part_one_before_its_header_is_committed() {
 
     let files = sevenz_fixture_bytes(set_name);
     assert!(files.len() > 2, "the fixture needs two later parts");
-    let spec = rar_job_spec("Amber Lantern Split", &files);
+    let mut spec = rar_job_spec("Amber Lantern Split", &files);
+    split_first_article(&mut spec, 0, 64);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
     let part_one = working_dir.join(&files[0].0);
@@ -361,7 +362,8 @@ async fn arming_does_not_open_part_one_before_its_header_is_committed() {
     );
 
     // Once the header is committed the next completion reads it and arms.
-    pipeline.pending_file_progress.insert(
+    commit_first_article(
+        &mut pipeline,
         NzbFileId {
             job_id,
             file_index: 0,

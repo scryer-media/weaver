@@ -1025,13 +1025,35 @@ impl Pipeline {
                     self.persisted_file_progress.insert(file_id, plan.len);
                 }
             } else if floor > 0 {
-                // A partial volume persists only a contiguous, segment-aligned
-                // floor. `note_file_progress_floor` suppresses direct source
-                // files, and this one still is one until the set's status is
-                // read again — so the upsert goes straight to the batch the
-                // flush drains, which is the same row `coverage_skip_plan` and
-                // `segments_covered_by_floor` read back at restart.
-                self.pending_file_progress.insert(file_id, floor);
+                // A partial volume persists the articles the sweep verified on
+                // disk as its coverage row. `note_file_coverage` suppresses
+                // direct source files, and this one still is one until the
+                // set's status is read again; nor has the assembly taken these
+                // articles yet. So the row is written from the sweep's own
+                // extents, the same row the restore reads back.
+                let coverage = crate::jobs::assembly::FileCoverage::from_ordered_runs(
+                    keep.get(file_index)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|ordinal| {
+                            extents.get(ordinal).map(|&(offset, len)| {
+                                crate::jobs::assembly::CoverageRun {
+                                    first_ordinal: *ordinal,
+                                    ordinals: 1,
+                                    start: offset,
+                                    end: offset.saturating_add(len),
+                                }
+                            })
+                        }),
+                );
+                let row = vec![crate::jobs::record::ActiveFileProgress {
+                    job_id,
+                    file_index: *file_index,
+                    coverage,
+                }];
+                if let Err(error) = self.queue_file_progress_batch(row) {
+                    warn!(job_id = job_id.0, file_index, error = %error, "failed to queue reconstructed volume coverage");
+                }
             }
             // Awaited, not fire-and-forget: the volume is about to be
             // dispatched and written conventionally, and until this floor is
@@ -1353,6 +1375,7 @@ impl Pipeline {
                         continue;
                     }
                     work.push(DownloadWork {
+                        counters: None,
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
                         groups: std::sync::Arc::from(file.groups.as_slice()),
@@ -1468,6 +1491,7 @@ impl Pipeline {
                         continue;
                     }
                     work.push(DownloadWork {
+                        counters: None,
                         segment_id,
                         message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
                         groups: std::sync::Arc::from(file.groups.as_slice()),

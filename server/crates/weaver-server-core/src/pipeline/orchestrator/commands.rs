@@ -4,710 +4,174 @@
 use super::*;
 
 impl Pipeline {
-    pub(crate) async fn handle_command(&mut self, cmd: SchedulerCommand) {
-        match cmd {
-            SchedulerCommand::AddJob {
-                job_id,
-                spec,
-                nzb_path,
-                nzb_zstd,
-                options,
-                reply,
-            } => {
-                let result = self
-                    .add_job(job_id, spec, nzb_path, nzb_zstd, options)
-                    .await;
-                if result.is_ok() {
-                    self.publish_snapshot();
-                }
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::RestoreJob { request, reply } => {
-                let result = self.restore_job(*request).await;
-                if result.is_ok() {
-                    self.publish_snapshot();
-                }
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::PauseJob { job_id, reply } => {
-                let result = self.pause_job_runtime(job_id);
-                if result.is_ok() {
-                    self.publish_snapshot();
-                    self.emit_download_finished_if_active(job_id);
-                    let _ = self.event_tx.send(PipelineEvent::JobPaused { job_id });
-                }
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::ResumeJob { job_id, reply } => {
-                let result = self.resume_restored_job(job_id).await;
-                if result.is_ok() {
-                    self.publish_snapshot();
-                    let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
-                }
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::CancelJobs {
-                job_ids,
-                origin,
-                reply,
-            } => {
-                self.start_cancel_jobs(job_ids, origin, reply);
-            }
-            SchedulerCommand::UpdateJob {
-                job_id,
-                update,
-                reply,
-            } => {
-                let result = if let Some(state) = self.jobs.get_mut(&job_id) {
-                    update.apply_to_spec(&mut state.spec);
-                    let mut update = update;
-                    if update.name.is_some() {
-                        // The new name lives in the metadata, so the metadata
-                        // write carries it.
-                        update.metadata =
-                            crate::jobs::FieldUpdate::Set(state.spec.metadata.clone());
-                        self.rederive_unwritten_working_dir(job_id);
-                    }
-                    // Ordered writer queue, not fire-and-forget: category/metadata
-                    // are last-write-wins columns, so two quick UpdateJob calls
-                    // must persist in order to avoid a stale restored value.
-                    if let Err(e) =
-                        self.db
-                            .try_queue_job_write(job_id, "update_active_job", move |db| {
-                                db.update_active_job(job_id, &update)
-                            })
-                    {
-                        error!(error = %e, "failed to queue UpdateJob write");
-                    }
-                    self.publish_snapshot();
-                    Ok(())
-                } else {
-                    Err(crate::SchedulerError::JobNotFound(job_id))
-                };
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::UpdateHistory {
-                job_id,
-                update,
-                reply,
-            } => {
-                if self
-                    .jobs
-                    .get(&job_id)
-                    .is_some_and(|state| !is_terminal_status(&state.status))
-                {
-                    let _ = reply.send(Err(crate::SchedulerError::Conflict(
-                        "the job is still in the queue".into(),
-                    )));
-                    return;
-                }
-                let row_update = update.clone();
-                let result = self
-                    .db_blocking(move |db| db.update_job_history_fields(job_id.0, &row_update))
-                    .await;
-                let result = match result {
-                    Ok(mut found) => {
-                        if let Some(job) = self
-                            .finished_jobs
-                            .iter_mut()
-                            .find(|job| job.job_id == job_id)
-                        {
-                            found = true;
-                            let mut spec_fields =
-                                (job.name.clone(), job.category.clone(), job.metadata.clone());
-                            apply_history_update(&update, &mut spec_fields);
-                            (job.name, job.category, job.metadata) = spec_fields;
-                        }
-                        if found {
-                            self.publish_snapshot();
-                            Ok(())
-                        } else {
-                            Err(crate::SchedulerError::JobNotFound(job_id))
-                        }
-                    }
-                    Err(error) => Err(crate::SchedulerError::State(error)),
-                };
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::ReorderJob {
-                job_id,
-                target,
-                reply,
-            } => {
-                let result =
-                    if self.jobs.contains_key(&job_id) {
-                        crate::jobs::handle::splice_job_order(&mut self.job_order, job_id, target)
-                            .map(|moved| {
-                                if !moved {
-                                    return;
-                                }
-                                // Persist the whole (small) order so restore can
-                                // sort by queue_position and reproduce it exactly.
-                                let positions: Vec<(JobId, i64)> = self
-                                    .job_order
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(index, id)| (*id, index as i64))
-                                    .collect();
-                                if let Err(e) = self.db.try_queue_write(
-                                    "update_active_job_queue_positions",
-                                    move |db| db.update_active_job_queue_positions(&positions),
-                                ) {
-                                    error!(error = %e, "failed to queue ReorderJob write");
-                                }
-                                self.publish_snapshot();
-                            })
-                    } else {
-                        Err(crate::SchedulerError::JobNotFound(job_id))
-                    };
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::ReorderJobs { moves, reply } => {
-                // All-or-nothing: if any job id is unknown, apply nothing so
-                // the facade can map JobNotFound -> false without a partially
-                // applied batch.
-                let unknown_job = moves
-                    .iter()
-                    .map(|(job_id, _)| *job_id)
-                    .find(|job_id| !self.jobs.contains_key(job_id));
-                let result = if let Some(job_id) = unknown_job {
-                    Err(crate::SchedulerError::JobNotFound(job_id))
-                } else {
-                    let mut any_moved = false;
-                    for (job_id, target) in moves {
-                        match crate::jobs::handle::splice_job_order(
-                            &mut self.job_order,
-                            job_id,
-                            target,
-                        ) {
-                            Ok(moved) => any_moved |= moved,
-                            Err(e) => {
-                                // Every id was verified present in `self.jobs`
-                                // above, so this would only fire on an
-                                // internal inconsistency between `self.jobs`
-                                // and `self.job_order`. Log and keep applying
-                                // the remaining moves rather than aborting
-                                // the whole batch partway through.
-                                error!(
-                                    job_id = job_id.0,
-                                    error = %e,
-                                    "reorder_jobs: job missing from manual order despite presence check"
-                                );
-                            }
-                        }
-                    }
-                    if any_moved {
-                        // Persist the whole (small) order ONCE for the batch —
-                        // not once per move — so restore can sort by
-                        // queue_position and reproduce it exactly.
-                        let positions: Vec<(JobId, i64)> = self
-                            .job_order
-                            .iter()
-                            .enumerate()
-                            .map(|(index, id)| (*id, index as i64))
-                            .collect();
-                        if let Err(e) = self
-                            .db
-                            .try_queue_write("update_active_job_queue_positions", move |db| {
-                                db.update_active_job_queue_positions(&positions)
-                            })
-                        {
-                            error!(error = %e, "failed to queue ReorderJobs write");
-                        }
-                        self.publish_snapshot();
-                    }
-                    Ok(())
-                };
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::SetSpeedTestPause { paused, reply } => {
-                self.shared_state.set_speed_test_paused(paused);
-                if paused {
-                    self.download_restart_durable_lead_retry_after.clear();
-                }
-                self.publish_download_block();
-                let _ = self.event_tx.send(if self.shared_state.is_paused() {
-                    PipelineEvent::GlobalPaused
-                } else {
-                    PipelineEvent::GlobalResumed
-                });
-                let _ = reply.send(());
-            }
-            SchedulerCommand::PauseAll { reply } => {
-                self.download_dispatch_stall = None;
-                self.global_paused = true;
-                self.scheduled_pause = false;
-                self.download_restart_durable_lead_retry_after.clear();
-                self.shared_state.set_paused(true);
-                self.shared_state.set_download_block(
-                    self.bandwidth_ledger
-                        .to_download_block_state(self.global_pause()),
-                );
-                if let Err(e) = self
-                    .db_blocking(move |db| db.set_setting("global_paused", "true"))
-                    .await
-                {
-                    error!(error = %e, "db write failed for PauseAll");
-                }
-                let _ = self.event_tx.send(PipelineEvent::GlobalPaused);
-                let _ = reply.send(());
-            }
-            SchedulerCommand::ResumeAll { reply } => {
-                self.download_dispatch_stall = None;
-                self.global_paused = false;
-                self.scheduled_pause = false;
-                self.shared_state.set_paused(false);
-                self.publish_download_block();
-                if let Err(e) = self
-                    .db_blocking(move |db| db.set_setting("global_paused", "false"))
-                    .await
-                {
-                    error!(error = %e, "db write failed for ResumeAll");
-                }
-                let _ = self.event_tx.send(if self.shared_state.is_paused() {
-                    PipelineEvent::GlobalPaused
-                } else {
-                    PipelineEvent::GlobalResumed
-                });
-                let _ = reply.send(());
-            }
-            SchedulerCommand::PausePostProcessing { reply }
-            | SchedulerCommand::ApplyScheduleAction {
-                action: crate::bandwidth::ScheduleAction::PausePostProcessing,
-                reply,
-            } => {
-                self.terminal_post_processing_executor.pause();
-                self.shared_state.set_post_processing_paused(true);
-                if let Some(runtime) = self.par3_runtime.as_mut() {
-                    runtime.admission_paused = true;
-                }
-                let _ = reply.send(());
-            }
-            SchedulerCommand::ResumePostProcessing { reply }
-            | SchedulerCommand::ApplyScheduleAction {
-                action: crate::bandwidth::ScheduleAction::ResumePostProcessing,
-                reply,
-            } => {
-                if !self.shared_state.is_post_processing_paused() {
-                    let _ = reply.send(());
-                    return;
-                }
-                self.terminal_post_processing_executor.resume();
-                self.shared_state.set_post_processing_paused(false);
-                if let Some(runtime) = self.par3_runtime.as_mut() {
-                    runtime.admission_paused = false;
-                    if let Err(error) = runtime.dispatch() {
-                        error!(%error, "PAR3 dispatch failed on post-processing resume");
-                    }
-                }
-                let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
-                for job_id in deferred_moves {
-                    if self.jobs.get(&job_id).is_some_and(|state| {
-                        !matches!(
-                            state.status,
-                            JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
-                        )
-                    }) && let Err(error) = self.start_move_to_complete(job_id).await
-                    {
-                        self.fail_job(job_id, error);
-                    }
-                }
-                self.promote_queued_repairs();
-                self.promote_queued_extractions();
-                let jobs: Vec<_> = self.deferred_post_processing.drain().collect();
-                for job_id in jobs {
-                    let Some(state) = self.jobs.get(&job_id) else {
-                        continue;
-                    };
-                    let files: Vec<_> = state.assembly.files().map(|file| file.file_id()).collect();
-                    for file_id in files {
-                        self.try_arm_direct_unpack_for_file(job_id, file_id);
-                    }
-                    self.try_rar_extraction(job_id).await;
-                    self.schedule_job_completion_check(job_id);
-                }
-                let _ = reply.send(());
-            }
-            SchedulerCommand::CancelPostProcessing { job_id, reply } => {
-                let pipeline_cancelled = self
-                    .terminal_post_processing_cancellations
-                    .get(&job_id)
-                    .is_some_and(|sender| sender.send(true).is_ok());
-                let executor_cancelled =
-                    self.terminal_post_processing_executor.cancel_job(job_id.0);
-                let result = (pipeline_cancelled || executor_cancelled)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        crate::SchedulerError::Conflict(format!(
-                            "job {} has no queued or active post-processing attempt",
-                            job_id.0
-                        ))
-                    });
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::SetSpeedLimit {
-                bytes_per_sec,
-                replaces_schedule,
-                reply,
-            } => {
-                self.configured_rate_limit = bytes_per_sec;
-                if replaces_schedule && self.scheduled_rate_limit.take().is_some() {
-                    // The schedule's rate gives way until its next rule fires.
-                    self.publish_download_block();
-                    info!(bytes_per_sec, "speed limit set over the scheduled one");
-                }
-                if self.scheduled_rate_limit.is_none() {
-                    self.rate_limiter.set_rate(bytes_per_sec);
-                }
-                let _ = reply.send(());
-            }
-            SchedulerCommand::SetPropagationDelay { seconds, reply } => {
-                let delay = Duration::from_secs(u64::from(seconds));
-                if self.propagation_delay != delay {
-                    self.propagation_delay = delay;
-                    self.propagation_ready_at.clear();
-                    self.dispatch_downloads();
-                    self.publish_snapshot();
-                }
-                let _ = reply.send(());
-            }
-            // Profile commands use the profile activation path.
-            SchedulerCommand::ApplyScheduleAction {
-                action: crate::bandwidth::ScheduleAction::HardwareProfile { profile },
-                reply,
-            } => {
-                self.set_scheduled_hardware_profile(Some(profile));
-                let _ = reply.send(());
-            }
-            SchedulerCommand::ApplyScheduleAction { action, reply } => {
-                use crate::bandwidth::ScheduleAction;
-                match action {
-                    ScheduleAction::Pause | ScheduleAction::PauseAll => {
-                        self.global_paused = true;
-                        self.scheduled_pause = true;
-                        self.shared_state.set_paused(true);
-                        // The Scheduled kind now falls out of global_pause(), so
-                        // any later block-state refresh keeps reporting it
-                        // instead of reclassifying the pause as manual.
-                        self.publish_download_block();
-                        info!("schedule: paused downloads");
-                    }
-                    ScheduleAction::Resume => {
-                        self.global_paused = false;
-                        self.scheduled_pause = false;
-                        self.shared_state.set_paused(false);
-                        self.publish_download_block();
-                        info!("schedule: resumed downloads");
-                    }
-                    ScheduleAction::SpeedLimit { limits } => {
-                        // Only the global limit lives here; an egress or
-                        // provider limit is that holder's own rate.
-                        match limits
-                            .iter()
-                            .rev()
-                            .find(|limit| limit.target == crate::bandwidth::SpeedTarget::Global)
-                        {
-                            Some(limit) => {
-                                let bytes_per_sec = limit.bytes_per_sec;
-                                self.scheduled_rate_limit = Some(bytes_per_sec);
-                                self.rate_limiter.set_rate(bytes_per_sec);
-                                let mut block = self
-                                    .bandwidth_ledger
-                                    .to_download_block_state(self.global_pause());
-                                block.scheduled_speed_limit = bytes_per_sec;
-                                self.shared_state.set_download_block(block);
-                                info!(bytes_per_sec, "schedule: set speed limit");
-                            }
-                            None => warn!(
-                                ?limits,
-                                "an egress or provider speed limit reached download pipeline"
-                            ),
-                        }
-                    }
-                    ScheduleAction::SetQuotaMetering { enabled, target } => {
-                        // Metering off suspends an egress's download quota:
-                        // bytes still reach the ledger, tagged unmetered, but
-                        // that egress does not count them or refuse work.
-                        match target {
-                            crate::bandwidth::QuotaTarget::AllEgresses => {
-                                self.bandwidth_ledger.set_metering_enabled(enabled);
-                                if let Some(policy) = self.shared_state.server_transfer_policy() {
-                                    policy.set_egress_quota_metering(enabled);
-                                }
-                            }
-                            crate::bandwidth::QuotaTarget::Egress(egress_id) => {
-                                if let Some(policy) = self.shared_state.server_transfer_policy() {
-                                    policy.set_one_egress_quota_metering(egress_id, enabled);
-                                }
-                            }
-                        }
-                        self.publish_download_block();
-                    }
-                    ScheduleAction::PauseWatchFolderScanning
-                    | ScheduleAction::ResumeWatchFolderScanning
-                    | ScheduleAction::PauseRss
-                    | ScheduleAction::ResumeRss
-                    | ScheduleAction::SetServerActive { .. }
-                    | ScheduleAction::PruneHistory { .. } => {
-                        self.publish_download_block();
-                        warn!(
-                            action = ?action,
-                            "service schedule action reached download pipeline"
-                        );
-                    }
-                    // Taken by the arm above.
-                    ScheduleAction::HardwareProfile { .. }
-                    | ScheduleAction::PausePostProcessing
-                    | ScheduleAction::ResumePostProcessing => {}
-                }
-                let _ = reply.send(());
-            }
-            SchedulerCommand::SetHardwareProfile { profile, reply } => {
-                self.set_configured_hardware_profile(profile);
-                let _ = reply.send(());
-            }
-            SchedulerCommand::SetScheduledHardwareProfile { profile, reply } => {
-                self.set_scheduled_hardware_profile(profile);
-                let _ = reply.send(());
-            }
-            SchedulerCommand::RebuildNntp {
-                client,
-                total_connections,
-                reply,
-            } => {
-                let result = if let Ok(new_client) = client.downcast::<NntpClient>() {
-                    let new_client = Arc::new(*new_client);
-                    let old_client = std::mem::replace(&mut self.nntp, new_client);
-                    // Server indices and retention windows may have changed:
-                    // recompute retention and drop queued failure exclusions,
-                    // whose indices refer to the old pool layout. Bumping the
-                    // generation also invalidates the failure indices carried by
-                    // in-flight delayed retries when they re-enter the queue.
-                    self.pool_generation = self.pool_generation.wrapping_add(1);
-                    // Re-point the per-server metric counters at the new pool
-                    // layout. This is the only place the counter vector is
-                    // rebuilt, so the completion path can index it without a
-                    // lock; counters are keyed by stable server id, so lifetime
-                    // totals carry across the rebuild.
-                    self.server_counters =
-                        Self::activate_server_counters(&self.metrics, &self.nntp);
-                    // Depth explorers are keyed by pool position, so they are
-                    // rebuilt against the new layout. A server that survived
-                    // the rebuild keeps what it had measured, matched by
-                    // stable id rather than by position.
-                    self.seed_download_lane_explorers();
-                    let recovery_requeues = self.wake_all_infrastructure_retries();
-                    self.reset_owned_download_lanes();
-                    self.drop_held_download_refills();
-                    self.clear_retention_exclude_cache();
-                    for state in self.jobs.values_mut() {
-                        state.download_queue.clear_exclude_servers();
-                        state.recovery_queue.clear_exclude_servers();
-                    }
-                    self.metrics
-                        .nntp_generation_recovery_requeues
-                        .fetch_add(recovery_requeues as u64, Ordering::Relaxed);
-                    self.owned_download_lane_pool
-                        .resize(total_connections.max(1));
-                    self.tuner.set_connection_limit(total_connections);
-                    // Dispatch on the new pool only once the old one has let
-                    // go of its sockets. The provider counts both generations
-                    // against one allowance, so dialling into the overlap is
-                    // refused as "too many connections" and would hold the
-                    // new pool off for the whole window on a healthy server.
-                    // Old-generation lanes drain on their own: their refills
-                    // are answered with the generation error and they park.
-                    self.nntp_handoff_draining = true;
-                    let drained_tx = self.nntp_handoff_drained_tx.clone();
-                    let generation = self.pool_generation;
-                    tokio::spawn(async move {
-                        old_client.shutdown().await;
-                        let _ = drained_tx.send(generation).await;
-                    });
-                    let activation = NntpRuntimeActivation {
-                        generation: self.pool_generation,
-                        configured_connections: total_connections,
-                    };
-                    self.shared_state.set_nntp_runtime_activation(activation);
-                    self.publish_snapshot();
-                    info!(
-                        runtime_generation = activation.generation,
-                        configured_connections = activation.configured_connections,
-                        recovery_requeues,
-                        max_downloads = self.tuner.params().max_concurrent_downloads,
-                        "NNTP runtime generation activated"
-                    );
-                    Ok(activation)
-                } else {
-                    Err(SchedulerError::Internal(
-                        "invalid NNTP runtime client supplied for activation".to_string(),
-                    ))
-                };
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::UpdateRandomReadIops {
-                random_read_iops,
-                reply,
-            } => {
-                let prior_limit = self.tuner.max_concurrent_extractions();
-                self.tuner.set_random_read_iops(random_read_iops);
-                let next_limit = self.tuner.max_concurrent_extractions();
-                if next_limit > prior_limit {
-                    self.promote_queued_extractions();
-                }
-                info!(
-                    random_read_iops,
-                    prior_limit, next_limit, "applied startup disk measurement to runtime tuner"
-                );
-                let _ = reply.send(());
-            }
-            SchedulerCommand::UpdateRuntimePaths {
-                data_dir,
-                intermediate_dir,
-                complete_dir,
-                reply,
-            } => {
-                let result = std::fs::create_dir_all(&data_dir)
-                    .and_then(|_| std::fs::create_dir_all(&intermediate_dir))
-                    .and_then(|_| std::fs::create_dir_all(&complete_dir))
-                    .map_err(crate::SchedulerError::Io)
-                    .map(|_| {
-                        use crate::operations::StorageRoot;
-                        self.storage_capacity
-                            .retarget(StorageRoot::Data, data_dir.clone());
-                        self.storage_capacity
-                            .retarget(StorageRoot::Intermediate, intermediate_dir.clone());
-                        self.storage_capacity
-                            .retarget(StorageRoot::Complete, complete_dir.clone());
-                        self.intermediate_dir = intermediate_dir;
-                        self.complete_dir = complete_dir;
-                        self.nzb_dir = data_dir.join(".weaver-nzbs");
-                    });
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::ReprocessJob {
-                job_id,
-                password,
-                reply,
-            } => {
-                if self.pending_history_deletions.contains(&job_id) {
-                    let _ = reply.send(Err(SchedulerError::Conflict(
-                        "history deletion is still running".into(),
-                    )));
-                    return;
-                }
-                let result = self.reprocess_job_with_password(job_id, password).await;
-                if result.is_ok() {
-                    self.publish_snapshot();
-                }
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::RedownloadJob {
-                job_id,
-                password,
-                reply,
-            } => {
-                if self.pending_history_deletions.contains(&job_id) {
-                    let _ = reply.send(Err(SchedulerError::Conflict(
-                        "history deletion is still running".into(),
-                    )));
-                    return;
-                }
-                let result = self.redownload_job_with_password(job_id, password).await;
-                if result.is_ok() {
-                    self.publish_snapshot();
-                }
-                let _ = reply.send(result);
-            }
-            SchedulerCommand::DeleteHistory {
-                job_ids,
-                delete_files,
-                reply,
-            } => {
-                self.start_history_delete(job_ids, delete_files, reply);
-            }
-            SchedulerCommand::PipelineDiagnostics { reply } => {
-                let _ = reply.send(Box::new(self.diagnostics_snapshot()));
-            }
-            SchedulerCommand::Shutdown => unreachable!("handled in select"),
+    pub(crate) fn activate_nntp(
+        &mut self,
+        new_client: NntpClient,
+        total_connections: usize,
+        generation: u64,
+    ) -> NntpRuntimeActivation {
+        let new_client = Arc::new(new_client);
+        let old_client = std::mem::replace(&mut self.nntp, new_client);
+        self.shared_state
+            .set_nntp_pool(Arc::clone(self.nntp.pool()));
+        // Server indices and retention windows may have changed:
+        // recompute retention and drop queued failure exclusions,
+        // whose indices refer to the old pool layout. Bumping the
+        // generation also invalidates the failure indices carried by
+        // in-flight delayed retries when they re-enter the queue.
+        self.pool_generation = generation;
+        // Re-point the per-server metric counters at the new pool
+        // layout. This is the only place the counter vector is
+        // rebuilt, so the completion path can index it without a
+        // lock; counters are keyed by stable server id, so lifetime
+        // totals carry across the rebuild.
+        self.server_counters = Self::activate_server_counters(&self.metrics, &self.nntp);
+        // Depth explorers are keyed by pool position, so they are
+        // rebuilt against the new layout. A server that survived
+        // the rebuild keeps what it had measured, matched by
+        // stable id rather than by position.
+        self.seed_download_lane_explorers();
+        let recovery_requeues = self.wake_all_infrastructure_retries();
+        self.reset_owned_download_lanes();
+        self.drop_held_download_refills();
+        self.clear_retention_exclude_cache();
+        for state in self.jobs.values_mut() {
+            state.download_queue.clear_exclude_servers();
+            state.recovery_queue.clear_exclude_servers();
         }
-    }
-}
-
-impl Pipeline {
-    // A renamed job moves to a working directory named after its new name,
-    // but only while that directory holds nothing but its ownership marker
-    // and no article is in flight. Anything already written stays where it
-    // is, and so does the directory.
-    pub(crate) fn rederive_unwritten_working_dir(&mut self, job_id: JobId) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
+        self.metrics
+            .nntp_generation_recovery_requeues
+            .fetch_add(recovery_requeues as u64, Ordering::Relaxed);
+        self.owned_download_lane_pool
+            .resize(total_connections.max(1));
+        self.tuner.set_connection_limit(total_connections);
+        // Dispatch on the new pool only once the old one has let
+        // go of its sockets. The provider counts both generations
+        // against one allowance, so dialling into the overlap is
+        // refused as "too many connections" and would hold the
+        // new pool off for the whole window on a healthy server.
+        // Old-generation lanes drain on their own: their refills
+        // are answered with the generation error and they park.
+        self.nntp_handoff_draining = true;
+        let drained_tx = self.nntp_handoff_drained_tx.clone();
+        let generation = self.pool_generation;
+        tokio::spawn(async move {
+            old_client.shutdown().await;
+            let _ = drained_tx.send(generation).await;
+        });
+        let activation = NntpRuntimeActivation {
+            generation: self.pool_generation,
+            configured_connections: total_connections,
         };
-        if state.downloaded_bytes > 0
-            || state.failed_bytes > 0
-            || state.staging_dir.is_some()
-            || self
-                .active_downloads_by_job
-                .get(&job_id)
-                .is_some_and(|n| *n > 0)
+        self.shared_state.set_nntp_runtime_activation(activation);
+        info!(
+            runtime_generation = activation.generation,
+            configured_connections = activation.configured_connections,
+            recovery_requeues,
+            max_downloads = self.tuner.params().max_concurrent_downloads,
+            "NNTP runtime generation activated"
+        );
+        activation
+    }
+
+    pub(crate) async fn rename_working_dir_when_quiet(
+        &mut self,
+        job_id: JobId,
+        name: &str,
+    ) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        if self
+            .active_downloads_by_job
+            .get(&job_id)
+            .is_some_and(|n| *n > 0)
             || self
                 .active_decodes_by_job
                 .get(&job_id)
                 .is_some_and(|n| *n > 0)
-            || !matches!(
-                (state.download_state, state.post_state),
-                (
-                    crate::jobs::model::DownloadState::Queued,
-                    crate::jobs::model::PostState::Idle
-                )
-            )
+            || self
+                .direct_barrier_flights
+                .keys()
+                .any(|(id, _)| *id == job_id)
+            || self
+                .direct_placement_lanes
+                .keys()
+                .any(|(id, _)| *id == job_id)
+            || self
+                .direct_rearm_in_flight
+                .iter()
+                .any(|(id, _)| *id == job_id)
+            || self.direct_post_repair_in_flight.contains_key(&job_id)
+            || self.direct_tolerated_in_flight.contains_key(&job_id)
+            || self.direct_demotion_in_flight.contains_key(&job_id)
+            || self.par2_analysis_in_flight.contains_key(&job_id)
+            || self.inflight_extractions.contains_key(&job_id)
+            || self.has_active_rar_workers(job_id)
+            || self.inflight_terminal_post_processing.contains(&job_id)
+            || self.added_script_holds.contains(&job_id)
+            || self.inflight_moves.contains(&job_id)
+            || self.direct_unpack.has_job_work_in_flight(job_id)
+            || self
+                .par3_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.has_worker_in_flight(job_id))
+            || self
+                .rar_refresh_state
+                .iter()
+                .any(|((id, _), state)| *id == job_id && state.in_flight.is_some())
         {
-            return;
+            return false;
         }
         let old_dir = state.working_dir.clone();
-        if !old_dir.starts_with(&self.intermediate_dir) || !working_dir_is_unwritten(&old_dir) {
-            return;
+        if old_dir.parent() != Some(self.intermediate_dir.as_path()) {
+            return true;
         }
-        let new_dir = crate::jobs::working_dir::compute_working_dir(
-            &self.intermediate_dir,
-            job_id,
-            &state.spec.name,
-        );
+        if old_dir.file_name()
+            == Some(std::ffi::OsStr::new(
+                &crate::jobs::working_dir::sanitize_dirname(name),
+            ))
+        {
+            return true;
+        }
+        let new_dir =
+            crate::jobs::working_dir::compute_working_dir(&self.intermediate_dir, job_id, name);
         if new_dir == old_dir {
-            return;
+            return true;
         }
-        if let Err(error) = std::fs::create_dir(&new_dir) {
-            tracing::warn!(job_id = job_id.0, %error, "keeping the working directory after a rename");
-            return;
+        crate::pipeline::close_cached_write_handles_under(&old_dir).await;
+        let root = self.intermediate_dir.clone();
+        let source = old_dir.clone();
+        let result = self
+            .db_blocking(move |db| {
+                crate::jobs::working_dir::rename_job_working_dir(
+                    db, &root, &source, &new_dir, job_id,
+                )
+            })
+            .await;
+        let new_dir = match result {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, %error, "working directory rename remains pending");
+                return false;
+            }
+        };
+        self.direct_store
+            .relocate_working_dir(job_id, &old_dir, &new_dir);
+        if let Some(cache) = self.repeated_articles.get(&job_id) {
+            cache.relocate_working_dir(&old_dir, &new_dir);
         }
-        if let Err(error) = crate::jobs::working_dir::mark_weaver_owned_working_dir(
-            &self.intermediate_dir,
-            &new_dir,
-            job_id,
-        ) {
-            tracing::warn!(job_id = job_id.0, %error, "keeping the working directory after a rename");
-            // Only remove the empty directory we created. A failed marker write
-            // does not establish ownership of any contents at this path.
-            let _ = std::fs::remove_dir(&new_dir);
-            return;
-        }
-        if let Err(error) = crate::jobs::working_dir::remove_weaver_owned_working_dir(
-            &self.intermediate_dir,
-            &old_dir,
-        ) {
-            tracing::warn!(job_id = job_id.0, %error, "left the previous working directory after a rename");
+        self.invalidate_par2_session_for_identity_rebind(job_id);
+        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
+            for set in runtime.sets.values_mut() {
+                set.scan_carry = None;
+                set.scan_carry_exclusions.clear();
+            }
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.working_dir = new_dir.clone();
+            state.working_dir = new_dir;
         }
-        if let Err(error) =
-            self.db
-                .try_queue_job_write(job_id, "update_active_job_output_dir", move |db| {
-                    db.update_active_job_output_dir(job_id, &new_dir)
-                })
-        {
-            error!(error = %error, "failed to queue the renamed working directory write");
-        }
+        true
     }
 
     pub(crate) async fn cleanup_cancelled_job_directories(
@@ -766,41 +230,8 @@ impl Pipeline {
     }
 }
 
-fn working_dir_is_unwritten(dir: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.into_iter().all(|entry| {
-        entry.is_ok_and(|entry| {
-            entry.file_name() == std::ffi::OsStr::new(crate::jobs::working_dir::WORKING_DIR_MARKER)
-        })
-    })
-}
-
-// The history-row fields of a job update, applied to a finished job's
-// in-memory copy.
-fn apply_history_update(
-    update: &crate::jobs::JobUpdate,
-    (name, category, metadata): &mut (String, Option<String>, Vec<(String, String)>),
-) {
-    match &update.category {
-        crate::jobs::FieldUpdate::Unchanged => {}
-        crate::jobs::FieldUpdate::Clear => *category = None,
-        crate::jobs::FieldUpdate::Set(value) => *category = Some(value.clone()),
-    }
-    match &update.metadata {
-        crate::jobs::FieldUpdate::Unchanged => {}
-        crate::jobs::FieldUpdate::Clear => metadata.clear(),
-        crate::jobs::FieldUpdate::Set(value) => *metadata = value.clone(),
-    }
-    if let Some(value) = &update.name {
-        *name = value.clone();
-        crate::ingest::set_renamed_title(metadata, value);
-    }
-}
-
 // What a cancelled job's directory cleanup waits for and removes, carried
-// from the cancel's turn to the turn that handles its archive commit.
+// from the turn that takes the cancel to the turn that handles its archive.
 struct CancelledJobCleanup {
     job_id: JobId,
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
@@ -809,32 +240,25 @@ struct CancelledJobCleanup {
     staging_dir: Option<PathBuf>,
 }
 
-// A batched cancel's archive outcome, carried back to the actor once the
-// archive write has answered: the ids it covered and the batch generation
-// they were recorded under in `pending_cancellations`.
+// A cancel batch's archive outcome, carried back to the actor once the
+// archive write has answered.
 pub(crate) struct CancelJobsDone {
-    generation: u64,
     cleanups: Vec<CancelledJobCleanup>,
     // The ids whose archive failed and why; an error means the writer closed
     // before answering.
     archived: Result<BTreeMap<JobId, String>, oneshot::error::RecvError>,
     keep_files: bool,
-    results: crate::CancelJobsOutcome,
-    reply: oneshot::Sender<crate::CancelJobsOutcome>,
 }
 
 impl Pipeline {
-    // The actor's share of a batched cancel: the safety checks, the cancel
-    // signals and each job's history row, then one archive write for the
-    // batch. Every job stays live, and in the snapshot, until its archive
-    // commits; the done event that follows removes the archived ones.
+    // Take accepted cancellation intents as one archive batch. Every job
+    // keeps its runtime until its own archive commits; the done event that
+    // follows retires the committed ones and hands the rest back.
     pub(super) fn start_cancel_jobs(
         &mut self,
         job_ids: BTreeSet<JobId>,
         origin: crate::jobs::handle::CancellationOrigin,
-        reply: oneshot::Sender<crate::CancelJobsOutcome>,
     ) {
-        let mut results = crate::CancelJobsOutcome::new();
         let mut archives = Vec::new();
         let mut cleanups = Vec::new();
         for job_id in job_ids {
@@ -844,39 +268,34 @@ impl Pipeline {
                     cleanups.push(cleanup);
                 }
                 Err(error) => {
-                    results.insert(job_id, Err(error));
+                    tracing::error!(job_id = job_id.0, %error, "failed to start accepted cancellation");
                 }
             }
         }
         if archives.is_empty() {
-            let _ = reply.send(results);
             return;
         }
-        let committed = match self.db.try_queue_archive_jobs(archives) {
+        let ids: Vec<JobId> = cleanups.iter().map(|cleanup| cleanup.job_id).collect();
+        let failure_kind = (origin == crate::jobs::handle::CancellationOrigin::UserDuplicate)
+            .then_some(crate::history::HistoryFailureKind::Duplicate);
+        let committed = match self.db.try_queue_archive_jobs(archives, failure_kind) {
             Ok(committed) => committed,
             Err(error) => {
-                // Nothing was archived, so every job stays live and
-                // recoverable rather than reported cancelled.
+                // Nothing was archived: every job stays live and recoverable,
+                // and a further cancel needs a new intent.
                 tracing::error!(error = %error, "failed to queue cancelled job archives");
-                for cleanup in cleanups {
-                    self.restore_after_failed_cancellation(cleanup.job_id);
-                    results.insert(
-                        cleanup.job_id,
-                        Err(crate::SchedulerError::State(crate::StateError::Database(
-                            format!("failed to archive cancelled job: {error}"),
-                        ))),
-                    );
-                }
-                let _ = reply.send(results);
+                self.release_cancel_intents(&ids);
                 return;
             }
         };
-        self.cancel_generation += 1;
-        let generation = self.cancel_generation;
-        for cleanup in &cleanups {
-            self.pending_cancellations
-                .insert(cleanup.job_id, generation);
-        }
+        // Taken: the rows are being archived, and these intents are acted on.
+        self.shared_state.queue.write(|inner| {
+            for row in inner.jobs.iter_mut().filter(|row| ids.contains(&row.id)) {
+                row.report.retiring = true;
+                row.report.seen_intent_seq = row.intents.seq;
+            }
+            crate::pipeline::queue::Change::changed(())
+        });
         let keep_files = matches!(
             origin,
             crate::jobs::handle::CancellationOrigin::UserKeepingFiles
@@ -887,12 +306,9 @@ impl Pipeline {
             let _ = completed
                 .send(TerminalPostProcessingEvent::CancelJobsDone(
                     CancelJobsDone {
-                        generation,
                         cleanups,
                         archived,
                         keep_files,
-                        results,
-                        reply,
                     },
                 ))
                 .await;
@@ -900,63 +316,105 @@ impl Pipeline {
     }
 
     // The archive has answered. Each id it committed leaves memory and the
-    // snapshot, with one `JobCancelled`; an id whose archive failed, or every
-    // id when the writer closed first, stays live and its result says why.
+    // Queue with one `JobCancelled`; an id whose archive failed, or every id
+    // when the writer closed first, is live again.
     pub(in crate::pipeline) fn handle_cancel_jobs_done(&mut self, done: CancelJobsDone) {
         let CancelJobsDone {
-            generation,
             cleanups,
             archived,
             keep_files,
-            mut results,
-            reply,
         } = done;
+        let mut failed = Vec::new();
         let mut cancelled = Vec::new();
         for mut cleanup in cleanups {
             let job_id = cleanup.job_id;
-            if self.pending_cancellations.get(&job_id) != Some(&generation) {
-                continue;
-            }
-            self.pending_cancellations.remove(&job_id);
             let failure = match &archived {
-                Ok(failed) => failed.get(&job_id).map(|error| {
-                    tracing::error!(job_id = job_id.0, %error, "failed to durably archive cancelled job");
-                    crate::SchedulerError::State(crate::StateError::Database(format!(
-                        "failed to archive cancelled job: {error}"
-                    )))
-                }),
-                Err(_) => Some(crate::SchedulerError::ChannelClosed),
+                Ok(errors) => errors.get(&job_id).cloned(),
+                Err(_) => Some("the history writer closed before answering".to_string()),
             };
             if let Some(error) = failure {
-                self.restore_after_failed_cancellation(job_id);
-                results.insert(job_id, Err(error));
+                tracing::error!(job_id = job_id.0, %error, "failed to durably archive cancelled job");
+                failed.push(job_id);
                 continue;
             }
             if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
                 cleanup.working_dir = state.working_dir;
                 cleanup.staging_dir = state.staging_dir;
             }
-            results.insert(job_id, Ok(()));
             cancelled.push(cleanup);
         }
-        if !cancelled.is_empty() {
-            // Same boundary as a job that completed or failed: the cancelled
-            // jobs' article pages are free and unwanted, so hand them back
-            // rather than holding a job-sized working set until the purge
-            // clock runs out.
-            crate::runtime::thread_release::release_job_completion_memory();
-            self.publish_snapshot();
+        self.release_cancel_intents(&failed);
+        if cancelled.is_empty() {
+            return;
         }
+        // Same boundary as a job that completed or failed: the cancelled
+        // jobs' article pages are free and unwanted, so hand them back rather
+        // than holding a job-sized working set until the purge clock runs out.
+        crate::runtime::thread_release::release_job_completion_memory();
+        let queue = self.shared_state.queue.clone();
         for cleanup in cancelled {
-            let _ = self.event_tx.send(PipelineEvent::JobCancelled {
-                job_id: cleanup.job_id,
+            let job_id = cleanup.job_id;
+            let delete_history = queue.write(|inner| {
+                let delete_history = inner
+                    .jobs
+                    .iter()
+                    .any(|row| row.id == job_id && row.intents.delete_history_after_cancel);
+                if !keep_files {
+                    inner.pending_cleanup.insert(job_id);
+                }
+                inner.jobs.retain(|row| row.id != job_id);
+                let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
+                crate::pipeline::queue::Change::changed(delete_history)
             });
+            if delete_history {
+                let history = queue.clone();
+                tokio::spawn(async move {
+                    let result = history
+                        .delete_history(BTreeSet::from([job_id]), false)
+                        .await
+                        .and_then(|mut outcome| {
+                            outcome.refused.remove(&job_id).map_or(Ok(()), Err)
+                        });
+                    if let Err(error) = result {
+                        tracing::error!(job_id = job_id.0, %error, "failed to finish requested history deletion after cancellation");
+                    }
+                });
+            }
             // A cancel that keeps the files schedules nothing.
             if !keep_files {
-                tokio::spawn(Self::cleanup_cancelled_job(self.db.clone(), cleanup));
+                let cleanup_db = self.db.clone();
+                let queue = queue.clone();
+                tokio::spawn(async move {
+                    Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
+                    queue.write(|inner| {
+                        inner.pending_cleanup.remove(&job_id);
+                        crate::pipeline::queue::Change::changed(())
+                    });
+                });
             }
         }
-        let _ = reply.send(results);
+    }
+
+    // A cancel whose archive did not commit hands the job back: the row is
+    // visible again in the same write that withdraws the cancel, and a
+    // further cancel needs a new intent. Whatever the job finished while it
+    // waited is judged now.
+    fn release_cancel_intents(&mut self, ids: &[JobId]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.shared_state.queue.write(|inner| {
+            for row in inner.jobs.iter_mut().filter(|row| ids.contains(&row.id)) {
+                row.intents.cancelled = None;
+                row.intents.delete_history_after_cancel = false;
+                row.report.retiring = false;
+            }
+            crate::pipeline::queue::Change::changed(())
+        });
+        for &job_id in ids {
+            self.restore_after_failed_cancellation(job_id);
+            self.report_job(job_id);
+        }
     }
 
     // The archive did not commit, so future work belongs to a live job again.
@@ -978,52 +436,41 @@ impl Pipeline {
         self.schedule_job_completion_check(job_id);
     }
 
-    // Refuses a cancel the job's state does not allow, or else sends every
-    // cancel signal and builds the job's `cancelled` history row. The job
-    // itself stays until the batch's archive is queued.
+    // Send cancellation signals and prepare history for an accepted intent.
+    // Runtime ownership stays here until the job's archive has committed.
     fn begin_cancel_job(
         &mut self,
         job_id: JobId,
         origin: crate::jobs::handle::CancellationOrigin,
     ) -> Result<(crate::JobHistoryRow, CancelledJobCleanup), crate::SchedulerError> {
-        let semantic_cancel_is_safe = !self.awaiting_queue_script_barrier(job_id)
-            && self.jobs.get(&job_id).is_some_and(|state| {
-                matches!(
-                    (state.download_state, state.post_state),
-                    (
-                        crate::jobs::model::DownloadState::Queued
-                            | crate::jobs::model::DownloadState::Downloading,
-                        crate::jobs::model::PostState::Idle
-                    )
-                )
-            });
-        if !origin.is_user() && !semantic_cancel_is_safe {
-            return Err(crate::SchedulerError::Conflict(
-                "semantic cancellation is only allowed while queued or downloading".to_string(),
-            ));
-        }
-        if self.inflight_moves.contains(&job_id) {
-            return Err(crate::SchedulerError::Conflict(
-                "cancel is not supported while the final move is running".to_string(),
-            ));
-        }
-        if self.pending_cancellations.contains_key(&job_id) {
-            return Err(crate::SchedulerError::Conflict(
-                "cancellation is still running".to_string(),
-            ));
-        }
+        // Refusal was decided atomically when the API recorded this intent.
+        // A later phase transition must not revoke an accepted cancellation.
         if !self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobNotFound(job_id));
         }
+        if let Some(update) = self.shared_state.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .find(|row| row.id == job_id)
+                .and_then(|row| row.intents.update.clone())
+        }) {
+            update.apply_to_spec(&mut self.jobs.get_mut(&job_id).expect("live cancellation").spec);
+        }
         self.db.cancel_event_scripts(job_id.0);
         if origin.is_user() {
-            // Reassert at actor admission: a preceding failed cancellation may
-            // have rolled back the handle's early cancellation signal.
+            // Reassert after any earlier failed cancellation withdrew its signal.
             self.shared_state.cancel_active_job_work(job_id);
             self.raise_queue_script_event(
                 job_id,
                 crate::post_processing::model::QueueEvent::NzbDeleted,
-                Some("MANUAL"),
+                Some(
+                    if origin == crate::jobs::handle::CancellationOrigin::UserDuplicate {
+                        "DUPE"
+                    } else {
+                        "MANUAL"
+                    },
+                ),
             );
         }
         // Normal job cancellation must also interrupt terminal
@@ -1085,7 +532,11 @@ impl Pipeline {
             job_hash: Some(state.job_hash.to_vec()),
             name: state.spec.name.clone(),
             status: "cancelled".to_string(),
-            error_message: None,
+            // History has no Cancelled state: the row reads Failed, so it
+            // names who ended it.
+            error_message: origin
+                .is_user()
+                .then(|| crate::jobs::model::OPERATOR_CANCELLED_ERROR.to_string()),
             total_bytes: total,
             downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
@@ -1131,12 +582,9 @@ impl Pipeline {
         self.clear_job_extraction_runtime(job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
-        self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
         self.active_completion_critical_connections_by_job
             .remove(&job_id);
-        self.active_downloads_by_file
-            .retain(|file_id, _| file_id.job_id != job_id);
         self.active_decodes_by_job.remove(&job_id);
         self.active_decodes_by_file
             .retain(|file_id, _| file_id.job_id != job_id);

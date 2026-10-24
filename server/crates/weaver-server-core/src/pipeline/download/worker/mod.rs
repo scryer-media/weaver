@@ -259,6 +259,28 @@ impl Pipeline {
     // it, so a job retrying hard on a low-priority server quietly handed it
     // everyone else's work. The sort is stable, so the pool's own ranking
     // survives inside each group.
+    // The fill servers this pass may send a hinted article to instead of its
+    // hinted one, for the rotation hint: the article stays off its server
+    // only while one of these could take it now. A fill server takes an
+    // article now only through an idle lane, the same fact the candidate
+    // order prefers; one whose every lane is busy would leave the hinted
+    // server idle for as long as its current body runs. Unknown when the
+    // pass never ranked.
+    pub(in crate::pipeline) fn rotation_alternatives_for_pass(
+        ranked: Option<&[usize]>,
+        backfill_flags: &[bool],
+        idle_by_server: &HashMap<usize, usize>,
+    ) -> Option<Vec<usize>> {
+        ranked.map(|order| {
+            order
+                .iter()
+                .copied()
+                .filter(|server| !backfill_flags.get(*server).copied().unwrap_or(false))
+                .filter(|server| idle_by_server.contains_key(server))
+                .collect()
+        })
+    }
+
     pub(in crate::pipeline) fn order_dispatch_candidates(
         servers: &mut [usize],
         groups: &[u32],
@@ -322,16 +344,11 @@ impl Pipeline {
                 None => idle_by_server.keys().copied().collect(),
             },
         };
-        // The fill servers this pass may send work to, for the rotation
-        // hint: a hinted article stays off its server only while one of
-        // these could take it instead. Unknown when the pass never ranked.
-        self.download_pass_fill_servers = ranked_this_pass.as_ref().map(|order| {
-            order
-                .iter()
-                .copied()
-                .filter(|server| !backfill_flags.get(*server).copied().unwrap_or(false))
-                .collect()
-        });
+        self.download_pass_fill_servers = Self::rotation_alternatives_for_pass(
+            ranked_this_pass.as_deref(),
+            backfill_flags,
+            &idle_by_server,
+        );
         let groups = self.nntp.pool().server_groups().to_vec();
         Self::order_dispatch_candidates(&mut servers, &groups, backfill_flags, &idle_by_server);
         // The backfill tier comes last, and only for what the fill tier has
@@ -490,9 +507,7 @@ impl Pipeline {
                 "NNTP download pass started"
             );
             self.phase_begin(job_id, JobPhase::Downloading, Some(total));
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::DownloadStarted { job_id });
+            self.emit_job_event(PipelineEvent::DownloadStarted { job_id });
         }
     }
 
@@ -548,17 +563,22 @@ impl Pipeline {
     // One dispatch pass at `now`, the instant the pass's timers and the stall
     // watchdog measure against.
     pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
+        self.dispatch_download_pass(now);
+        self.report_changed_dispatch_holds();
+        #[cfg(test)]
+        self.audit_lane_holdings();
+    }
+
+    fn dispatch_download_pass(&mut self, now: Instant) {
         self.download_dispatch_wake = false;
         // Every early return below except an operator pause is a gate that
         // can lift with no event to announce it, so the pass is retried on
         // the idle tick until one gets as far as the eligible jobs.
-        self.download_dispatch_retry =
-            !self.global_paused && !self.shared_state.speed_test_paused();
+        self.download_dispatch_retry = !self.shared_state.is_paused();
         // Lanes already connected and waiting in the actor are answered
         // before any dial: an established socket outranks a new one.
         self.service_held_download_refills();
-        if self.global_paused
-            || self.shared_state.speed_test_paused()
+        if self.shared_state.is_paused()
             || self.shared_state.schedule_replay_paused()
             || self.rate_limiter.should_wait()
         {

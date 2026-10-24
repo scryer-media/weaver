@@ -228,6 +228,9 @@ impl<T> FieldUpdate<T> {
 pub struct JobUpdate {
     pub category: FieldUpdate<String>,
     pub metadata: FieldUpdate<Vec<(String, String)>>,
+    // Ordered per-key edits preserve unrelated script and client updates.
+    // A missing value removes the key; matching is ASCII case-insensitive.
+    pub metadata_edits: Vec<(String, Option<String>)>,
     // Archive/unpack password override. `Clear` removes a password even when
     // the NZB itself carries one; the override persists across restarts.
     pub password: FieldUpdate<String>,
@@ -240,6 +243,7 @@ impl JobUpdate {
     pub fn is_empty(&self) -> bool {
         self.category.is_unchanged()
             && self.metadata.is_unchanged()
+            && self.metadata_edits.is_empty()
             && self.password.is_unchanged()
             && self.name.is_none()
     }
@@ -251,11 +255,7 @@ impl JobUpdate {
             FieldUpdate::Set(category) => spec.category = Some(category.clone()),
         }
 
-        match &self.metadata {
-            FieldUpdate::Unchanged => {}
-            FieldUpdate::Clear => spec.metadata.clear(),
-            FieldUpdate::Set(metadata) => spec.metadata = metadata.clone(),
-        }
+        self.apply_to_metadata(&mut spec.metadata);
 
         match &self.password {
             FieldUpdate::Unchanged => {}
@@ -266,6 +266,20 @@ impl JobUpdate {
         if let Some(name) = &self.name {
             spec.name = name.clone();
             crate::ingest::set_renamed_title(&mut spec.metadata, name);
+        }
+    }
+
+    pub fn apply_to_metadata(&self, metadata: &mut Vec<(String, String)>) {
+        match &self.metadata {
+            FieldUpdate::Unchanged => {}
+            FieldUpdate::Clear => metadata.clear(),
+            FieldUpdate::Set(values) => *metadata = values.clone(),
+        }
+        for (key, value) in &self.metadata_edits {
+            metadata.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+            if let Some(value) = value {
+                metadata.push((key.clone(), value.clone()));
+            }
         }
     }
 }
@@ -503,6 +517,9 @@ pub fn derive_legacy_job_status(
     }
 }
 
+// The error a job the operator cancelled carries in history.
+pub const OPERATOR_CANCELLED_ERROR: &str = "cancelled by operator";
+
 pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobStatus {
     match status {
         "awaiting_queue_scripts" => JobStatus::AwaitingQueueScripts,
@@ -523,7 +540,7 @@ pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobSt
         },
         "paused" => JobStatus::Paused,
         "cancelled" => JobStatus::Failed {
-            error: "cancelled".to_string(),
+            error: error.unwrap_or("cancelled").to_string(),
         },
         other => JobStatus::Failed {
             error: format!("unknown status: {other}"),

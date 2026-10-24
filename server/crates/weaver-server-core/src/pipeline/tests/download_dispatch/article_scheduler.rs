@@ -51,6 +51,7 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
                 segment_number: index as u32,
             };
             let work = DownloadWork {
+                counters: None,
                 segment_id,
                 message_id: MessageId::new(&format!("held-{}-{index}@share.test", job_id.0)),
                 groups: Arc::from(Vec::new()),
@@ -510,9 +511,8 @@ async fn only_a_failed_pause_or_server_disable_holds_admission() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     add_job(&mut pipeline, JobId(71080), "Schedule Gate", 200).await;
-    let (commands, _) = tokio::sync::mpsc::channel(1);
     let (events, _) = tokio::sync::broadcast::channel(1);
-    let handle = crate::SchedulerHandle::new(commands, events, pipeline.shared_state.clone());
+    let handle = crate::SchedulerHandle::new(events, pipeline.shared_state.clone());
     let rule = |active| ScheduleEntry {
         id: "server-rule".into(),
         enabled: true,
@@ -584,12 +584,12 @@ async fn every_whole_link_gate_yields_under_its_own_name() {
     let hot = JobId(71081);
     add_job(&mut pipeline, hot, "Gated Reel", 200).await;
 
-    pipeline.global_paused = true;
+    pipeline.shared_state.set_paused(true);
     assert!(matches!(
         ask(&mut pipeline, SERVER_A, 8, None),
         Handout::Yield(YieldReason::Paused)
     ));
-    pipeline.global_paused = false;
+    pipeline.shared_state.set_paused(false);
 
     pipeline.nntp_handoff_draining = true;
     assert!(matches!(
@@ -692,6 +692,64 @@ async fn a_rotated_article_goes_to_the_alternative_while_it_is_up() {
     assert_eq!(on_b.len(), 4);
     assert_eq!(single_job(&on_b), job_id);
     assert_eq!(queued(&pipeline, job_id), 0);
+}
+
+// A fill server with every lane busy cannot take a hinted article this pass,
+// so it is no alternative: the hinted server serves the article now instead
+// of idling for as long as the other server's current body runs.
+#[tokio::test]
+async fn a_rotated_article_stays_on_its_server_while_the_alternative_has_no_idle_lane() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(71095);
+    add_job(&mut pipeline, job_id, "Rotated Reel", 4).await;
+    rewrite_queue(&mut pipeline, job_id, |work| {
+        work.avoid_server = Some(SERVER_A);
+    });
+    let ranked = [SERVER_A, SERVER_B];
+    let backfill = [false, false];
+    // Only the hinted server has an idle lane this pass.
+    let idle_by_server = std::collections::HashMap::from([(SERVER_A, 1)]);
+    pipeline.download_pass_fill_servers =
+        Pipeline::rotation_alternatives_for_pass(Some(&ranked), &backfill, &idle_by_server);
+
+    let on_a = taken(ask(&mut pipeline, SERVER_A, 8, None));
+    assert_eq!(on_a.len(), 4);
+    assert_eq!(single_job(&on_a), job_id);
+    assert_eq!(queued(&pipeline, job_id), 0);
+}
+
+// With an idle lane on the alternative, the hint still rotates the article.
+#[tokio::test]
+async fn a_rotated_article_goes_to_an_alternative_with_an_idle_lane() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(71096);
+    add_job(&mut pipeline, job_id, "Rotated Reel", 4).await;
+    rewrite_queue(&mut pipeline, job_id, |work| {
+        work.avoid_server = Some(SERVER_A);
+    });
+    let ranked = [SERVER_A, SERVER_B];
+    let backfill = [false, false];
+    let idle_by_server = std::collections::HashMap::from([(SERVER_A, 1), (SERVER_B, 1)]);
+    pipeline.download_pass_fill_servers =
+        Pipeline::rotation_alternatives_for_pass(Some(&ranked), &backfill, &idle_by_server);
+
+    assert!(taken(ask(&mut pipeline, SERVER_A, 8, None)).is_empty());
+    assert_eq!(queued(&pipeline, job_id), 4);
+    let on_b = taken(ask(&mut pipeline, SERVER_B, 8, None));
+    assert_eq!(on_b.len(), 4);
+    assert_eq!(single_job(&on_b), job_id);
+}
+
+// A pass that never ranked knows no alternatives, whatever lanes are idle.
+#[test]
+fn an_unranked_pass_knows_no_rotation_alternatives() {
+    let idle_by_server = std::collections::HashMap::from([(SERVER_B, 1)]);
+    assert_eq!(
+        Pipeline::rotation_alternatives_for_pass(None, &[false, false], &idle_by_server),
+        None
+    );
 }
 
 // Rule 2: the hot job is recomputed on every call, so a higher-priority job

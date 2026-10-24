@@ -54,6 +54,89 @@ async fn hp_before_restart(
     working_dir
 }
 
+#[tokio::test]
+async fn header_restore_uses_a_recorded_password_before_installing_the_actor_spec() {
+    let payload: Vec<u8> = (0..2400u32).map(|index| (index % 197) as u8).collect();
+    let volumes = header_encrypted_store_set(
+        "payload.bin",
+        &payload,
+        3,
+        HP_RESTART_PASSWORD,
+        HeaderCheck::For(HP_RESTART_PASSWORD),
+    );
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(45193);
+    let working_dir = hp_before_restart(
+        &temp_dir,
+        job_id,
+        &volumes,
+        &[(0, 0), (0, 1), (1, 0)],
+        Some(HP_RESTART_PASSWORD),
+        sample_nzb_zstd(),
+    )
+    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
+    let mut spec =
+        direct_store_job_spec_with_articles("Silver Horizon", &volumes, HP_RESTART_ARTICLES);
+    spec.password = Some("stale-restore-key".into());
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            complete_files: Default::default(),
+            file_progress: Default::default(),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            extracted_members: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+    handle
+        .update_job(
+            job_id,
+            crate::JobUpdate {
+                password: crate::jobs::FieldUpdate::Set(HP_RESTART_PASSWORD.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!pipeline.jobs.contains_key(&job_id));
+
+    pipeline.apply_queue_intents().await;
+
+    let set = pipeline
+        .direct_store
+        .set(job_id, 0)
+        .expect("restored direct set");
+    assert!(
+        !set.is_demoted(),
+        "recorded password must re-prove the header key: {set:?}"
+    );
+    assert!(
+        set.has_restart_seeded_coverage(),
+        "the correct password must preserve the direct checkpoint"
+    );
+    assert!(
+        !peek_queued_segments(&mut pipeline, job_id)
+            .iter()
+            .any(|(file_index, _)| *file_index == 0)
+    );
+}
+
 // Restarts a `-hp` job with volume 0 complete and asserts the checkpoint
 // survived: the set is live, seeded from its coverage, and nothing of volume
 // 0 is fetched again.

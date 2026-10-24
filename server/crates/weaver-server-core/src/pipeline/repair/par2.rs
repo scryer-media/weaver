@@ -2679,6 +2679,45 @@ impl Pipeline {
         cancellation
     }
 
+    // Await a PAR2 run the actor holds inline on a blocking worker.
+    //
+    // While it waits here the actor takes no command, so the shutdown check
+    // at the top of its loop cannot reach this run. Shutdown is watched beside
+    // the run instead: the moment it is signalled every job's token fires, the
+    // run stops at its next poll, and the await returns its cancelled result.
+    pub(crate) async fn await_inline_par2_run<T>(
+        &mut self,
+        mut run: tokio::task::JoinHandle<T>,
+    ) -> Result<T, tokio::task::JoinError> {
+        let queue = std::sync::Arc::clone(&self.shared_state.queue);
+        tokio::select! {
+            biased;
+            joined = &mut run => return joined,
+            () = queue.shutdown_requested() => {}
+        }
+        self.cancel_par2_work_for_shutdown();
+        run.await
+    }
+
+    // Shutdown stops every PAR2 read this process still owns.
+    //
+    // A damaged-path analysis runs detached on a blocking worker, carrying
+    // the retained session and the job's token. The runtime waits for that
+    // worker before the process can exit, so an uncancelled scan holds the
+    // exit for as long as the scan takes. Firing each job's own token stops
+    // it at the scan's next poll; forgetting the ticket means the cancelled
+    // verdict is never read as the job's answer. Nothing is recorded: the job
+    // keeps the state it had, and a restart runs its read again.
+    pub(crate) fn cancel_par2_work_for_shutdown(&mut self) {
+        for cancellation in self.par2_cancellations.values() {
+            cancellation.cancel();
+        }
+        let in_flight: Vec<JobId> = self.par2_analysis_in_flight.keys().copied().collect();
+        for job_id in in_flight {
+            self.forget_par2_analysis_work(job_id);
+        }
+    }
+
     pub(crate) fn restore_par2_repair_session(
         &mut self,
         job_id: JobId,
