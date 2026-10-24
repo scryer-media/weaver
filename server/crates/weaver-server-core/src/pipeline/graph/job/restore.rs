@@ -13,8 +13,10 @@
 //   4. each article read is delivered down the tree before the next is
 //      read, as it first came, so every object is where it was and a stream
 //      replays from its start
-//   5. the engines' runs are asked again for their slots; holds were in
-//      memory and are fetched again
+//   5. the engines' runs are asked again for their slots; holds the
+//      checkpoint recorded on scratch were adopted before step 3, so they
+//      read back as bytes on disk do, and holds that were in memory are
+//      fetched again
 //   6. what the root still waits on is what the queue fetches
 //
 // Step 1, refusing a graph job with no checkpoint, is the caller's.
@@ -101,6 +103,7 @@ impl GraphJob {
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
         }
+        writer.restore_holds(&tree, &snapshot.holds)?;
         let mut job = Self {
             tree,
             root,
@@ -150,9 +153,10 @@ impl GraphJob {
     // what the earlier ones rebuilt, as a cipher's chain does. What does not
     // read is the root's to fetch again: the article waits, and the bytes
     // it covered are no longer covered, or said at any depth they reached.
-    // A restore starts with no holds, so any it reads through are bytes an
-    // earlier article's delivery moved there from disk, as a member bound
-    // by its bytes moves its file.
+    // A restore starts with the holds the checkpoint recorded on scratch,
+    // read through as any bytes on disk are; any others it reads through are
+    // bytes an earlier article's delivery moved there from disk, as a member
+    // bound by its bytes moves its file.
     fn read_back(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
         let mut missing = Vec::new();
         let mut bytes = Vec::new();

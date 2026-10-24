@@ -3,18 +3,20 @@
 
 // The job as a checkpoint takes it: the tree's records, the root's facts
 // with the job's count of repair reads and the phase it last reported, the
-// writer's files and kept envelopes, and which candidate each node was
-// offered last. A node is read on its own, so a checkpoint reads only the
-// nodes the tree, the writer, its envelopes or an offer marked since the
-// generations it read at.
+// writer's files, kept envelopes and holds on scratch, and which candidate
+// each node was offered last. A node is read on its own, so a checkpoint
+// reads only the nodes the tree, the writer, its envelopes or an offer
+// marked since the generations it read at.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use weaver_graph::holds::ScratchHold;
 use weaver_graph::{MemberId, NodeId, NodeRecord};
 
 use super::GraphJob;
 use crate::pipeline::graph::checkpoint::{FileState, Generations};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
+use crate::pipeline::graph::namespace::WriteError;
 use crate::pipeline::graph::root::facts::{Encoded, Encoding};
 
 impl GraphJob {
@@ -59,6 +61,17 @@ impl GraphJob {
     // The node's kept envelopes.
     pub(crate) fn kept_records(&self, node: NodeId) -> Vec<KeptRecord> {
         self.writer.kept_records(node)
+    }
+
+    // The holds the node's namespace has on scratch.
+    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<ScratchHold> {
+        self.writer.hold_records(node)
+    }
+
+    // A graceful stop: what the job holds in RAM goes to scratch, so the
+    // checkpoint after it spares a restart fetching it again.
+    pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
+        self.writer.page_out_holds()
     }
 
     // The candidate the node was offered last, by index.

@@ -1856,6 +1856,7 @@ impl Pipeline {
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.
         self.drain_graph_runs().await;
+        self.checkpoint_graph_holds();
 
         if self.active_downloads > 0
             || !self.active_decodes_by_job.is_empty()
@@ -1968,6 +1969,25 @@ impl Pipeline {
                     break;
                 }
             }
+        }
+    }
+
+    // Every graph job pages what it holds in RAM to scratch and is
+    // checkpointed, before the database write queue is flushed: a restart
+    // then reads those holds back instead of fetching them again. A job whose
+    // page-out failed keeps the checkpoint it last wrote, which describes
+    // only bytes that were written.
+    fn checkpoint_graph_holds(&mut self) {
+        let jobs: Vec<JobId> = self.graph_jobs.keys().copied().collect();
+        for job_id in jobs {
+            let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+                continue;
+            };
+            if let Err(error) = graph.page_out_holds() {
+                warn!(job_id = job_id.0, %error, "could not page graph holds out at shutdown");
+                continue;
+            }
+            self.checkpoint_graph_job(job_id);
         }
     }
 

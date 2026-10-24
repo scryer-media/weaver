@@ -2,11 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A graph job's checkpoint: the tree's records, the root's facts, which
-// members have files, the kept envelopes and which candidate each node was
-// offered last, as the rows the database keeps. It is taken after every
-// step that reached the tree, when the step's bytes are written, so it only
-// ever describes bytes on disk; holds in memory are left out and fetched
-// again.
+// members have files, the kept envelopes, the holds paged to scratch and
+// which candidate each node was offered last, as the rows the database
+// keeps. It is taken after every step that reached the tree, when the step's
+// bytes are written, so it only ever describes bytes on disk; holds in
+// memory are left out and fetched again. A graceful stop pages every hold it
+// can to scratch first, so its last checkpoint leaves out only what scratch
+// could not take.
 //
 // Each checkpoint is written as what it changed of the one before: a step
 // costs the database the rows it changed, not the job's. One writer per job:
@@ -22,6 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use tracing::{debug, warn};
+use weaver_graph::holds::ScratchHold;
 use weaver_graph::{
     ByteRange, CoverageRecord, CryptRecord, Facts, Kind, MemberId, MemberRecord, NodeId,
     NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
@@ -31,8 +34,8 @@ use super::envelope::durable::KeptRecord;
 use super::job::GraphJob;
 use super::root::facts::{self, Parts, RootFacts, RootFactsError};
 use crate::jobs::graph_checkpoint::{
-    Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, MemberRow, NodeRow,
-    PartRow, Row,
+    Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, HoldRow, MemberRow,
+    NodeRow, PartRow, Row,
 };
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
@@ -49,8 +52,17 @@ pub(crate) struct Snapshot {
     // What the writer holds of each member it holds anything of.
     pub(crate) files: BTreeMap<(NodeId, MemberId), FileState>,
     pub(crate) kept: Vec<KeptRecord>,
+    // The holds each namespace had paged to scratch.
+    pub(crate) holds: Vec<HoldRecord>,
     // The candidate each node was offered last, by index.
     pub(crate) passwords: BTreeMap<NodeId, usize>,
+}
+
+// A hold of the namespace at `node` paged to its scratch file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HoldRecord {
+    pub(crate) node: NodeId,
+    pub(crate) held: ScratchHold,
 }
 
 // The generations a checkpoint read the job at: of the tree, of the
@@ -253,6 +265,9 @@ impl Pending {
         for row in rows.envelopes {
             held.nodes.entry(row.node).or_default().envelopes.push(row);
         }
+        for row in rows.holds {
+            held.nodes.entry(row.node).or_default().holds.push(row);
+        }
         slot.held = Some(held);
     }
 
@@ -399,7 +414,7 @@ fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
 }
 
 // The rows the job has now of one node: its own, as `node_rows` takes
-// them, and its kept envelopes'.
+// them, its kept envelopes' and its holds on scratch.
 fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
     let mut out = job
         .node(node)
@@ -411,6 +426,24 @@ fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
             )
         });
     out.envelopes = envelope_rows(&job.kept_records(node));
+    out.holds = hold_rows(node, &job.hold_records(node));
+    out
+}
+
+// A namespace's holds on scratch, in key order, as the ledger lists them.
+fn hold_rows(node: NodeId, holds: &[ScratchHold]) -> Vec<HoldRow> {
+    let node = i64::from(node.0);
+    let mut out: Vec<HoldRow> = holds
+        .iter()
+        .map(|held| HoldRow {
+            node,
+            volume: i64::from(held.volume.0),
+            start: held.range.start as i64,
+            end: held.range.end as i64,
+            scratch_offset: held.scratch_offset as i64,
+        })
+        .collect();
+    out.sort_by_key(Row::key);
     out
 }
 
@@ -734,6 +767,24 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             });
         }
     }
+    let mut holds = Vec::with_capacity(rows.holds.len());
+    for row in &rows.holds {
+        let node = node_id(row.node, row.node)?;
+        let refuse = |reason| CheckpointError::Row {
+            node: row.node,
+            reason,
+        };
+        let scratch_offset =
+            u64::try_from(row.scratch_offset).map_err(|_| refuse("a scratch offset"))?;
+        holds.push(HoldRecord {
+            node,
+            held: ScratchHold {
+                volume: VolumeIndex(u32::try_from(row.volume).map_err(|_| refuse("a volume"))?),
+                range: range(row.node, row.start, row.end)?,
+                scratch_offset,
+            },
+        });
+    }
     Ok(Snapshot {
         tree: TreeRecord {
             nodes: nodes.into_values().collect(),
@@ -742,6 +793,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
         root,
         files,
         kept: kept.into_values().collect(),
+        holds,
         passwords,
     })
 }

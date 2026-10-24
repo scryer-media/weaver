@@ -122,6 +122,11 @@ pub(crate) struct NamespaceWriter {
     envelopes: Envelopes,
     // Member reads the recovery objects made while repairing.
     read_backs: u64,
+    // Whether the job's holds have been paged out for a stop. Only then do
+    // the holds on scratch go in the checkpoint: scratch space is reused
+    // once nothing lives on it, so a row written mid-run could name bytes a
+    // later hold replaced before the next checkpoint reached the database.
+    stopped: bool,
     renamed: Vec<MemberId>,
     segments: Vec<Segment>,
     placements: Vec<Placement>,
@@ -143,6 +148,7 @@ impl NamespaceWriter {
             caps: Caps::unbounded(),
             files: Marked::default(),
             read_backs: 0,
+            stopped: false,
             renamed: Vec::new(),
             segments: Vec::new(),
             placements: Vec::new(),
@@ -957,11 +963,7 @@ impl NamespaceWriter {
         offset: u64,
         bytes: Bytes,
     ) -> Result<bool, WriteError> {
-        let free_disk = self
-            .free_disk
-            .current()
-            .best_available_bytes()
-            .unwrap_or(u64::MAX);
+        let free_disk = self.free_disk_bytes();
         let outcome =
             self.files_mut(node)
                 .holds
@@ -1352,18 +1354,22 @@ impl NamespaceWriter {
         }
     }
 
-    // The node's holds scratch, created empty the first time anything pages.
-    // It lives under the directory finalize never delivers.
+    // The free space the holds budgets judge a page-out against.
+    fn free_disk_bytes(&self) -> u64 {
+        self.free_disk
+            .current()
+            .best_available_bytes()
+            .unwrap_or(u64::MAX)
+    }
+
+    // The node's holds scratch, created empty the first time anything pages,
+    // unless a restore adopted it as it was left. It lives under the
+    // directory finalize never delivers.
     fn scratch(&mut self, node: NodeId) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
         let files = self.files_mut(node);
         if files.scratch.is_none() {
-            let name = format!(
-                "{}/graph-holds-{}.scratch",
-                weaver_graph::names::INTERNAL_DIR,
-                node.0
-            );
-            let mut scratch = Leaf::at(&dir, &name)?;
+            let mut scratch = Leaf::at(&dir, &scratch_name(node))?;
             scratch.truncate()?;
             files.scratch = Some(scratch);
         }
@@ -1635,6 +1641,15 @@ fn member_name(tree: &Tree, node: NodeId, member: MemberId) -> String {
         .and_then(|namespace| namespace.get(member))
         .map(|record| record.name.clone())
         .unwrap_or_default()
+}
+
+// The node's holds scratch file, under the working directory.
+fn scratch_name(node: NodeId) -> String {
+    format!(
+        "{}/graph-holds-{}.scratch",
+        weaver_graph::names::INTERNAL_DIR,
+        node.0
+    )
 }
 
 fn held_volume(member: MemberId) -> VolumeIndex {

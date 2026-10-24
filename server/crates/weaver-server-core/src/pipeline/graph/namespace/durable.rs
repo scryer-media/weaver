@@ -3,15 +3,20 @@
 
 // What a checkpoint says of the writer, and the writer a restore puts back:
 // which members have a file of their own and why a member is a leaf, the
-// kept envelopes, how many member reads the repairs made, and the read of a
-// root member back from wherever its bytes went. Holds are not here: a hold
-// is fetched again.
+// kept envelopes, the holds paged to scratch, how many member reads the
+// repairs made, and the read of a root member back from wherever its bytes
+// went. A hold in memory is not here: it is fetched again, so a graceful stop
+// pages what it can to scratch first.
 
+use std::collections::BTreeMap;
+
+use weaver_graph::holds::{Reserve, ScratchHold};
 use weaver_graph::{MemberId, NodeId, Tree};
 
-use super::{NamespaceWriter, WriteError};
-use crate::pipeline::graph::checkpoint::FileState;
+use super::{NamespaceWriter, WriteError, scratch_name};
+use crate::pipeline::graph::checkpoint::{FileState, HoldRecord};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
+use crate::pipeline::graph::leaf::Leaf;
 
 impl NamespaceWriter {
     pub(crate) fn file_state(&self, node: NodeId, member: MemberId) -> FileState {
@@ -23,7 +28,9 @@ impl NamespaceWriter {
     }
 
     // The generation of the writer's namespaces: a change to what a
-    // namespace's members hold marks it under a later one.
+    // namespace's members hold marks it under a later one. Its holds are
+    // among what it holds: every hold, take and page-out reaches the ledger
+    // through the marked map, so it marks the namespace too.
     pub(crate) fn files_generation(&self) -> u64 {
         self.files.marks().at()
     }
@@ -31,6 +38,89 @@ impl NamespaceWriter {
     // The namespaces whose members' states changed since generation `at`.
     pub(crate) fn files_changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
         self.files.marks().since(at)
+    }
+
+    // The holds the node's namespace has on scratch, once the job has paged
+    // them out for a stop; none before, so no row names bytes a later hold
+    // may replace.
+    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<ScratchHold> {
+        if !self.stopped {
+            return Vec::new();
+        }
+        self.files
+            .get(&node)
+            .map(|files| files.holds.scratch_holds())
+            .unwrap_or_default()
+    }
+
+    // A graceful stop: every namespace pages what it holds in RAM to
+    // scratch, under the same budgets as any page-out, so the checkpoint
+    // after it records them and a restart reads them back. What scratch
+    // cannot take stays in RAM and is fetched again.
+    pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
+        self.stopped = true;
+        let nodes: Vec<NodeId> = self
+            .files
+            .iter()
+            .filter(|(_, files)| files.holds.resident_bytes() > 0)
+            .map(|(node, _)| *node)
+            .collect();
+        let mut free_disk = self.free_disk_bytes();
+        for node in nodes {
+            let page_outs = self.files_mut(node).holds.page_out_all(free_disk);
+            for page_out in &page_outs {
+                free_disk = free_disk.saturating_sub(page_out.range.len());
+                self.scratch(node)?
+                    .write(page_out.scratch_offset, &page_out.bytes, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    // The holds a checkpoint recorded on scratch, adopted where they lie:
+    // the node's scratch file is opened as it was left, never emptied, and
+    // each hold goes back into its ledger. A hold of a namespace or member
+    // the tree no longer has, one past the end of the file, or one the
+    // budgets refuse is not adopted, so its article reads as missing and is
+    // fetched again. Bytes the rows do not describe are never read.
+    pub(crate) fn restore_holds(
+        &mut self,
+        tree: &Tree,
+        records: &[HoldRecord],
+    ) -> Result<(), WriteError> {
+        let mut by_node: BTreeMap<NodeId, Vec<ScratchHold>> = BTreeMap::new();
+        for record in records {
+            let member = MemberId(record.held.volume.0);
+            if tree
+                .namespace(record.node)
+                .is_some_and(|namespace| namespace.get(member).is_some())
+            {
+                by_node.entry(record.node).or_default().push(record.held);
+            }
+        }
+        for (node, holds) in by_node {
+            let scratch = Leaf::at(&self.working_dir, &scratch_name(node))?;
+            let written = scratch.len().unwrap_or(0);
+            // The file's bytes are already on disk, so the disk reserve
+            // judges them against the space they would leave if absent.
+            let mut free_disk = self.free_disk_bytes().saturating_add(written);
+            let files = self.files_mut(node);
+            let mut adopted = false;
+            for held in holds {
+                let within = held
+                    .scratch_offset
+                    .checked_add(held.range.len())
+                    .is_some_and(|end| end <= written);
+                if within && files.holds.restore(held, free_disk) == Reserve::Granted {
+                    free_disk = free_disk.saturating_sub(held.range.len());
+                    adopted = true;
+                }
+            }
+            if adopted {
+                files.scratch = Some(scratch);
+            }
+        }
+        Ok(())
     }
 
     // The node's kept envelopes.

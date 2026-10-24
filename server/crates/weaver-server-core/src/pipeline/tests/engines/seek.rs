@@ -8,7 +8,7 @@
 // recovery seek, and a recovery seek standing across a restart. Where the
 // engines part, the row names how.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 
 use weaver_graph::recovery::RepairOutcome;
@@ -619,10 +619,52 @@ async fn an_open_ended_recovery_seek_fetches_the_volume_after_the_damage() {
 }
 
 // Row 10. A graph run restarted once, the moment the recovery seek was
-// answered: the restored objects restate their wants, and the run finishes
-// in the order the whole run took, asking for nothing twice.
+// answered: the pipeline drains, so the volume heads it held go to scratch
+// and are read back; the restored objects restate their wants, and the run
+// finishes in the order the whole run took, asking for nothing twice.
 #[tokio::test]
 async fn a_recovery_seek_stands_across_a_restart() {
+    let (scenario, whole) = recovery_seek().await;
+    let (status, order, requests) = run_restarting_once(&scenario, recovering, Stop::Drained).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    assert_eq!(order, whole.order, "the restarted run's order");
+    assert!(
+        requests.values().all(|count| *count == 1),
+        "the restarted run asks for nothing twice: {requests:?}"
+    );
+}
+
+// Row 10 with the pipeline dropped instead of drained: the volume heads held
+// in RAM are lost with it and fetched again, and nothing that had a place on
+// disk is.
+#[tokio::test]
+async fn a_recovery_seek_across_a_crash_fetches_only_the_held_heads_again() {
+    let (scenario, whole) = recovery_seek().await;
+    let (status, _, requests) = run_restarting_once(&scenario, recovering, Stop::Crashed).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    let twice: Vec<(u32, u32)> = requests
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(article, _)| *article)
+        .collect();
+    assert!(!twice.is_empty(), "a crash loses the held heads");
+    assert!(
+        twice.iter().all(|(_, ordinal)| *ordinal == 0),
+        "only volume heads are fetched again: {twice:?}"
+    );
+    assert!(
+        requests.values().all(|count| *count <= 2),
+        "nothing is fetched more than once again: {requests:?}"
+    );
+    assert_eq!(
+        requests.keys().copied().collect::<BTreeSet<_>>(),
+        whole.order.iter().copied().collect::<BTreeSet<_>>(),
+        "the crashed run fetches what the whole run fetched"
+    );
+}
+
+// The store and set of row 10, and the run of it with no restart.
+async fn recovery_seek() -> (Scenario, Outcome) {
     let members = members(3, 151);
     let volumes = store_set(&members, 4);
     let mut posts = posts(&volumes);
@@ -630,19 +672,22 @@ async fn a_recovery_seek_stands_across_a_restart() {
     let scenario = Scenario::new(posts).damaged(1, 2);
     let whole = run(&scenario, Engine::Graph).await;
     assert_members(&whole, &members);
-    let recovering = |pipeline: &Pipeline| {
-        pipeline
-            .jobs
-            .get(&JOB)
-            .is_some_and(|state| state.download_queue.has_recovery_work())
-    };
-    let (status, order, requests) = run_restarting_once(&scenario, recovering).await;
-    assert_eq!(status, Some(JobStatus::Complete));
-    assert_eq!(order, whole.order, "the restarted run's order");
-    assert!(
-        requests.values().all(|count| *count == 1),
-        "the restarted run asks for nothing twice: {requests:?}"
-    );
+    (scenario, whole)
+}
+
+fn recovering(pipeline: &Pipeline) -> bool {
+    pipeline
+        .jobs
+        .get(&JOB)
+        .is_some_and(|state| state.download_queue.has_recovery_work())
+}
+
+// How a restart takes the pipeline down: drained, as a graceful stop does,
+// or dropped where it stands, as a crash does.
+#[derive(Clone, Copy)]
+enum Stop {
+    Drained,
+    Crashed,
 }
 
 // A file the set describes and no post carries is a root member the root
@@ -670,7 +715,7 @@ async fn a_root_member_the_set_announced_restores_across_a_restart() {
                 .is_some_and(|root| root.records().any(|member| member.id.0 >= posted))
         })
     };
-    let (status, _, _) = run_restarting_once(&scenario, announced).await;
+    let (status, _, _) = run_restarting_once(&scenario, announced, Stop::Drained).await;
     assert_eq!(status, Some(JobStatus::Complete));
 }
 
@@ -679,6 +724,7 @@ async fn a_root_member_the_set_announced_restores_across_a_restart() {
 async fn run_restarting_once(
     scenario: &Scenario,
     due: impl Fn(&Pipeline) -> bool,
+    stop: Stop,
 ) -> (
     Option<JobStatus>,
     Vec<(u32, u32)>,
@@ -708,7 +754,7 @@ async fn run_restarting_once(
             serve(&mut pipeline, scenario, article).await;
             if !restarted && due(&pipeline) {
                 restarted = true;
-                pipeline = restart(&temp_dir, pipeline, scenario).await;
+                pipeline = restart(&temp_dir, pipeline, scenario, stop).await;
             }
         }
         if finished(&pipeline) {
@@ -753,14 +799,19 @@ fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
     }
 }
 
-// The pipeline goes down and a new one restores the job from what reached
-// the database, as `restart.rs` does after every article.
+// The pipeline goes down as `stop` says and a new one restores the job from
+// what reached the database, as `restart.rs` does after every article.
 async fn restart(
     temp_dir: &tempfile::TempDir,
-    pipeline: Pipeline,
+    mut pipeline: Pipeline,
     scenario: &Scenario,
+    stop: Stop,
 ) -> Pipeline {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    match stop {
+        Stop::Drained => pipeline.drain().await,
+        Stop::Crashed => {}
+    }
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;
     drop(db);

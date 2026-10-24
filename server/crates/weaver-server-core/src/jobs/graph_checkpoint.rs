@@ -41,6 +41,7 @@ pub(crate) struct GraphCheckpoint {
     pub(crate) envelopes: Vec<EnvelopeRow>,
     pub(crate) crypt: Vec<CryptRow>,
     pub(crate) parts: Vec<PartRow>,
+    pub(crate) holds: Vec<HoldRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +104,18 @@ pub(crate) struct CryptRow {
     pub(crate) member: i64,
     pub(crate) run_start: i64,
     pub(crate) seed: Vec<u8>,
+}
+
+// A hold of a namespace paged to scratch: a range of one of its members,
+// named as the ledger's volume, and where its bytes start in the node's
+// scratch file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HoldRow {
+    pub(crate) node: i64,
+    pub(crate) volume: i64,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
+    pub(crate) scratch_offset: i64,
 }
 
 // One sealed part of a node's facts. Its bytes are shared with the facts
@@ -311,6 +324,32 @@ impl Row for CryptRow {
     }
 }
 
+impl Row for HoldRow {
+    type Key = (i64, i64, i64);
+    const TABLE: &'static str = "graph_holds";
+    const KEY: &'static [&'static str] = &["node_id", "volume", "range_start"];
+    const COLUMNS: &'static str = "job_id, node_id, volume, range_start, range_end, scratch_offset";
+
+    fn key(&self) -> (i64, i64, i64) {
+        (self.node, self.volume, self.start)
+    }
+
+    fn key_args(key: &(i64, i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1), SqlArg::I64(key.2)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.node),
+            SqlArg::I64(self.volume),
+            SqlArg::I64(self.start),
+            SqlArg::I64(self.end),
+            SqlArg::I64(self.scratch_offset),
+        ]
+    }
+}
+
 impl Row for PartRow {
     type Key = (i64, i64);
     const TABLE: &'static str = "graph_facts_parts";
@@ -355,6 +394,7 @@ pub(crate) struct Delta {
     pub(crate) envelopes: Changes<EnvelopeRow>,
     pub(crate) crypt: Changes<CryptRow>,
     pub(crate) parts: Changes<PartRow>,
+    pub(crate) holds: Changes<HoldRow>,
 }
 
 impl Delta {
@@ -368,6 +408,7 @@ impl Delta {
         changes(&mut self.envelopes, &before.envelopes, &after.envelopes);
         changes(&mut self.crypt, &before.crypt, &after.crypt);
         changes(&mut self.parts, &before.parts, &after.parts);
+        changes(&mut self.holds, &before.holds, &after.holds);
     }
 
     // This change followed by `later`, as one.
@@ -382,6 +423,7 @@ impl Delta {
         self.envelopes.extend(later.envelopes);
         self.crypt.extend(later.crypt);
         self.parts.extend(later.parts);
+        self.holds.extend(later.holds);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -396,6 +438,7 @@ impl Delta {
             + self.envelopes.len()
             + self.crypt.len()
             + self.parts.len()
+            + self.holds.len()
     }
 
     // How many bytes of facts it writes.
@@ -489,6 +532,7 @@ async fn write_delta(tx: &mut SqlTx<'_>, job_id: JobId, delta: &Delta) -> Result
     write(tx, id, &delta.envelopes).await?;
     write(tx, id, &delta.crypt).await?;
     write(tx, id, &delta.parts).await?;
+    write(tx, id, &delta.holds).await?;
     Ok(())
 }
 
@@ -674,6 +718,24 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
+    let holds = tx
+        .fetch_all(
+            "SELECT node_id, volume, range_start, range_end, scratch_offset \
+             FROM graph_holds WHERE job_id = {} ORDER BY node_id, volume, range_start",
+            &args,
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            Ok(HoldRow {
+                node: row.i64("node_id")?,
+                volume: row.i64("volume")?,
+                start: row.i64("range_start")?,
+                end: row.i64("range_end")?,
+                scratch_offset: row.i64("scratch_offset")?,
+            })
+        })
+        .collect::<Result<_, StateError>>()?;
     Ok(Some(GraphCheckpoint {
         nodes,
         members,
@@ -681,5 +743,6 @@ async fn read_checkpoint(
         envelopes,
         crypt,
         parts,
+        holds,
     }))
 }

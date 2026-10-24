@@ -3,7 +3,9 @@
 
 use std::sync::Mutex;
 
-use weaver_graph::holds::HoldBudgets;
+use weaver_graph::holds::{HoldBudgets, ScratchHold};
+
+use crate::pipeline::graph::checkpoint::HoldRecord;
 use weaver_graph::recovery::{MemberAccess, Recovery, RepairOutcome, SliceVerdict};
 use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, RecoveryKind, Seek};
 
@@ -630,6 +632,114 @@ fn held_bytes_paged_to_scratch_come_back_intact() {
     job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rarxback");
     assert_eq!(job.accountant.usage().scratch, 0);
+}
+
+// A hold paged to scratch under pressure is not a record: its span is
+// reused once nothing lives on scratch, so only a stop's page-out, after
+// which nothing is held again, is written down.
+#[test]
+fn holds_paged_out_under_pressure_are_not_recorded_before_a_stop() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 4,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    });
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 6, b"world", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().scratch, 5);
+    assert!(job.writer.hold_records(NodeId::ROOT).is_empty());
+
+    job.writer.page_out_holds().expect("page out");
+    assert_eq!(job.writer.hold_records(NodeId::ROOT).len(), 2);
+}
+
+#[test]
+fn holds_paged_out_at_a_stop_read_back_in_a_writer_rebuilt_from_their_records() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 6, b"world", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().resident, 7);
+
+    job.writer.page_out_holds().expect("page out");
+    assert_eq!(job.accountant.usage().resident, 0);
+    assert_eq!(job.accountant.usage().scratch, 7);
+    let records: Vec<HoldRecord> = job
+        .writer
+        .hold_records(NodeId::ROOT)
+        .into_iter()
+        .map(|held| HoldRecord {
+            node: NodeId::ROOT,
+            held,
+        })
+        .collect();
+    assert_eq!(records.len(), 2);
+
+    // The process goes away; its scratch file stays.
+    let writer = std::mem::replace(
+        &mut job.writer,
+        NamespaceWriter::new(
+            1,
+            job.dir.path().to_path_buf(),
+            Arc::clone(&job.accountant),
+            CapacityReader::unknown(),
+        ),
+    );
+    drop(writer);
+    assert_eq!(job.accountant.usage().scratch, 0);
+
+    job.writer
+        .restore_holds(&job.tree, &records)
+        .expect("restore holds");
+    assert_eq!(job.accountant.usage().scratch, 7);
+    let mut bytes = Vec::new();
+    assert!(job.writer.access(&job.tree).read_at(
+        NodeId::ROOT,
+        member,
+        ByteRange::new(6, 11),
+        &mut bytes
+    ));
+    assert_eq!(bytes, b"world");
+    bytes.clear();
+    assert!(job.writer.access(&job.tree).read_at(
+        NodeId::ROOT,
+        member,
+        ByteRange::new(0, 2),
+        &mut bytes
+    ));
+    assert_eq!(bytes, b"Ra");
+
+    // And they go down as any hold does once the member is decided.
+    job.send(member, 2, b"ws, ", Provenance::Fresh);
+    assert_eq!(job.file("notes.bin"), b"Raws, world");
+    assert_eq!(job.accountant.usage().scratch, 0);
+}
+
+#[test]
+fn a_hold_record_past_its_scratch_file_is_not_adopted() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("notes.bin", Some(11));
+    let records = [HoldRecord {
+        node: NodeId::ROOT,
+        held: ScratchHold {
+            volume: VolumeIndex(member.0),
+            range: ByteRange::new(6, 11),
+            scratch_offset: 0,
+        },
+    }];
+    job.writer
+        .restore_holds(&job.tree, &records)
+        .expect("restore holds");
+    assert_eq!(job.accountant.usage().scratch, 0);
+    let mut bytes = Vec::new();
+    assert!(!job.writer.access(&job.tree).read_at(
+        NodeId::ROOT,
+        member,
+        ByteRange::new(6, 11),
+        &mut bytes
+    ));
 }
 
 #[test]

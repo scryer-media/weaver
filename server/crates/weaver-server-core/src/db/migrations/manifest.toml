@@ -846,3 +846,20 @@ kind = "sql"
 file = "migrations/0071_graph_member_unusable_dropped/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 72
+description = "a graph checkpoint records where each hold paged to scratch lies in its scratch file"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0072_graph_holds_scratch_offset/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0072_graph_holds_scratch_offset/postgres.sql"
+engine = "postgres"
+scope = "all"
