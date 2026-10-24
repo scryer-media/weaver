@@ -34,7 +34,17 @@ impl ServersQuery {
             .into_iter()
             .map(|snapshot| (snapshot.server_id, snapshot))
             .collect::<std::collections::HashMap<_, _>>();
-        let tls_diagnostics = load_tls_diagnostics_by_server(db).await?;
+        // TLS diagnostics decorate the rows; a failure to load them leaves the
+        // rows undecorated instead of failing the list.
+        let tls_diagnostics = load_tls_diagnostics_by_server(db)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    error = ?error.message,
+                    "could not load server TLS diagnostics; listing servers without them"
+                );
+                std::collections::HashMap::new()
+            });
         Ok(
             with_timed_config_read(config, "servers.query.servers", |cfg| {
                 cfg.servers
@@ -63,7 +73,15 @@ impl ServersQuery {
                 "servers.query.server.tls_diagnostics",
                 move || db.server_tls_diagnostics(id),
             )
-            .await?
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    server_id = id,
+                    error = ?error.message,
+                    "could not load server TLS diagnostics; loading the server without them"
+                );
+                None
+            })
         };
         Ok(
             with_timed_config_read(config, "servers.query.server", |cfg| {
