@@ -228,7 +228,10 @@ impl SupportedTracker {
             "http" | "https" => Some(SupportedTracker::Http(url)),
             "udp" => Some(SupportedTracker::Udp(url)),
             _ => {
-                debug!("unsupported tracker URL: {}", url);
+                debug!(
+                    "unsupported tracker URL: {}",
+                    redacted_tracker_url(url.as_str())
+                );
                 None
             }
         }
@@ -237,10 +240,31 @@ impl SupportedTracker {
 
 impl std::fmt::Debug for SupportedTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SupportedTracker::Udp(u) => std::fmt::Display::fmt(u, f),
-            SupportedTracker::Http(u) => std::fmt::Display::fmt(u, f),
-        }
+        f.write_str(&redacted_tracker_url(self.url().as_str()))
+    }
+}
+
+/// A tracker as logs and read-only views show it: its scheme, host and
+/// port. Its user, path and query, where a private tracker puts the
+/// passkey, are left out.
+pub fn redacted_tracker_url(url: &str) -> String {
+    let Ok(url) = Url::parse(url) else {
+        return "…".to_owned();
+    };
+    let (scheme, host) = (url.scheme(), url.host_str().unwrap_or_default());
+    match url.port_or_known_default() {
+        Some(port) => format!("{scheme}://{host}:{port}/…"),
+        None => format!("{scheme}://{host}/…"),
+    }
+}
+
+/// `e` without the URL an HTTP client error names, which carries the
+/// tracker's passkey. Every tracker request's error passes through it
+/// before it is logged or kept as the tracker's message.
+fn without_url(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast::<reqwest::Error>() {
+        Ok(e) => e.without_url().into(),
+        Err(e) => e,
     }
 }
 
@@ -972,17 +996,18 @@ impl Scraper {
             match tracker {
                 SupportedTracker::Http(url) => {
                     self.scrape_http(url, info_hash)
-                        .instrument(trace_span!("http_scrape", tracker = %url))
+                        .instrument(trace_span!("http_scrape", ?tracker))
                         .await
                 }
                 SupportedTracker::Udp(url) => {
                     self.scrape_udp(url, info_hash)
-                        .instrument(trace_span!("udp_scrape", tracker = %url))
+                        .instrument(trace_span!("udp_scrape", ?tracker))
                         .await
                 }
             }
         })
         .await
+        .map_err(without_url)
     }
 
     async fn scrape_http(&self, tracker_url: &Url, info_hash: Id20) -> anyhow::Result<ScrapeOk> {
@@ -1946,17 +1971,18 @@ impl TrackerComms {
             match tracker {
                 SupportedTracker::Http(url) => {
                     self.announce_http(url, event, stats)
-                        .instrument(trace_span!("http_tracker", tracker = %url))
+                        .instrument(trace_span!("http_tracker", ?tracker))
                         .await
                 }
                 SupportedTracker::Udp(url) => {
                     self.announce_udp(url, event, stats)
-                        .instrument(trace_span!("udp_tracker", tracker = %url))
+                        .instrument(trace_span!("udp_tracker", ?tracker))
                         .await
                 }
             }
         })
         .await
+        .map_err(without_url)
     }
 
     async fn announce_http(
@@ -2142,6 +2168,163 @@ mod tests {
 
     fn http(name: &str) -> SupportedTracker {
         SupportedTracker::Http(Url::parse(&format!("http://{name}/announce")).unwrap())
+    }
+
+    /// A private tracker's URL: a user, a passkey in the path, one in the
+    /// query.
+    const PRIVATE: &str = "https://member:pw@tracker.example:8443/0123passkey/announce?pk=s3cret";
+
+    /// Whether `text` names any part of [`PRIVATE`] past its host and port,
+    /// or of `url`'s path and query.
+    fn leaks(text: &str, url: &Url) -> bool {
+        [
+            "member",
+            "pw@",
+            "0123passkey",
+            "s3cret",
+            url.path(),
+            url.query().unwrap_or("?"),
+        ]
+        .iter()
+        .any(|secret| text.contains(secret))
+    }
+
+    #[test]
+    fn a_tracker_shows_only_its_scheme_host_and_port() {
+        let url = Url::parse(PRIVATE).unwrap();
+        let shown = format!("{:?}", SupportedTracker::new(url.clone()).unwrap());
+        assert_eq!(shown, "https://tracker.example:8443/…");
+        assert!(!leaks(&shown, &url), "{shown}");
+        let udp = Url::parse("udp://tracker.example:6969/0123passkey/announce").unwrap();
+        assert_eq!(
+            format!("{:?}", SupportedTracker::new(udp).unwrap()),
+            "udp://tracker.example:6969/…"
+        );
+        assert_eq!(
+            super::redacted_tracker_url("http://[::1]/announce?pk=s3cret"),
+            "http://[::1]:80/…"
+        );
+        assert_eq!(super::redacted_tracker_url("not a url"), "…");
+    }
+
+    /// Every log line written while it is the thread's subscriber.
+    #[derive(Clone, Default)]
+    struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Lines {
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let lines = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new("weaver_torrent=trace"))
+                    .with_ansi(false)
+                    .with_writer(move || lines.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// The URL of a loopback tracker with a passkey in its path and query.
+    async fn private_listener() -> (tokio::net::TcpListener, Url) {
+        let (listener, url) = http_listener().await;
+        let url = Url::parse(&format!("{url}/0123passkey?pk=s3cret")).unwrap();
+        (listener, url)
+    }
+
+    #[tokio::test]
+    async fn an_answered_announce_logs_no_passkey() {
+        let lines = Lines::default();
+        let _capture = lines.capture();
+        let (listener, url) = private_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        answer(&listener, &mut peers, "d8:intervali1800e5:peers0:e").await;
+        // The row is set after the answer is logged.
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = rx.wait_for(|a| a[0].last.is_some()) => { r.unwrap(); }
+        }
+        let text = lines.text();
+        assert!(text.contains("tracker answered"), "{text}");
+        assert!(text.contains(&format!("{:?}", http_of(&url))), "{text}");
+        assert!(!leaks(&text, &url), "{text}");
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_failed_announce_logs_and_keeps_no_passkey() {
+        let lines = Lines::default();
+        let _capture = lines.capture();
+        let (listener, url) = private_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        let mut rx = status.subscribe();
+        // The tracker hangs up on the request: the client's error names
+        // the URL it sent it to.
+        tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = async {
+                drop(read_announce(&listener).await);
+                rx.wait_for(|a| a[0].last.is_some()).await.map(|_| ())
+            } => r.unwrap(),
+        }
+        let error = status.announces()[0]
+            .last
+            .clone()
+            .unwrap()
+            .result
+            .unwrap_err();
+        assert!(!leaks(&error.message, &url), "{error}");
+        let text = lines.text();
+        assert!(text.contains("error calling tracker"), "{text}");
+        assert!(!leaks(&text, &url), "{text}");
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_client_error_is_mapped_without_its_url() {
+        let (listener, url) = private_listener().await;
+        let hang_up = async {
+            drop(read_request(&listener).await);
+        };
+        let (sent, ()) = tokio::join!(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(url.clone())
+                .send(),
+            hang_up
+        );
+        let e = anyhow::Error::from(sent.unwrap_err());
+        assert!(
+            leaks(&format!("{e:#}"), &url),
+            "the client's error names the URL"
+        );
+        let mapped = format!("{:#}", super::without_url(e));
+        assert!(!leaks(&mapped, &url), "{mapped}");
+    }
+
+    fn http_of(url: &Url) -> SupportedTracker {
+        SupportedTracker::Http(url.clone())
     }
 
     fn live(downloaded: u64, left: u64, completed_during_run: bool) -> TrackerCommsStats {

@@ -457,20 +457,23 @@ fn a_trackers_status_reads_as_the_clients_number() {
         TrackerStatus::Unreachable,
     ]
     .into_iter()
-    .map(|status| tracker_json(&tracker(status))["status"].clone())
+    .map(|status| tracker_json(&tracker(status), CallerScope::Admin)["status"].clone())
     .collect();
     assert_eq!(numbers, [0, 1, 2, 4, 5, 6]);
 
-    let working = tracker_json(&TorrentTracker {
-        updating: true,
-        seeders: Some(3),
-        leechers: Some(5),
-        downloaded: Some(9),
-        peers: Some(7),
-        next_announce_ms: Some(1_800_500),
-        min_announce_ms: Some(30_000),
-        ..tracker(TrackerStatus::Working)
-    });
+    let working = tracker_json(
+        &TorrentTracker {
+            updating: true,
+            seeders: Some(3),
+            leechers: Some(5),
+            downloaded: Some(9),
+            peers: Some(7),
+            next_announce_ms: Some(1_800_500),
+            min_announce_ms: Some(30_000),
+            ..tracker(TrackerStatus::Working)
+        },
+        CallerScope::Admin,
+    );
     assert_eq!(
         working,
         serde_json::json!({
@@ -488,10 +491,13 @@ fn a_trackers_status_reads_as_the_clients_number() {
             "endpoints": [],
         })
     );
-    let failed = tracker_json(&TorrentTracker {
-        message: Some("refused".into()),
-        ..tracker(TrackerStatus::NotWorking)
-    });
+    let failed = tracker_json(
+        &TorrentTracker {
+            message: Some("refused".into()),
+            ..tracker(TrackerStatus::NotWorking)
+        },
+        CallerScope::Admin,
+    );
     assert_eq!(
         (&failed["status"], &failed["num_seeds"], &failed["msg"]),
         (&Value::from(4), &Value::from(-1), &Value::from("refused"))
@@ -2285,4 +2291,40 @@ async fn trackers_are_added_edited_removed_and_reannounced() {
         )
         .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_read_key_sees_no_trackers_passkey() {
+    const PRIVATE: &str = "https://tracker.invalid:8443/0123passkey/announce?pk=s3cret";
+    let rig = rig().await;
+    let added = rig.add_file(&metainfo("one.mkv", 3000, true), &[]).await;
+    assert_eq!(added.status, StatusCode::OK);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let reply = rig
+        .post(
+            "/api/v2/torrents/addTrackers",
+            &format!("hash={hash}&urls={}", url_encode(PRIVATE)),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let urls = |key: &'static str| {
+        let (rig, hash) = (&rig, &hash);
+        async move {
+            let rows = rig
+                .send(
+                    Request::get(format!("/api/v2/torrents/trackers?hash={hash}"))
+                        .header("x-api-key", key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .json();
+            rows.as_array().unwrap()[3..]
+                .iter()
+                .map(|row| row["url"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(urls(READER).await, ["https://tracker.invalid:8443/…"]);
+    assert_eq!(urls(ADMIN).await, [PRIVATE]);
 }

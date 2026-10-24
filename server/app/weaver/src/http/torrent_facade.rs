@@ -40,7 +40,7 @@ use weaver_server_core::torrents::service::{
 };
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TrackerEntry, TrackerStatus, status,
+    TorrentTracker, TrackerEntry, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
@@ -492,7 +492,7 @@ async fn handle(
         ("torrents", "info") => torrents_info(&ctx, &params).await,
         ("torrents", "properties") => properties(&ctx, &params).await,
         ("torrents", "files") => files(&ctx, &params).await,
-        ("torrents", "trackers") => trackers(&ctx, &params).await,
+        ("torrents", "trackers") => trackers(&ctx, &params, scope).await,
         ("torrents", "add") => add(&ctx, params).await,
         ("torrents", "delete") => delete(&ctx, &params).await,
         // Every torrent at once is one hold, which leaves each torrent's
@@ -1019,7 +1019,7 @@ fn tracker_status(status: TrackerStatus) -> u8 {
 
 // `torrents/trackers` (qBittorrent `TorrentsController::trackersAction`):
 // the DHT, PeX and LSD rows, then the torrent's trackers.
-async fn trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+async fn trackers(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScope) -> Response {
     let Some(torrents) = &ctx.inner.torrents else {
         return not_found();
     };
@@ -1043,7 +1043,11 @@ async fn trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             ("** [LSD] **", PeerSourceFlag::Lsd, LSD),
         ],
     );
-    list.extend(view.trackers.iter().map(tracker_json));
+    list.extend(
+        view.trackers
+            .iter()
+            .map(|tracker| tracker_json(tracker, scope)),
+    );
     axum::Json(list).into_response()
 }
 
@@ -1083,12 +1087,18 @@ fn sticky_trackers(
 }
 
 // qBittorrent `getTrackers`, each time in seconds since the epoch and -1
-// for a count the tracker has not given.
-fn tracker_json(tracker: &TorrentTracker) -> Value {
+// for a count the tracker has not given. A caller that may change trackers
+// sees the whole URL; one that only reads, its scheme, host and port.
+fn tracker_json(tracker: &TorrentTracker, scope: CallerScope) -> Value {
     let count = |value: Option<u32>| value.map_or(-1, i64::from);
     let seconds = |ms: Option<i64>| ms.map_or(0, |ms| ms / 1000);
+    let url = if scope.can_control() {
+        tracker.url.clone()
+    } else {
+        redacted_tracker_url(&tracker.url)
+    };
     json!({
-        "url": tracker.url,
+        "url": url,
         "tier": tracker.tier,
         "updating": tracker.updating,
         "status": tracker_status(tracker.status),

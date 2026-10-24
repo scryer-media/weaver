@@ -114,6 +114,15 @@ impl Rig {
             .data(self.torrents.clone());
         self.harness.schema.execute(request).await
     }
+
+    // `query` as an API key of `scope` asks it.
+    async fn execute_as_key(&self, query: &str, scope: CallerScope) -> Response {
+        let request = Request::new(query)
+            .data(scope)
+            .data(CallerIdentity::ApiKey([9; 32]))
+            .data(self.torrents.clone());
+        self.harness.schema.execute(request).await
+    }
 }
 
 fn bstr(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -1062,6 +1071,62 @@ async fn a_torrents_trackers_are_listed_and_edited() {
         let unknown = rig.execute(query).await;
         assert_eq!(code(&unknown).as_deref(), Some("NOT_FOUND"), "{query}");
     }
+}
+
+// A key that only reads sees a tracker's scheme, host and port, never the
+// passkey in its path or query; a key that controls sees the whole URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_key_sees_no_trackers_passkey() {
+    const PRIVATE: &str = "https://tracker.invalid:8443/0123passkey/announce?pk=s3cret";
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("one.mkv", 3000, false), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let added = rig
+        .execute(&format!(
+            r#"mutation {{ addTorrentTrackers(id: {id}, urls: ["{PRIVATE}"]) }}"#
+        ))
+        .await;
+    assert!(added.errors.is_empty(), "{:?}", added.errors);
+    let urls = |scope: CallerScope| {
+        let rig = &rig;
+        async move {
+            let response = rig
+                .execute_as_key(
+                    &format!(
+                        "{{ torrentTrackers(id: {id}) {{ url }} torrent(id: {id}) {{ trackers {{ url }} }} }}"
+                    ),
+                    scope,
+                )
+                .await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            let data = response.data.into_json().unwrap();
+            [
+                data["torrentTrackers"][0]["url"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+                data["torrent"]["trackers"][0]["url"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ]
+        }
+    };
+    let shown = "https://tracker.invalid:8443/…".to_owned();
+    assert_eq!(urls(CallerScope::Read).await, [shown.clone(), shown]);
+    assert_eq!(
+        urls(CallerScope::Admin).await,
+        [PRIVATE.to_owned(), PRIVATE.to_owned()]
+    );
+    assert_eq!(
+        urls(CallerScope::Control).await,
+        [PRIVATE.to_owned(), PRIVATE.to_owned()]
+    );
 }
 
 // Every route is listed with the scopes that run on it; one whose leg is

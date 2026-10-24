@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use async_graphql::{Enum, InputObject, SimpleObject};
+use async_graphql::{ComplexObject, Context, Enum, InputObject, Result, SimpleObject};
+use weaver_server_core::auth::CallerScope;
 use weaver_server_core::proxies::TorrentScope;
 use weaver_server_core::torrents::service::{
     ScheduleSeeding, SeedingSource, TorrentRoute, TorrentView,
@@ -9,7 +10,7 @@ use weaver_server_core::torrents::service::{
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FilePriority, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TorrentVersion, TrackerEntry, TrackerStatus,
+    TorrentTracker, TorrentVersion, TrackerEntry, TrackerStatus, redacted_tracker_url,
 };
 
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
@@ -311,9 +312,10 @@ pub struct TorrentFileGql {
 }
 
 #[derive(Clone, Debug, SimpleObject)]
-#[graphql(name = "TorrentTracker")]
+#[graphql(name = "TorrentTracker", complex)]
 pub struct TorrentTrackerGql {
     pub tier: u32,
+    #[graphql(skip)]
     pub url: String,
     pub status: TrackerStatusGql,
     /// An announce to it is in flight.
@@ -350,6 +352,19 @@ impl From<TorrentTracker> for TorrentTrackerGql {
             next_announce_ms: tracker.next_announce_ms,
             min_announce_ms: tracker.min_announce_ms,
         }
+    }
+}
+
+#[ComplexObject]
+impl TorrentTrackerGql {
+    /// The tracker's whole URL to a caller that may change trackers;
+    /// its scheme, host and port to one that only reads.
+    async fn url(&self, ctx: &Context<'_>) -> Result<String> {
+        Ok(if ctx.data::<CallerScope>()?.can_control() {
+            self.url.clone()
+        } else {
+            redacted_tracker_url(&self.url)
+        })
     }
 }
 
