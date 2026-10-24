@@ -5,7 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-mod bprotocol;
+pub(crate) mod bprotocol;
 mod dht;
 mod error;
 mod peer_store;

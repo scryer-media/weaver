@@ -6,7 +6,9 @@
 
 use std::collections::BTreeSet;
 
-use weaver_torrent::{AnnounceErrorKind, TorrentStats, TorrentStatsState, TrackerAnnounce};
+use weaver_torrent::{
+    AnnounceErrorKind, FetchPhase, TorrentStats, TorrentStatsState, TrackerAnnounce,
+};
 
 use crate::jobs::JobId;
 use crate::jobs::handle::HoldTarget;
@@ -132,6 +134,8 @@ impl Held {
 pub struct Observed {
     pub engine: Engine,
     pub has_metadata: bool,
+    /// Where its metadata fetch asks for peers, while one runs.
+    pub fetch: Option<FetchPhase>,
     pub complete: bool,
     /// What the operator asked.
     pub intent: TorrentIntent,
@@ -187,7 +191,10 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         return (held.state(), Some(held.detail(seen.seeding())));
     }
     if !seen.has_metadata {
-        return (TorrentState::FetchingMetadata, None);
+        return (
+            TorrentState::FetchingMetadata,
+            seen.fetch.map(|phase| phase.to_string()),
+        );
     }
     if seen.queued {
         return (TorrentState::Queued, None);
@@ -466,6 +473,7 @@ mod tests {
         Observed {
             engine,
             has_metadata: true,
+            fetch: None,
             complete: false,
             intent: TorrentIntent::Resumed,
             queued: false,
@@ -473,6 +481,25 @@ mod tests {
             failed: None,
             held: None,
             moving: false,
+        }
+    }
+
+    // A magnet fetching its metadata says where it asks for peers.
+    #[test]
+    fn a_fetch_names_where_it_asks_for_peers() {
+        for (phase, detail) in [
+            (FetchPhase::Trackers, "trackers"),
+            (FetchPhase::Discovery, "trackers, DHT, LSD"),
+            (FetchPhase::Waiting, "no peers from trackers"),
+        ] {
+            assert_eq!(
+                project(&Observed {
+                    has_metadata: false,
+                    fetch: Some(phase),
+                    ..seen(Engine::Absent)
+                }),
+                (TorrentState::FetchingMetadata, Some(detail.to_owned()))
+            );
         }
     }
 

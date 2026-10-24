@@ -57,7 +57,10 @@ impl TorrentService {
             .filter(|(id, _)| job_id.is_none_or(|job_id| **id == job_id))
             .filter_map(|(_, torrent)| match &torrent.attached {
                 Some(attached) => attached.handle.tracker_status(),
-                None => torrent.fetching.clone(),
+                None => torrent
+                    .fetching
+                    .as_ref()
+                    .and_then(|fetch| fetch.trackers.clone()),
             })
             .map(|table| table.subscribe())
             .collect()

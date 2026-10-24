@@ -43,8 +43,8 @@ use crate::torrent_state::live::{
     web_seed::WebSeeds,
 };
 use crate::tracker::{
-    AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerComms, TrackerHandover,
-    TrackerTask, UdpTrackerClient, Unreachable,
+    AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerAnnounce, TrackerComms,
+    TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
     PortMapEvents, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
@@ -587,12 +587,11 @@ pub struct AddTorrentOptions {
     /// until one is set. Not read for any other torrent.
     #[serde(skip)]
     pub ssl_identity: Option<SslIdentity>,
-    /// For a magnet: receives the announce table its metadata fetch
-    /// announces from, as the fetch starts, so the trackers' answers can be
-    /// read while the metadata is fetched. Not sent when the metadata is
-    /// given or trackers are off.
+    /// For a magnet: receives its metadata fetch as the fetch starts, so the
+    /// trackers' answers and where it asks for peers can be read while the
+    /// metadata is fetched. Not sent when the metadata is given.
     #[serde(skip)]
-    pub metadata_trackers: Option<tokio::sync::oneshot::Sender<crate::tracker::TrackerStatus>>,
+    pub metadata_fetch: Option<tokio::sync::oneshot::Sender<MetadataFetch>>,
     /// The tracker task a metadata fetch of this torrent on this session
     /// announced from (see [`ListOnlyResponse::trackers`]): a run started
     /// by this add takes it over, so its trackers hear one torrent, and
@@ -638,7 +637,7 @@ impl Default for AddTorrentOptions {
             super_seeding: false,
             trackers_only: false,
             ssl_identity: None,
-            metadata_trackers: None,
+            metadata_fetch: None,
             tracker_handover: None,
         }
     }
@@ -1132,6 +1131,83 @@ fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<url::Url>>> {
 /// exchange, nor announces to any tracker but its own.
 pub(crate) const fn trackers_only(private: bool, added_trackers_only: bool) -> bool {
     private || added_trackers_only
+}
+
+/// Where a magnet's metadata fetch asks for peers. Until its metadata says
+/// whether it is private, it asks its own trackers alone, and goes on to
+/// the DHT and local discovery only once they named no peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchPhase {
+    /// Its own trackers, until one names a peer, one answers, or every one
+    /// fails.
+    Trackers,
+    /// Its trackers, the DHT and local discovery: no tracker named a peer.
+    Discovery,
+    /// No tracker named a peer, and there is no discovery to go on to.
+    Waiting,
+}
+
+impl FetchPhase {
+    /// The phase of a fetch whose trackers stand at `table`, with discovery
+    /// to go on to or not. The trackers are done without a peer once one
+    /// answered and none named a peer, or once every one failed; a fetch
+    /// with no tracker is done at once.
+    fn of(table: &[TrackerAnnounce], discovery: bool) -> Self {
+        let results = || table.iter().map(|t| t.last.as_ref().map(|l| &l.result));
+        let named_peer = results().any(|r| matches!(r, Some(Ok(ok)) if ok.peers > 0));
+        let done = results().any(|r| matches!(r, Some(Ok(_))))
+            || results().all(|r| matches!(r, Some(Err(_))));
+        match (done && !named_peer, discovery) {
+            (false, _) => Self::Trackers,
+            (true, true) => Self::Discovery,
+            (true, false) => Self::Waiting,
+        }
+    }
+}
+
+impl std::fmt::Display for FetchPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Trackers => "trackers",
+            Self::Discovery => "trackers, DHT, LSD",
+            Self::Waiting => "no peers from trackers",
+        })
+    }
+}
+
+/// A magnet's metadata fetch, while it runs.
+#[derive(Clone, Debug)]
+pub struct MetadataFetch {
+    /// The announce table it announces from, unless trackers are off.
+    pub trackers: Option<TrackerStatus>,
+    /// Where it asks for peers now.
+    pub phase: tokio::sync::watch::Receiver<FetchPhase>,
+}
+
+/// Follows a fetch's announce table into `phase`: returns once the fetch
+/// goes on to discovery, and never while it does not.
+async fn follow_fetch(
+    mut table: Option<tokio::sync::watch::Receiver<Vec<TrackerAnnounce>>>,
+    discovery: bool,
+    phase: tokio::sync::watch::Sender<FetchPhase>,
+) {
+    loop {
+        let now = match &mut table {
+            Some(table) => FetchPhase::of(&table.borrow_and_update(), discovery),
+            None => FetchPhase::of(&[], discovery),
+        };
+        phase.send_if_modified(|was| std::mem::replace(was, now) != now);
+        if now == FetchPhase::Discovery {
+            return;
+        }
+        let moved = match &mut table {
+            Some(table) => table.changed().await.is_ok(),
+            None => false,
+        };
+        if !moved {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// The tiers a torrent announces to: its own tiers in order, then each of
@@ -2340,33 +2416,65 @@ impl Session {
         let (metadata, peer_list) = match metadata {
             Some(metadata) => (metadata, peer_list),
             None => {
-                if (opts.trackers_only || (self.dht.is_none() && self.lsd.is_none()))
-                    && tracker_tiers.is_empty()
+                // The DHT and local discovery, when the session runs either
+                // and the torrent was not added to take peers from its
+                // trackers alone.
+                let discovery = !opts.trackers_only && (self.dht.is_some() || self.lsd.is_some());
+                if self.disable_trackers
+                    && !discovery
                     && opts.initial_peers.as_ref().is_none_or(Vec::is_empty)
                 {
                     bail!("no known way to resolve peers (no DHT, no trackers, no initial_peers)");
                 }
                 // Whether the torrent is private is known only once its
-                // metadata arrives.
+                // metadata arrives: until then it is taken to be, and asks
+                // its own trackers alone.
                 handover = handover.or_else(|| {
                     self.start_trackers(
                         info_hashes,
                         &identity,
                         tracker_tiers.clone(),
                         opts.force_tracker_interval,
-                        trackers_only(false, opts.trackers_only),
+                        true,
                         None,
                     )
                     .map(TrackerHandover::new)
                 });
                 let fetched = handover.as_ref().map(TrackerHandover::task);
-                if let (Some(tx), Some(fetched)) = (opts.metadata_trackers.take(), &fetched) {
-                    let _ = tx.send(fetched.status.clone());
+                let table = fetched.as_ref().map(|task| task.status.clone());
+                let (phase_tx, phase) = tokio::sync::watch::channel(FetchPhase::of(
+                    &table
+                        .as_ref()
+                        .map(TrackerStatus::announces)
+                        .unwrap_or_default(),
+                    discovery,
+                ));
+                if let Some(tx) = opts.metadata_fetch.take() {
+                    let _ = tx.send(MetadataFetch {
+                        trackers: table.clone(),
+                        phase,
+                    });
                 }
-                let PeerSource { peers, .. } = make_peer_rx(info_hashes, &identity, false, fetched)
-                    .context(
-                        "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
-                    )?;
+                let asked_first =
+                    make_peer_rx(info_hashes, &identity, true, fetched).map(|source| source.peers);
+                // The DHT and local discovery, once the trackers named no
+                // peer.
+                let then = {
+                    let session = self.clone();
+                    let dht_announce = dht_announce.subscribe();
+                    async move {
+                        follow_fetch(table.map(|t| t.subscribe()), discovery, phase_tx).await;
+                        session
+                            .discovery_peers(info_hashes, false, dht_announce, None)
+                            .unwrap_or_else(|| futures::stream::empty().boxed())
+                    }
+                    .flatten_stream()
+                    .boxed()
+                };
+                let peers = match asked_first {
+                    Some(first) => merge_streams(first, then).boxed(),
+                    None => then,
+                };
                 let resolved_magnet = self
                     .resolve_magnet(
                         info_hashes,
@@ -2851,55 +2959,10 @@ impl Session {
         if ssl.is_some_and(|ssl| !ssl.has_identity()) {
             return None;
         }
-        // The port the torrent's peers are told to reach it at: an SSL
-        // torrent's is the SSL listener's.
-        let port = || match ssl {
-            Some(_) => self.ssl_port.subscribe(),
-            None => self.announce_port.subscribe(),
-        };
-        let dht_rx = if trackers_only {
+        let discovery_rx = if trackers_only {
             None
         } else {
-            self.dht.as_ref().map(|dht| {
-                futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    dht_peers(
-                        dht.clone(),
-                        info_hash,
-                        if announce {
-                            port()
-                        } else {
-                            tokio::sync::watch::channel(None).1
-                        },
-                        dht_announce.clone(),
-                    )
-                }))
-            })
-        };
-
-        // Each source starts when the torrent first asks it for peers, which
-        // is once it is checked and running: trackers and the DHT by their
-        // streams, the LSD by registering here (libtorrent
-        // `torrent::start_announcing` runs only after `files_checked`, never
-        // while paused).
-        let lsd_rx = if trackers_only {
-            None
-        } else {
-            self.lsd.as_ref().map(|lsd| {
-                // Local peers reach the listen port itself.
-                let port = if !announce {
-                    None
-                } else if ssl.is_some() {
-                    *self.ssl_port.borrow()
-                } else {
-                    self.announce_port.configured
-                };
-                futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
-                    let lsd = lsd.clone();
-                    futures::stream::once(async move { lsd.announce(info_hash, port) })
-                        .flatten()
-                        .boxed()
-                }))
-            })
+            self.discovery_peers(info_hashes, announce, dht_announce, ssl)
         };
 
         let (tracker_rx, trackers) = trackers
@@ -2926,15 +2989,71 @@ impl Session {
         let named = |source| move |addr| (addr, source);
         merge_two_optional_streams(
             merge_two_optional_streams(
-                merge_two_optional_streams(
-                    dht_rx.map(|s| s.map(named(PeerSourceFlag::Dht))),
-                    tracker_rx.map(|s| s.map(named(PeerSourceFlag::Tracker))),
-                ),
+                tracker_rx.map(|s| s.map(named(PeerSourceFlag::Tracker))),
                 initial_peers_rx.map(|s| s.map(named(PeerSourceFlag::ResumeData))),
             ),
-            lsd_rx.map(|s| s.map(named(PeerSourceFlag::Lsd))),
+            discovery_rx,
         )
         .map(|peers| PeerSource { peers, trackers })
+    }
+
+    // The peers the DHT and local discovery name, under every hash the
+    // torrent goes by; None when the session runs neither.
+    fn discovery_peers(
+        self: &Arc<Self>,
+        info_hashes: InfoHashes,
+        announce: bool,
+        dht_announce: tokio::sync::watch::Receiver<()>,
+        ssl: Option<&Arc<SslTorrent>>,
+    ) -> Option<PeerStream> {
+        // The port the torrent's peers are told to reach it at: an SSL
+        // torrent's is the SSL listener's.
+        let port = || match ssl {
+            Some(_) => self.ssl_port.subscribe(),
+            None => self.announce_port.subscribe(),
+        };
+        let dht_rx = self.dht.as_ref().map(|dht| {
+            futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
+                dht_peers(
+                    dht.clone(),
+                    info_hash,
+                    if announce {
+                        port()
+                    } else {
+                        tokio::sync::watch::channel(None).1
+                    },
+                    dht_announce.clone(),
+                )
+            }))
+        });
+
+        // Each source starts when the torrent first asks it for peers, which
+        // is once it is checked and running: trackers and the DHT by their
+        // streams, the LSD by registering here (libtorrent
+        // `torrent::start_announcing` runs only after `files_checked`, never
+        // while paused).
+        let lsd_rx = self.lsd.as_ref().map(|lsd| {
+            // Local peers reach the listen port itself.
+            let port = if !announce {
+                None
+            } else if ssl.is_some() {
+                *self.ssl_port.borrow()
+            } else {
+                self.announce_port.configured
+            };
+            futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
+                let lsd = lsd.clone();
+                futures::stream::once(async move { lsd.announce(info_hash, port) })
+                    .flatten()
+                    .boxed()
+            }))
+        });
+
+        let named = |source| move |addr| (addr, source);
+        merge_two_optional_streams(
+            dht_rx.map(|s| s.map(named(PeerSourceFlag::Dht))),
+            lsd_rx.map(|s| s.map(named(PeerSourceFlag::Lsd))),
+        )
     }
 
     async fn try_update_persistence_metadata(&self, handle: &ManagedTorrentHandle) {
@@ -5034,5 +5153,57 @@ mod tests {
         // Peers stay held to it.
         assert_eq!(session.may_reach(blocked), Err(Unreachable::Filtered));
         session.stop().await;
+    }
+
+    #[test]
+    fn a_fetch_goes_on_from_its_trackers_once_they_named_no_peer() {
+        use super::FetchPhase::{self, Discovery, Trackers, Waiting};
+        use crate::{AnnounceError, AnnounceErrorKind, AnnounceOk, LastAnnounce, TrackerAnnounce};
+
+        let answered = |peers| TrackerAnnounce {
+            last: Some(LastAnnounce {
+                at: std::time::SystemTime::UNIX_EPOCH,
+                result: Ok(AnnounceOk {
+                    interval: std::time::Duration::from_secs(1800),
+                    min_interval: std::time::Duration::from_secs(60),
+                    seeders: None,
+                    leechers: None,
+                    downloaded: None,
+                    peers,
+                    warning: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let failed = || TrackerAnnounce {
+            last: Some(LastAnnounce {
+                at: std::time::SystemTime::UNIX_EPOCH,
+                result: Err(AnnounceError {
+                    kind: AnnounceErrorKind::Failed,
+                    message: "refused".to_owned(),
+                }),
+            }),
+            ..Default::default()
+        };
+        let unasked = TrackerAnnounce::default;
+
+        for (table, discovery, phase) in [
+            (vec![], true, Discovery),
+            (vec![], false, Waiting),
+            (vec![unasked()], true, Trackers),
+            (vec![failed(), unasked()], true, Trackers),
+            (vec![failed(), failed()], true, Discovery),
+            (vec![failed(), failed()], false, Waiting),
+            (vec![answered(0)], true, Discovery),
+            (vec![answered(0), unasked()], false, Waiting),
+            (vec![answered(1)], true, Trackers),
+            (vec![failed(), answered(2)], false, Trackers),
+        ] {
+            assert_eq!(
+                FetchPhase::of(&table, discovery),
+                phase,
+                "{table:?}, discovery {discovery}"
+            );
+        }
     }
 }

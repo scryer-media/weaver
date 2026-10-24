@@ -641,7 +641,7 @@ async fn fetch_metadata(
             list_only: true,
             tracker_tiers: Some(vec![vec![url.to_owned()]]),
             identity: Some(identity),
-            metadata_trackers: Some(table_tx),
+            metadata_fetch: Some(table_tx),
             ..Default::default()
         }),
     );
@@ -656,7 +656,7 @@ async fn fetch_metadata(
     let crate::AddTorrentResponse::ListOnly(listed) = listed? else {
         anyhow::bail!("a list-only add lists");
     };
-    Ok((listed, table_rx.await?))
+    Ok((listed, table_rx.await?.trackers.context("trackers are on")?))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -801,7 +801,7 @@ async fn test_a_magnet_removed_while_its_metadata_is_fetched_sends_stopped_once(
                         list_only: true,
                         tracker_tiers: Some(vec![vec![url]]),
                         identity: Some(identity_of(b'x')),
-                        metadata_trackers: Some(table_tx),
+                        metadata_fetch: Some(table_tx),
                         ..Default::default()
                     }),
                 )
@@ -814,7 +814,7 @@ async fn test_a_magnet_removed_while_its_metadata_is_fetched_sends_stopped_once(
     assert_eq!(param(&query, "event"), Some("started"));
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
     // The tracker took `started`: it is owed `stopped`.
-    let table = table_rx.await?;
+    let table = table_rx.await?.trackers.context("trackers are on")?;
     table
         .subscribe()
         .wait_for(|a| !a[0].in_flight && a[0].last.is_some())
@@ -875,5 +875,324 @@ async fn test_a_magnets_run_starts_from_the_peers_its_fetchs_tracker_gave() -> a
     assert_eq!(param(&query, "event"), Some("completed"));
     assert_eq!(param(&query, "peer_id"), Some(peer_id.as_str()));
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(())
+}
+
+/// A session that announces to trackers and runs a DHT whose one bootstrap
+/// node is `node`, a loopback socket the test holds: whatever the DHT sends
+/// lands there and nowhere else.
+fn discovery_session_opts(node: &tokio::net::UdpSocket) -> anyhow::Result<SessionOptions> {
+    Ok(SessionOptions {
+        dht: Some(crate::DhtSessionConfig {
+            bootstrap_addrs: Some(vec![node.local_addr()?.to_string()]),
+            port: None,
+            persistence: None,
+        }),
+        ipv4_only: true,
+        ..tracker_session_opts()?
+    })
+}
+
+/// The DHT's next get_peers for `info_hash` to `node`, answering nothing
+/// else. Returns the request's transaction id and where it came from.
+async fn next_get_peers(
+    node: &tokio::net::UdpSocket,
+    info_hash: crate::core::hash_id::Id20,
+) -> anyhow::Result<(crate::bencode::ByteBufOwned, SocketAddr)> {
+    use crate::dht::bprotocol::{MessageKind, deserialize_message};
+    let mut buf = [0u8; 2048];
+    loop {
+        let (len, from) = node.recv_from(&mut buf).await?;
+        let Ok(message) = deserialize_message::<crate::bencode::ByteBufOwned>(&buf[..len]) else {
+            continue;
+        };
+        if let MessageKind::GetPeersRequest(request) = message.kind
+            && request.info_hash == info_hash
+        {
+            return Ok((message.transaction_id, from));
+        }
+    }
+}
+
+/// Whether the DHT has sent `node` a get_peers for `info_hash` by now.
+fn asked_for_peers(node: &tokio::net::UdpSocket, info_hash: crate::core::hash_id::Id20) -> bool {
+    use crate::dht::bprotocol::{MessageKind, deserialize_message};
+    let mut buf = [0u8; 2048];
+    while let Ok((len, _)) = node.try_recv_from(&mut buf) {
+        if let Ok(message) = deserialize_message::<crate::bencode::ByteBufOwned>(&buf[..len])
+            && matches!(message.kind, MessageKind::GetPeersRequest(r) if r.info_hash == info_hash)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Starts fetching `magnet`'s metadata as a list-only add announcing to
+/// `tiers`, taking peers from them alone when `trackers_only`. Returns the
+/// fetch, running, and its view.
+async fn start_fetch(
+    session: &std::sync::Arc<Session>,
+    magnet: String,
+    tiers: Vec<Vec<String>>,
+    trackers_only: bool,
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<anyhow::Result<crate::AddTorrentResponse>>,
+    crate::MetadataFetch,
+)> {
+    let (fetch_tx, fetch_rx) = tokio::sync::oneshot::channel();
+    let fetch = tokio::spawn({
+        let session = session.clone();
+        async move {
+            session
+                .add_torrent(
+                    AddTorrent::from_url(magnet),
+                    Some(AddTorrentOptions {
+                        list_only: true,
+                        tracker_tiers: Some(tiers),
+                        trackers_only,
+                        metadata_fetch: Some(fetch_tx),
+                        ..Default::default()
+                    }),
+                )
+                .await
+        }
+    });
+    Ok((fetch, fetch_rx.await?))
+}
+
+fn info_hash_of(torrent: &[u8]) -> anyhow::Result<crate::core::hash_id::Id20> {
+    crate::core::torrent_metainfo::torrent_from_bytes(torrent)?
+        .info_hashes
+        .v1
+        .context("a v1 torrent")
+}
+
+const REFUSED: &str = "d14:failure reason7:refusede";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_fetch_whose_tracker_names_a_peer_never_asks_the_dht() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_fetch_tracker_peer", 4096, 1024).await?;
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let out = TempDir::with_prefix("test_fetch_tracker_peer_out")?;
+    let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
+
+    let (fetch, view) =
+        start_fetch(&session, magnet_of(&t.torrent)?, vec![vec![url]], false).await?;
+    assert_eq!(*view.phase.borrow(), crate::FetchPhase::Trackers);
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond_bytes(conn, &answer_with_peer(seeder_addr)?).await?;
+    let crate::AddTorrentResponse::ListOnly(_) = fetch.await?? else {
+        anyhow::bail!("a list-only add lists");
+    };
+
+    // The tracker named the peer that served the metadata: the fetch never
+    // went on to the DHT.
+    assert_eq!(*view.phase.borrow(), crate::FetchPhase::Trackers);
+    assert!(!asked_for_peers(&node, info_hash_of(&t.torrent)?));
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_fetch_whose_tracker_fails_goes_on_to_the_dht() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_fetch_tracker_fails", 4096, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let out = TempDir::with_prefix("test_fetch_tracker_fails_out")?;
+    let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
+
+    let (fetch, mut view) =
+        start_fetch(&session, magnet_of(&t.torrent)?, vec![vec![url]], false).await?;
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond(conn, REFUSED).await?;
+    view.phase
+        .wait_for(|phase| *phase == crate::FetchPhase::Discovery)
+        .await?;
+    assert_eq!(view.phase.borrow().to_string(), "trackers, DHT, LSD");
+    next_get_peers(&node, info_hash_of(&t.torrent)?).await?;
+    fetch.abort();
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_fetch_without_discovery_whose_tracker_fails_waits() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_fetch_tracker_fails_waits", 4096, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let out = TempDir::with_prefix("test_fetch_tracker_fails_waits_out")?;
+    let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
+
+    let (fetch, mut view) =
+        start_fetch(&session, magnet_of(&t.torrent)?, vec![vec![url]], true).await?;
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond(conn, REFUSED).await?;
+    view.phase
+        .wait_for(|phase| *phase == crate::FetchPhase::Waiting)
+        .await?;
+    assert_eq!(view.phase.borrow().to_string(), "no peers from trackers");
+    assert!(!asked_for_peers(&node, info_hash_of(&t.torrent)?));
+    fetch.abort();
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_fetch_with_no_tracker_and_no_discovery_waits() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_fetch_no_tracker_waits", 4096, 1024).await?;
+    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let out = TempDir::with_prefix("test_fetch_no_tracker_waits_out")?;
+    let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
+
+    // Added rather than refused: it waits, and says why.
+    let (fetch, view) = start_fetch(&session, magnet_of(&t.torrent)?, Vec::new(), true).await?;
+    assert_eq!(*view.phase.borrow(), crate::FetchPhase::Waiting);
+    assert_eq!(view.phase.borrow().to_string(), "no peers from trackers");
+    assert!(!fetch.is_finished());
+    assert!(!asked_for_peers(&node, info_hash_of(&t.torrent)?));
+    fetch.abort();
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+/// `torrent` marked private (BEP 27): its info dictionary, the last key of
+/// the metainfo, ends with `pieces`, which `private` sorts after.
+fn made_private(torrent: &[u8]) -> anyhow::Result<bytes::Bytes> {
+    let body = torrent
+        .strip_suffix(b"ee")
+        .context("the info dictionary closes the metainfo")?;
+    let private = [body, b"7:privatei1eee".as_slice()].concat();
+    let parsed = crate::core::torrent_metainfo::torrent_from_bytes(&private)?;
+    anyhow::ensure!(parsed.info.data.private, "not private");
+    Ok(private.into())
+}
+
+/// A peer that serves `torrent`'s metadata to the first peer that connects,
+/// private or not, and does nothing else. Returns its task and its address.
+async fn serve_metadata(
+    torrent: &[u8],
+) -> anyhow::Result<(tokio::task::JoinHandle<anyhow::Result<()>>, SocketAddr)> {
+    use crate::buffers::ByteBuf;
+    use crate::peer_protocol::{
+        Handshake, Message,
+        extended::{
+            ExtendedMessage, PeerExtendedMessageIds,
+            handshake::ExtendedHandshake,
+            ut_metadata::{UtMetadata, UtMetadataData},
+        },
+    };
+    let parsed = crate::core::torrent_metainfo::torrent_from_bytes(torrent)?;
+    let info_hash = parsed.info_hashes.v1.context("a v1 torrent")?;
+    let info = parsed.info.raw_bytes.as_ref().to_vec();
+    let size = u32::try_from(info.len())?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await?;
+        let mut theirs = [0u8; 68];
+        conn.read_exact(&mut theirs).await?;
+        let mut out = vec![0u8; 64 * 1024];
+        let len = Handshake::new(info_hash, crate::core::hash_id::Id20::new([0x55; 20]))
+            .serialize_unchecked_len(&mut out);
+        conn.write_all(&out[..len]).await?;
+        let mut ours = ExtendedHandshake::new();
+        ours.metadata_size = Some(size);
+        let len = Message::Extended(ExtendedMessage::Handshake(ours))
+            .serialize(&mut out, &PeerExtendedMessageIds::my)?;
+        conn.write_all(&out[..len]).await?;
+        loop {
+            let frame = conn.read_u32().await?;
+            let mut message = frame.to_be_bytes().to_vec();
+            message.resize(4 + frame as usize, 0);
+            conn.read_exact(&mut message[4..]).await?;
+            if let Ok((
+                Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(piece))),
+                _,
+            )) = Message::deserialize(&message, &[], None)
+            {
+                let data = UtMetadataData::from_bytes(piece, size, ByteBuf(&info));
+                let len = Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(data)))
+                    .serialize(&mut out, &PeerExtendedMessageIds::my)?;
+                conn.write_all(&out[..len]).await?;
+            }
+        }
+    });
+    Ok((task, addr))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_private_torrent_found_on_the_dht_takes_peers_from_its_trackers_alone()
+-> anyhow::Result<()> {
+    use crate::dht::bprotocol::{MessageKind, Response, serialize_message};
+    setup_test_logging();
+    let mut t = TestTorrent::new("test_fetch_private_after_dht", 4096, 1024).await?;
+    t.torrent = made_private(&t.torrent)?;
+    let info_hash = info_hash_of(&t.torrent)?;
+    let (server, seeder_addr) = serve_metadata(&t.torrent).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let out = TempDir::with_prefix("test_fetch_private_after_dht_out")?;
+    let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
+
+    // A running add: its fetch is the start of the torrent's run.
+    let (fetch_tx, fetch_rx) = tokio::sync::oneshot::channel();
+    let add = tokio::spawn({
+        let session = session.clone();
+        let magnet = magnet_of(&t.torrent)?;
+        let url = url.clone();
+        async move {
+            session
+                .add_torrent(
+                    AddTorrent::from_url(magnet),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                        tracker_tiers: Some(vec![vec![url]]),
+                        metadata_fetch: Some(fetch_tx),
+                        ..Default::default()
+                    }),
+                )
+                .await
+        }
+    });
+    let mut view: crate::MetadataFetch = fetch_rx.await?;
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond(conn, REFUSED).await?;
+    view.phase
+        .wait_for(|phase| *phase == crate::FetchPhase::Discovery)
+        .await?;
+
+    // The DHT names the seeder, which serves the metadata: private.
+    let (transaction_id, dht) = next_get_peers(&node, info_hash).await?;
+    let mut answer = Vec::new();
+    serialize_message(
+        &mut answer,
+        transaction_id,
+        None,
+        None,
+        MessageKind::Response(Response {
+            id: crate::core::hash_id::Id20::new([0x33; 20]),
+            values: Some(vec![seeder_addr.into()]),
+            token: Some(b"t".as_slice().into()),
+            ..Default::default()
+        }),
+    )?;
+    node.send_to(&answer, dht).await?;
+    let handle = add.await??.into_handle().context("expected a handle")?;
+
+    // From its metadata on, it takes peers from its trackers alone.
+    assert!(handle.takes_peers_from_trackers_only());
+    server.abort();
+    session.cancellation_token().cancel();
     Ok(())
 }
