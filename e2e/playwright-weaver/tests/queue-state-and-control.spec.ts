@@ -231,10 +231,17 @@ test("Q2 the global pause holds every download and counts them paused", async ({
 });
 
 test("Q3 a pause or resume answers with the state it applied", async ({ request }) => {
+  // One lane and 64 articles: the job is far inside its download when the
+  // pause lands and again when the resume does.
+  await updateConfiguredServer(request, "nntp2", { active: false });
+  await updateConfiguredServer(request, "nntp", { connections: 1 });
   const tag = `q3-${Date.now()}`;
-  const job = await probeJob(request, tag, 6);
+  const job = await probeJob(request, tag, 64);
   started.push(job);
-  await waitFor(request, "job downloading", (snap) => itemOf(snap, job)?.state === "DOWNLOADING");
+  await waitFor(request, "job mid-download", (snap) => {
+    const item = itemOf(snap, job);
+    return item?.state === "DOWNLOADING" && item.progressPercent > 0;
+  });
 
   pausedByUs.add(job);
   const pause = await graphql<{ pauseQueueItem: { success: boolean; item: { id: number; state: string } | null } }>(
