@@ -43,6 +43,10 @@ impl Routes for Offline {
         })
     }
 
+    fn leg_down(&self, _: &RoutePlan) -> Option<String> {
+        Some("offline".into())
+    }
+
     fn open<'life0, 'life1, 'async_trait>(
         &'life0 self,
         _: &'life1 RoutePlan,

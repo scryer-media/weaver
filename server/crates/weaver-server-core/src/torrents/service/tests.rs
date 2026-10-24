@@ -5349,3 +5349,298 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
     assert_eq!(view.pieces.unwrap().have, 0);
     again.stop().await;
 }
+
+// An announce a tracker heard: its event, the torrent's key and peer id,
+// and the counters it carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Heard {
+    event: Option<String>,
+    key: String,
+    peer_id: String,
+    downloaded: u64,
+    uploaded: u64,
+}
+
+impl Heard {
+    fn of(query: &str) -> Self {
+        let field = |name: &str| {
+            query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+                .map(str::to_owned)
+        };
+        let count = |name: &str| field(name).unwrap().parse().unwrap();
+        Self {
+            event: field("event"),
+            key: field("key").unwrap(),
+            peer_id: field("peer_id").unwrap(),
+            downloaded: count("downloaded"),
+            uploaded: count("uploaded"),
+        }
+    }
+
+    fn identity(&self) -> (&str, &str) {
+        (&self.key, &self.peer_id)
+    }
+}
+
+// A tracker on loopback that names `peers` to every announce and hands the
+// test each announce in the order it read them.
+async fn heard_tracker(
+    peers: &[std::net::SocketAddrV4],
+) -> (String, tokio::sync::mpsc::UnboundedReceiver<Heard>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let mut body = format!("d8:intervali1800e5:peers{}:", peers.len() * 6).into_bytes();
+    for peer in peers {
+        body.extend_from_slice(&peer.ip().octets());
+        body.extend_from_slice(&peer.port().to_be_bytes());
+    }
+    body.push(b'e');
+    let (heard, announces) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let heard = heard.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let path = request.split(' ').nth(1).unwrap();
+                let (_, query) = path.split_once('?').unwrap();
+                let _ = heard.send(Heard::of(query));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if let Err(error) = stream.write_all(&[head.as_bytes(), &body].concat()).await {
+                    tracing::debug!(error = %error, "a client hung up before its answer");
+                }
+            });
+        }
+    });
+    (url, announces)
+}
+
+// Once the torrent's session has the answer to its `started`: a tracker is
+// owed `stopped` only once it accepted `started`.
+async fn started_accepted(service: &TorrentService, job_id: JobId) {
+    trackers_once(service, job_id, |announces| {
+        announces
+            .iter()
+            .any(|announce| announce.last.as_ref().is_some_and(|last| last.result.is_ok()))
+    })
+    .await;
+}
+
+// The next announce heard that carries an event.
+async fn next_event(announces: &mut tokio::sync::mpsc::UnboundedReceiver<Heard>) -> Heard {
+    loop {
+        let heard = announces.recv().await.unwrap();
+        if heard.event.is_some() {
+            return heard;
+        }
+    }
+}
+
+// A torrent paused and resumed announces as the same torrent: one key and
+// one peer id from its `started` through its `stopped` to its next
+// `started`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_and_resumed_torrent_keeps_its_key_and_peer_id() {
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("kept", 7)))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    started_accepted(&rig.service, job_id).await;
+
+    rig.service.pause(job_id).await.unwrap();
+    let stopped = next_event(&mut announces).await;
+    assert_eq!(stopped.event.as_deref(), Some("stopped"));
+    rig.service.resume(job_id).await.unwrap();
+    let again = next_event(&mut announces).await;
+    assert_eq!(again.event.as_deref(), Some("started"));
+
+    assert_eq!(stopped.identity(), started.identity());
+    assert_eq!(again.identity(), started.identity());
+    rig.service.stop().await;
+}
+
+// A torrent whose route changes while its old leg stands says `stopped`
+// over the old leg and `started` over the new one as the same torrent, and
+// its counters go on from where they were: the new session's totals are the
+// old session's, and the trackers hear them so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, 16_384, true);
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let (url, mut announces) = heard_tracker(&[peer]).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(private.to_vec()))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    let old = handle_of(&rig.service, job_id).await;
+    old.wait_until_completed().await.unwrap();
+    let before = old.totals();
+    assert_eq!(before.downloaded_bytes, data.len() as u64);
+
+    rig.routes.route(TorrentScope::Default, 2);
+    rig.service.follow_routes().await;
+
+    // The old session's `stopped` and the new one's `started`, in either
+    // order; a `completed` the old session sent first says nothing here.
+    let mut moved = Vec::new();
+    while moved.len() < 2 {
+        let heard = next_event(&mut announces).await;
+        if heard.event.as_deref() != Some("completed") {
+            moved.push(heard);
+        }
+    }
+    moved.sort_by(|a, b| a.event.cmp(&b.event));
+    let [again, stopped] = <[Heard; 2]>::try_from(moved).unwrap();
+    assert_eq!(again.event.as_deref(), Some("started"));
+    assert_eq!(stopped.event.as_deref(), Some("stopped"));
+    for heard in [&again, &stopped] {
+        assert_eq!(heard.identity(), started.identity());
+        assert_eq!(
+            (heard.downloaded, heard.uploaded),
+            (before.downloaded_bytes, before.uploaded_bytes)
+        );
+    }
+
+    // The new session starts from the old one's totals as they ended; only
+    // the bytes of its own connections move after, and no payload does.
+    let ended = old.totals();
+    let now = handle_of(&rig.service, job_id).await.totals();
+    assert_eq!(
+        (now.downloaded_bytes, now.uploaded_bytes, now.fetched_bytes),
+        (ended.downloaded_bytes, ended.uploaded_bytes, ended.fetched_bytes)
+    );
+    assert_eq!((ended.downloaded_bytes, ended.uploaded_bytes), (before.downloaded_bytes, before.uploaded_bytes));
+    assert!(now.fetched_protocol_bytes >= ended.fetched_protocol_bytes);
+    assert!(now.uploaded_protocol_bytes >= ended.uploaded_protocol_bytes);
+    rig.service.stop().await;
+}
+
+// A torrent whose route changes while its old leg is out of quota says
+// nothing more over that leg: the tracker hears the new session's `started`
+// as the same torrent, and no `stopped` until the torrent is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_moved_off_a_spent_leg_sends_no_stopped_over_it() {
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("spent", 8)))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+
+    rig.routes.spend(0);
+    rig.routes.route(TorrentScope::Default, 2);
+    rig.service.follow_routes().await;
+    let again = next_event(&mut announces).await;
+    assert_eq!(again.event.as_deref(), Some("started"));
+    assert_eq!(again.identity(), started.identity());
+    started_accepted(&rig.service, job_id).await;
+
+    // The one `stopped` the tracker hears is the new session's, at the
+    // remove.
+    rig.service.remove(job_id, false, false).await.unwrap();
+    let stopped = next_event(&mut announces).await;
+    assert_eq!(stopped.event.as_deref(), Some("stopped"));
+    assert_eq!(stopped.identity(), started.identity());
+    rig.service.stop().await;
+    while let Ok(heard) = announces.try_recv() {
+        assert_eq!(heard.event, None, "the tracker heard more: {heard:?}");
+    }
+}
+
+// A torrent removed and added again is a new torrent to its trackers: a new
+// key and a new peer id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_removed_and_added_again_takes_a_new_identity() {
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let bytes = plain("again", 9);
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(bytes.clone()))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+    let first = next_event(&mut announces).await;
+    assert_eq!(first.event.as_deref(), Some("started"));
+    started_accepted(&rig.service, job_id).await;
+    rig.service.remove(job_id, false, false).await.unwrap();
+    let stopped = next_event(&mut announces).await;
+    assert_eq!(stopped.event.as_deref(), Some("stopped"));
+
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(bytes))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+    let second = next_event(&mut announces).await;
+    assert_eq!(second.event.as_deref(), Some("started"));
+    assert_ne!(second.key, first.key);
+    assert_ne!(second.peer_id, first.peer_id);
+    rig.service.stop().await;
+}

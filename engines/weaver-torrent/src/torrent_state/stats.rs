@@ -54,6 +54,57 @@ impl From<&TorrentStateLive> for LiveStats {
     }
 }
 
+/// What a torrent has moved since it was added: every run it made, on this
+/// session and on any session it was taken over from (see
+/// [`crate::AddTorrentOptions::totals`]). Its trackers hear these.
+#[derive(Clone, Copy, Serialize, Debug, Default, PartialEq, Eq)]
+pub struct TorrentTotals {
+    /// Block payload sent to peers.
+    pub uploaded_bytes: u64,
+    /// Bytes of the pieces received that passed their check.
+    pub downloaded_bytes: u64,
+    /// Block payload received, used or not.
+    pub fetched_bytes: u64,
+    /// Bytes received and sent that were not block payload.
+    pub fetched_protocol_bytes: u64,
+    pub uploaded_protocol_bytes: u64,
+    /// Bytes of the pieces that failed their check.
+    pub failed_bytes: u64,
+    /// Bytes of the blocks received and not used.
+    pub redundant_bytes: u64,
+}
+
+impl std::ops::Add for TorrentTotals {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            uploaded_bytes: self.uploaded_bytes + other.uploaded_bytes,
+            downloaded_bytes: self.downloaded_bytes + other.downloaded_bytes,
+            fetched_bytes: self.fetched_bytes + other.fetched_bytes,
+            fetched_protocol_bytes: self.fetched_protocol_bytes + other.fetched_protocol_bytes,
+            uploaded_protocol_bytes: self.uploaded_protocol_bytes + other.uploaded_protocol_bytes,
+            failed_bytes: self.failed_bytes + other.failed_bytes,
+            redundant_bytes: self.redundant_bytes + other.redundant_bytes,
+        }
+    }
+}
+
+impl From<&StatsSnapshot> for TorrentTotals {
+    // What one run has moved.
+    fn from(run: &StatsSnapshot) -> Self {
+        Self {
+            uploaded_bytes: run.uploaded_bytes,
+            downloaded_bytes: run.downloaded_and_checked_bytes,
+            fetched_bytes: run.fetched_bytes,
+            fetched_protocol_bytes: run.fetched_protocol_bytes,
+            uploaded_protocol_bytes: run.uploaded_protocol_bytes,
+            failed_bytes: run.failed_bytes,
+            redundant_bytes: run.redundant_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Serialize, Debug)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum TorrentStatsState {

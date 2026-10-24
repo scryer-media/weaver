@@ -116,6 +116,9 @@ pub struct OpenLeg {
 #[async_trait::async_trait]
 pub trait Routes: Send + Sync {
     fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String>;
+    /// Why `plan`'s leg may carry nothing now, when it may not: its egress
+    /// is down, gone, or out of quota. A route plans down for the same.
+    fn leg_down(&self, plan: &RoutePlan) -> Option<String>;
     /// Open `plan`'s leg for a session of at most `peers` peers.
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String>;
     /// The blocklist at `url`, which every route's session shares.
@@ -148,6 +151,21 @@ impl NetworkRoutes {
     fn network(&self) -> &NetworkRuntime {
         &self.proxies.network
     }
+
+    // Why a leg on egress `egress_id` may carry nothing now, when it may
+    // not.
+    fn egress_down(&self, egress_id: u32) -> Option<String> {
+        let Some(egress) = leg_egress(self.network(), egress_id) else {
+            return Some(format!("egress {egress_id} is missing"));
+        };
+        match self.network().interfaces().health(&egress, None) {
+            EgressHealth::Down(reason) => Some(reason),
+            _ if self.network().quota_blocked_egresses().contains(&egress.id) => {
+                Some("quota reached".into())
+            }
+            _ => None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -163,19 +181,10 @@ impl Routes for NetworkRoutes {
         let egress = leg_egress(self.network(), leg.egress_id);
         let (key, down) = match consumer.validate_route(&route) {
             Err(refusal) => (refused_key(&route), Some(refusal.to_string())),
-            Ok(()) => {
-                let down = match &egress {
-                    None => Some(format!("egress {} is missing", leg.egress_id)),
-                    Some(egress) => match self.network().interfaces().health(egress, None) {
-                        EgressHealth::Down(reason) => Some(reason),
-                        _ if self.network().quota_blocked_egresses().contains(&egress.id) => {
-                            Some("quota reached".into())
-                        }
-                        _ => None,
-                    },
-                };
-                (leg_key(self.network(), leg.egress_id, &leg.path), down)
-            }
+            Ok(()) => (
+                leg_key(self.network(), leg.egress_id, &leg.path),
+                self.egress_down(leg.egress_id),
+            ),
         };
         Ok(RoutePlan {
             scope,
@@ -187,6 +196,10 @@ impl Routes for NetworkRoutes {
             policy,
             down,
         })
+    }
+
+    fn leg_down(&self, plan: &RoutePlan) -> Option<String> {
+        self.egress_down(plan.egress_id)
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
@@ -460,7 +473,8 @@ enum Slot {
         port: u16,
         // The external port its session asks a gateway to map, when it maps.
         maps: Option<u16>,
-        kind: LegKind,
+        // The route plan it opened under, whose leg it runs on.
+        plan: RoutePlan,
         mappings: PortMappings,
         opening: Opening,
     },
@@ -476,6 +490,14 @@ impl Slot {
         match self {
             Self::Open { session, .. } if self.held().is_none() => Some(session),
             _ => None,
+        }
+    }
+
+    // The kind of leg the slot's route runs on.
+    fn kind(&self) -> &LegKind {
+        match self {
+            Self::Open { plan, .. } => &plan.kind,
+            Self::Held { kind, .. } => kind,
         }
     }
 
@@ -835,7 +857,7 @@ impl Sessions {
                         leg,
                         port,
                         maps,
-                        kind: plan.kind.clone(),
+                        plan: plan.clone(),
                         mappings,
                         opening,
                     },
@@ -917,27 +939,41 @@ impl Sessions {
     /// revoked under it, or the settings as they stand would bind or
     /// announce another port, map it or not, or keep its state elsewhere.
     /// Each opens again once it is dropped.
-    /// A session whose leg is revoked may send no more from here on, even
-    /// before the watch on its leg wakes: nothing taken off it after this
-    /// sends its trackers `stopped`.
+    /// A session whose leg may not send, revoked, down or out of quota, may
+    /// send no more from here on, even before the watch on its leg wakes:
+    /// nothing taken off it after this sends its trackers `stopped`.
     pub async fn outdated(&self) -> BTreeSet<RouteKey> {
         let torrent = self.config();
         let slots = self.slots.lock().await;
         slots
             .iter()
-            .filter_map(|(key, slot)| match slot {
-                Slot::Open { session, .. } if let Some(reason) = slot.held() => {
-                    withhold(key, session, reason);
-                    Some(key.clone())
+            .filter_map(|(key, slot)| {
+                let Slot::Open {
+                    session, opening, ..
+                } = slot
+                else {
+                    return None;
+                };
+                if let Some(reason) = self.silenced(slot) {
+                    withhold(key, session, &reason);
                 }
-                Slot::Open { opening, .. }
-                    if *opening != Opening::of(&self.env, &torrent, opening.shape) =>
-                {
-                    Some(key.clone())
-                }
-                _ => None,
+                (slot.held().is_some()
+                    || *opening != Opening::of(&self.env, &torrent, opening.shape))
+                .then(|| key.clone())
             })
             .collect()
+    }
+
+    // Why `slot`'s session may send nothing more, when it may not: its leg
+    // was revoked under it, or is down or out of quota now.
+    fn silenced(&self, slot: &Slot) -> Option<String> {
+        match slot {
+            Slot::Open { plan, .. } => slot
+                .held()
+                .map(str::to_owned)
+                .or_else(|| self.routes.leg_down(plan)),
+            Slot::Held { reason, .. } => Some(reason.clone()),
+        }
     }
 
     /// The session each route runs now: a torrent attached to another has
@@ -962,12 +998,12 @@ impl Sessions {
                 session,
                 leg,
                 maps,
-                kind,
+                plan,
                 ..
             } => {
                 withhold(key, &session, &reason);
                 self.closing.close(key, session, leg, maps);
-                kind
+                plan.kind
             }
             Slot::Held { kind, .. } => kind,
         };
@@ -1152,13 +1188,19 @@ async fn refilter(
                     session,
                     leg,
                     maps,
-                    kind,
+                    plan,
                     ..
                 }) = slots.remove(&key)
                 {
                     closing.close(&key, session, leg, maps);
                     let reason = reason.clone();
-                    slots.insert(key, Slot::Held { reason, kind });
+                    slots.insert(
+                        key,
+                        Slot::Held {
+                            reason,
+                            kind: plan.kind,
+                        },
+                    );
                 }
             }
         }
@@ -1183,14 +1225,13 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             Slot::Open {
                 session,
                 port,
-                kind,
                 mappings,
                 ..
             },
             None,
         ) => SessionView {
             key: key.clone(),
-            kind: kind.clone(),
+            kind: slot.kind().clone(),
             port: Some(*port),
             listen: session.listen_addr(),
             utp: session.listens_utp(),
@@ -1198,9 +1239,9 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             external: session.external_ips(),
             held: None,
         },
-        (Slot::Open { kind, .. } | Slot::Held { kind, .. }, held) => SessionView {
+        (_, held) => SessionView {
             key: key.clone(),
-            kind: kind.clone(),
+            kind: slot.kind().clone(),
             port: None,
             listen: None,
             utp: false,

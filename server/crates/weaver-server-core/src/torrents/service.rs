@@ -20,8 +20,8 @@ use weaver_torrent::core::{Id20, Id32, InfoHashes};
 use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
-    ManagedTorrent, PeerConnectionOptions, ResumePeers, Session, SslIdentity, TorrentVersion,
-    TrackerAnnounce, torrent_from_bytes, tracker::Tracker,
+    ManagedTorrent, PeerConnectionOptions, ResumePeers, Session, SslIdentity, TorrentTotals,
+    TorrentVersion, TrackerAnnounce, torrent_from_bytes, tracker::Tracker,
 };
 
 use crate::SchedulerError;
@@ -58,6 +58,7 @@ use crate::settings::{
     TrackerUploadLimit, resolve_seeding_policy,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
+use crate::torrents::identity::TorrentIdentity;
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{
@@ -238,13 +239,14 @@ fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
     rules.iter().find(|rule| rule.id == id)
 }
 
-// How a torrent under `rule` names itself to peers and trackers: as the
-// client its tracker rule names, else Weaver, under a fresh peer id.
-fn identity_of(rule: Option<&TrackerRule>) -> Identity {
+// How a torrent that is `own` under `rule` names itself to peers and
+// trackers: as the client its tracker rule names, else Weaver, under its own
+// peer id and tracker key.
+fn identity_of(rule: Option<&TrackerRule>, own: TorrentIdentity) -> Identity {
     rule.and_then(|rule| rule.client)
         .unwrap_or(Client::Weaver)
         .name()
-        .identity()
+        .identity_of(own)
 }
 
 // The limits `record`'s session holds it to: its own, and on upload a cap
@@ -808,6 +810,9 @@ enum Resolving {
 // What the service keeps of each torrent while it lives.
 struct Live {
     record: TorrentRecord,
+    // Who it is to its peers and trackers from its add to its remove, in
+    // every session it runs in.
+    identity: TorrentIdentity,
     // The tracker rule its trackers match, picked again whenever they or
     // the rules change: the trackers are what is kept, not the rule.
     rule_id: Option<u32>,
@@ -836,8 +841,8 @@ struct Live {
     about: About,
     counters: TorrentCounters,
     // What the session reported at the last kept reading, for the ledger's
-    // deltas.
-    seen: Seen,
+    // deltas; the next session it runs in counts on from here.
+    seen: TorrentTotals,
     // The instant its durations were last advanced to, with what each ran
     // past its whole seconds.
     timed: Timed,
@@ -922,6 +927,7 @@ impl Live {
     ) -> Self {
         Self {
             record,
+            identity: TorrentIdentity::fresh(),
             rule_id: None,
             private: false,
             ledger: Ledger {
@@ -942,7 +948,7 @@ impl Live {
             held: None,
             about: About::default(),
             counters,
-            seen: Seen::default(),
+            seen: TorrentTotals::default(),
             timed: Timed::at(now),
             engine: Engine::Absent,
             run_error: None,
@@ -1142,25 +1148,21 @@ impl Live {
         let mut file_have = self.file_have.clone();
         take_file_have(&mut file_have, &engine, &stats.file_progress);
         let live = stats.live.as_ref();
-        let seen = Seen {
-            uploaded: stats.uploaded_bytes,
-            fetched: live.map_or(0, |live| live.snapshot.fetched_bytes),
-            uploaded_protocol: live.map_or(0, |live| live.snapshot.uploaded_protocol_bytes),
-            fetched_protocol: live.map_or(0, |live| live.snapshot.fetched_protocol_bytes),
-            discarded: live.map_or(0, |live| {
-                live.snapshot.failed_bytes + live.snapshot.redundant_bytes
-            }),
-        };
-        // The session counts from zero each time it takes the torrent.
-        let delta = |now: u64, then: u64| if now >= then { now - then } else { now };
+        // The session counts on from what the torrent had moved when it
+        // took it, through every pause.
+        let seen = attached.handle.totals();
         let (up, down) = (
-            delta(seen.uploaded, self.seen.uploaded),
-            delta(seen.fetched, self.seen.fetched),
+            seen.uploaded_bytes.saturating_sub(self.seen.uploaded_bytes),
+            seen.fetched_bytes.saturating_sub(self.seen.fetched_bytes),
         );
         // On the wire: the blocks and every other message around them.
         let moved = (
-            down + delta(seen.fetched_protocol, self.seen.fetched_protocol),
-            up + delta(seen.uploaded_protocol, self.seen.uploaded_protocol),
+            down + seen
+                .fetched_protocol_bytes
+                .saturating_sub(self.seen.fetched_protocol_bytes),
+            up + seen
+                .uploaded_protocol_bytes
+                .saturating_sub(self.seen.uploaded_protocol_bytes),
         );
         let mut counters = self.counters;
         counters.uploaded_bytes += up;
@@ -1222,8 +1224,8 @@ struct Reading {
     file_have: Vec<u64>,
     // The ledger with what the session moved since it was last kept.
     counters: TorrentCounters,
-    // The session's own totals, which the ledger's deltas are taken from.
-    seen: Seen,
+    // The session's totals, which the ledger's deltas are taken from.
+    seen: TorrentTotals,
     // The instant the counters' durations run to.
     timed: Timed,
     // The bytes received and sent on the wire since the last kept reading.
@@ -1232,24 +1234,11 @@ struct Reading {
     peers: (u32, u32),
 }
 
-// The session's own totals for a torrent, since it last took it.
-#[derive(Debug, Clone, Copy, Default)]
-struct Seen {
-    uploaded: u64,
-    fetched: u64,
-    // What the messages around the blocks took, each way.
-    uploaded_protocol: u64,
-    fetched_protocol: u64,
-    // Received and thrown away: pieces that failed their check, and blocks
-    // that arrived when already in hand.
-    discarded: u64,
-}
-
-impl Seen {
-    // Bytes received and thrown away this run.
-    fn wasted(&self) -> u64 {
-        self.discarded
-    }
+// Bytes a torrent received and threw away since it was added in this
+// process: pieces that failed their check, and blocks that arrived when
+// already in hand.
+fn wasted(totals: &TorrentTotals) -> u64 {
+    totals.failed_bytes + totals.redundant_bytes
 }
 
 // The instant a torrent's durations run to, and the milliseconds each ran
@@ -2380,7 +2369,7 @@ impl TorrentService {
                     None,
                 );
                 let mut torrent = self.insert(record, &trackers)?;
-                let identity = identity_of(torrent.rule(&rules));
+                let identity = identity_of(torrent.rule(&rules), torrent.identity);
                 let terms = PeerTerms::of(torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
@@ -2715,13 +2704,13 @@ impl TorrentService {
     // the route is up.
     async fn resolve(&self, job_id: JobId) {
         let rules = self.rules();
-        let Some((record, rule)) = self
+        let Some((record, rule, own)) = self
             .inner
             .live
             .lock()
             .await
             .get(&job_id)
-            .map(|torrent| (torrent.record.clone(), torrent.rule(&rules)))
+            .map(|torrent| (torrent.record.clone(), torrent.rule(&rules), torrent.identity))
         else {
             return;
         };
@@ -2749,16 +2738,17 @@ impl TorrentService {
             plan,
             uri,
             Some(tiers),
-            identity_of(rule),
+            identity_of(rule, own),
             PeerTerms::of(rule),
         )
         .await;
     }
 
     // Put a torrent in its route's session, or hold it while the route is
-    // down. A torrent whose metadata was just `fetched` takes over the
-    // fetch's trackers when it starts running now, on the fetch's session
-    // as the client the fetch named, under the identity they heard `started` from, so
+    // down. It runs under its own identity, and counts on from what it had
+    // moved in the session it ran in before. A torrent whose metadata was
+    // just `fetched` takes over the fetch's trackers when it starts running
+    // now, on the fetch's session under the identity the fetch announced, so
     // they hear one torrent; otherwise the fetch's trackers are let go,
     // which sends them `stopped`, and the run starts its own.
     async fn attach(&self, job_id: JobId, fetched: Option<Fetched>) {
@@ -2775,6 +2765,7 @@ impl TorrentService {
             ratelimits,
             have,
             identity,
+            totals,
             terms,
             ssl,
             picking,
@@ -2815,7 +2806,8 @@ impl TorrentService {
                         .is_some(),
                 ratelimits,
                 job.with(|job| initial_have(job)),
-                identity_of(rule),
+                identity_of(rule, torrent.identity),
+                torrent.seen,
                 PeerTerms::of(rule),
                 certificate_of(rule),
                 (
@@ -2855,8 +2847,7 @@ impl TorrentService {
             Some(fetched)
                 if !paused
                     && Arc::ptr_eq(&fetched.session, &session)
-                    && (&fetched.identity.version, &fetched.identity.user_agent)
-                        == (&identity.version, &identity.user_agent) =>
+                    && fetched.identity == identity =>
             {
                 (fetched.identity, Some(fetched.trackers))
             }
@@ -2871,6 +2862,7 @@ impl TorrentService {
             storage_factory: Some(factory.boxed_factory()),
             ratelimits,
             identity: Some(identity),
+            totals,
             tracker_tiers: Some(trackers),
             initial_peers: (!saved.peers.is_empty()).then(|| saved.peers.clone()),
             banned_peers: saved.banned.clone(),
@@ -2932,7 +2924,6 @@ impl TorrentService {
                 });
                 torrent.route = Some(plan.key);
                 torrent.held = None;
-                torrent.seen = Seen::default();
                 torrent.run_error = None;
             }
             None => {
@@ -4283,7 +4274,7 @@ impl TorrentService {
             active_seconds: counters.active_duration_s,
             download_avg_bps: average(counters.downloaded_bytes),
             upload_avg_bps: average(counters.uploaded_bytes),
-            wasted_bytes: reading.seen.wasted(),
+            wasted_bytes: wasted(&reading.seen),
             last_seen_complete_ms: counters.last_seen_complete_ms,
             pieces: torrent.pieces(),
             created_by: torrent.about.created_by.clone(),

@@ -76,21 +76,49 @@ impl ClientIdentity {
         self.version
     }
 
-    /// This client under a fresh peer id.
+    /// This client under a fresh peer id and tracker key.
     pub fn identity(&self) -> Identity {
+        self.identity_of(TorrentIdentity::fresh())
+    }
+
+    /// This client as the torrent `own` is: its peer id carries this
+    /// client's prefix before the torrent's own bytes.
+    pub fn identity_of(&self, own: TorrentIdentity) -> Identity {
         Identity {
-            peer_id: self.peer_id(),
+            peer_id: self.peer_id_of(own),
+            tracker_key: own.tracker_key,
             version: self.version.to_owned(),
             user_agent: self.user_agent.to_owned(),
         }
     }
 
-    /// A fresh peer id carrying this prefix.
-    pub fn peer_id(&self) -> Id20 {
+    fn peer_id_of(&self, own: TorrentIdentity) -> Id20 {
         let mut id = [0u8; 20];
         id[..8].copy_from_slice(&self.prefix);
-        getrandom::fill(&mut id[8..]).expect("system randomness");
+        id[8..].copy_from_slice(&own.peer_id);
         Id20::new(id)
+    }
+}
+
+/// Who a torrent is to its peers and trackers for as long as it is kept in
+/// this process: the bytes of its peer id after the client's prefix, and its
+/// tracker key. A pause, a session reopening or a route change keeps it; a
+/// restart or a remove and add again makes another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TorrentIdentity {
+    peer_id: [u8; 12],
+    tracker_key: u32,
+}
+
+impl TorrentIdentity {
+    pub fn fresh() -> Self {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("system randomness");
+        let (peer_id, key) = bytes.split_at(12);
+        Self {
+            peer_id: peer_id.try_into().expect("twelve bytes"),
+            tracker_key: u32::from_le_bytes(key.try_into().expect("four bytes")),
+        }
     }
 }
 
@@ -117,8 +145,8 @@ mod tests {
 
     #[test]
     fn peer_ids_share_the_prefix_and_differ() {
-        let first = IDENTITY.peer_id();
-        let second = IDENTITY.peer_id();
+        let first = IDENTITY.identity().peer_id;
+        let second = IDENTITY.identity().peer_id;
         assert_eq!(&first.0[..8], IDENTITY.prefix());
         assert_eq!(&second.0[..8], IDENTITY.prefix());
         assert_ne!(first, second);

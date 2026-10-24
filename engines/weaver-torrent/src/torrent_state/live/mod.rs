@@ -133,7 +133,7 @@ use self::{
 };
 
 use super::{
-    ManagedTorrentShared, RunCounters, TorrentMetadata,
+    ManagedTorrentShared, RunCounters, TorrentMetadata, TorrentTotals,
     paused::TorrentStatePaused,
     streaming::TorrentStreams,
     utils::{TimedExistence, timeit},
@@ -1360,12 +1360,12 @@ impl TorrentStateLive {
         let chunk_tracker = piece_tracker.into_chunks();
 
         *self.shared.last_run.lock() = Some(RunCounters {
-            uploaded_bytes: self.get_uploaded_bytes(),
-            downloaded_bytes: self.get_downloaded_bytes(),
-            corrupt_bytes: self.get_failed_bytes(),
-            redundant_bytes: self.get_redundant_bytes(),
             left_bytes: chunk_tracker.bytes_left(),
         });
+        let run = TorrentTotals::from(&self.stats_snapshot());
+        let mut moved = self.shared.moved.lock();
+        *moved = *moved + run;
+        drop(moved);
 
         Ok(TorrentStatePaused {
             shared: self.shared.clone(),

@@ -98,7 +98,7 @@ pub use ssl::SslIdentity;
 pub use stream_connect::{ConnectionKind, ConnectionOptions};
 pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState,
+    TorrentStatsState, TorrentTotals,
     initializing::Checkpoint,
     live::peer::info::{PeerFlags, PeerInfo},
     live::peers::ResumePeers,

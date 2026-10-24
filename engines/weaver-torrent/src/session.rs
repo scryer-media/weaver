@@ -82,7 +82,7 @@ use crate::{
     stream_connect::{ConnectionKind, ConnectionOptions, StreamConnector, StreamConnectorArgs},
     torrent_state::{
         AddIncomingPeerResult, ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions,
-        ManagedTorrentState, TorrentMetadata, TorrentStateLive,
+        ManagedTorrentState, TorrentMetadata, TorrentStateLive, TorrentTotals,
         initializing::{Checkpoint, TorrentStateInitializing, normalize_checkpoint},
         live::peers::PeerList,
     },
@@ -566,6 +566,11 @@ pub struct AddTorrentOptions {
     /// the session's identity is used.
     #[serde(skip)]
     pub identity: Option<Identity>,
+    /// What the torrent moved before this session took it, as another
+    /// session's [`ManagedTorrent::totals`] last read: its counters, and
+    /// what its trackers hear, go on from there.
+    #[serde(skip)]
+    pub totals: TorrentTotals,
     /// For a hybrid, verify a piece by its v2 hash alone, without SHA-1,
     /// wherever its v2 block hashes are known; a piece whose v2 hashes are
     /// not known yet is still verified by v1. No effect on a v1 or a v2
@@ -638,6 +643,7 @@ impl Default for AddTorrentOptions {
             checkpoint: None,
             piece_priorities: None,
             identity: None,
+            totals: TorrentTotals::default(),
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
             trackers_only: false,
@@ -2678,6 +2684,7 @@ impl Session {
                 dht_announce,
                 spawner: self.spawner.clone(),
                 peer_id: identity.peer_id,
+                tracker_key: identity.tracker_key,
                 storage_factory,
                 options: ManagedTorrentOptions {
                     force_tracker_interval: opts.force_tracker_interval,
@@ -2698,6 +2705,7 @@ impl Session {
                 client_name_and_version: identity.version.clone(),
                 user_agent: identity.user_agent.clone(),
                 last_run: Default::default(),
+                moved: parking_lot::Mutex::new(opts.totals),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
                 ssl,
             });
@@ -3408,28 +3416,9 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             TS::Paused | TS::NeedsCertificate => S::Paused,
             TS::Error => S::None,
         };
-        // The running run's counters; once it has ended (its pieces are gone
-        // from the live state) the ones recorded as it ended.
+        // What the torrent has moved, the running run's bytes included.
         let last_run = *mt.shared().last_run.lock();
-        let run = live
-            .as_ref()
-            .map(|l| {
-                (
-                    l.get_uploaded_bytes(),
-                    l.get_downloaded_bytes(),
-                    l.get_failed_bytes(),
-                    l.get_redundant_bytes(),
-                )
-            })
-            .or(last_run.map(|r| {
-                (
-                    r.uploaded_bytes,
-                    r.downloaded_bytes,
-                    r.corrupt_bytes,
-                    r.redundant_bytes,
-                )
-            }));
-        let (uploaded, downloaded, corrupt, redundant) = run.unwrap_or_default();
+        let totals = mt.totals();
         // What the whole torrent still lacks, whatever is selected, so a
         // torrent that has its selected files but not every piece never reads
         // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
@@ -3439,10 +3428,10 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             .ok()
             .or(last_run.map(|r| r.left_bytes));
         crate::tracker::TrackerCommsStats {
-            uploaded_bytes: uploaded,
-            downloaded_bytes: downloaded,
-            corrupt_bytes: corrupt,
-            redundant_bytes: redundant,
+            uploaded_bytes: totals.uploaded_bytes,
+            downloaded_bytes: totals.downloaded_bytes,
+            corrupt_bytes: totals.failed_bytes,
+            redundant_bytes: totals.redundant_bytes,
             left_bytes,
             torrent_state,
             // `completed` is for becoming a seed, not for finishing a

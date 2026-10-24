@@ -58,6 +58,10 @@ impl Routes for Offline {
         })
     }
 
+    fn leg_down(&self, _: &RoutePlan) -> Option<String> {
+        (!self.up).then(|| "offline".into())
+    }
+
     fn open<'life0, 'life1, 'async_trait>(
         &'life0 self,
         _: &'life1 RoutePlan,
@@ -1930,7 +1934,7 @@ fn a_peer_id_reads_as_its_first_eight_bytes() {
 // in qBittorrent's order.
 #[test]
 fn a_listed_peer_shows_its_letters_connection_and_contribution() {
-    let peer_id = IDENTITY.peer_id();
+    let peer_id = IDENTITY.identity().peer_id;
     let peer = PeerInfo {
         addr: "203.0.113.1:6881".parse().unwrap(),
         client: "Weaver 1.0".to_owned(),

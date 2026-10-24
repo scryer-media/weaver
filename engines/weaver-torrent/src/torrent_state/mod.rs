@@ -70,7 +70,7 @@ use crate::type_aliases::PeerStream;
 use initializing::TorrentStateInitializing;
 
 use self::paused::TorrentStatePaused;
-pub use self::stats::{TorrentStats, TorrentStatsState};
+pub use self::stats::{TorrentStats, TorrentStatsState, TorrentTotals};
 pub use self::streaming::FileStream;
 
 // State machine transitions.
@@ -352,6 +352,9 @@ pub struct ManagedTorrentShared {
     /// (libtorrent `torrent::dht_announce`).
     pub(crate) dht_announce: tokio::sync::watch::Sender<()>,
     pub peer_id: Id20,
+    /// The `key` of its announces, with `peer_id` the torrent's for as long
+    /// as it is kept.
+    pub(crate) tracker_key: u32,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
     pub(crate) connector: Arc<StreamConnector>,
@@ -366,9 +369,13 @@ pub struct ManagedTorrentShared {
     pub(crate) client_name_and_version: String,
     pub(crate) user_agent: String,
 
-    /// Counters of the most recent live run, recorded as the run ends, so a
-    /// `stopped` tracker announce made after it ended reports them.
+    /// What the most recent live run left, recorded as the run ends, so a
+    /// `stopped` tracker announce made after it ended reports it.
     pub(crate) last_run: parking_lot::Mutex<Option<RunCounters>>,
+
+    /// What the torrent moved before its running run: the totals it was
+    /// added with, and every run of it that ended since.
+    pub(crate) moved: parking_lot::Mutex<TorrentTotals>,
 
     /// The torrent's web seeds, kept across its runs.
     pub(crate) web_seeds: Arc<live::web_seed::WebSeeds>,
@@ -378,18 +385,10 @@ pub struct ManagedTorrentShared {
     pub(crate) ssl: Option<Arc<crate::ssl::SslTorrent>>,
 }
 
-/// Transfer counters of one live run of a torrent, as its tracker announces
-/// report them (see `TrackerCommsStats`).
+/// What one live run of a torrent left as it ended, as its tracker
+/// announces report it (see `TrackerCommsStats`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RunCounters {
-    /// Payload bytes uploaded during the run.
-    pub uploaded_bytes: u64,
-    /// Bytes of the pieces downloaded during the run that passed their check.
-    pub downloaded_bytes: u64,
-    /// Bytes of the pieces downloaded during the run that failed their check.
-    pub corrupt_bytes: u64,
-    /// Bytes of the blocks received during the run and not used.
-    pub redundant_bytes: u64,
     /// What the whole torrent still lacked as the run ended
     /// (`ChunkTracker::bytes_left`).
     pub left_bytes: u64,
@@ -408,6 +407,7 @@ impl ManagedTorrentShared {
     pub fn identity(&self) -> Identity {
         Identity {
             peer_id: self.peer_id,
+            tracker_key: self.tracker_key,
             version: self.client_name_and_version.clone(),
             user_agent: self.user_agent.clone(),
         }
@@ -1192,6 +1192,17 @@ impl ManagedTorrent {
                 bail!("can't pause torrent in error state")
             }
             ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
+        }
+    }
+
+    /// What the torrent has moved since it was added: its runs that ended
+    /// and the one running.
+    pub fn totals(&self) -> TorrentTotals {
+        let g = self.locked.read();
+        let moved = *self.shared.moved.lock();
+        match &g.state {
+            ManagedTorrentState::Live(live) => moved + TorrentTotals::from(&live.stats_snapshot()),
+            _ => moved,
         }
     }
 

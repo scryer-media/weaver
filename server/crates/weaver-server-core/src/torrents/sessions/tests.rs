@@ -49,12 +49,14 @@ fn ladder(proxy: u32) -> LegPath {
 
 // Routes whose legs are ladders that reach no one, unless a leg of another
 // kind is given. Each scope maps to a proxy id, so scopes with the same id
-// share a route; a leg can be set down, refuse to open, or wait to open
-// until the route answers.
+// share a route; every leg can be set down, one proxy's out of quota, a leg
+// can refuse to open, or wait to open until the route answers.
 #[derive(Default)]
 pub(crate) struct FakeRoutes {
     pub(crate) proxies: Mutex<BTreeMap<String, u32>>,
     pub(crate) down: Mutex<Option<String>>,
+    // The routes whose legs are out of quota.
+    pub(crate) spent: Mutex<BTreeSet<RouteKey>>,
     pub(crate) refuse: Mutex<Option<String>>,
     // While true, the route has not answered: a leg asked to open waits.
     pub(crate) unanswered: tokio::sync::watch::Sender<bool>,
@@ -72,6 +74,11 @@ pub(crate) struct FakeRoutes {
     pub(crate) network: Mutex<Option<Arc<NetworkRuntime>>>,
 }
 
+// The route of a scope mapped to `proxy`.
+fn proxy_key(proxy: u32) -> RouteKey {
+    RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &ladder(proxy))
+}
+
 fn scope_name(scope: TorrentScope) -> String {
     Consumer::Torrent(scope).key()
 }
@@ -86,6 +93,22 @@ impl FakeRoutes {
 
     pub(crate) fn set_down(&self, reason: Option<&str>) {
         *self.down.lock().unwrap() = reason.map(str::to_owned);
+    }
+
+    // The leg through `proxy` is out of quota.
+    pub(crate) fn spend(&self, proxy: u32) {
+        self.spent.lock().unwrap().insert(proxy_key(proxy));
+    }
+
+    // Why the leg of `key` may carry nothing, when it may not.
+    fn key_down(&self, key: &RouteKey) -> Option<String> {
+        self.down.lock().unwrap().clone().or_else(|| {
+            self.spent
+                .lock()
+                .unwrap()
+                .contains(key)
+                .then(|| "quota reached".to_owned())
+        })
     }
 
     pub(crate) fn set_refused(&self, error: Option<&str>) {
@@ -107,7 +130,7 @@ impl Routes for FakeRoutes {
             .get(&scope_name(scope))
             .copied()
             .unwrap_or(0);
-        let path = ladder(proxy);
+        let key = proxy_key(proxy);
         Ok(RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
@@ -118,9 +141,13 @@ impl Routes for FakeRoutes {
                 .unwrap()
                 .as_ref()
                 .map_or(LegKind::Ladder, |(kind, _)| kind.clone()),
-            key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &path),
-            down: self.down.lock().unwrap().clone(),
+            down: self.key_down(&key),
+            key,
         })
+    }
+
+    fn leg_down(&self, plan: &RoutePlan) -> Option<String> {
+        self.key_down(&plan.key)
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
@@ -1911,7 +1938,8 @@ async fn a_new_session_directory_reopens_the_route_there() {
 
 // A torrent's trackers hear `stopped` only from a session that may still
 // send: one dropped with its leg standing and its route up says it, one
-// held for its route going down or whose leg was revoked under it does not.
+// held for its route going down, whose leg was revoked under it, or whose
+// leg is out of quota does not.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up() {
     let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1985,6 +2013,14 @@ async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up()
         sessions.outdated().await,
         BTreeSet::from([plan.key.clone()])
     );
+    sessions.drop_route(&plan.key).await;
+    sessions.closing.all_stopped().await;
+
+    // Its leg out of quota: nothing, though the leg stands and the session
+    // is not outdated.
+    announced().await;
+    routes.spend(1);
+    assert!(sessions.outdated().await.is_empty());
     sessions.drop_route(&plan.key).await;
     sessions.closing.all_stopped().await;
 

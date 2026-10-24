@@ -54,7 +54,6 @@ pub struct TrackerComms {
     http_clients: Arc<dyn HttpClients>,
     reachable: Reachable,
     udp_client: UdpTrackerClient,
-    key: u32,
     // The trackers under this hash and what announcing to them has done.
     list: Mutex<TrackerList>,
     // The `tracker id` each HTTP tracker last gave, sent back on every later
@@ -1726,9 +1725,6 @@ impl TrackerComms {
         let (grow, mut grown) = tokio::sync::mpsc::unbounded_channel::<Arc<TrackerComms>>();
 
         let stats: Arc<dyn TorrentStatsProvider> = stats.into();
-        // One key for the torrent, whatever hash it announces under
-        // (libtorrent `torrent::tracker_key`).
-        let key = rand::random();
         let comms = info_hashes
             .ids20()
             .map(|info_hash| {
@@ -1743,7 +1739,6 @@ impl TrackerComms {
                     http_clients: http_clients.clone(),
                     reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
-                    key,
                     list: Mutex::new(TrackerList::new(&tiers, Instant::now())),
                     tracker_ids: Default::default(),
                     status: status.clone(),
@@ -1817,7 +1812,6 @@ impl TrackerComms {
             http_clients: self.http_clients.clone(),
             reachable: self.reachable.clone(),
             udp_client: self.udp_client.clone(),
-            key: self.key,
             list: Mutex::new(TrackerList::new(tiers, Instant::now())),
             tracker_ids: Default::default(),
             status: self.status.clone(),
@@ -2054,7 +2048,7 @@ impl TrackerComms {
             no_peer_id: false,
             event,
             numwant: numwant(event),
-            key: Some(self.key),
+            key: Some(self.identity.tracker_key),
             trackerid: trackerid.as_deref(),
         };
 
@@ -2152,7 +2146,7 @@ impl TrackerComms {
             left: stats.announced_left(),
             uploaded: stats.uploaded_bytes,
             event: udp_event(event),
-            key: self.key,
+            key: self.identity.tracker_key,
             num_want: numwant(event),
             port: announced_port(*self.announce_port.borrow()),
         };
@@ -3026,6 +3020,7 @@ mod tests {
     fn identity() -> Identity {
         Identity {
             peer_id: Id20::new([2; 20]),
+            tracker_key: 0x5eed,
             version: "Test 1.0".into(),
             user_agent: "Test/1.0".into(),
         }
