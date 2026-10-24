@@ -43,7 +43,7 @@ use crate::torrent_state::live::{
     web_seed::WebSeeds,
 };
 use crate::tracker::{
-    AutoScrape, ListenPort, Reachable, StoppedAnnounces, Tracker, TrackerAnnounce, TrackerComms,
+    ListenPort, Reachable, StoppedAnnounces, Tracker, TrackerAnnounce, TrackerComms,
     TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
@@ -286,7 +286,6 @@ pub struct Session {
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
     stopped_announces: StoppedAnnounces,
-    auto_scrape: AutoScrape,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -1254,11 +1253,6 @@ impl Session {
         &self.identity
     }
 
-    /// The cadence paused torrents scrape their trackers on.
-    pub(crate) fn auto_scrape(&self) -> &AutoScrape {
-        &self.auto_scrape
-    }
-
     /// Create a new session with options.
     #[inline(never)]
     pub fn new_with_opts(
@@ -1541,7 +1535,6 @@ impl Session {
                     opts.tracker_stopped_timeout
                         .unwrap_or(StoppedAnnounces::DEFAULT_TIMEOUT),
                 ),
-                auto_scrape: AutoScrape::default(),
                 peer_limit: opts.peer_limit,
                 choker: Arc::new(Choker::new(opts.unchoke_slots_limit)),
                 disable_pex: opts.disable_pex,
@@ -2733,7 +2726,6 @@ impl Session {
                     first_last: opts.first_last_piece_first,
                     piece_priorities,
                     trackers: None,
-                    auto_scrape: None,
                 }),
                 state_change_notify: Notify::new(),
                 shared: minfo,

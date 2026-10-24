@@ -940,58 +940,6 @@ pub struct TrackerScrape {
     pub last: Option<LastScrape>,
 }
 
-/// When paused torrents scrape their trackers on their own (libtorrent
-/// `session_impl` auto-scrape of `torrent_want_scrape`): each torrent once
-/// every `interval`, and the session no more than once every
-/// `min_interval`, so with many torrents each waits its turn. Clones share
-/// the session's turns: create one per session.
-#[derive(Clone)]
-pub struct AutoScrape {
-    interval: Duration,
-    min_interval: Duration,
-    last: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
-}
-
-impl Default for AutoScrape {
-    fn default() -> Self {
-        Self::new(Self::INTERVAL, Self::MIN_INTERVAL)
-    }
-}
-
-impl AutoScrape {
-    /// libtorrent `settings_pack::auto_scrape_interval`.
-    pub const INTERVAL: Duration = Duration::from_secs(1800);
-    /// libtorrent `settings_pack::auto_scrape_min_interval`.
-    pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
-
-    pub fn new(interval: Duration, min_interval: Duration) -> Self {
-        Self {
-            interval,
-            min_interval,
-            last: Default::default(),
-        }
-    }
-
-    /// Runs `scrape` once every interval, each run in the session's next
-    /// turn, until dropped. libtorrent's round robin gives each of `n`
-    /// torrents a scrape every `max(interval, n * min_interval)`; waiting
-    /// out the interval, then queueing (fairly) for a turn spaced
-    /// `min_interval` after the previous one, gives the same.
-    async fn run<F: std::future::Future<Output = ()>>(&self, mut scrape: impl FnMut() -> F) {
-        loop {
-            tokio::time::sleep(self.interval).await;
-            {
-                let mut last = self.last.lock().await;
-                if let Some(at) = *last {
-                    tokio::time::sleep_until(at + self.min_interval).await;
-                }
-                *last = Some(tokio::time::Instant::now());
-            }
-            scrape().await;
-        }
-    }
-}
-
 /// Scrapes a torrent's trackers under every hash it announces.
 struct Scraper {
     info_hashes: Mutex<Vec<Id20>>,
@@ -1318,17 +1266,6 @@ impl TrackerStatus {
         let result = self.0.scraper.scrape(&tracker).await;
         self.record_scrape(&tracker, &result);
         result
-    }
-
-    /// Scrapes on `schedule` until dropped.
-    pub(crate) async fn auto_scrape(&self, schedule: &AutoScrape) {
-        schedule
-            .run(|| async {
-                if let Err(e) = self.scrape().await {
-                    debug!("auto-scrape failed: {e:#}");
-                }
-            })
-            .await
     }
 
     /// libtorrent `tracker_list::last_working`, else `tracker_list::first`.
@@ -2200,10 +2137,10 @@ mod tests {
     use tokio::time::Instant;
 
     use super::{
-        AnnounceErrorKind, AnnounceOk, AutoScrape, MIN_ANNOUNCE_INTERVAL, Reachable,
-        ReannounceDelay, Refused, ScrapeOk, StoppedAnnounces, SupportedTracker, Tracker, TrackerAnnounce,
-        TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape,
-        TrackerTask, UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
+        AnnounceErrorKind, AnnounceOk, MIN_ANNOUNCE_INTERVAL, Reachable, ReannounceDelay, Refused,
+        ScrapeOk, StoppedAnnounces, SupportedTracker, Tracker, TrackerAnnounce, TrackerComms,
+        TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape, TrackerTask,
+        UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
         udp_tracker_to_socket_addrs,
     };
     use crate::Identity;
@@ -4019,49 +3956,6 @@ mod tests {
         assert_eq!(status.announces()[0].last, None);
         stopped.wait_idle().await;
         token.cancel();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn auto_scrape_waits_the_interval_and_spaces_the_sessions_scrapes() {
-        let schedule = AutoScrape::default();
-        let start = tokio::time::Instant::now();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        // Two paused torrents on one session's schedule.
-        for torrent in ["a", "b"] {
-            let schedule = schedule.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                schedule
-                    .run(|| {
-                        let _ = tx.send((torrent, tokio::time::Instant::now()));
-                        async {}
-                    })
-                    .await
-            });
-        }
-        let mut scrapes = Vec::new();
-        while scrapes.len() < 4 {
-            scrapes.push(rx.recv().await.unwrap());
-        }
-        // Neither scrapes before the interval has passed.
-        assert!(scrapes[0].1 - start >= AutoScrape::INTERVAL);
-        // Every scrape is a minimum interval after the session's previous one.
-        for pair in scrapes.windows(2) {
-            assert!(
-                pair[1].1 - pair[0].1 >= AutoScrape::MIN_INTERVAL,
-                "{scrapes:?}"
-            );
-        }
-        // Each torrent waits the interval again after its scrape.
-        for torrent in ["a", "b"] {
-            let at: Vec<_> = scrapes
-                .iter()
-                .filter(|(t, _)| *t == torrent)
-                .map(|(_, at)| *at)
-                .collect();
-            assert_eq!(at.len(), 2, "{scrapes:?}");
-            assert!(at[1] - at[0] >= AutoScrape::INTERVAL, "{scrapes:?}");
-        }
     }
 
     /// Resolves every name to `at`'s address.

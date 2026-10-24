@@ -136,8 +136,6 @@ pub(crate) struct ManagedTorrentLocked {
     // The announce table of the trackers of the latest live run. It outlives
     // the run, so the last outcomes stay readable while paused.
     pub(crate) trackers: Option<crate::tracker::TrackerStatus>,
-    // While paused, ends the scraping of those trackers when dropped.
-    pub(crate) auto_scrape: Option<tokio_util::sync::DropGuard>,
 }
 
 #[derive(Default)]
@@ -829,7 +827,6 @@ impl ManagedTorrent {
 
         self.state_change_notify.notify_waiters();
 
-        g.auto_scrape = None;
         g.state = ManagedTorrentState::Error(error)
     }
 
@@ -921,10 +918,8 @@ impl ManagedTorrent {
                 }
                 ManagedTorrentState::Paused(_) => {
                     if start_paused {
-                        g.auto_scrape = t.spawn_auto_scrape(g.trackers.clone());
                         return Ok(());
                     }
-                    g.auto_scrape = None;
                     // An SSL torrent goes live only with an identity to
                     // present; until it has one it waits here, asking no
                     // peer and no tracker.
@@ -1068,29 +1063,6 @@ impl ManagedTorrent {
         trackers.scrape().await
     }
 
-    /// While the torrent rests paused, its trackers are scraped on the
-    /// session's auto-scrape cadence (libtorrent `torrent::update_want_scrape`
-    /// lists paused torrents). Dropping the returned guard ends it.
-    fn spawn_auto_scrape(
-        &self,
-        trackers: Option<crate::tracker::TrackerStatus>,
-    ) -> Option<tokio_util::sync::DropGuard> {
-        let trackers = trackers?;
-        let session = self.shared.session.upgrade()?;
-        let schedule = session.auto_scrape().clone();
-        let token = session.cancellation_token().child_token();
-        spawn_with_cancel(
-            debug_span!(parent: self.shared.span.clone(), "auto_scrape"),
-            "auto_scrape",
-            token.clone(),
-            async move {
-                trackers.auto_scrape(&schedule).await;
-                anyhow::Ok(())
-            },
-        );
-        Some(token.drop_guard())
-    }
-
     // A run that checks every piece and trusts nothing saved, on files
     // opened again, founded on `peers`: the restart after an error, and a
     // forced recheck.
@@ -1140,7 +1112,6 @@ impl ManagedTorrent {
             ManagedTorrentState::Error(_) => Default::default(),
             ManagedTorrentState::None => bail!("bug: torrent is in empty state"),
         };
-        g.auto_scrape = None;
         g.state = ManagedTorrentState::Initializing(self.checking_everything(&g, peers)?);
         self.state_change_notify.notify_waiters();
         Ok(())
@@ -1174,7 +1145,6 @@ impl ManagedTorrent {
                 let paused = live.pause()?;
                 g.state = ManagedTorrentState::Paused(paused);
                 g.paused = true;
-                g.auto_scrape = self.spawn_auto_scrape(g.trackers.clone());
                 self.state_change_notify.notify_waiters();
                 Ok(())
             }
