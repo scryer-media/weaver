@@ -1451,6 +1451,54 @@ pub(crate) mod tests {
         }
     }
 
+    // A mapping is described to the gateway as the forwarder was told to
+    // describe it: the client its session names itself as.
+    #[tokio::test(start_paused = true)]
+    async fn a_mapping_is_described_as_the_forwarder_was_told() {
+        let _hold = hold_clock();
+        let (location, mut calls) = mock_gateway(
+            |_| {
+                gateway_description(
+                    "InternetGatewayDevice:1",
+                    "urn:schemas-upnp-org:service:WANIPConnection:1",
+                    "",
+                )
+            },
+            Arc::new(|call: &SoapCall| match call.action() {
+                "GetExternalIPAddress" => external_ip_answer(),
+                _ => ok(""),
+            }),
+        )
+        .await;
+        let forwarder = UpnpPortForwarder::new(
+            tcp_and_udp(6881),
+            Some(UpnpPortForwarderOptions {
+                description: "qBittorrent/5.2.3".into(),
+                ..Default::default()
+            }),
+            Ok(loopback()),
+        )
+        .unwrap();
+        let (found, found_rx) = unbounded_channel();
+        let cancel = CancellationToken::new();
+        let (events_tx, _events) = unbounded_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { forwarder.run_gateways(found_rx, cancel, events_tx).await }
+        });
+        found.send(found_at(location)).unwrap();
+
+        assert_eq!(calls.recv().await.unwrap().action(), "GetExternalIPAddress");
+        for protocol in ["TCP", "UDP"] {
+            let call = calls.recv().await.unwrap();
+            assert_eq!(call.action(), "AddPortMapping");
+            assert_eq!(call.arg("NewProtocol"), protocol);
+            assert_eq!(call.arg("NewPortMappingDescription"), "qBittorrent/5.2.3");
+        }
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_wanipconnection_2_gateway_maps_tcp_and_udp_renews_at_three_quarters_of_the_lease_and_removes_them_on_close()
      {

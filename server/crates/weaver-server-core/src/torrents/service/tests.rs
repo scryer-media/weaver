@@ -817,6 +817,89 @@ fn store_route_unchecked(db: &Database, consumer: Consumer, policy: &RoutingPoli
     .unwrap();
 }
 
+// A torrent added by URL is asked for as the client of the tracker rule its
+// URL's host falls under, and as Weaver under no rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = Arc::new(crate::torrents::sessions::NetworkRoutes::new(
+        db.clone(),
+        Arc::clone(&proxies),
+        Duration::from_secs(30),
+    ));
+    let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
+    service.open().await.unwrap();
+
+    let site = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url =
+        reqwest::Url::parse(&format!("http://{}/a.torrent", site.local_addr().unwrap())).unwrap();
+    let body = b"d4:infod4:name1:aee";
+    let fetch_as = async || {
+        let served = async {
+            let (mut stream, _) = site.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                assert!(read > 0, "the request ended before it was read");
+                request.extend_from_slice(&buf[..read]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("user-agent")
+                        .then(|| value.trim().to_owned())
+                })
+        };
+        let (fetched, agent) = tokio::join!(service.fetch_url(&proxies, None, &url, None), served);
+        assert_eq!(fetched.unwrap(), body);
+        agent
+    };
+
+    assert_eq!(
+        fetch_as().await.as_deref(),
+        Some(crate::torrents::identity::IDENTITY.user_agent())
+    );
+
+    db.insert_tracker_rule(
+        &TrackerRule {
+            id: 0,
+            host_pattern: "127.0.0.1".into(),
+            seeding: None,
+            never_pause: false,
+            unpack: None,
+            client: Some(Client::QBittorrent),
+            torrent_route: false,
+            discovery: None,
+            encryption: None,
+            upload_limit: None,
+            forced: false,
+            ssl: None,
+        },
+        EPOCH_MS,
+    )
+    .unwrap();
+    service.reload_tracker_rules().await.unwrap();
+    assert_eq!(
+        fetch_as().await.as_deref(),
+        Some(Client::QBittorrent.name().user_agent())
+    );
+    service.stop().await;
+}
+
 // A torrent added by URL is fetched over its route's one leg: up, the
 // request reaches the site; down, the add fails for the route being down,
 // and nothing is asked.
@@ -832,17 +915,13 @@ async fn a_torrent_url_is_fetched_over_the_routes_one_leg_or_not_at_all() {
         db.clone(),
         Arc::clone(&proxies),
         Duration::from_secs(30),
-        crate::torrents::identity::IDENTITY,
     ));
     let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
     service.open().await.unwrap();
 
     let site = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = reqwest::Url::parse(&format!(
-        "http://{}/a.torrent",
-        site.local_addr().unwrap()
-    ))
-    .unwrap();
+    let url =
+        reqwest::Url::parse(&format!("http://{}/a.torrent", site.local_addr().unwrap())).unwrap();
     let body = b"d4:infod4:name1:aee";
     let served = async {
         let (mut stream, _) = site.accept().await.unwrap();
@@ -949,7 +1028,6 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
         db.clone(),
         Arc::clone(&proxies),
         Duration::from_secs(30),
-        crate::torrents::identity::IDENTITY,
     ));
     let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
     service.open().await.unwrap();
@@ -1186,7 +1264,12 @@ async fn a_torrent_past_the_session_limit_says_so() {
     for id in 0..MAX_SESSIONS as u32 {
         rig.routes.route(TorrentScope::Category(100 + id), 100 + id);
         let plan = rig.routes.plan(TorrentScope::Category(100 + id)).unwrap();
-        rig.service.inner.sessions.session(&plan).await.unwrap();
+        rig.service
+            .inner
+            .sessions
+            .session(&plan, &crate::torrents::identity::IDENTITY.identity())
+            .await
+            .unwrap();
     }
     let job_id = rig
         .service
@@ -1556,7 +1639,12 @@ async fn fetching_from(service: &TorrentService, hash: &str, port: u16) -> JobId
         })
         .await
         .unwrap();
-    tracked(service, job_id, &format!("http://127.0.0.1:{port}/announce")).await;
+    tracked(
+        service,
+        job_id,
+        &format!("http://127.0.0.1:{port}/announce"),
+    )
+    .await;
     service.resume(job_id).await.unwrap();
     job_id
 }
@@ -3366,7 +3454,10 @@ async fn a_magnet_fetching_when_its_route_changes_fetches_again_on_the_new_route
     assert_eq!(events, ["started", "stopped"]);
     let live = rig.service.inner.live.lock().await;
     assert_eq!(live[&job_id].route.as_ref(), Some(&new));
-    assert!(matches!(live[&job_id].resolving, Some(Resolving::Fetching(_))));
+    assert!(matches!(
+        live[&job_id].resolving,
+        Some(Resolving::Fetching(_))
+    ));
     drop(live);
     let running = rig.service.inner.sessions.running().await;
     assert!(running.contains_key(&new), "{:?}", running.keys());
@@ -3421,7 +3512,8 @@ async fn a_magnet_added_paused_announces_only_once_resumed() {
 
 // A torrent under a tracker rule that names a client names itself as that
 // client to its peers and trackers; a torrent under no rule names itself as
-// Weaver.
+// Weaver. The route both run on names the client of the torrent that opened
+// it, the rule's, though the second torrent names another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rules_client_names_its_torrents() {
     use crate::torrents::identity::IDENTITY;
@@ -3486,6 +3578,37 @@ async fn a_tracker_rules_client_names_its_torrents() {
             IDENTITY.version().to_owned()
         )
     );
+    let session = session_of(&rig.service, kept).await;
+    assert!(Arc::ptr_eq(
+        &session,
+        &session_of(&rig.service, plain).await
+    ));
+    assert_eq!(
+        named(session.identity().clone()),
+        (
+            qbittorrent.prefix().to_vec(),
+            qbittorrent.user_agent().to_owned(),
+            qbittorrent.version().to_owned()
+        )
+    );
+}
+
+// A route opened by a torrent under no rule names Weaver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_route_opened_by_a_torrent_under_no_rule_names_weaver() {
+    use crate::torrents::identity::IDENTITY;
+
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let plain = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("plain", 1))))
+        .await
+        .unwrap();
+    let identity = session_of(&rig.service, plain).await.identity().clone();
+    assert_eq!(&identity.peer_id.0[..8], IDENTITY.prefix());
+    assert_eq!(identity.user_agent, IDENTITY.user_agent());
+    assert_eq!(identity.version, IDENTITY.version());
 }
 
 // Who holds `job_id` stopped, as the queue last applied the holds.
@@ -4704,10 +4827,7 @@ async fn file_levels_and_picking_toggles_reach_the_session_and_outlive_a_restart
 
 // The torrent's trackers as the service lists them: tier, URL and who
 // named it.
-async fn listed_trackers(
-    service: &TorrentService,
-    job_id: JobId,
-) -> Vec<(u32, String, NamedBy)> {
+async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, String, NamedBy)> {
     service
         .trackers(job_id)
         .await

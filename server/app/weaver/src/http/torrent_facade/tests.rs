@@ -200,7 +200,6 @@ async fn rig_on(
             Arc::new(routes),
             SessionEnv {
                 root: dir.path().join("sessions"),
-                identity: IDENTITY,
             },
             db.clone(),
         );

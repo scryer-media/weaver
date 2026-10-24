@@ -58,7 +58,7 @@ use crate::settings::{
     TrackerUploadLimit, resolve_seeding_policy,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
-use crate::torrents::identity::TorrentIdentity;
+use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{
@@ -239,14 +239,18 @@ fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
     rules.iter().find(|rule| rule.id == id)
 }
 
-// How a torrent that is `own` under `rule` names itself to peers and
-// trackers: as the client its tracker rule names, else Weaver, under its own
-// peer id and tracker key.
-fn identity_of(rule: Option<&TrackerRule>, own: TorrentIdentity) -> Identity {
+// The client a torrent under `rule` claims to be on every surface that
+// names one: the client its tracker rule names, else Weaver.
+fn client_of(rule: Option<&TrackerRule>) -> ClientIdentity {
     rule.and_then(|rule| rule.client)
         .unwrap_or(Client::Weaver)
         .name()
-        .identity_of(own)
+}
+
+// How a torrent that is `own` under `rule` names itself to peers and
+// trackers: as its client, under its own peer id and tracker key.
+fn identity_of(rule: Option<&TrackerRule>, own: TorrentIdentity) -> Identity {
+    client_of(rule).identity_of(own)
 }
 
 // The limits `record`'s session holds it to: its own, and on upload a cap
@@ -387,12 +391,7 @@ impl TorrentService {
         pipeline: &crate::pipeline::Pipeline,
         queue: SchedulerHandle,
     ) -> Result<Self, String> {
-        let routes = NetworkRoutes::new(
-            db.clone(),
-            Arc::clone(proxies),
-            ROUTE_TIMEOUT,
-            crate::torrents::identity::IDENTITY,
-        );
+        let routes = NetworkRoutes::new(db.clone(), Arc::clone(proxies), ROUTE_TIMEOUT);
         let sessions = Sessions::new(Arc::new(routes), SessionEnv::of(config), db.clone());
         let service = Self::new(
             db,
@@ -2346,7 +2345,7 @@ impl TorrentService {
                 let session = self
                     .inner
                     .sessions
-                    .session(&plan)
+                    .session(&plan, &client_of(rule).identity())
                     .await
                     .map_err(|error| AddError::NoNetwork(error.to_string()))?;
                 if magnet.trackers.is_empty() && session.get_dht().is_none() {
@@ -2554,7 +2553,7 @@ impl TorrentService {
         identity: Identity,
         terms: PeerTerms,
     ) {
-        let session = match self.inner.sessions.session(&plan).await {
+        let session = match self.inner.sessions.session(&plan, &identity).await {
             Ok(session) => session,
             Err(error) => {
                 self.fetch_ended(job_id).await;
@@ -2828,7 +2827,7 @@ impl TorrentService {
                 return;
             }
         };
-        let session = match self.inner.sessions.session(&plan).await {
+        let session = match self.inner.sessions.session(&plan, &identity).await {
             Ok(session) => session,
             Err(error) => {
                 self.held(job_id, Some(plan.key), held_by(error)).await;
@@ -4377,7 +4376,8 @@ impl TorrentService {
     }
 
     /// The bytes at `url` for a torrent added in `category`, fetched over
-    /// its route's one leg and nothing else. A leg that is down fetches
+    /// its route's one leg and nothing else, as the client of the tracker
+    /// rule whose pattern the URL's host matches. A leg that is down fetches
     /// nothing: the add fails for the route being down.
     pub async fn fetch_url(
         &self,
@@ -4391,7 +4391,8 @@ impl TorrentService {
         if let Some(reason) = plan.down {
             return Err(SessionError::RouteDown(reason).to_string());
         }
-        crate::ingest::fetch_torrent_url(proxies, scope, url, cookie).await
+        let client = client_of(tracker_rule_for(&self.rules(), [url.as_str()]));
+        crate::ingest::fetch_torrent_url(proxies, scope, url, cookie, client).await
     }
 }
 

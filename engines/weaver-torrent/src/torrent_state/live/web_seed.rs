@@ -669,6 +669,8 @@ pub(crate) struct WebSeedConnection<'a> {
     allowed: &'a (dyn Fn(SocketAddr) -> bool + Send + Sync),
     layout: &'a Layout,
     link: &'a SeedLink,
+    // The client the torrent names itself as: every request's User-Agent.
+    user_agent: &'a str,
     // The clients built for this connection, by host, port and address, so
     // its requests to one address share their connections.
     pinned: Mutex<HashMap<(String, u16, Option<IpAddr>), reqwest::Client>>,
@@ -681,6 +683,7 @@ impl<'a> WebSeedConnection<'a> {
         allowed: &'a (dyn Fn(SocketAddr) -> bool + Send + Sync),
         layout: &'a Layout,
         link: &'a SeedLink,
+        user_agent: &'a str,
     ) -> Self {
         Self {
             clients,
@@ -688,6 +691,7 @@ impl<'a> WebSeedConnection<'a> {
             allowed,
             layout,
             link,
+            user_agent,
             pinned: Mutex::default(),
         }
     }
@@ -1060,7 +1064,9 @@ impl<'a> WebSeedConnection<'a> {
 
     async fn send(&self, request: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
         // Ranges of the bytes as stored, not of a compressed body.
-        let request = request.header(header::ACCEPT_ENCODING, "identity");
+        let request = request
+            .header(header::ACCEPT_ENCODING, "identity")
+            .header(header::USER_AGENT, self.user_agent);
         tokio::time::timeout(URLSEED_TIMEOUT, request.send())
             .await
             .context("timed out")?
@@ -1197,6 +1203,7 @@ mod tests {
     struct Head {
         target: String,
         range: Option<(u64, u64)>,
+        user_agent: Option<String>,
     }
 
     struct Reply {
@@ -1315,9 +1322,15 @@ mod tests {
                 let (a, b) = v.strip_prefix("bytes=").unwrap().split_once('-').unwrap();
                 (a.parse().unwrap(), b.parse().unwrap())
             });
+        let user_agent = req
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("user-agent"))
+            .map(|h| String::from_utf8(h.value.to_vec()).unwrap());
         let head = Head {
             target: req.path.unwrap().to_owned(),
             range,
+            user_agent,
         };
         let reply = respond(&head);
         seen.lock().push(head);
@@ -1457,6 +1470,9 @@ mod tests {
             })
             .collect()
     }
+
+    // The client the tests' torrent names itself as.
+    const UA: &str = "Client/1.0";
 
     // Every address may be connected to.
     const ALL: &(dyn Fn(SocketAddr) -> bool + Send + Sync) = &|_| true;
@@ -1624,7 +1640,7 @@ mod tests {
             ("b", 30000, false),
         ]);
         let (_seeds, link) = one_seed(server.url("/seed"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
         let fake = Fake::default();
 
         let requests = blocks(&layout, 0..3);
@@ -1643,11 +1659,13 @@ mod tests {
             vec![
                 Head {
                     target: "/seed/t/a%20file".into(),
-                    range: Some((0, 39999))
+                    range: Some((0, 39999)),
+                    user_agent: Some(UA.into()),
                 },
                 Head {
                     target: "/seed/t/b".into(),
-                    range: Some((0, 29999))
+                    range: Some((0, 29999)),
+                    user_agent: Some(UA.into()),
                 },
             ]
         );
@@ -1672,7 +1690,7 @@ mod tests {
             ("b", 30000, false),
         ]);
         let (seeds, link) = one_seed(server.url("/seed/"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
         let fake = Fake::default();
 
         let failed = drive(&conn, &fake, &blocks(&layout, 2..3), 1).await;
@@ -1703,7 +1721,7 @@ mod tests {
             let server = Server::start(move |_| reply.lock().take().unwrap());
             let (seeds, link) = one_seed(server.url("/f"), WebSeedKind::Url);
             let layout = super::tests::layout(&[("f", 100, false)]);
-            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
             assert!(
                 drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
                     .await
@@ -1732,7 +1750,7 @@ mod tests {
             let server = Server::start(move |_| Reply::status(503).header("Retry-After", value));
             let (seeds, link) = one_seed(server.url("/f"), WebSeedKind::Url);
             let layout = super::tests::layout(&[("f", 100, false)]);
-            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
             assert!(
                 drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
                     .await
@@ -1761,12 +1779,15 @@ mod tests {
         });
         let layout = layout(&[("a", 40000, false), ("b", 10, false)]);
         let (seeds, link) = one_seed(server.url("/seed/"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
         let fake = Fake::default();
 
         drive(&conn, &fake, &blocks(&layout, 0..1), 2)
             .await
             .unwrap();
+        // The move is asked for under the torrent's client, as the seed was.
+        let agents: Vec<_> = server.seen().into_iter().map(|h| h.user_agent).collect();
+        assert_eq!(agents, [Some(UA.to_owned()), Some(UA.to_owned())]);
         assert_eq!(
             entry(&seeds, |e| e.redirects.clone()),
             HashMap::from([(
@@ -1813,7 +1834,8 @@ mod tests {
             }
             for (url, resolver) in refused {
                 let (seeds, link) = seed_named(url.clone(), WebSeedKind::Url, NamedBy::Torrent);
-                let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+                let conn =
+                    WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
                 let failed = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1).await;
                 assert!(failed.is_err(), "{url}");
                 assert!(entry(&seeds, |e| e.disabled), "{url}");
@@ -1828,7 +1850,7 @@ mod tests {
             NamedBy::Torrent,
         );
         let resolver = names(&[("seed.test", "10.0.0.1"), ("seed.test", "8.8.8.8")]);
-        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
             .await
             .unwrap();
@@ -1838,7 +1860,7 @@ mod tests {
 
         let (seeds, link) = one_seed(format!("http://seed.test:{port}/f?x=1"), WebSeedKind::Url);
         let resolver = names(&[("seed.test", "10.0.0.1")]);
-        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
             .await
             .unwrap();
@@ -1877,11 +1899,14 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        for (n, named_by) in [NamedBy::Torrent, NamedBy::Operator].into_iter().enumerate() {
+        for (n, named_by) in [NamedBy::Torrent, NamedBy::Operator]
+            .into_iter()
+            .enumerate()
+        {
             let clients = Wired::new(server.addr);
             let resolver = names(&[("seed.test", "8.8.8.8"), ("moved.test", "192.168.1.2")]);
             let (seeds, link) = seed_named(url.clone(), WebSeedKind::Url, named_by);
-            let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+            let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
             assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
             assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([0]));
             assert!(!entry(&seeds, |e| e.disabled));
@@ -1893,7 +1918,7 @@ mod tests {
         let clients = Wired::new(server.addr);
         let resolver = names(&[("seed.test", "8.8.8.8"), ("moved.test", "9.9.9.9")]);
         let (seeds, link) = one_seed(url, WebSeedKind::Url);
-        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
         drive(&conn, &Fake::default(), &requests, 1).await.unwrap();
         assert_eq!(
             entry(&seeds, |e| e.redirects.clone()),
@@ -1933,7 +1958,7 @@ mod tests {
         let layout = layout(&[("a", 40000, false), ("b", 10, false)]);
         let resolver = names(&[("seed.test", "127.0.0.1"), ("moved.test", "127.0.0.1")]);
         let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), resolver, ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), resolver, ALL, &layout, &link, UA);
         let fake = Fake::default();
         let requests = blocks(&layout, 0..2);
         drive(&conn, &fake, &requests, requests.len())
@@ -1989,7 +2014,7 @@ mod tests {
             });
             let layout = layout(&[("f", 100, false)]);
             let (seeds, link) = one_seed(server.url("/r0"), WebSeedKind::Url);
-            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
             let fake = Fake::default();
             let fetched = drive(&conn, &fake, &blocks(&layout, 0..1), 1).await;
             assert_eq!(fetched.is_ok(), ok, "{fetched:?}");
@@ -2015,14 +2040,14 @@ mod tests {
         let (seeds, link) = one_seed(url, WebSeedKind::Url);
 
         let blocked = |a: SocketAddr| a.ip() != ip("127.0.0.1");
-        let conn = WebSeedConnection::new(direct(), resolver(), &blocked, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), resolver(), &blocked, &layout, &link, UA);
         let failed = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1).await;
         assert!(failed.is_err());
         assert!(server.seen().is_empty());
         assert!(!entry(&seeds, |e| e.disabled));
         assert!(entry(&seeds, |e| e.lacks.files.is_empty()));
 
-        let conn = WebSeedConnection::new(direct(), resolver(), ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), resolver(), ALL, &layout, &link, UA);
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
             .await
             .unwrap();
@@ -2052,8 +2077,14 @@ mod tests {
         let (_seeds, link) = seed_named(url, WebSeedKind::Url, NamedBy::Torrent);
         let clients = Wired::new(server.addr);
         let nothing = |_: SocketAddr| false;
-        let conn =
-            WebSeedConnection::new(clients.clone(), Arc::new(AtExit), &nothing, &layout, &link);
+        let conn = WebSeedConnection::new(
+            clients.clone(),
+            Arc::new(AtExit),
+            &nothing,
+            &layout,
+            &link,
+            UA,
+        );
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
             .await
             .unwrap();
@@ -2074,7 +2105,7 @@ mod tests {
         });
         let layout = layout(&[("a", u64::from(PIECE), false)]);
         let (seeds, link) = one_seed(server.url("/a"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
         let fake = Fake::default();
 
         let failed = drive(&conn, &fake, &blocks(&layout, 0..1), 2).await;
@@ -2111,7 +2142,7 @@ mod tests {
             let reply = Mutex::new(Some(reply));
             let server = Server::start(move |_| reply.lock().take().unwrap());
             let (seeds, link) = one_seed(server.url("/a"), WebSeedKind::Url);
-            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
             let fake = Fake::default();
             assert!(
                 drive(&conn, &fake, &blocks(&layout, 0..1), 1)
@@ -2125,7 +2156,7 @@ mod tests {
         let sa = a.clone();
         let server = Server::start(move |_| Reply::status(200).body(sa.clone()));
         let (_seeds, link) = one_seed(server.url("/a"), WebSeedKind::Url);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
         let fake = Fake::default();
         drive(&conn, &fake, &blocks(&layout, 0..1), 2)
             .await
@@ -2164,7 +2195,7 @@ mod tests {
         });
         let layout = layout(&[("f", 40000, false)]);
         let (seeds, link) = one_seed(server.url("/s.php"), WebSeedKind::Http);
-        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+        let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
 
         let fake = Fake::default();
         let requests = blocks(&layout, 0..2);
@@ -2202,7 +2233,7 @@ mod tests {
         ] {
             let server = Server::start(move |_| Reply::status(503).body(body.clone()));
             let (seeds, link) = one_seed(server.url("/s.php"), WebSeedKind::Http);
-            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
             assert!(
                 drive(&conn, &Fake::default(), &requests[..1], 1)
                     .await
@@ -2223,6 +2254,7 @@ mod tests {
             ALL,
             &layout,
             &link,
+            UA,
         );
         assert!(
             drive(&conn, &Fake::default(), &requests[..1], 1)
@@ -2256,7 +2288,7 @@ mod tests {
                 named_by: NamedBy::Torrent,
             }]));
             let link = seeds.link(0).unwrap();
-            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link);
+            let conn = WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA);
             let mut queue = VecDeque::from(requests);
             std::iter::from_fn(|| conn.take_run(&mut queue))
                 .map(|r| (r.offset, r.len))
@@ -2301,7 +2333,7 @@ mod tests {
                 named_by: NamedBy::Torrent,
             }]));
             let link = seeds.link(0).unwrap();
-            WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link)
+            WebSeedConnection::new(direct(), names(&[]), ALL, &layout, &link, UA)
                 .file_target(file)
                 .unwrap()
                 .url

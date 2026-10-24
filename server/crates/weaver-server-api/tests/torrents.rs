@@ -18,7 +18,6 @@ use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::{SeedingPolicy, TorrentConfig};
-use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
@@ -90,7 +89,6 @@ async fn rig_on(routes: impl FnOnce(&weaver_server_core::Database) -> Arc<dyn Ro
         routes(&db),
         SessionEnv {
             root: dir.path().join("sessions"),
-            identity: IDENTITY,
         },
         db.clone(),
     );
@@ -1361,7 +1359,6 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             db.clone(),
             proxies,
             std::time::Duration::from_secs(30),
-            IDENTITY,
         )))
     })
     .await;

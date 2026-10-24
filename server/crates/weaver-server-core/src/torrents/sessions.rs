@@ -20,8 +20,8 @@ use weaver_torrent::network::Resolver;
 use weaver_torrent::upnp::PortMapEvents;
 pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
-    ConnectionOptions, DhtSessionConfig, HttpClients, IpFilter, ListenerMode, ListenerOptions,
-    PeerConnectionOptions, Session, SessionLimits, SessionOptions, SocketFactory,
+    ConnectionOptions, DhtSessionConfig, HttpClients, Identity, IpFilter, ListenerMode,
+    ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions, SocketFactory,
 };
 
 use crate::StateError;
@@ -32,7 +32,7 @@ use crate::proxies::{
     TorrentScope, routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
-use crate::torrents::identity::ClientIdentity;
+use crate::torrents::identity::IDENTITY;
 use crate::torrents::net::{LegKind, LegNames, LegSockets, Shape, tracker_client};
 use crate::torrents::rate::SessionRates;
 
@@ -138,21 +138,14 @@ pub struct NetworkRoutes {
     db: Database,
     proxies: Arc<ProxyRuntime>,
     timeout: Duration,
-    identity: ClientIdentity,
 }
 
 impl NetworkRoutes {
-    pub fn new(
-        db: Database,
-        proxies: Arc<ProxyRuntime>,
-        timeout: Duration,
-        identity: ClientIdentity,
-    ) -> Self {
+    pub fn new(db: Database, proxies: Arc<ProxyRuntime>, timeout: Duration) -> Self {
         Self {
             db,
             proxies,
             timeout,
-            identity,
         }
     }
 
@@ -232,7 +225,7 @@ impl Routes for NetworkRoutes {
                 shape: plan.kind.shape(None),
                 factory: None,
                 names: Arc::new(LegNames(egress)),
-                http: tracker_client(&plan.kind, None, &self.identity)?,
+                http: tracker_client(&plan.kind, None)?,
                 leg: None,
             });
         }
@@ -244,7 +237,7 @@ impl Routes for NetworkRoutes {
             LegKind::Ladder => Some(leg.bridge()?),
             _ => None,
         };
-        let http = tracker_client(&plan.kind, bridge, &self.identity)?;
+        let http = tracker_client(&plan.kind, bridge)?;
         let dialer = leg.dialer();
         Ok(OpenLeg {
             shape: plan.kind.shape(Some(&dialer)),
@@ -258,13 +251,13 @@ impl Routes for NetworkRoutes {
 
     // Fetched once for every route, so on Default outbound, which carries
     // what Weaver fetches that no one consumer does; bounded like a fetched
-    // torrent.
+    // torrent. No torrent's traffic, so Weaver names itself.
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String> {
         let options = FetchOptions {
             label: "blocklist",
             timeout: Duration::from_secs(60),
             redirects: 10,
-            user_agent: self.identity.user_agent(),
+            user_agent: IDENTITY.user_agent(),
             https_only: false,
             allow_private_network: self.proxies.allow_private_network(),
         };
@@ -295,7 +288,6 @@ pub struct SessionEnv {
     /// Each session keeps its state in a directory of its own under here,
     /// unless the settings name another.
     pub root: PathBuf,
-    pub identity: ClientIdentity,
 }
 
 impl SessionEnv {
@@ -303,7 +295,6 @@ impl SessionEnv {
     pub fn of(config: &crate::settings::Config) -> Self {
         Self {
             root: PathBuf::from(&config.data_dir).join("torrents"),
-            identity: crate::torrents::identity::IDENTITY,
         }
     }
 
@@ -413,15 +404,17 @@ pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
 }
 
 /// The options of a session on `leg`, listening on `port` when it listens,
-/// under the torrent settings `torrent` and the IP filter made of them.
+/// under the torrent settings `torrent` and the IP filter made of them, that
+/// names itself as `opener`'s client where it names a client for all its
+/// torrents: its DHT node and its gateway mappings.
 pub fn session_options(
-    env: &SessionEnv,
     leg: &OpenLeg,
     port: u16,
     dir: &Path,
     peers: usize,
     torrent: &TorrentConfig,
     ip_filter: IpFilter,
+    opener: &Identity,
 ) -> SessionOptions {
     let shape = leg.shape;
     let listen_ip = leg.kind.listen_ip().unwrap_or_else(|| unspecified(binds));
@@ -440,7 +433,7 @@ pub fn session_options(
         disable_trackers: false,
         fastresume: false,
         persistence: None,
-        identity: Some(env.identity.identity()),
+        identity: Some(opener.same_client()),
         listen: shape.listen.then(|| ListenerOptions {
             mode,
             listen_addr: SocketAddr::new(listen_ip, port),
@@ -824,8 +817,14 @@ impl Sessions {
     }
 
     /// The open session of `plan`'s route, built when it is not open yet. A
-    /// route that is down holds closed.
-    pub async fn session(&self, plan: &RoutePlan) -> Result<Arc<Session>, SessionError> {
+    /// route that is down holds closed. A session built here names itself as
+    /// the client of `opener`, the torrent that opens it, wherever it names a
+    /// client for all its torrents; it keeps that client while it is open.
+    pub async fn session(
+        &self,
+        plan: &RoutePlan,
+        opener: &Identity,
+    ) -> Result<Arc<Session>, SessionError> {
         if let Some(session) = self
             .slots
             .lock()
@@ -868,7 +867,7 @@ impl Sessions {
         // The peer limit is each torrent's, whatever else is open.
         let peers = self.config().max_peers_total as usize;
         let mappings = PortMappings::default();
-        match self.build(plan, port_slot, peers, &mappings).await {
+        match self.build(plan, opener, port_slot, peers, &mappings).await {
             Ok((session, leg, port, maps, opening)) => {
                 self.rates.add(&session);
                 self.configured().add(&session);
@@ -906,6 +905,7 @@ impl Sessions {
     async fn build(
         &self,
         plan: &RoutePlan,
+        opener: &Identity,
         slot: Result<(u16, Option<u16>), String>,
         peers: usize,
         mappings: &PortMappings,
@@ -948,7 +948,7 @@ impl Sessions {
             .await;
         let mut options = SessionOptions {
             port_map_events: Some(mappings.follow()),
-            ..session_options(&self.env, &leg, port, &dir, peers, &torrent, ip_filter)
+            ..session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener)
         };
         // SSL torrents' peers come to a port of the route's own beside its
         // peer port.

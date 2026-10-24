@@ -612,8 +612,14 @@ impl TorrentStateLive {
             .fetch_add(1, Ordering::Relaxed);
         // The session's IP filter, on the address the seed's host resolved to.
         let allowed = |addr| self.may_reach(addr);
-        let connection =
-            WebSeedConnection::new(clients, resolver, &allowed, &self.web_layout, &link);
+        let connection = WebSeedConnection::new(
+            clients,
+            resolver,
+            &allowed,
+            &self.web_layout,
+            &link,
+            &self.shared.user_agent,
+        );
         let res = tokio::select! {
             r = handler.task_peer_chunk_requester() => r,
             r = connection.run(&handler, rx) => r,

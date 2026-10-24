@@ -21,7 +21,6 @@ use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::TorrentConfig;
-use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
@@ -88,7 +87,6 @@ async fn rig() -> Rig {
         Arc::new(Offline),
         SessionEnv {
             root: dir.path().join("sessions"),
-            identity: IDENTITY,
         },
         db.clone(),
     );

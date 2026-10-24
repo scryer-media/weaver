@@ -25,7 +25,6 @@ use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport}
 use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};
 
 use crate::proxies::{EgressBinding, LegPath};
-use crate::torrents::identity::ClientIdentity;
 
 /// How a leg reaches peers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -436,11 +435,11 @@ impl DatagramSocket for NoDatagrams {
 /// The HTTP clients of a session on a leg: the one for no target downloads
 /// metainfo, and a tracker or web seed is asked through one held to the
 /// addresses its host was checked at. A ladder leg's clients ride `bridge`,
-/// the leg's own.
+/// the leg's own. They name no client: each request names the client of
+/// the torrent it is for.
 pub fn tracker_client(
     kind: &LegKind,
     bridge: Option<Arc<Bridge>>,
-    identity: &ClientIdentity,
 ) -> Result<Arc<dyn HttpClients>, String> {
     let bridge = match (kind, bridge) {
         (LegKind::Ladder, None) => return Err("a ladder leg needs its bridge".into()),
@@ -448,9 +447,8 @@ pub fn tracker_client(
         _ => None,
     };
     let kind = kind.clone();
-    let user_agent = identity.user_agent();
     let base = move || {
-        let builder = reqwest::Client::builder().user_agent(user_agent);
+        let builder = reqwest::Client::builder();
         Ok(match &kind {
             LegKind::Ladder | LegKind::System => builder,
             LegKind::SourceAddress(address) => builder.local_address(*address),
@@ -900,9 +898,8 @@ mod tests {
 
     #[test]
     fn a_ladder_client_needs_its_bridge() {
-        let identity = crate::torrents::identity::IDENTITY;
-        assert!(tracker_client(&LegKind::Ladder, None, &identity).is_err());
-        assert!(tracker_client(&LegKind::System, None, &identity).is_ok());
+        assert!(tracker_client(&LegKind::Ladder, None).is_err());
+        assert!(tracker_client(&LegKind::System, None).is_ok());
     }
 
     // A leg's client for a web seed's target dials the host at the checked

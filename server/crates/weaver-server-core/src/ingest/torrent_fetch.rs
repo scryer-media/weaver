@@ -3,24 +3,27 @@
 
 //! A torrent fetched from a URL, on the route the torrent itself will take.
 //! The fetch is the one every routed fetch makes; what is this fetch's own is
-//! the cookie a client hands over for the site, sent to that site alone.
+//! the cookie a client hands over for the site, sent to that site alone, and
+//! the client it asks as: the one the torrent will name itself as.
 
 use std::time::Duration;
 
 use crate::proxies::{Consumer, FetchOptions, ProxyRuntime, TorrentScope, routed_fetch};
 use crate::security::RuntimeSecurityConfig;
+use crate::torrents::identity::ClientIdentity;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_REDIRECTS: usize = 10;
 
-/// The bytes at `url`, fetched on the torrent route of `scope` with `cookie`
-/// sent to the host named, and only to it, when one is given. A body is
-/// bounded like an NZB's.
+/// The bytes at `url`, fetched on the torrent route of `scope` as `client`,
+/// with `cookie` sent to the host named, and only to it, when one is given.
+/// A body is bounded like an NZB's.
 pub async fn fetch_torrent_url(
     runtime: &ProxyRuntime,
     scope: TorrentScope,
     url: &reqwest::Url,
     cookie: Option<&str>,
+    client: ClientIdentity,
 ) -> Result<Vec<u8>, String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("URL must use http or https".into());
@@ -29,7 +32,7 @@ pub async fn fetch_torrent_url(
         label: "torrent",
         timeout: FETCH_TIMEOUT,
         redirects: MAX_REDIRECTS,
-        user_agent: crate::torrents::identity::IDENTITY.user_agent(),
+        user_agent: client.user_agent(),
         https_only: false,
         allow_private_network: runtime.allow_private_network(),
     };
@@ -64,6 +67,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::torrents::identity::IDENTITY;
 
     async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
         let mut request = Vec::new();
@@ -104,6 +108,7 @@ mod tests {
             TorrentScope::Default,
             &url,
             Some("uid=1; pass=2"),
+            IDENTITY,
         )
         .await
         .unwrap();
@@ -112,6 +117,13 @@ mod tests {
         let request = server.await.unwrap().to_ascii_lowercase();
         assert!(request.starts_with("get /a.torrent?passkey=k http/1.1"));
         assert!(request.contains("cookie: uid=1; pass=2"), "{request}");
+        assert!(
+            request.contains(&format!(
+                "user-agent: {}",
+                IDENTITY.user_agent().to_ascii_lowercase()
+            )),
+            "{request}"
+        );
     }
 
     #[tokio::test]
@@ -126,7 +138,7 @@ mod tests {
         let runtime = crate::proxies::direct_runtime();
         runtime.set_allow_private_network(false);
 
-        let error = fetch_torrent_url(&runtime, TorrentScope::Default, &url, None)
+        let error = fetch_torrent_url(&runtime, TorrentScope::Default, &url, None, IDENTITY)
             .await
             .unwrap_err();
 
@@ -159,6 +171,7 @@ mod tests {
             TorrentScope::Default,
             &url,
             None,
+            IDENTITY,
         )
         .await
         .unwrap_err();

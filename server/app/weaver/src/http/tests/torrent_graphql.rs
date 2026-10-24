@@ -19,7 +19,6 @@ use weaver_server_core::runtime::system_profile::{
 };
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::TorrentConfig;
-use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
@@ -231,7 +230,6 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
             Arc::new(Offline),
             SessionEnv {
                 root: dir.path().join("sessions"),
-                identity: IDENTITY,
             },
             db.clone(),
         ),

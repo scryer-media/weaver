@@ -223,7 +223,6 @@ mod tests {
     use weaver_tunnel::resolution::record::{Recording, ResolvedBy};
 
     use super::*;
-    use crate::torrents::identity::IDENTITY;
     use crate::torrents::net::{LegKind, LegNames, tracker_client};
 
     // A leg whose naming answers `answer` for every name, or hands names on
@@ -331,7 +330,7 @@ mod tests {
             Resolved::Addresses(found) => found.iter().map(SocketAddr::ip).collect(),
             Resolved::AtExit => Vec::new(),
         };
-        let client = tracker_client(&LegKind::Ladder, Some(bridge.clone()), &IDENTITY)
+        let client = tracker_client(&LegKind::Ladder, Some(bridge.clone()))
             .unwrap()
             .client(Some(HttpTarget {
                 host: "tracker.test",
