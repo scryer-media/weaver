@@ -782,6 +782,77 @@ async fn a_graph_job_with_no_checkpoint_is_refused_at_restore() {
     assert!(!pipeline.graph_jobs.contains_key(&JOB));
 }
 
+// A restored graph job's durable download floor is what its checkpoints
+// settle. The graph writes the job's files and its checkpoint is the barrier,
+// so the floor moves with every checkpoint the restored job takes; a floor
+// read off the file coverage barrier never moves past the restored one, and
+// the restart lead gate holds the job to one article at a time with nothing
+// to flush.
+#[tokio::test]
+async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 73))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
+    stamp_graph(&pipeline.db);
+    pipeline.admit_graph_job(JOB, Engine::Graph);
+    for _ in 0..4 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    let mut in_memory = BTreeSet::new();
+    let mut pipeline = restart(&temp_dir, pipeline, &scenario, &mut in_memory, &mut |_| {}).await;
+    let restored = pipeline.jobs[&JOB].restored_download_floor_bytes;
+    assert!(restored > 0, "the fixture restores with a durable floor");
+    assert_eq!(pipeline.durable_download_floor_bytes_for_job(JOB), restored);
+
+    // Three more articles, each checkpointed by the step that took it.
+    let mut served = 0u64;
+    for _ in 0..3 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        served += u64::from(work.byte_estimate);
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    assert!(
+        !pipeline
+            .pending_file_progress
+            .keys()
+            .any(|file| file.job_id == JOB),
+        "a graph job leaves the file coverage barrier nothing to flush"
+    );
+    let floor = pipeline.durable_download_floor_bytes_for_job(JOB);
+    assert_eq!(
+        floor,
+        restored + served,
+        "the floor is what the graph checkpoint settles"
+    );
+
+    // Accepted bytes placed so that a floor frozen at the restored one leaves
+    // the job past its lead limit, and the checkpointed floor leaves room for
+    // a lease of more than one article.
+    let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+    let estimate = u64::from(work.byte_estimate);
+    let limit = Pipeline::restart_durable_lead_limit_bytes();
+    pipeline.jobs.get_mut(&JOB).unwrap().downloaded_bytes = floor + limit - 2 * estimate;
+    let admission = pipeline.checkpoint_admission(JOB);
+    assert_eq!(admission.decision(&work, &[]).as_str(), "within_limit");
+    assert_eq!(
+        admission.decision(&work, &[work.clone()]).as_str(),
+        "within_limit",
+        "a restored graph job must not drop to one article at a time"
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
 // The row stamped graph as an admission stamps it, with no checkpoint
 // written beside it.
 pub(in crate::pipeline::tests) fn stamp_graph(db: &crate::Database) {

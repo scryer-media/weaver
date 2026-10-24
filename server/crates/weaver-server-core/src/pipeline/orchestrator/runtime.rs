@@ -1592,12 +1592,15 @@ impl Pipeline {
 
     pub(crate) fn consume_due_checkpoint_rechecks(&mut self) {
         let now = Instant::now();
-        if self
+        let due: Vec<JobId> = self
             .download_restart_durable_lead_retry_after
-            .values()
-            .any(|ready_at| *ready_at <= now)
-        {
-            self.flush_file_progress_batch(
+            .iter()
+            .filter(|(_, ready_at)| **ready_at <= now)
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        for job_id in due {
+            self.advance_durable_download_floor(
+                job_id,
                 "download.file_progress.flush.restart_durable_lead_retry_recheck",
             );
         }

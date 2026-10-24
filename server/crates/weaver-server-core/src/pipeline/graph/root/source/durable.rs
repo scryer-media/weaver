@@ -119,6 +119,12 @@ impl ArticleMap {
         self.each(|state| state != State::Waiting)
     }
 
+    // The post's encoded bytes of the articles `settled` names: what a
+    // checkpoint taken now spares a restore fetching again.
+    pub(crate) fn settled_bytes(&self) -> u64 {
+        self.volumes.iter().map(|volume| volume.settled_bytes).sum()
+    }
+
     fn each(&self, mut keep: impl FnMut(State) -> bool) -> Vec<(VolumeIndex, u32)> {
         let mut out = Vec::new();
         for (index, found) in self.volumes.iter().enumerate() {

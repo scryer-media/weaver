@@ -185,7 +185,10 @@ impl Pipeline {
         work: DownloadWork,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
         if !self.primary_download_within_restart_durable_lead(job_id, &work) {
-            self.flush_file_progress_batch("download.file_progress.flush.restart_durable_lead");
+            self.advance_durable_download_floor(
+                job_id,
+                "download.file_progress.flush.restart_durable_lead",
+            );
             if !self.primary_download_within_restart_durable_lead(job_id, &work) {
                 self.note_checkpoint_dispatch_block(job_id);
                 if let Some(state) = self.jobs.get_mut(&job_id) {

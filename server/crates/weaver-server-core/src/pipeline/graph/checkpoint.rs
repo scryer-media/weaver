@@ -113,6 +113,11 @@ struct Held {
     // `None` for rows a restore read, not ones taken from the job: the next
     // step reads every node.
     read: Option<Generations>,
+    // The post's encoded bytes of the articles the rows' root facts settle,
+    // as the last checkpoint taken from the job encoded them: the job's
+    // durable download floor. 0 for rows a restore read; the restore's own
+    // floor stands for them until the job's first checkpoint.
+    settled_bytes: u64,
 }
 
 // What a job's checkpoints asked the database to write, counted as each is
@@ -141,6 +146,7 @@ impl Pending {
         };
         let held = slot.held.get_or_insert_with(Held::default);
         let encoding = job.encode_root(&mut slot.root, job.next_node());
+        held.settled_bytes = job.settled_bytes();
         let root = root_row(encoding.version, encoding.bytes);
         if held.root.as_ref() != Some(&root) {
             delta.nodes.insert(root.key(), Some(root.clone()));
@@ -250,6 +256,16 @@ impl Pending {
         slot.held = Some(held);
     }
 
+    // The bytes the rows the database holds, once what is queued is
+    // written, spare a restore fetching again; 0 while what it holds is not
+    // known.
+    pub(crate) fn settled_bytes(&self) -> u64 {
+        self.slot()
+            .held
+            .as_ref()
+            .map_or(0, |held| held.settled_bytes)
+    }
+
     #[cfg(test)]
     pub(crate) fn tally(&self) -> Tally {
         self.slot().tally
@@ -257,6 +273,15 @@ impl Pending {
 }
 
 impl Pipeline {
+    // A graph job's durable download floor: the bytes its last checkpoint
+    // spares a restore. `None` for a classic job, whose floor is its file
+    // coverage barrier's.
+    pub(in crate::pipeline) fn graph_checkpointed_bytes(&self, job_id: JobId) -> Option<u64> {
+        self.graph_jobs
+            .get(&job_id)
+            .map(|graph| graph.pending().settled_bytes())
+    }
+
     // Checkpoint the job's tree as it stands now.
     pub(crate) fn checkpoint_graph_job(&mut self, job_id: JobId) {
         let Some(graph) = self.graph_jobs.get(&job_id) else {

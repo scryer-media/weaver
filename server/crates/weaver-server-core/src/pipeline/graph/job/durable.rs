@@ -72,4 +72,10 @@ impl GraphJob {
         self.root
             .encode(encoded, next_node, self.writer.read_backs(), self.reported)
     }
+
+    // The post's encoded bytes of the articles the root's facts say this
+    // run does not fetch again: what the facts encoded now spare a restore.
+    pub(crate) fn settled_bytes(&self) -> u64 {
+        self.root.map.settled_bytes()
+    }
 }

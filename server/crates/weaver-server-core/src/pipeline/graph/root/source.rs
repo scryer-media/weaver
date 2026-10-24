@@ -77,6 +77,9 @@ struct Volume {
     // In ordinal order.
     articles: Vec<Article>,
     encoded_len: u64,
+    // The post's encoded bytes of the articles no longer waited on: in hand,
+    // or lost for good. Kept by the one path that changes a state.
+    settled_bytes: u64,
     // Decoded offsets known exactly, by boundary index: boundary `k` is
     // where article `k` starts, and boundary `articles.len()` is the end.
     known: BTreeMap<usize, u64>,
@@ -121,6 +124,7 @@ impl Volume {
         Self {
             articles,
             encoded_len: encoded,
+            settled_bytes: 0,
             known: BTreeMap::from([(0, 0)]),
             disorder: 0,
             parkable: (0..sizes.len()).collect(),
@@ -142,6 +146,13 @@ impl Volume {
         } = self.articles[index];
         if was == state {
             return;
+        }
+        if (was == State::Waiting) != (state == State::Waiting) {
+            let size = self.encoded_at(index + 1) - self.encoded_at(index);
+            self.settled_bytes = match state {
+                State::Waiting => self.settled_bytes - size,
+                _ => self.settled_bytes + size,
+            };
         }
         self.articles[index].state = state;
         self.file_parkable(index);
