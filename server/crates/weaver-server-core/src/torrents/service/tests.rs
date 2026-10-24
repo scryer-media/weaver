@@ -2097,6 +2097,69 @@ async fn a_pause_credits_the_time_before_it_and_nothing_after() {
     seeded.stop().await;
 }
 
+// A torrent that wants none of its files has every piece it wants: it seeds
+// at 100 % with nothing in hand and no peers, though its job is not
+// complete, and its seeding time runs. Wanting the file again takes it back
+// to fetching, and its seeding time stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
+    use FilePriority::*;
+    let clock = set_clock();
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(0, Ignored)])
+        .await
+        .unwrap();
+    rig.service.resume(job_id).await.unwrap();
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (
+            view.state,
+            view.progress,
+            view.have_bytes,
+            view.total_bytes,
+            view.peers,
+            view.completed_at_ms,
+        ),
+        (TorrentState::Seeding, 1.0, 0, 3000, 0, None)
+    );
+
+    rig.service.tick().await;
+    clock.0.fetch_add(5_000, Ordering::SeqCst);
+    rig.service.tick().await;
+    let kept = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    assert_eq!((kept.active_duration_s, kept.finished_duration_s), (5, 5));
+
+    rig.service
+        .set_file_priorities(job_id, &[(0, Normal)])
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.progress, view.completed_at_ms),
+        (TorrentState::Stalled, 0.0, None)
+    );
+    clock.0.fetch_add(5_000, Ordering::SeqCst);
+    rig.service.tick().await;
+    let kept = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    assert_eq!((kept.active_duration_s, kept.finished_duration_s), (10, 5));
+    rig.service.stop().await;
+}
+
 // Turning torrents off reads every torrent before its session closes: the
 // time it ran since the last tick is in the ledger.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4745,13 +4808,14 @@ async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
     again.open().await.unwrap();
     assert_eq!(written.borrow().checkpoints_read, 0);
     let kept = in_hand(&again.torrent(job_id).await.unwrap());
+    // Its progress is over the second file, the one it wants.
     let found = SPLIT_PIECE as u64;
     assert_eq!(
         kept,
         (
             vec![0, found],
             found,
-            found as f64 / sizes.iter().sum::<u64>() as f64,
+            found as f64 / sizes[1] as f64,
             Some(1)
         )
     );
@@ -4776,16 +4840,12 @@ fn in_hand(view: &TorrentView) -> (Vec<u64>, u64, f64, Option<u32>) {
 }
 
 // What a partly fetched torrent of files `sizes` has in hand: pieces 3, 4
-// and 5, the first file's last half piece and the second file whole.
+// and 5, the first file's last half piece and the second file whole, which
+// is all it wants.
 fn checkpointed(sizes: [u64; 2]) -> (Vec<u64>, u64, f64, Option<u32>) {
     let have = [SPLIT_PIECE as u64 / 2, sizes[1]];
     let all = have.iter().sum::<u64>();
-    (
-        have.to_vec(),
-        all,
-        all as f64 / sizes.iter().sum::<u64>() as f64,
-        Some(3),
-    )
+    (have.to_vec(), all, 1.0, Some(3))
 }
 
 // A paused torrent restarts paused, showing what its checkpoint has in hand

@@ -857,16 +857,16 @@ struct Live {
     failed: Option<String>,
 }
 
-// `torrent` as the download queue and its holds see it. A complete torrent
+// `torrent` as the download queue and its holds see it. A seeding torrent
 // under a tracker rule that never pauses seeds through the schedule's holds
 // until its goal is met.
 fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now: i64) -> Queued {
-    let complete = torrent.complete();
+    let seeding = torrent.seeding();
     // A torrent under a never-pause rule still owes its tracker while it
     // downloads, and while it seeds with a goal left.
     let rule = torrent.rule(rules);
     let runs_through_schedule = rule.is_some_and(|rule| rule.never_pause)
-        && (!complete
+        && (!seeding
             || status::goal_left(
                 settings.policy(&torrent.record, rule).as_ref(),
                 &torrent.counters,
@@ -876,7 +876,7 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
             .is_some());
     Queued {
         job_id: torrent.record.job_id,
-        complete,
+        seeding,
         forced: torrent.record.forced,
         paused: !torrent.resumed(),
         runs_through_schedule,
@@ -952,6 +952,11 @@ impl Live {
 
     fn complete(&self) -> bool {
         self.record.completed_at_ms.is_some()
+    }
+
+    // Complete, or with every piece it wants had as the session last said.
+    fn seeding(&self) -> bool {
+        status::seeding(self.complete(), &self.engine)
     }
 
     // What it shows until its job is back, from what was stored: what the
@@ -3879,7 +3884,7 @@ impl TorrentService {
         }
     }
 
-    // A complete torrent whose seeding goal is met does what its policy says.
+    // A seeding torrent whose seeding goal is met does what its policy says.
     async fn apply_goals(&self, now: i64) {
         let settings = self.settings();
         let rules = self.rules();
@@ -3889,7 +3894,7 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 // A forced torrent seeds past its goal.
-                if !torrent.complete() || !torrent.resumed() || torrent.record.forced {
+                if !torrent.seeding() || !torrent.resumed() || torrent.record.forced {
                     continue;
                 }
                 let Some(policy) = settings.policy(&torrent.record, torrent.rule(&rules)) else {
@@ -4176,6 +4181,11 @@ impl TorrentService {
         let record = &torrent.record;
         let total = torrent.total;
         let have = on_disk(torrent.layout.as_deref(), &reading.file_have);
+        let (wanted, wanted_have) = wanted(
+            torrent.layout.as_deref(),
+            &torrent.levels,
+            &reading.file_have,
+        );
         let rules = self.rules();
         let rule = torrent.rule(&rules);
         let policy = settings.policy(record, rule);
@@ -4207,10 +4217,14 @@ impl TorrentService {
                 .map(|category| category.name.clone()),
             private: torrent.private,
             forced: record.forced,
+            // Over the bytes it wants, all of them had when it wants none
+            // (libtorrent `torrent_status::progress`).
             progress: if total == 0 {
                 0.0
+            } else if wanted == 0 {
+                1.0
             } else {
-                (have as f64 / total as f64).min(1.0)
+                (wanted_have as f64 / wanted as f64).min(1.0)
             },
             total_bytes: total,
             have_bytes: have,
@@ -4417,7 +4431,8 @@ fn job_status(view: &TorrentView) -> JobStatus {
         TorrentState::NeedsCertificate => JobStatus::Stalled,
         // A stop with any reason but its met goal is a failure.
         TorrentState::Stopped => match view.detail.as_deref() {
-            None | Some(status::GOAL_MET) if view.completed_at_ms.is_some() => JobStatus::Complete,
+            Some(status::GOAL_MET) => JobStatus::Complete,
+            None if view.completed_at_ms.is_some() => JobStatus::Complete,
             detail => JobStatus::Failed {
                 error: detail.unwrap_or_default().to_owned(),
             },
@@ -4497,6 +4512,23 @@ fn on_disk(layout: Option<&PieceLayout>, file_have: &[u64]) -> u64 {
             .filter(|(file, _)| !file.padding)
             .map(|(_, have)| have)
             .sum()
+    })
+}
+
+// The bytes of the files the torrent wants, and those of them in hand,
+// padding left out.
+fn wanted(layout: Option<&PieceLayout>, levels: &[FilePriority], file_have: &[u64]) -> (u64, u64) {
+    layout.map_or((0, 0), |layout| {
+        layout
+            .files()
+            .enumerate()
+            .filter(|(index, file)| {
+                !file.padding && levels.get(*index).copied().unwrap_or_default().wanted()
+            })
+            .fold((0, 0), |(length, have), (index, file)| {
+                let in_hand = file_have.get(index).copied().unwrap_or(0);
+                (length + file.length, have + in_hand)
+            })
     })
 }
 

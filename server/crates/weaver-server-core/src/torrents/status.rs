@@ -48,6 +48,14 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// Every piece it wants is had (libtorrent `torrent::is_finished`).
+    pub fn finished(&self) -> bool {
+        matches!(
+            self,
+            Self::Live { finished: true, .. } | Self::Paused { finished: true }
+        )
+    }
+
     pub fn of(stats: &TorrentStats) -> Self {
         match &stats.state {
             TorrentStatsState::Initializing { checking: true, .. } => Self::Checking,
@@ -76,6 +84,12 @@ impl Engine {
     }
 }
 
+/// A torrent seeds once it is complete or once it has every piece it wants,
+/// whichever files it leaves out (qBittorrent `TorrentImpl::isFinished`).
+pub fn seeding(complete: bool, engine: &Engine) -> bool {
+    complete || engine.finished()
+}
+
 /// Why a torrent has no session to run in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Held {
@@ -97,8 +111,8 @@ impl Held {
         }
     }
 
-    fn detail(&self, complete: bool) -> String {
-        let lead = if complete {
+    fn detail(&self, seeding: bool) -> String {
+        let lead = if seeding {
             "Not seeding"
         } else {
             "Not downloading"
@@ -132,6 +146,12 @@ pub struct Observed {
     pub moving: bool,
 }
 
+impl Observed {
+    fn seeding(&self) -> bool {
+        seeding(self.complete, &self.engine)
+    }
+}
+
 /// The state and the reason behind it, when there is one to give.
 pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
     let detail = |text: &str| Some(text.to_owned());
@@ -147,7 +167,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
             let why = seen
                 .failed
                 .clone()
-                .or_else(|| seen.complete.then(|| GOAL_MET.to_owned()));
+                .or_else(|| seen.seeding().then(|| GOAL_MET.to_owned()));
             return (TorrentState::Stopped, why);
         }
         TorrentIntent::Resumed => {}
@@ -164,7 +184,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         return (TorrentState::Queued, detail(origin.reason()));
     }
     if let Some(held) = &seen.held {
-        return (held.state(), Some(held.detail(seen.complete)));
+        return (held.state(), Some(held.detail(seen.seeding())));
     }
     if !seen.has_metadata {
         return (TorrentState::FetchingMetadata, None);
@@ -175,7 +195,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
     match &seen.engine {
         Engine::Absent | Engine::Starting => (TorrentState::Queued, None),
         Engine::Checking => (TorrentState::CheckingFiles, None),
-        Engine::Live { .. } | Engine::Paused { .. } if seen.complete => {
+        Engine::Live { .. } | Engine::Paused { .. } if seen.seeding() => {
             (TorrentState::Seeding, None)
         }
         Engine::Live {
@@ -266,7 +286,8 @@ pub fn eta_seconds(left_bytes: u64, bytes_per_second: u64) -> Option<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Queued {
     pub job_id: JobId,
-    pub complete: bool,
+    /// Complete or finished: it seeds, and fetches nothing.
+    pub seeding: bool,
     pub forced: bool,
     pub paused: bool,
     /// Under a tracker rule that never pauses, still downloading or with
@@ -279,14 +300,14 @@ impl Queued {
     pub fn target(&self) -> HoldTarget {
         HoldTarget {
             owner: HoldOwner::Torrents,
-            complete: self.complete,
+            complete: self.seeding,
             runs_through_schedule: self.runs_through_schedule,
         }
     }
 }
 
 /// The torrents the queue lets run: of those no hold stops, every forced
-/// or complete one, and the first `max_active` of the rest that are not
+/// or seeding one, and the first `max_active` of the rest that are not
 /// paused. Only a torrent still downloading takes one of the `max_active`
 /// slots.
 pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet<JobId> {
@@ -296,7 +317,7 @@ pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet
         if holds.reason_for(torrent.target()).is_some() {
             continue;
         }
-        if torrent.forced || torrent.complete {
+        if torrent.forced || torrent.seeding {
             active.insert(torrent.job_id);
         } else if !torrent.paused && slots > 0 {
             slots -= 1;
@@ -679,6 +700,58 @@ mod tests {
         );
     }
 
+    // A torrent with every piece it wants seeds, whichever files it leaves
+    // out and whether or not its job is complete; wanting a file it lacks
+    // takes it back to downloading.
+    #[test]
+    fn a_finished_torrent_seeds_until_it_wants_more() {
+        let live = |finished, peers| Engine::Live {
+            finished,
+            peers,
+            upload_mode: false,
+        };
+        assert_eq!(project(&seen(live(true, 0))), (TorrentState::Seeding, None));
+        assert_eq!(project(&seen(live(true, 3))), (TorrentState::Seeding, None));
+        assert_eq!(
+            project(&seen(Engine::Paused { finished: true })),
+            (TorrentState::Seeding, None)
+        );
+        assert_eq!(
+            project(&seen(live(false, 0))),
+            (TorrentState::Stalled, None)
+        );
+        assert_eq!(
+            project(&seen(live(false, 3))),
+            (TorrentState::Downloading, None)
+        );
+        // Stopped once seeding, it met its goal; stopped short of that, it
+        // did not.
+        let stopped = |engine| Observed {
+            intent: TorrentIntent::Stopped,
+            ..seen(engine)
+        };
+        assert_eq!(
+            project(&stopped(Engine::Paused { finished: true })),
+            (TorrentState::Stopped, Some(GOAL_MET.to_owned()))
+        );
+        assert_eq!(
+            project(&stopped(Engine::Paused { finished: false })),
+            (TorrentState::Stopped, None)
+        );
+        // Asked to pause, it is paused; an engine error is the error.
+        assert_eq!(
+            project(&Observed {
+                intent: TorrentIntent::Paused,
+                ..seen(live(true, 3))
+            }),
+            (TorrentState::Paused, None)
+        );
+        assert_eq!(
+            project(&seen(Engine::Error("disk gone".into()))),
+            (TorrentState::Stopped, Some("disk gone".into()))
+        );
+    }
+
     #[test]
     fn a_torrent_with_no_session_says_why() {
         assert_eq!(
@@ -758,9 +831,9 @@ mod tests {
 
     #[test]
     fn the_queue_runs_forced_and_complete_torrents_beside_its_limit() {
-        let torrent = |id, complete, forced, paused| Queued {
+        let torrent = |id, seeding, forced, paused| Queued {
             job_id: JobId(id),
-            complete,
+            seeding,
             forced,
             paused,
             runs_through_schedule: false,
@@ -807,9 +880,9 @@ mod tests {
     // and a limit of zero runs none of them.
     #[test]
     fn only_downloading_torrents_take_a_slot() {
-        let torrent = |id, complete| Queued {
+        let torrent = |id, seeding| Queued {
             job_id: JobId(id),
-            complete,
+            seeding,
             forced: false,
             paused: false,
             runs_through_schedule: false,
@@ -852,7 +925,7 @@ mod tests {
         };
         let through = Queued {
             job_id: JobId(1),
-            complete: true,
+            seeding: true,
             forced: false,
             paused: false,
             runs_through_schedule: true,
