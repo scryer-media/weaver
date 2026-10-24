@@ -201,10 +201,19 @@ test("Q1 jobs past the connection capacity wait as Queued and every one complete
 });
 
 test("Q2 the global pause holds every download and counts them paused", async ({ request }) => {
+  // One lane and 64 articles each: the hot job takes the lane and is far
+  // inside its download when the pause lands, and the other waits Queued
+  // behind it. The pause holds the one mid-download and counts both.
+  await updateConfiguredServer(request, "nntp2", { active: false });
+  await updateConfiguredServer(request, "nntp", { connections: 1 });
   const tag = `q2-${Date.now()}`;
-  const jobs = [await probeJob(request, tag, 6), await probeJob(request, tag, 6)];
+  const jobs = [await probeJob(request, tag, 64), await probeJob(request, tag, 64)];
   started.push(...jobs);
-  await waitFor(request, "both jobs downloading", (snap) => jobs.every((id) => itemOf(snap, id)?.state === "DOWNLOADING"));
+  await waitFor(request, "one job mid-download, the other queued", (snap) => {
+    const items = jobs.map((id) => itemOf(snap, id));
+    return items.some((item) => item?.state === "DOWNLOADING" && item.progressPercent > 0)
+      && items.some((item) => item?.state === "QUEUED");
+  });
 
   globalPauseByUs = true;
   expect((await graphql<{ pauseAll: boolean }>(request, "mutation WeaverE2EQ2Pause { pauseAll }")).pauseAll).toBeTruthy();
