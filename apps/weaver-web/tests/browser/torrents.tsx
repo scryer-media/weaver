@@ -16,7 +16,7 @@ import { AddNzbDialog } from "@/next/features/AddNzbDialog";
 import { TorrentDetail } from "@/next/features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 import { DownloadRow } from "@/next/pages/downloads/DownloadRow";
-import type { SeedingPolicyData, SeedingSource, TorrentData, TorrentFileData } from "@/lib/torrents";
+import type { SeedingPolicyData, SeedingSource, TorrentData, TorrentFileData, TorrentTrackerData } from "@/lib/torrents";
 import { nextEn } from "@/next/i18n/en";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -253,6 +253,13 @@ function Fixture() {
   if (screen === "remove") return <Remove />;
   if (screen === "queue") return <Queue />;
   if (screen === "seeding") return <Seeding />;
+  if (screen === "trackers") {
+    const tracker = (url: string, source: TorrentTrackerData["source"]): TorrentTrackerData => ({
+      tier: 0, url, source, status: "WORKING", updating: false, message: null, seeders: 1, leechers: 0, peers: 1,
+    });
+    const named = { ...torrent(5, "GLOBAL", null), trackers: [tracker("http://a.test/announce", "TORRENT"), tracker("http://b.test/announce", "OPERATOR")] };
+    return <TorrentDetail torrent={named} onChanged={() => {}} onReport={(message) => { status.textContent = message; }} />;
+  }
   if (screen === "files") {
     held ??= {
       ...torrent(4, "GLOBAL", null),

@@ -45,6 +45,16 @@ test("a wait reason that is a sentence is shown as the daemon wrote it", async (
   await page.close();
 });
 
+test("a tracker row says who named the tracker", async () => {
+  const { page, errors } = await open("trackers");
+  const row = (url) => page.getByTitle(url, { exact: true });
+  await row("http://a.test/announce").waitFor();
+  assert.equal(await row("http://a.test/announce").getByText("Torrent", { exact: true }).count(), 1);
+  assert.equal(await row("http://b.test/announce").getByText("Added", { exact: true }).count(), 1);
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+});
+
 test("the add dialog sends a torrent file and a magnet link through submit, read for what they are", async () => {
   const { page, errors } = await open("add");
   const dialog = page.getByRole("dialog", { name: "Add", exact: true });

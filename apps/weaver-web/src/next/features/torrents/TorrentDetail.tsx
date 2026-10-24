@@ -21,6 +21,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import {
   torrentErrorText,
+  trackerSourceKey,
   type TorrentActionError,
   type TorrentData,
   type TorrentFilePriority,
@@ -40,8 +41,8 @@ import { countLabel } from "@/next/i18n/labels";
 import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
 const TRACKER_COLUMNS = {
-  base: "minmax(0,1fr) 112px max-content",
-  sm: "minmax(0,1fr) 112px 96px minmax(0,1fr) max-content",
+  base: "minmax(0,1fr) 80px 112px max-content",
+  sm: "minmax(0,1fr) 80px 112px 96px minmax(0,1fr) max-content",
 };
 const FILE_COLUMNS = {
   base: "14px minmax(0,1fr) 72px 120px",
@@ -325,6 +326,7 @@ function TrackersBlock({
             title={tracker.url}
           >
             <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">{tracker.url}</span>
+            <span className="truncate font-wv-mono text-[11.5px] text-wv-muted">{t(trackerSourceKey(tracker.source))}</span>
             <span className="font-wv-mono text-[11.5px] text-wv-muted">
               {t(tracker.updating ? "next.torrent.tracker.UPDATING" : `next.torrent.tracker.${tracker.status}`)}
             </span>

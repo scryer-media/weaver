@@ -65,9 +65,16 @@ export interface TorrentFileData {
   progress: number;
 }
 
+/** Who named a tracker: the torrent itself, or the operator who added it. */
+export type TrackerSource = "TORRENT" | "OPERATOR";
+
+/** Where the label for who named a tracker lives in the dictionary. */
+export const trackerSourceKey = (source: TrackerSource) => `next.torrent.trackerSource.${source}`;
+
 export interface TorrentTrackerData {
   tier: number;
   url: string;
+  source: TrackerSource;
   status: TrackerStatus;
   /** An announce to it is in flight. */
   updating: boolean;

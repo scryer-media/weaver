@@ -1631,6 +1631,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       trackers {
         tier
         url
+        source
         status
         updating
         message

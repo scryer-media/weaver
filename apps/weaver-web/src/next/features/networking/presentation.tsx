@@ -4,6 +4,7 @@
 import type { ReactNode } from "react";
 import type { Translate } from "@/lib/context/translate-context";
 import type { Egress, RouteProblem } from "@/lib/networking";
+import { refusalKey } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
 import { Square } from "../../components/chrome";
 import { CheckBox } from "../../components/controls";
@@ -127,8 +128,11 @@ export function routeProblemText(t: Translate, problem: RouteProblem): string {
       return t("next.networking.problem.egressDisabled");
     case "proxyRepeated":
       return t("next.networking.problem.proxyRepeated");
-    case "torrentPool":
-      return t("next.refusal.TORRENT_ROUTE_POOL");
+    case "TORRENT_ROUTE_LEGS":
+    case "TORRENT_ROUTE_POOL":
+    case "TORRENT_ROUTE_DIRECT_FALLBACK":
+    case "TORRENT_ROUTE_RUNGS":
+      return t(refusalKey(problem));
   }
 }
 

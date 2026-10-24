@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { removeOutcome, showsSeeding, type TorrentData } from "../src/lib/torrents.ts";
+import { removeOutcome, showsSeeding, trackerSourceKey, type TorrentData } from "../src/lib/torrents.ts";
 import { EM_DASH, formatRate, formatSize } from "../src/next/data/format.ts";
 import { informationFields, transferFields } from "../src/next/features/torrents/general.ts";
 import { englishTranslate as t } from "./english-translate.ts";
@@ -152,4 +152,9 @@ test("the information section names the pieces, the maker and where the torrent 
   // A magnet without its metainfo has no pieces yet.
   const magnet = byLabel(informationFields(t, torrent({ pieceCount: null, pieceSize: null, piecesHave: null })));
   assert.equal(magnet["Pieces"], EM_DASH);
+});
+
+test("a tracker row says whether the torrent or the operator named it", () => {
+  assert.equal(t(trackerSourceKey("TORRENT")), "Torrent");
+  assert.equal(t(trackerSourceKey("OPERATOR")), "Added");
 });

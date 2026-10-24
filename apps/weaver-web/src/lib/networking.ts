@@ -48,7 +48,7 @@ export type PoolFlow = { poolId: number; egressId: number; pinnedMember: number 
  */
 export type ConsumerKind = "SERVER" | "RSS" | "OUTBOUND" | "TORRENT_DEFAULT" | "TORRENT_CATEGORY" | "TORRENT_TRACKER";
 export type TorrentConsumerKind = Extract<ConsumerKind, "TORRENT_DEFAULT" | "TORRENT_CATEGORY" | "TORRENT_TRACKER">;
-/** Whether a consumer carries torrent traffic, whose route takes no pool. */
+/** Whether a consumer carries torrent traffic, whose route is one leg with one exit. */
 export const isTorrentConsumer = (kind: ConsumerKind): kind is TorrentConsumerKind =>
   kind === "TORRENT_DEFAULT" || kind === "TORRENT_CATEGORY" || kind === "TORRENT_TRACKER";
 /** Default outbound's key: there is one, and it is never made or removed. */
@@ -63,8 +63,25 @@ export function routeInput(route: NetworkRoute) {
     path: leg.path.kind === "DIRECT" ? { direct: true } : { ladder: { directFallback: leg.path.directFallback, rungs: leg.path.rungs.map(r => r.kind === "PROXY" ? { proxy: r.proxyId } : r.kind === "POOL" ? { pool: r.poolId } : { chain: r.chainIds }) } },
   })) };
 }
+/** What keeps a route off torrent traffic, by the daemon's own refusal code. */
+export type TorrentRouteFault = "TORRENT_ROUTE_LEGS" | "TORRENT_ROUTE_POOL" | "TORRENT_ROUTE_DIRECT_FALLBACK" | "TORRENT_ROUTE_RUNGS";
+/**
+ * Why a torrent may not run on a route, the daemon's rule and order: a
+ * torrent's peers and trackers see one address, so its route is one leg with
+ * one exit. A direct leg is its egress; a ladder is one rung, a proxy or a
+ * chain ending at one proxy, never a pool and never falling back direct.
+ */
+export function torrentRouteFault(route: NetworkRoute): TorrentRouteFault | null {
+  if (route.legs.length !== 1) return "TORRENT_ROUTE_LEGS";
+  const path = route.legs[0]!.path;
+  if (path.kind === "DIRECT") return null;
+  if (path.rungs.some(rung => rung.kind === "POOL")) return "TORRENT_ROUTE_POOL";
+  if (path.directFallback) return "TORRENT_ROUTE_DIRECT_FALLBACK";
+  if (path.rungs.length > 1) return "TORRENT_ROUTE_RUNGS";
+  return null;
+}
 /** Why a route cannot be saved, as a code the interface words for itself. */
-export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated" | "torrentPool";
+export type RouteProblem = "legCount" | "weights" | "rungCount" | "rungTarget" | "chain" | "egressDisabled" | "proxyRepeated" | TorrentRouteFault;
 /** The proxies a rung uses, a pool's members included. */
 export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
   if (rung.kind === "PROXY") return rung.proxyId === null ? [] : [rung.proxyId];
@@ -73,9 +90,8 @@ export function rungProxyIds(rung: Rung, pools: ProxyPool[]): number[] {
 }
 export function routeProblem(route: NetworkRoute, known: { egresses?: Egress[]; pools?: ProxyPool[]; kind?: ConsumerKind } = {}): RouteProblem | null {
   if (!route.legs.length || route.legs.length > 8) return "legCount";
-  // A torrent route takes no pool.
-  const torrent = known.kind !== undefined && isTorrentConsumer(known.kind);
-  if (torrent && route.legs.some(leg => leg.path.kind === "LADDER" && leg.path.rungs.some(rung => rung.kind === "POOL"))) return "torrentPool";
+  const fault = known.kind !== undefined && isTorrentConsumer(known.kind) ? torrentRouteFault(route) : null;
+  if (fault) return fault;
   if (route.legs.some(l => !Number.isInteger(l.weight) || l.weight < 1 || l.weight > 100) || route.legs.reduce((sum,l) => sum+l.weight,0) !== 100) return "weights";
   for (const leg of route.legs) {
     if (leg.path.kind === "DIRECT") continue;
