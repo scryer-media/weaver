@@ -832,6 +832,29 @@ impl Pipeline {
         batch
     }
 
+    // The barrier's rows go to the ordered writer, each job's on its own
+    // lane, so two checkpoints for one file land in submission order and a
+    // job's archive waits for the checkpoints queued before it. A detached
+    // task would let an older snapshot overwrite a newer one: the row is
+    // replaced whole, and coverage may shrink, so no merge rule in the
+    // statement could tell the two apart.
+    pub(crate) fn queue_file_progress_batch(
+        &self,
+        batch: Vec<ActiveFileProgress>,
+    ) -> Result<(), crate::StateError> {
+        let mut by_job = HashMap::<JobId, Vec<ActiveFileProgress>>::new();
+        for entry in batch {
+            by_job.entry(entry.job_id).or_default().push(entry);
+        }
+        for (job_id, rows) in by_job {
+            self.db
+                .try_queue_job_write(job_id, "active_file_progress", move |db| {
+                    db.upsert_file_progress_batch(&rows)
+                })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn flush_file_progress_batch(&mut self, label: &'static str) {
         if self.pending_file_progress.is_empty() {
             return;
@@ -841,13 +864,16 @@ impl Pipeline {
         if batch.is_empty() {
             return;
         }
-        self.db_fire_and_forget(move |db| {
-            if let Err(error) = db.upsert_file_progress_batch(&batch) {
-                tracing::error!(count = batch.len(), error = %error, "failed to persist file coverage checkpoints");
-            }
-        });
+        let count = batch.len();
+        if let Err(error) = self.queue_file_progress_batch(batch) {
+            tracing::error!(count, error = %error, "failed to queue file coverage checkpoints");
+        }
     }
 
+    // The same rows on the same lanes, then the writer drained: the caller
+    // needs the checkpoint committed, and it must still land after any
+    // checkpoint queued before it. A write the writer could not apply is
+    // logged there, not returned here.
     pub(crate) async fn flush_file_progress_batch_awaited(
         &mut self,
         label: &'static str,
@@ -860,8 +886,8 @@ impl Pipeline {
         if batch.is_empty() {
             return Ok(());
         }
-        self.db_blocking(move |db| db.upsert_file_progress_batch(&batch))
-            .await
+        self.queue_file_progress_batch(batch)?;
+        self.db.flush_write_queue().await
     }
 
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
@@ -1849,9 +1875,9 @@ impl Pipeline {
             warn!(error = %error, "failed to flush pending bandwidth usage during drain");
         }
 
-        // Join any detached fire-and-forget writes still in flight (e.g. file
-        // progress floors flushed above, or runtime writes) so shutdown does not
-        // drop them. Bounded so a stuck write cannot hang shutdown forever.
+        // Join any detached fire-and-forget writes still in flight (runtime
+        // writes such as a proven pipelining depth) so shutdown does not drop
+        // them. Bounded so a stuck write cannot hang shutdown forever.
         self.join_fire_and_forget_tasks().await;
         match tokio::time::timeout(
             Self::FIRE_AND_FORGET_DRAIN_TIMEOUT,

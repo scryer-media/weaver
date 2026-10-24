@@ -195,7 +195,10 @@ async fn bulk_upsert_file_progress_tx(
 
     let chunk_size = max_rows_for_tx(tx, 3);
     // Replaced, never merged: each barrier writes the file's whole coverage,
-    // which may also have shrunk (a withdrawn or reset article).
+    // which may also have shrunk (a withdrawn or reset article). The order
+    // between two replacements of one row is the ordered writer's, which every
+    // caller submits through on the job's lane; this statement cannot tell a
+    // stale snapshot from a shrunken one.
     let conflict_sql = " ON CONFLICT(job_id, file_index)
                          DO UPDATE SET coverage = excluded.coverage";
     match tx {
