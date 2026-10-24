@@ -286,12 +286,6 @@ impl SocketFactory for LegSockets {
             }) as Arc<dyn DatagramSocket>)
         })
     }
-
-    // Every name the session looks up resolves by the leg's naming, as its
-    // peers' names do.
-    fn resolver(&self) -> Option<Arc<dyn Resolver>> {
-        Some(Arc::new(LegNames(Arc::clone(&self.dialer))))
-    }
 }
 
 // A socket in the leg's tunnel, as the session's datagram socket.
@@ -806,7 +800,7 @@ mod tests {
             (&b"pong"[..], peer.local_addr().unwrap())
         );
 
-        let resolver = sockets.resolver().expect("a tunnel resolves its names");
+        let resolver = LegNames(Arc::new(Carrying(tunnel.clone())));
         assert_eq!(
             resolver.resolve("router.example", 6881).await.unwrap(),
             Resolved::Addresses(vec![SocketAddr::from(([192, 0, 2, 7], 6881))])
@@ -873,9 +867,7 @@ mod tests {
     #[tokio::test]
     async fn a_leg_resolves_names_through_its_dialer_and_hands_the_rest_on() {
         let answer: IpAddr = "192.0.2.9".parse().unwrap();
-        let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
-        let sockets = LegSockets::new(Arc::new(Naming(Some(answer))), &kind);
-        let resolver = sockets.resolver().expect("the leg resolves its names");
+        let resolver = LegNames(Arc::new(Naming(Some(answer))));
         assert_eq!(
             resolver.resolve("router.test", 6881).await.unwrap(),
             Resolved::Addresses(vec![SocketAddr::new(answer, 6881)])
@@ -898,8 +890,7 @@ mod tests {
             resolved + held
         };
         let before = host_lookups();
-        let sockets = LegSockets::new(Arc::new(Naming(None)), &LegKind::Ladder);
-        let resolver = sockets.resolver().expect("the leg resolves its names");
+        let resolver = LegNames(Arc::new(Naming(None)));
         assert_eq!(
             resolver.resolve("localhost", 6881).await.unwrap(),
             Resolved::AtExit

@@ -5224,6 +5224,10 @@ type TorrentRoute {
 	as nothing has asked it to open. None while open.
 	"""
 	reason: String
+	"""
+	Who resolves the names its sessions look up.
+	"""
+	resolvedBy: ResolvedBy
 }
 
 """
@@ -5354,7 +5358,6 @@ type TorrentTestRequest {
 
 type TorrentTracker {
 	tier: Int!
-	url: String!
 	source: TrackerSource!
 	status: TrackerStatus!
 	"""
@@ -5382,6 +5385,15 @@ type TorrentTracker {
 	The earliest the tracker takes the next announce.
 	"""
 	minAnnounceMs: Int
+	"""
+	Who resolves its host; none for an address.
+	"""
+	resolvedBy: ResolvedBy
+	"""
+	The tracker's whole URL to a caller that may change trackers;
+	its scheme, host and port to one that only reads.
+	"""
+	url: String!
 }
 
 """

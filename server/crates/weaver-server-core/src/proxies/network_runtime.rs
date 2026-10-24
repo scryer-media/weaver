@@ -372,6 +372,22 @@ impl NetworkRuntime {
             .get(&id)
             .cloned()
     }
+    /// Who resolves a destination's name dialled through proxy `id` as the
+    /// last hop, when the proxy is configured.
+    pub fn resolved_by(&self, id: u32) -> Option<ResolvedBy> {
+        self.configuration
+            .read()
+            .expect("network configuration")
+            .profiles
+            .get(&id)
+            .map(ProxyProfile::resolved_by)
+    }
+    /// Egress `id` alone, with no proxy above it: what a direct leg's own
+    /// sockets dial out of, and how they look names up.
+    pub fn egress_dialer(&self, id: u32, timeout: Duration) -> Result<Arc<dyn Dialer>, String> {
+        let config = self.configuration.read().expect("network configuration");
+        Ok(Self::bottom(&config, id, timeout)? as Arc<dyn Dialer>)
+    }
     pub fn configuration_snapshot(
         &self,
     ) -> (Vec<EgressInterface>, Vec<ProxyProfile>, Vec<ProxyPool>) {

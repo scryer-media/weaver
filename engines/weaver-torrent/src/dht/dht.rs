@@ -34,7 +34,7 @@ use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, stream::FuturesUn
 use crate::core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     hash_id::Id20,
-    net::{DatagramSocket, Resolved, Resolver, SystemResolver},
+    net::{DatagramSocket, NoNames, Resolved, Resolver},
     peer_id::generate_azereus_style,
     spawn_utils::{spawn, spawn_with_cancel},
 };
@@ -1501,8 +1501,8 @@ pub struct DhtConfig<'a> {
     /// ignored and the DHT reports the socket's `bind_addr()` as its listen
     /// address.
     pub socket: Option<Arc<dyn DatagramSocket>>,
-    /// Look up bootstrap hostnames through this resolver, else the host's
-    /// resolver.
+    /// Look up bootstrap hostnames through this resolver; with none, only
+    /// bootstrap addresses are asked.
     pub resolver: Option<Arc<dyn Resolver>>,
     /// The leading bytes of our node id, the rest being random (BEP 5 node ids
     /// are otherwise random). A client puts its BEP 20 peer id fingerprint here
@@ -1610,10 +1610,7 @@ impl DhtState {
                 state.cancellation_token.clone(),
                 {
                     let state = state.clone();
-                    let resolver = config
-                        .resolver
-                        .take()
-                        .unwrap_or_else(|| Arc::new(SystemResolver));
+                    let resolver = config.resolver.take().unwrap_or_else(|| Arc::new(NoNames));
                     let worker = async move {
                         let worker = DhtWorker {
                             socket,

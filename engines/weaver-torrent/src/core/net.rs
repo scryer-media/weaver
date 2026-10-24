@@ -158,16 +158,22 @@ pub trait Resolver: Send + Sync + 'static {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Resolved>>;
 }
 
-/// The host's resolver, via [`tokio::net::lookup_host`].
+/// The resolver of a session given none: it looks no name up, so the
+/// session reaches only what is named by its address.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct SystemResolver;
+pub struct NoNames;
 
-impl Resolver for SystemResolver {
+impl Resolver for NoNames {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Resolved>> {
         Box::pin(async move {
-            Ok(Resolved::Addresses(
-                tokio::net::lookup_host((host, port)).await?.collect(),
-            ))
+            let address = host.trim_start_matches('[').trim_end_matches(']');
+            match address.parse::<IpAddr>() {
+                Ok(ip) => Ok(Resolved::Addresses(vec![SocketAddr::new(ip, port)])),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{host}: the session was given no resolver"),
+                )),
+            }
         })
     }
 }

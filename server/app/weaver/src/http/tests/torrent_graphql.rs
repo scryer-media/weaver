@@ -11,7 +11,7 @@ use std::sync::RwLock as StdRwLock;
 use base64::Engine;
 use weaver_server_api::{SchemaContext, SystemRuntimeContext, build_schema};
 use weaver_server_core::proxies::{
-    EgressBinding, LegPath, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
+    EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
@@ -41,6 +41,7 @@ impl Routes for Offline {
             egress_id: SYSTEM_EGRESS_ID,
             kind: LegKind::System,
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
+            names: Some(ResolvedBy::Host),
             down: Some("offline".into()),
         })
     }

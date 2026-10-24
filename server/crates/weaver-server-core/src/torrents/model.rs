@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::jobs::JobId;
+use crate::proxies::ResolvedBy;
 use crate::settings::SeedingPolicy;
 pub use weaver_torrent::FilePriority;
 use weaver_torrent::NamedBy;
@@ -295,6 +296,8 @@ pub struct TorrentTracker {
     pub peers: Option<u32>,
     /// Failures in a row since it last answered.
     pub fails: u32,
+    /// Who resolves its host: none for an address, else the route's naming.
+    pub resolved_by: Option<ResolvedBy>,
 }
 
 // The seeding ledger.

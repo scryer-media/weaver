@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 use weaver_torrent::core::lengths::ValidPieceIndex;
 use weaver_torrent::network::{
-    AsyncReadVectored, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket, Resolver,
+    AsyncReadVectored, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
 };
 use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
@@ -193,11 +193,6 @@ impl SocketFactory for ProbeSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         self.inner.bind_udp(addr)
-    }
-
-    // The path's names resolve as the leg's do.
-    fn resolver(&self) -> Option<Arc<dyn Resolver>> {
-        self.inner.resolver()
     }
 }
 
@@ -724,7 +719,7 @@ impl TorrentStorage for HeldPieces {
 
 #[cfg(test)]
 mod tests {
-    use weaver_torrent::network::Resolved;
+    use weaver_torrent::network::{Resolved, Resolver};
     use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Resolution, Target};
 
     use super::*;
@@ -756,8 +751,7 @@ mod tests {
     #[tokio::test]
     async fn a_probe_resolves_names_on_its_path() {
         let path = Arc::new(Path::default());
-        let sockets = ProbeSockets::new(path.clone(), LegKind::Ladder, Arc::new(Watched::new()));
-        let resolver = sockets.resolver().expect("the path resolves its names");
+        let resolver = crate::torrents::net::LegNames(path.clone());
         assert_eq!(
             resolver.resolve("tracker.test", 6969).await.unwrap(),
             Resolved::Addresses(vec![SocketAddr::from(([192, 0, 2, 3], 6969))])

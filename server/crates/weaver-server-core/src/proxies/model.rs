@@ -77,6 +77,17 @@ impl ProxyProfile {
             (Resolver::Proxy, false) => Naming::proxy_servers(self.dns_servers.clone()),
         }
     }
+    // Who resolves a destination's name dialled through this proxy as the
+    // last hop, as `naming` resolves it.
+    pub fn resolved_by(&self) -> super::ResolvedBy {
+        use super::ResolvedBy;
+        match (self.resolver, self.dns_servers.is_empty()) {
+            (Resolver::Weaver, true) => ResolvedBy::Host,
+            (Resolver::Weaver, false) => ResolvedBy::Servers,
+            (Resolver::Proxy, true) => ResolvedBy::Proxy,
+            (Resolver::Proxy, false) => ResolvedBy::ProxyServers,
+        }
+    }
     // The DNS servers asked through the proxy itself.
     pub fn proxy_dns_servers(&self) -> &[IpAddr] {
         match self.resolver {

@@ -228,3 +228,33 @@ fn lock_packages(lock: &str) -> Vec<(String, Vec<String>)> {
         })
         .collect()
 }
+
+// The torrent engine looks no name up by itself: every name a session asks
+// for goes through the resolver its embedder gives it, which for Weaver is
+// the leg's, on the resolution record.
+#[test]
+fn the_torrent_engine_looks_no_name_up_itself() {
+    let mut found = Vec::new();
+    lookups_in(&workspace().join("engines/weaver-torrent/src"), &mut found);
+    assert!(
+        found.is_empty(),
+        "the torrent engine resolves on its own in {found:?}"
+    );
+}
+
+fn lookups_in(dir: &Path, found: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            lookups_in(&path, found);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            let source = std::fs::read_to_string(&path).unwrap();
+            if ["lookup_host", "ToSocketAddrs", ".to_socket_addrs("]
+                .iter()
+                .any(|call| source.contains(call))
+            {
+                found.push(path);
+            }
+        }
+    }
+}

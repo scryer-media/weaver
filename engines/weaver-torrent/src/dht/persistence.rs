@@ -125,8 +125,8 @@ impl PersistentDht {
     /// case `port`, `ipv4_only`, `bind_device` and any persisted port are
     /// ignored.
     ///
-    /// When `resolver` is set, bootstrap hostnames are looked up through it
-    /// instead of the host's resolver.
+    /// Bootstrap hostnames are looked up through `resolver`; with none, only
+    /// bootstrap addresses are asked.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub fn create_with_socket<'a>(

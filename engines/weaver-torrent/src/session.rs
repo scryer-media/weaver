@@ -26,7 +26,7 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
-    net::{HttpClients, NamedBy, Resolver, SystemResolver},
+    net::{HttpClients, NamedBy, NoNames, Resolver},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
 };
@@ -281,7 +281,7 @@ pub struct Session {
     // address its request was checked at.
     pub(crate) http_clients: Arc<dyn HttpClients>,
     // Resolves web seeds' host names, so their addresses are known before
-    // they are asked: the socket factory's resolver, or the host's.
+    // they are asked: the session's resolver.
     pub(crate) resolver: Arc<dyn Resolver>,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
@@ -966,6 +966,12 @@ pub struct SessionOptions {
     /// sockets. See [`SocketFactory`] for what it covers.
     pub socket_factory: Option<Arc<dyn SocketFactory>>,
 
+    /// The resolver for every name the session looks up: DHT bootstrap
+    /// nodes, UDP and HTTP trackers, and web seeds, whose addresses are
+    /// checked before they are asked. A session given none looks no name up
+    /// ([`NoNames`]).
+    pub resolver: Option<Arc<dyn Resolver>>,
+
     /// Build the HTTP clients with this instead of the session's own builder.
     /// Its client for no target downloads torrents and the block and allow
     /// lists; a tracker or a web seed is asked through a client for the
@@ -974,7 +980,7 @@ pub struct SessionOptions {
     /// requests; configure them on the clients.
     ///
     /// The client for no target does its own DNS lookups:
-    /// [`SocketFactory::resolver`] does not apply to it. If those lookups must be routed too, build it
+    /// [`SessionOptions::resolver`] does not apply to it. If those lookups must be routed too, build it
     /// with its own resolver (`reqwest::ClientBuilder::dns_resolver`).
     pub http_client: Option<Arc<dyn HttpClients>>,
 
@@ -1024,6 +1030,7 @@ impl Default for SessionOptions {
             disable_pex: false,
             ipv4_only: false,
             socket_factory: None,
+            resolver: None,
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
             allow_multiple_connections_per_ip: false,
@@ -1267,11 +1274,8 @@ impl Session {
             let swarm = token.child_token();
             let swarm_tasks = TaskTracker::new();
             // Every name the session looks up, on whichever socket.
-            let resolver: Arc<dyn Resolver> = opts
-                .socket_factory
-                .as_ref()
-                .and_then(|factory| factory.resolver())
-                .unwrap_or_else(|| Arc::new(SystemResolver));
+            let resolver: Arc<dyn Resolver> =
+                opts.resolver.take().unwrap_or_else(|| Arc::new(NoNames));
 
             let bind_device = match opts.bind_device_name.as_ref() {
                 Some(name) => Some(

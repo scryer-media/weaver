@@ -5552,9 +5552,16 @@ async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
     let now = handle_of(&rig.service, job_id).await.totals();
     assert_eq!(
         (now.downloaded_bytes, now.uploaded_bytes, now.fetched_bytes),
-        (ended.downloaded_bytes, ended.uploaded_bytes, ended.fetched_bytes)
+        (
+            ended.downloaded_bytes,
+            ended.uploaded_bytes,
+            ended.fetched_bytes
+        )
     );
-    assert_eq!((ended.downloaded_bytes, ended.uploaded_bytes), (before.downloaded_bytes, before.uploaded_bytes));
+    assert_eq!(
+        (ended.downloaded_bytes, ended.uploaded_bytes),
+        (before.downloaded_bytes, before.uploaded_bytes)
+    );
     assert!(now.fetched_protocol_bytes >= ended.fetched_protocol_bytes);
     assert!(now.uploaded_protocol_bytes >= ended.uploaded_protocol_bytes);
     rig.service.stop().await;

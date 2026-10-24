@@ -131,16 +131,21 @@ impl Routes for FakeRoutes {
             .copied()
             .unwrap_or(0);
         let key = proxy_key(proxy);
+        let kind = self
+            .leg
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(LegKind::Ladder, |(kind, _)| kind.clone());
         Ok(RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
             egress_id: SYSTEM_EGRESS_ID,
-            kind: self
-                .leg
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map_or(LegKind::Ladder, |(kind, _)| kind.clone()),
+            names: Some(match kind {
+                LegKind::Ladder => ResolvedBy::Proxy,
+                _ => ResolvedBy::Host,
+            }),
+            kind,
             down: self.key_down(&key),
             key,
         })
@@ -171,6 +176,7 @@ impl Routes for FakeRoutes {
             kind: plan.kind.clone(),
             shape: plan.kind.shape(None),
             factory: Some(factory),
+            names: Arc::new(weaver_torrent::network::NoNames),
             http: tracker_client(&LegKind::System, None, &IDENTITY)?,
             leg,
         })
@@ -1289,6 +1295,7 @@ fn leg(kind: LegKind) -> OpenLeg {
         shape: kind.shape(None),
         kind,
         factory: None,
+        names: Arc::new(weaver_torrent::network::NoNames),
         http: tracker_client(&LegKind::System, None, &IDENTITY).unwrap(),
         leg: None,
     }
@@ -1642,18 +1649,6 @@ impl StreamListener for Quiet {
     }
 }
 
-struct NoNames;
-
-impl weaver_torrent::network::Resolver for NoNames {
-    fn resolve<'a>(
-        &'a self,
-        _: &'a str,
-        _: u16,
-    ) -> BoxFuture<'a, io::Result<weaver_torrent::network::Resolved>> {
-        Box::pin(async { Err(io::Error::from(io::ErrorKind::NotFound)) })
-    }
-}
-
 impl SocketFactory for LoggedDht {
     fn connect_tcp<'a>(
         &'a self,
@@ -1684,10 +1679,6 @@ impl SocketFactory for LoggedDht {
                 log: Arc::clone(&self.log),
             }) as Arc<dyn DatagramSocket>)
         })
-    }
-
-    fn resolver(&self) -> Option<Arc<dyn weaver_torrent::network::Resolver>> {
-        Some(Arc::new(NoNames))
     }
 }
 
@@ -1757,10 +1748,6 @@ impl SocketFactory for Unbound {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async move { Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>) })
-    }
-
-    fn resolver(&self) -> Option<Arc<dyn weaver_torrent::network::Resolver>> {
-        Some(Arc::new(NoNames))
     }
 }
 
@@ -2033,4 +2020,93 @@ async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up()
     );
     sessions.stop_all().await;
     network.shutdown().await;
+}
+
+// A session on the host's own sockets looks its names up as every other leg
+// does, through its leg's dialer: the lookup lands in the resolution record
+// of the task that asked, made by the host's DNS.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_system_leg_session_looks_names_up_on_the_record() {
+    use weaver_torrent::network::Resolved;
+    use weaver_tunnel::resolution::record::{Recording, ResolvedBy};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = crate::torrents::sessions::NetworkRoutes::new(
+        db,
+        proxies,
+        Duration::from_secs(30),
+        IDENTITY,
+    );
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    assert_eq!(plan.kind, LegKind::System);
+    let leg = routes.open(&plan, 8).await.unwrap();
+    assert!(leg.factory.is_none());
+    let options = session_options(
+        &env(dir.path()),
+        &leg,
+        0,
+        dir.path(),
+        8,
+        &TorrentConfig::default(),
+        IpFilter::default(),
+    );
+    let names = options.resolver.expect("the session resolves on its leg");
+    assert!(Arc::ptr_eq(&names, &leg.names));
+
+    let recording = Arc::new(Recording::default());
+    let resolved = recording
+        .scope(names.resolve("localhost", 6969))
+        .await
+        .unwrap();
+    let Resolved::Addresses(found) = resolved else {
+        panic!("the host's DNS handed the name on");
+    };
+    let noted = recording
+        .finish("localhost", 6969, None)
+        .expect("the lookup was recorded");
+    assert_eq!(noted.by, ResolvedBy::Host);
+    // The leg's egress hands its addresses on in its own order.
+    assert_eq!(
+        noted.addresses.iter().copied().collect::<BTreeSet<_>>(),
+        found.iter().map(SocketAddr::ip).collect::<BTreeSet<_>>()
+    );
+}
+
+// A route says who resolves its sessions' names: the host's DNS on the
+// System leg, the exit proxy's naming on a ladder, here a proxy handed the
+// names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_plans_who_resolves_its_names() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(1)).unwrap();
+    let category = TorrentScope::Category(3);
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(category),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: ladder(1),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = crate::torrents::sessions::NetworkRoutes::new(
+        db,
+        proxies,
+        Duration::from_secs(30),
+        IDENTITY,
+    );
+    let direct = routes.plan(TorrentScope::Default).unwrap();
+    assert_eq!(direct.kind, LegKind::System);
+    assert_eq!(direct.names, Some(ResolvedBy::Host));
+    let laddered = routes.plan(category).unwrap();
+    assert_eq!(laddered.kind, LegKind::Ladder);
+    assert_eq!(laddered.names, Some(ResolvedBy::Proxy));
 }

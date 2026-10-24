@@ -27,7 +27,7 @@ use weaver_server_core::categories::{
     CategoryConfig, completion_parent, validate_category_path_component,
 };
 use weaver_server_core::ingest::{Kind, classify};
-use weaver_server_core::proxies::{Bandwidth, TorrentScope};
+use weaver_server_core::proxies::{Bandwidth, ResolvedBy, TorrentScope};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
@@ -1144,7 +1144,19 @@ fn tracker_json(tracker: &TorrentTracker, scope: CallerScope) -> Value {
         "next_announce": seconds(tracker.next_announce_ms),
         "min_announce": seconds(tracker.min_announce_ms),
         "endpoints": [],
+        "resolved_by": tracker.resolved_by.map(resolved_by_name),
     })
+}
+
+// Who resolves a tracker's host, as Weaver names it.
+fn resolved_by_name(by: ResolvedBy) -> &'static str {
+    match by {
+        ResolvedBy::Literal => "LITERAL",
+        ResolvedBy::Host => "HOST",
+        ResolvedBy::Servers => "SERVERS",
+        ResolvedBy::Proxy => "PROXY",
+        ResolvedBy::ProxyServers => "PROXY_SERVERS",
+    }
 }
 
 // A `|`-separated list whose parts a client may percent-encode, as

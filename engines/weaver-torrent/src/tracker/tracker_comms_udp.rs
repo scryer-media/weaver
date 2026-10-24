@@ -15,7 +15,7 @@ use std::{
 
 use crate::core::{
     hash_id::Id20,
-    net::{DatagramSocket, Resolver, SystemResolver},
+    net::{DatagramSocket, NoNames, Resolver},
     spawn_utils::spawn_with_cancel,
 };
 use anyhow::{Context, bail};
@@ -389,14 +389,14 @@ impl UdpTrackerClient {
     /// Create a client that sends and receives tracker traffic through `socket`
     /// instead of binding a kernel UDP socket.
     ///
-    /// Tracker hostnames are looked up through `resolver`, else the host's
-    /// resolver.
+    /// Tracker hostnames are looked up through `resolver`; with none, only
+    /// trackers named by their address are asked.
     pub fn new_with_socket(
         cancel_token: CancellationToken,
         socket: Arc<dyn DatagramSocket>,
         resolver: Option<Arc<dyn Resolver>>,
     ) -> Self {
-        let resolver = resolver.unwrap_or_else(|| Arc::new(SystemResolver));
+        let resolver = resolver.unwrap_or_else(|| Arc::new(NoNames));
         Self::spawn(cancel_token, UdpTrackerSocket::Custom(socket), resolver)
     }
 

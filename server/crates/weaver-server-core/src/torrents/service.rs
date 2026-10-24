@@ -51,7 +51,7 @@ use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::{PieceLayout, PieceRoot};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::proxies::{Consumer, NetworkRuntime, SessionTraffic, TorrentScope};
+use crate::proxies::{Consumer, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope};
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{
     Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption,
@@ -302,6 +302,8 @@ pub struct TorrentRoute {
     pub session: Option<SessionView>,
     /// Why its leg is down, when it is.
     pub down: Option<String>,
+    /// Who resolves the names its sessions look up.
+    pub names: Option<ResolvedBy>,
 }
 
 /// What torrent jobs are built with.
@@ -2704,14 +2706,13 @@ impl TorrentService {
     // the route is up.
     async fn resolve(&self, job_id: JobId) {
         let rules = self.rules();
-        let Some((record, rule, own)) = self
-            .inner
-            .live
-            .lock()
-            .await
-            .get(&job_id)
-            .map(|torrent| (torrent.record.clone(), torrent.rule(&rules), torrent.identity))
-        else {
+        let Some((record, rule, own)) = self.inner.live.lock().await.get(&job_id).map(|torrent| {
+            (
+                torrent.record.clone(),
+                torrent.rule(&rules),
+                torrent.identity,
+            )
+        }) else {
             return;
         };
         let scope = self.settings().scope(record.category_id, rule);
@@ -4143,6 +4144,7 @@ impl TorrentService {
                     scopes: vec![(scope, name)],
                     session: None,
                     down: plan.down,
+                    names: plan.names,
                 }),
             }
         }
@@ -4154,6 +4156,7 @@ impl TorrentService {
                     scopes: Vec::new(),
                     session: Some(view),
                     down: None,
+                    names: None,
                 }),
             }
         }
@@ -4302,20 +4305,30 @@ impl TorrentService {
     /// One torrent, with its files and trackers.
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
         let settings = self.settings();
+        let rules = self.rules();
         let now = self.inner.clock.now_ms();
-        let (mut view, announces) = {
+        let (mut view, announces, scope) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
             let mut view = self.view(&settings, torrent, now);
             view.files = torrent.files();
-            (view, torrent.announces())
+            let scope = settings.scope(torrent.record.category_id, torrent.rule(&rules));
+            (view, torrent.announces(), scope)
         };
+        let names = self
+            .inner
+            .sessions
+            .routes()
+            .plan(scope)
+            .ok()
+            .and_then(|plan| plan.names);
         view.trackers = status::trackers(
             self.inner
                 .db
                 .list_torrent_trackers(job_id)
                 .unwrap_or_default(),
             &announces,
+            names,
         );
         Some(view)
     }

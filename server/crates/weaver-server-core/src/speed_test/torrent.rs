@@ -32,7 +32,7 @@ use super::progress::StreamProvider;
 use super::torrent_net::{PieceStore, ProbeSockets, Watched};
 use crate::proxies::{FetchPath, start_bridge};
 use crate::torrents::identity::IDENTITY;
-use crate::torrents::net::{LegClients, LegKind};
+use crate::torrents::net::{LegClients, LegKind, LegNames};
 
 // Where the test torrent is found: the directory of the current Debian
 // netinst torrents.
@@ -384,6 +384,8 @@ impl Joined {
                 path.kind.clone(),
                 watched,
             ))),
+            // The path's names resolve as a leg's do.
+            resolver: Some(Arc::new(LegNames(path.stage.clone()))),
             http_client: Some(torrent.client.clone()),
             ..SessionOptions::default()
         };

@@ -15,7 +15,7 @@ use weaver_server_api::auth::{CallerIdentity, CallerScope};
 use weaver_server_core::categories::CategoryConfig;
 use weaver_server_core::post_processing::model::PostProcessingSettings;
 use weaver_server_core::proxies::{
-    EgressBinding, LegPath, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
+    EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::{SeedingPolicy, TorrentConfig};
 use weaver_server_core::torrents::identity::IDENTITY;
@@ -36,6 +36,7 @@ impl Routes for Offline {
             egress_id: SYSTEM_EGRESS_ID,
             kind: LegKind::System,
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
+            names: Some(ResolvedBy::Host),
             down: Some("offline".into()),
         })
     }
@@ -77,11 +78,16 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
+    rig_on(|_| Arc::new(Offline)).await
+}
+
+// A rig whose torrents run on the routes `routes` makes of its database.
+async fn rig_on(routes: impl FnOnce(&weaver_server_core::Database) -> Arc<dyn Routes>) -> Rig {
     let harness = TestHarness::new().await;
     let dir = tempfile::tempdir().unwrap();
     let db = harness.db.clone();
     let sessions = Sessions::new(
-        Arc::new(Offline),
+        routes(&db),
         SessionEnv {
             root: dir.path().join("sessions"),
             identity: IDENTITY,
@@ -1199,6 +1205,7 @@ fn an_open_route_shows_where_it_listens_and_its_mappings() {
     let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
     let route = TorrentRouteGql::from(TorrentRoute {
         key: key.clone(),
+        names: Some(ResolvedBy::Host),
         scopes: vec![(TorrentScope::Category(3), Some("tv".into()))],
         session: Some(SessionView {
             key: key.clone(),
@@ -1259,6 +1266,7 @@ fn a_route_nothing_asked_to_open_says_so() {
     let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
     let route = TorrentRouteGql::from(TorrentRoute {
         key,
+        names: None,
         scopes: vec![(TorrentScope::Default, None)],
         session: None,
         down: None,
@@ -1266,4 +1274,156 @@ fn a_route_nothing_asked_to_open_says_so() {
     assert!(!route.open);
     assert_eq!(route.listen_address, None);
     assert_eq!(route.reason.as_deref(), Some(NOT_ASKED_TO_OPEN));
+}
+
+// The routes the network plans, on legs that never open: nothing in these
+// tests reaches a network.
+struct Planned(weaver_server_core::torrents::sessions::NetworkRoutes);
+
+impl Routes for Planned {
+    fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
+        self.0.plan(scope)
+    }
+
+    fn leg_down(&self, plan: &RoutePlan) -> Option<String> {
+        self.0.leg_down(plan)
+    }
+
+    fn open<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: &'life1 RoutePlan,
+        _: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenLeg, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Err("never opened".to_owned()) })
+    }
+
+    fn fetch_blocklist<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: &'life1 reqwest::Url,
+    ) -> Pin<Box<dyn Future<Output = Result<IpRanges, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async { Err("never fetched".to_owned()) })
+    }
+}
+
+// `metainfo` announcing to `announce`.
+fn announcing(name: &str, announce: &str) -> String {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let plain = engine.decode(metainfo(name, 3000, false)).unwrap();
+    let mut out = b"d".to_vec();
+    bstr(&mut out, b"announce");
+    bstr(&mut out, announce.as_bytes());
+    out.extend_from_slice(&plain[1..]);
+    engine.encode(out)
+}
+
+// The route view and each tracker row say who resolves the names: the
+// host's DNS on the System leg, the proxy on a ladder whose exit proxy is
+// handed the names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_routes_and_trackers_say_who_resolves_their_names() {
+    use weaver_server_core::proxies::{
+        Consumer, ProxyKind, ProxyProfile, ProxyRuntime, ProxySecrets, Resolver, RouteLeg, Rung,
+    };
+    use weaver_server_core::torrents::sessions::NetworkRoutes;
+
+    let rig = rig_on(|db| {
+        db.save_proxy_profile(&ProxyProfile {
+            id: 1,
+            name: "tunnel".into(),
+            kind: ProxyKind::Socks5,
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port: 1,
+            resolver: Resolver::Proxy,
+            dns_servers: vec![],
+            tunnel_addresses: vec![],
+            peer_public_key: None,
+            mtu: 1280,
+            keepalive_seconds: None,
+            timeout_seconds: 30,
+            host_key_fingerprint: None,
+            revision: 1,
+            secrets: ProxySecrets::default(),
+        })
+        .unwrap();
+        let proxies = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+        Arc::new(Planned(NetworkRoutes::new(
+            db.clone(),
+            proxies,
+            std::time::Duration::from_secs(30),
+            IDENTITY,
+        )))
+    })
+    .await;
+    let response = rig
+        .execute(
+            r#"mutation { saveTrackerRule(input: {
+                hostPattern: "tracker.test", torrentRoute: true
+            }) { id } }"#,
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let rule = response.data.into_json().unwrap()["saveTrackerRule"][0]["id"]
+        .as_u64()
+        .unwrap();
+    rig.harness
+        .db
+        .save_proxy_routing_policy(
+            Consumer::Torrent(TorrentScope::TrackerRule(rule as u32)),
+            &RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: LegPath::Ladder {
+                        rungs: vec![Rung::Proxy { id: 1 }],
+                        direct_fallback: false,
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let response = rig
+        .execute("{ torrentRoutes { scopes { scope } resolvedBy } }")
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap()["torrentRoutes"],
+        serde_json::json!([
+            { "scopes": [{ "scope": "DEFAULT" }], "resolvedBy": "HOST" },
+            { "scopes": [{ "scope": "TRACKER_RULE" }], "resolvedBy": "PROXY" },
+        ])
+    );
+
+    for (name, announce, by) in [
+        ("host.mkv", "http://other.invalid/announce", "HOST"),
+        ("proxy.mkv", "http://tracker.test/announce", "PROXY"),
+    ] {
+        let response = rig.execute(&submit(&announcing(name, announce), "")).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+            .as_u64()
+            .unwrap();
+        let response = rig
+            .execute(&format!(
+                "{{ torrentTrackers(id: {id}) {{ url resolvedBy }} }}"
+            ))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap()["torrentTrackers"],
+            serde_json::json!([{ "url": announce, "resolvedBy": by }])
+        );
+    }
 }

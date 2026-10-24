@@ -13,6 +13,7 @@ use weaver_server_core::torrents::{
     TorrentTracker, TorrentVersion, TrackerStatus, redacted_tracker_url,
 };
 
+use crate::networking::ResolvedBy;
 use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -223,6 +224,8 @@ pub struct TorrentRouteGql {
     /// Why its session is closed: held closed, its leg down, or not opened
     /// as nothing has asked it to open. None while open.
     pub reason: Option<String>,
+    /// Who resolves the names its sessions look up.
+    pub resolved_by: Option<ResolvedBy>,
 }
 
 /// The reason of a route with no session whose leg is up.
@@ -254,6 +257,7 @@ impl From<TorrentRoute> for TorrentRouteGql {
                 .map(|session| session.external.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
             reason,
+            resolved_by: route.names.map(Into::into),
         }
     }
 }
@@ -334,6 +338,8 @@ pub struct TorrentTrackerGql {
     pub next_announce_ms: Option<i64>,
     /// The earliest the tracker takes the next announce.
     pub min_announce_ms: Option<i64>,
+    /// Who resolves its host; none for an address.
+    pub resolved_by: Option<ResolvedBy>,
 }
 
 impl From<TorrentTracker> for TorrentTrackerGql {
@@ -353,6 +359,7 @@ impl From<TorrentTracker> for TorrentTrackerGql {
             last_announce_ms: tracker.last_announce_ms,
             next_announce_ms: tracker.next_announce_ms,
             min_announce_ms: tracker.min_announce_ms,
+            resolved_by: tracker.resolved_by.map(Into::into),
         }
     }
 }

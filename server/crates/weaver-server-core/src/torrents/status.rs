@@ -13,6 +13,7 @@ use weaver_torrent::{
 use crate::jobs::JobId;
 use crate::jobs::handle::HoldTarget;
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
+use crate::proxies::ResolvedBy;
 use crate::settings::{SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
     NamedBy, TorrentCounters, TorrentIntent, TorrentState, TorrentTracker, TrackerEntry,
@@ -387,6 +388,7 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
         downloaded: accepted.and_then(|accepted| accepted.downloaded),
         peers: accepted.map(|accepted| accepted.peers),
         fails: u32::from(announce.fails),
+        resolved_by: None,
     }
 }
 
@@ -422,7 +424,12 @@ pub fn swarm(announces: &[TrackerAnnounce], now_ms: i64) -> Swarm {
 /// the torrent lists it in and as whoever named it there, or, before it has
 /// run, the ones it lists. A tracker the torrent does not list came with its
 /// magnet, whose trackers each take a tier of their own in the link's order.
-pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec<TorrentTracker> {
+/// Each says who resolves its host on a route whose names `names` resolves.
+pub fn trackers(
+    listed: Vec<TrackerEntry>,
+    announces: &[TrackerAnnounce],
+    names: Option<ResolvedBy>,
+) -> Vec<TorrentTracker> {
     let mut trackers: Vec<TorrentTracker> = if announces.is_empty() {
         listed
             .into_iter()
@@ -441,6 +448,7 @@ pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec
                 downloaded: None,
                 peers: None,
                 fails: 0,
+                resolved_by: None,
             })
             .collect()
     } else {
@@ -469,7 +477,24 @@ pub fn trackers(listed: Vec<TrackerEntry>, announces: &[TrackerAnnounce]) -> Vec
             .collect()
     };
     trackers.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+    for tracker in &mut trackers {
+        tracker.resolved_by = resolved_by(&tracker.url, names);
+    }
     trackers
+}
+
+/// Who resolves the host `url` names, on a route whose names `names`
+/// resolves: no one for an address, which is dialled as it stands.
+pub fn resolved_by(url: &str, names: Option<ResolvedBy>) -> Option<ResolvedBy> {
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_owned();
+    let address = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>();
+    match address {
+        Ok(_) => Some(ResolvedBy::Literal),
+        Err(_) => names,
+    }
 }
 
 #[cfg(test)]
@@ -1209,6 +1234,31 @@ mod tests {
         );
     }
 
+    // A tracker named by its address is resolved by no one; one named by
+    // its host, by whoever resolves the route's names.
+    #[test]
+    fn a_trackers_host_is_resolved_by_the_routes_naming_unless_it_is_an_address() {
+        for (url, by) in [
+            ("http://tracker.invalid/announce", Some(ResolvedBy::Proxy)),
+            ("udp://tracker.invalid:80", Some(ResolvedBy::Proxy)),
+            ("http://192.0.2.7:6969/announce", Some(ResolvedBy::Literal)),
+            ("udp://192.0.2.7:6969", Some(ResolvedBy::Literal)),
+            ("udp://[2001:db8::7]:6969", Some(ResolvedBy::Literal)),
+            ("not a url", None),
+        ] {
+            assert_eq!(resolved_by(url, Some(ResolvedBy::Proxy)), by, "{url}");
+        }
+        assert_eq!(resolved_by("http://tracker.invalid/announce", None), None);
+
+        let listed = vec![TrackerEntry {
+            tier: 0,
+            url: "http://tracker.invalid/announce".into(),
+            named_by: NamedBy::Torrent,
+        }];
+        let rows = trackers(listed, &[], Some(ResolvedBy::Host));
+        assert_eq!(rows[0].resolved_by, Some(ResolvedBy::Host));
+    }
+
     #[test]
     fn a_torrent_lists_its_trackers_until_it_runs_then_the_runs() {
         let listed = vec![
@@ -1223,7 +1273,7 @@ mod tests {
                 named_by: NamedBy::Torrent,
             },
         ];
-        let never: Vec<_> = trackers(listed.clone(), &[])
+        let never: Vec<_> = trackers(listed.clone(), &[], None)
             .into_iter()
             .map(|tracker| (tracker.tier, tracker.url, tracker.status, tracker.named_by))
             .collect();
@@ -1262,7 +1312,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let ran: Vec<_> = trackers(listed, &run)
+        let ran: Vec<_> = trackers(listed, &run, None)
             .into_iter()
             .map(|tracker| (tracker.tier, tracker.url, tracker.updating, tracker.named_by))
             .collect();

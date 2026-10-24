@@ -27,7 +27,7 @@ use std::{
 use librqbit_dualstack_sockets::PollSendToVectored;
 use librqbit_utp::{Transport, UtpSocketUdp, UtpStream};
 
-pub use crate::core::net::{BoxFuture, DatagramSocket, Resolved, Resolver, SystemResolver};
+pub use crate::core::net::{BoxFuture, DatagramSocket, NoNames, Resolved, Resolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{
     AsyncReadToVectoredCompat, AsyncReadVectored, AsyncReadVectoredIntoCompat,
@@ -87,15 +87,6 @@ pub trait SocketFactory: Send + Sync + 'static {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>>;
-
-    /// The resolver for every name the session looks up: DHT bootstrap
-    /// nodes, UDP and HTTP trackers, and web seeds, whose addresses are
-    /// checked before they are asked.
-    ///
-    /// The default, `None`, uses the host's resolver ([`SystemResolver`]).
-    fn resolver(&self) -> Option<Arc<dyn Resolver>> {
-        None
-    }
 }
 
 impl std::fmt::Debug for dyn SocketFactory {

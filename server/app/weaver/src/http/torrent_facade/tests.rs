@@ -19,7 +19,7 @@ use weaver_server_core::jobs::ids::JobId;
 use weaver_server_core::operations::metrics::PipelineMetrics;
 use weaver_server_core::post_processing::model::PostProcessingSettings;
 use weaver_server_core::proxies::{
-    EgressBinding, LegPath, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
+    EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{BlocklistSource, SeedingPolicy, TorrentConfig, TorrentLimit};
@@ -54,6 +54,7 @@ impl Routes for Offline {
             egress_id: SYSTEM_EGRESS_ID,
             kind: LegKind::System,
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
+            names: Some(ResolvedBy::Host),
             down: (!self.up).then(|| "offline".into()),
         })
     }
@@ -463,6 +464,7 @@ fn a_trackers_status_reads_as_the_clients_number() {
         downloaded: None,
         peers: None,
         fails: 0,
+        resolved_by: None,
     };
     let numbers: Vec<Value> = [
         TrackerStatus::Disabled,
@@ -486,6 +488,7 @@ fn a_trackers_status_reads_as_the_clients_number() {
             peers: Some(7),
             next_announce_ms: Some(1_800_500),
             min_announce_ms: Some(30_000),
+            resolved_by: Some(ResolvedBy::Proxy),
             ..tracker(TrackerStatus::Working)
         },
         CallerScope::Admin,
@@ -506,6 +509,7 @@ fn a_trackers_status_reads_as_the_clients_number() {
             "next_announce": 1_800,
             "min_announce": 30,
             "endpoints": [],
+            "resolved_by": "PROXY",
         })
     );
     let failed = tracker_json(
@@ -516,8 +520,18 @@ fn a_trackers_status_reads_as_the_clients_number() {
         CallerScope::Admin,
     );
     assert_eq!(
-        (&failed["status"], &failed["num_seeds"], &failed["msg"]),
-        (&Value::from(4), &Value::from(-1), &Value::from("refused"))
+        (
+            &failed["status"],
+            &failed["num_seeds"],
+            &failed["msg"],
+            &failed["resolved_by"]
+        ),
+        (
+            &Value::from(4),
+            &Value::from(-1),
+            &Value::from("refused"),
+            &Value::Null
+        )
     );
     let added = tracker_json(
         &TorrentTracker {

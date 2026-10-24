@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 pub use weaver_torrent::IpRanges;
 use weaver_torrent::dht::DhtPersistenceConfig;
+use weaver_torrent::network::Resolver;
 use weaver_torrent::upnp::PortMapEvents;
 pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
@@ -27,12 +28,12 @@ use crate::StateError;
 use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, FetchOptions, LegPath, NetworkRuntime,
-    ProxyRuntime, Route, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope,
-    routed_fetch,
+    ProxyRuntime, ResolvedBy, Route, RoutingPolicy, Rung, SYSTEM_EGRESS_ID, TorrentLeg,
+    TorrentScope, routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::ClientIdentity;
-use crate::torrents::net::{LegKind, LegSockets, Shape, tracker_client};
+use crate::torrents::net::{LegKind, LegNames, LegSockets, Shape, tracker_client};
 use crate::torrents::rate::SessionRates;
 
 /// The most sessions that run at once.
@@ -98,6 +99,10 @@ pub struct RoutePlan {
     pub key: RouteKey,
     /// Why the leg is down, when it is.
     pub down: Option<String>,
+    /// Who resolves the names its sessions look up: the host's DNS on a
+    /// direct leg, the exit proxy's naming on a ladder, none when the route
+    /// names no proxy that is configured.
+    pub names: Option<ResolvedBy>,
 }
 
 /// A leg made ready for a session.
@@ -105,6 +110,9 @@ pub struct OpenLeg {
     pub kind: LegKind,
     pub shape: Shape,
     pub factory: Option<Arc<dyn SocketFactory>>,
+    /// Every name the session looks up, on whichever leg: the leg's
+    /// dialer's naming, which records each lookup as every other dial does.
+    pub names: Arc<dyn Resolver>,
     /// The session's HTTP clients, for its trackers and web seeds.
     pub http: Arc<dyn HttpClients>,
     /// The route's leg the factory dials through, kept while the session
@@ -166,6 +174,19 @@ impl NetworkRoutes {
             _ => None,
         }
     }
+
+    // Who resolves the names a session on `path` looks up.
+    fn names_on(&self, path: &LegPath) -> Option<ResolvedBy> {
+        let exit = match path {
+            LegPath::Direct => return Some(ResolvedBy::Host),
+            LegPath::Ladder { rungs, .. } => match rungs.last()? {
+                Rung::Proxy { id } => *id,
+                Rung::Chain { ids } => *ids.last()?,
+                Rung::Pool { .. } => return None,
+            },
+        };
+        self.network().resolved_by(exit)
+    }
 }
 
 #[async_trait::async_trait]
@@ -193,6 +214,7 @@ impl Routes for NetworkRoutes {
                 LegKind::of(&egress.binding, &leg.path)
             }),
             key,
+            names: self.names_on(&leg.path),
             policy,
             down,
         })
@@ -204,10 +226,12 @@ impl Routes for NetworkRoutes {
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
         if plan.kind.own_sockets() {
+            let egress = self.network().egress_dialer(plan.egress_id, self.timeout)?;
             return Ok(OpenLeg {
                 kind: plan.kind.clone(),
                 shape: plan.kind.shape(None),
                 factory: None,
+                names: Arc::new(LegNames(egress)),
                 http: tracker_client(&plan.kind, None, &self.identity)?,
                 leg: None,
             });
@@ -224,7 +248,8 @@ impl Routes for NetworkRoutes {
         let dialer = leg.dialer();
         Ok(OpenLeg {
             shape: plan.kind.shape(Some(&dialer)),
-            factory: Some(Arc::new(LegSockets::new(dialer, &plan.kind))),
+            factory: Some(Arc::new(LegSockets::new(Arc::clone(&dialer), &plan.kind))),
+            names: Arc::new(LegNames(dialer)),
             kind: plan.kind.clone(),
             http,
             leg: Some(leg),
@@ -443,6 +468,7 @@ pub fn session_options(
         ip_filter,
         disable_local_service_discovery: !shape.own_sockets,
         socket_factory: leg.factory.clone(),
+        resolver: Some(Arc::clone(&leg.names)),
         http_client: Some(leg.http.clone()),
         ..SessionOptions::default()
     };
