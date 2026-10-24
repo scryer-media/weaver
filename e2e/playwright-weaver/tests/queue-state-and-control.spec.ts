@@ -143,6 +143,15 @@ async function cancelAll(request: APIRequestContext, ids: number[]): Promise<voi
   await graphql(request, "mutation WeaverE2EQueueStateCleanup($ids: [Int!]!) { cancelJobs(ids: $ids) { id } }", { ids });
 }
 
+const BATCH = 10;
+async function inBatches<T, R>(inputs: T[], run: (input: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+  for (let offset = 0; offset < inputs.length; offset += BATCH) {
+    results.push(...await Promise.all(inputs.slice(offset, offset + BATCH).map(run)));
+  }
+  return results;
+}
+
 let started: number[] = [];
 
 test.beforeEach(async ({ request }) => {
@@ -340,22 +349,22 @@ test("Q6 a cancelled job leaves the queue only once its history row says cancell
 });
 
 test("Q7 one history delete of 120 ids announces every id and leaves the rest", async ({ request }) => {
-  test.setTimeout(10 * 60 * 1000);
   globalPauseByUs = true;
   await graphql(request, "mutation WeaverE2EQ7Pause { pauseAll }");
   const tag = `q7-${Date.now()}`;
   const keep = await probeJob(request, tag, 1);
-  const jobs: number[] = [];
-  for (let index = 0; index < 120; index += 1) {
+  // Nothing below depends on the order the jobs were admitted in, so the
+  // submissions and the polls go in bounded concurrent batches.
+  const jobs = await inBatches(Array.from({ length: 120 }, (_, index) => index), async (index) => {
     const submitted = await submitProbeNzb(request, `${tag}-bulk-${index}`, [
       { messageId: `${tag}-bulk-${index}@e2e.invalid`, bytes: 1 },
     ]);
     expect(submitted.jobId).not.toBeNull();
-    jobs.push(submitted.jobId!);
-  }
+    return submitted.jobId!;
+  });
   started.push(keep, ...jobs);
   await cancelAll(request, [keep, ...jobs]);
-  for (const id of [keep, ...jobs]) await waitTerminal(request, id);
+  await inBatches([keep, ...jobs], (id) => waitTerminal(request, id));
 
   const gone = jobs[17]!;
   await graphql(request, "mutation WeaverE2EQ7DeleteOne($ids: [Int!]!) { removeHistoryItems(ids: $ids) { success } }", { ids: [gone] });
@@ -369,8 +378,7 @@ test("Q7 one history delete of 120 ids announces every id and leaves the rest", 
   const announced = new Set(removed.removeHistoryItems.removedIds);
   const missing = jobs.filter((id) => id !== gone && !announced.has(id));
   expect(missing, "every deleted id is announced").toEqual([]);
-  for (const id of jobs) {
-    await expect.poll(async () => history(request, id), { message: `history ${id} deleted`, timeout: 0 }).toBeNull();
-  }
+  await inBatches(jobs, (id) =>
+    expect.poll(async () => history(request, id), { message: `history ${id} deleted`, timeout: 0 }).toBeNull());
   expect(await history(request, keep), "the row outside the batch is intact").not.toBeNull();
 });
