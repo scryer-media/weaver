@@ -4180,8 +4180,15 @@ impl TorrentService {
         let rule = torrent.rule(&rules);
         let policy = settings.policy(record, rule);
         let swarm = status::swarm(&torrent.announces(), now);
-        let active = counters.active_duration_s;
-        let average = |bytes: u64| bytes.checked_div(active).unwrap_or(0);
+        // Over the time the torrent has run to this reading, the part of a
+        // second included: its first second reads a rate, not 0.
+        let active_ms =
+            u128::from(counters.active_duration_s) * 1000 + u128::from(reading.timed.active_ms);
+        let average = |bytes: u64| {
+            (u128::from(bytes) * 1000)
+                .checked_div(active_ms)
+                .map_or(0, |bps| u64::try_from(bps).unwrap_or(u64::MAX))
+        };
         TorrentView {
             job_id: record.job_id,
             name: record.name.clone(),
@@ -4222,7 +4229,7 @@ impl TorrentService {
             swarm_seeds: swarm.seeds,
             swarm_leechers: swarm.leechers,
             reannounce_seconds: swarm.reannounce_seconds,
-            active_seconds: active,
+            active_seconds: counters.active_duration_s,
             download_avg_bps: average(counters.downloaded_bytes),
             upload_avg_bps: average(counters.uploaded_bytes),
             wasted_bytes: reading.seen.wasted(),

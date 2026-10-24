@@ -1997,6 +1997,21 @@ impl Seeded {
     }
 }
 
+// A torrent's averages run over the part of a second it has been active:
+// its first second reads a rate, not 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrents_first_second_reads_a_rate() {
+    let seeded = seeded().await;
+    seeded.advance(500);
+    let view = seeded.view().await;
+    assert!(view.downloaded_bytes > 0);
+    assert_eq!(
+        (view.active_seconds, view.download_avg_bps),
+        (0, view.downloaded_bytes * 2)
+    );
+    seeded.stop().await;
+}
+
 // A torrent's active time is read as of now, with its bytes: a view between
 // ticks counts the time since the last one, its averages are its bytes
 // over that time, and the tick lands the same figures in the ledger with no
