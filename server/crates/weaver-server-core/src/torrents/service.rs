@@ -4349,6 +4349,24 @@ impl TorrentService {
             .map(|category| category.id);
         settings.scope(id, None)
     }
+
+    /// The bytes at `url` for a torrent added in `category`, fetched over
+    /// its route's one leg and nothing else. A leg that is down fetches
+    /// nothing: the add fails for the route being down.
+    pub async fn fetch_url(
+        &self,
+        proxies: &crate::proxies::ProxyRuntime,
+        category: Option<&str>,
+        url: &reqwest::Url,
+        cookie: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let scope = self.scope_of(category);
+        let plan = self.inner.sessions.routes().plan(scope)?;
+        if let Some(reason) = plan.down {
+            return Err(SessionError::RouteDown(reason).to_string());
+        }
+        crate::ingest::fetch_torrent_url(proxies, scope, url, cookie).await
+    }
 }
 
 // The torrents' seat in the queue.

@@ -40,8 +40,11 @@ use super::*;
 const ADMIN: &str = "facade-admin-key";
 const READER: &str = "facade-read-key";
 
-// A route that is always down: nothing here reaches a network.
-struct Offline;
+// A route that opens no session: nothing here reaches a network. It plans
+// down unless `up`, which lets a URL be fetched over its leg.
+struct Offline {
+    up: bool,
+}
 
 impl Routes for Offline {
     fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
@@ -51,7 +54,7 @@ impl Routes for Offline {
             egress_id: SYSTEM_EGRESS_ID,
             kind: LegKind::System,
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
-            down: Some("offline".into()),
+            down: (!self.up).then(|| "offline".into()),
         })
     }
 
@@ -166,6 +169,15 @@ async fn rig_from(
     security: RuntimeSecurityConfig,
     handle: SchedulerHandle,
 ) -> Rig {
+    rig_on(torrents_on, security, handle, Offline { up: false }).await
+}
+
+async fn rig_on(
+    torrents_on: bool,
+    security: RuntimeSecurityConfig,
+    handle: SchedulerHandle,
+    routes: Offline,
+) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory().unwrap();
     let complete = dir.path().join("complete");
@@ -180,7 +192,7 @@ async fn rig_from(
     }
     let torrents = if torrents_on {
         let sessions = Sessions::new(
-            Arc::new(Offline),
+            Arc::new(routes),
             SessionEnv {
                 root: dir.path().join("sessions"),
                 identity: IDENTITY,
@@ -980,7 +992,13 @@ async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
         )
         .unwrap(),
     );
-    let rig = rig_from(true, RuntimeSecurityConfig::default(), handle).await;
+    let rig = rig_on(
+        true,
+        RuntimeSecurityConfig::default(),
+        handle,
+        Offline { up: true },
+    )
+    .await;
 
     let (url, server) = serve(vec![metainfo("fetched.mkv", 4096, false)]).await;
     let added = rig

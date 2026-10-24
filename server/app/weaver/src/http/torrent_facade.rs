@@ -26,7 +26,7 @@ use weaver_server_core::auth::{
 use weaver_server_core::categories::{
     CategoryConfig, completion_parent, validate_category_path_component,
 };
-use weaver_server_core::ingest::{Kind, classify, fetch_torrent_url};
+use weaver_server_core::ingest::{Kind, classify};
 use weaver_server_core::proxies::{Bandwidth, TorrentScope};
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
@@ -1320,7 +1320,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         }
     };
     // Each file, and each url's text, is read for what it is. A url is
-    // fetched on the route its torrent takes, with the client's cookie.
+    // fetched over the one leg of the route its torrent takes, with the\n    // client's cookie.
     let mut bodies = params.files.clone();
     for line in params
         .get("urls")
@@ -1336,8 +1336,10 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         let Some(runtime) = ctx.inner.handle.proxy_runtime() else {
             return text(StatusCode::CONFLICT, "torrent request has no route");
         };
-        let scope = torrents.scope_of(category.as_deref());
-        match fetch_torrent_url(&runtime, scope, &url, params.get("cookie")).await {
+        match torrents
+            .fetch_url(&runtime, category.as_deref(), &url, params.get("cookie"))
+            .await
+        {
             Ok(body) => bodies.push(body),
             Err(error) => return text(StatusCode::CONFLICT, error),
         }

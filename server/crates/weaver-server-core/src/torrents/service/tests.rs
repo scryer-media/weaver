@@ -817,6 +817,100 @@ fn store_route_unchecked(db: &Database, consumer: Consumer, policy: &RoutingPoli
     .unwrap();
 }
 
+// A torrent added by URL is fetched over its route's one leg: up, the
+// request reaches the site; down, the add fails for the route being down,
+// and nothing is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_url_is_fetched_over_the_routes_one_leg_or_not_at_all() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = Arc::new(crate::torrents::sessions::NetworkRoutes::new(
+        db.clone(),
+        Arc::clone(&proxies),
+        Duration::from_secs(30),
+        crate::torrents::identity::IDENTITY,
+    ));
+    let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
+    service.open().await.unwrap();
+
+    let site = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = reqwest::Url::parse(&format!(
+        "http://{}/a.torrent",
+        site.local_addr().unwrap()
+    ))
+    .unwrap();
+    let body = b"d4:infod4:name1:aee";
+    let served = async {
+        let (mut stream, _) = site.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            assert!(read > 0, "the request ended before it was read");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+    };
+    let (fetched, ()) = tokio::join!(service.fetch_url(&proxies, None, &url, None), served);
+    assert_eq!(fetched.unwrap(), body);
+
+    // The route's one leg on an interface the host does not have.
+    let absent = db
+        .create_egress_interface(&crate::proxies::EgressInterface {
+            id: 0,
+            name: "absent".into(),
+            binding: crate::proxies::EgressBinding::Interface {
+                name: "weaverabsent0".into(),
+            },
+            enabled: true,
+            download_bps: None,
+            upload_bps: None,
+            quota: Default::default(),
+        })
+        .unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: absent.id,
+                weight: 100,
+                path: LegPath::Direct,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    proxies.network.reload().await.unwrap();
+    let down = service
+        .inner
+        .sessions
+        .routes()
+        .plan(TorrentScope::Default)
+        .unwrap()
+        .down
+        .expect("the leg is down");
+
+    let refused = service.fetch_url(&proxies, None, &url, None).await;
+    assert_eq!(refused, Err(format!("route down: {down}")));
+    let site = site.into_std().unwrap();
+    site.set_nonblocking(true).unwrap();
+    let asked = site.accept();
+    assert!(
+        matches!(&asked, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the site was asked: {asked:?}"
+    );
+    service.stop().await;
+}
+
 // A torrent route stored with two legs is no route a torrent may run on: it
 // reads down for the refusal, the route view shows why, and its torrent is
 // held. Saved again as its one leg, the route and the torrent are released.
