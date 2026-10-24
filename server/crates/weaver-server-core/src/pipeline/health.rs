@@ -900,18 +900,25 @@ impl Pipeline {
             health as f64 / 10.0,
             critical as f64 / 10.0
         );
+        self.attributed_dead_post_error(job_id, health_error)
+    }
+
+    // The error a health detector fails a job with: the first-article
+    // sample's diagnosis when the sample has ruled, the detector's own
+    // `error` otherwise.
+    fn attributed_dead_post_error(&self, job_id: JobId, error: String) -> String {
         match self.first_article_verdict(job_id) {
             Some((missing, total)) => {
                 warn!(
                     job_id = job_id.0,
                     missing,
                     total,
-                    health = %health_error,
+                    health = %error,
                     "health abort attributed to the first-article sample"
                 );
                 Self::first_article_verdict_error(missing, total)
             }
-            None => health_error,
+            None => error,
         }
     }
 
@@ -976,10 +983,23 @@ impl Pipeline {
             .get(&job_id)
             .is_some_and(|state| state.par2_bytes > 0);
 
-        if done && !inconclusive && missed == total && total > 0 && !par2_recovery_potential {
-            let error = format!(
-                "health probe: all {} samples missing — release is unavailable",
-                total
+        // A dead post has one verdict whichever detector reaches it first.
+        // While the first-article sample can still rule, the round falls
+        // through to the ordinary projection below, and the health arithmetic
+        // holds its abort on that sample exactly as it holds a byte-count
+        // abort; the sample's diagnosis is then the one the job fails with.
+        // The probe's own wording is left for a post the sample cannot speak
+        // for.
+        if done
+            && !inconclusive
+            && missed == total
+            && total > 0
+            && !par2_recovery_potential
+            && !self.first_article_sample_can_still_decide(job_id)
+        {
+            let error = self.attributed_dead_post_error(
+                job_id,
+                format!("health probe: all {total} samples missing — release is unavailable"),
             );
             warn!(job_id = job_id.0, "{error}");
             self.raise_queue_script_event(
