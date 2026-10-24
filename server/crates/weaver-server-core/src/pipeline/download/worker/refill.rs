@@ -350,8 +350,12 @@ impl Pipeline {
             }
         }
         let mut returned = 0;
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            for work in works {
+        for work in works {
+            let Some(work) = self.requeue_graph_work(work) else {
+                returned += 1;
+                continue;
+            };
+            if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.download_queue.push(work);
                 returned += 1;
             }

@@ -50,6 +50,9 @@ pub(crate) struct ArticleRoot {
     // file of its number whatever a recovery set renames it to, so this,
     // not the member's name, is what says a restore has the right post.
     posted: Vec<String>,
+    // The members the post declares as indexes, by their posted names: the
+    // root asks for them first, whole.
+    pub(crate) indexes: Vec<VolumeIndex>,
 }
 
 impl ArticleRoot {
@@ -60,6 +63,12 @@ impl ArticleRoot {
             window: Window::default(),
             checksums: Checksums::default(),
             posted: files.iter().map(|file| file.name.clone()).collect(),
+            indexes: files
+                .iter()
+                .zip(0u32..)
+                .filter(|(file, _)| sample::declared_index(&file.name))
+                .map(|(_, index)| VolumeIndex(index))
+                .collect(),
         }
     }
 

@@ -436,6 +436,9 @@ impl Pipeline {
         lease: DownloadBatchLease,
     ) {
         for work in lease.works {
+            let Some(work) = self.requeue_graph_work(work) else {
+                continue;
+            };
             if let Some(state) = self.jobs.get_mut(&lease.job_id) {
                 state.download_queue.push(work);
             }
@@ -1144,6 +1147,11 @@ impl Pipeline {
             self.note_download_activity(job_id);
         }
 
+        let Some(work) = self.requeue_graph_work(work) else {
+            self.update_queue_metrics();
+            self.publish_active_stage_metrics();
+            return;
+        };
         let parks = self.requeue_parks(&work);
         if let Some(state) = self.jobs.get_mut(&job_id)
             && !is_terminal_status(&state.status)

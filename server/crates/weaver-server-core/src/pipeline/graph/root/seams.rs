@@ -27,8 +27,8 @@ use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
-// The best priority a window volume is raised to: ahead of every ordinary
-// file, behind the index and first volumes a post leads with.
+// The priority a window volume is raised to: ahead of every article at the
+// neutral priority.
 const WINDOW_PRIORITY: u32 = 3;
 
 impl Pipeline {
@@ -187,6 +187,7 @@ impl Pipeline {
             VolumeIndex(work.segment_id.file_id.file_index),
             work.segment_id.segment_number,
         );
+        work.priority = crate::pipeline::graph::NEUTRAL_PRIORITY;
         work.is_recovery = false;
         work.completion_critical = false;
         if let Some(class) = class {
@@ -388,19 +389,21 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
         state
             .download_queue
             .reprioritize_matching_with_rank(|work| match class_of(work) {
-                Some(Class::Window(rank)) => Some((work.priority.min(WINDOW_PRIORITY), Some(rank))),
+                Some(Class::Window(rank)) => Some((WINDOW_PRIORITY, Some(rank))),
                 _ => None,
             });
     }
 }
 
-// The queue flags a class is fetched under, and a window volume's priority.
+// The queue flags a class is fetched under, and its priority: a window
+// volume's, or the one neutral priority every other article holds.
 fn classify(work: &mut DownloadWork, class: Class) {
     work.completion_critical |= class.waited_on();
     work.is_recovery |= class == Class::Recovery;
-    if let Class::Window(_) = class {
-        work.priority = work.priority.min(WINDOW_PRIORITY);
-    }
+    work.priority = match class {
+        Class::Window(_) => WINDOW_PRIORITY,
+        _ => crate::pipeline::graph::NEUTRAL_PRIORITY,
+    };
 }
 
 fn file(job_id: JobId, volume: VolumeIndex) -> NzbFileId {

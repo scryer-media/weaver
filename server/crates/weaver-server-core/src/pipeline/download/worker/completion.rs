@@ -121,6 +121,10 @@ impl Pipeline {
         let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
             return false;
         };
+        let Some(work) = self.requeue_graph_work(work) else {
+            self.update_queue_metrics();
+            return true;
+        };
         let parks = self.requeue_parks(&work);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return false;
@@ -229,7 +233,7 @@ impl Pipeline {
         })
     }
 
-    fn download_retry_work(
+    pub(in crate::pipeline) fn download_retry_work(
         &self,
         segment_id: SegmentId,
         retry_count: u32,

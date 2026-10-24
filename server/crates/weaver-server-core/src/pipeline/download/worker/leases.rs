@@ -191,7 +191,9 @@ impl Pipeline {
             );
             if !self.primary_download_within_restart_durable_lead(job_id, &work) {
                 self.note_checkpoint_dispatch_block(job_id);
-                if let Some(state) = self.jobs.get_mut(&job_id) {
+                if let Some(work) = self.requeue_graph_work(work)
+                    && let Some(state) = self.jobs.get_mut(&job_id)
+                {
                     state.download_queue.push(work);
                 }
                 self.update_queue_metrics();

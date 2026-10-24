@@ -16,6 +16,9 @@ pub(crate) struct AdmissionResources {
     pub intermediate_dir: PathBuf,
     pub complete_dir: PathBuf,
     pub memory: Arc<crate::pipeline::ProcessMemoryBudget>,
+    // The engine an admitted job is stamped with: the process switch, so
+    // graph unless the server opted into classic.
+    pub engine: crate::pipeline::graph::Engine,
 }
 
 pub(crate) struct PreparedAdd {

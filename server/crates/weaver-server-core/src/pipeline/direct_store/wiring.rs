@@ -1070,7 +1070,11 @@ impl Pipeline {
             return;
         }
         self.direct_store.examined.insert(job_id);
-        if !self.direct_store.gate().is_enabled() {
+        // `[direct_store]` and `WEAVER_RAR_DIRECT_STORE` are classic switches:
+        // a graph job's objects decide where its bytes go.
+        if !self.direct_store.gate().is_enabled()
+            || !self.job_engine(job_id).classic_switches_apply()
+        {
             return;
         }
         // Deterministic rather than `extraction_staging_dir`, and deliberately
@@ -1203,7 +1207,9 @@ impl Pipeline {
     // exactly one recovery set, and fingerprint-unique — anything less routes
     // nothing and leaves the job on the conventional path it is on today.
     pub(crate) async fn arm_direct_identity_admission(&mut self, job_id: JobId) {
-        if !self.direct_store.gate().is_enabled() {
+        if !self.direct_store.gate().is_enabled()
+            || !self.job_engine(job_id).classic_switches_apply()
+        {
             return;
         }
         // Only for jobs the name path found nothing for. Once identity mode is

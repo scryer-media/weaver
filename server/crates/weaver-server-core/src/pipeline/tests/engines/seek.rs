@@ -23,7 +23,7 @@ use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::{multi_member_store_set, obfuscate_volumes};
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues,
+    insert_active_job_on, new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues,
     retire_pipeline_database,
 };
 
@@ -171,8 +171,10 @@ fn last(outcome: &Outcome, file: u32) -> usize {
 }
 
 // Row 1. A store posted out of volume order, reversed and shuffled, a plain
-// file between its volumes: the store's bids bring each next volume forward
-// as far as the window lets them, and both engines ask in one order.
+// file between its volumes. The graph's root samples every member's head
+// first, in posted order, and the store's bids bring its volumes ahead of
+// the plain file's payload. Both engines deliver every member, asking for
+// nothing twice.
 async fn out_of_order(order: &[usize]) {
     let members = members(4, 11);
     let volumes = store_set(&members, 12);
@@ -189,16 +191,32 @@ async fn out_of_order(order: &[usize]) {
     all.push(("ember.bin".to_string(), plain));
     assert_members(&classic, &all);
     assert_members(&graph, &all);
-    assert_eq!(graph.order, classic.order, "one order of asks");
+    for outcome in [&classic, &graph] {
+        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+    }
+    let heads: Vec<(u32, u32)> = (0..posted(order)).map(|file| (file, 0)).collect();
+    assert_eq!(graph.order[..heads.len()], heads, "the heads lead");
+    let plain = graph.order.iter().position(|article| *article == (6, 1));
+    let plain = plain.expect("the plain file's payload is asked for");
+    assert!(
+        graph.order[plain..].iter().all(|(file, _)| *file == 6),
+        "the store's volumes come ahead of the plain payload: {:?}",
+        graph.order
+    );
+}
+
+// The posts of an `out_of_order` row: its volumes and the plain file.
+fn posted(order: &[usize]) -> u32 {
+    order.len() as u32 + 1
 }
 
 #[tokio::test]
-async fn a_store_posted_in_reverse_is_asked_for_in_one_order_by_both_engines() {
+async fn a_store_posted_in_reverse_is_fetched_heads_first_and_delivered_by_both_engines() {
     out_of_order(&(0..12).rev().collect::<Vec<_>>()).await;
 }
 
 #[tokio::test]
-async fn a_store_posted_shuffled_is_asked_for_in_one_order_by_both_engines() {
+async fn a_store_posted_shuffled_is_fetched_heads_first_and_delivered_by_both_engines() {
     out_of_order(&[5, 0, 9, 3, 11, 1, 7, 10, 2, 8, 4, 6]).await;
 }
 
@@ -632,8 +650,9 @@ async fn run_restarting_once(
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
-    stamp_graph(&pipeline.db);
+    // Admitted as the whole run's job is: its queues built as admission
+    // builds a graph job's.
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     pipeline.admit_graph_job(JOB, Engine::Graph);
     let mut order = Vec::new();
     let mut requests = BTreeMap::new();
@@ -739,23 +758,4 @@ async fn restart(
         .unwrap();
     assert!(pipeline.graph_jobs.contains_key(&JOB), "the job restored");
     pipeline
-}
-
-// The row stamped graph as an admission stamps it.
-fn stamp_graph(db: &crate::Database) {
-    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-    let datastore = db.datastore();
-    db.run_sql_blocking(async move {
-        SqlRuntime::execute(
-            datastore.read_exec(),
-            "UPDATE active_jobs SET engine = {} WHERE job_id = {}",
-            &[
-                SqlArg::Text(Engine::Graph.as_str().to_string()),
-                SqlArg::I64(JOB.0 as i64),
-            ],
-        )
-        .await?;
-        Ok(())
-    })
-    .unwrap();
 }

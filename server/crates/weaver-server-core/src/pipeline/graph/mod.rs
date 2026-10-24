@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Which engine runs a job: the classic pipeline or the graph engine
-// (`weaver-graph`). Both exist side by side until the graph engine replaces
-// the classic one, so every job is stamped with the engine it was admitted
-// under and a restart keeps that engine whatever the switch says now.
+// Which engine runs a job: the graph engine (`weaver-graph`), the default,
+// or the classic pipeline, which a server opts into. Both exist side by side,
+// so every job is stamped with the engine it was admitted under and a
+// restart keeps that engine whatever the switch says now.
 
 pub(crate) mod checkpoint;
 pub(crate) mod engine;
@@ -23,9 +23,17 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
-// The switch for new jobs. It is read once per process so a job admitted
-// mid-run never sees a different answer from one admitted at start-up.
+// The switch for new jobs: unset, blank or unknown is the graph engine, and
+// `classic` opts new jobs into the classic pipeline. It is read once per
+// process so a job admitted mid-run never sees a different answer from one
+// admitted at start-up.
 pub(crate) const ENGINE_VARIABLE: &str = "WEAVER_ENGINE";
+
+// The one priority every article of a graph job is queued at. The root is
+// the only ranker: its classes raise what it wants sooner, and nothing about
+// a file's name or role orders the queue, so the posted order breaks every
+// tie. It sits behind the window volumes the root raises.
+pub(crate) const NEUTRAL_PRIORITY: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Engine {

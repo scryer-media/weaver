@@ -510,6 +510,7 @@ impl Pipeline {
             intermediate_dir: self.intermediate_dir.clone(),
             complete_dir: self.complete_dir.clone(),
             memory: self.process_memory_budget.clone(),
+            engine: crate::pipeline::graph::Engine::from_environment(),
         }
     }
 
@@ -680,7 +681,7 @@ impl Pipeline {
         // The engine is decided once, here, and stamped on the row: a restart
         // resumes the job on it whatever the switch says by then. A reprocess
         // is a new admission, so it takes the engine the switch names now.
-        let engine = crate::pipeline::graph::Engine::from_environment();
+        let engine = resources.engine;
         let active_job = crate::ActiveJob {
             engine,
             job_id,
@@ -980,9 +981,16 @@ impl Pipeline {
                 _ => {}
             }
 
-            let priority = file_spec.role.download_priority();
             let is_recovery = file_spec.role.is_recovery();
             let classic = engine.classic_switches_apply();
+            // A classic job ranks its files by role. A graph job's root is
+            // the only ranker: every article starts at one neutral priority,
+            // in posted order, and the root's classes raise what it wants.
+            let priority = if classic {
+                file_spec.role.download_priority()
+            } else {
+                crate::pipeline::graph::NEUTRAL_PRIORITY
+            };
             // A recovery file waits parked, by its name, only under the
             // classic engine. A graph job's root parks what its objects defer
             // and nothing else, and its own classes say what is recovery.
@@ -1008,14 +1016,17 @@ impl Pipeline {
             // already leased, deterministically, every run. Heads are
             // ordinary file bytes; nothing is wasted if the job turns out to
             // be nothing special.
-            let head_segment = matches!(
-                file_spec.role,
-                weaver_model::files::FileRole::Unknown
-                    | weaver_model::files::FileRole::SplitFile { .. }
-                    | weaver_model::files::FileRole::SevenZipArchive
-                    | weaver_model::files::FileRole::SevenZipSplit { .. }
-                    | weaver_model::files::FileRole::ZipArchive
-            )
+            //
+            // Classic only, like every role-driven boost here.
+            let head_segment = (classic
+                && matches!(
+                    file_spec.role,
+                    weaver_model::files::FileRole::Unknown
+                        | weaver_model::files::FileRole::SplitFile { .. }
+                        | weaver_model::files::FileRole::SevenZipArchive
+                        | weaver_model::files::FileRole::SevenZipSplit { .. }
+                        | weaver_model::files::FileRole::ZipArchive
+                ))
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
             .flatten();
 
@@ -1033,12 +1044,13 @@ impl Pipeline {
             // Purely an overlap optimization: boosting the wrong segment costs
             // a little latency and nothing else, and the gated reader is
             // correct whatever order the bytes arrive in.
-            let tail_segment = matches!(
-                file_spec.role,
-                weaver_model::files::FileRole::SevenZipArchive
-                    | weaver_model::files::FileRole::SevenZipSplit { .. }
-                    | weaver_model::files::FileRole::ZipArchive
-            )
+            let tail_segment = (classic
+                && matches!(
+                    file_spec.role,
+                    weaver_model::files::FileRole::SevenZipArchive
+                        | weaver_model::files::FileRole::SevenZipSplit { .. }
+                        | weaver_model::files::FileRole::ZipArchive
+                ))
             .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
             .flatten();
 

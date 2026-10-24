@@ -501,7 +501,12 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
         Weight(1),
     )];
     let (mut job, _dir, answers) = job_with(
-        &[file("inner.zip", &[64, 64]), file("blocks.par2", &[64])],
+        // A recovery volume by its name, not an index the root asks for
+        // first.
+        &[
+            file("inner.zip", &[64, 64]),
+            file("blocks.vol0+1.par2", &[64]),
+        ],
         wants,
     );
     job.intake(
@@ -625,6 +630,104 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
             .segment_number,
         0
     );
+}
+
+// Every file role the classic engine ranks or parks, in an order no role
+// ranking would keep.
+fn ranked_roles() -> Vec<(String, FileRole, u32)> {
+    vec![
+        ("lantern.vol0+4.par2".to_string(), recovery_role(), 2),
+        ("lantern.bin".to_string(), FileRole::Unknown, 2),
+        (
+            "lantern.part2.rar".to_string(),
+            FileRole::RarVolume { volume_number: 1 },
+            2,
+        ),
+        (
+            "lantern.part1.rar".to_string(),
+            FileRole::RarVolume { volume_number: 0 },
+            3,
+        ),
+        ("lantern.7z".to_string(), FileRole::SevenZipArchive, 2),
+        (
+            "lantern.par2".to_string(),
+            FileRole::Par2 {
+                is_index: true,
+                recovery_block_count: 0,
+            },
+            1,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_graph_job_is_queued_in_posted_order_at_one_neutral_priority() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_010);
+    let files = ranked_roles();
+    let posted: Vec<SegmentId> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (_, _, segments))| {
+            (0..*segments).map(move |ordinal| segment_id(job_id, index as u32, ordinal))
+        })
+        .collect();
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec("lantern posted", files),
+        Engine::Graph,
+    )
+    .await;
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    // Nothing is parked by its name: the recovery volume waits in the
+    // download queue with everything else, and nothing marks it recovery.
+    assert_eq!(state.recovery_queue.count_matching(|_| true), 0);
+    let mut queued = Vec::new();
+    while let Some(work) = state.download_queue.pop() {
+        assert_eq!(work.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
+        assert!(!work.is_recovery);
+        assert!(!work.completion_critical);
+        queued.push(work.segment_id);
+    }
+    assert_eq!(queued, posted);
+}
+
+#[tokio::test]
+async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_011);
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec("lantern requeued", ranked_roles()),
+        Engine::Graph,
+    )
+    .await;
+    pipeline.admit_graph_job(job_id, Engine::Graph);
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    while state.download_queue.pop().is_some() {}
+
+    // The first RAR volume's role ranks it ahead of everything, and a
+    // retry rebuilt from the post says so; the root holds it ordinary.
+    let first_volume = segment_id(job_id, 3, 1);
+    let retry = pipeline
+        .download_retry_work(first_volume, 1, Vec::new())
+        .unwrap();
+    assert_eq!(
+        retry.priority,
+        FileRole::RarVolume { volume_number: 0 }.download_priority()
+    );
+    pipeline.enqueue_download_work(retry);
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let requeued = state.download_queue.pop().unwrap();
+    assert_eq!(requeued.segment_id, first_volume);
+    assert_eq!(requeued.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
+    assert!(state.download_queue.pop().is_none());
 }
 
 #[tokio::test]
@@ -932,6 +1035,47 @@ fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
     let small = changed(40);
     assert!(!small.is_empty() && small.len() <= 3, "{small:?}");
     assert_eq!(changed(400), small);
+}
+
+// With the switch unset a new job is a graph job, row and runtime both; a
+// switch naming classic opts it into the classic pipeline. The decision is
+// driven through `Engine::parse`, never the process variable.
+#[tokio::test]
+async fn admission_with_the_switch_unset_stamps_graph_and_classic_is_the_opt_in() {
+    for (switch, engine, job_id) in [
+        (None, Engine::Graph, JobId(91_008)),
+        (Some("classic"), Engine::Classic, JobId(91_009)),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let mut resources = pipeline.admission_resources();
+        resources.engine = Engine::parse(switch);
+        let prepared = crate::pipeline::Pipeline::prepare_add(
+            &resources,
+            job_id,
+            spec(
+                "lantern default",
+                vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
+            ),
+            PathBuf::from("lantern-default.nzb"),
+            sample_nzb_zstd(),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+        pipeline.install_prepared_add(job_id, prepared);
+        assert_eq!(
+            pipeline.db.load_active_job_engine(job_id).unwrap(),
+            Some(engine),
+            "{switch:?}"
+        );
+        assert_eq!(
+            pipeline.graph_jobs.contains_key(&job_id),
+            engine == Engine::Graph,
+            "{switch:?}"
+        );
+        retire_pipeline_database(pipeline).await;
+    }
 }
 
 #[tokio::test]

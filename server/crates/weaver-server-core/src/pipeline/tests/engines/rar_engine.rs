@@ -296,10 +296,12 @@ fn heads(outcome: &Outcome) -> Vec<u32> {
         .collect()
 }
 
-// The set out of order. Both engines ask for each volume's head in the
-// order `expected` gives by post index; the set is stored (encrypted
-// store), so the graph streams it through the store and the engine
-// object's claim, bound and wants never run on it.
+// The set out of order. Classic asks for each volume's head in the order
+// `expected` gives by post index, its roles ranking the named volumes. The
+// graph's root samples every member's head first, in posted order, whatever
+// the names say. The set is stored (encrypted store), so the graph streams
+// it through the store and the engine object's claim, bound and wants never
+// run on it.
 async fn order_row(volumes: Vec<(String, Vec<u8>)>, expected: [u32; 5]) {
     let scenario = video(posts(volumes)).password(VIDEO_SECRET);
     let (classic, graph) = run_both(&scenario).await;
@@ -307,21 +309,22 @@ async fn order_row(volumes: Vec<(String, Vec<u8>)>, expected: [u32; 5]) {
     assert_video(&graph);
     assert_eq!(kinds(&graph), ["rar_store"]);
     assert_eq!(heads(&classic), expected, "classic");
-    assert_eq!(heads(&graph), expected, "graph");
+    assert_eq!(heads(&graph), [0, 1, 2, 3, 4], "graph");
     assert_same(&classic, &graph);
 }
 
-// Posted p2 p3 p4 p5 p1: volume 1, the last post, is asked for first and
-// the rest follow in set order, as §10 places a named volume.
+// Posted p2 p3 p4 p5 p1: under classic volume 1, the last post, is asked
+// for first and the rest follow in set order, as a named volume is placed.
 #[tokio::test]
-async fn the_encrypted_five_volume_set_posted_first_volume_last_is_asked_for_in_set_order() {
+async fn the_encrypted_five_volume_set_posted_first_volume_last_is_asked_for_in_set_order_by_classic()
+ {
     let mut volumes = video_set();
     volumes.rotate_left(1);
     order_row(volumes, [4, 0, 1, 2, 3]).await;
 }
 
 #[tokio::test]
-async fn the_encrypted_five_volume_set_posted_backwards_is_asked_for_in_set_order() {
+async fn the_encrypted_five_volume_set_posted_backwards_is_asked_for_in_set_order_by_classic() {
     let mut volumes = video_set();
     volumes.reverse();
     order_row(volumes, [4, 3, 2, 1, 0]).await;

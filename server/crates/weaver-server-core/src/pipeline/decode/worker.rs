@@ -3131,36 +3131,15 @@ impl Pipeline {
     // ordering reason rather than because anything was wrong with it.
     fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let completion_critical = self.segment_is_completion_critical(segment_id);
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(work) = self.download_retry_work(segment_id, 0, Vec::new()) else {
             return false;
         };
-        let file_idx = segment_id.file_id.file_index as usize;
-        let Some(file_spec) = state.spec.files.get(file_idx) else {
-            return false;
-        };
-        let Some(seg_spec) = file_spec
-            .segments
-            .iter()
-            .find(|segment| segment.ordinal == segment_id.segment_number)
-        else {
-            return false;
-        };
-
-        let work = DownloadWork {
-            counters: None,
-            segment_id,
-            message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
-            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
-            priority: file_spec.role.download_priority(),
-            byte_estimate: seg_spec.bytes,
-            retry_count: 0,
-            is_recovery: file_spec.role.is_recovery(),
-            completion_critical,
-            exclude_servers: Vec::new(),
-            avoid_server: None,
-        };
-        state.download_queue.push(work);
+        if let Some(work) = self.requeue_graph_work(work) {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return false;
+            };
+            state.download_queue.push(work);
+        }
         self.update_queue_metrics();
         true
     }

@@ -91,6 +91,10 @@ impl RootJob for Prepared {
     fn refusal(&self) -> Option<&ExtractionFailure> {
         None
     }
+
+    fn repair_out(&self) -> bool {
+        false
+    }
 }
 
 // A member: its name, its length, and the runs it holds with how each came.

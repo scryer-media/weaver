@@ -9,16 +9,48 @@
 // PAR2 set identifies a file by) so the sniffer and a recovery object's name
 // match can run. The root delivers it; the namespace keeps it.
 //
+// The index members come next, whole: an index is what names the members
+// and the sets they form, so the leading volumes of each set wait on it, and
+// so does the payload the root namespace holds while an index is to come.
+// They are the members the post declares as indexes by name.
+//
 // Once a recovery object has said what the members are called, the sets they
 // form are known before any of their objects has asked for anything, so the
-// first volumes of each set are bid into the window at once.
+// first volumes of each set are bid into the window at once. The payload
+// follows in posted order.
 
 use std::collections::BTreeMap;
 
 use weaver_graph::{ByteRange, MemberId, NodeId, Tree, VERDICT_BYTES, VolumeIndex, Weight};
+use weaver_model::files::FileRole;
 
 use super::source::ArticleMap;
 use super::window::{Bid, Window};
+
+// Whether the post declares a file an index by its name.
+pub(crate) fn declared_index(name: &str) -> bool {
+    matches!(
+        FileRole::from_filename(name),
+        FileRole::Par2 { is_index: true, .. } | FileRole::Par3 { is_index: true }
+    )
+}
+
+// Bid every declared index still waiting, whole, ahead of every set's bid:
+// the root is the bidder, which the draw takes first at the same weight.
+pub(crate) fn indexes(indexes: &[VolumeIndex], map: &ArticleMap, window: &mut Window) {
+    for volume in indexes {
+        if !map.volume_waiting(*volume) {
+            continue;
+        }
+        window.bid(Bid {
+            volume: *volume,
+            range: ByteRange::new(0, u64::MAX),
+            weight: Weight::FIRST,
+            bidder: NodeId::ROOT,
+            in_order: false,
+        });
+    }
+}
 
 // How many of a set's leading volumes the bootstrap asks for.
 pub(crate) const BOOTSTRAP_VOLUMES: usize = 4;

@@ -1820,6 +1820,23 @@ impl Pipeline {
         }
     }
 
+    // Put a graph job's article back through `enqueue_download_work`, under
+    // the class the root holds it in now, and hand a classic job's back to
+    // its caller to queue as that caller always has.
+    pub(in crate::pipeline) fn requeue_graph_work(
+        &mut self,
+        work: DownloadWork,
+    ) -> Option<DownloadWork> {
+        if self
+            .job_engine(work.segment_id.file_id.job_id)
+            .classic_switches_apply()
+        {
+            return Some(work);
+        }
+        self.enqueue_download_work(work);
+        None
+    }
+
     pub(crate) async fn drain(&mut self) {
         // First, because a parked chase is a blocking thread that nothing else
         // here will ever wake: the pipeline's other state dies with the struct,

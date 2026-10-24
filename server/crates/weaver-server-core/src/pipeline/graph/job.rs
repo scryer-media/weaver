@@ -211,8 +211,7 @@ impl GraphJob {
         self.runs.stop(limit);
     }
 
-    // Whether a repair of the job is out on a thread.
-    #[cfg(test)]
+    // Seam for status: whether a repair of the job is out on a thread.
     pub(crate) fn repair_out(&self) -> bool {
         self.loans.out()
     }
@@ -470,6 +469,7 @@ impl GraphJob {
         &mut self,
         queued: impl FnMut(VolumeIndex) -> bool,
     ) -> Result<Vec<Move>, GraphError> {
+        sample::indexes(&self.root.indexes, &self.root.map, &mut self.root.window);
         sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
         sample::fronts(&self.tree, &mut self.root.map);
         let mut wants = Vec::new();

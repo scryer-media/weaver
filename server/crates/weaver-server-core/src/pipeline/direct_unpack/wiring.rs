@@ -696,7 +696,11 @@ impl Pipeline {
     // latching when the answer is only "not yet" — no bytes on part one — so a
     // later part's completion can try again.
     pub(in crate::pipeline) fn try_arm_direct_unpack(&mut self, job_id: JobId, set_name: &str) {
-        if self.direct_unpack.gate() != DirectUnpackGate::Enabled {
+        // `[direct_unpack]` is a classic switch: a graph job's objects read
+        // their own members.
+        if self.direct_unpack.gate() != DirectUnpackGate::Enabled
+            || !self.job_engine(job_id).classic_switches_apply()
+        {
             return;
         }
         let key = (job_id, set_name.to_string());
@@ -918,6 +922,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn try_arm_rar_chase(&mut self, job_id: JobId, set_name: &str) {
         let key = (job_id, set_name.to_string());
         if self.direct_unpack.gate() != DirectUnpackGate::Enabled
+            || !self.job_engine(job_id).classic_switches_apply()
             || self.rar_chase_owns_set(job_id, set_name)
             || self.direct_unpack.latched.contains_key(&key)
             || self
