@@ -33,7 +33,7 @@ use url::Url;
 
 use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
-use crate::core::net::{HttpClients, Resolver};
+use crate::core::net::{HttpClients, Resolved, Resolver};
 use crate::tracker::tracker_comms_http;
 use crate::tracker::tracker_comms_http::Ask;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
@@ -1524,22 +1524,27 @@ enum UdpTrackerResolveResult {
     Two(SocketAddrV4, SocketAddrV6),
 }
 
-/// Where a UDP tracker at `host` is asked: of the addresses the session may
-/// reach (see [`only_reachable`]), the first IPv4 and the first IPv6.
+/// Where a UDP tracker at `host` is asked: of the addresses `resolver` finds
+/// that the session may reach (see [`only_reachable`]), the first IPv4 and
+/// the first IPv6. A datagram goes to an address, so a name the session's
+/// network resolves where it exits cannot be asked over UDP.
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
-    resolver: Option<&dyn Resolver>,
+    resolver: &dyn Resolver,
     reachable: &Reachable,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
     let found: Vec<SocketAddr> = match host {
-        url::Host::Domain(name) => match resolver {
-            Some(resolver) => resolver.resolve(name, port).await,
-            None => tokio::net::lookup_host((name, port))
-                .await
-                .map(Iterator::collect),
-        }
-        .with_context(|| format!("error looking up hostname {name}"))?,
+        url::Host::Domain(name) => match resolver
+            .resolve(name, port)
+            .await
+            .with_context(|| format!("error looking up hostname {name}"))?
+        {
+            Resolved::Addresses(found) => found,
+            Resolved::AtExit => {
+                anyhow::bail!("{name} is resolved where the leg exits, and UDP needs its address")
+            }
+        },
         url::Host::Ipv4(addr) => vec![(addr, port).into()],
         url::Host::Ipv6(addr) => vec![(addr, port).into()],
     };
@@ -4017,8 +4022,12 @@ mod tests {
             &'a self,
             _host: &'a str,
             port: u16,
-        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
-            Box::pin(async move { Ok(vec![(self.at, port).into()]) })
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
+            Box::pin(async move {
+                Ok(crate::core::net::Resolved::Addresses(vec![
+                    (self.at, port).into(),
+                ]))
+            })
         }
     }
 
@@ -4257,11 +4266,13 @@ mod tests {
             &'a self,
             host: &'a str,
             port: u16,
-        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
             Box::pin(async move {
                 assert_eq!(host, "tracker.invalid");
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![(Ipv4Addr::LOCALHOST, port).into()])
+                Ok(crate::core::net::Resolved::Addresses(vec![
+                    (Ipv4Addr::LOCALHOST, port).into(),
+                ]))
             })
         }
     }
@@ -4399,10 +4410,12 @@ mod tests {
             &'a self,
             host: &'a str,
             port: u16,
-        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
             Box::pin(async move {
                 if let Ok(ip) = host.parse::<IpAddr>() {
-                    return Ok(vec![(ip, port).into()]);
+                    return Ok(crate::core::net::Resolved::Addresses(vec![
+                        (ip, port).into(),
+                    ]));
                 }
                 let (_, addrs) =
                     self.0
@@ -4411,9 +4424,40 @@ mod tests {
                         .ok_or_else(|| {
                             std::io::Error::new(std::io::ErrorKind::NotFound, host.to_owned())
                         })?;
-                Ok(addrs.iter().map(|ip| (*ip, port).into()).collect())
+                Ok(crate::core::net::Resolved::Addresses(
+                    addrs.iter().map(|ip| (*ip, port).into()).collect(),
+                ))
             })
         }
+    }
+
+    // A datagram goes to an address: a UDP tracker whose name the network
+    // resolves at its exit is not asked.
+    #[tokio::test]
+    async fn a_udp_tracker_resolved_at_the_exit_is_not_asked() {
+        struct AtExit(AtomicUsize);
+        impl Resolver for AtExit {
+            fn resolve<'a>(
+                &'a self,
+                host: &'a str,
+                _: u16,
+            ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>>
+            {
+                assert_eq!(host, "tracker.invalid");
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(crate::core::net::Resolved::AtExit) })
+            }
+        }
+        let resolver = AtExit(AtomicUsize::new(0));
+        let found = udp_tracker_to_socket_addrs(
+            url::Host::Domain("tracker.invalid"),
+            6969,
+            &resolver,
+            &reach_all(),
+        )
+        .await;
+        assert!(found.is_err(), "{found:?}");
+        assert_eq!(resolver.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -4571,7 +4615,7 @@ mod tests {
         let v6 = (Ipv6Addr::LOCALHOST, 6969).into();
 
         let ipv4_only = reach_but(vec![blocked], true);
-        let found = udp_tracker_to_socket_addrs(host.clone(), 6969, Some(&resolver), &ipv4_only)
+        let found = udp_tracker_to_socket_addrs(host.clone(), 6969, &resolver, &ipv4_only)
             .await
             .unwrap();
         assert!(
@@ -4580,7 +4624,7 @@ mod tests {
         );
 
         let both = reach_but(vec![blocked], false);
-        let found = udp_tracker_to_socket_addrs(host, 6969, Some(&resolver), &both)
+        let found = udp_tracker_to_socket_addrs(host, 6969, &resolver, &both)
             .await
             .unwrap();
         assert!(

@@ -7,7 +7,7 @@
 
 use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
-use crate::core::net::{HttpClients, HttpTarget, Resolver};
+use crate::core::net::{HttpClients, HttpTarget, Resolved, Resolver};
 use crate::tracker::ScrapeOk;
 use crate::tracker::tracker_comms::{Reachable, only_reachable};
 use anyhow::Context;
@@ -355,10 +355,11 @@ fn ssrf_refusal(url: &url::Url, ask: Ask, addrs: &[IpAddr]) -> Option<&'static s
 }
 
 /// `url`'s host as a client is told it, and its addresses: the address it
-/// names, or what `resolver`, else the host's resolver, finds for its name.
+/// names, or what `resolver` finds for its name. None when the session's
+/// network resolves the name where it exits.
 async fn addresses(
     url: &url::Url,
-    resolver: Option<&dyn Resolver>,
+    resolver: &dyn Resolver,
 ) -> anyhow::Result<(String, Vec<IpAddr>)> {
     let port = url.port_or_known_default().unwrap_or(0);
     let name = match url.host() {
@@ -367,13 +368,14 @@ async fn addresses(
         Some(url::Host::Domain(name)) => name,
         None => anyhow::bail!("the tracker URL has no host"),
     };
-    let found: Vec<SocketAddr> = match resolver {
-        Some(resolver) => resolver.resolve(name, port).await,
-        None => tokio::net::lookup_host((name, port))
-            .await
-            .map(Iterator::collect),
-    }
-    .with_context(|| format!("error looking up hostname {name}"))?;
+    let found = match resolver
+        .resolve(name, port)
+        .await
+        .with_context(|| format!("error looking up hostname {name}"))?
+    {
+        Resolved::Addresses(found) => found,
+        Resolved::AtExit => return Ok((name.to_owned(), Vec::new())),
+    };
     anyhow::ensure!(!found.is_empty(), "the tracker's name has no address");
     Ok((name.to_owned(), found.iter().map(SocketAddr::ip).collect()))
 }
@@ -382,18 +384,17 @@ async fn addresses(
 /// URL's host at the addresses found for it now that the session may reach
 /// (see [`only_reachable`]), in the order found, and nowhere else, and
 /// follows no redirect. Refused when none is left, or when [`ssrf_refusal`]
-/// holds the GET back from those left (libtorrent
-/// `http_connection::on_resolve` hands the endpoints to `on_filter`, then
-/// `connect` tries only those left). `on_filter` drops by the family, then by
-/// SSRF, then by the IP filter, each address on its own, so the order changes
-/// only which refusal is named; here [`ssrf_refusal`] refuses the GET for
-/// any loopback address the client may pick, so it judges the addresses the
-/// client is handed, after the filter.
+/// holds the GET back from those left. Each address is filtered on its own,
+/// so the order of the checks changes only which refusal is named;
+/// [`ssrf_refusal`] refuses the GET for any loopback address the client may
+/// pick, so it judges the addresses the client is handed, after the filter.
+/// A name the session's network resolves where it exits has no address
+/// here: nothing is checked, and the client hands the name on.
 async fn reach(
     clients: &dyn HttpClients,
     url: &url::Url,
     ask: Ask,
-    resolver: Option<&dyn Resolver>,
+    resolver: &dyn Resolver,
     reachable: &Reachable,
 ) -> anyhow::Result<reqwest::Client> {
     let (host, found) = addresses(url, resolver).await?;
@@ -425,7 +426,7 @@ const MAX_REDIRECTS: usize = 5;
 /// hold whatever client is used.
 pub(crate) async fn get(
     clients: &dyn HttpClients,
-    resolver: Option<&dyn Resolver>,
+    resolver: &dyn Resolver,
     reachable: &Reachable,
     tracker: &url::Url,
     ask: Ask,
@@ -561,6 +562,82 @@ pub(crate) fn parse_scrape(body: &[u8], info_hash: &Id20) -> anyhow::Result<Scra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A resolver that answers every name with `answer`, counting the asks.
+    struct Answering {
+        answer: Resolved,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Resolver for Answering {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+            _: u16,
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Resolved>> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(self.answer.clone()) })
+        }
+    }
+
+    // The targets clients were built for.
+    #[derive(Default)]
+    struct Targets(std::sync::Mutex<Vec<(String, u16, Vec<IpAddr>)>>);
+
+    impl HttpClients for Targets {
+        fn builder(
+            &self,
+            target: Option<HttpTarget<'_>>,
+        ) -> anyhow::Result<reqwest::ClientBuilder> {
+            let target = target.expect("a tracker is asked through a target");
+            self.0.lock().unwrap().push((
+                target.host.to_owned(),
+                target.port,
+                target.addrs.to_vec(),
+            ));
+            Ok(reqwest::Client::builder().no_proxy())
+        }
+    }
+
+    // A tracker's client is built for exactly the addresses its name
+    // resolved to that the session may reach; a name the network resolves
+    // at its exit is handed on with no address and nothing checked.
+    #[tokio::test]
+    async fn a_trackers_client_carries_what_its_name_resolved_to() {
+        let url = url::Url::parse("http://tracker.test:6969/announce").unwrap();
+        let blocked = IpAddr::from([192, 0, 2, 2]);
+        let reachable: Reachable = std::sync::Arc::new(move |ip| {
+            if ip == blocked {
+                Err(crate::tracker::tracker_comms::Unreachable::Filtered)
+            } else {
+                Ok(())
+            }
+        });
+        for (answer, checked) in [
+            (
+                Resolved::Addresses(vec![
+                    SocketAddr::from(([192, 0, 2, 1], 6969)),
+                    SocketAddr::new(blocked, 6969),
+                ]),
+                vec![IpAddr::from([192, 0, 2, 1])],
+            ),
+            (Resolved::AtExit, Vec::new()),
+        ] {
+            let resolver = Answering {
+                answer,
+                asked: Default::default(),
+            };
+            let clients = Targets::default();
+            reach(&clients, &url, Ask::Announce, &resolver, &reachable)
+                .await
+                .unwrap();
+            assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                *clients.0.lock().unwrap(),
+                [("tracker.test".to_owned(), 6969, checked)]
+            );
+        }
+    }
     #[test]
     fn test_serialize() {
         let info_hash = Id20::new([

@@ -23,7 +23,9 @@ pub use network::*;
 pub use network_runtime::*;
 pub use pool_stage::*;
 pub use refusal::*;
-pub(crate) use routed_http::{AdmitError, Admitted, admit, pinned, start_bridge, through_bridge};
+pub(crate) use routed_http::{
+    AdmitError, Admitted, admit, pinned, start_bridge, through_bridge, through_bridge_at,
+};
 pub use routed_http::{
     FetchOptions, FetchPath, RoutedBody, read_body, routed_fetch, with_routed_client,
 };

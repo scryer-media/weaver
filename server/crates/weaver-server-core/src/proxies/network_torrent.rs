@@ -101,13 +101,15 @@ impl TunnelProvider for TorrentProvider {
         port: u16,
         outcome: Arc<ConnectionOutcome>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        // A client hands the bridge the address it checked, which the leg
+        // dials as it is; a name it hands on, the leg resolves by its naming.
         let dialed = self
             .0
             .dial(&Target {
                 host: host.into(),
                 port,
                 purpose: Purpose::Torrent,
-                addresses: Vec::new(),
+                addresses: host.trim_matches(['[', ']']).parse().into_iter().collect(),
             })
             .await
             .map_err(|e| match e {
@@ -207,5 +209,232 @@ impl NetworkRuntime {
             handle: self.handle.clone(),
             bridge: Mutex::new(None),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, SocketAddr};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use weaver_torrent::HttpTarget;
+    use weaver_torrent::network::{Resolved, Resolver};
+    use weaver_tunnel::pipe::DialedStream;
+    use weaver_tunnel::resolution::record::{Recording, ResolvedBy};
+
+    use super::*;
+    use crate::torrents::identity::IDENTITY;
+    use crate::torrents::net::{LegKind, LegNames, tracker_client};
+
+    // A leg whose naming answers `answer` for every name, or hands names on
+    // to its exit, and whose exit is the loopback tracker at `exit`.
+    struct Leg {
+        answer: Option<IpAddr>,
+        exit: SocketAddr,
+        asked: Mutex<Vec<String>>,
+        dialed: Mutex<Vec<Target>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Dialer for Leg {
+        async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+            self.dialed.lock().unwrap().push(target.clone());
+            let stream = tokio::net::TcpStream::connect(self.exit)
+                .await
+                .map_err(|e| DialError::Skipped(e.to_string()))?;
+            Ok(Dialed {
+                stream: DialedStream::Socket(stream),
+                outcome: Arc::default(),
+                path: Default::default(),
+                peer: None,
+                source: None,
+                setup: None,
+            })
+        }
+        async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+            self.asked.lock().unwrap().push(host.into());
+            Ok(self
+                .answer
+                .map_or(Resolution::Unresolved, |ip| Resolution::Addresses(vec![ip])))
+        }
+        fn budget(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn describe(&self) -> String {
+            "leg".into()
+        }
+    }
+
+    fn host_lookups() -> u64 {
+        let metrics = weaver_tunnel::metrics::snapshot();
+        let resolved: u64 = metrics
+            .resolutions
+            .iter()
+            .filter(|(by, ..)| *by == weaver_tunnel::metrics::Resolver::Host)
+            .map(|(_, ok, failed)| ok + failed)
+            .sum();
+        let held: u64 = metrics
+            .cache
+            .iter()
+            .filter(|(by, ..)| *by == weaver_tunnel::metrics::Resolver::Host)
+            .map(|(.., count)| count)
+            .sum();
+        resolved + held
+    }
+
+    // A tracker that answers one announce.
+    async fn tracker() -> (SocketAddr, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                assert!(read > 0, "the request ended early");
+                head.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8(head).unwrap()
+        });
+        (addr, served)
+    }
+
+    // An announce to a tracker by name on a ladder leg, as the session makes
+    // it: the leg resolves the name by its naming, and the client is held to
+    // what that gave. Returns what the leg was asked and what it dialled.
+    async fn announce(answer: Option<IpAddr>) -> (Vec<String>, Vec<Target>) {
+        let (exit, served) = tracker().await;
+        let leg = Arc::new(Leg {
+            answer,
+            exit,
+            asked: Mutex::default(),
+            dialed: Mutex::default(),
+        });
+        let bridge = Bridge::start(
+            &tokio::runtime::Handle::current(),
+            Arc::new(TorrentProvider(leg.clone())),
+            leg.budget(),
+            ("weaver".into(), "bridge".into()),
+        )
+        .unwrap();
+        let port = exit.port();
+        let addrs: Vec<IpAddr> = match LegNames(leg.clone())
+            .resolve("tracker.test", port)
+            .await
+            .unwrap()
+        {
+            Resolved::Addresses(found) => found.iter().map(SocketAddr::ip).collect(),
+            Resolved::AtExit => Vec::new(),
+        };
+        let client = tracker_client(&LegKind::Ladder, Some(bridge.clone()), &IDENTITY)
+            .unwrap()
+            .client(Some(HttpTarget {
+                host: "tracker.test",
+                port,
+                addrs: &addrs,
+            }))
+            .unwrap();
+        let response = client
+            .get(format!("http://tracker.test:{port}/announce"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let head = served.await.unwrap();
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("host: tracker.test:{port}\r\n")),
+            "{head}"
+        );
+        bridge.revoke().await;
+        let asked = std::mem::take(&mut *leg.asked.lock().unwrap());
+        let dialed = std::mem::take(&mut *leg.dialed.lock().unwrap());
+        (asked, dialed)
+    }
+
+    // Host, Servers and Proxy-servers naming each answer the leg's lookup
+    // with addresses: the session checks those, and the bridge is handed
+    // the checked address, which the leg dials as it is. The host's
+    // resolver is never asked.
+    #[tokio::test]
+    async fn a_name_the_leg_resolves_is_dialled_at_the_checked_address() {
+        let before = host_lookups();
+        for naming in ["host", "servers", "proxy servers"] {
+            let checked = IpAddr::from([127, 0, 0, 1]);
+            let (asked, dialed) = announce(Some(checked)).await;
+            assert_eq!(asked, ["tracker.test"], "{naming}");
+            let [target] = &dialed[..] else {
+                panic!("{naming}: dialled {dialed:?}");
+            };
+            assert_eq!(target.addresses, [checked], "{naming}");
+            assert_eq!(target.host, checked.to_string(), "{naming}");
+            assert!(matches!(target.purpose, Purpose::Torrent), "{naming}");
+        }
+        assert_eq!(host_lookups(), before);
+    }
+
+    // Proxy naming hands the name on: the leg is asked once, no address is
+    // pinned, the bridge is handed the name, and no host lookup is made.
+    #[tokio::test]
+    async fn a_name_the_proxy_resolves_is_handed_through_with_no_lookup() {
+        let before = host_lookups();
+        let (asked, dialed) = announce(None).await;
+        assert_eq!(asked, ["tracker.test"]);
+        let [target] = &dialed[..] else {
+            panic!("dialled {dialed:?}");
+        };
+        assert_eq!(target.host, "tracker.test");
+        assert!(target.addresses.is_empty(), "{:?}", target.addresses);
+        assert_eq!(host_lookups(), before);
+    }
+
+    // A dialer that resolves with the host's resolver, as a Host-named leg
+    // does.
+    struct HostNamed;
+
+    #[async_trait::async_trait]
+    impl Dialer for HostNamed {
+        async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+            Err(DialError::Skipped("names only".into()))
+        }
+        async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+            weaver_tunnel::resolution::host_lookup(host)
+                .await
+                .map(Resolution::Addresses)
+                .map_err(|e| DialError::Skipped(e.to_string()))
+        }
+        fn budget(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn describe(&self) -> String {
+            "host".into()
+        }
+    }
+
+    // A name the session looks up on its leg, a UDP tracker's or a web
+    // seed's alike, lands in the resolution record of the task that asked.
+    #[tokio::test]
+    async fn a_session_lookup_lands_in_the_resolution_record() {
+        let recording = Arc::new(Recording::default());
+        let resolved = recording
+            .scope(LegNames(Arc::new(HostNamed)).resolve("localhost", 6969))
+            .await
+            .unwrap();
+        let Resolved::Addresses(found) = resolved else {
+            panic!("the host resolver handed the name on");
+        };
+        let noted = recording
+            .finish("localhost", 6969, None)
+            .expect("the lookup was recorded");
+        assert_eq!(noted.by, ResolvedBy::Host);
+        assert_eq!(
+            noted.addresses,
+            found.iter().map(SocketAddr::ip).collect::<Vec<_>>()
+        );
     }
 }

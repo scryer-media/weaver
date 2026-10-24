@@ -34,7 +34,7 @@ use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, stream::FuturesUn
 use crate::core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     hash_id::Id20,
-    net::{DatagramSocket, Resolver},
+    net::{DatagramSocket, Resolved, Resolver, SystemResolver},
     peer_id::generate_azereus_style,
     spawn_utils::{spawn, spawn_with_cancel},
 };
@@ -1105,7 +1105,7 @@ impl DhtSocket {
 
 struct DhtWorker {
     socket: DhtSocket,
-    resolver: Option<Arc<dyn Resolver>>,
+    resolver: Arc<dyn Resolver>,
     dht: Arc<DhtState>,
 }
 
@@ -1134,11 +1134,10 @@ impl DhtWorker {
         };
     }
 
-    /// Resolve a bootstrap `host:port` (or `ip:port`) string.
+    /// Resolve a bootstrap `host:port` (or `ip:port`) string. A node is
+    /// asked at an address, so a name the network resolves where it exits
+    /// gives none.
     async fn lookup_bootstrap(&self, hostname: &str) -> std::io::Result<Vec<SocketAddr>> {
-        let Some(resolver) = self.resolver.as_ref() else {
-            return Ok(tokio::net::lookup_host(hostname).await?.collect());
-        };
         if let Ok(addr) = hostname.parse::<SocketAddr>() {
             return Ok(vec![addr]);
         }
@@ -1148,7 +1147,13 @@ impl DhtWorker {
             .ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid socket address")
             })?;
-        resolver.resolve(host, port).await
+        match self.resolver.resolve(host, port).await? {
+            Resolved::Addresses(found) => Ok(found),
+            Resolved::AtExit => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the name is resolved where the leg exits, and a node needs its address",
+            )),
+        }
     }
 
     async fn bootstrap_hostname(&self, hostname: &str) -> crate::dht::Result<()> {
@@ -1496,7 +1501,7 @@ pub struct DhtConfig<'a> {
     /// ignored and the DHT reports the socket's `bind_addr()` as its listen
     /// address.
     pub socket: Option<Arc<dyn DatagramSocket>>,
-    /// Look up bootstrap hostnames through this resolver instead of the host's
+    /// Look up bootstrap hostnames through this resolver, else the host's
     /// resolver.
     pub resolver: Option<Arc<dyn Resolver>>,
     /// The leading bytes of our node id, the rest being random (BEP 5 node ids
@@ -1605,7 +1610,10 @@ impl DhtState {
                 state.cancellation_token.clone(),
                 {
                     let state = state.clone();
-                    let resolver = config.resolver.take();
+                    let resolver = config
+                        .resolver
+                        .take()
+                        .unwrap_or_else(|| Arc::new(SystemResolver));
                     let worker = async move {
                         let worker = DhtWorker {
                             socket,
@@ -1836,12 +1844,12 @@ mod tests {
                 &'a self,
                 host: &'a str,
                 port: u16,
-            ) -> BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            ) -> BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
                 Box::pin(async move {
                     assert_eq!(host, "bootstrap.invalid");
                     assert_eq!(port, self.target.port());
                     self.calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(vec![self.target])
+                    Ok(crate::core::net::Resolved::Addresses(vec![self.target]))
                 })
             }
         }
@@ -2483,10 +2491,10 @@ mod tests {
                 &'a self,
                 host: &'a str,
                 _port: u16,
-            ) -> BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+            ) -> BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
                 Box::pin(async move {
                     assert_eq!(host, "router.invalid");
-                    Ok(self.0.clone())
+                    Ok(crate::core::net::Resolved::Addresses(self.0.clone()))
                 })
             }
         }
@@ -2502,7 +2510,7 @@ mod tests {
             Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
         let worker = super::DhtWorker {
             socket: super::DhtSocket::Custom(socket),
-            resolver: Some(Arc::new(Names(vec![new, known]))),
+            resolver: Arc::new(Names(vec![new, known])),
             dht: dht.clone(),
         };
         let mut bootstrap = std::pin::pin!(worker.bootstrap_hostname("router.invalid:6881"));

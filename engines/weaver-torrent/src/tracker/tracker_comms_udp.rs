@@ -15,7 +15,7 @@ use std::{
 
 use crate::core::{
     hash_id::Id20,
-    net::{DatagramSocket, Resolver},
+    net::{DatagramSocket, Resolver, SystemResolver},
     spawn_utils::spawn_with_cancel,
 };
 use anyhow::{Context, bail};
@@ -340,7 +340,7 @@ impl UdpTrackerSocket {
 
 struct ClientShared {
     sock: UdpTrackerSocket,
-    resolver: Option<Arc<dyn Resolver>>,
+    resolver: Arc<dyn Resolver>,
     locked: RwLock<ClientLocked>,
 }
 
@@ -362,9 +362,12 @@ impl Drop for TransactionIdGuard<'_> {
 }
 
 impl UdpTrackerClient {
+    /// A client on a kernel UDP socket of its own, whose tracker hostnames
+    /// `resolver` looks up.
     pub async fn new(
         cancel_token: CancellationToken,
         bind_device: Option<&BindDevice>,
+        resolver: Arc<dyn Resolver>,
     ) -> anyhow::Result<Self> {
         let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
         let sock = UdpSocket::bind_udp(
@@ -376,26 +379,31 @@ impl UdpTrackerClient {
         )
         .with_context(|| format!("error creating UDP socket at {addr}"))?;
 
-        Ok(Self::spawn(cancel_token, UdpTrackerSocket::Udp(sock), None))
+        Ok(Self::spawn(
+            cancel_token,
+            UdpTrackerSocket::Udp(sock),
+            resolver,
+        ))
     }
 
     /// Create a client that sends and receives tracker traffic through `socket`
     /// instead of binding a kernel UDP socket.
     ///
-    /// When `resolver` is set, UDP tracker hostnames are looked up through it
-    /// instead of the host's resolver.
+    /// Tracker hostnames are looked up through `resolver`, else the host's
+    /// resolver.
     pub fn new_with_socket(
         cancel_token: CancellationToken,
         socket: Arc<dyn DatagramSocket>,
         resolver: Option<Arc<dyn Resolver>>,
     ) -> Self {
+        let resolver = resolver.unwrap_or_else(|| Arc::new(SystemResolver));
         Self::spawn(cancel_token, UdpTrackerSocket::Custom(socket), resolver)
     }
 
     fn spawn(
         cancel_token: CancellationToken,
         sock: UdpTrackerSocket,
-        resolver: Option<Arc<dyn Resolver>>,
+        resolver: Arc<dyn Resolver>,
     ) -> Self {
         let client = Self {
             state: Arc::new(ClientShared {
@@ -413,9 +421,9 @@ impl UdpTrackerClient {
         client
     }
 
-    /// The resolver for tracker hostnames, if one was injected.
-    pub(crate) fn resolver(&self) -> Option<&dyn Resolver> {
-        self.state.resolver.as_deref()
+    /// The resolver for tracker hostnames.
+    pub(crate) fn resolver(&self) -> &dyn Resolver {
+        &*self.state.resolver
     }
 
     async fn run(self) -> anyhow::Result<()> {

@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use weaver_torrent::network::{
     AsyncReadVectored, AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
-    DatagramSocket, Resolver,
+    DatagramSocket, Resolved, Resolver,
 };
 use weaver_torrent::{HttpClients, HttpTarget, SocketFactory, StreamListener};
 use weaver_tunnel::bridge::{Bridge, ConnectionOutcome};
@@ -287,8 +287,8 @@ impl SocketFactory for LegSockets {
         })
     }
 
-    // Names for DHT bootstrap and UDP trackers resolve by the leg's naming
-    // rule, as its peers' names do.
+    // Every name the session looks up resolves by the leg's naming, as its
+    // peers' names do.
     fn resolver(&self) -> Option<Arc<dyn Resolver>> {
         Some(Arc::new(LegNames(Arc::clone(&self.dialer))))
     }
@@ -338,30 +338,26 @@ impl DatagramSocket for Carried {
     }
 }
 
-// The names a leg's dialer resolves. A leg that hands names on leaves them
-// to the host's resolver, as the session's own lookup would.
-struct LegNames(Arc<dyn Dialer>);
+/// The names a session resolves on its leg: who resolves each is the leg's
+/// naming, as for every other dial on the leg. A name the leg hands to its
+/// proxy resolves at the exit, and no lookup is made here.
+pub struct LegNames(pub Arc<dyn Dialer>);
 
 impl Resolver for LegNames {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the session's own lookup, for a leg that hands names on"
-    )]
-    fn resolve<'a>(
-        &'a self,
-        host: &'a str,
-        port: u16,
-    ) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Resolved>> {
         shared(async move {
             let resolved = self.0.resolve(host).await;
-            let addresses = match resolved.map_err(|error| io::Error::other(error.to_string()))? {
-                Resolution::Addresses(addresses) => addresses,
-                Resolution::Unresolved => weaver_tunnel::resolution::host_lookup(host).await?,
-            };
-            Ok(addresses
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, port))
-                .collect())
+            Ok(
+                match resolved.map_err(|error| io::Error::other(error.to_string()))? {
+                    Resolution::Addresses(addresses) => Resolved::Addresses(
+                        addresses
+                            .into_iter()
+                            .map(|ip| SocketAddr::new(ip, port))
+                            .collect(),
+                    ),
+                    Resolution::Unresolved => Resolved::AtExit,
+                },
+            )
         })
     }
 }
@@ -443,48 +439,64 @@ impl DatagramSocket for NoDatagrams {
     }
 }
 
-/// The HTTP clients of a session on a leg: the one for no target asks HTTP
-/// trackers and downloads metainfo, and a web seed is asked through one
-/// held to the address its host was checked at. A ladder leg's clients ride
-/// `bridge`, the leg's own.
+/// The HTTP clients of a session on a leg: the one for no target downloads
+/// metainfo, and a tracker or web seed is asked through one held to the
+/// addresses its host was checked at. A ladder leg's clients ride `bridge`,
+/// the leg's own.
 pub fn tracker_client(
     kind: &LegKind,
     bridge: Option<Arc<Bridge>>,
     identity: &ClientIdentity,
 ) -> Result<Arc<dyn HttpClients>, String> {
+    let bridge = match (kind, bridge) {
+        (LegKind::Ladder, None) => return Err("a ladder leg needs its bridge".into()),
+        (LegKind::Ladder, bridge) => bridge,
+        _ => None,
+    };
     let kind = kind.clone();
     let user_agent = identity.user_agent();
-    let builder = move || {
+    let base = move || {
         let builder = reqwest::Client::builder().user_agent(user_agent);
-        Ok(match (&kind, &bridge) {
-            (LegKind::Ladder, Some(bridge)) => crate::proxies::through_bridge(builder, bridge)?,
-            (LegKind::Ladder, None) => return Err("a ladder leg needs its bridge".into()),
-            (LegKind::System, _) => builder,
-            (LegKind::SourceAddress(address), _) => builder.local_address(*address),
-            (LegKind::Interface(name), _) => bound_to(builder, name)?,
+        Ok(match &kind {
+            LegKind::Ladder | LegKind::System => builder,
+            LegKind::SourceAddress(address) => builder.local_address(*address),
+            LegKind::Interface(name) => bound_to(builder, name)?,
         })
     };
+    let clients = LegClients { base, bridge };
     // A leg whose clients cannot be built does not open.
-    let _ = builder()?;
-    Ok(Arc::new(LegClients(builder)))
+    let _ = clients.builder(None).map_err(|error| error.to_string())?;
+    Ok(Arc::new(clients))
 }
 
-/// A session's HTTP clients, each from the builder its leg gives.
-pub(crate) struct LegClients<F>(pub(crate) F);
+/// A session's HTTP clients: each from `base`, through `bridge` on a leg
+/// that has one.
+pub(crate) struct LegClients<F> {
+    pub(crate) base: F,
+    pub(crate) bridge: Option<Arc<Bridge>>,
+}
 
 impl<F> HttpClients for LegClients<F>
 where
     F: Fn() -> Result<reqwest::ClientBuilder, String> + Send + Sync + 'static,
 {
+    // A client for a target dials the host at an address it was checked
+    // at, and follows no redirect. Through the leg's bridge, the bridge is
+    // handed that address, so the leg dials exactly it; with none, the
+    // name, which the leg's exit resolves.
     fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder> {
-        let builder = (self.0)().map_err(anyhow::Error::msg)?;
+        let builder = (self.base)().map_err(anyhow::Error::msg)?;
+        let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
+            (target.host, target.port, target.addrs)
+        });
+        let builder = match &self.bridge {
+            Some(bridge) => crate::proxies::through_bridge_at(builder, bridge, host, port, addrs)
+                .map_err(anyhow::Error::msg)?,
+            None => crate::proxies::pinned(builder, host, port, addrs),
+        };
         Ok(match target {
             None => builder,
-            // A leg that dials the host itself dials it at the checked
-            // address; a ladder leg's bridge is handed the name, and its
-            // exit reaches it.
-            Some(target) => crate::proxies::pinned(builder, target.host, target.port, target.addrs)
-                .redirect(reqwest::redirect::Policy::none()),
+            Some(_) => builder.redirect(reqwest::redirect::Policy::none()),
         })
     }
 
@@ -797,7 +809,7 @@ mod tests {
         let resolver = sockets.resolver().expect("a tunnel resolves its names");
         assert_eq!(
             resolver.resolve("router.example", 6881).await.unwrap(),
-            [SocketAddr::from(([192, 0, 2, 7], 6881))]
+            Resolved::Addresses(vec![SocketAddr::from(([192, 0, 2, 7], 6881))])
         );
     }
 
@@ -855,30 +867,44 @@ mod tests {
         }
     }
 
-    // A leg that pins a source address resolves DHT bootstrap and UDP
-    // tracker names by its dialer's naming rule, not the host's.
+    // A leg resolves every name the session looks up by its dialer's
+    // naming, and a name its dialer hands on resolves at the exit: no
+    // lookup is made here, of the host's resolver or any other.
     #[tokio::test]
-    async fn a_source_address_leg_resolves_names_through_its_dialer() {
+    async fn a_leg_resolves_names_through_its_dialer_and_hands_the_rest_on() {
         let answer: IpAddr = "192.0.2.9".parse().unwrap();
         let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
         let sockets = LegSockets::new(Arc::new(Naming(Some(answer))), &kind);
         let resolver = sockets.resolver().expect("the leg resolves its names");
         assert_eq!(
-            resolver
-                .resolve("router.bittorrent.com", 6881)
-                .await
-                .unwrap(),
-            [SocketAddr::new(answer, 6881)]
+            resolver.resolve("router.test", 6881).await.unwrap(),
+            Resolved::Addresses(vec![SocketAddr::new(answer, 6881)])
         );
 
-        // A dialer that hands names on leaves them to the host's resolver.
-        let sockets = LegSockets::new(Arc::new(Naming(None)), &kind);
+        let host_lookups = || {
+            let metrics = weaver_tunnel::metrics::snapshot();
+            let resolved: u64 = metrics
+                .resolutions
+                .iter()
+                .filter(|(by, ..)| *by == weaver_tunnel::metrics::Resolver::Host)
+                .map(|(_, ok, failed)| ok + failed)
+                .sum();
+            let held: u64 = metrics
+                .cache
+                .iter()
+                .filter(|(by, ..)| *by == weaver_tunnel::metrics::Resolver::Host)
+                .map(|(.., count)| count)
+                .sum();
+            resolved + held
+        };
+        let before = host_lookups();
+        let sockets = LegSockets::new(Arc::new(Naming(None)), &LegKind::Ladder);
         let resolver = sockets.resolver().expect("the leg resolves its names");
-        let found = resolver.resolve("localhost", 6881).await.unwrap();
-        assert!(
-            found.contains(&SocketAddr::from(([127, 0, 0, 1], 6881))),
-            "{found:?}"
+        assert_eq!(
+            resolver.resolve("localhost", 6881).await.unwrap(),
+            Resolved::AtExit
         );
+        assert_eq!(host_lookups(), before);
     }
 
     #[test]
@@ -917,7 +943,10 @@ mod tests {
         });
 
         // A direct leg's builder, kept off any proxy the host names.
-        let clients = LegClients(|| Ok(reqwest::Client::builder().no_proxy()));
+        let clients = LegClients {
+            base: || Ok(reqwest::Client::builder().no_proxy()),
+            bridge: None,
+        };
         let client = clients
             .client(Some(HttpTarget {
                 host: "seed.test",

@@ -252,10 +252,40 @@ pub(crate) fn through_bridge(
     builder: reqwest::ClientBuilder,
     bridge: &Bridge,
 ) -> Result<reqwest::ClientBuilder, String> {
+    bridged(builder, bridge, "socks5h")
+}
+
+// Sends every request of `builder` through `bridge`, handing the bridge
+// `host` at the first of the checked `addresses`, so the path dials an
+// address that was checked and resolves nothing. With no addresses the
+// bridge is handed the name, as `through_bridge` does.
+pub(crate) fn through_bridge_at(
+    builder: reqwest::ClientBuilder,
+    bridge: &Bridge,
+    host: &str,
+    port: u16,
+    addresses: &[IpAddr],
+) -> Result<reqwest::ClientBuilder, String> {
+    if addresses.is_empty() || host.parse::<IpAddr>().is_ok() {
+        return through_bridge(builder, bridge);
+    }
+    Ok(pinned(
+        bridged(builder, bridge, "socks5")?,
+        host,
+        port,
+        addresses,
+    ))
+}
+
+fn bridged(
+    builder: reqwest::ClientBuilder,
+    bridge: &Bridge,
+    scheme: &str,
+) -> Result<reqwest::ClientBuilder, String> {
     let addr = bridge.addr().map_err(|e| e.to_string())?;
     let (user, password) = bridge.credentials();
     Ok(builder.no_proxy().proxy(
-        reqwest::Proxy::all(format!("socks5h://{addr}"))
+        reqwest::Proxy::all(format!("{scheme}://{addr}"))
             .map_err(|e| e.to_string())?
             .basic_auth(user, password),
     ))

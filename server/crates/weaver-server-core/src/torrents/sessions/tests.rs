@@ -1607,7 +1607,11 @@ impl StreamListener for Quiet {
 struct NoNames;
 
 impl weaver_torrent::network::Resolver for NoNames {
-    fn resolve<'a>(&'a self, _: &'a str, _: u16) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
+    fn resolve<'a>(
+        &'a self,
+        _: &'a str,
+        _: u16,
+    ) -> BoxFuture<'a, io::Result<weaver_torrent::network::Resolved>> {
         Box::pin(async { Err(io::Error::from(io::ErrorKind::NotFound)) })
     }
 }

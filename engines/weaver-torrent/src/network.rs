@@ -27,7 +27,7 @@ use std::{
 use librqbit_dualstack_sockets::PollSendToVectored;
 use librqbit_utp::{Transport, UtpSocketUdp, UtpStream};
 
-pub use crate::core::net::{BoxFuture, DatagramSocket, Resolver, SystemResolver};
+pub use crate::core::net::{BoxFuture, DatagramSocket, Resolved, Resolver, SystemResolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{
     AsyncReadToVectoredCompat, AsyncReadVectored, AsyncReadVectoredIntoCompat,
@@ -88,13 +88,11 @@ pub trait SocketFactory: Send + Sync + 'static {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>>;
 
-    /// The resolver for DHT bootstrap hostnames and UDP tracker hostnames,
-    /// and for web seed hostnames, whose addresses are checked before the
-    /// HTTP client asks them.
+    /// The resolver for every name the session looks up: DHT bootstrap
+    /// nodes, UDP and HTTP trackers, and web seeds, whose addresses are
+    /// checked before they are asked.
     ///
     /// The default, `None`, uses the host's resolver ([`SystemResolver`]).
-    /// HTTP tracker hostnames are resolved by the HTTP client; see
-    /// [`SessionOptions::http_client`](crate::SessionOptions::http_client).
     fn resolver(&self) -> Option<Arc<dyn Resolver>> {
         None
     }

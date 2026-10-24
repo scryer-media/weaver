@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 use weaver_torrent::core::lengths::ValidPieceIndex;
 use weaver_torrent::network::{
-    AsyncReadVectored, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
+    AsyncReadVectored, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket, Resolver,
 };
 use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
@@ -193,6 +193,11 @@ impl SocketFactory for ProbeSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         self.inner.bind_udp(addr)
+    }
+
+    // The path's names resolve as the leg's do.
+    fn resolver(&self) -> Option<Arc<dyn Resolver>> {
+        self.inner.resolver()
     }
 }
 
@@ -714,5 +719,49 @@ impl TorrentStorage for HeldPieces {
             .get_or_insert_with(tokio::time::Instant::now);
         self.store.verified.send_modify(|verified| *verified += 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use weaver_torrent::network::Resolved;
+    use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Resolution, Target};
+
+    use super::*;
+
+    // A path whose naming answers one address, noting each name it is
+    // asked.
+    #[derive(Default)]
+    struct Path(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl Dialer for Path {
+        async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+            Err(DialError::Skipped("names only".into()))
+        }
+        async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+            self.0.lock().unwrap().push(host.into());
+            Ok(Resolution::Addresses(vec![IpAddr::from([192, 0, 2, 3])]))
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(60)
+        }
+        fn describe(&self) -> String {
+            "path".into()
+        }
+    }
+
+    // A test torrent's names resolve on the path it tests, by the path's
+    // naming, as a session's do on its leg.
+    #[tokio::test]
+    async fn a_probe_resolves_names_on_its_path() {
+        let path = Arc::new(Path::default());
+        let sockets = ProbeSockets::new(path.clone(), LegKind::Ladder, Arc::new(Watched::new()));
+        let resolver = sockets.resolver().expect("the path resolves its names");
+        assert_eq!(
+            resolver.resolve("tracker.test", 6969).await.unwrap(),
+            Resolved::Addresses(vec![SocketAddr::from(([192, 0, 2, 3], 6969))])
+        );
+        assert_eq!(*path.0.lock().unwrap(), ["tracker.test"]);
     }
 }

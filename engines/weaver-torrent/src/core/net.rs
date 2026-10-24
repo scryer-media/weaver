@@ -98,19 +98,27 @@ impl DatagramSocket for tokio::net::UdpSocket {
     }
 }
 
-/// Resolves a hostname to socket addresses.
+/// What a name resolves to on the session's network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// Every address found, each carrying the port asked for. The session
+    /// checks them, and connects only to those it keeps.
+    Addresses(Vec<SocketAddr>),
+    /// The network resolves the name where it exits: no address is known
+    /// here to check, and a connection hands the name on.
+    AtExit,
+}
+
+/// Resolves a hostname on the session's network.
 ///
-/// Used for DHT bootstrap nodes and UDP trackers. Embedders that route traffic
-/// through their own network stack can inject one so that lookups go through
-/// that stack too, instead of the host's resolver.
+/// Every name the session looks up goes through it: DHT bootstrap nodes,
+/// UDP and HTTP trackers, and web seeds. Embedders that route traffic
+/// through their own network stack inject one so that lookups follow that
+/// stack too.
 pub trait Resolver: Send + Sync + 'static {
-    /// Resolve `host` (a domain name, without port or brackets) and return
-    /// every address found, each carrying `port`.
-    fn resolve<'a>(
-        &'a self,
-        host: &'a str,
-        port: u16,
-    ) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>>;
+    /// Resolve `host` (a domain name, without port or brackets), every
+    /// address found carrying `port`.
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Resolved>>;
 }
 
 /// The host's resolver, via [`tokio::net::lookup_host`].
@@ -118,17 +126,18 @@ pub trait Resolver: Send + Sync + 'static {
 pub struct SystemResolver;
 
 impl Resolver for SystemResolver {
-    fn resolve<'a>(
-        &'a self,
-        host: &'a str,
-        port: u16,
-    ) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
-        Box::pin(async move { Ok(tokio::net::lookup_host((host, port)).await?.collect()) })
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> BoxFuture<'a, io::Result<Resolved>> {
+        Box::pin(async move {
+            Ok(Resolved::Addresses(
+                tokio::net::lookup_host((host, port)).await?.collect(),
+            ))
+        })
     }
 }
 
 /// Where one HTTP request goes: the host its URL names, its port, and the
-/// addresses the engine checked for that host.
+/// addresses the engine checked for that host, none when the network
+/// resolves the name where it exits ([`Resolved::AtExit`]).
 #[derive(Debug, Clone, Copy)]
 pub struct HttpTarget<'a> {
     pub host: &'a str,

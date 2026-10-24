@@ -956,16 +956,15 @@ pub struct SessionOptions {
     pub socket_factory: Option<Arc<dyn SocketFactory>>,
 
     /// Build the HTTP clients with this instead of the session's own builder.
-    /// Its client for no target asks HTTP trackers and downloads torrents and
-    /// the block and allow lists; a web seed is asked through a client for
-    /// the address the session checked its host at. When set,
+    /// Its client for no target downloads torrents and the block and allow
+    /// lists; a tracker or a web seed is asked through a client for the
+    /// addresses the session checked its host at. When set,
     /// `bind_device_name` and the identity's User-Agent do not apply to HTTP
     /// requests; configure them on the clients.
     ///
     /// The client for no target does its own DNS lookups:
-    /// [`SocketFactory::resolver`] does not apply to it. If HTTP hostname
-    /// lookups must be routed too, build it with its own resolver
-    /// (`reqwest::ClientBuilder::dns_resolver`).
+    /// [`SocketFactory::resolver`] does not apply to it. If those lookups must be routed too, build it
+    /// with its own resolver (`reqwest::ClientBuilder::dns_resolver`).
     pub http_client: Option<Arc<dyn HttpClients>>,
 
     /// Message stream encryption for peer connections, outgoing and incoming.
@@ -1257,6 +1256,12 @@ impl Session {
             let identity = opts.identity.take().unwrap_or_default();
             let token = opts.cancellation_token.take().unwrap_or_default();
             let tasks = TaskTracker::new();
+            // Every name the session looks up, on whichever socket.
+            let resolver: Arc<dyn Resolver> = opts
+                .socket_factory
+                .as_ref()
+                .and_then(|factory| factory.resolver())
+                .unwrap_or_else(|| Arc::new(SystemResolver));
 
             let bind_device = match opts.bind_device_name.as_ref() {
                 Some(name) => Some(
@@ -1294,7 +1299,6 @@ impl Session {
                     ),
                     None => None,
                 };
-                let dht_resolver = opts.socket_factory.as_ref().and_then(|f| f.resolver());
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create_from_config(
                         persistence_config,
@@ -1305,7 +1309,7 @@ impl Session {
                             cancellation_token: Some(token.clone()),
                             bind_device: bind_device.as_ref(),
                             socket: dht_socket,
-                            resolver: dht_resolver,
+                            resolver: Some(resolver.clone()),
                             node_id_prefix: dht_node_id_prefix,
                             client_version: dht_client_version,
                             tasks: Some(tasks.clone()),
@@ -1322,7 +1326,7 @@ impl Session {
                         bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
                         socket: dht_socket,
-                        resolver: dht_resolver,
+                        resolver: Some(resolver.clone()),
                         node_id_prefix: dht_node_id_prefix,
                         client_version: dht_client_version,
                         tasks: Some(tasks.clone()),
@@ -1438,11 +1442,13 @@ impl Session {
                         .bind_udp(addr)
                         .await
                         .context("error binding UDP tracker socket through socket factory")?;
-                    UdpTrackerClient::new_with_socket(token.clone(), socket, factory.resolver())
+                    UdpTrackerClient::new_with_socket(token.clone(), socket, Some(resolver.clone()))
                 }
-                None => UdpTrackerClient::new(token.clone(), bind_device.as_ref())
-                    .await
-                    .context("error creating UDP tracker client")?,
+                None => {
+                    UdpTrackerClient::new(token.clone(), bind_device.as_ref(), resolver.clone())
+                        .await
+                        .context("error creating UDP tracker client")?
+                }
             };
 
             let lsd = {
@@ -1498,11 +1504,7 @@ impl Session {
                 default_storage_factory: opts.default_storage_factory,
                 reqwest_client,
                 http_clients,
-                resolver: opts
-                    .socket_factory
-                    .as_ref()
-                    .and_then(|f| f.resolver())
-                    .unwrap_or_else(|| Arc::new(SystemResolver)),
+                resolver,
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),

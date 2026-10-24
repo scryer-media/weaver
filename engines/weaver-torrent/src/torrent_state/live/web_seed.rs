@@ -35,7 +35,7 @@ use crate::{
         hash_id::Id20,
         lengths::{Lengths, ValidPieceIndex},
         magnet::Escaped,
-        net::{HttpClients, HttpTarget, Resolver},
+        net::{HttpClients, HttpTarget, Resolved, Resolver},
         torrent_metainfo::{WebSeed, WebSeedKind, escape_path},
     },
     peer_connection::{PeerConnectionHandler, WriterRequest},
@@ -657,10 +657,11 @@ struct Target {
     moved: Option<usize>,
 }
 
-/// Where a request goes: the address its host was checked at, and a client
-/// that reaches the host there and nowhere else.
+/// Where a request goes: the address its host was checked at, none when the
+/// network resolves the name where it exits, and a client that reaches the
+/// host there and nowhere else.
 struct Reached {
-    addr: IpAddr,
+    addr: Option<IpAddr>,
     client: reqwest::Client,
 }
 
@@ -677,7 +678,7 @@ pub(crate) struct WebSeedConnection<'a> {
     link: &'a SeedLink,
     // The clients built for this connection, by host, port and address, so
     // its requests to one address share their connections.
-    pinned: Mutex<HashMap<(String, u16, IpAddr), reqwest::Client>>,
+    pinned: Mutex<HashMap<(String, u16, Option<IpAddr>), reqwest::Client>>,
 }
 
 impl<'a> WebSeedConnection<'a> {
@@ -857,29 +858,36 @@ impl<'a> WebSeedConnection<'a> {
     }
 
     // Where `target` is asked: the one address of its host its URL may be
-    // asked at, and a client held to it (libtorrent
-    // `torrent::connect_to_url_seed`, `on_name_lookup`, `connect_web_seed`).
-    // A seed that may not be asked there is disabled; a file moved where it
-    // may not be asked is lost to the seed. A name that does not resolve
-    // leaves the seed for WEB_SEED_NAME_LOOKUP_RETRY.
+    // asked at, and a client held to it. A seed that may not be asked there
+    // is disabled; a file moved where it may not be asked is lost to the
+    // seed. A name that does not resolve leaves the seed for
+    // WEB_SEED_NAME_LOOKUP_RETRY. A name the session's network resolves
+    // where it exits has no address here to check, and its client hands the
+    // name on.
     async fn reach(&self, target: &Target) -> anyhow::Result<Reached> {
         let url = &target.url;
         let port = url.port_or_known_default().unwrap_or(0);
         let (host, addrs) = match url.host() {
-            Some(url::Host::Ipv4(ip)) => (ip.to_string(), vec![IpAddr::V4(ip)]),
-            Some(url::Host::Ipv6(ip)) => (ip.to_string(), vec![IpAddr::V6(ip)]),
+            Some(url::Host::Ipv4(ip)) => (ip.to_string(), Some(vec![IpAddr::V4(ip)])),
+            Some(url::Host::Ipv6(ip)) => (ip.to_string(), Some(vec![IpAddr::V6(ip)])),
             Some(url::Host::Domain(name)) => {
                 let found =
                     tokio::time::timeout(URLSEED_TIMEOUT, self.resolver.resolve(name, port))
                         .await
                         .map_err(|_| anyhow!("{url}: the name lookup timed out"))
                         .and_then(|r| r.with_context(|| format!("{url}: the name lookup failed")))
-                        .and_then(|a| {
-                            anyhow::ensure!(!a.is_empty(), "{url}: the name has no address");
-                            Ok(a)
+                        .and_then(|resolved| match resolved {
+                            Resolved::Addresses(found) => {
+                                anyhow::ensure!(
+                                    !found.is_empty(),
+                                    "{url}: the name has no address"
+                                );
+                                Ok(Some(found.iter().map(SocketAddr::ip).collect()))
+                            }
+                            Resolved::AtExit => Ok(None),
                         });
                 match found {
-                    Ok(found) => (name.to_owned(), found.iter().map(SocketAddr::ip).collect()),
+                    Ok(found) => (name.to_owned(), found),
                     Err(e) => {
                         self.link.retry_after(Some(WEB_SEED_NAME_LOOKUP_RETRY));
                         return Err(e);
@@ -888,12 +896,13 @@ impl<'a> WebSeedConnection<'a> {
             }
             None => return Err(anyhow!("{url}: no host").into()),
         };
-        let addr = match endpoint(&addrs, port, target, self.allowed) {
-            Ok(addr) => addr,
-            Err(Unreachable::Blocked(addr)) => {
+        let addr = match addrs.map(|addrs| endpoint(&addrs, port, target, self.allowed)) {
+            None => None,
+            Some(Ok(addr)) => Some(addr),
+            Some(Err(Unreachable::Blocked(addr))) => {
                 return Err(anyhow!("{url}: the IP filter blocks {addr}"));
             }
-            Err(Unreachable::Refused(why)) => {
+            Some(Err(Unreachable::Refused(why))) => {
                 match target.moved {
                     Some(file) => self.link.file_missing(file),
                     None => self.link.disable(),
@@ -913,7 +922,7 @@ impl<'a> WebSeedConnection<'a> {
             .client(Some(HttpTarget {
                 host: &key.0,
                 port,
-                addrs: &[addr],
+                addrs: addr.as_slice(),
             }))
             .with_context(|| format!("{url}: building its client"))?;
         self.pinned.lock().insert(key, client.clone());
@@ -956,7 +965,7 @@ impl<'a> WebSeedConnection<'a> {
             target = Target {
                 url: to,
                 query: false,
-                no_local_ips: is_global(reached.addr),
+                no_local_ips: reached.addr.is_some_and(is_global),
                 moved: file,
             };
         }
@@ -1530,13 +1539,17 @@ mod tests {
             &'a self,
             host: &'a str,
             port: u16,
-        ) -> crate::core::net::BoxFuture<'a, std::io::Result<Vec<SocketAddr>>> {
+        ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
             let found = self.0.get(host).map(|ips| {
                 ips.iter()
                     .map(|ip| SocketAddr::new(*ip, port))
                     .collect::<Vec<_>>()
             });
-            Box::pin(async move { found.ok_or_else(|| std::io::ErrorKind::NotFound.into()) })
+            Box::pin(async move {
+                found
+                    .map(crate::core::net::Resolved::Addresses)
+                    .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+            })
         }
     }
 
@@ -1931,8 +1944,8 @@ mod tests {
         assert_eq!(
             pinned,
             [
-                ("moved.test".into(), port, at),
-                ("seed.test".into(), port, at)
+                ("moved.test".into(), port, Some(at)),
+                ("seed.test".into(), port, Some(at))
             ]
         );
         // The same factory's client for no target reaches no such host.
@@ -1997,6 +2010,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(server.seen().len(), 1);
+    }
+
+    // A seed whose name the network resolves at its exit is asked by name:
+    // its client is built for no address, and no address of it is checked
+    // here, so the IP filter has nothing to hold.
+    #[tokio::test(start_paused = true)]
+    async fn a_name_resolved_at_the_exit_is_asked_by_name() {
+        struct AtExit;
+        impl Resolver for AtExit {
+            fn resolve<'a>(
+                &'a self,
+                _: &'a str,
+                _: u16,
+            ) -> crate::core::net::BoxFuture<'a, std::io::Result<Resolved>> {
+                Box::pin(async { Ok(Resolved::AtExit) })
+            }
+        }
+        let f = content(100, 10);
+        let server = Server::start(move |head| Reply::ranged(&f, head));
+        let url = format!("http://seed.test:{}/f", server.addr.port());
+        let layout = layout(&[("f", 100, false)]);
+        let (_seeds, link) = one_seed(url, WebSeedKind::Url);
+        let clients = Wired::new(server.addr);
+        let nothing = |_: SocketAddr| false;
+        let conn =
+            WebSeedConnection::new(clients.clone(), Arc::new(AtExit), &nothing, &layout, &link);
+        drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
+            .await
+            .unwrap();
+        assert_eq!(server.seen().len(), 1);
+        assert!(clients.built().is_empty(), "{:?}", clients.built());
+        let pinned: Vec<_> = conn.pinned.lock().keys().cloned().collect();
+        assert_eq!(pinned, [("seed.test".to_owned(), server.addr.port(), None)]);
     }
 
     // A body cut short fails the connection; the whole blocks it carried

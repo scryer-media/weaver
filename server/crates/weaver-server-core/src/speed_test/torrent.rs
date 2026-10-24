@@ -29,7 +29,7 @@ use weaver_tunnel::pipe::Dialer;
 use super::natpmp;
 use super::progress::StreamProvider;
 use super::torrent_net::{PieceStore, ProbeSockets, Watched};
-use crate::proxies::{FetchPath, start_bridge, through_bridge};
+use crate::proxies::{FetchPath, start_bridge};
 use crate::torrents::identity::IDENTITY;
 use crate::torrents::net::{LegClients, LegKind};
 
@@ -205,16 +205,17 @@ fn failed_at(step: P2pStep, error: String) -> P2pReport {
     }
 }
 
-// The test torrent's HTTP clients, which ride the path's bridge.
+// The test torrent's HTTP clients, which ride the path's bridge as a
+// session's on a ladder leg do.
 fn http_client(bridge: Arc<weaver_tunnel::bridge::Bridge>) -> Arc<dyn HttpClients> {
-    Arc::new(LegClients(move || {
-        through_bridge(
-            reqwest::Client::builder()
+    Arc::new(LegClients {
+        base: || {
+            Ok(reqwest::Client::builder()
                 .user_agent(IDENTITY.user_agent())
-                .read_timeout(Duration::from_secs(30)),
-            &bridge,
-        )
-    }))
+                .read_timeout(Duration::from_secs(30)))
+        },
+        bridge: Some(bridge),
+    })
 }
 
 // The netinst torrent a directory listing names.
