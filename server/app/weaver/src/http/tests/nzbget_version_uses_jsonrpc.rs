@@ -1206,9 +1206,7 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     let shared_state = SharedPipelineState::new(metrics.clone(), vec![job]);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    metrics
-        .bytes_downloaded
-        .store(1_048_576, std::sync::atomic::Ordering::Relaxed);
+    shared_state.record_wire_bytes(1_048_576);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     let handle = SchedulerHandle::new(event_tx, shared_state);
     let config = test_config();
@@ -1352,11 +1350,9 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    metrics
-        .bytes_downloaded
-        // Far past i32::MAX per second however long this runner takes between
-        // samples or since the router started: both rates divide by elapsed time.
-        .store(1 << 60, std::sync::atomic::Ordering::Relaxed);
+    // Far past i32::MAX per second however long this runner takes between
+    // samples or since the router started: both rates divide by elapsed time.
+    shared_state.record_wire_bytes(1 << 60);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
     let handle = SchedulerHandle::new(event_tx, shared_state);
