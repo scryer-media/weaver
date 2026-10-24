@@ -3553,15 +3553,144 @@ fn handshake(dht: bool) -> Handshake {
     Handshake::new(Id20::default(), Id20::new([9; 20])).offering_dht(dht)
 }
 
-/// A DHT node on 127.0.0.1 that knows no other node.
-async fn local_dht(silent: SocketAddr) -> crate::dht::Dht {
-    crate::dht::DhtState::with_config(crate::dht::DhtConfig {
-        listen_addr: Some((std::net::Ipv4Addr::LOCALHOST, 0).into()),
-        bootstrap_addrs: Some(vec![silent.to_string()]),
-        ..Default::default()
-    })
-    .await
-    .unwrap()
+type Datagram = (Vec<u8>, SocketAddr);
+
+/// A datagram socket the test holds the other end of: what the session
+/// sends through it comes out of the test's receiver, with the address it
+/// went to, and what the test sends is what the session receives.
+struct HeldDatagrams {
+    addr: SocketAddr,
+    sent: tokio::sync::mpsc::UnboundedSender<Datagram>,
+    arriving: parking_lot::Mutex<tokio::sync::mpsc::UnboundedReceiver<Datagram>>,
+}
+
+impl HeldDatagrams {
+    fn send(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.sent.send((buf.to_vec(), target)).ok();
+        Ok(buf.len())
+    }
+}
+
+impl crate::network::DatagramSocket for HeldDatagrams {
+    fn bind_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> crate::network::BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
+        Box::pin(std::future::poll_fn(move |cx| {
+            match std::task::ready!(self.arriving.lock().poll_recv(cx)) {
+                Some((datagram, from)) => {
+                    buf[..datagram.len()].copy_from_slice(&datagram);
+                    std::task::Poll::Ready(Ok((datagram.len(), from)))
+                }
+                // The test is done with it: nothing more arrives.
+                None => std::task::Poll::Pending,
+            }
+        }))
+    }
+
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<usize>> {
+        Box::pin(std::future::ready(self.send(buf, target)))
+    }
+
+    fn poll_send_to(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(self.send(buf, target))
+    }
+}
+
+/// The test's ends of a [`HeldDatagrams`].
+struct HeldEnds {
+    addr: SocketAddr,
+    sent: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
+    arriving: tokio::sync::mpsc::UnboundedSender<Datagram>,
+}
+
+/// A socket factory whose every datagram socket is a [`HeldDatagrams`], at
+/// an address of its own on 127.0.0.1, and which makes no connection.
+#[derive(Default)]
+struct HeldUdp {
+    held: parking_lot::Mutex<Vec<HeldEnds>>,
+}
+
+impl HeldUdp {
+    /// The test's ends of the socket bound at `addr`.
+    fn take(&self, addr: SocketAddr) -> HeldEnds {
+        let mut held = self.held.lock();
+        let at = held.iter().position(|h| h.addr == addr).unwrap();
+        held.swap_remove(at)
+    }
+}
+
+impl crate::network::SocketFactory for HeldUdp {
+    fn connect_tcp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        Box::pin(async { Err(std::io::ErrorKind::Unsupported.into()) })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        Box::pin(async { Err(std::io::ErrorKind::Unsupported.into()) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+    {
+        let (sent, sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (arriving_tx, arriving) = tokio::sync::mpsc::unbounded_channel();
+        let mut held = self.held.lock();
+        let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 50000 + held.len() as u16));
+        held.push(HeldEnds {
+            addr,
+            sent: sent_rx,
+            arriving: arriving_tx,
+        });
+        let socket: Arc<dyn crate::network::DatagramSocket> = Arc::new(HeldDatagrams {
+            addr,
+            sent,
+            arriving: parking_lot::Mutex::new(arriving),
+        });
+        Box::pin(std::future::ready(Ok(socket)))
+    }
+}
+
+/// The value under `key` in the bencoded dict `v`, as bytes.
+fn dict_bytes<'a>(
+    v: &'a crate::bencode::BencodeValue<crate::bencode::ByteBufOwned>,
+    key: &str,
+) -> &'a [u8] {
+    use crate::bencode::{BencodeValue, ByteBufOwned};
+    match v {
+        BencodeValue::Dict(d) => match &d[&ByteBufOwned::from(key.as_bytes())] {
+            BencodeValue::Bytes(b) => b.as_ref(),
+            other => panic!("{key} is not bytes: {other:?}"),
+        },
+        _ => panic!("not a dict: {v:?}"),
+    }
 }
 
 // libtorrent `bt_peer_connection::write_handshake` sets the DHT bit only
@@ -3608,18 +3737,18 @@ async fn a_repeated_dht_port_names_no_new_node() {
 // peer with the DHT bit, `on_dht_port` answering a PORT from a peer
 // without it, once per connection; `peer_connection::incoming_dht_port`
 // and `node::add_node`: the named node is pinged and, on its reply, joins
-// the routing table.
+// the routing table. The DHT runs over a socket the test holds, with no
+// bootstrap host, so the ping is the one datagram it sends and the test
+// writes the node's answer.
 #[tokio::test]
 async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
-    let silent = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let silent = silent.local_addr().unwrap();
+    let udp = Arc::new(HeldUdp::default());
     let opts = SessionOptions {
         dht: Some(crate::DhtSessionConfig {
-            bootstrap_addrs: Some(vec![silent.to_string()]),
+            bootstrap_addrs: Some(Vec::new()),
             ..Default::default()
         }),
+        socket_factory: Some(udp.clone()),
         ..isolated_session_opts(false)
     };
     let h = Harness::build_on(
@@ -3631,6 +3760,7 @@ async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
     .await;
     let ours = h._session.get_dht().unwrap().clone();
     let our_port = ours.listen_addr().port();
+    let mut node_side = udp.take(ours.listen_addr());
 
     let (bit, mut bit_rx) = h.peer("127.0.0.2:6881");
     assert_eq!((&bit).dht_port(), Some(our_port));
@@ -3648,10 +3778,11 @@ async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
         .unwrap();
     assert!(no_bit_rx.try_recv().is_err());
 
-    let theirs = local_dht(silent).await;
-    let their_id = theirs.stats().id;
+    // The node the peer names, on the peer's address.
+    let node = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 6890));
+    let their_id = Id20::new([0x33; 20]);
     (&no_bit)
-        .on_received_message(Message::Port(theirs.listen_addr().port()))
+        .on_received_message(Message::Port(node.port()))
         .await
         .unwrap();
     assert!(matches!(
@@ -3659,15 +3790,31 @@ async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
         Ok(WriterRequest::Message(Message::Port(p))) if p == our_port
     ));
     (&no_bit)
-        .on_received_message(Message::Port(theirs.listen_addr().port()))
+        .on_received_message(Message::Port(node.port()))
         .await
         .unwrap();
     assert!(no_bit_rx.try_recv().is_err());
 
-    while !ours.with_routing_tables(|v4, _| v4.iter().any(|n| n.id() == their_id)) {
-        tokio::task::yield_now().await;
-    }
-    theirs.cancellation_token().cancel();
+    let (ping, to) = node_side.sent.recv().await.unwrap();
+    assert_eq!(to, node);
+    let ping = crate::bencode::dyn_from_bytes::<crate::bencode::ByteBufOwned>(&ping).unwrap();
+    assert_eq!(dict_bytes(&ping, "y"), b"q");
+    assert_eq!(dict_bytes(&ping, "q"), b"ping");
+    let tid = dict_bytes(&ping, "t");
+
+    let entered = ours.with_routing_tables(|v4, _| v4.entered());
+    let mut entry = std::pin::pin!(entered.notified());
+    entry.as_mut().enable();
+    let mut answer = b"d1:rd2:id20:".to_vec();
+    answer.extend_from_slice(&their_id.0);
+    answer.extend_from_slice(format!("e1:t{}:", tid.len()).as_bytes());
+    answer.extend_from_slice(tid);
+    answer.extend_from_slice(b"1:y1:re");
+    node_side.arriving.send((answer, node)).unwrap();
+    entry.await;
+    assert!(ours.with_routing_tables(|v4, _| {
+        v4.iter().any(|n| n.id() == their_id && n.addr() == node)
+    }));
 }
 
 impl Harness {
