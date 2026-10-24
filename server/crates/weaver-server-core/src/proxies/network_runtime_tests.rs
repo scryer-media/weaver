@@ -1246,3 +1246,108 @@ async fn torrent_scopes_on_one_leg_keep_its_stage_until_the_last_goes() {
     assert!(film_leg.stage.is_revoked());
     runtime.shutdown().await;
 }
+
+// A torrent scope that reorders its legs keeps a stage another scope still
+// shares, now at another position: the connections its session dials
+// through that stage count on the row the stage is on now.
+#[tokio::test]
+async fn a_shared_torrent_leg_moved_to_another_position_counts_on_its_new_row() {
+    use crate::torrents::net::{LegKind, LegSockets};
+    use weaver_torrent::SocketFactory;
+
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let timeout = Duration::from_secs(1);
+    let (default, tv) = (TorrentScope::Default, TorrentScope::Category(1));
+    let direct = RouteLeg {
+        egress_id: SYSTEM_EGRESS_ID,
+        weight: 50,
+        path: LegPath::Direct,
+    };
+    let proxied = RouteLeg {
+        egress_id: SYSTEM_EGRESS_ID,
+        weight: 50,
+        path: LegPath::Ladder {
+            rungs: vec![Rung::Proxy { id: 1 }],
+            direct_fallback: false,
+        },
+    };
+    let policy = |legs: Vec<RouteLeg>| RoutingPolicy {
+        legs,
+        ..Default::default()
+    };
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(1, proxy());
+    config.consumers.insert(Consumer::Torrent(default).key());
+    config.consumers.insert(Consumer::Torrent(tv).key());
+    config.policies.insert(
+        Consumer::Torrent(tv).key(),
+        policy(vec![RouteLeg {
+            weight: 100,
+            ..direct.clone()
+        }]),
+    );
+    config.policies.insert(
+        Consumer::Torrent(default).key(),
+        policy(vec![proxied.clone(), direct.clone()]),
+    );
+    runtime.apply_configuration(config.clone()).unwrap();
+    let tv_leg = runtime.torrent_leg(tv, 0, 8, timeout).unwrap();
+    let leg = runtime.torrent_leg(default, 1, 8, timeout).unwrap();
+    assert!(Arc::ptr_eq(&leg.stage, &tv_leg.stage));
+    let open = || {
+        let route = runtime
+            .route(Consumer::Torrent(default), 8, timeout)
+            .unwrap();
+        let open: Vec<u64> = route
+            .weighted
+            .allocations()
+            .iter()
+            .map(|leg| u64::from(leg.open))
+            .collect();
+        let rows = super::network_metrics::snapshot(&runtime);
+        let rows: Vec<u64> = (0..2)
+            .map(|position| {
+                rows.legs
+                    .iter()
+                    .find(|row| {
+                        row.consumer == Consumer::Torrent(default).key() && row.position == position
+                    })
+                    .map_or(0, |row| row.open)
+            })
+            .collect();
+        assert_eq!(open, rows);
+        open
+    };
+    let sockets = LegSockets::new(leg.dialer(), &LegKind::Ladder);
+    let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = sockets
+        .connect_tcp(peer.local_addr().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(open(), [0, 1]);
+
+    config.policies.insert(
+        Consumer::Torrent(default).key(),
+        policy(vec![direct, proxied]),
+    );
+    runtime.apply_configuration(config).unwrap();
+    assert!(!leg.stage.is_revoked());
+    let route = runtime
+        .route(Consumer::Torrent(default), 8, timeout)
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &leg.stage,
+        &route.legs.read().unwrap()[0].stage
+    ));
+    let second = sockets
+        .connect_tcp(peer.local_addr().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(open(), [1, 0]);
+    drop((first, second));
+    runtime.shutdown().await;
+}

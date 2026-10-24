@@ -67,6 +67,9 @@ pub(crate) struct FakeRoutes {
     // The blocklist a fetch hands back, and the fetches made.
     pub(crate) blocklist: Mutex<Option<String>>,
     pub(crate) fetched: AtomicUsize,
+    // The network whose route gives each leg opened, when one is set: the
+    // leg is its route's, and is revoked as the route changes.
+    pub(crate) network: Mutex<Option<Arc<NetworkRuntime>>>,
 }
 
 fn scope_name(scope: TorrentScope) -> String {
@@ -134,12 +137,16 @@ impl Routes for FakeRoutes {
             || Arc::new(Nowhere) as Arc<dyn SocketFactory>,
             |(_, factory)| Arc::clone(factory),
         );
+        let network = self.network.lock().unwrap().clone();
+        let leg = network
+            .map(|network| network.torrent_leg(plan.scope, plan.leg, 8, Duration::from_secs(30)))
+            .transpose()?;
         Ok(OpenLeg {
             kind: plan.kind.clone(),
             shape: plan.kind.shape(None),
             factory: Some(factory),
             http: tracker_client(&LegKind::System, None, &IDENTITY)?,
-            leg: None,
+            leg,
         })
     }
 
@@ -171,6 +178,143 @@ fn any_port() -> TorrentConfig {
         base_port: 0,
         ..TorrentConfig::default()
     }
+}
+
+// A proxy at 127.0.0.1:`port`, as saved under id 1.
+fn loopback_proxy(port: u16) -> crate::proxies::ProxyProfile {
+    crate::proxies::ProxyProfile {
+        id: 1,
+        name: "tunnel".into(),
+        kind: crate::proxies::ProxyKind::Socks5,
+        enabled: true,
+        host: "127.0.0.1".into(),
+        port,
+        resolver: crate::proxies::Resolver::Proxy,
+        dns_servers: vec![],
+        tunnel_addresses: vec![],
+        peer_public_key: None,
+        mtu: 1280,
+        keepalive_seconds: None,
+        timeout_seconds: 30,
+        host_key_fingerprint: None,
+        revision: 1,
+        secrets: crate::proxies::ProxySecrets::default(),
+    }
+}
+
+// The default scope's route on a network whose one leg is a ladder through
+// the proxy of id 1, the legs `routes` opens being that route's.
+pub(crate) fn on_network(routes: &FakeRoutes) -> (Database, Arc<NetworkRuntime>) {
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(1)).unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: ladder(1),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let network = NetworkRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    routes.route(TorrentScope::Default, 1);
+    *routes.network.lock().unwrap() = Some(Arc::clone(&network));
+    (db, network)
+}
+
+// Save the proxy's profile again, at another port, and reload the network:
+// the route's leg is rebuilt behind the same proxy id.
+pub(crate) async fn save_again(db: &Database, network: &NetworkRuntime) {
+    let saved = db.list_proxy_profiles().unwrap().remove(0);
+    db.save_proxy_profile(&crate::proxies::ProxyProfile {
+        port: saved.port + 1,
+        revision: saved.revision + 1,
+        ..saved
+    })
+    .unwrap();
+    network.reload().await.unwrap();
+}
+
+// A profile saved again behind the same proxy, under a route's open
+// session, revokes the leg the session opened on. The route's key names the
+// proxy, not its settings, so it stands; the session no longer reads open,
+// is outdated, and the route opens again on the leg the network gives it
+// now.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_whose_leg_is_revoked_opens_again_on_the_new_leg() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let (db, network) = on_network(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let stage = |slots: &BTreeMap<RouteKey, Slot>| match slots.get(&plan.key) {
+        Some(Slot::Open { leg: Some(leg), .. }) => Arc::clone(&leg.stage),
+        _ => panic!("the route is not open on a leg"),
+    };
+
+    let old = sessions.session(&plan).await.unwrap();
+    let old_stage = stage(&*sessions.slots.lock().await);
+    assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
+
+    save_again(&db, &network).await;
+    assert!(old_stage.is_revoked());
+    sessions.revoked().await;
+    let view = sessions.view(&plan.key).await.unwrap();
+    assert_eq!(view.held.as_deref(), Some(REVOKED));
+    assert_eq!((view.port, view.listen), (None, None));
+    assert!(view.external.is_empty());
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+
+    sessions.drop_route(&plan.key).await;
+    let new = sessions.session(&plan).await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &new));
+    let new_stage = stage(&*sessions.slots.lock().await);
+    assert!(!Arc::ptr_eq(&old_stage, &new_stage));
+    assert!(!new_stage.is_revoked());
+    assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
+    assert!(sessions.outdated().await.is_empty());
+    sessions.stop_all().await;
+    network.shutdown().await;
+}
+
+// A session whose leg was revoked is not handed out before the follower
+// drops it: the route opens again on the leg the network gives it now, and
+// the revoked session stops.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_session_is_not_handed_out_before_its_route_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let (db, network) = on_network(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let old = sessions.session(&plan).await.unwrap();
+
+    save_again(&db, &network).await;
+    let new = sessions.session(&plan).await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &new));
+    old.cancellation_token().cancelled().await;
+    assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
+    assert!(sessions.outdated().await.is_empty());
+    let running = sessions.running().await;
+    assert!(Arc::ptr_eq(&running[&plan.key], &new));
+    sessions.stop_all().await;
+    network.shutdown().await;
 }
 
 #[test]

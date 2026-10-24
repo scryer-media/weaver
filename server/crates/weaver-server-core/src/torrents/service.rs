@@ -1674,6 +1674,8 @@ impl TorrentService {
                 tokio::select! {
                     _ = interval.tick() => {}
                     () = service.inner.settings_changed.notified() => {}
+                    // A session whose leg was revoked opens again at once.
+                    () = service.inner.sessions.revoked() => {}
                 }
                 service.tick().await;
             }
@@ -3696,12 +3698,14 @@ impl TorrentService {
     // A torrent whose route changed moves to the new route's session, and
     // one whose peer terms changed goes through its session again; one
     // whose route went down is held, and comes back when it is up. A
-    // session the settings would now open otherwise opens again under them,
-    // its torrents with it.
+    // session the settings would now open otherwise, or whose leg was
+    // revoked under it, opens again, its torrents with it; one left on a
+    // session its route no longer runs moves to the one it does.
     async fn follow_routes(&self) {
         let settings = self.settings();
         let rules = self.rules();
         let outdated = self.inner.sessions.outdated().await;
+        let running = self.inner.sessions.running().await;
         let mut reattach = Vec::new();
         let mut down: BTreeMap<RouteKey, String> = BTreeMap::new();
         let mut unresolved = Vec::new();
@@ -3727,10 +3731,12 @@ impl TorrentService {
                             torrent.held = Some(Held::RouteDown(reason.clone()));
                         } else if torrent.route.as_ref() != Some(&plan.key)
                             || outdated.contains(&plan.key)
-                            || torrent
-                                .attached
-                                .as_ref()
-                                .is_none_or(|attached| attached.terms != terms)
+                            || torrent.attached.as_ref().is_none_or(|attached| {
+                                attached.terms != terms
+                                    || !running
+                                        .get(&plan.key)
+                                        .is_some_and(|open| Arc::ptr_eq(open, &attached.session))
+                            })
                         {
                             self.detach(torrent).await;
                             torrent.held = None;

@@ -13,7 +13,7 @@ use crate::post_processing::model::PostProcessingSettings;
 use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::TrackerStatus;
 use crate::torrents::sessions::Routes;
-use crate::torrents::sessions::tests::{FakeRoutes, env, unbound_leg};
+use crate::torrents::sessions::tests::{FakeRoutes, env, on_network, save_again, unbound_leg};
 use crate::torrents::status::ROUTE_DOWN_FETCHING;
 use crate::torrents::storage::PieceStorage;
 
@@ -875,6 +875,80 @@ async fn a_new_listen_port_reaches_the_route_without_waiting_for_the_tick() {
         Some(41_000)
     );
     rig.service.stop().await;
+}
+
+// A leg revoked under a torrent's session, as saving its proxy's profile
+// again revokes it, wakes the tick: the torrent moves to a session opened on
+// the leg the network gives its route now, and the revoked one stops.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_whose_leg_is_revoked_moves_to_a_session_on_the_new_leg() {
+    let clock = Arc::new(RuntimeClock(tokio::time::Instant::now()));
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
+    let (db, network) = on_network(&rig.routes);
+    let mut ticks = rig.service.ticks();
+    rig.service.start().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    ticks.wait_for(|ticks| *ticks > 0).await.unwrap();
+    let before = session_of(&rig.service, job_id).await;
+    let stage = || {
+        network
+            .route(
+                crate::proxies::Consumer::Torrent(TorrentScope::Default),
+                8,
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap()
+            .legs
+            .read()
+            .unwrap()[0]
+            .stage
+            .clone()
+    };
+    let old_stage = stage();
+
+    save_again(&db, &network).await;
+    assert!(old_stage.is_revoked());
+    // The torrent's attachment names another session once the tick that the
+    // revocation woke has moved it.
+    let attached = || async {
+        let live = rig.service.inner.live.lock().await;
+        live[&job_id]
+            .attached
+            .as_ref()
+            .map(|attached| Arc::clone(&attached.session))
+    };
+    loop {
+        ticks.borrow_and_update();
+        if attached()
+            .await
+            .is_some_and(|session| !Arc::ptr_eq(&session, &before))
+        {
+            break;
+        }
+        ticks.changed().await.unwrap();
+    }
+    let after = session_of(&rig.service, job_id).await;
+    before.cancellation_token().cancelled().await;
+    assert!(!stage().is_revoked());
+    let views = rig.service.inner.sessions.views().await;
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].held, None);
+    assert!(
+        after
+            .get(TorrentIdOrHash::Id(
+                handle_of(&rig.service, job_id).await.id()
+            ))
+            .is_some()
+    );
+    rig.service.stop().await;
+    network.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

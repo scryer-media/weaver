@@ -514,6 +514,55 @@ mod tests {
         assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0));
     }
 
+    // A torrent session that dials its peers through its leg counts the
+    // bytes it reads on that leg, as every connection the leg carries does.
+    // It runs on the current-thread runtime so the rate timer cannot close
+    // another window between the wait and the snapshot that reads it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_torrent_session_through_its_leg_counts_its_reads_on_that_leg() {
+        use crate::torrents::net::{LegKind, LegSockets};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use weaver_torrent::SocketFactory;
+
+        let runtime = NetworkRuntime::new(
+            crate::Database::open_in_memory().unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let scope = super::super::TorrentScope::Default;
+        let consumer = super::super::Consumer::Torrent(scope);
+        let timeout = std::time::Duration::from_secs(30);
+        let leg = runtime.torrent_leg(scope, 0, 8, timeout).unwrap();
+        let sockets = LegSockets::new(leg.dialer(), &LegKind::Ladder);
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut read, _write) = sockets
+            .connect_tcp(peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut stream, _) = peer.accept().await.unwrap();
+        stream.write_all(&[7; 64 * 1024]).await.unwrap();
+        let mut piece = vec![0; 64 * 1024];
+        read.read_exact(&mut piece).await.unwrap();
+
+        // The leg's rate closes its first window a second after the reads.
+        let route = runtime.route(consumer, 8, timeout).unwrap();
+        route
+            .weighted
+            .subscribe()
+            .wait_for(|legs| legs[0].bytes_per_second > 0)
+            .await
+            .unwrap();
+        let metrics = snapshot(&runtime);
+        let row = metrics
+            .legs
+            .iter()
+            .find(|leg| leg.consumer == consumer.key() && leg.position == 0)
+            .unwrap();
+        assert_eq!((row.live, row.open), (true, 1));
+        assert!(row.bytes_per_second > 0);
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn torrent_bytes_count_in_the_egress_totals_and_not_its_download_quota() {
         let db = crate::Database::open_in_memory().unwrap();

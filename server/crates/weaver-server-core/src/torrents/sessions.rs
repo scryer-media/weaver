@@ -460,6 +460,9 @@ pub enum SessionError {
     Off,
 }
 
+/// Why a session whose leg was revoked under it holds closed.
+pub(crate) const REVOKED: &str = "the route's leg was revoked";
+
 enum Slot {
     Open {
         session: Arc<Session>,
@@ -475,6 +478,26 @@ enum Slot {
         reason: String,
         kind: LegKind,
     },
+}
+
+impl Slot {
+    // The slot's session, while it runs.
+    fn running(&self) -> Option<&Arc<Session>> {
+        match self {
+            Self::Open { session, .. } if self.held().is_none() => Some(session),
+            _ => None,
+        }
+    }
+
+    // Why the slot's session does not run, when it does not: it is held
+    // closed, or the leg it opened on has been revoked under it.
+    fn held(&self) -> Option<&str> {
+        match self {
+            Self::Held { reason, .. } => Some(reason),
+            Self::Open { leg: Some(leg), .. } if leg.stage.is_revoked() => Some(REVOKED),
+            Self::Open { .. } => None,
+        }
+    }
 }
 
 /// The last report of each of a session's port mappings, one for each
@@ -560,6 +583,9 @@ pub struct Sessions {
     rates: SessionRates,
     // The sessions closing off the open path, each until it has stopped.
     closing: Closing,
+    // Wakes the follower of the routes when the leg under an open session
+    // is revoked.
+    revoked: Arc<tokio::sync::Notify>,
 }
 
 impl Sessions {
@@ -576,7 +602,35 @@ impl Sessions {
             port_slots: Arc::default(),
             rates: SessionRates::default(),
             closing: Closing::default(),
+            revoked: Arc::default(),
         }
+    }
+
+    /// Resolves once the leg under an open session has been revoked since
+    /// last asked: that session is `outdated` until its route opens again.
+    pub async fn revoked(&self) {
+        self.revoked.notified().await;
+    }
+
+    // Wake the follower once `leg` is revoked under `session`, unless the
+    // session stops first.
+    fn watch(&self, key: &RouteKey, leg: &TorrentLeg, session: &Session) {
+        let (key, stage) = (key.clone(), Arc::clone(&leg.stage));
+        let stopped = session.cancellation_token().clone();
+        let revoked = Arc::clone(&self.revoked);
+        tokio::spawn(async move {
+            tokio::select! {
+                () = stage.cancelled() => {
+                    tracing::info!(
+                        route = key.as_str(),
+                        reason = REVOKED,
+                        "a route's leg was revoked under its open session"
+                    );
+                    revoked.notify_one();
+                }
+                () = stopped.cancelled() => {}
+            }
+        });
     }
 
     /// The torrents' download rate across the open sessions.
@@ -715,16 +769,28 @@ impl Sessions {
     /// Whether `plan`'s route carries DHT. Its open session says; a route
     /// with none open yet has no dialer to ask, so a ladder leg says no.
     pub async fn carries_dht(&self, plan: &RoutePlan) -> bool {
-        match self.slots.lock().await.get(&plan.key) {
-            Some(Slot::Open { session, .. }) => session.get_dht().is_some(),
-            _ => plan.kind.shape(None).dht,
+        match self
+            .slots
+            .lock()
+            .await
+            .get(&plan.key)
+            .and_then(Slot::running)
+        {
+            Some(session) => session.get_dht().is_some(),
+            None => plan.kind.shape(None).dht,
         }
     }
 
     /// The open session of `plan`'s route, built when it is not open yet. A
     /// route that is down holds closed.
     pub async fn session(&self, plan: &RoutePlan) -> Result<Arc<Session>, SessionError> {
-        if let Some(Slot::Open { session, .. }) = self.slots.lock().await.get(&plan.key) {
+        if let Some(session) = self
+            .slots
+            .lock()
+            .await
+            .get(&plan.key)
+            .and_then(Slot::running)
+        {
             return Ok(Arc::clone(session));
         }
         let port_slot = self.port_slot(&plan.key).await;
@@ -732,11 +798,20 @@ impl Sessions {
         if !self.on() {
             return Err(SessionError::Off);
         }
-        if let Some(Slot::Open { session, .. }) = slots.get(&plan.key) {
+        if let Some(session) = slots.get(&plan.key).and_then(Slot::running) {
             return Ok(Arc::clone(session));
         }
         if !slots.contains_key(&plan.key) && slots.len() >= MAX_SESSIONS {
             return Err(SessionError::Cap);
+        }
+        // A session whose leg was revoked under it stops before its route
+        // opens again.
+        if matches!(slots.get(&plan.key), Some(Slot::Open { .. }))
+            && let Some(Slot::Open {
+                session, leg, maps, ..
+            }) = slots.remove(&plan.key)
+        {
+            self.closing.close(&plan.key, session, leg, maps);
         }
         if let Some(reason) = &plan.down {
             slots.insert(
@@ -755,6 +830,10 @@ impl Sessions {
             Ok((session, leg, port, maps, opening)) => {
                 self.rates.add(&session);
                 self.configured().add(&session);
+                if let Some(leg) = &leg {
+                    self.watch(&plan.key, leg, &session);
+                }
+                tracing::info!(route = plan.key.as_str(), port, "a route's session opened");
                 slots.insert(
                     plan.key.clone(),
                     Slot::Open {
@@ -840,10 +919,10 @@ impl Sessions {
             .map_err(|error| format!("{error:#}"))
     }
 
-    /// The routes whose open session the settings as they stand would open
-    /// otherwise: binding or announcing another port, mapping it or not, or
-    /// keeping its state elsewhere. Each opens again, under the settings,
-    /// once it is dropped.
+    /// The routes whose open session would open otherwise now: its leg was
+    /// revoked under it, or the settings as they stand would bind or
+    /// announce another port, map it or not, or keep its state elsewhere.
+    /// Each opens again once it is dropped.
     pub async fn outdated(&self) -> BTreeSet<RouteKey> {
         let torrent = self.config();
         let slots = self.slots.lock().await;
@@ -851,12 +930,23 @@ impl Sessions {
             .iter()
             .filter_map(|(key, slot)| match slot {
                 Slot::Open { opening, .. }
-                    if *opening != Opening::of(&self.env, &torrent, opening.shape) =>
+                    if slot.held().is_some()
+                        || *opening != Opening::of(&self.env, &torrent, opening.shape) =>
                 {
                     Some(key.clone())
                 }
                 _ => None,
             })
+            .collect()
+    }
+
+    /// The session each route runs now: a torrent attached to another has
+    /// lost it, and moves to this one.
+    pub async fn running(&self) -> BTreeMap<RouteKey, Arc<Session>> {
+        let slots = self.slots.lock().await;
+        slots
+            .iter()
+            .filter_map(|(key, slot)| Some((key.clone(), Arc::clone(slot.running()?))))
             .collect()
     }
 
@@ -1086,14 +1176,17 @@ async fn close_all(slots: BTreeMap<RouteKey, Slot>) {
 }
 
 fn view(key: &RouteKey, slot: &Slot) -> SessionView {
-    match slot {
-        Slot::Open {
-            session,
-            port,
-            kind,
-            mappings,
-            ..
-        } => SessionView {
+    match (slot, slot.held()) {
+        (
+            Slot::Open {
+                session,
+                port,
+                kind,
+                mappings,
+                ..
+            },
+            None,
+        ) => SessionView {
             key: key.clone(),
             kind: kind.clone(),
             port: Some(*port),
@@ -1103,7 +1196,7 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             external: session.external_ips(),
             held: None,
         },
-        Slot::Held { reason, kind } => SessionView {
+        (Slot::Open { kind, .. } | Slot::Held { kind, .. }, held) => SessionView {
             key: key.clone(),
             kind: kind.clone(),
             port: None,
@@ -1111,7 +1204,7 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             utp: false,
             mappings: Vec::new(),
             external: Vec::new(),
-            held: Some(reason.clone()),
+            held: held.map(str::to_owned),
         },
     }
 }

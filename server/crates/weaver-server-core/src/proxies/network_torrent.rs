@@ -11,9 +11,9 @@ use weaver_tunnel::{
     pipe::{Dialed, Purpose, Resolution},
 };
 
-/// A torrent session's leg: the first leg of its consumer's live route.
-/// The stage belongs to the route, which revokes it when the leg changes;
-/// the bridge an HTTP client rides belongs to this leg, and stops with it.
+/// A torrent session's leg: a leg of its consumer's live route. The stage
+/// belongs to the route, which revokes it when the leg changes; the bridge
+/// an HTTP client rides belongs to this leg, and stops with it.
 pub struct TorrentLeg {
     pub stage: Arc<Revocable>,
     route: Arc<super::weighted::Weighted>,
@@ -60,9 +60,11 @@ impl Drop for TorrentLeg {
         }
     }
 }
-// A session's connections on the first leg of its route. The session keeps
-// its own peer limit, so they pass the route's allocation by, but the route
-// counts them, and their bytes, as the leg's.
+// A session's connections on its leg of the route. The session keeps its
+// own peer limit, so they pass the route's allocation by, but the route
+// counts them, and their bytes, as those of the leg its stage is when each
+// is dialled: a reload that moves the stage to another position moves its
+// counts with it.
 struct Carried {
     stage: Arc<Revocable>,
     route: Arc<super::weighted::Weighted>,
@@ -71,7 +73,7 @@ struct Carried {
 impl Dialer for Carried {
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let mut dialed = self.stage.dial(target).await?;
-        self.route.carry(0, &mut dialed);
+        self.route.carry(&*self.stage, &mut dialed);
         Ok(dialed)
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {

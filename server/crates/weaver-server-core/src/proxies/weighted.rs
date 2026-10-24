@@ -460,12 +460,21 @@ impl Weighted {
         }));
         Ok(result)
     }
-    /// Count `dialed`, made on leg `position` by a consumer that keeps its
-    /// own connection limit, among the leg's open connections until it
-    /// closes, with its reads in the leg's throughput.
-    pub fn carry(&self, position: usize, dialed: &mut Dialed) {
+    /// Count `dialed`, made through `stage` by a consumer that keeps its own
+    /// connection limit, among the open connections of the leg that stage is
+    /// now, until it closes, with its reads in the leg's throughput. A stage
+    /// the route no longer holds counts on no leg.
+    pub fn carry(&self, stage: &dyn Dialer, dialed: &mut Dialed) {
         let mut state = self.shared.state.lock().expect("leg allocation");
-        let Some(leg) = state.legs.get_mut(position) else {
+        let position = self
+            .legs
+            .read()
+            .expect("route stages")
+            .iter()
+            .position(|leg| std::ptr::addr_eq(Arc::as_ptr(leg), stage));
+        let Some((position, leg)) =
+            position.and_then(|position| Some((position, state.legs.get_mut(position)?)))
+        else {
             return;
         };
         dialed.path.leg = Some(position);

@@ -8,16 +8,19 @@
 //! may use UDP at all (DHT, UDP trackers, uTP) is the dialer's to say.
 
 use std::future::Future;
-use std::io;
+use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 
+use tokio::io::{AsyncRead, ReadBuf};
 use weaver_torrent::network::{
-    AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket,
-    Resolver,
+    AsyncReadVectored, AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
+    DatagramSocket, Resolver,
 };
 use weaver_torrent::{HttpClients, HttpTarget, SocketFactory, StreamListener};
-use weaver_tunnel::bridge::Bridge;
+use weaver_tunnel::bridge::{Bridge, ConnectionOutcome};
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};
 
@@ -169,6 +172,40 @@ fn shared<'a, T>(future: impl Future<Output = T> + Send + 'a) -> BoxFuture<'a, T
     }))
 }
 
+// A peer connection's read half through a leg's dialer. The leg counts the
+// bytes it reads, as it counts those of every connection it carries.
+struct Counted {
+    read: BoxAsyncReadVectored,
+    outcome: Arc<ConnectionOutcome>,
+}
+
+impl AsyncRead for Counted {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.read).poll_read(cx, buf);
+        self.outcome.read(buf.filled().len() - before);
+        polled
+    }
+}
+
+impl AsyncReadVectored for Counted {
+    fn poll_read_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        vec: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let polled = Pin::new(&mut self.read).poll_read_vectored(cx, vec);
+        if let Poll::Ready(Ok(read)) = polled {
+            self.outcome.read(read);
+        }
+        polled
+    }
+}
+
 fn halves(stream: DialedStream) -> (BoxAsyncReadVectored, BoxAsyncWrite) {
     match stream {
         DialedStream::Socket(socket) => {
@@ -202,7 +239,12 @@ impl SocketFactory for LegSockets {
                 .await
                 .map_err(io::Error::other)?
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            Ok(halves(dialed.stream))
+            let (read, write) = halves(dialed.stream);
+            let read = Counted {
+                read,
+                outcome: dialed.outcome,
+            };
+            Ok((Box::new(read) as BoxAsyncReadVectored, write))
         })
     }
 
