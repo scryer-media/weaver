@@ -92,7 +92,7 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
             }
             _ => {
                 pipeline.log_deliveries(job_id);
-                pipeline.remove_recovery_volumes(job_id).await;
+                pipeline.remove_spent_members(job_id).await;
                 // A repair ruled before this delivery: the moment the e2e
                 // post-repair hook names, between the ruling and the move.
                 let hold = pipeline
@@ -180,30 +180,20 @@ impl Pipeline {
         true
     }
 
-    // PAR2 and PAR3 files, indexes and volumes alike, and the volumes of any
-    // recovery object are spent once the job delivers and are not part of
-    // the release, so they are left out of it as a classic job's are. Root
-    // members are numbered as the posted files they are.
-    async fn remove_recovery_volumes(&self, job_id: JobId) {
-        let (Some(graph), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
-        else {
+    // What the job spent is not part of the release and is removed once it
+    // delivers, before the move: recovery data, bound or named so, and the
+    // volumes an object consumed to make what it hands over, such as the
+    // pieces a join wrote out whole.
+    async fn remove_spent_members(&self, job_id: JobId) {
+        let Some(graph) = self.graph_jobs.get(&job_id) else {
             return;
         };
-        for (member, path) in graph.member_files() {
-            let is_recovery = graph.spends(member)
-                || state
-                    .spec
-                    .files
-                    .get(member.0 as usize)
-                    .is_some_and(|file| !file.role.counts_toward_health());
-            if !is_recovery {
-                continue;
-            }
+        for path in graph.spent_files() {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    warn!(file = %path.display(), error = %error, "could not remove a recovery volume");
+                    warn!(file = %path.display(), error = %error, "could not remove a spent member");
                 }
             }
         }

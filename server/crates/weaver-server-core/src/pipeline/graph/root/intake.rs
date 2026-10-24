@@ -59,16 +59,26 @@ impl Decoded {
     }
 }
 
-// The checksums the decoder computed, kept for as long as the job runs: the
-// namespace asks for them whenever bytes of a member reach a recovery object,
-// which for bytes held until their member was decided is later than the
-// delivery that brought them.
+// The checksums the decoder computed, kept until their member is proven
+// whole: the namespace asks for them whenever bytes of a member reach a
+// recovery object, which for bytes held until their member was decided is
+// later than the delivery that brought them. A member a set proved has no
+// bytes left for a set to check, and its volume is sealed.
 #[derive(Debug, Default)]
 pub(crate) struct Checksums {
     volumes: BTreeMap<VolumeIndex, BTreeMap<u64, Segment>>,
     // The starts of the segments each change put in or took out.
     marks: BTreeMap<VolumeIndex, Marks<u64>>,
+    // How many segments are kept across every volume, and whether the
+    // guard below has said they passed it.
+    kept: usize,
+    warned: bool,
 }
+
+// Past this many kept segments the job holds checksums for more than any
+// post needs at once: something proven is not being sealed. A guard that
+// says so, not a limit; nothing is dropped for it.
+const KEPT_GUARD: usize = 1 << 22;
 
 impl Checksums {
     // The checksums kept for a range are those of the bytes last delivered
@@ -87,10 +97,41 @@ impl Checksums {
             for start in stale {
                 kept.remove(&start);
                 marks.mark(start);
+                self.kept -= 1;
             }
             kept.insert(segment.range.start, *segment);
             marks.mark(segment.range.start);
+            self.kept += 1;
         }
+        if self.kept > KEPT_GUARD && !self.warned {
+            self.warned = true;
+            tracing::warn!(
+                kept = self.kept,
+                "the job keeps more decoder checksums than any post needs"
+            );
+        }
+    }
+
+    // The volume's member is proven whole: no set reads the source's
+    // checksums of its bytes again. Each segment dropped is marked, so the
+    // facts drop it too.
+    pub(crate) fn seal(&mut self, volume: VolumeIndex) {
+        let Some(kept) = self.volumes.remove(&volume) else {
+            return;
+        };
+        self.kept -= kept.len();
+        let marks = self.marks.entry(volume).or_default();
+        for start in kept.keys() {
+            marks.mark(*start);
+        }
+    }
+
+    // Whether any checksum of the volume is kept.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, volume: VolumeIndex) -> bool {
+        self.volumes
+            .get(&volume)
+            .is_some_and(|kept| !kept.is_empty())
     }
 }
 

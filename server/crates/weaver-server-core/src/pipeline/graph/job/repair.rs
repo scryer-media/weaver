@@ -11,8 +11,8 @@
 // that the job is quiet, and an object that cannot finish refuses itself for
 // its own reason. The server tells; it chooses no reason.
 
-use weaver_graph::NodeId;
 use weaver_graph::slots::Ticket;
+use weaver_graph::{MemberId, NodeId, VolumeIndex};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::status::RepairSlots;
@@ -64,7 +64,27 @@ impl GraphJob {
             )?;
             self.heard(out)?;
         }
+        self.seal_proven();
         Ok(())
+    }
+
+    // Every root member the walk's rulings proved whole has its decoder
+    // checksums dropped: no set reads them again.
+    fn seal_proven(&mut self) {
+        let proven: Vec<MemberId> = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .map(|namespace| {
+                namespace
+                    .members()
+                    .map(|member| member.id)
+                    .filter(|member| self.writer.proven_whole(&self.tree, NodeId::ROOT, *member))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for member in proven {
+            self.root.seal(VolumeIndex(member.0));
+        }
     }
 
     // Once nothing more can change, every data object hears the lost

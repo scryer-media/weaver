@@ -176,6 +176,17 @@ impl NamespaceWriter {
             .map(|(member, leaf)| (*member, leaf.path()))
     }
 
+    // The file an object at `node` keeps of its volume, at the volume's own
+    // offsets, if it kept any of it.
+    pub(crate) fn kept_file(&self, node: NodeId, volume: VolumeIndex) -> Option<PathBuf> {
+        let shelf = self.envelopes.shelf_of(node)?;
+        let state = shelf.lock();
+        state
+            .kept
+            .get(&volume.0)
+            .map(|kept| kept.path().to_path_buf())
+    }
+
     // Why the member is a leaf, when an object or the holds budgets refused
     // to own it.
     pub(crate) fn refused(&self, node: NodeId, member: MemberId) -> Option<Why> {

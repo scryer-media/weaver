@@ -124,6 +124,16 @@ impl ArticleRoot {
         answers
     }
 
+    // The member of the volume is proven whole: its checksums are dropped.
+    pub(crate) fn seal(&mut self, volume: VolumeIndex) {
+        self.checksums.seal(volume);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checksums_held(&self, volume: VolumeIndex) -> bool {
+        self.checksums.holds(volume)
+    }
+
     // The ranges of lost articles that can now be marked damaged.
     pub(crate) fn damage(&mut self) -> Vec<(VolumeIndex, ByteRange)> {
         let mut out = Vec::new();

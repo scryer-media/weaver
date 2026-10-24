@@ -64,6 +64,7 @@ impl RootJob for Prepared {
                 .iter()
                 .enumerate()
                 .map(|(at, set)| self.ruled.get(at).copied().or(set.outcome)),
+            false,
         );
         RootPhase::derive(false, activity, self.extracting)
     }
@@ -259,10 +260,11 @@ fn the_drive_walks_the_phases_the_root_reports() {
     assert_eq!(drive(&mut job, &mut slots, AskerId(1), 1), Step::Deliver);
     assert_eq!((job.repairs, job.phase()), (1, RootPhase::Done));
 
-    // Waiting on recovery bytes: the root repairs until they come.
+    // Waiting on recovery bytes: the root fetches them, and no repair is
+    // out until they come.
     let mut job = Prepared::new(names(), damaged()).repairing_to(vec![RepairOutcome::Waiting]);
     assert_eq!(drive(&mut job, &mut slots, AskerId(2), 1), Step::Wait);
-    assert_eq!(job.phase(), RootPhase::Repairing);
+    assert_eq!(job.phase(), RootPhase::Downloading);
 
     // Not ruled yet: the root verifies.
     let job = Prepared::new(names(), damaged());

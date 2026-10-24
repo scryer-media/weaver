@@ -99,6 +99,49 @@ impl NamespaceWriter {
         })
     }
 
+    // Some member of a namespace holds damage a set of that namespace
+    // covers: a repair of it has something to rebuild.
+    pub(crate) fn damage_covered(&self, tree: &Tree) -> bool {
+        tree.live().into_iter().any(|node| {
+            let sets = tree.recovery_nodes(node);
+            tree.namespace(node).is_some_and(|namespace| {
+                namespace.members().any(|member| {
+                    member
+                        .coverage
+                        .runs()
+                        .any(|run| run.provenance == Provenance::Damaged)
+                        && self.covering(tree, &sets, member.id).next().is_some()
+                })
+            })
+        })
+    }
+
+    // The member is closed whole and the sets proved it: one covers it, and
+    // every one that does ruled it clean or repaired it and is not out on
+    // loan. No set reads the source's checksums of its bytes again.
+    pub(crate) fn proven_whole(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+        let whole = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .is_some_and(|record| record.is_whole());
+        let sets = tree.recovery_nodes(node);
+        let mut covering = self.covering(tree, &sets, member).peekable();
+        whole
+            && covering.peek().is_some()
+            && covering.all(|set| {
+                !tree.lent(set)
+                    && tree
+                        .recovery(set)
+                        .and_then(|recovery| recovery.outcome())
+                        .is_some_and(|outcome| {
+                            matches!(
+                                outcome,
+                                RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+                            )
+                        })
+            })
+    }
+
     // Every set of every namespace has ruled on something other than
     // waiting.
     pub(crate) fn all_ruled(&self, tree: &Tree) -> bool {

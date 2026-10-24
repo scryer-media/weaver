@@ -60,6 +60,6 @@ pub use records::{
 };
 pub use recovery::{Recovery, Segment, SliceVerdict};
 pub use seek::{Pull, Purpose, Seek, SeekUp, Weight, When};
-pub use sniff::{Sniff, VERDICT_BYTES, signed, sniff};
+pub use sniff::{Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, sniff};
 pub use tree::{Builder, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};

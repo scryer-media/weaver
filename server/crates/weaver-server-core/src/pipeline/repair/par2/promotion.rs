@@ -187,7 +187,17 @@ impl Pipeline {
             })
     }
 
+    // The job is fetching repair data once its payload is in. A graph job's
+    // root says so from its sets; a classic job reads it off its queues.
     fn job_fetching_repair_data(&self, job_id: JobId) -> bool {
+        match self.graph_jobs.get(&job_id) {
+            Some(graph) => graph.fetching_repair_data(),
+            None => self.job_fetching_recovery(job_id) && self.job_payload_fetched(job_id),
+        }
+    }
+
+    // Recovery articles of a classic job are still queued, retrying or out.
+    fn job_fetching_recovery(&self, job_id: JobId) -> bool {
         self.jobs
             .get(&job_id)
             .is_some_and(|state| state.download_queue.has_completion_critical_work())
@@ -1419,9 +1429,7 @@ impl Pipeline {
             download_state,
             finalizing_download: !native_verifying
                 && self.jobs_finalizing_download.contains(&state.job_id),
-            fetching_repair_data: !native_verifying
-                && self.job_fetching_repair_data(state.job_id)
-                && self.job_payload_fetched(state.job_id),
+            fetching_repair_data: !native_verifying && self.job_fetching_repair_data(state.job_id),
             post_state,
             run_state,
             progress: Self::effective_progress(state),

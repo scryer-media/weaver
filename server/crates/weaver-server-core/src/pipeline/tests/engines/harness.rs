@@ -491,6 +491,13 @@ pub(super) struct GraphView {
     pub(super) resident: u64,
     // The time the looks themselves took, which a run's time is not.
     pub(super) observed: std::time::Duration,
+    // What the job's report showed at each look, its status and whether it
+    // was fetching repair data, each change once.
+    pub(super) shown: Vec<(JobStatus, bool)>,
+    // At each look, for every root member a set covers: its name, whether
+    // its sets proved it (every one covering it ruled clean or repaired and
+    // none is out), and whether the root still keeps its checksums.
+    pub(super) sealing: Vec<Vec<(String, bool, bool)>>,
 }
 
 #[derive(Debug)]
@@ -1193,7 +1200,29 @@ pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: 
         return;
     };
     let looked = std::time::Instant::now();
+    if let Some(report) = pipeline.job_report(JOB) {
+        let shown = (report.status, report.fetching_repair_data);
+        if view.shown.last() != Some(&shown) {
+            view.shown.push(shown);
+        }
+    }
     let tree = job.tree();
+    if let Some(namespace) = tree.namespace(weaver_graph::NodeId::ROOT) {
+        let sets = tree.recovery_nodes(weaver_graph::NodeId::ROOT);
+        let writer = job.writer();
+        let look = namespace
+            .members()
+            .filter(|member| writer.covering(tree, &sets, member.id).next().is_some())
+            .map(|member| {
+                (
+                    member.name.clone(),
+                    writer.proven_whole(tree, weaver_graph::NodeId::ROOT, member.id),
+                    job.checksums_held(member.id),
+                )
+            })
+            .collect();
+        view.sealing.push(look);
+    }
     view.kinds.extend(
         tree.live()
             .into_iter()

@@ -231,6 +231,43 @@ fn par2_header_looks_valid(prefix: &[u8], known_file_len: Option<u64>) -> bool {
         && known_file_len.is_none_or(|file_len| packet_len <= file_len)
 }
 
+const PAR2_RECOVERY_SLICE: &[u8; 16] = b"PAR 2.0\0RecvSlic";
+const PAR2_CRITICAL: [&[u8; 16]; 3] = [
+    b"PAR 2.0\0Main\0\0\0\0",
+    b"PAR 2.0\0FileDesc",
+    b"PAR 2.0\0IFSC\0\0\0\0",
+];
+
+// Whether a PAR2 member's front says it is an index: the packets it opens,
+// read by their headers as far as the front reaches, carry the set's
+// description and no recovery slice. A volume opens on its slices; an index
+// holds none. Whatever name it was posted under.
+pub fn par2_index(first_bytes: &[u8]) -> bool {
+    let mut at = 0usize;
+    let mut critical = false;
+    while let Some(header) = first_bytes.get(at..at + PAR2_PACKET_HEADER_BYTES) {
+        if &header[..8] != PAR2_MAGIC {
+            break;
+        }
+        let kind = &header[48..64];
+        if kind == PAR2_RECOVERY_SLICE {
+            return false;
+        }
+        critical |= PAR2_CRITICAL.iter().any(|known| kind == *known);
+        let Some(length) = header[8..16]
+            .try_into()
+            .ok()
+            .map(u64::from_le_bytes)
+            .and_then(|length| usize::try_from(length).ok())
+            .filter(|length| *length >= PAR2_PACKET_HEADER_BYTES)
+        else {
+            break;
+        };
+        at = at.saturating_add(length);
+    }
+    critical
+}
+
 // Kinds by the extensions their files are posted under, for members whose
 // bytes open no signature. A compound name such as `.tar.gz` is the signature's to decide; its
 // object announces the `.tar` inside.
@@ -244,11 +281,15 @@ const NAMED: &[(Kind, &[&str])] = &[
     (Kind::RarRecovery, &[".rev"]),
 ];
 
-fn named(name: &str) -> Option<Kind> {
-    // Posted names often trail quotes, underscores or dots past the extension.
-    let name = name.trim_end_matches(|ch: char| {
+// Posted names often trail quotes, underscores or dots past the extension.
+fn trimmed(name: &str) -> &str {
+    name.trim_end_matches(|ch: char| {
         ch.is_ascii_whitespace() || matches!(ch, '"' | '\'' | '`' | '_' | '.')
-    });
+    })
+}
+
+fn named(name: &str) -> Option<Kind> {
+    let name = trimmed(name);
     NAMED
         .iter()
         .find(|(_, extensions)| {
@@ -258,6 +299,24 @@ fn named(name: &str) -> Option<Kind> {
         })
         .map(|(kind, _)| *kind)
         .or_else(|| numbered_piece(name).then_some(Kind::Split))
+}
+
+// Whether a posted name is a recovery volume's, as PAR creators spell them:
+// `.par2` and `.par3`, indexes and `.vol<start>+<count>` volumes alike, and
+// the older numbered `.p<N>` and `.par<N>`. A member whose bytes never said
+// what it is, its first article lost, is recovery data by its name alone.
+pub fn names_recovery(name: &str) -> bool {
+    let name = trimmed(name).to_ascii_lowercase();
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let digits = extension
+        .strip_prefix("par")
+        .or_else(|| extension.strip_prefix('p'));
+    !stem.is_empty()
+        && digits.is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 // A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
@@ -321,6 +380,33 @@ mod tests {
         bytes.extend_from_slice(&packet_len.to_le_bytes());
         bytes.resize(PAR2_PACKET_HEADER_BYTES, 0);
         bytes
+    }
+
+    #[test]
+    fn a_recovery_volume_is_known_by_its_name() {
+        for name in [
+            "a.par2",
+            "a.vol07+08.par2",
+            "A.VOL000+128.PAR2",
+            "a.par3",
+            "a.vol0+4.par3",
+            "a.p01",
+            "a.par1",
+            "a.par2\"",
+        ] {
+            assert!(names_recovery(name), "{name}");
+        }
+        for name in [
+            "a.bin",
+            "a.part01.rar",
+            "par2",
+            "a.p",
+            "a.par",
+            "a.pdf",
+            "a.7z.001",
+        ] {
+            assert!(!names_recovery(name), "{name}");
+        }
     }
 
     #[test]
@@ -392,6 +478,31 @@ mod tests {
         let mut bytes = vec![0x50, 0x2A, 0x4D, 0x18];
         bytes.extend(plain(600));
         assert_eq!(sniff("a.bin", &bytes, None), Sniff::Leaf);
+    }
+
+    // A PAR2 packet header of the type, stating the length, then its body.
+    fn packet(kind: &[u8; 16], length: usize) -> Vec<u8> {
+        let mut bytes = PAR2_MAGIC.to_vec();
+        bytes.extend_from_slice(&(length as u64).to_le_bytes());
+        bytes.resize(48, 0);
+        bytes.extend_from_slice(kind);
+        bytes.resize(length, 0);
+        bytes
+    }
+
+    #[test]
+    fn a_par2_index_is_known_by_its_packets() {
+        let main = packet(b"PAR 2.0\0Main\0\0\0\0", 92);
+        let file = packet(b"PAR 2.0\0FileDesc", 128);
+        let slice = packet(b"PAR 2.0\0RecvSlic", 132);
+        let index = [file.clone(), main.clone()].concat();
+        assert!(par2_index(&index));
+        // The front may end inside a packet: its header still says what it is.
+        assert!(par2_index(&index[..100]));
+        assert!(!par2_index(&[slice.clone(), main.clone()].concat()));
+        assert!(!par2_index(&[main.clone(), slice].concat()));
+        assert!(!par2_index(&main[..63]));
+        assert!(!par2_index(b"Rar!\x1a\x07\x01\x00"));
     }
 
     #[test]

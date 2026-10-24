@@ -281,7 +281,12 @@ pub(in crate::pipeline::graph) fn stamp_graph(db: &crate::Database, job_id: JobI
 
 #[test]
 fn the_phase_is_the_first_state_that_holds() {
-    for activity in [Activity::Idle, Activity::Verifying, Activity::Repairing] {
+    for activity in [
+        Activity::Idle,
+        Activity::Verifying,
+        Activity::Fetching,
+        Activity::Repairing,
+    ] {
         for extracting in [false, true] {
             assert_eq!(
                 RootPhase::derive(true, activity, extracting),
@@ -298,6 +303,10 @@ fn the_phase_is_the_first_state_that_holds() {
             RootPhase::derive(false, Activity::Verifying, extracting),
             RootPhase::Verifying
         );
+        assert_eq!(
+            RootPhase::derive(false, Activity::Fetching, extracting),
+            RootPhase::Downloading
+        );
     }
     assert_eq!(
         RootPhase::derive(false, Activity::Idle, true),
@@ -307,13 +316,17 @@ fn the_phase_is_the_first_state_that_holds() {
         RootPhase::derive(false, Activity::Idle, false),
         RootPhase::Done
     );
-    assert_eq!(phase::activity([]), Activity::Idle);
+    assert_eq!(phase::activity([], false), Activity::Idle);
     assert_eq!(
-        phase::activity([Some(RepairOutcome::Clean), None]),
+        phase::activity([Some(RepairOutcome::Clean), None], false),
         Activity::Verifying
     );
     assert_eq!(
-        phase::activity([None, Some(RepairOutcome::Waiting)]),
+        phase::activity([None, Some(RepairOutcome::Waiting)], false),
+        Activity::Fetching
+    );
+    assert_eq!(
+        phase::activity([None, Some(RepairOutcome::Waiting)], true),
         Activity::Repairing
     );
     assert_eq!(RootPhase::Done.job_status(), None);

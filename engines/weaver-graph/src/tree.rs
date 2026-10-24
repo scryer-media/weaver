@@ -449,6 +449,25 @@ impl Tree {
         self.recovery(node).is_some() || self.lent(node)
     }
 
+    // Whether the job spends the member of `node`'s namespace rather than
+    // hand it over: it is a volume an object bound in the namespace
+    // consumed, whose output is what the object hands over in its stead,
+    // unless it is a recovery object's whose volumes are released, as a
+    // listing is kept beside what it lists. A member no object holds is
+    // spent when its posted name says it is recovery data: one whose first
+    // bytes were lost never said by them which set it is.
+    pub fn spends(&self, node: NodeId, member: MemberId) -> bool {
+        match self.child_of(node, member) {
+            Some((child, _)) => self
+                .recovery(child)
+                .is_none_or(|recovery| !recovery.released()),
+            None => self
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .is_some_and(|record| crate::sniff::names_recovery(&record.name)),
+        }
+    }
+
     // The recovery objects bound in `node`'s namespace, the ones that cover
     // its members, in the order the namespace lists what is bound in it.
     // Those posted beside its object that moved into it come after its own.
@@ -1703,6 +1722,23 @@ impl Tree {
                 }
             }
         }
+    }
+
+    // The members of the namespace bound to a PAR2 object whose fronts say
+    // they are the set's index, whatever they were posted as.
+    pub fn signed_indexes(&self, node: NodeId) -> Vec<MemberId> {
+        let Some(namespace) = self.namespace(node) else {
+            return Vec::new();
+        };
+        namespace
+            .members()
+            .filter(|member| {
+                self.child_of(node, member.id)
+                    .is_some_and(|(child, _)| self.kind(child) == Some(Kind::Par2))
+                    && crate::sniff::par2_index(namespace.first_bytes(member.id))
+            })
+            .map(|member| member.id)
+            .collect()
     }
 
     // A member no object owns: a leaf whose front has spoken, and which no
