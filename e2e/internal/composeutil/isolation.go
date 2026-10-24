@@ -24,27 +24,46 @@ func ListNetworkSubnets(ctx context.Context, workDir string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s network ls: %w: %s", engine.Binary, err, strings.TrimSpace(string(output)))
 	}
-	ids := strings.Fields(string(output))
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	args := append(
-		[]string{"network", "inspect", "--format", engine.NetworkSubnetTemplate()},
-		ids...,
-	)
-	inspect := engine.CommandContext(ctx, args...)
-	inspect.Dir = workDir
-	output, err = inspect.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("%s network inspect: %w: %s", engine.Binary, err, strings.TrimSpace(string(output)))
-	}
 	var subnets []string
-	for _, line := range strings.Split(string(output), "\n") {
-		if subnet := strings.TrimSpace(line); subnet != "" && subnet != "<no value>" {
-			subnets = append(subnets, subnet)
+	for _, id := range strings.Fields(string(output)) {
+		inspect := engine.CommandContext(ctx, "network", "inspect", "--format", engine.NetworkSubnetTemplate(), id)
+		inspect.Dir = workDir
+		output, err := inspect.CombinedOutput()
+		if err != nil {
+			// Another run can remove a network between the listing and its
+			// inspection; a network that has left the listing claims nothing.
+			listed, listErr := networkListed(ctx, workDir, id)
+			if listErr != nil {
+				return nil, listErr
+			}
+			if !listed {
+				continue
+			}
+			return nil, fmt.Errorf("%s network inspect %s: %w: %s", engine.Binary, id, err, strings.TrimSpace(string(output)))
+		}
+		for _, line := range strings.Split(string(output), "\n") {
+			if subnet := strings.TrimSpace(line); subnet != "" && subnet != "<no value>" {
+				subnets = append(subnets, subnet)
+			}
 		}
 	}
 	return subnets, nil
+}
+
+func networkListed(ctx context.Context, workDir string, id string) (bool, error) {
+	engine := containerengine.Current()
+	list := engine.CommandContext(ctx, "network", "ls", "-q")
+	list.Dir = workDir
+	output, err := list.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("%s network ls: %w: %s", engine.Binary, err, strings.TrimSpace(string(output)))
+	}
+	for _, listed := range strings.Fields(string(output)) {
+		if listed == id {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // SelectNonOverlappingSubnets chooses the requested number of candidates
