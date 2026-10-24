@@ -61,6 +61,7 @@ pub enum NetworkRefusal {
     RouteHasAdvancedLegs,
     RouteConsumerGone,
     TorrentRoutePool,
+    TorrentRouteExit(TorrentRouteFault),
 
     // WireGuard sessions across every route.
     WireGuardPathConflict {
@@ -130,6 +131,15 @@ pub enum NetworkRefusal {
     },
 }
 
+// What gives a torrent route more than one exit: a second leg, a fall back
+// to the host's own address, or a second rung that would be another exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorrentRouteFault {
+    Legs,
+    DirectFallback,
+    Rungs,
+}
+
 // Whose download quota keeps a speed test from starting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeedTestQuotaHolder {
@@ -190,6 +200,11 @@ impl NetworkRefusal {
             Self::RouteHasAdvancedLegs => "ROUTE_HAS_ADVANCED_LEGS",
             Self::RouteConsumerGone => "ROUTE_CONSUMER_NOT_FOUND",
             Self::TorrentRoutePool => "TORRENT_ROUTE_POOL",
+            Self::TorrentRouteExit(TorrentRouteFault::Legs) => "TORRENT_ROUTE_LEGS",
+            Self::TorrentRouteExit(TorrentRouteFault::DirectFallback) => {
+                "TORRENT_ROUTE_DIRECT_FALLBACK"
+            }
+            Self::TorrentRouteExit(TorrentRouteFault::Rungs) => "TORRENT_ROUTE_RUNGS",
 
             Self::WireGuardPathConflict { .. } => "WIREGUARD_PROXY_PATH_CONFLICT",
             Self::WireGuardInstanceLimit { .. } => "WIREGUARD_INSTANCE_LIMIT",
@@ -335,6 +350,11 @@ impl std::fmt::Display for NetworkRefusal {
             }
             Self::RouteConsumerGone => "routing consumer no longer exists",
             Self::TorrentRoutePool => "a torrent route cannot use a pool",
+            Self::TorrentRouteExit(TorrentRouteFault::Legs) => "a torrent route has one leg",
+            Self::TorrentRouteExit(TorrentRouteFault::DirectFallback) => {
+                "a torrent route has no direct fallback"
+            }
+            Self::TorrentRouteExit(TorrentRouteFault::Rungs) => "a torrent route has one rung",
 
             Self::WireGuardPathConflict {
                 proxy,

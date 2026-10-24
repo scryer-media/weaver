@@ -2923,7 +2923,7 @@ impl TorrentService {
                         .map(|proxies| OnLeg {
                             network: proxies.network.clone(),
                             scope,
-                            position: plan.leg,
+                            position: crate::torrents::sessions::TORRENT_LEG,
                             egress_id: plan.egress_id,
                             own_sockets: plan.kind.own_sockets(),
                         }),

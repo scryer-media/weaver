@@ -371,21 +371,36 @@ impl Consumer {
         matches!(self, Self::Torrent(_))
     }
 
-    // A torrent session dials through one path at a time: its route's first
-    // leg that is up, trying that leg's rungs in order. It cannot spread over
-    // a pool.
+    // A torrent's peers and trackers see one address for the whole run: its
+    // route is one leg with one exit. A direct leg is its egress; a ladder
+    // is one rung, a proxy or a chain ending at one proxy, and never falls
+    // back to the egress. With one leg there is nothing to fail over to, so
+    // the route's failover means nothing here.
     pub fn validate_route(self, route: &super::Route) -> Result<(), super::NetworkRefusal> {
+        use super::{LegPath, NetworkRefusal, Rung, TorrentRouteFault};
         if !matches!(self, Self::Torrent(_)) {
             return Ok(());
         }
-        let pooled = route.legs.iter().any(|leg| match &leg.path {
-            super::LegPath::Direct => false,
-            super::LegPath::Ladder { rungs, .. } => rungs
-                .iter()
-                .any(|rung| matches!(rung, super::Rung::Pool { .. })),
-        });
-        if pooled {
-            return Err(super::NetworkRefusal::TorrentRoutePool);
+        let [leg] = route.legs.as_slice() else {
+            return Err(NetworkRefusal::TorrentRouteExit(TorrentRouteFault::Legs));
+        };
+        let LegPath::Ladder {
+            rungs,
+            direct_fallback,
+        } = &leg.path
+        else {
+            return Ok(());
+        };
+        if rungs.iter().any(|rung| matches!(rung, Rung::Pool { .. })) {
+            return Err(NetworkRefusal::TorrentRoutePool);
+        }
+        if *direct_fallback {
+            return Err(NetworkRefusal::TorrentRouteExit(
+                TorrentRouteFault::DirectFallback,
+            ));
+        }
+        if rungs.len() > 1 {
+            return Err(NetworkRefusal::TorrentRouteExit(TorrentRouteFault::Rungs));
         }
         Ok(())
     }

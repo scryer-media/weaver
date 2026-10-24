@@ -235,6 +235,21 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "a torrent route cannot use a pool",
         ),
         (
+            R::TorrentRouteExit(super::TorrentRouteFault::Legs),
+            "TORRENT_ROUTE_LEGS",
+            "a torrent route has one leg",
+        ),
+        (
+            R::TorrentRouteExit(super::TorrentRouteFault::DirectFallback),
+            "TORRENT_ROUTE_DIRECT_FALLBACK",
+            "a torrent route has no direct fallback",
+        ),
+        (
+            R::TorrentRouteExit(super::TorrentRouteFault::Rungs),
+            "TORRENT_ROUTE_RUNGS",
+            "a torrent route has one rung",
+        ),
+        (
             R::BandwidthLimitTooLarge,
             "BANDWIDTH_LIMIT_TOO_LARGE",
             "bandwidth limit is too large",
@@ -535,9 +550,12 @@ fn slot(refusal: &R) -> usize {
         R::BandwidthSplitRange => 84,
         R::SpeedTestTorrentNeedsTorrentRoute => 85,
         R::SpeedTestTorrentsOff => 86,
+        R::TorrentRouteExit(super::TorrentRouteFault::Legs) => 87,
+        R::TorrentRouteExit(super::TorrentRouteFault::DirectFallback) => 88,
+        R::TorrentRouteExit(super::TorrentRouteFault::Rungs) => 89,
     }
 }
-const SLOTS: usize = 87;
+const SLOTS: usize = 90;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {

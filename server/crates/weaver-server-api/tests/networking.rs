@@ -576,8 +576,8 @@ async fn route_save_rejects_missing_consumers_without_persisting() {
 }
 
 // A tracker rule that routes its torrents itself is listed by its host
-// pattern and takes a route of several legs; turned off, it is no consumer,
-// and a rule that is gone takes no route.
+// pattern and takes a route of one leg, never two; turned off, it is no
+// consumer, and a rule that is gone takes no route.
 #[tokio::test]
 async fn a_tracker_rule_with_its_own_route_is_listed_and_routed() {
     let h = harness().await;
@@ -615,19 +615,27 @@ async fn a_tracker_rule_with_its_own_route_is_listed_and_routed() {
         })]
     );
 
-    let legs =
-        "{egressId:0,weight:50,path:{direct:true}},{egressId:0,weight:50,path:{direct:true}}";
-    let response = h
-        .execute(&format!(
+    let route = |legs: &str| {
+        format!(
             "mutation{{saveNetworkRoute(kind:TORRENT_TRACKER,id:{id},input:{{legs:[{legs}]}}){{consumer legs{{weight}}}}}}"
+        )
+    };
+    let response = h
+        .execute(&route(
+            "{egressId:0,weight:50,path:{direct:true}},{egressId:0,weight:50,path:{direct:true}}",
         ))
+        .await;
+    let (_, code, _) = refusal(&response);
+    assert_eq!(code, "TORRENT_ROUTE_LEGS");
+    let response = h
+        .execute(&route("{egressId:0,weight:100,path:{direct:true}}"))
         .await;
     assert_no_errors(&response);
     assert_eq!(
         response_data(&response)["saveNetworkRoute"],
         serde_json::json!({
             "consumer": format!("torrent:tracker:{id}"),
-            "legs": [{"weight": 50}, {"weight": 50}],
+            "legs": [{"weight": 100}],
         })
     );
 

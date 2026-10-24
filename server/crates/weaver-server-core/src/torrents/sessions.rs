@@ -27,7 +27,7 @@ use crate::StateError;
 use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, FetchOptions, LegPath, NetworkRuntime,
-    ProxyRuntime, RouteLeg, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope,
+    ProxyRuntime, Route, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope,
     routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
@@ -77,31 +77,22 @@ pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Rout
     }
 }
 
-/// The leg a route runs on: the first that is up, else the first, with why
-/// it is down. `down` says why a leg is down, when it is.
-pub fn first_up(
-    legs: &[RouteLeg],
-    down: impl Fn(&RouteLeg) -> Option<String>,
-) -> Option<(usize, Option<String>)> {
-    let first = down(legs.first()?);
-    if first.is_none() {
-        return Some((0, None));
-    }
-    Some(
-        (1..legs.len())
-            .find(|position| down(&legs[*position]).is_none())
-            .map_or((0, first), |position| (position, None)),
-    )
+/// The key of a route no torrent may run on, as stored: its own, so holding
+/// it holds no session another route's leg runs.
+fn refused_key(route: &Route) -> RouteKey {
+    let encoded = serde_json::to_vec(&("refused", route)).expect("routes always encode");
+    RouteKey(hex::encode(&Sha1::digest(&encoded)[..8]))
 }
 
-/// A torrent scope's route as it stands: the leg it runs on, and whether that
-/// leg is up.
+/// The position of a torrent route's one leg.
+pub const TORRENT_LEG: usize = 0;
+
+/// A torrent scope's route as it stands: its one leg, and whether that leg is
+/// up. A route a torrent may not run on is down, for the refusal.
 #[derive(Clone, Debug)]
 pub struct RoutePlan {
     pub scope: TorrentScope,
     pub policy: RoutingPolicy,
-    /// The route's leg it runs on, by position.
-    pub leg: usize,
     pub egress_id: u32,
     pub kind: LegKind,
     pub key: RouteKey,
@@ -168,32 +159,31 @@ impl Routes for NetworkRoutes {
             .proxy_routing_policy(consumer)
             .map_err(|error| error.to_string())?;
         let route = policy.route();
-        consumer
-            .validate_route(&route)
-            .map_err(|refusal| refusal.to_string())?;
-        let interfaces = self.network().interfaces();
-        let quota_blocked = self.network().quota_blocked_egresses();
-        let (position, down) = first_up(&route.legs, |leg| {
-            let Some(egress) = leg_egress(self.network(), leg.egress_id) else {
-                return Some(format!("egress {} is missing", leg.egress_id));
-            };
-            match interfaces.health(&egress, None) {
-                EgressHealth::Down(reason) => Some(reason),
-                _ if quota_blocked.contains(&egress.id) => Some("quota reached".into()),
-                _ => None,
-            }
-        })
-        .ok_or("the route has no leg")?;
-        let leg = &route.legs[position];
+        let leg = route.legs.first().ok_or("the route has no leg")?;
         let egress = leg_egress(self.network(), leg.egress_id);
+        let (key, down) = match consumer.validate_route(&route) {
+            Err(refusal) => (refused_key(&route), Some(refusal.to_string())),
+            Ok(()) => {
+                let down = match &egress {
+                    None => Some(format!("egress {} is missing", leg.egress_id)),
+                    Some(egress) => match self.network().interfaces().health(egress, None) {
+                        EgressHealth::Down(reason) => Some(reason),
+                        _ if self.network().quota_blocked_egresses().contains(&egress.id) => {
+                            Some("quota reached".into())
+                        }
+                        _ => None,
+                    },
+                };
+                (leg_key(self.network(), leg.egress_id, &leg.path), down)
+            }
+        };
         Ok(RoutePlan {
             scope,
-            leg: position,
             egress_id: egress.as_ref().map_or(leg.egress_id, |egress| egress.id),
             kind: egress.as_ref().map_or(LegKind::System, |egress| {
                 LegKind::of(&egress.binding, &leg.path)
             }),
-            key: leg_key(self.network(), leg.egress_id, &leg.path),
+            key,
             policy,
             down,
         })
@@ -212,7 +202,7 @@ impl Routes for NetworkRoutes {
         let peers = u16::try_from(peers).unwrap_or(u16::MAX);
         let leg = self
             .network()
-            .torrent_leg(plan.scope, plan.leg, peers, self.timeout)?;
+            .torrent_leg(plan.scope, TORRENT_LEG, peers, self.timeout)?;
         let bridge = match plan.kind {
             LegKind::Ladder => Some(leg.bridge()?),
             _ => None,

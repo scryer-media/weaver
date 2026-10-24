@@ -621,71 +621,111 @@ fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
     );
 }
 
-// A torrent route's legs are failover in order: it runs on the first that is
-// up. Only a pool is refused.
+// A torrent route is one leg with one exit: a second leg, a fall back to the
+// egress, a second rung or a pool is refused; a direct leg on any egress, a
+// proxy or a chain is saved. A server takes any of them.
 #[test]
-fn a_torrent_route_may_have_several_legs_but_no_pool() {
+fn a_torrent_route_is_one_leg_with_one_exit() {
     let db = Database::open_in_memory().unwrap();
     let pool = pool(&db);
-    let ladder = |rungs: Vec<Rung>| RouteLeg {
-        egress_id: 0,
+    let interface = db
+        .create_egress_interface(&EgressInterface {
+            name: "tun".into(),
+            binding: EgressBinding::Interface { name: "lo0".into() },
+            ..egress()
+        })
+        .unwrap();
+    let source = db.create_egress_interface(&egress()).unwrap();
+    let leg = |egress_id: u32, path: LegPath| RouteLeg {
+        egress_id,
         weight: 100,
-        path: LegPath::Ladder {
-            rungs,
-            direct_fallback: false,
-        },
+        path,
+    };
+    let ladder = |rungs: Vec<Rung>, direct_fallback| LegPath::Ladder {
+        rungs,
+        direct_fallback,
     };
     let policy = |legs: Vec<RouteLeg>| RoutingPolicy {
         legs,
         failover: Failover::Hold,
         ..Default::default()
     };
-    let split = policy(vec![
-        RouteLeg {
-            weight: 50,
-            ..ladder(vec![Rung::Proxy { id: 1 }])
+    let proxy = |id| ladder(vec![Rung::Proxy { id }], false);
+    // Each legacy shape first: it may not replace a route saved with legs.
+    let refusals = [
+        // A legacy route that may go direct is a fall back to the egress.
+        (
+            RoutingPolicy {
+                proxy_ids: vec![3],
+                allow_direct: true,
+                ..Default::default()
+            },
+            "TORRENT_ROUTE_DIRECT_FALLBACK",
+        ),
+        (
+            policy(vec![
+                RouteLeg {
+                    weight: 50,
+                    ..leg(0, proxy(1))
+                },
+                RouteLeg {
+                    weight: 50,
+                    ..leg(0, proxy(3))
+                },
+            ]),
+            "TORRENT_ROUTE_LEGS",
+        ),
+        (
+            policy(vec![leg(0, ladder(vec![Rung::Proxy { id: 1 }], true))]),
+            "TORRENT_ROUTE_DIRECT_FALLBACK",
+        ),
+        (
+            policy(vec![leg(
+                0,
+                ladder(vec![Rung::Proxy { id: 1 }, Rung::Proxy { id: 3 }], false),
+            )]),
+            "TORRENT_ROUTE_RUNGS",
+        ),
+        (
+            policy(vec![leg(0, ladder(vec![Rung::Pool { id: pool.id }], false))]),
+            "TORRENT_ROUTE_POOL",
+        ),
+    ];
+    let saved = [
+        RoutingPolicy {
+            proxy_ids: vec![3],
+            allow_direct: false,
+            ..Default::default()
         },
-        RouteLeg {
-            weight: 50,
-            ..ladder(vec![Rung::Proxy { id: 3 }])
-        },
-    ]);
-    let pooled = policy(vec![ladder(vec![Rung::Pool { id: pool.id }])]);
-    let ordered = policy(vec![ladder(vec![
-        Rung::Proxy { id: 1 },
-        Rung::Proxy { id: 3 },
-    ])]);
-
+        policy(vec![leg(0, LegPath::Direct)]),
+        policy(vec![leg(interface.id, LegPath::Direct)]),
+        policy(vec![leg(source.id, LegPath::Direct)]),
+        policy(vec![leg(0, proxy(1))]),
+        policy(vec![leg(
+            0,
+            ladder(vec![Rung::Chain { ids: vec![1, 3] }], false),
+        )]),
+    ];
     for consumer in [
         Consumer::Torrent(TorrentScope::Default),
         Consumer::Torrent(TorrentScope::Category(4)),
     ] {
-        db.save_proxy_routing_policy(consumer, &split).unwrap();
-        assert_eq!(
-            db.proxy_routing_policy(consumer)
-                .unwrap()
-                .route()
-                .legs
-                .len(),
-            2
-        );
-        assert_eq!(
-            refused(db.save_proxy_routing_policy(consumer, &pooled)),
-            "TORRENT_ROUTE_POOL"
-        );
-        db.save_proxy_routing_policy(consumer, &ordered).unwrap();
-        db.save_proxy_routing_policy(
-            consumer,
-            &RoutingPolicy {
-                proxy_ids: vec![3, 1],
-                allow_direct: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        for (policy, code) in &refusals {
+            assert_eq!(
+                refused(db.save_proxy_routing_policy(consumer, policy)),
+                *code,
+                "{policy:?}"
+            );
+        }
+        for policy in &saved {
+            db.save_proxy_routing_policy(consumer, policy).unwrap();
+            assert_eq!(db.proxy_routing_policy(consumer).unwrap().route().legs.len(), 1);
+        }
     }
-    db.save_proxy_routing_policy(Consumer::Server(1), &pooled)
-        .unwrap();
+    for (policy, _) in &refusals {
+        db.save_proxy_routing_policy(Consumer::Server(1), policy)
+            .unwrap();
+    }
 }
 
 #[test]

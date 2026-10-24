@@ -10,7 +10,7 @@ use weaver_torrent::StreamListener;
 use weaver_torrent::network::{BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture, DatagramSocket};
 
 use super::*;
-use crate::proxies::{Rung, TorrentScope};
+use crate::proxies::{RouteLeg, Rung, TorrentScope};
 use crate::torrents::identity::IDENTITY;
 use crate::torrents::net::NoDatagrams;
 
@@ -111,7 +111,6 @@ impl Routes for FakeRoutes {
         Ok(RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
-            leg: 0,
             egress_id: SYSTEM_EGRESS_ID,
             kind: self
                 .leg
@@ -139,7 +138,7 @@ impl Routes for FakeRoutes {
         );
         let network = self.network.lock().unwrap().clone();
         let leg = network
-            .map(|network| network.torrent_leg(plan.scope, plan.leg, 8, Duration::from_secs(30)))
+            .map(|network| network.torrent_leg(plan.scope, TORRENT_LEG, 8, Duration::from_secs(30)))
             .transpose()?;
         Ok(OpenLeg {
             kind: plan.kind.clone(),
@@ -181,7 +180,7 @@ fn any_port() -> TorrentConfig {
 }
 
 // A proxy at 127.0.0.1:`port`, as saved under id 1.
-fn loopback_proxy(port: u16) -> crate::proxies::ProxyProfile {
+pub(crate) fn loopback_proxy(port: u16) -> crate::proxies::ProxyProfile {
     crate::proxies::ProxyProfile {
         id: 1,
         name: "tunnel".into(),
@@ -1692,54 +1691,6 @@ async fn a_closed_route_lets_go_of_its_dht_socket_before_it_opens_again() {
         *log.lock().unwrap(),
         ["bound", "dropped", "bound", "dropped"]
     );
-}
-
-fn vpn_legs() -> Vec<RouteLeg> {
-    [1, 2]
-        .map(|proxy| RouteLeg {
-            egress_id: SYSTEM_EGRESS_ID,
-            weight: 50,
-            path: LegPath::Ladder {
-                rungs: vec![Rung::Proxy { id: proxy }],
-                direct_fallback: false,
-            },
-        })
-        .into()
-}
-
-#[test]
-fn a_route_runs_on_its_first_leg_that_is_up() {
-    let legs = vpn_legs();
-    let down = |downs: &'static [usize]| {
-        let legs = &legs;
-        move |leg: &RouteLeg| {
-            let position = legs.iter().position(|each| each == leg).unwrap();
-            downs
-                .contains(&position)
-                .then(|| format!("vpn {position} is down"))
-        }
-    };
-    let key = |position: usize| {
-        RouteKey::of(
-            SYSTEM_EGRESS_ID,
-            &EgressBinding::System,
-            &legs[position].path,
-        )
-    };
-
-    assert_eq!(first_up(&legs, down(&[])), Some((0, None)));
-    // The first leg down: the second carries the route.
-    assert_eq!(first_up(&legs, down(&[0])), Some((1, None)));
-    // Every leg down: the route is down, for the first leg's reason.
-    assert_eq!(
-        first_up(&legs, down(&[0, 1])),
-        Some((0, Some("vpn 0 is down".into())))
-    );
-    // The first leg back: the route comes home, under a different key.
-    let (away, _) = first_up(&legs, down(&[0])).unwrap();
-    let (home, _) = first_up(&legs, down(&[])).unwrap();
-    assert_ne!(key(away), key(home));
-    assert_eq!(first_up(&[], down(&[])), None);
 }
 
 // A leg whose sockets reach no one and bind nothing on the host: its

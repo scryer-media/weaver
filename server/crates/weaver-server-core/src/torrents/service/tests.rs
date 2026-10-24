@@ -10,10 +10,13 @@ use weaver_torrent::storage::TorrentStorage;
 use super::*;
 use crate::jobs::{Hold, HoldOwner, HoldScope};
 use crate::post_processing::model::PostProcessingSettings;
+use crate::proxies::{Consumer, LegPath, RouteLeg, RoutingPolicy, SYSTEM_EGRESS_ID};
 use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::TrackerStatus;
 use crate::torrents::sessions::Routes;
-use crate::torrents::sessions::tests::{FakeRoutes, env, on_network, save_again, unbound_leg};
+use crate::torrents::sessions::tests::{
+    FakeRoutes, env, loopback_proxy, on_network, save_again, unbound_leg,
+};
 use crate::torrents::status::ROUTE_DOWN_FETCHING;
 use crate::torrents::storage::PieceStorage;
 
@@ -140,11 +143,24 @@ fn service_on(
     job_env: JobEnv,
     clock: Arc<dyn Clock>,
 ) -> TorrentService {
-    let sessions = Sessions::new(
+    service_over(
+        db,
+        dir,
         Arc::clone(routes) as Arc<dyn Routes>,
-        env(&dir.join("sessions")),
-        db.clone(),
-    );
+        job_env,
+        clock,
+    )
+}
+
+// A service over `db` and `dir` whose sessions open on `routes`.
+fn service_over(
+    db: &Database,
+    dir: &Path,
+    routes: Arc<dyn Routes>,
+    job_env: JobEnv,
+    clock: Arc<dyn Clock>,
+) -> TorrentService {
+    let sessions = Sessions::new(routes, env(&dir.join("sessions")), db.clone());
     let settings = TorrentSettings {
         complete_dir: dir.join("complete"),
         categories: vec![CategoryConfig {
@@ -776,6 +792,121 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
         rig.db.get_torrent(job_id).unwrap().unwrap().category_id,
         Some(1)
     );
+}
+
+// `policy` stored as `consumer`'s route as it is, past the checks a save
+// makes: a route kept from before they held.
+fn store_route_unchecked(db: &Database, consumer: Consumer, policy: &RoutingPolicy) {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let store = db.datastore();
+    let row = (consumer.key(), serde_json::to_string(policy).unwrap());
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&store, "route_fixture", |tx| {
+            let (key, policy) = row.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {})",
+                    &[SqlArg::Text(key), SqlArg::Text(policy)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+
+// A torrent route stored with two legs is no route a torrent may run on: it
+// reads down for the refusal, the route view shows why, and its torrent is
+// held. Saved again as its one leg, the route and the torrent are released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&loopback_proxy(1)).unwrap();
+    let through = |weight| RouteLeg {
+        egress_id: SYSTEM_EGRESS_ID,
+        weight,
+        path: LegPath::Ladder {
+            rungs: vec![crate::proxies::Rung::Proxy { id: 1 }],
+            direct_fallback: false,
+        },
+    };
+    let consumer = Consumer::Torrent(TorrentScope::Default);
+    store_route_unchecked(
+        &db,
+        consumer,
+        &RoutingPolicy {
+            legs: vec![
+                through(50),
+                RouteLeg {
+                    weight: 50,
+                    path: LegPath::Direct,
+                    ..through(50)
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = Arc::new(crate::torrents::sessions::NetworkRoutes::new(
+        db.clone(),
+        Arc::clone(&proxies),
+        Duration::from_secs(30),
+        crate::torrents::identity::IDENTITY,
+    ));
+    let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
+    service.open().await.unwrap();
+    let job_id = service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    service.tick().await;
+
+    let refusal = "a torrent route has one leg";
+    assert_eq!(
+        service.inner.live.lock().await[&job_id].held,
+        Some(Held::RouteDown(refusal.into()))
+    );
+    let listed = service.routes().await;
+    let held = listed
+        .iter()
+        .find(|route| {
+            route
+                .scopes
+                .iter()
+                .any(|(scope, _)| *scope == TorrentScope::Default)
+        })
+        .unwrap();
+    assert_eq!(held.down.as_deref(), Some(refusal));
+    assert_eq!(
+        held.session.as_ref().unwrap().held.as_deref(),
+        Some(refusal)
+    );
+
+    db.save_proxy_routing_policy(
+        consumer,
+        &RoutingPolicy {
+            legs: vec![through(100)],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    proxies.network.reload().await.unwrap();
+    service.tick().await;
+
+    let live = service.inner.live.lock().await;
+    assert_eq!(live[&job_id].held, None);
+    assert!(live[&job_id].attached.is_some());
+    let key = live[&job_id].route.clone().unwrap();
+    drop(live);
+    let listed = service.routes().await;
+    let route = listed.iter().find(|route| route.key == key).unwrap();
+    assert_eq!(route.down, None);
+    assert_eq!(route.session.as_ref().unwrap().held, None);
+    service.stop().await;
 }
 
 // The session a torrent runs in, while it runs in one.

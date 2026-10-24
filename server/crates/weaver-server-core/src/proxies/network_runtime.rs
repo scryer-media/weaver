@@ -855,23 +855,21 @@ impl NetworkRuntime {
         if !config.consumers.contains(&consumer.key()) {
             return Err("routing consumer no longer exists".into());
         }
-        if let Some(route) = routes.get(&consumer.key()) {
-            let definition = config
-                .policies
-                .get(&consumer.key())
-                .cloned()
-                .unwrap_or_default()
-                .route();
-            route.weighted.reweight(definition, cap)?;
-            route.cap.store(cap, std::sync::atomic::Ordering::Release);
-            return Ok(route.clone());
-        }
         let definition = config
             .policies
             .get(&consumer.key())
             .cloned()
             .unwrap_or_default()
             .route();
+        // A route its consumer may not run on gives no path at all.
+        consumer
+            .validate_route(&definition)
+            .map_err(|refusal| refusal.to_string())?;
+        if let Some(route) = routes.get(&consumer.key()) {
+            route.weighted.reweight(definition, cap)?;
+            route.cap.store(cap, std::sync::atomic::Ordering::Release);
+            return Ok(route.clone());
+        }
         let mut legs = definition
             .legs
             .iter()
@@ -993,16 +991,18 @@ impl NetworkRuntime {
         // Legs a sharing consumer took up this reload, by signature.
         let mut shared: HashMap<String, LiveLeg> = HashMap::new();
         for route in routes {
-            if !next.consumers.contains(&route.consumer.key()) {
-                removed.push(route);
-                continue;
-            }
             let definition = next
                 .policies
                 .get(&route.consumer.key())
                 .cloned()
                 .unwrap_or_default()
                 .route();
+            if !next.consumers.contains(&route.consumer.key())
+                || route.consumer.validate_route(&definition).is_err()
+            {
+                removed.push(route);
+                continue;
+            }
             let mut fresh = definition
                 .legs
                 .iter()
