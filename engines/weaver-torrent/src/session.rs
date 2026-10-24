@@ -43,8 +43,8 @@ use crate::torrent_state::live::{
     web_seed::WebSeeds,
 };
 use crate::tracker::{
-    AnnounceIps, AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerComms,
-    TrackerHandover, TrackerTask, UdpTrackerClient, Unreachable,
+    AutoScrape, ListenPort, Reachable, StoppedAnnounces, TrackerComms, TrackerHandover,
+    TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
     PortMapEvents, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
@@ -274,8 +274,6 @@ pub struct Session {
     ssl_listen_addr: Option<SocketAddr>,
     // Our address as the internet sees it, one for each family.
     pub(crate) external_ips: Arc<ExternalIps>,
-    // Our own addresses a private torrent's HTTP announces name.
-    own_ips: AnnounceIps,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) reqwest_client: reqwest::Client,
@@ -327,75 +325,6 @@ pub struct Session {
     pub(crate) disable_pex: bool,
     // Whether the session listens on uTP, and so connects over it.
     pub(crate) utp: bool,
-}
-
-/// Our own addresses as an announce names them (BEP 7 `ipv4=`/`ipv6=`),
-/// read when each announce goes out: our external address of each family
-/// the listener accepts, then the listen address, or for one that is
-/// unspecified, the addresses of the host's interfaces of those families
-/// (libtorrent `expand_unspecified_address`, re-run as the interfaces
-/// change), each neither local nor loopback
-/// (`torrent::build_tracker_request`). A listener of a socket factory
-/// stands where libtorrent's proxy listen socket does: unspecified, it is
-/// never expanded, since the host's interfaces are not where peers reach
-/// it.
-fn own_ips(
-    listen: Option<SocketAddr>,
-    socket_factory: bool,
-    external: Arc<ExternalIps>,
-) -> AnnounceIps {
-    let Some(listen) = listen else {
-        return Arc::new(Vec::new);
-    };
-    if !listen.ip().is_unspecified() || socket_factory {
-        return Arc::new(move || {
-            announced_ips(listen.ip(), external.get().into_iter(), std::iter::empty())
-        });
-    }
-    Arc::new(move || {
-        use network_interface::{NetworkInterface, NetworkInterfaceConfig};
-        let interfaces = match NetworkInterface::show() {
-            Ok(nics) => nics,
-            Err(e) => {
-                debug!("error listing network interfaces: {e:#}");
-                Vec::new()
-            }
-        };
-        announced_ips(
-            listen.ip(),
-            external.get().into_iter(),
-            interfaces
-                .iter()
-                .flat_map(|nic| nic.addr.iter().map(|a| a.ip())),
-        )
-    })
-}
-
-/// Of our `external` addresses and those of `listen`, or for one that is
-/// unspecified, of the `interfaces`, the ones of the families it accepts
-/// (an unspecified IPv6 one is dual-stack) that an announce may name:
-/// neither unspecified, local nor loopback.
-fn announced_ips(
-    listen: IpAddr,
-    external: impl Iterator<Item = IpAddr>,
-    interfaces: impl Iterator<Item = IpAddr>,
-) -> Vec<IpAddr> {
-    use crate::torrent_state::live::peers::holepunch::is_local;
-    let accepts = |ip: &IpAddr| {
-        ip.is_ipv4() == listen.is_ipv4() || (listen.is_ipv6() && listen.is_unspecified())
-    };
-    let ips = external.chain(if listen.is_unspecified() {
-        interfaces.collect()
-    } else {
-        vec![listen]
-    });
-    let mut named = Vec::new();
-    for ip in ips.filter(accepts).map(|ip| ip.to_canonical()) {
-        if !ip.is_unspecified() && !ip.is_loopback() && !is_local(ip) && !named.contains(&ip) {
-            named.push(ip);
-        }
-    }
-    named
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -1486,11 +1415,6 @@ impl Session {
                     .as_ref()
                     .and_then(|l| l.ssl.as_ref())
                     .map(|ssl| ssl.addr),
-                own_ips: own_ips(
-                    listen_result.as_ref().map(|l| l.addr),
-                    opts.socket_factory.is_some(),
-                    external_ips.clone(),
-                ),
                 external_ips,
                 utp: listen_result
                     .as_ref()
@@ -2479,7 +2403,6 @@ impl Session {
                     task.take_over(
                         metadata.info_hashes,
                         self.announce_tiers(tracker_tiers.clone(), trackers_only),
-                        self.announce_ips(trackers_only),
                     )
                 });
             peer_rx = make_peer_rx(metadata.info_hashes, &identity, private, trackers);
@@ -2894,7 +2817,6 @@ impl Session {
                 Some(_) => self.ssl_port.subscribe(),
                 None => self.announce_port.subscribe(),
             },
-            self.announce_ips(trackers_only),
             self.external_ips.tracker_vote(),
             match ssl {
                 Some(ssl) => Arc::new(SslHttpClients {
@@ -2907,16 +2829,6 @@ impl Session {
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
         ))
-    }
-
-    // Only a torrent that takes peers from its trackers alone tells them our
-    // addresses.
-    fn announce_ips(&self, trackers_only: bool) -> AnnounceIps {
-        if trackers_only {
-            self.own_ips.clone()
-        } else {
-            Arc::new(Vec::new)
-        }
     }
 
     // Get a peer stream from both DHT and trackers, under every hash the
@@ -3416,9 +3328,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AddTorrent, AddTorrentOptions, AddTorrentResponse, ExternalIps, IpFilter, Session,
-        SessionOptions, TorrentIdOrHash, is_bare_info_hash, merge_tracker_tiers,
-        metainfo_tracker_tiers, torrent_file_from_info_bytes, torrent_from_bytes,
+        AddTorrent, AddTorrentOptions, AddTorrentResponse, IpFilter, Session, SessionOptions,
+        TorrentIdOrHash, is_bare_info_hash, merge_tracker_tiers, metainfo_tracker_tiers,
+        torrent_file_from_info_bytes, torrent_from_bytes,
     };
 
     fn url(s: &str) -> url::Url {
@@ -3433,95 +3345,6 @@ mod tests {
 
     fn bstr(s: &str) -> String {
         format!("{}:{s}", s.len())
-    }
-
-    #[test]
-    fn an_announce_names_the_listeners_addresses_that_are_on_the_internet() {
-        // libtorrent expand_unspecified_address and
-        // torrent::build_tracker_request.
-        use super::{announced_ips, own_ips};
-        use std::net::{IpAddr, SocketAddr};
-        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        let nics = || {
-            [
-                "127.0.0.1",
-                "192.168.1.9",
-                "198.51.100.7",
-                "::1",
-                "fe80::1",
-                "fd00::1",
-                "2001:db8::7",
-                "::ffff:203.0.113.5",
-            ]
-            .into_iter()
-            .map(ip)
-        };
-        let none = std::iter::empty;
-        // A listener on one address names it, whatever the interfaces.
-        assert_eq!(
-            announced_ips(ip("203.0.113.9"), none(), nics()),
-            [ip("203.0.113.9")]
-        );
-        assert_eq!(
-            announced_ips(ip("10.0.0.2"), none(), nics()),
-            [] as [IpAddr; 0]
-        );
-        assert_eq!(announced_ips(ip("::1"), none(), nics()), [] as [IpAddr; 0]);
-        // Unspecified: the interfaces of its families, neither local nor
-        // loopback; an IPv6 listener takes IPv4 too.
-        assert_eq!(
-            announced_ips(ip("0.0.0.0"), none(), nics()),
-            [ip("198.51.100.7")]
-        );
-        assert_eq!(
-            announced_ips(ip("::"), none(), nics()),
-            [ip("198.51.100.7"), ip("2001:db8::7"), ip("203.0.113.5")]
-        );
-        // A socket factory's unspecified listener is never expanded; no
-        // listener names nothing.
-        let external = || Arc::new(ExternalIps::new(tokio::time::Instant::now()));
-        let any: SocketAddr = "[::]:6881".parse().unwrap();
-        assert_eq!(own_ips(Some(any), true, external())(), [] as [IpAddr; 0]);
-        assert_eq!(own_ips(None, false, external())(), [] as [IpAddr; 0]);
-        let one: SocketAddr = "198.51.100.8:6881".parse().unwrap();
-        assert_eq!(own_ips(Some(one), true, external())(), [ip("198.51.100.8")]);
-    }
-
-    #[test]
-    fn an_announce_names_our_external_address_of_each_family_the_listener_takes() {
-        // libtorrent session_impl::set_external_address keeps one external
-        // address to a listen socket, and so to a family.
-        use super::external_ip::Voter;
-        use super::{announced_ips, own_ips};
-        use std::net::{IpAddr, SocketAddr};
-        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        let now = tokio::time::Instant::now();
-        let external = Arc::new(ExternalIps::new(now));
-        external.cast_vote(ip("203.0.113.5"), Voter::Peer(ip("198.51.100.1")), now);
-        external.cast_vote(ip("2001:db8::5"), Voter::Peer(ip("2001:db8::1")), now);
-        let nics = || ["192.168.1.9", "198.51.100.7"].into_iter().map(ip);
-        assert_eq!(
-            announced_ips(ip("0.0.0.0"), external.get().into_iter(), nics()),
-            [ip("203.0.113.5"), ip("198.51.100.7")]
-        );
-        assert_eq!(
-            announced_ips(ip("::"), external.get().into_iter(), nics()),
-            [ip("203.0.113.5"), ip("2001:db8::5"), ip("198.51.100.7")]
-        );
-        // An address of ours named twice is named once.
-        let on_it: SocketAddr = "203.0.113.5:6881".parse().unwrap();
-        assert_eq!(
-            own_ips(Some(on_it), false, external.clone())(),
-            [ip("203.0.113.5")]
-        );
-        // The set is read as each announce goes out: a later address is in
-        // the next one.
-        let behind_nat: SocketAddr = "10.0.0.2:6881".parse().unwrap();
-        let later = Arc::new(ExternalIps::new(now));
-        let named = own_ips(Some(behind_nat), false, later.clone());
-        assert_eq!(named(), [] as [IpAddr; 0]);
-        later.cast_vote(ip("203.0.113.9"), Voter::Peer(ip("198.51.100.1")), now);
-        assert_eq!(named(), [ip("203.0.113.9")]);
     }
 
     #[test]

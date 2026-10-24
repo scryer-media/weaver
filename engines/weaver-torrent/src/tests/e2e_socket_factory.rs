@@ -35,7 +35,7 @@ use crate::{
 
 /// A `SocketFactory` over plain tokio sockets that counts every call.
 #[derive(Default)]
-struct CountingFactory {
+pub(super) struct CountingFactory {
     connect_tcp: AtomicUsize,
     listen_tcp: AtomicUsize,
     accept_tcp: Arc<AtomicUsize>,

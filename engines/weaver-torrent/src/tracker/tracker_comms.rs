@@ -49,9 +49,6 @@ pub struct TrackerComms {
     /// The port peers reach this session on, read when each announce goes
     /// out (see [`announced_port`]).
     announce_port: ListenPort,
-    /// Our own addresses an HTTP announce names (see [`AnnounceIps`]): the
-    /// run's that announces now (see [`TrackerTask::take_over`]).
-    announce_ips: Mutex<AnnounceIps>,
     /// Where an accepted announce's `external ip` goes.
     vote: ExternalIpVote,
     http_clients: Arc<dyn HttpClients>,
@@ -152,11 +149,6 @@ type Sender = tokio::sync::mpsc::Sender<SocketAddr>;
 /// lands after start), so each announce reads it as it goes out (libtorrent
 /// `session_impl::queue_tracker_request` sets `req.listen_port` per request).
 pub type ListenPort = tokio::sync::watch::Receiver<Option<u16>>;
-
-/// Our own addresses an HTTP announce names as `ipv4=` and `ipv6=` (BEP 7),
-/// read as each announce goes out (libtorrent `torrent::build_tracker_request`
-/// reads the session's listen sockets per request).
-pub type AnnounceIps = Arc<dyn Fn() -> Vec<IpAddr> + Send + Sync>;
 
 /// Takes the vote of a tracker that accepted an announce: the address it
 /// says we are at (`external ip`), then the tracker's own address, the one
@@ -1379,8 +1371,7 @@ pub struct TrackerTask {
 impl TrackerTask {
     /// The task, taken over by the run that follows the one that started it
     /// (a magnet's metadata fetch, then its download): it announces to
-    /// `tiers` under every one of `info_hashes` and names `announce_ips` as
-    /// ours from now on, and keeps what the trackers heard from it,
+    /// `tiers` under every one of `info_hashes` from now on, and keeps what the trackers heard from it,
     /// `started`, their intervals and their tracker ids, so they hear one
     /// torrent. A tracker the run leaves out that accepted `started` is sent
     /// `stopped`, as dropping the task would send it. A hash the task did
@@ -1388,12 +1379,7 @@ impl TrackerTask {
     /// of the same torrent. A task that announced under none of
     /// `info_hashes` was another torrent's: it is dropped, which sends
     /// `stopped`, and `None` is returned.
-    pub(crate) fn take_over(
-        self,
-        info_hashes: InfoHashes,
-        tiers: Vec<Vec<Url>>,
-        announce_ips: AnnounceIps,
-    ) -> Option<Self> {
+    pub(crate) fn take_over(self, info_hashes: InfoHashes, tiers: Vec<Vec<Url>>) -> Option<Self> {
         let runs = self.status.runs();
         if !runs
             .iter()
@@ -1402,9 +1388,6 @@ impl TrackerTask {
             return None;
         }
         let tiers = supported_tiers(tiers);
-        for comms in &runs {
-            *comms.announce_ips.lock() = announce_ips.clone();
-        }
         for (comms, gone) in self.status.replace_tiers(&tiers) {
             comms.send_stopped(gone, comms.stopped.register());
         }
@@ -1588,7 +1571,6 @@ impl TrackerComms {
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
         listen_port: ListenPort,
-        announce_ips: AnnounceIps,
         vote: ExternalIpVote,
         http_clients: Arc<dyn HttpClients>,
         reachable: Reachable,
@@ -1601,7 +1583,6 @@ impl TrackerComms {
             stats,
             force_interval,
             listen_port,
-            announce_ips,
             vote,
             http_clients,
             reachable,
@@ -1623,8 +1604,9 @@ impl TrackerComms {
     /// recorded in the returned [`TrackerStatus`]. `listen_port` is the port peers reach this
     /// session on, None when it accepts no connections; when it changes, each
     /// tier announces it as soon as its tracker's `min interval` allows.
-    /// `announce_ips` gives the addresses each HTTP announce names as ours,
-    /// and `vote` takes the address an accepted answer says is ours.
+    /// An announce names none of our addresses: the tracker takes the one it
+    /// was reached from. `vote` takes the address an accepted answer says is
+    /// ours.
     /// A tracker, HTTP or UDP, announce or scrape, every hop, is asked only
     /// at the addresses `reachable` lets through.
     ///
@@ -1643,7 +1625,6 @@ impl TrackerComms {
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
         listen_port: ListenPort,
-        announce_ips: AnnounceIps,
         vote: ExternalIpVote,
         http_clients: Arc<dyn HttpClients>,
         reachable: Reachable,
@@ -1682,7 +1663,6 @@ impl TrackerComms {
                     force_tracker_interval: force_interval,
                     tx: tx.clone(),
                     announce_port: listen_port.clone(),
-                    announce_ips: Mutex::new(announce_ips.clone()),
                     vote: vote.clone(),
                     http_clients: http_clients.clone(),
                     reachable: reachable.clone(),
@@ -1757,7 +1737,6 @@ impl TrackerComms {
             force_tracker_interval: self.force_tracker_interval,
             tx: self.tx.clone(),
             announce_port: self.announce_port.clone(),
-            announce_ips: Mutex::new(self.announce_ips.lock().clone()),
             vote: self.vote.clone(),
             http_clients: self.http_clients.clone(),
             reachable: self.reachable.clone(),
@@ -1987,8 +1966,6 @@ impl TrackerComms {
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
-        let announce_ips = self.announce_ips.lock().clone();
-        let ips = announce_ips();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
@@ -2001,11 +1978,9 @@ impl TrackerComms {
             compact: true,
             no_peer_id: false,
             event,
-            ip: None,
             numwant: numwant(event),
             key: Some(self.key),
             trackerid: trackerid.as_deref(),
-            ips: &ips,
         };
 
         let answer = tracker_comms_http::get(
@@ -2536,11 +2511,6 @@ mod tests {
         token.cancel();
     }
 
-    /// A torrent that names none of its own addresses.
-    fn no_ips() -> super::AnnounceIps {
-        Arc::new(Vec::new)
-    }
-
     /// Takes no tracker's vote.
     fn no_vote() -> super::ExternalIpVote {
         Arc::new(|_, _| {})
@@ -2563,56 +2533,6 @@ mod tests {
                 Ok(())
             }
         })
-    }
-
-    #[tokio::test]
-    async fn an_http_announce_names_our_addresses_as_they_are_when_it_goes_out() {
-        // BEP 7; libtorrent torrent::build_tracker_request reads the listen
-        // sockets per request.
-        let (listener, url) = http_listener().await;
-        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
-        let ips = Arc::new(Mutex::new(vec![std::net::IpAddr::from([198, 51, 100, 7])]));
-        let announce_ips: super::AnnounceIps = {
-            let ips = ips.clone();
-            Arc::new(move || ips.lock().clone())
-        };
-        let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
-        let mut peers = TrackerComms::start_with_tiers(
-            v1_hash(),
-            identity(),
-            vec![vec![url]],
-            Box::new(()),
-            None,
-            listen_port,
-            announce_ips,
-            no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
-            reach_all(),
-            udp_client,
-            StoppedAnnounces::default(),
-        )
-        .peers;
-        let first = tokio::select! {
-            _ = peers.next() => panic!("the tracker sent no peers"),
-            q = next_announce(&listener) => q,
-        };
-        assert_eq!(query_param(&first, "ipv4"), Some("198.51.100.7"));
-        assert_eq!(query_param(&first, "ipv6"), None);
-
-        *ips.lock() = vec!["2001:db8::1".parse().unwrap()];
-        port.send_replace(Some(40001));
-        let second = tokio::select! {
-            _ = peers.next() => panic!("the tracker sent no peers"),
-            q = next_announce(&listener) => q,
-        };
-        assert_eq!(query_param(&second, "ipv4"), None);
-        assert_eq!(query_param(&second, "ipv6"), Some("2001%3Adb8%3A%3A1"));
-        drop(peers);
-        token.cancel();
     }
 
     fn v1_hash() -> InfoHashes {
@@ -2645,7 +2565,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -2702,7 +2621,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -2719,7 +2637,7 @@ mod tests {
 
         // Taken over by a run that announces to b alone, under both hashes.
         let TrackerTask { mut peers, status } = TrackerTask { peers, status }
-            .take_over(hybrid, vec![vec![b_url.clone()]], no_ips())
+            .take_over(hybrid, vec![vec![b_url.clone()]])
             .expect("the task announced under one of the run's hashes");
         let left_out = async {
             let (conn, q) = read_announce(&a).await;
@@ -2784,7 +2702,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -2801,8 +2718,7 @@ mod tests {
 
         // A run under hashes the task never announced under does not take
         // it: the task ends, and a hears it stop.
-        let taken =
-            TrackerTask { peers, status }.take_over(other, vec![vec![a_url.clone()]], no_ips());
+        let taken = TrackerTask { peers, status }.take_over(other, vec![vec![a_url.clone()]]);
         assert!(taken.is_none());
         let (conn, q) = read_announce(&a).await;
         respond(conn, "d8:intervali1800e5:peers0:e").await;
@@ -2939,7 +2855,6 @@ mod tests {
             Box::new(()),
             None,
             listen_port,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -2992,7 +2907,6 @@ mod tests {
             Box::new(stats.clone()),
             None,
             listen_port,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -3050,7 +2964,6 @@ mod tests {
             Box::new(stats.clone()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -3126,7 +3039,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -3169,7 +3081,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| {
                 reqwest::Client::builder()
@@ -3234,7 +3145,6 @@ mod tests {
             Box::new(stats.clone()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -3373,7 +3283,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(reqwest::Client::builder),
             reach_all(),
@@ -3415,7 +3324,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -3686,7 +3594,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             Arc::new(move |ours, by| votes.send((ours, by)).unwrap()),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -3989,7 +3896,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             Arc::new(|| reqwest::Client::builder().no_proxy()),
             reach_all(),
@@ -4123,7 +4029,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             clients.clone(),
             reach_all(),
@@ -4377,7 +4282,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             clients.clone(),
             reach_but(vec![loopback], true),
@@ -4436,7 +4340,6 @@ mod tests {
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
-            no_ips(),
             no_vote(),
             clients.clone(),
             reach_but(vec![blocked], true),

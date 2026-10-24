@@ -207,6 +207,75 @@ async fn test_announced_port_is_the_one_the_session_listens_on() -> anyhow::Resu
     Ok(())
 }
 
+/// The query of the `started` announce a session makes for a torrent that
+/// takes its peers from its trackers alone.
+async fn trackers_only_started_query(opts: SessionOptions) -> anyhow::Result<String> {
+    let t = TestTorrent::new("test_announce_addresses", 2048, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_announce_addresses_out")?;
+    let session = Session::new_with_opts(out.path().into(), opts).await?;
+    session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                tracker_tiers: Some(vec![vec![url]]),
+                trackers_only: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    Ok(query)
+}
+
+fn assert_names_no_address(query: &str) {
+    for key in ["ip", "ipv4", "ipv6"] {
+        assert_eq!(param(query, key), None, "{key} in {query}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_an_announce_names_no_address_on_a_session_listening_on_every_interface()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let query = trackers_only_started_query(SessionOptions {
+        listen: Some(ListenerOptions {
+            mode: ListenerMode::TcpOnly,
+            listen_addr: (Ipv4Addr::UNSPECIFIED, 0).into(),
+            ..Default::default()
+        }),
+        ..tracker_session_opts()?
+    })
+    .await?;
+    assert_names_no_address(&query);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_an_announce_names_no_address_on_a_socket_factory_bound_to_a_source()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let factory = std::sync::Arc::new(super::e2e_socket_factory::CountingFactory::default());
+    let query = trackers_only_started_query(SessionOptions {
+        listen: Some(ListenerOptions {
+            mode: ListenerMode::TcpOnly,
+            listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+            ..Default::default()
+        }),
+        socket_factory: Some(factory),
+        ..tracker_session_opts()?
+    })
+    .await?;
+    assert_names_no_address(&query);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_partial_selection_announces_what_the_whole_torrent_lacks() -> anyhow::Result<()> {
     setup_test_logging();
