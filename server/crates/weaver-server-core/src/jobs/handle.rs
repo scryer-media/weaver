@@ -1700,6 +1700,9 @@ impl SchedulerHandle {
             inner.globals.shutting_down = true;
             Change::changed(())
         });
+        // An e2e hook held until shutdown is released by the same signal
+        // the pipeline reads.
+        crate::e2e_failpoint::release_shutdown_holds();
         Ok(())
     }
 }

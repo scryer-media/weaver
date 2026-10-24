@@ -626,7 +626,7 @@ func (ctx *restartCaseContext) startWeaverWithOptions(failpoint string, connecti
 		if strings.HasPrefix(entry, "WEAVER_E2E_FAILPOINT=") {
 			continue
 		}
-		if strings.HasPrefix(entry, "WEAVER_E2E_DELAY=") {
+		if strings.HasPrefix(entry, "WEAVER_E2E_DELAY=") || strings.HasPrefix(entry, "WEAVER_E2E_HOLD=") {
 			continue
 		}
 		if strings.HasPrefix(entry, "WEAVER_MAX_CONCURRENT_EXTRACTIONS=") {
