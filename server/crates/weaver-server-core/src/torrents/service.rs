@@ -827,8 +827,12 @@ struct Live {
     held: Option<Held>,
     about: About,
     counters: TorrentCounters,
-    // What the session reported at the last tick, for the ledger's deltas.
+    // What the session reported at the last kept reading, for the ledger's
+    // deltas.
     seen: Seen,
+    // The instant its durations were last advanced to, with what each ran
+    // past its whole seconds.
+    timed: Timed,
     engine: Engine,
     // Why the session last refused to pause or resume the torrent, until it
     // takes the next change.
@@ -931,6 +935,7 @@ impl Live {
             about: About::default(),
             counters,
             seen: Seen::default(),
+            timed: Timed::at(now),
             engine: Engine::Absent,
             run_error: None,
             queued: false,
@@ -961,7 +966,9 @@ impl Live {
     }
 
     // Fold what the session moved since the last reading into the ledger,
-    // as it leaves the session or is written at once.
+    // and run its durations to `now`: taken before anything changes what
+    // the torrent is doing, so what came before the change counts as what
+    // the torrent was doing then.
     fn settle(&mut self, now: i64) {
         let reading = self.reading(now);
         self.keep(reading);
@@ -978,6 +985,7 @@ impl Live {
         self.file_have = reading.file_have;
         self.counters = reading.counters;
         self.seen = reading.seen;
+        self.timed = reading.timed;
     }
 
     // What of the ledger and peers the database does not hold yet, taken
@@ -1084,14 +1092,32 @@ impl Live {
     }
 
     // What the session says of the torrent now, over what was kept of it:
-    // the one reading the views show and the ledger keeps.
+    // the one reading the views show and the ledger keeps. Its durations
+    // run to `now` as its bytes do: the time since the last kept reading
+    // is active while the session runs the torrent, and finished while it
+    // seeds.
     fn reading(&self, now: i64) -> Reading {
+        let mut reading = self.sampled(now);
+        let (state, _) = status::project(&self.observed(reading.engine.clone()));
+        reading.timed = self.timed.advanced(
+            now,
+            matches!(reading.engine, Engine::Live { .. }),
+            state == TorrentState::Seeding,
+            &mut reading.counters,
+        );
+        reading
+    }
+
+    // The session's figures for the torrent now, over what was kept of it,
+    // with its durations as last kept.
+    fn sampled(&self, now: i64) -> Reading {
         let Some(attached) = &self.attached else {
             return Reading {
                 engine: Engine::Absent,
                 file_have: self.file_have.clone(),
                 counters: self.counters,
                 seen: self.seen,
+                timed: self.timed,
                 moved: (0, 0),
                 speeds: (0, 0),
                 peers: (0, 0),
@@ -1143,6 +1169,7 @@ impl Live {
             file_have,
             counters,
             seen,
+            timed: self.timed,
             moved,
             speeds: live.map_or((0, 0), |live| {
                 (live.download_speed.as_bytes(), live.upload_speed.as_bytes())
@@ -1182,6 +1209,8 @@ struct Reading {
     counters: TorrentCounters,
     // The session's own totals, which the ledger's deltas are taken from.
     seen: Seen,
+    // The instant the counters' durations run to.
+    timed: Timed,
     // The bytes received and sent on the wire since the last kept reading.
     moved: (u64, u64),
     speeds: (u64, u64),
@@ -1205,6 +1234,52 @@ impl Seen {
     // Bytes received and thrown away this run.
     fn wasted(&self) -> u64 {
         self.discarded
+    }
+}
+
+// The instant a torrent's durations run to, and the milliseconds each ran
+// past the whole seconds its counter holds: a reading carries them over,
+// so no part of a second is lost between readings.
+#[derive(Debug, Clone, Copy)]
+struct Timed {
+    at_ms: i64,
+    active_ms: u64,
+    finished_ms: u64,
+}
+
+impl Timed {
+    fn at(now: i64) -> Self {
+        Self {
+            at_ms: now,
+            active_ms: 0,
+            finished_ms: 0,
+        }
+    }
+
+    // Run on to `now`: the time since runs into the active duration while
+    // `active`, and into the finished one while `seeding`. A clock stepped
+    // back credits nothing for that reading, and the next runs from `now`.
+    fn advanced(
+        self,
+        now: i64,
+        active: bool,
+        seeding: bool,
+        counters: &mut TorrentCounters,
+    ) -> Self {
+        let elapsed = u64::try_from(now - self.at_ms).unwrap_or(0);
+        let run = |part: u64, running: bool, seconds: &mut u64| {
+            if !running {
+                return part;
+            }
+            let ms = part.saturating_add(elapsed);
+            *seconds = seconds.saturating_add(ms / 1000);
+            ms % 1000
+        };
+        Self {
+            at_ms: now,
+            active_ms: run(self.active_ms, active, &mut counters.active_duration_s),
+            finished_ms: run(self.finished_ms, seeding, &mut counters.finished_duration_s),
+        }
     }
 }
 
@@ -1333,7 +1408,6 @@ struct Inner {
     ticks: watch::Sender<u64>,
     retired: watch::Sender<u64>,
     written: watch::Sender<Written>,
-    last_tick_ms: Mutex<Option<i64>>,
     queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1369,7 +1443,6 @@ impl TorrentService {
                 ticks: watch::channel(0).0,
                 retired: watch::channel(0).0,
                 written: watch::channel(Written::default()).0,
-                last_tick_ms: Mutex::new(None),
                 queue: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
@@ -1519,7 +1592,10 @@ impl TorrentService {
         self.inner.settings_changed.notify_one();
     }
 
+    // Every torrent is read before its session changes, as `stop` reads
+    // before the sessions close.
     async fn turn(&self, on: bool) {
+        self.read(self.inner.clock.now_ms(), true).await;
         self.inner.sessions.turn(on).await;
         self.run(on).await;
     }
@@ -1604,8 +1680,7 @@ impl TorrentService {
         // (qBittorrent saves only what changed as it exits, libtorrent
         // `torrent::write_resume_data` reads the peers off the torrent).
         let now = self.inner.clock.now_ms();
-        let elapsed_s = self.elapsed_s(now);
-        self.read(now, elapsed_s, true).await;
+        self.read(now, true).await;
         self.inner.sessions.stop_all().await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -1881,11 +1956,11 @@ impl TorrentService {
             if torrent.complete() {
                 return;
             }
+            torrent.settle(now);
             torrent.record.completed_at_ms = Some(now);
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
-            torrent.settle(now);
             self.queue_resume(torrent, now, true)
         };
         let _ = self.landed(landing).await;
@@ -2829,6 +2904,7 @@ impl TorrentService {
                 if !since.is_empty() {
                     handle.ban_peers(&since);
                 }
+                torrent.settle(self.inner.clock.now_ms());
                 torrent.attached = Some(Attached {
                     session,
                     handle,
@@ -2864,6 +2940,7 @@ impl TorrentService {
 
     async fn held(&self, job_id: JobId, key: Option<RouteKey>, held: Held) {
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
+            torrent.settle(self.inner.clock.now_ms());
             torrent.route = key.or(torrent.route.take());
             torrent.held = Some(held);
         }
@@ -2880,13 +2957,11 @@ impl TorrentService {
             self.save_checkpoint(job_id, job).await;
         }
         let now = self.inner.clock.now_ms();
+        torrent.settle(now);
         let landing = torrent
             .attached
             .is_some()
-            .then(|| {
-                torrent.settle(now);
-                self.queue_resume(torrent, now, true)
-            })
+            .then(|| self.queue_resume(torrent, now, true))
             .flatten();
         if let Some(attached) = torrent.attached.take() {
             let id = TorrentIdOrHash::Id(attached.handle.id());
@@ -3046,8 +3121,8 @@ impl TorrentService {
                     .db
                     .update_torrent_intent(job_id, intent)
                     .map_err(|error| ActionError::State(state_error(error)))?;
-                torrent.record.intent = intent;
                 torrent.settle(now);
+                torrent.record.intent = intent;
                 Ok(self.queue_resume(torrent, now, true))
             })
             .await?;
@@ -3059,6 +3134,7 @@ impl TorrentService {
     // is written, and the ledger and peers as they stand, queued.
     fn stop_torrent(&self, torrent: &mut Live, now: i64) -> Option<Landing> {
         let job_id = torrent.record.job_id;
+        torrent.settle(now);
         torrent.record.intent = TorrentIntent::Stopped;
         if let Err(error) = self
             .inner
@@ -3067,7 +3143,6 @@ impl TorrentService {
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's stop");
         }
-        torrent.settle(now);
         self.queue_resume(torrent, now, true)
     }
 
@@ -3345,6 +3420,7 @@ impl TorrentService {
                         "the torrent is already moving".to_owned(),
                     ));
                 }
+                torrent.settle(self.inner.clock.now_ms());
                 torrent.moving = Some(to.clone());
                 Ok(job.with(|job| {
                     job.relocate(to.clone());
@@ -3392,7 +3468,10 @@ impl TorrentService {
     // where it was.
     async fn moved(&self, job_id: JobId, outcome: Result<PathBuf, LeafError>) {
         let claimed = self
-            .with_torrent(job_id, |torrent| Ok(torrent.moving.take()))
+            .with_torrent(job_id, |torrent| {
+                torrent.settle(self.inner.clock.now_ms());
+                Ok(torrent.moving.take())
+            })
             .await
             .ok()
             .flatten();
@@ -3644,6 +3723,7 @@ impl TorrentService {
         for torrent in live.values_mut() {
             let job_id = torrent.record.job_id;
             let active = active.contains(&job_id);
+            torrent.settle(now);
             torrent.paused_by = torrent
                 .resumed()
                 .then(|| holds.reason_for(targets[&job_id]))
@@ -3667,11 +3747,12 @@ impl TorrentService {
     /// Read every torrent, keep their ledgers, follow their routes, and
     /// apply what that changes.
     pub async fn tick(&self) {
-        let now = self.inner.clock.now_ms();
-        let elapsed_s = self.elapsed_s(now);
         self.restore_jobs().await;
         self.follow_routes().await;
-        self.read(now, elapsed_s, false).await;
+        // Taken after the routes are followed, whose readings take their
+        // own: no reading in the tick runs from before one already kept.
+        let now = self.inner.clock.now_ms();
+        self.read(now, false).await;
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
         self.apply_goals(now).await;
@@ -3683,18 +3764,6 @@ impl TorrentService {
         self.inner.ticks.send_modify(|ticks| *ticks += 1);
     }
 
-    // The whole seconds since the last reading, as of `now`.
-    fn elapsed_s(&self, now: i64) -> u64 {
-        let mut last = self
-            .inner
-            .last_tick_ms
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let elapsed = last.map_or(0, |last| ((now - last).max(0) / 1000) as u64);
-        *last = Some(now);
-        elapsed
-    }
-
     // A torrent whose route changed moves to the new route's session, and
     // one whose peer terms changed goes through its session again; one
     // whose route went down is held, and comes back when it is up. A
@@ -3702,6 +3771,7 @@ impl TorrentService {
     // revoked under it, opens again, its torrents with it; one left on a
     // session its route no longer runs moves to the one it does.
     async fn follow_routes(&self) {
+        let now = self.inner.clock.now_ms();
         let settings = self.settings();
         let rules = self.rules();
         let outdated = self.inner.sessions.outdated().await;
@@ -3725,6 +3795,7 @@ impl TorrentService {
                     Ok(plan) => {
                         if let Some(reason) = &plan.down {
                             down.insert(plan.key.clone(), reason.clone());
+                            torrent.settle(now);
                             torrent.attached = None;
                             torrent.engine = Engine::Absent;
                             torrent.route = Some(plan.key);
@@ -3767,7 +3838,7 @@ impl TorrentService {
     // The session's figures for each torrent, and the ledger kept from
     // them: written whenever it changed, with its peers once a minute while
     // they change, or now when `at_once`.
-    async fn read(&self, now: i64, elapsed_s: u64, at_once: bool) {
+    async fn read(&self, now: i64, at_once: bool) {
         let mut landings = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
@@ -3777,14 +3848,6 @@ impl TorrentService {
                 torrent.speeds = reading.speeds;
                 torrent.peers = reading.peers;
                 torrent.keep(reading);
-                let (state, _) = status::project(&torrent.observed(torrent.engine.clone()));
-                if state == TorrentState::Seeding {
-                    torrent.counters.finished_duration_s += elapsed_s;
-                }
-                // Active is running in a session: not paused, held or queued.
-                if matches!(torrent.engine, Engine::Live { .. }) {
-                    torrent.counters.active_duration_s += elapsed_s;
-                }
                 // Queued in the step that took it, so ledgers land in the
                 // order they were read.
                 landings.extend(self.queue_resume(torrent, now, at_once));

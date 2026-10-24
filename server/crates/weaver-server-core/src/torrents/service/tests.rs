@@ -1926,6 +1926,256 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     seeding.stop().await;
 }
 
+// A torrent fetched whole from a seed on loopback and seeding, on a clock
+// the test sets.
+struct Seeded {
+    rig: Rig,
+    clock: Arc<SetClock>,
+    job_id: JobId,
+    seeder: Arc<Session>,
+    _seeds: tempfile::TempDir,
+}
+
+async fn seeded() -> Seeded {
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let private = metainfo("set", &files, 16_384, true);
+    let seeds = tempfile::tempdir().unwrap();
+    let seeder = seeder(seeds.path(), &private, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeder.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let bytes = announcing(&private, &tracker(peer).await);
+
+    let clock = set_clock();
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
+    on_loopback(&rig.routes);
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_completed()
+        .await
+        .unwrap();
+    seeding_view(&rig.service, &mut changes, job_id).await;
+    Seeded {
+        rig,
+        clock,
+        job_id,
+        seeder,
+        _seeds: seeds,
+    }
+}
+
+impl Seeded {
+    fn advance(&self, ms: i64) {
+        self.clock.0.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    async fn view(&self) -> TorrentView {
+        self.rig.service.torrent(self.job_id).await.unwrap()
+    }
+
+    fn kept(&self) -> TorrentCounters {
+        self.rig
+            .db
+            .get_torrent_counters(self.job_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn stop(self) {
+        self.rig.service.stop().await;
+        self.seeder.stop().await;
+    }
+}
+
+// A torrent's active time is read as of now, with its bytes: a view between
+// ticks counts the time since the last one, its averages are its bytes
+// over that time, and the tick lands the same figures in the ledger with no
+// step. Seeding time runs with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrents_active_time_reads_as_of_now_between_ticks() {
+    let seeded = seeded().await;
+    seeded.advance(1_000);
+    seeded.rig.service.tick().await;
+    let at_tick = seeded.view().await;
+    let kept = seeded.kept();
+    assert_eq!(at_tick.active_seconds, 1);
+    assert_eq!(
+        (
+            kept.active_duration_s,
+            kept.finished_duration_s,
+            kept.downloaded_bytes,
+        ),
+        (
+            at_tick.active_seconds,
+            at_tick.active_seconds,
+            at_tick.downloaded_bytes,
+        )
+    );
+
+    seeded.advance(7_000);
+    let later = seeded.view().await;
+    assert_eq!(later.active_seconds, at_tick.active_seconds + 7);
+    assert_eq!(
+        (later.download_avg_bps, later.upload_avg_bps),
+        (
+            later.downloaded_bytes / later.active_seconds,
+            later.uploaded_bytes / later.active_seconds,
+        )
+    );
+
+    seeded.advance(3_000);
+    let before = seeded.view().await;
+    seeded.rig.service.tick().await;
+    let after = seeded.view().await;
+    assert_eq!(before.active_seconds, at_tick.active_seconds + 10);
+    assert_eq!(
+        (after.active_seconds, after.download_avg_bps),
+        (before.active_seconds, before.download_avg_bps)
+    );
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.active_duration_s, kept.finished_duration_s),
+        (after.active_seconds, after.active_seconds)
+    );
+    seeded.stop().await;
+}
+
+// A pause takes the torrent's reading first: the time it ran since the
+// last tick is active and seeding, and the time it stays paused is
+// neither, between ticks or across one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pause_credits_the_time_before_it_and_nothing_after() {
+    let seeded = seeded().await;
+    seeded.advance(1_000);
+    seeded.rig.service.tick().await;
+    let at_tick = seeded.view().await;
+    seeded.advance(7_000);
+    seeded.rig.service.pause(seeded.job_id).await.unwrap();
+    let paused = seeded.view().await;
+    assert_eq!(paused.state, TorrentState::Paused);
+    assert_eq!(paused.active_seconds, at_tick.active_seconds + 7);
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.active_duration_s, kept.finished_duration_s),
+        (paused.active_seconds, paused.active_seconds)
+    );
+    seeded.advance(7_000);
+    assert_eq!(seeded.view().await.active_seconds, paused.active_seconds);
+    seeded.advance(3_000);
+    seeded.rig.service.tick().await;
+    assert_eq!(seeded.view().await.active_seconds, paused.active_seconds);
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.active_duration_s, kept.finished_duration_s),
+        (paused.active_seconds, paused.active_seconds)
+    );
+    seeded.stop().await;
+}
+
+// Turning torrents off reads every torrent before its session closes: the
+// time it ran since the last tick is in the ledger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_torrents_off_keeps_the_time_they_ran_since_the_tick() {
+    let seeded = seeded().await;
+    seeded.advance(1_000);
+    seeded.rig.service.tick().await;
+    let at_tick = seeded.view().await;
+    seeded.advance(7_000);
+    let mut settings = seeded.rig.service.settings();
+    settings.torrent.enabled = false;
+    seeded.rig.service.set_settings(settings).await;
+    let kept = seeded.kept();
+    assert_eq!(
+        (
+            kept.active_duration_s,
+            kept.finished_duration_s,
+            kept.downloaded_bytes,
+        ),
+        (
+            at_tick.active_seconds + 7,
+            at_tick.active_seconds + 7,
+            at_tick.downloaded_bytes,
+        )
+    );
+    let off = seeded.view().await;
+    assert_eq!(off.active_seconds, at_tick.active_seconds + 7);
+    seeded.advance(7_000);
+    assert_eq!(seeded.view().await.active_seconds, off.active_seconds);
+    seeded.stop().await;
+}
+
+// A clock stepped back credits nothing for the reading that sees it, and
+// the time from there on counts again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clock_stepped_back_credits_nothing_and_counts_on() {
+    let seeded = seeded().await;
+    seeded.advance(1_000);
+    seeded.rig.service.tick().await;
+    let at_tick = seeded.view().await.active_seconds;
+    seeded.advance(-60_000);
+    seeded.rig.service.tick().await;
+    assert_eq!(seeded.kept().active_duration_s, at_tick);
+    seeded.advance(7_000);
+    assert_eq!(seeded.view().await.active_seconds, at_tick + 7);
+    seeded.rig.service.tick().await;
+    assert_eq!(seeded.kept().active_duration_s, at_tick + 7);
+    seeded.stop().await;
+}
+
+// No part of a second is lost at a tick: ticks 2.4 s, 2.4 s, 1.6 s and
+// 1.6 s apart add the 8 s they span.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ticks_lose_no_part_of_a_second() {
+    let seeded = seeded().await;
+    seeded.rig.service.tick().await;
+    let base = seeded.view().await.active_seconds;
+    for ms in [2_400, 2_400] {
+        seeded.advance(ms);
+        seeded.rig.service.tick().await;
+    }
+    assert_eq!(seeded.kept().active_duration_s, base + 4);
+    for ms in [1_600, 1_600] {
+        seeded.advance(ms);
+        seeded.rig.service.tick().await;
+    }
+    assert_eq!(seeded.kept().active_duration_s, base + 8);
+    assert_eq!(seeded.view().await.active_seconds, base + 8);
+    seeded.stop().await;
+}
+
+// Readings 2.4 s and 2.4 s apart add 4 s, the 4.8 s rounded down once;
+// 1.6 s and 1.6 s add 3. A duration the torrent was not in takes nothing.
+#[test]
+fn a_reading_carries_the_part_of_a_second_to_the_next() {
+    let run = |steps: &[i64]| {
+        let mut counters = TorrentCounters::default();
+        let mut timed = Timed::at(EPOCH_MS);
+        let mut now = EPOCH_MS;
+        for step in steps {
+            now += step;
+            timed = timed.advanced(now, true, false, &mut counters);
+        }
+        (counters.active_duration_s, counters.finished_duration_s)
+    };
+    assert_eq!(run(&[2_400, 2_400]), (4, 0));
+    assert_eq!(run(&[1_600, 1_600]), (3, 0));
+    assert_eq!(run(&[999]), (0, 0));
+    assert_eq!(run(&[999, 1]), (1, 0));
+    // Stepped back 60 s: nothing for that reading, then 7 s from there.
+    assert_eq!(run(&[1_000, -60_000]), (1, 0));
+    assert_eq!(run(&[1_000, -60_000, 7_000]), (8, 0));
+}
+
 // Starting never waits on a route. After a restart whose route has not
 // answered, the service starts with its torrents waiting: the torrent at
 // the tick, the magnet on the task that fetches its metainfo. Once the
