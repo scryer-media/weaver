@@ -34,17 +34,7 @@ impl ServersQuery {
             .into_iter()
             .map(|snapshot| (snapshot.server_id, snapshot))
             .collect::<std::collections::HashMap<_, _>>();
-        // TLS diagnostics decorate the rows; a failure to load them leaves the
-        // rows undecorated instead of failing the list.
-        let tls_diagnostics = load_tls_diagnostics_by_server(db)
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(
-                    error = ?error.message,
-                    "could not load server TLS diagnostics; listing servers without them"
-                );
-                std::collections::HashMap::new()
-            });
+        let tls_diagnostics = load_tls_diagnostics_by_server(db).await;
         Ok(
             with_timed_config_read(config, "servers.query.servers", |cfg| {
                 cfg.servers
@@ -98,17 +88,28 @@ impl ServersQuery {
     }
 }
 
+/// TLS diagnostics decorate server rows; a failure to load them leaves the
+/// rows undecorated instead of failing the list that carries them.
 pub(crate) async fn load_tls_diagnostics_by_server(
     db: &Database,
-) -> Result<std::collections::HashMap<u32, weaver_server_core::servers::ServerTlsDiagnostics>> {
+) -> std::collections::HashMap<u32, weaver_server_core::servers::ServerTlsDiagnostics> {
     let db = db.clone();
     let rows =
         crate::observability::spawn_blocking_db("servers.query.tls_diagnostics", move || {
             db.list_server_tls_diagnostics()
         })
-        .await?;
-    Ok(rows
-        .into_iter()
-        .map(|diagnostics| (diagnostics.server_id, diagnostics))
-        .collect())
+        .await;
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|diagnostics| (diagnostics.server_id, diagnostics))
+            .collect(),
+        Err(error) => {
+            tracing::warn!(
+                error = ?error.message,
+                "could not load server TLS diagnostics; listing servers without them"
+            );
+            std::collections::HashMap::new()
+        }
+    }
 }

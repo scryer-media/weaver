@@ -291,7 +291,7 @@ impl ServersMutation {
             .into_iter()
             .map(|snapshot| (snapshot.server_id, snapshot))
             .collect::<std::collections::HashMap<_, _>>();
-        let tls_diagnostics = load_tls_diagnostics_by_server(db).await?;
+        let tls_diagnostics = load_tls_diagnostics_by_server(db).await;
         Ok(remaining
             .iter()
             .map(|server| {
