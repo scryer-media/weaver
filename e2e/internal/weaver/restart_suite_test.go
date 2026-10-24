@@ -59,6 +59,26 @@ func TestRestartCasesIncludeDirectStorePar2AliasRegression(t *testing.T) {
 	t.Fatalf("restart suite does not include %s", caseName)
 }
 
+// The full run seeds the restart NNTP image once from the restart seed profile
+// and the suite seeds nothing per case while that image is active, so a slug a
+// case names but the profile lacks is missing from the full run alone.
+func TestRestartSeedProfileCoversEveryRestartCaseSlug(t *testing.T) {
+	seeded := map[string]bool{}
+	for _, slug := range fixtureSlugsForSeedProfile("restart") {
+		seeded[slug] = true
+	}
+	for _, tc := range restartCases() {
+		if len(tc.Slugs) == 0 {
+			t.Errorf("%s names no fixture", tc.Name)
+		}
+		for _, slug := range tc.Slugs {
+			if !seeded[slug] {
+				t.Errorf("%s names %s, which the restart seed profile does not seed", tc.Name, slug)
+			}
+		}
+	}
+}
+
 func TestRestartCasesIncludeConventional7zDamagedBlockRepair(t *testing.T) {
 	const caseName = "conventional_7z_damaged_block_repairs_once"
 	for _, tc := range restartCases() {
@@ -71,7 +91,7 @@ func TestRestartCasesIncludeConventional7zDamagedBlockRepair(t *testing.T) {
 		if tc.Run == nil {
 			t.Fatalf("%s has no flow", caseName)
 		}
-		for _, slug := range restartFixtureSlugs {
+		for _, slug := range fixtureSlugsForSeedProfile("restart") {
 			if slug == conventional7zRepairSlug {
 				return
 			}
