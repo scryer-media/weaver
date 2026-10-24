@@ -1678,6 +1678,11 @@ fn resolve_queue_item_state(
 pub fn queue_item_state_from_job_info_for_download_accounting(
     info: &weaver_server_core::JobInfo,
 ) -> QueueItemState {
+    // The control and terminal lanes rule here as everywhere: a started
+    // download the global pause holds is Paused, not active.
+    if let Some(state) = terminal_queue_item_state(info) {
+        return state;
+    }
     // A started download that holds no lane right now has still started for
     // the counters, unless propagation holds it.
     if info.status == weaver_server_core::JobStatus::Downloading
