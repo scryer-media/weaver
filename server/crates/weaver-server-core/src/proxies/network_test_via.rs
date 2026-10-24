@@ -14,9 +14,11 @@ pub use weaver_tunnel::resolution::record::{
 };
 use weaver_tunnel::{fault, pipe::Purpose, resolution::record::Recording};
 
-use crate::speed_test::torrent::{P2pPath, P2pPlan, probe as p2p_probe};
+use crate::settings::TorrentConfig;
+use crate::speed_test::torrent::{P2pLeg, P2pPath, P2pPlan, probe as p2p_probe};
 use crate::speed_test::{P2pReport, TestTorrentSource};
 use crate::torrents::net::LegKind;
+use crate::torrents::sessions::{leg_down, leg_kind, names_on};
 
 // The most paths one test tries, counting a pool under test by its members.
 pub const MAX_TEST_PATHS: usize = 64;
@@ -64,9 +66,12 @@ pub struct PathTest {
     pub p2p: Option<P2pReport>,
 }
 
-// A test torrent run over each path that reaches its target.
+// A test torrent run over each path that reaches its target, under the
+// torrent settings as they stand.
 struct P2pTest {
     source: TestTorrentSource,
+    torrent: TorrentConfig,
+    allow_private_network: bool,
 }
 
 // A path's stages: the one beneath the proxy under test, and that proxy on
@@ -83,8 +88,11 @@ struct Probe {
     // How long the path's last hop waits.
     wait: Duration,
     stages: Stages,
-    // How a torrent session would ride the path.
+    // How a torrent session would ride the path, why it carries nothing
+    // now when it does not, and who resolves its names.
     kind: LegKind,
+    down: Option<String>,
+    names: Option<ResolvedBy>,
 }
 
 // The runtime a test builds its paths in. It is shut down when the test
@@ -183,11 +191,17 @@ impl NetworkRuntime {
         subject: TestSubject,
         target: Option<(String, u16)>,
         source: TestTorrentSource,
+        torrent: TorrentConfig,
+        allow_private_network: bool,
     ) -> Result<Vec<PathTest>, NetworkRefusal> {
         let target = target
             .filter(|(host, _)| !host.trim().is_empty())
             .or_else(|| Some(source.target()));
-        let p2p = P2pTest { source };
+        let p2p = P2pTest {
+            source,
+            torrent,
+            allow_private_network,
+        };
         self.test_paths(route, subject, target, Some(p2p)).await
     }
 
@@ -334,10 +348,21 @@ impl NetworkRuntime {
         for (leg, egress_id, carriers) in paths {
             let bottom = Self::bottom(&config, egress_id, ROUTE_TEST_WAIT)
                 .map_err(|_| NetworkRefusal::RouteEgressMissing)?;
-            let direct = match bottom.binding() {
-                SocketEgress::System => LegKind::System,
-                SocketEgress::Interface(name) => LegKind::Interface(name.clone()),
-                SocketEgress::SourceAddress(address) => LegKind::SourceAddress(*address),
+            // The leg a torrent route through this path would be, and how its
+            // session would ride it.
+            let torrent_leg = |rung: Option<Rung>| {
+                let path = match rung {
+                    None => LegPath::Direct,
+                    Some(rung) => LegPath::Ladder {
+                        rungs: vec![rung],
+                        direct_fallback: false,
+                    },
+                };
+                (
+                    leg_kind(self, egress_id, &path),
+                    leg_down(self, egress_id),
+                    names_on(self, &path),
+                )
             };
             let beneath = self.carriers(&config, &carriers, &bottom);
             if let Some(pool) = pool {
@@ -354,13 +379,16 @@ impl NetworkRuntime {
                     let top: Arc<dyn Dialer> = PoolStage::new(pool, members, self.handle.clone());
                     Ok((stage, Some(top)))
                 });
+                let (kind, down, names) = torrent_leg(Some(Rung::Pool { id: pool }));
                 probes.push(Probe {
                     leg,
                     egress_id,
                     carriers,
                     subject: None,
                     pool: Some(pool),
-                    kind: LegKind::Ladder,
+                    kind,
+                    down,
+                    names,
                     wait: subjects
                         .iter()
                         .flatten()
@@ -380,15 +408,19 @@ impl NetworkRuntime {
                         .map(|top| (stage, Some(top)))
                         .map_err(|detail| (ProxyFault::Other { detail }, Some(*id))),
                 });
-                let kind = match (subject, carriers.is_empty()) {
-                    (None, true) => direct.clone(),
-                    _ => LegKind::Ladder,
-                };
+                let ids: Vec<u32> = carriers.iter().copied().chain(*subject).collect();
+                let (kind, down, names) = torrent_leg(match ids.as_slice() {
+                    [] => None,
+                    [id] => Some(Rung::Proxy { id: *id }),
+                    _ => Some(Rung::Chain { ids }),
+                });
                 let subject = subject.and_then(|id| config.profiles.get(&id).cloned());
                 probes.push(Probe {
                     leg,
                     egress_id,
                     kind,
+                    down,
+                    names,
                     carriers: carriers.clone(),
                     wait: subject
                         .as_ref()
@@ -516,21 +548,26 @@ impl Probe {
         // The test torrent runs over a path that reached its target.
         let p2p = match (p2p, &outcome, &self.stages) {
             (Some(test), Ok(_), Ok((beneath, top))) => {
-                let stop = std::pin::pin!(std::future::pending::<()>());
-                Some(
-                    p2p_probe(
-                        P2pPath {
-                            stage: top.as_ref().unwrap_or(beneath).clone(),
-                            kind: self.kind.clone(),
-                        },
-                        &P2pPlan {
+                let opened = P2pPath::open(P2pLeg {
+                    kind: self.kind.clone(),
+                    stage: top.as_ref().unwrap_or(beneath).clone(),
+                    down: self.down.clone(),
+                    names: self.names,
+                    torrent: test.torrent.clone(),
+                    allow_private_network: test.allow_private_network,
+                })
+                .await;
+                Some(match opened {
+                    Ok(path) => {
+                        let stop = std::pin::pin!(std::future::pending::<()>());
+                        let plan = P2pPlan {
                             source: test.source.clone(),
                             upload_budget: None,
-                        },
-                        stop,
-                    )
-                    .await,
-                )
+                        };
+                        p2p_probe(path, &plan, stop).await
+                    }
+                    Err(error) => P2pReport::failed(error),
+                })
             }
             _ => None,
         };

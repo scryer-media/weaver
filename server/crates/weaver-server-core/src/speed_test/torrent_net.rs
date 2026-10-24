@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, IoSliceMut};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,8 +25,6 @@ use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
 };
 use weaver_torrent::{ManagedTorrentShared, SocketFactory, StreamListener, TorrentMetadata};
-
-use crate::torrents::net::{LegKind, LegSockets};
 
 // A peer that sent this much answered the handshake.
 const HANDSHAKE_LEN: u64 = 68;
@@ -118,24 +116,15 @@ impl Watched {
     }
 }
 
-// The sockets of a path, every connection watched.
+// The sockets of the test session's leg, every connection watched.
 pub(super) struct ProbeSockets {
-    inner: LegSockets,
-    kind: LegKind,
+    inner: Arc<dyn SocketFactory>,
     watched: Arc<Watched>,
 }
 
 impl ProbeSockets {
-    pub(super) fn new(
-        stage: Arc<dyn weaver_tunnel::pipe::Dialer>,
-        kind: LegKind,
-        watched: Arc<Watched>,
-    ) -> Self {
-        Self {
-            inner: LegSockets::new(stage, &kind),
-            kind,
-            watched,
-        }
+    pub(super) fn new(inner: Arc<dyn SocketFactory>, watched: Arc<Watched>) -> Self {
+        Self { inner, watched }
     }
 }
 
@@ -170,17 +159,7 @@ impl SocketFactory for ProbeSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
         Box::pin(async move {
-            let ip = match &self.kind {
-                LegKind::Ladder => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "this path cannot listen",
-                    ));
-                }
-                LegKind::SourceAddress(ip) => *ip,
-                LegKind::System | LegKind::Interface(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            };
-            let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, addr.port())).await?;
+            let listener = self.inner.listen_tcp(addr).await?;
             Ok(Box::new(WatchedListener {
                 listener,
                 watched: self.watched.clone(),
@@ -196,26 +175,24 @@ impl SocketFactory for ProbeSockets {
     }
 }
 
+// The leg's listener, every peer it takes in counted.
 struct WatchedListener {
-    listener: tokio::net::TcpListener,
+    listener: Box<dyn StreamListener>,
     watched: Arc<Watched>,
 }
 
 impl StreamListener for WatchedListener {
     fn local_addr(&self) -> SocketAddr {
-        self.listener
-            .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))
+        self.listener.local_addr()
     }
 
     fn accept<'a>(
         &'a self,
     ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
         Box::pin(async move {
-            let (stream, peer) = self.listener.accept().await?;
+            let (peer, read, write) = self.listener.accept().await?;
             self.watched.inbound.fetch_add(1, Ordering::AcqRel);
             self.watched.wake();
-            let (read, write) = stream.into_split();
             let state = Arc::new(Connection {
                 peer,
                 outgoing: false,
@@ -223,7 +200,7 @@ impl StreamListener for WatchedListener {
                 frames: Mutex::default(),
                 watched: self.watched.clone(),
             });
-            let (read, write) = state.wrap(Box::new(read), Box::new(write));
+            let (read, write) = state.wrap(read, write);
             Ok((peer, read, write))
         })
     }
@@ -719,7 +696,9 @@ impl TorrentStorage for HeldPieces {
 
 #[cfg(test)]
 mod tests {
-    use weaver_torrent::network::{Resolved, Resolver};
+    use std::net::IpAddr;
+
+    use weaver_torrent::network::{KernelSockets, Resolved, Resolver};
     use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Resolution, Target};
 
     use super::*;
@@ -757,5 +736,27 @@ mod tests {
             Resolved::Addresses(vec![SocketAddr::from(([192, 0, 2, 3], 6969))])
         );
         assert_eq!(*path.0.lock().unwrap(), ["tracker.test"]);
+    }
+
+    // A peer the leg's listener takes in is counted, whichever sockets the
+    // leg opens.
+    #[tokio::test]
+    async fn a_peer_taken_in_is_counted() {
+        let watched = Arc::new(Watched::new());
+        let sockets = ProbeSockets::new(
+            Arc::new(KernelSockets::new(None).unwrap()),
+            watched.clone(),
+        );
+        let listener = sockets
+            .listen_tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap();
+        let (dialed, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr()),
+            listener.accept()
+        );
+        dialed.unwrap();
+        accepted.unwrap();
+        assert_eq!(watched.inbound(), 1);
     }
 }

@@ -181,3 +181,130 @@ impl UtpSocket {
         }
     }
 }
+
+/// The kernel sockets a session opens when it is given no factory, as a
+/// factory: TCP dialled and listened on, and UDP bound, by the same calls
+/// and on the same device. A caller that watches a session's sockets wraps
+/// this and hands the session the wrapper.
+pub struct KernelSockets {
+    bind_device: Option<librqbit_dualstack_sockets::BindDevice>,
+}
+
+impl KernelSockets {
+    /// The kernel sockets of a session bound to `bind_device_name`, or to
+    /// none.
+    pub fn new(bind_device_name: Option<&str>) -> anyhow::Result<Self> {
+        let bind_device = bind_device_name
+            .map(librqbit_dualstack_sockets::BindDevice::new_from_name)
+            .transpose()?;
+        Ok(Self { bind_device })
+    }
+
+    fn bind_opts(&self) -> librqbit_dualstack_sockets::BindOpts<'_> {
+        librqbit_dualstack_sockets::BindOpts {
+            request_dualstack: true,
+            reuseport: false,
+            device: self.bind_device.as_ref(),
+        }
+    }
+}
+
+impl SocketFactory for KernelSockets {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(async move {
+            let stream = librqbit_dualstack_sockets::tcp_connect(
+                addr,
+                librqbit_dualstack_sockets::ConnectOpts {
+                    source_port: None,
+                    bind_device: self.bind_device.as_ref(),
+                },
+            )
+            .await
+            .map_err(io::Error::other)?;
+            let (read, write) = stream.into_split();
+            Ok((
+                Box::new(read) as BoxAsyncReadVectored,
+                Box::new(write) as BoxAsyncWrite,
+            ))
+        })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        Box::pin(async move {
+            let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(addr, self.bind_opts())
+                .map_err(io::Error::other)?;
+            Ok(Box::new(KernelListener(listener)) as Box<dyn StreamListener>)
+        })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts())
+                .map_err(io::Error::other)?;
+            Ok(Arc::new(KernelUdp(socket)) as Arc<dyn DatagramSocket>)
+        })
+    }
+}
+
+struct KernelListener(librqbit_dualstack_sockets::TcpListener);
+
+impl StreamListener for KernelListener {
+    fn local_addr(&self) -> SocketAddr {
+        self.0.bind_addr()
+    }
+
+    fn accept<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(async move {
+            let (stream, peer) = self.0.accept().await?;
+            let (read, write) = stream.into_split();
+            Ok((
+                peer,
+                Box::new(read) as BoxAsyncReadVectored,
+                Box::new(write) as BoxAsyncWrite,
+            ))
+        })
+    }
+}
+
+struct KernelUdp(librqbit_dualstack_sockets::UdpSocket);
+
+impl DatagramSocket for KernelUdp {
+    fn bind_addr(&self) -> SocketAddr {
+        self.0.bind_addr()
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        Box::pin(self.0.recv_from(buf))
+    }
+
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        Box::pin(self.0.send_to(buf, target))
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_send_to(cx, buf, target)
+    }
+}

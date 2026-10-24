@@ -7,6 +7,7 @@ use weaver_server_core::proxies::TorrentScope;
 use weaver_server_core::torrents::service::{
     ScheduleSeeding, SeedingSource, TorrentRoute, TorrentView,
 };
+use weaver_server_core::torrents::net::Exposure;
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
@@ -207,6 +208,36 @@ impl From<PortMapped> for TorrentPortMappingGql {
     }
 }
 
+/// What a torrent session shows the trackers and peers it reaches.
+#[derive(Clone, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "TorrentExposure")]
+pub struct TorrentExposureGql {
+    /// Who resolves the names the session looks up.
+    pub resolved_by: Option<ResolvedBy>,
+    /// The address a tracker sees; none until one is known.
+    pub address: Option<String>,
+    /// The port announced; 0 when none is.
+    pub announced_port: u16,
+    pub inbound: bool,
+    pub udp_trackers: bool,
+    pub dht: bool,
+    pub utp: bool,
+}
+
+impl From<Exposure> for TorrentExposureGql {
+    fn from(exposure: Exposure) -> Self {
+        Self {
+            resolved_by: exposure.resolved_by.map(Into::into),
+            address: exposure.address.map(|ip| ip.to_string()),
+            announced_port: exposure.announced_port,
+            inbound: exposure.inbound,
+            udp_trackers: exposure.udp_trackers,
+            dht: exposure.dht,
+            utp: exposure.utp,
+        }
+    }
+}
+
 /// A torrent route and whether peers can reach its session.
 #[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "TorrentRoute")]
@@ -226,6 +257,8 @@ pub struct TorrentRouteGql {
     pub reason: Option<String>,
     /// Who resolves the names its sessions look up.
     pub resolved_by: Option<ResolvedBy>,
+    /// What its session shows trackers and peers, while open.
+    pub exposure: Option<TorrentExposureGql>,
 }
 
 /// The reason of a route with no session whose leg is up.
@@ -253,6 +286,10 @@ impl From<TorrentRoute> for TorrentRouteGql {
                 .as_ref()
                 .map(|session| session.mappings.iter().cloned().map(Into::into).collect())
                 .unwrap_or_default(),
+            exposure: session
+                .as_ref()
+                .and_then(|session| session.exposure)
+                .map(Into::into),
             external_addresses: session
                 .map(|session| session.external.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),

@@ -2307,6 +2307,7 @@ enum P2pStep {
 type P2pTestResult {
 	rungs: [P2pRung!]!
 	mappedPort: Int
+	exposure: TorrentExposure
 }
 
 type ParsedEpisode {
@@ -5074,6 +5075,28 @@ enum TorrentEncryption {
 	REQUIRE
 }
 
+"""
+What a torrent session shows the trackers and peers it reaches.
+"""
+type TorrentExposure {
+	"""
+	Who resolves the names the session looks up.
+	"""
+	resolvedBy: ResolvedBy
+	"""
+	The address a tracker sees; none until one is known.
+	"""
+	address: String
+	"""
+	The port announced; 0 when none is.
+	"""
+	announcedPort: Int!
+	inbound: Boolean!
+	udpTrackers: Boolean!
+	dht: Boolean!
+	utp: Boolean!
+}
+
 type TorrentFile {
 	index: Int!
 	path: String!
@@ -5228,6 +5251,10 @@ type TorrentRoute {
 	Who resolves the names its sessions look up.
 	"""
 	resolvedBy: ResolvedBy
+	"""
+	What its session shows trackers and peers, while open.
+	"""
+	exposure: TorrentExposure
 }
 
 """

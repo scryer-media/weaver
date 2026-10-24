@@ -11,33 +11,42 @@
 use std::collections::HashSet;
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bitvec::boxed::BitBox;
 use bitvec::order::Msb0;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use weaver_torrent::core::lengths::Lengths;
 use weaver_torrent::tracker::Tracker;
+use weaver_torrent::upnp::{PortMapped, PortmapProtocol};
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, Checkpoint, ConnectionOptions, HttpClients, ListenerMode,
-    ListenerOptions, ManagedTorrent, PiecePriority, Session, SessionOptions, TrackerAnnounce,
+    AddTorrent, AddTorrentOptions, Checkpoint, IpFilter, ManagedTorrent, PiecePriority, Session,
+    SessionOptions, TrackerAnnounce,
 };
+use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::pipe::Dialer;
 
 use super::progress::StreamProvider;
 use super::torrent_net::{PieceStore, ProbeSockets, Watched};
-use crate::proxies::{FetchPath, start_bridge};
+use crate::proxies::{
+    AttemptError, FetchOptions, FetchPath, ResolvedBy, fetch_on, read_body, start_bridge,
+};
+use crate::settings::TorrentConfig;
 use crate::torrents::identity::IDENTITY;
-use crate::torrents::net::{LegClients, LegKind, LegNames};
+use crate::torrents::net::{Exposure, LegKind};
+use crate::torrents::sessions::{OpenLeg, SessionError, session_options};
 
 // Where the test torrent is found: the directory of the current Debian
 // netinst torrents.
 pub const DEBIAN_TORRENTS: &str = "https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/";
 // The directory listing and the torrent may be no larger than this.
-const FETCH_LIMIT: usize = 1024 * 1024;
+const FETCH_LIMIT: u64 = 1024 * 1024;
+// How long one fetch of the listing or the torrent may take, redirects
+// included.
+const FETCH_WAIT: Duration = Duration::from_secs(60);
 // The most peers the test talks to at once.
 const PEER_LIMIT: usize = 8;
 // How long the test waits for its piece.
@@ -123,10 +132,17 @@ pub struct P2pReport {
     pub rungs: Vec<P2pRung>,
     // The port a gateway mapped to the test session's listener.
     pub mapped_port: Option<u16>,
+    // What the test session showed trackers and peers, once it opened.
+    pub exposure: Option<Exposure>,
     pub upload: Option<PeerUpload>,
 }
 
 impl P2pReport {
+    // A test whose path could not be opened: its first step failed.
+    pub(crate) fn failed(error: String) -> Self {
+        failed_at(P2pStep::Torrent, error)
+    }
+
     pub fn passed(&self, step: P2pStep) -> bool {
         self.rungs
             .iter()
@@ -134,10 +150,91 @@ impl P2pReport {
     }
 }
 
-// The path a test torrent runs over.
-pub(crate) struct P2pPath {
-    pub stage: Arc<dyn Dialer>,
+// What a test torrent's path opens from: the leg of the route under test,
+// as a route's session would ride it.
+pub(crate) struct P2pLeg {
     pub kind: LegKind,
+    // The leg's dialer.
+    pub stage: Arc<dyn Dialer>,
+    // Why the leg carries nothing now, when it does not.
+    pub down: Option<String>,
+    // Who resolves the names a session on the leg looks up.
+    pub names: Option<ResolvedBy>,
+    // The torrent settings as they stand.
+    pub torrent: TorrentConfig,
+    pub allow_private_network: bool,
+}
+
+// The path a test torrent runs over: the leg its session rides, opened as a
+// route's session opens its leg, and the dialer it is fetched through. A
+// ladder leg's bridge is revoked as the path closes.
+pub(crate) struct P2pPath {
+    stage: Arc<dyn Dialer>,
+    leg: OpenLeg,
+    bridge: Option<Arc<Bridge>>,
+    down: Option<String>,
+    names: Option<ResolvedBy>,
+    torrent: TorrentConfig,
+    allow_private_network: bool,
+}
+
+impl P2pPath {
+    pub(crate) async fn open(leg: P2pLeg) -> Result<Self, String> {
+        let bridge = match leg.kind {
+            LegKind::Ladder => Some(start_bridge(
+                StreamProvider::new(Arc::clone(&leg.stage), None) as Arc<dyn FetchPath>,
+            )?),
+            _ => None,
+        };
+        match OpenLeg::on(
+            leg.kind,
+            Arc::clone(&leg.stage),
+            bridge.clone(),
+            None,
+        ) {
+            Ok(open) => Ok(Self {
+                stage: leg.stage,
+                leg: open,
+                bridge,
+                down: leg.down,
+                names: leg.names,
+                torrent: leg.torrent,
+                allow_private_network: leg.allow_private_network,
+            }),
+            Err(error) => {
+                if let Some(bridge) = bridge {
+                    bridge.revoke().await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn close(self) {
+        if let Some(bridge) = self.bridge {
+            bridge.revoke().await;
+        }
+    }
+
+    // The options of the test session keeping its state in `dir`: a route's
+    // session's on the same leg, under the same settings, listening on a
+    // port of its own and announcing that port, with the test's peer limit
+    // and the IP filter of no blocklist.
+    pub(crate) fn session_options(&self, dir: &Path) -> SessionOptions {
+        let torrent = TorrentConfig {
+            announce_port: None,
+            ..self.torrent.clone()
+        };
+        session_options(
+            &self.leg,
+            0,
+            dir,
+            PEER_LIMIT,
+            &torrent,
+            IpFilter::default(),
+            &IDENTITY.identity(),
+        )
+    }
 }
 
 pub(crate) struct P2pPlan {
@@ -163,15 +260,14 @@ pub(crate) async fn probe(
 ) -> P2pReport {
     let fetched = tokio::select! {
         biased;
-        () = stop.as_mut() => return failed_at(P2pStep::Torrent, "stopped".into()),
-        fetched = TestTorrent::fetch(path.stage.clone(), &plan.source) => fetched,
+        () = stop.as_mut() => Err("stopped".into()),
+        fetched = TestTorrent::fetch(&path, &plan.source) => fetched,
     };
-    let torrent = match fetched {
-        Ok(torrent) => torrent,
-        Err(error) => return failed_at(P2pStep::Torrent, error),
+    let report = match fetched {
+        Ok(torrent) => run(&path, plan, &torrent, stop).await,
+        Err(error) => failed_at(P2pStep::Torrent, error),
     };
-    let report = run(&path, plan, &torrent, stop).await;
-    torrent.close().await;
+    path.close().await;
     report
 }
 
@@ -196,21 +292,9 @@ fn failed_at(step: P2pStep, error: String) -> P2pReport {
             })
             .collect(),
         mapped_port: None,
+        exposure: None,
         upload: None,
     }
-}
-
-// The test torrent's HTTP clients, which ride the path's bridge as a
-// session's on a ladder leg do.
-fn http_client(bridge: Arc<weaver_tunnel::bridge::Bridge>) -> Arc<dyn HttpClients> {
-    Arc::new(LegClients {
-        base: || {
-            Ok(reqwest::Client::builder()
-                .user_agent(IDENTITY.user_agent())
-                .read_timeout(Duration::from_secs(30)))
-        },
-        bridge: Some(bridge),
-    })
 }
 
 // The netinst torrent a directory listing names.
@@ -229,60 +313,63 @@ pub(crate) fn pick_torrent(listing: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn get_capped(client: &reqwest::Client, url: &reqwest::Url) -> Result<Vec<u8>, String> {
-    let mut response = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|error| format!("GET {url} failed: {error}"))?;
+// GET `url` over `path`'s leg, its addresses checked and pinned on every
+// hop as a torrent added by URL is fetched; nothing goes out while the leg
+// is down.
+async fn get_capped(path: &P2pPath, url: &reqwest::Url) -> Result<Vec<u8>, String> {
+    if let Some(reason) = &path.down {
+        return Err(SessionError::RouteDown(reason.clone()).to_string());
+    }
+    let over = StreamProvider::new(Arc::clone(&path.stage), None) as Arc<dyn FetchPath>;
+    let options = FetchOptions {
+        label: "test torrent",
+        timeout: FETCH_WAIT,
+        redirects: 5,
+        user_agent: IDENTITY.user_agent(),
+        https_only: false,
+        allow_private_network: path.allow_private_network,
+    };
+    let response = tokio::time::timeout(
+        FETCH_WAIT,
+        fetch_on(&over, url, &options, &|request, _, _| request),
+    )
+    .await
+    .map_err(|_| format!("GET {url} timed out"))?
+    .map_err(|error| match error {
+        AttemptError::Route => format!("GET {url} failed: the path did not carry it"),
+        AttemptError::Routed(error) => format!("GET {url} failed: {error}"),
+        AttemptError::Destination(message) | AttemptError::Answered(message) => {
+            format!("GET {url} failed: {message}")
+        }
+    })?;
     if !response.status().is_success() {
         return Err(format!("GET {url} answered {}", response.status()));
     }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    read_body(response, FETCH_LIMIT)
         .await
-        .map_err(|error| format!("reading {url} failed: {error}"))?
-    {
-        if body.len() + chunk.len() > FETCH_LIMIT {
-            return Err(format!("{url} is larger than {FETCH_LIMIT} bytes"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+        .map_err(|error| format!("reading {url} failed: {error}"))
 }
 
-// The test torrent, fetched through a path: its name, metainfo and
-// trackers, and the client its trackers are asked through, which rides the
-// path's bridge. The bridge is revoked as the torrent closes or drops. Its
-// trackers are named by whoever named its source: the test's own, so they
-// are the operator's.
+// The test torrent, fetched over a path: its name, metainfo and trackers.
+// Its trackers are named by whoever named its source: the test's own, so
+// they are the operator's.
 pub(crate) struct TestTorrent {
     name: String,
     bytes: Vec<u8>,
     trackers: Vec<Vec<Tracker>>,
     lengths: Lengths,
-    client: Arc<dyn HttpClients>,
-    bridge: Arc<weaver_tunnel::bridge::Bridge>,
 }
 
 impl TestTorrent {
-    pub(crate) async fn fetch(
-        stage: Arc<dyn Dialer>,
-        source: &TestTorrentSource,
-    ) -> Result<Self, String> {
-        let provider = StreamProvider::new(stage, None);
-        let bridge = start_bridge(provider as Arc<dyn FetchPath>)?;
-        let client = http_client(bridge.clone());
-        let fetcher = client.client(None).map_err(|error| error.to_string())?;
-        let listing = get_capped(&fetcher, &source.directory).await?;
+    pub(crate) async fn fetch(path: &P2pPath, source: &TestTorrentSource) -> Result<Self, String> {
+        let listing = get_capped(path, &source.directory).await?;
         let name = pick_torrent(&String::from_utf8_lossy(&listing))
             .ok_or_else(|| format!("{} lists no netinst torrent", source.directory))?;
         let url = source
             .directory
             .join(&name)
             .map_err(|error| error.to_string())?;
-        let bytes = get_capped(&fetcher, &url).await?;
+        let bytes = get_capped(path, &url).await?;
         let (trackers, lengths) = weaver_torrent::torrent_from_bytes(&bytes)
             .map_err(|error| error.to_string())
             .and_then(|torrent| {
@@ -313,13 +400,7 @@ impl TestTorrent {
             bytes,
             trackers,
             lengths,
-            client,
-            bridge,
         })
-    }
-
-    pub(crate) async fn close(self) {
-        self.bridge.revoke().await;
     }
 
     fn pieces(&self) -> u32 {
@@ -338,6 +419,8 @@ impl TestTorrent {
 struct Joined {
     session: Arc<Session>,
     handle: Arc<ManagedTorrent>,
+    // Its port mappers' reports.
+    mapped: mpsc::UnboundedReceiver<PortMapped>,
     _dir: tempfile::TempDir,
 }
 
@@ -350,38 +433,13 @@ impl Joined {
         watched: Arc<Watched>,
     ) -> Result<Self, String> {
         let dir = tempfile::TempDir::new().map_err(|error| error.to_string())?;
-        let listens = path.kind != LegKind::Ladder;
+        let (events, mapped) = mpsc::unbounded_channel();
+        // A route's session's options; only its sockets are watched, and its
+        // mappers' reports kept.
         let options = SessionOptions {
-            dht: None,
-            disable_trackers: false,
-            fastresume: false,
-            persistence: None,
-            identity: Some(IDENTITY.identity()),
-            listen: listens.then(|| ListenerOptions {
-                mode: ListenerMode::TcpOnly,
-                listen_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-                enable_upnp_port_forwarding: false,
-                ..ListenerOptions::default()
-            }),
-            connect: Some(ConnectionOptions {
-                enable_tcp: true,
-                peer_opts: None,
-            }),
-            peer_limit: Some(PEER_LIMIT),
-            disable_local_service_discovery: true,
-            // The probe measures demand from every peer the tracker names,
-            // several behind one address included; it holds its few slots
-            // for seconds (libtorrent `allow_multiple_connections_per_ip`).
-            allow_multiple_connections_per_ip: true,
-            socket_factory: Some(Arc::new(ProbeSockets::new(
-                path.stage.clone(),
-                path.kind.clone(),
-                watched,
-            ))),
-            // The path's names resolve as a leg's do.
-            resolver: Some(Arc::new(LegNames(path.stage.clone()))),
-            http_client: Some(torrent.client.clone()),
-            ..SessionOptions::default()
+            socket_factory: Some(Arc::new(ProbeSockets::new(path.leg.sockets()?, watched))),
+            port_map_events: Some(events),
+            ..path.session_options(dir.path())
         };
         let session = Session::new_with_opts(dir.path().join("output"), options)
             .await
@@ -417,6 +475,7 @@ impl Joined {
             Ok(Some(handle)) => Ok(Self {
                 session,
                 handle,
+                mapped,
                 _dir: dir,
             }),
             Ok(None) => {
@@ -428,6 +487,26 @@ impl Joined {
                 Err(format!("{error:#}"))
             }
         }
+    }
+
+    // What the session showed trackers and peers over `path`, and the port
+    // a gateway mapped to its listener, when one did.
+    fn exposure(&mut self, path: &P2pPath) -> (Exposure, Option<u16>) {
+        let mut mappings: Vec<PortMapped> = Vec::new();
+        while let Ok(event) = self.mapped.try_recv() {
+            mappings.retain(|mapping| {
+                (mapping.transport, mapping.protocol) != (event.transport, event.protocol)
+            });
+            mappings.push(event);
+        }
+        let mapped_port = mappings
+            .iter()
+            .filter(|mapping| mapping.protocol == PortmapProtocol::Tcp)
+            .find_map(|mapping| mapping.external_port);
+        (
+            Exposure::of(&self.session, path.leg.shape, path.names, &mappings),
+            mapped_port,
+        )
     }
 
     // Stopping sends `stopped` to every tracker that took `started`.
@@ -445,7 +524,7 @@ async fn run(
     let piece = 0u32;
     let watched = Arc::new(Watched::new());
     let store = PieceStore::new(vec![piece]);
-    let joined = match Joined::open(torrent, path, &store, &[], watched.clone()).await {
+    let mut joined = match Joined::open(torrent, path, &store, &[], watched.clone()).await {
         Ok(joined) => joined,
         Err(error) => return failed_at(P2pStep::Announce, error),
     };
@@ -470,7 +549,7 @@ async fn run(
         (_, Some(_)) => Some(PeerUpload::Failed("no piece arrived to serve".into())),
         (_, None) => None,
     };
-    let (inbound, mapped_port) = inbound(path, &watched);
+    let (exposure, mapped_port) = joined.exposure(path);
     let report = rungs(
         torrent.name.clone(),
         &announces,
@@ -478,8 +557,9 @@ async fn run(
         &ended,
         piece,
         torrent.piece_len(piece),
-        inbound,
+        inbound(&exposure, &watched),
         mapped_port,
+        Some(exposure),
         upload,
     );
     joined.leave().await;
@@ -534,6 +614,7 @@ pub(crate) async fn pull(
         0,
         torrent.piece_len(0),
         P2pOutcome::NotReached,
+        None,
         None,
         None,
     );
@@ -696,20 +777,15 @@ async fn serve(
     }
 }
 
-// Whether peers can connect in: the peers that did.
-fn inbound(path: &P2pPath, watched: &Watched) -> (P2pOutcome, Option<u16>) {
-    if path.kind == LegKind::Ladder {
-        return (
-            P2pOutcome::Failed("this path cannot take peer connections".into()),
-            None,
-        );
+// Whether peers can connect in: a session that announces no port takes
+// none, and one that does took the peers that did.
+fn inbound(exposure: &Exposure, watched: &Watched) -> P2pOutcome {
+    if !exposure.inbound {
+        return P2pOutcome::Failed("this path cannot take peer connections".into());
     }
     match watched.inbound() {
-        0 => (
-            P2pOutcome::Failed("no peer connected in: not connectable".into()),
-            None,
-        ),
-        peers => (P2pOutcome::Passed(format!("{peers} connected in")), None),
+        0 => P2pOutcome::Failed("no peer connected in: not connectable".into()),
+        peers => P2pOutcome::Passed(format!("{peers} connected in")),
     }
 }
 
@@ -723,6 +799,7 @@ fn rungs(
     piece_len: u32,
     inbound: P2pOutcome,
     mapped_port: Option<u16>,
+    exposure: Option<Exposure>,
     upload: Option<PeerUpload>,
 ) -> P2pReport {
     let announce = match announced(announces) {
@@ -803,6 +880,7 @@ fn rungs(
             },
         ],
         mapped_port,
+        exposure,
         upload,
     }
 }

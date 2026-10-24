@@ -688,6 +688,8 @@ pub struct P2pTestResult {
     pub rungs: Vec<P2pRung>,
     // The port a gateway mapped to the test session's listener.
     pub mapped_port: Option<u16>,
+    // What the test session showed trackers and peers, once it opened.
+    pub exposure: Option<crate::torrents::types::TorrentExposureGql>,
 }
 impl From<weaver_server_core::speed_test::P2pReport> for P2pTestResult {
     fn from(report: weaver_server_core::speed_test::P2pReport) -> Self {
@@ -720,6 +722,7 @@ impl From<weaver_server_core::speed_test::P2pReport> for P2pTestResult {
                 })
                 .collect(),
             mapped_port: report.mapped_port,
+            exposure: report.exposure.map(Into::into),
         }
     }
 }
@@ -876,6 +879,13 @@ async fn test_via_torrent(
         .data_opt::<weaver_server_core::speed_test::TestTorrentSource>()
         .cloned()
         .unwrap_or_default();
+    let torrent = ctx
+        .data::<weaver_server_core::settings::SharedConfig>()?
+        .read()
+        .await
+        .torrent
+        .clone();
+    let allow_private_network = runtime.allow_private_network();
     let tests = {
         let _guard = runtime.mutations.lock().await;
         let test: std::pin::Pin<
@@ -888,7 +898,14 @@ async fn test_via_torrent(
         > = Box::pin(
             runtime
                 .network
-                .test_via_torrent(route, subject, target, source),
+                .test_via_torrent(
+                    route,
+                    subject,
+                    target,
+                    source,
+                    torrent,
+                    allow_private_network,
+                ),
         );
         test.await.map_err(refusal_error)?
     };

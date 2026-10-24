@@ -21,6 +21,9 @@ struct Rig {
     handle: SchedulerHandle,
     metrics: Arc<PipelineMetrics>,
     config: crate::settings::SharedConfig,
+    // An egress on the loopback source address, whose torrent sessions take
+    // their sockets from its dialer and multicast nothing.
+    loopback: u32,
     _dir: tempfile::TempDir,
 }
 
@@ -74,6 +77,16 @@ async fn rig() -> Rig {
         }
     });
     let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
+    let loopback = db
+        .create_egress_interface(&crate::proxies::EgressInterface {
+            name: "loopback".into(),
+            binding: crate::proxies::EgressBinding::SourceAddress {
+                address: "127.0.0.1".parse().unwrap(),
+            },
+            ..crate::proxies::EgressInterface::system()
+        })
+        .unwrap()
+        .id;
     handle.set_proxy_runtime(
         ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap(),
     );
@@ -83,8 +96,30 @@ async fn rig() -> Rig {
         handle,
         metrics,
         config,
+        loopback,
         _dir: dir,
     }
+}
+
+// A route of one direct leg on `egress_id`.
+fn direct_on(egress_id: u32) -> Route {
+    Route {
+        legs: vec![RouteLeg {
+            egress_id,
+            weight: 100,
+            path: LegPath::Direct,
+        }],
+        failover: Failover::Redistribute,
+    }
+}
+
+// Torrents on, under settings whose sessions reach no host: no DHT
+// bootstrap node and no port mapping.
+async fn torrents_on(rig: &Rig) {
+    let mut config = rig.config.write().await;
+    config.torrent.enabled = true;
+    config.torrent.upnp = false;
+    config.torrent.dht_bootstrap_nodes = String::new();
 }
 
 fn direct_route() -> Route {
@@ -688,6 +723,11 @@ async fn a_bandwidth_connection_keeps_one_row_across_its_gets() {
 
 // Give egress 0 a download quota of `limit` bytes.
 fn egress_quota(rig: &Rig, limit: u64) {
+    egress_quota_on(rig, 0, limit);
+}
+
+// Give `egress_id` a download quota of `limit` bytes.
+fn egress_quota_on(rig: &Rig, egress_id: u32, limit: u64) {
     use weaver_nntp::transfer::{QuotaRuntimeConfig, ServerTransferConfig, StableServerId};
 
     rig.handle
@@ -696,7 +736,7 @@ fn egress_quota(rig: &Rig, limit: u64) {
         .network
         .egress_controls
         .configure(
-            StableServerId(0),
+            StableServerId(egress_id),
             ServerTransferConfig {
                 closed: false,
                 rate_bytes_per_sec: 0,
@@ -1320,14 +1360,14 @@ async fn with_torrents_on_a_swarm_without_leechers_is_no_demand() {
     });
     rig.service
         .test_torrent_source_for_tests(fixture.source.clone());
-    rig.config.write().await.torrent.enabled = true;
+    torrents_on(&rig).await;
     let (http, _) = upload_fixture(&rig).await;
-    let provider = BandwidthProvider::Custom {
-        url: format!("https://127.0.0.1:{}/blob", http.addr.port())
-            .parse()
-            .unwrap(),
-    };
-    let run = bandwidth_run_with_upload(&rig, provider, None).await;
+    rig.service.measure_until_stopped_for_tests();
+    egress_quota_on(&rig, rig.loopback, super::bandwidth::QUOTA_SLICE + 300_000);
+    let mut request = bandwidth_request(format!("https://127.0.0.1:{}/blob", http.addr.port()));
+    request.route = Some(direct_on(rig.loopback));
+    let started = rig.service.start(request).await.unwrap();
+    let run = finished(&rig, started.id).await;
 
     assert_eq!(run.status, SpeedTestStatus::Completed, "{:?}", run.error);
     let upload = run.result.unwrap().upload.unwrap();
@@ -1341,10 +1381,10 @@ async fn with_torrents_on_a_swarm_without_leechers_is_no_demand() {
     fixture.stop().await;
 }
 
-fn torrent_request() -> SpeedTestRequest {
+fn torrent_request(egress_id: u32) -> SpeedTestRequest {
     SpeedTestRequest {
         consumer: Consumer::Torrent(crate::proxies::TorrentScope::Default),
-        route: Some(direct_route()),
+        route: Some(direct_on(egress_id)),
         overrides: PathOverride::default(),
         kind: SpeedTestKind::Torrent {
             source: TestTorrentSource::debian(),
@@ -1358,26 +1398,26 @@ async fn torrent_rig(fixture: &super::torrent_fixture::TorrentFixture) -> Rig {
     let rig = rig().await;
     rig.service
         .test_torrent_source_for_tests(fixture.source.clone());
-    rig.config.write().await.torrent.enabled = true;
+    torrents_on(&rig).await;
     rig
 }
 
 #[tokio::test]
 async fn a_torrent_run_needs_a_torrent_route_and_torrents_on() {
     let rig = rig().await;
-    let mut request = torrent_request();
+    let mut request = torrent_request(rig.loopback);
     request.consumer = Consumer::Rss(1);
     assert_eq!(
         rig.service.start(request).await.unwrap_err(),
         SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentNeedsTorrentRoute)
     );
     assert_eq!(
-        rig.service.start(torrent_request()).await.unwrap_err(),
+        rig.service.start(torrent_request(rig.loopback)).await.unwrap_err(),
         SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentsOff)
     );
     rig.config.write().await.torrent.enabled = true;
     for max_duration in [Duration::ZERO, MAX_DURATION + Duration::from_secs(1)] {
-        let mut request = torrent_request();
+        let mut request = torrent_request(rig.loopback);
         request.kind = SpeedTestKind::Torrent {
             source: TestTorrentSource::debian(),
             max_duration,
@@ -1407,7 +1447,7 @@ async fn a_torrent_run_pulls_from_the_swarm_and_serves_what_it_held() {
     let rig = torrent_rig(&fixture).await;
     rig.service
         .peer_upload_budget_for_tests(u64::from(PIECE_LEN));
-    let started = rig.service.start(torrent_request()).await.unwrap();
+    let started = rig.service.start(torrent_request(rig.loopback)).await.unwrap();
     assert_eq!(started.kind, SpeedTestKindLabel::Torrent);
     assert_eq!(
         started
@@ -1457,7 +1497,7 @@ async fn a_torrent_run_whose_tracker_fails_says_so() {
         ..Answer::default()
     });
     let rig = torrent_rig(&fixture).await;
-    let started = rig.service.start(torrent_request()).await.unwrap();
+    let started = rig.service.start(torrent_request(rig.loopback)).await.unwrap();
     let run = finished(&rig, started.id).await;
 
     assert_eq!(run.status, SpeedTestStatus::Failed);
@@ -1481,7 +1521,7 @@ async fn a_torrent_run_without_leechers_has_no_demand() {
         ..Answer::default()
     });
     let rig = torrent_rig(&fixture).await;
-    let started = rig.service.start(torrent_request()).await.unwrap();
+    let started = rig.service.start(torrent_request(rig.loopback)).await.unwrap();
     let run = finished(&rig, started.id).await;
 
     assert_eq!(run.status, SpeedTestStatus::Completed, "{:?}", run.error);

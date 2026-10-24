@@ -31,6 +31,32 @@ impl DraftNetworkRoute {
             .stage
             .clone())
     }
+    // How a torrent session rides the leg at `position`, as a saved
+    // route's session would: its kind, why it carries nothing now when it
+    // does not, and who resolves its names.
+    pub fn torrent_leg(
+        &self,
+        position: usize,
+    ) -> Result<
+        (
+            crate::torrents::net::LegKind,
+            Option<String>,
+            Option<ResolvedBy>,
+        ),
+        String,
+    > {
+        use crate::torrents::sessions::{leg_down, leg_kind, names_on};
+        let leg = &self
+            .legs
+            .get(position)
+            .ok_or("draft leg does not exist")?
+            .definition;
+        Ok((
+            leg_kind(&self.isolated, leg.egress_id, &leg.path),
+            leg_down(&self.isolated, leg.egress_id),
+            names_on(&self.isolated, &leg.path),
+        ))
+    }
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
         &self.handle
     }

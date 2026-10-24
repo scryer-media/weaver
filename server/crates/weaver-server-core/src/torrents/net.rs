@@ -19,12 +19,13 @@ use weaver_torrent::network::{
     AsyncReadVectored, AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
     DatagramSocket, Resolved, Resolver,
 };
-use weaver_torrent::{HttpClients, HttpTarget, SocketFactory, StreamListener};
+use weaver_torrent::upnp::PortMapped;
+use weaver_torrent::{HttpClients, HttpTarget, Session, SocketFactory, StreamListener};
 use weaver_tunnel::bridge::{Bridge, ConnectionOutcome};
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};
 
-use crate::proxies::{EgressBinding, LegPath};
+use crate::proxies::{EgressBinding, LegPath, ResolvedBy};
 
 /// How a leg reaches peers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -955,5 +956,49 @@ mod tests {
                 .contains(&format!("host: seed.test:{port}\r\n")),
             "{head}"
         );
+    }
+}
+
+/// What a session on one leg shows the trackers and peers it reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exposure {
+    /// Who resolves the names the session looks up.
+    pub resolved_by: Option<ResolvedBy>,
+    /// The address a tracker sees: the session's vote of its external
+    /// address, else a gateway's; none until one is known.
+    pub address: Option<IpAddr>,
+    /// The port the session announces, 0 when it announces none.
+    pub announced_port: u16,
+    /// Peers can connect in.
+    pub inbound: bool,
+    pub udp_trackers: bool,
+    pub dht: bool,
+    pub utp: bool,
+}
+
+impl Exposure {
+    /// The exposure of `session`, open on a leg of `shape` whose names
+    /// `resolved_by` resolves, with the last report of each of its port
+    /// mappings.
+    pub fn of(
+        session: &Session,
+        shape: Shape,
+        resolved_by: Option<ResolvedBy>,
+        mappings: &[PortMapped],
+    ) -> Self {
+        let announced_port = session.announce_port().unwrap_or(0);
+        Self {
+            resolved_by,
+            address: session
+                .external_ips()
+                .first()
+                .copied()
+                .or_else(|| mappings.iter().find_map(|mapping| mapping.external_ip)),
+            announced_port,
+            inbound: announced_port != 0,
+            udp_trackers: shape.datagrams,
+            dht: shape.dht,
+            utp: session.listens_utp(),
+        }
     }
 }

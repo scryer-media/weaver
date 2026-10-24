@@ -12,6 +12,7 @@ use base64::Engine;
 use common::TestHarness;
 use serde_json::Value;
 use weaver_server_api::auth::{CallerIdentity, CallerScope};
+use weaver_server_api::networking::ResolvedBy as ResolvedByGql;
 use weaver_server_core::categories::CategoryConfig;
 use weaver_server_core::post_processing::model::PostProcessingSettings;
 use weaver_server_core::proxies::{
@@ -1230,6 +1231,7 @@ fn an_open_route_shows_where_it_listens_and_its_mappings() {
                 },
             ],
             external: vec!["203.0.113.7".parse().unwrap()],
+            exposure: Some(exposure()),
             held: None,
         }),
         down: None,
@@ -1253,6 +1255,64 @@ fn an_open_route_shows_where_it_listens_and_its_mappings() {
     );
     assert_eq!(route.external_addresses, ["203.0.113.7"]);
     assert_eq!(route.reason, None);
+    let shown = route.exposure.unwrap();
+    assert_eq!(shown.resolved_by, Some(ResolvedByGql::Host));
+    assert_eq!(shown.address.as_deref(), Some("203.0.113.7"));
+    assert_eq!(shown.announced_port, 40_001);
+    assert!(shown.inbound);
+    assert!(shown.udp_trackers && shown.dht && shown.utp);
+}
+
+// What an open session on a System leg shows: the host resolves its names,
+// a gateway mapped its port.
+fn exposure() -> weaver_server_core::torrents::net::Exposure {
+    weaver_server_core::torrents::net::Exposure {
+        resolved_by: Some(ResolvedBy::Host),
+        address: Some("203.0.113.7".parse().unwrap()),
+        announced_port: 40_001,
+        inbound: true,
+        udp_trackers: true,
+        dht: true,
+        utp: true,
+    }
+}
+
+// The speed test's report shows a session's exposure in the very values the
+// route view shows it in.
+#[test]
+fn the_speed_test_shows_exposure_as_the_route_view_does() {
+    use weaver_server_api::networking::P2pTestResult;
+    use weaver_server_api::torrents::types::TorrentRouteGql;
+    use weaver_server_core::speed_test::P2pReport;
+    use weaver_server_core::torrents::service::TorrentRoute;
+    use weaver_server_core::torrents::sessions::SessionView;
+
+    let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
+    let route = TorrentRouteGql::from(TorrentRoute {
+        key: key.clone(),
+        names: Some(ResolvedBy::Host),
+        scopes: vec![(TorrentScope::Default, None)],
+        session: Some(SessionView {
+            key,
+            kind: LegKind::System,
+            port: Some(6881),
+            listen: Some("0.0.0.0:6881".parse().unwrap()),
+            utp: true,
+            mappings: Vec::new(),
+            external: Vec::new(),
+            exposure: Some(exposure()),
+            held: None,
+        }),
+        down: None,
+    });
+    let report = P2pTestResult::from(P2pReport {
+        rungs: Vec::new(),
+        mapped_port: Some(40_001),
+        exposure: Some(exposure()),
+        upload: None,
+    });
+    assert!(report.exposure.is_some());
+    assert_eq!(report.exposure, route.exposure);
 }
 
 // A route whose leg is up and that nothing has asked to open says so.

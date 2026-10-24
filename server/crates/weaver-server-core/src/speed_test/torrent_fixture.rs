@@ -175,12 +175,14 @@ impl TorrentFixture {
     }
 }
 
-// A session on loopback alone: no DHT, no trackers, no discovery.
+// A session on loopback alone: no DHT, no trackers, no discovery. It takes
+// encrypted and plain handshakes, as the probe may open with either.
 async fn session(dir: &Path) -> Arc<Session> {
     Session::new_with_opts(
         dir.to_path_buf(),
         SessionOptions {
             dht: None,
+            encryption: weaver_torrent::EncryptionPolicy::Prefer,
             disable_trackers: true,
             disable_local_service_discovery: true,
             persistence: None,

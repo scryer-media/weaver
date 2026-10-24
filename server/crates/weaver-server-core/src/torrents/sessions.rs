@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 pub use weaver_torrent::IpRanges;
 use weaver_torrent::dht::DhtPersistenceConfig;
-use weaver_torrent::network::Resolver;
+use weaver_torrent::network::{KernelSockets, Resolver};
+use weaver_tunnel::bridge::Bridge;
+use weaver_tunnel::pipe::Dialer;
 use weaver_torrent::upnp::PortMapEvents;
 pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
@@ -33,7 +35,7 @@ use crate::proxies::{
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
-use crate::torrents::net::{LegKind, LegNames, LegSockets, Shape, tracker_client};
+use crate::torrents::net::{Exposure, LegKind, LegNames, LegSockets, Shape, tracker_client};
 use crate::torrents::rate::SessionRates;
 
 /// The most sessions that run at once.
@@ -67,6 +69,41 @@ fn leg_egress(network: &NetworkRuntime, egress_id: u32) -> Option<EgressInterfac
     network
         .egress_configuration(egress_id)
         .or_else(|| (egress_id == SYSTEM_EGRESS_ID).then(EgressInterface::system))
+}
+
+/// How a session rides a leg through `egress_id` and `path`.
+pub fn leg_kind(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> LegKind {
+    leg_egress(network, egress_id).map_or(LegKind::System, |egress| {
+        LegKind::of(&egress.binding, path)
+    })
+}
+
+/// Why a leg on egress `egress_id` may carry nothing now, when it may not:
+/// its egress is down, gone, or out of quota.
+pub fn leg_down(network: &NetworkRuntime, egress_id: u32) -> Option<String> {
+    let Some(egress) = leg_egress(network, egress_id) else {
+        return Some(format!("egress {egress_id} is missing"));
+    };
+    match network.interfaces().health(&egress, None) {
+        EgressHealth::Down(reason) => Some(reason),
+        _ if network.quota_blocked_egresses().contains(&egress.id) => Some("quota reached".into()),
+        _ => None,
+    }
+}
+
+/// Who resolves the names a session on `path` looks up: the host's DNS on a
+/// direct leg, the exit proxy's naming on a ladder, none on a pool exit or a
+/// proxy that is not configured.
+pub fn names_on(network: &NetworkRuntime, path: &LegPath) -> Option<ResolvedBy> {
+    let exit = match path {
+        LegPath::Direct => return Some(ResolvedBy::Host),
+        LegPath::Ladder { rungs, .. } => match rungs.last()? {
+            Rung::Proxy { id } => *id,
+            Rung::Chain { ids } => *ids.last()?,
+            Rung::Pool { .. } => return None,
+        },
+    };
+    network.resolved_by(exit)
 }
 
 /// The key of the session a route through `egress_id` and `path` opens.
@@ -119,6 +156,42 @@ pub struct OpenLeg {
     pub leg: Option<Arc<TorrentLeg>>,
 }
 
+impl OpenLeg {
+    /// A leg of `kind` over `dialer`, as every session's leg is opened. A
+    /// session on an own-socket leg opens kernel sockets itself and looks
+    /// its names up through `dialer`; on any other leg its sockets and names
+    /// come from `dialer` too, and a ladder's HTTP rides `bridge`.
+    pub fn on(
+        kind: LegKind,
+        dialer: Arc<dyn Dialer>,
+        bridge: Option<Arc<Bridge>>,
+        leg: Option<Arc<TorrentLeg>>,
+    ) -> Result<Self, String> {
+        let factory = (!kind.own_sockets()).then(|| {
+            Arc::new(LegSockets::new(Arc::clone(&dialer), &kind)) as Arc<dyn SocketFactory>
+        });
+        Ok(Self {
+            shape: kind.shape(Some(&dialer)),
+            factory,
+            names: Arc::new(LegNames(dialer)),
+            http: tracker_client(&kind, bridge)?,
+            kind,
+            leg,
+        })
+    }
+
+    /// The sockets a session on the leg opens: the leg's factory's, or the
+    /// kernel's on the leg's device.
+    pub fn sockets(&self) -> Result<Arc<dyn SocketFactory>, String> {
+        match &self.factory {
+            Some(factory) => Ok(Arc::clone(factory)),
+            None => KernelSockets::new(self.kind.bind_device())
+                .map(|sockets| Arc::new(sockets) as Arc<dyn SocketFactory>)
+                .map_err(|error| format!("{error:#}")),
+        }
+    }
+}
+
 /// Where routes come from.
 #[async_trait::async_trait]
 pub trait Routes: Send + Sync {
@@ -152,33 +225,6 @@ impl NetworkRoutes {
         &self.proxies.network
     }
 
-    // Why a leg on egress `egress_id` may carry nothing now, when it may
-    // not.
-    fn egress_down(&self, egress_id: u32) -> Option<String> {
-        let Some(egress) = leg_egress(self.network(), egress_id) else {
-            return Some(format!("egress {egress_id} is missing"));
-        };
-        match self.network().interfaces().health(&egress, None) {
-            EgressHealth::Down(reason) => Some(reason),
-            _ if self.network().quota_blocked_egresses().contains(&egress.id) => {
-                Some("quota reached".into())
-            }
-            _ => None,
-        }
-    }
-
-    // Who resolves the names a session on `path` looks up.
-    fn names_on(&self, path: &LegPath) -> Option<ResolvedBy> {
-        let exit = match path {
-            LegPath::Direct => return Some(ResolvedBy::Host),
-            LegPath::Ladder { rungs, .. } => match rungs.last()? {
-                Rung::Proxy { id } => *id,
-                Rung::Chain { ids } => *ids.last()?,
-                Rung::Pool { .. } => return None,
-            },
-        };
-        self.network().resolved_by(exit)
-    }
 }
 
 #[async_trait::async_trait]
@@ -196,37 +242,28 @@ impl Routes for NetworkRoutes {
             Err(refusal) => (refused_key(&route), Some(refusal.to_string())),
             Ok(()) => (
                 leg_key(self.network(), leg.egress_id, &leg.path),
-                self.egress_down(leg.egress_id),
+                leg_down(self.network(), leg.egress_id),
             ),
         };
         Ok(RoutePlan {
             scope,
             egress_id: egress.as_ref().map_or(leg.egress_id, |egress| egress.id),
-            kind: egress.as_ref().map_or(LegKind::System, |egress| {
-                LegKind::of(&egress.binding, &leg.path)
-            }),
+            kind: leg_kind(self.network(), leg.egress_id, &leg.path),
             key,
-            names: self.names_on(&leg.path),
+            names: names_on(self.network(), &leg.path),
             policy,
             down,
         })
     }
 
     fn leg_down(&self, plan: &RoutePlan) -> Option<String> {
-        self.egress_down(plan.egress_id)
+        leg_down(self.network(), plan.egress_id)
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
         if plan.kind.own_sockets() {
             let egress = self.network().egress_dialer(plan.egress_id, self.timeout)?;
-            return Ok(OpenLeg {
-                kind: plan.kind.clone(),
-                shape: plan.kind.shape(None),
-                factory: None,
-                names: Arc::new(LegNames(egress)),
-                http: tracker_client(&plan.kind, None)?,
-                leg: None,
-            });
+            return OpenLeg::on(plan.kind.clone(), egress, None, None);
         }
         let peers = u16::try_from(peers).unwrap_or(u16::MAX);
         let leg = self
@@ -236,16 +273,7 @@ impl Routes for NetworkRoutes {
             LegKind::Ladder => Some(leg.bridge()?),
             _ => None,
         };
-        let http = tracker_client(&plan.kind, bridge)?;
-        let dialer = leg.dialer();
-        Ok(OpenLeg {
-            shape: plan.kind.shape(Some(&dialer)),
-            factory: Some(Arc::new(LegSockets::new(Arc::clone(&dialer), &plan.kind))),
-            names: Arc::new(LegNames(dialer)),
-            kind: plan.kind.clone(),
-            http,
-            leg: Some(leg),
-        })
+        OpenLeg::on(plan.kind.clone(), leg.dialer(), bridge, Some(leg))
     }
 
     // Fetched once for every route, so on Default outbound, which carries
@@ -586,6 +614,8 @@ pub struct SessionView {
     pub mappings: Vec<PortMapped>,
     /// Its address as the internet sees it, of each family it knows one for.
     pub external: Vec<IpAddr>,
+    /// What it shows trackers and peers, while open.
+    pub exposure: Option<Exposure>,
     /// Why it holds closed.
     pub held: Option<String>,
 }
@@ -1247,19 +1277,25 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
                 session,
                 port,
                 mappings,
+                plan,
+                opening,
                 ..
             },
             None,
-        ) => SessionView {
-            key: key.clone(),
-            kind: slot.kind().clone(),
-            port: Some(*port),
-            listen: session.listen_addr(),
-            utp: session.listens_utp(),
-            mappings: mappings.get(),
-            external: session.external_ips(),
-            held: None,
-        },
+        ) => {
+            let mappings = mappings.get();
+            SessionView {
+                key: key.clone(),
+                kind: slot.kind().clone(),
+                port: Some(*port),
+                listen: session.listen_addr(),
+                utp: session.listens_utp(),
+                exposure: Some(Exposure::of(session, opening.shape, plan.names, &mappings)),
+                mappings,
+                external: session.external_ips(),
+                held: None,
+            }
+        }
         (_, held) => SessionView {
             key: key.clone(),
             kind: slot.kind().clone(),
@@ -1268,6 +1304,7 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             utp: false,
             mappings: Vec::new(),
             external: Vec::new(),
+            exposure: None,
             held: held.map(str::to_owned),
         },
     }

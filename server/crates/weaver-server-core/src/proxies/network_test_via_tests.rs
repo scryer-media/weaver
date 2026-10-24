@@ -746,11 +746,14 @@ async fn a_pool_carries_the_target_through_the_member_it_picks() {
 }
 
 // A torrent route's test runs the test torrent over each path that reached
-// the torrent's host: every rung passes on a path that can take peers in.
+// the torrent's host, on that path's leg as the route's session would ride
+// it: a direct leg on a loopback source address takes peers through its
+// own sockets, and its loopback listener announces no port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
     use crate::speed_test::P2pStep;
     use crate::speed_test::torrent_fixture::{Answer, TorrentFixture};
+    use crate::torrents::net::Exposure;
 
     let fixture = TorrentFixture::start(true).await;
     fixture.answer(Answer {
@@ -761,12 +764,40 @@ async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
         connect_in: true,
     });
     let runtime = runtime_with(vec![], vec![], vec![]);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.egresses.insert(
+        5,
+        EgressInterface {
+            id: 5,
+            name: "loopback".into(),
+            binding: EgressBinding::SourceAddress {
+                address: ip("127.0.0.1"),
+            },
+            ..EgressInterface::system()
+        },
+    );
+    runtime.apply_configuration(config).unwrap();
+    let route = Route {
+        legs: vec![RouteLeg {
+            egress_id: 5,
+            weight: 100,
+            path: LegPath::Direct,
+        }],
+        failover: Failover::default(),
+    };
+    let quiet = crate::settings::TorrentConfig {
+        upnp: false,
+        dht_bootstrap_nodes: String::new(),
+        ..Default::default()
+    };
     let tests = runtime
         .test_via_torrent(
-            &draft(LegPath::Direct),
+            &route,
             TestSubject::Route,
             None,
             fixture.source.clone(),
+            quiet,
+            true,
         )
         .await
         .unwrap();
@@ -779,11 +810,16 @@ async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
         P2pStep::Announce,
         P2pStep::Handshake,
         P2pStep::Piece,
-        P2pStep::Inbound,
     ] {
         assert!(report.passed(step), "{step:?} in {report:?}");
     }
+    assert!(!report.passed(P2pStep::Inbound), "{report:?}");
     assert_eq!(report.mapped_port, None);
+    let exposure: Exposure = report.exposure.expect("the session opened");
+    assert_eq!(exposure.resolved_by, Some(ResolvedBy::Host));
+    assert_eq!(exposure.announced_port, 0);
+    assert!(!exposure.inbound);
+    assert!(exposure.udp_trackers && exposure.dht);
     fixture.stop().await;
     runtime.shutdown().await;
 }

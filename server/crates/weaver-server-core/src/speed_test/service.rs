@@ -21,7 +21,7 @@ use super::progress::{LegRecorder, Progress, UsenetFacts};
 use super::providers::{self, Endpoints, ProviderServer};
 use super::runner::Stop;
 use super::torrent::{
-    P2pOutcome, P2pPath, P2pPlan, PeerUpload, Pulled, TestTorrent, TestTorrentSource,
+    P2pLeg, P2pOutcome, P2pPath, P2pPlan, PeerUpload, Pulled, TestTorrent, TestTorrentSource,
 };
 use super::upload;
 use super::usenet::{self, UsenetLeg, UsenetPlan};
@@ -31,7 +31,6 @@ use crate::proxies::{
     RoutingPolicy, Rung, SpeedTestQuotaHolder, TorrentScope,
 };
 use crate::settings::SharedConfig;
-use crate::torrents::net::LegKind;
 use crate::{Database, SchedulerHandle};
 
 // Finished runs kept beside the running one.
@@ -949,13 +948,31 @@ impl ServiceInner {
         tested
     }
 
-    // Serve the test torrent's piece to the leechers its trackers send,
-    // through `stage`. Peers are dialled out, so any path can serve.
-    async fn serve_test_torrent(
+    // The test torrent's path over the draft's leg at `position`, as a
+    // saved route's session would ride that leg.
+    async fn p2p_path(
         &self,
-        stage: Arc<dyn weaver_tunnel::pipe::Dialer>,
-        stop: &mut Stop,
-    ) -> PeerUpload {
+        draft: &DraftNetworkRoute,
+        position: usize,
+    ) -> Result<P2pPath, String> {
+        let (kind, down, names) = draft.torrent_leg(position)?;
+        P2pPath::open(P2pLeg {
+            kind,
+            stage: draft.leg_stage(position)?,
+            down,
+            names,
+            torrent: self.config.read().await.torrent.clone(),
+            allow_private_network: self
+                .runtime()
+                .map_err(|error| error.to_string())?
+                .allow_private_network(),
+        })
+        .await
+    }
+
+    // Serve the test torrent's piece to the leechers its trackers send,
+    // over `path`.
+    async fn serve_test_torrent(&self, path: P2pPath, stop: &mut Stop) -> PeerUpload {
         let source = self
             .torrent_source
             .lock()
@@ -965,10 +982,6 @@ impl ServiceInner {
         let plan = P2pPlan {
             source,
             upload_budget: Some(self.peer_budget.load(Ordering::Acquire)),
-        };
-        let path = P2pPath {
-            stage,
-            kind: LegKind::Ladder,
         };
         let stopped = std::pin::pin!(stop.stopped());
         let report = super::torrent::probe(path, &plan, stopped).await;
@@ -1272,8 +1285,8 @@ async fn execute(
     };
 
     let torrent = if let SpeedTestKind::Torrent { source, .. } = &cell.request.kind {
-        let stage = match plan.draft.leg_stage(first.position) {
-            Ok(stage) => stage,
+        let path = match inner.p2p_path(&plan.draft, first.position).await {
+            Ok(path) => path,
             Err(error) => return Outcome::Failed(error),
         };
         let source = inner
@@ -1285,18 +1298,14 @@ async fn execute(
         let fetched = tokio::select! {
             biased;
             _ = stop.stopped() => return Outcome::Cancelled,
-            fetched = TestTorrent::fetch(stage.clone(), &source) => fetched,
+            fetched = TestTorrent::fetch(&path, &source) => fetched,
         };
         match fetched {
-            // Peers are dialled out, so any path can pull and serve.
-            Ok(torrent) => Some((
-                torrent,
-                P2pPath {
-                    stage,
-                    kind: LegKind::Ladder,
-                },
-            )),
-            Err(error) => return Outcome::Failed(error),
+            Ok(torrent) => Some((torrent, path)),
+            Err(error) => {
+                path.close().await;
+                return Outcome::Failed(error);
+            }
         }
     } else {
         None
@@ -1562,7 +1571,10 @@ async fn execute(
         });
         inner.bump();
         if inner.config.read().await.torrent.enabled {
-            let peers = inner.serve_test_torrent(stage, &mut stop).await;
+            let peers = match inner.p2p_path(&plan.draft, first.position).await {
+                Ok(path) => inner.serve_test_torrent(path, &mut stop).await,
+                Err(error) => PeerUpload::Failed(error),
+            };
             if stop.cancelled() {
                 return Outcome::Cancelled;
             }
@@ -1584,7 +1596,7 @@ async fn execute(
             std::pin::pin!(stop.stopped()),
         )
         .await;
-        torrent.close().await;
+        path.close().await;
         if stop.cancelled() {
             return Outcome::Cancelled;
         }
