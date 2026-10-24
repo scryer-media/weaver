@@ -748,9 +748,10 @@ async fn a_base_port_change_listens_on_the_new_port_while_the_old_stopped_announ
         assert_eq!(heard.len(), 2, "{message}: {heard:?}");
     }
     for message in [
+        "stopping the session: closing its listeners, DHT and local discovery",
         "stopping the session: pausing its torrents",
         "stopping the session: waiting on its trackers' stopped announces",
-        "stopping the session: closing its listeners, DHT and trackers, and removing its port mappings",
+        "stopping the session: closing its trackers and removing its port mappings",
         "the session stopped",
     ] {
         let heard = heard(message);
@@ -1895,4 +1896,94 @@ async fn a_new_session_directory_reopens_the_route_there() {
     assert!(elsewhere.join(plan.key.as_str()).is_dir());
     assert!(sessions.outdated().await.is_empty());
     sessions.stop_all().await;
+}
+
+// A torrent's trackers hear `stopped` only from a session that may still
+// send: one dropped with its leg standing and its route up says it, one
+// held for its route going down or whose leg was revoked under it does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up() {
+    let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", tracker.local_addr().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let (db, network) = on_network(&routes);
+    loopback_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    // A day: a stopped announce waits on the tracker, not on its timeout.
+    sessions.set_config(TorrentConfig {
+        stop_tracker_timeout_secs: 86_400,
+        ..any_port()
+    });
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    // The route's session, running a torrent its tracker took `started` from.
+    let announced = || async {
+        let session = sessions.session(&plan).await.unwrap();
+        // Each session in turn writes the one file.
+        let added = session
+            .add_torrent(
+                weaver_torrent::AddTorrent::from_bytes(announcing(&url)),
+                Some(weaver_torrent::AddTorrentOptions {
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        let (started, line) = heard_announce(&tracker).await;
+        assert!(line.contains("event=started"), "{line}");
+        answer(started).await;
+        added
+            .tracker_status()
+            .expect("a live run with trackers")
+            .subscribe()
+            .wait_for(|announces| {
+                announces[0]
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.result.is_ok())
+            })
+            .await
+            .unwrap();
+    };
+
+    // Dropped, its leg standing and its route up: `stopped`.
+    announced().await;
+    sessions.drop_route(&plan.key).await;
+    let (stopped, line) = heard_announce(&tracker).await;
+    assert!(line.contains("event=stopped"), "{line}");
+    answer(stopped).await;
+    sessions.closing.all_stopped().await;
+
+    // Held, its route down: nothing. The next request the tracker hears is
+    // the next session's `started`.
+    announced().await;
+    sessions.hold(&plan.key, "down".into()).await;
+    sessions.closing.all_stopped().await;
+
+    // Its leg revoked under it: nothing, from its own sockets either.
+    announced().await;
+    save_again(&db, &network).await;
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    sessions.closing.all_stopped().await;
+
+    let tracker = tracker.into_std().unwrap();
+    tracker.set_nonblocking(true).unwrap();
+    let asked = tracker.accept();
+    assert!(
+        matches!(&asked, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+        "the tracker heard more: {asked:?}"
+    );
+    sessions.stop_all().await;
+    network.shutdown().await;
 }

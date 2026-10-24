@@ -3776,7 +3776,9 @@ impl TorrentService {
     // whose route went down is held, and comes back when it is up. A
     // session the settings would now open otherwise, or whose leg was
     // revoked under it, opens again, its torrents with it; one left on a
-    // session its route no longer runs moves to the one it does.
+    // session its route no longer runs moves to the one it does. A magnet
+    // fetching on a session its route no longer runs, or on a route gone
+    // down, ends that fetch and fetches again on its route as it stands.
     async fn follow_routes(&self) {
         let now = self.inner.clock.now_ms();
         let settings = self.settings();
@@ -3789,16 +3791,27 @@ impl TorrentService {
         {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
+                let rule = torrent.rule(&rules);
+                let scope = settings.scope(torrent.record.category_id, rule);
+                let plan = self.inner.sessions.routes().plan(scope);
                 if torrent.layout.is_none() {
-                    if torrent.held.is_some() {
+                    let moved = matches!(torrent.resolving, Some(Resolving::Fetching(_)))
+                        && plan.as_ref().ok().is_none_or(|plan| {
+                            plan.down.is_some()
+                                || torrent.route.as_ref() != Some(&plan.key)
+                                || outdated.contains(&plan.key)
+                        });
+                    if moved && let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
+                        fetch.abort();
+                        torrent.fetching = None;
+                    }
+                    if moved || torrent.held.is_some() {
                         unresolved.push(torrent.record.job_id);
                     }
                     continue;
                 }
-                let rule = torrent.rule(&rules);
-                let scope = settings.scope(torrent.record.category_id, rule);
                 let terms = PeerTerms::of(rule);
-                match self.inner.sessions.routes().plan(scope) {
+                match plan {
                     Ok(plan) => {
                         if let Some(reason) = &plan.down {
                             down.insert(plan.key.clone(), reason.clone());

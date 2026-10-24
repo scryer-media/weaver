@@ -3218,6 +3218,54 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     rig.service.stop().await;
 }
 
+// A magnet whose route changes while its metainfo is fetched ends that
+// fetch, which its old session lets go with `stopped`, and fetches again on
+// the new route's session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnet_fetching_when_its_route_changes_fetches_again_on_the_new_route() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Magnet(format!(
+            "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
+            "fc".repeat(20)
+        ))))
+        .await
+        .unwrap();
+    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+    started_and_answered(&listener, &mut updates).await;
+    let old = rig.service.inner.live.lock().await[&job_id]
+        .route
+        .clone()
+        .unwrap();
+
+    rig.routes.route(TorrentScope::Default, 2);
+    let new = rig.routes.plan(TorrentScope::Default).unwrap().key;
+    assert_ne!(old, new);
+    rig.service.follow_routes().await;
+
+    // The old fetch's `stopped` and the new one's `started`, in either order.
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        let (stream, event) = heard_event(&listener).await;
+        events.push(event.unwrap());
+        answer_no_peers(stream).await;
+    }
+    events.sort();
+    assert_eq!(events, ["started", "stopped"]);
+    let live = rig.service.inner.live.lock().await;
+    assert_eq!(live[&job_id].route.as_ref(), Some(&new));
+    assert!(matches!(live[&job_id].resolving, Some(Resolving::Fetching(_))));
+    drop(live);
+    let running = rig.service.inner.sessions.running().await;
+    assert!(running.contains_key(&new), "{:?}", running.keys());
+    rig.service.stop().await;
+}
+
 // A magnet added paused fetches nothing and announces nothing until it is
 // resumed; resumed, its fetch announces `started` once, and removed, it
 // stops.

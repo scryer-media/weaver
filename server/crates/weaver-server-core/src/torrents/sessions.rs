@@ -602,11 +602,12 @@ impl Sessions {
         self.revoked.notified().await;
     }
 
-    // Wake the follower once `leg` is revoked under `session`, unless the
-    // session stops first.
-    fn watch(&self, key: &RouteKey, leg: &TorrentLeg, session: &Session) {
+    // Once `leg` is revoked under `session`, the session may send no more,
+    // and the follower wakes; unless the session stops first.
+    fn watch(&self, key: &RouteKey, leg: &TorrentLeg, session: &Arc<Session>) {
         let (key, stage) = (key.clone(), Arc::clone(&leg.stage));
         let stopped = session.cancellation_token().clone();
+        let session = Arc::downgrade(session);
         let revoked = Arc::clone(&self.revoked);
         tokio::spawn(async move {
             tokio::select! {
@@ -616,6 +617,9 @@ impl Sessions {
                         reason = REVOKED,
                         "a route's leg was revoked under its open session"
                     );
+                    if let Some(session) = session.upgrade() {
+                        withhold(&key, &session, REVOKED);
+                    }
                     revoked.notify_one();
                 }
                 () = stopped.cancelled() => {}
@@ -913,15 +917,21 @@ impl Sessions {
     /// revoked under it, or the settings as they stand would bind or
     /// announce another port, map it or not, or keep its state elsewhere.
     /// Each opens again once it is dropped.
+    /// A session whose leg is revoked may send no more from here on, even
+    /// before the watch on its leg wakes: nothing taken off it after this
+    /// sends its trackers `stopped`.
     pub async fn outdated(&self) -> BTreeSet<RouteKey> {
         let torrent = self.config();
         let slots = self.slots.lock().await;
         slots
             .iter()
             .filter_map(|(key, slot)| match slot {
+                Slot::Open { session, .. } if let Some(reason) = slot.held() => {
+                    withhold(key, session, reason);
+                    Some(key.clone())
+                }
                 Slot::Open { opening, .. }
-                    if slot.held().is_some()
-                        || *opening != Opening::of(&self.env, &torrent, opening.shape) =>
+                    if *opening != Opening::of(&self.env, &torrent, opening.shape) =>
                 {
                     Some(key.clone())
                 }
@@ -940,7 +950,8 @@ impl Sessions {
             .collect()
     }
 
-    /// Close `key`'s session and hold it closed for `reason`.
+    /// Close `key`'s session and hold it closed for `reason`, its route
+    /// down: its trackers hear no `stopped` from it.
     pub async fn hold(&self, key: &RouteKey, reason: String) {
         let mut slots = self.slots.lock().await;
         let Some(slot) = slots.remove(key) else {
@@ -954,6 +965,7 @@ impl Sessions {
                 kind,
                 ..
             } => {
+                withhold(key, &session, &reason);
                 self.closing.close(key, session, leg, maps);
                 kind
             }
@@ -1197,6 +1209,18 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             held: held.map(str::to_owned),
         },
     }
+}
+
+// The session may send no more: its leg was revoked under it, or its route
+// is down. From here on its trackers hear no `stopped` from it, whatever
+// stops it or takes a torrent off it.
+fn withhold(key: &RouteKey, session: &Session, reason: &str) {
+    tracing::info!(
+        route = key.as_str(),
+        reason,
+        "a route's session sends its trackers no stopped announce"
+    );
+    session.withhold_stopped();
 }
 
 // Stop a session; its leg's bridge stops with the leg. The leg's stage is

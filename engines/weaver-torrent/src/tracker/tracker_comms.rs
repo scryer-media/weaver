@@ -1435,6 +1435,9 @@ impl TrackerTask {
 #[derive(Clone)]
 pub struct StoppedAnnounces {
     timeout: Duration,
+    // Set once the address these announces would leave from may no longer
+    // carry them: from then on they take no time, so none is sent.
+    withheld: Arc<std::sync::atomic::AtomicBool>,
     running: Arc<tokio::sync::watch::Sender<usize>>,
 }
 
@@ -1453,12 +1456,23 @@ impl StoppedAnnounces {
     pub fn new(timeout: Duration) -> Self {
         Self {
             timeout,
+            withheld: Default::default(),
             running: Arc::new(tokio::sync::watch::channel(0).0),
         }
     }
 
+    /// The bound on each `stopped` announce; zero once withheld.
     pub fn timeout(&self) -> Duration {
+        if self.withheld.load(std::sync::atomic::Ordering::Acquire) {
+            return Duration::ZERO;
+        }
         self.timeout
+    }
+
+    /// Sends no `stopped` announce from now on, through any clone.
+    pub fn withhold(&self) {
+        self.withheld
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Resolves once every tracker task started with these settings has ended

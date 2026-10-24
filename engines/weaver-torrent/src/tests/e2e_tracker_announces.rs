@@ -36,14 +36,14 @@ async fn read_announce(listener: &TcpListener) -> anyhow::Result<(TcpStream, Opt
 }
 
 /// One parameter of an announce's query string.
-fn param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+pub(super) fn param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query
         .split('&')
         .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
 }
 
 /// The next HTTP request to the tracker, unanswered, and its query string.
-async fn read_announce_query(listener: &TcpListener) -> anyhow::Result<(TcpStream, String)> {
+pub(super) async fn read_announce_query(listener: &TcpListener) -> anyhow::Result<(TcpStream, String)> {
     let (mut conn, _) = listener.accept().await?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -58,7 +58,7 @@ async fn read_announce_query(listener: &TcpListener) -> anyhow::Result<(TcpStrea
     Ok((conn, query))
 }
 
-async fn respond(conn: TcpStream, body: &str) -> anyhow::Result<()> {
+pub(super) async fn respond(conn: TcpStream, body: &str) -> anyhow::Result<()> {
     respond_bytes(conn, body.as_bytes()).await
 }
 
@@ -84,7 +84,7 @@ fn answer_with_peer(peer: SocketAddr) -> anyhow::Result<Vec<u8>> {
     Ok(body)
 }
 
-fn tracker_session_opts() -> anyhow::Result<SessionOptions> {
+pub(super) fn tracker_session_opts() -> anyhow::Result<SessionOptions> {
     Ok(SessionOptions {
         disable_trackers: false,
         http_client: Some(std::sync::Arc::new(|| {

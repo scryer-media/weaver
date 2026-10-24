@@ -291,8 +291,13 @@ pub struct Session {
     // Lifecycle management
     cancellation_token: CancellationToken,
     _cancellation_token_drop_guard: DropGuard,
-    // Every task the session spawns and the DHT's worker: stop() returns once they are gone.
+    // Every task the session spawns: stop() returns once they are gone.
     tasks: TaskTracker,
+    // What lets the swarm reach this session: its listeners, its DHT and its
+    // local discovery. stop() ends them, and waits for them, before any
+    // tracker hears stopped.
+    swarm: CancellationToken,
+    swarm_tasks: TaskTracker,
 
     // Runtime settings
     output_folder: PathBuf,
@@ -1256,6 +1261,8 @@ impl Session {
             let identity = opts.identity.take().unwrap_or_default();
             let token = opts.cancellation_token.take().unwrap_or_default();
             let tasks = TaskTracker::new();
+            let swarm = token.child_token();
+            let swarm_tasks = TaskTracker::new();
             // Every name the session looks up, on whichever socket.
             let resolver: Arc<dyn Resolver> = opts
                 .socket_factory
@@ -1276,7 +1283,7 @@ impl Session {
                     listen_opts
                         .start(
                             opts.root_span.as_ref().and_then(|s| s.id()),
-                            token.child_token(),
+                            swarm.child_token(),
                             bind_device.as_ref(),
                             opts.socket_factory.as_ref(),
                         )
@@ -1306,13 +1313,13 @@ impl Session {
                         opts.ipv4_only,
                         DhtConfig {
                             bootstrap_addrs: dht_config.bootstrap_addrs,
-                            cancellation_token: Some(token.clone()),
+                            cancellation_token: Some(swarm.clone()),
                             bind_device: bind_device.as_ref(),
                             socket: dht_socket,
                             resolver: Some(resolver.clone()),
                             node_id_prefix: dht_node_id_prefix,
                             client_version: dht_client_version,
-                            tasks: Some(tasks.clone()),
+                            tasks: Some(swarm_tasks.clone()),
                             ..Default::default()
                         },
                     )
@@ -1322,14 +1329,14 @@ impl Session {
                     let listen_addr = dht_listen_addr(dht_config.port, None, opts.ipv4_only);
                     DhtBuilder::with_config(DhtConfig {
                         bootstrap_addrs: dht_config.bootstrap_addrs,
-                        cancellation_token: Some(token.child_token()),
+                        cancellation_token: Some(swarm.child_token()),
                         bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
                         socket: dht_socket,
                         resolver: Some(resolver.clone()),
                         node_id_prefix: dht_node_id_prefix,
                         client_version: dht_client_version,
-                        tasks: Some(tasks.clone()),
+                        tasks: Some(swarm_tasks.clone()),
                         ..Default::default()
                     })
                     .await
@@ -1456,7 +1463,7 @@ impl Session {
                     None
                 } else {
                     LocalServiceDiscovery::new(LocalServiceDiscoveryOptions {
-                        cancel_token: token.clone(),
+                        cancel_token: swarm.clone(),
                         bind_device: bind_device.as_ref(),
                         #[cfg(test)]
                         socket: opts.lsd_socket.take(),
@@ -1482,6 +1489,8 @@ impl Session {
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
                 tasks,
+                swarm,
+                swarm_tasks,
                 announce_port: Arc::new(AnnouncePort::new(
                     listen_result.as_ref().and_then(|l| l.announce_port),
                 )),
@@ -1782,7 +1791,7 @@ impl Session {
         let addr = listening.addr;
         if let Some(tcp) = listening.tcp_socket {
             let this = self.clone();
-            self.spawn(
+            self.spawn_on_swarm(
                 debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
                 "tcp_listen",
                 async move {
@@ -1793,7 +1802,7 @@ impl Session {
         }
         if let Some(tcp) = listening.custom_tcp_socket {
             let this = self.clone();
-            self.spawn(
+            self.spawn_on_swarm(
                 debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
                 "tcp_listen",
                 async move {
@@ -1804,7 +1813,7 @@ impl Session {
         }
         if let Some(utp) = listening.utp_socket {
             let this = self.clone();
-            self.spawn(
+            self.spawn_on_swarm(
                 debug_span!(parent: self.rs(), "utp_listen", ?addr, tls),
                 "utp_listen",
                 async move {
@@ -2038,14 +2047,50 @@ impl Session {
         );
     }
 
+    /// Spawn a task the swarm reaches this session through; stop() ends it
+    /// before the trackers hear stopped.
+    fn spawn_on_swarm(
+        &self,
+        span: tracing::Span,
+        name: impl Into<Cow<'static, str>>,
+        fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) {
+        spawn_with_cancel(
+            span,
+            name,
+            self.swarm.clone(),
+            self.swarm_tasks.track_future(fut),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stopped_announces(&self) -> &StoppedAnnounces {
+        &self.stopped_announces
+    }
+
+    /// From now on no tracker hears `stopped` from this session: the address
+    /// it would go out from no longer carries this session's traffic.
+    pub fn withhold_stopped(&self) {
+        self.stopped_announces.withhold();
+    }
+
     pub(crate) fn rs(&self) -> Option<tracing::Id> {
         self.root_span.as_ref().and_then(|s| s.id())
     }
 
     /// Stop the session and all managed tasks. Each step logs as it starts,
-    /// naming what it waits on.
+    /// naming what it waits on. The swarm loses this session first: its
+    /// listeners, DHT and local discovery are gone, and its torrents' peers
+    /// dropped, before the trackers hear stopped, when they may.
     pub async fn stop(&self) {
         let listen = self.listen_addr();
+        info!(
+            ?listen,
+            "stopping the session: closing its listeners, DHT and local discovery"
+        );
+        self.swarm.cancel();
+        self.swarm_tasks.close();
+        self.swarm_tasks.wait().await;
         let torrents = self
             .db
             .read()
@@ -2081,7 +2126,7 @@ impl Session {
         }
         info!(
             ?listen,
-            "stopping the session: closing its listeners, DHT and trackers, and removing its port mappings"
+            "stopping the session: closing its trackers and removing its port mappings"
         );
         self.cancellation_token.cancel();
         self.tasks.close();
