@@ -7,11 +7,9 @@
 // volumes, never delivered themselves, so a piece whose first never came is
 // no file of its own: the set counts from `.001`, and any piece founds it.
 
-use std::io::{self, Read};
-
 use weaver_graph::{Kind, Standing, Why};
 
-use super::{Decoder, Front};
+use super::Decoder;
 use crate::split;
 
 pub struct Pieces;
@@ -22,13 +20,11 @@ const WINDOW: u64 = 64 << 10;
 impl Decoder for Pieces {
     const KIND: Kind = Kind::Split;
     const FIRST_PIECE: Option<u32> = Some(1);
+    // The member is the pieces' bytes joined, nothing done to them.
+    const IDENTITY: bool = true;
 
     fn window(_first: &[u8]) -> u64 {
         WINDOW
-    }
-
-    fn open(input: Front, _window: u64) -> io::Result<Box<dyn Read + Send>> {
-        Ok(Box::new(input))
     }
 
     // What the pieces were cut from.

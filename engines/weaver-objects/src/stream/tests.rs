@@ -597,3 +597,115 @@ fn a_run_hands_its_output_on_in_whole_chunks() {
         }
     }
 }
+
+// A closed volume in memory whose bytes at `lost` nothing will bring: a read
+// ends short where they begin and fails on them, as the owner's does, and
+// what the run read on past is kept.
+struct Holed {
+    bytes: Vec<u8>,
+    lost: ByteRange,
+    bridged: Mutex<Vec<weaver_graph::Lost>>,
+}
+
+impl Volumes for Holed {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        Ok(after.is_none().then_some(VolumeIndex(0)))
+    }
+
+    fn len(&self, _volume: VolumeIndex) -> Option<u64> {
+        Some(self.bytes.len() as u64)
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        let end = (offset + into.len() as u64).min(self.bytes.len() as u64);
+        let want = ByteRange::new(offset.min(end), end);
+        if self.lost.contains(offset) {
+            let range = ByteRange::new(offset, self.lost.end.min(want.end));
+            let lost = weaver_graph::Lost { volume, range };
+            return Err(io::Error::new(io::ErrorKind::NotFound, lost));
+        }
+        let end = if offset < self.lost.start {
+            want.end.min(self.lost.start)
+        } else {
+            want.end
+        };
+        let read = (end - want.start) as usize;
+        into[..read].copy_from_slice(&self.bytes[want.start as usize..end as usize]);
+        Ok(read)
+    }
+
+    fn bridged(&self, lost: weaver_graph::Lost) {
+        self.bridged.lock().unwrap().push(lost);
+    }
+}
+
+fn holed<D: Decoder>(name: &str, bytes: Vec<u8>, lost: ByteRange) -> (Vec<Emit>, Arc<Holed>) {
+    let volumes = Arc::new(Holed {
+        bytes,
+        lost,
+        bridged: Mutex::default(),
+    });
+    let mut emits = Vec::new();
+    let reader: Arc<dyn Volumes> = volumes.clone();
+    stream::<D>(name).start().run(reader, &mut |emit| {
+        emits.push(emit);
+        true
+    });
+    (emits, volumes)
+}
+
+// Pieces joined as they are lose nothing beside a lost span: the member
+// holds it as a gap marked damaged at the same offsets, every other byte as
+// posted, and closes at its full length for a recovery set to rebuild.
+#[test]
+fn a_join_reads_on_past_a_lost_span_and_marks_it_damaged() {
+    let plain = payload(9, 3 * super::run::CHUNK);
+    let lost = ByteRange::new(70_000, 75_000);
+    let (emits, volumes) = holed::<Pieces>("lantern.bin.001", plain.clone(), lost);
+    let mut joined = vec![1u8; plain.len()];
+    let mut damaged = Vec::new();
+    for emit in &emits {
+        if let Emit::Bytes {
+            offset,
+            bytes,
+            provenance,
+            ..
+        } = emit
+        {
+            let range = ByteRange::at(*offset, bytes.len() as u64);
+            joined[range.start as usize..range.end as usize].copy_from_slice(bytes);
+            if *provenance == Provenance::Damaged {
+                damaged.push(range);
+            }
+        }
+    }
+    assert_eq!(
+        damaged.iter().map(|range| range.len()).sum::<u64>(),
+        lost.len()
+    );
+    assert!(damaged.iter().all(|range| lost.contains(range.start)));
+    assert_eq!(
+        &joined[..lost.start as usize],
+        &plain[..lost.start as usize]
+    );
+    assert_eq!(&joined[lost.end as usize..], &plain[lost.end as usize..]);
+    assert_eq!(emits.last(), Some(&Emit::MemberClosed(MemberId(0))));
+    assert_eq!(
+        *volumes.bridged.lock().unwrap(),
+        vec![weaver_graph::Lost {
+            volume: VolumeIndex(0),
+            range: lost
+        }]
+    );
+}
+
+// A decoder's output is not its input's bytes: it reads on past nothing
+// lost, and never closes its member.
+#[test]
+fn a_decoder_reads_on_past_no_lost_span() {
+    let bytes = gzip(&payload(9, 3 * super::run::CHUNK));
+    let lost = ByteRange::new(100, 200);
+    let (emits, volumes) = holed::<Gzip>("a.gz", bytes, lost);
+    assert!(!emits.contains(&Emit::MemberClosed(MemberId(0))));
+    assert!(volumes.bridged.lock().unwrap().is_empty());
+}

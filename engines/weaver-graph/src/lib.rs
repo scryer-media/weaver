@@ -44,7 +44,7 @@ pub mod volume;
 mod wire;
 
 pub use deliver::{Delivery, Emit, Handed, Posted, Provenance, RecoveryKind, Why};
-pub use engine::{Engine, Extraction, Sink, Volumes};
+pub use engine::{Engine, Extraction, Lost, Sink, Volumes};
 pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
     decode_parts, encode_parts, encode_since,

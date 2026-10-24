@@ -5,19 +5,21 @@
 // reads verified bytes only: a read waits on the shelf until every byte of
 // its range is in, fresh or repaired, and damaged bytes wait for their repair
 // as missing ones wait to arrive, so a decoder never builds on bytes known to
-// be bad. A read ends short only where a closed volume ends, and fails once
-// its bytes are lost, damaged ones nothing will repair included, or the run
-// is stopped. A lost read is remembered: the run cannot tell it from its
-// own failure, so its owner says why it ended. Nothing here polls: every
-// change to the shelf wakes the reads waiting on it.
+// be bad. A read ends short where a closed volume ends, or where bytes that
+// will never come begin once its volume settles; one that starts on those
+// fails with the span that is lost, damaged bytes nothing will repair
+// included, as one fails once the run is stopped. A lost read is remembered
+// until the run says it read on past the span: a run that cannot tell it
+// from its own failure leaves it to its owner to say why it ended. Nothing
+// here polls: every change to the shelf wakes the reads waiting on it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use weaver_graph::{ByteRange, VolumeIndex, Volumes};
+use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
 use crate::pipeline::graph::envelope::Shelf;
 use crate::pipeline::graph::leaf::read_exact_at;
@@ -26,23 +28,21 @@ use crate::pipeline::graph::leaf::read_exact_at;
 pub(crate) enum Unreadable {
     #[error("the run was stopped")]
     Stopped,
-    #[error("{volume} lost {range}: nothing will bring those bytes")]
-    Lost {
-        volume: VolumeIndex,
-        range: ByteRange,
-    },
+    #[error(transparent)]
+    Lost(Lost),
 }
 
 impl From<Unreadable> for io::Error {
     fn from(error: Unreadable) -> Self {
-        // A stopped run's reads fail for good. `Interrupted` is the one kind
-        // every reader retries, a decoder's header parse and `read_exact`
-        // included, so a run stopped under one would spin and never return.
-        let kind = match error {
-            Unreadable::Stopped => io::ErrorKind::BrokenPipe,
-            Unreadable::Lost { .. } => io::ErrorKind::NotFound,
-        };
-        io::Error::new(kind, error)
+        match error {
+            // A stopped run's reads fail for good. `Interrupted` is the one
+            // kind every reader retries, a decoder's header parse and
+            // `read_exact` included, so a run stopped under one would spin
+            // and never return.
+            Unreadable::Stopped => io::Error::new(io::ErrorKind::BrokenPipe, error),
+            // The span itself is the payload, which a run reads back.
+            Unreadable::Lost(lost) => io::Error::new(io::ErrorKind::NotFound, lost),
+        }
     }
 }
 
@@ -52,7 +52,8 @@ pub(crate) struct RunVolumes {
     // The run's own handles, so a read never holds the shelf's lock while
     // it touches the disk.
     files: Mutex<BTreeMap<u32, File>>,
-    lost: AtomicBool,
+    // The lost spans reads failed on that the run has not read on past.
+    lost: Mutex<BTreeSet<(u32, u64, u64)>>,
     stopped: AtomicBool,
 }
 
@@ -72,7 +73,7 @@ impl RunVolumes {
             shelf,
             generation,
             files: Mutex::default(),
-            lost: AtomicBool::new(false),
+            lost: Mutex::default(),
             stopped: AtomicBool::new(false),
         }
     }
@@ -89,9 +90,14 @@ impl RunVolumes {
         self.stopped.load(Ordering::Acquire)
     }
 
-    // Whether a read failed because nothing will bring its bytes.
+    // Whether a read failed because nothing will bring its bytes, and the
+    // run did not read on past them.
     pub(crate) fn lost(&self) -> bool {
-        self.lost.load(Ordering::Acquire)
+        !self.spans().is_empty()
+    }
+
+    fn spans(&self) -> std::sync::MutexGuard<'_, BTreeSet<(u32, u64, u64)>> {
+        self.lost.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     // Whether the run may still speak: nothing has stopped it.
@@ -129,16 +135,19 @@ impl RunVolumes {
                     return Ok((want.len(), Some(kept.path().to_path_buf())));
                 }
                 Some(kept) if kept.settled => {
-                    return Err(Unreadable::Lost {
-                        volume,
-                        range: want,
-                    });
+                    return match settled(&kept.coverage, want) {
+                        Ok(len) => {
+                            kept.reached = kept.reached.max(want.start + len);
+                            Ok((len, Some(kept.path().to_path_buf())))
+                        }
+                        Err(range) => Err(Unreadable::Lost(Lost { volume, range })),
+                    };
                 }
                 None if complete && !known => {
-                    return Err(Unreadable::Lost {
+                    return Err(Unreadable::Lost(Lost {
                         volume,
                         range: want,
-                    });
+                    }));
                 }
                 _ => {}
             }
@@ -179,8 +188,9 @@ impl Volumes for RunVolumes {
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
         let range = ByteRange::at(offset, into.len() as u64);
         let (len, path) = self.wait_for(volume, range).inspect_err(|error| {
-            if matches!(error, Unreadable::Lost { .. }) {
-                self.lost.store(true, Ordering::Release);
+            if let Unreadable::Lost(lost) = error {
+                self.spans()
+                    .insert((lost.volume.0, lost.range.start, lost.range.end));
             }
         })?;
         let Some(path) = path else {
@@ -194,5 +204,33 @@ impl Volumes for RunVolumes {
         };
         read_exact_at(file, offset, &mut into[..len])?;
         Ok(len)
+    }
+
+    fn bridged(&self, lost: Lost) {
+        self.spans()
+            .remove(&(lost.volume.0, lost.range.start, lost.range.end));
+    }
+}
+
+// What a read of `want` gets from a volume nothing more will come to: the
+// verified bytes from its start, as many as run unbroken, or, when its
+// first byte is not one of them, the span from there to the next verified
+// byte, which is lost.
+fn settled(coverage: &Coverage, want: ByteRange) -> Result<u64, ByteRange> {
+    let mut reached = want.start;
+    let mut next = want.end;
+    for run in coverage.runs() {
+        if run.range.end <= reached || !run.provenance.is_verified() {
+            continue;
+        }
+        if run.range.start > reached {
+            next = next.min(run.range.start);
+            break;
+        }
+        reached = run.range.end;
+    }
+    match reached.min(want.end) - want.start {
+        0 => Err(ByteRange::new(want.start, next.max(want.start))),
+        len => Ok(len),
     }
 }

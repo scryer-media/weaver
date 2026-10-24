@@ -4,7 +4,9 @@
 // One run of a stream: its volume decoded from the front into its one member,
 // waiting for bytes still on their way. A decode that fails ends the member:
 // what was said of it is retracted, and the stream is called damaged where
-// its format can say so and refused where it cannot.
+// its format can say so and refused where it cannot. A stream whose decoder
+// does nothing to its bytes reads on past bytes that will never come: the
+// member holds them as a gap marked damaged, at the same offsets.
 
 use std::io::{self, Read};
 use std::marker::PhantomData;
@@ -54,7 +56,12 @@ impl<D: Decoder> Extraction for Run<D> {
         if !announced {
             return;
         }
-        let error = match D::open(input, self.window).and_then(|reader| pump(reader, sink)) {
+        let pumped = if D::IDENTITY {
+            pump(Box::new(input), sink, Front::bridge)
+        } else {
+            D::open(input, self.window).and_then(|reader| pump(reader, sink, |_, _| None))
+        };
+        let error = match pumped {
             Ok(Ended::Whole) => {
                 sink(Emit::MemberClosed(MEMBER));
                 return;
@@ -91,36 +98,55 @@ impl<D: Decoder> Extraction for Run<D> {
 // Decoded bytes to the sink a whole chunk at a time, however little each
 // read of the decoder gives, until the stream ends or fails or the owner
 // stops listening: every emit is a step of the owner's, so only the last is
-// short. What decoded before a failure is said before it.
-fn pump(mut reader: Box<dyn Read + Send>, sink: &mut Sink<'_>) -> io::Result<Ended> {
+// short. What decoded before a failure is said before it. A failure `bridge`
+// reads on past is a gap of the length it gives, said as damaged bytes.
+fn pump<R: Read + ?Sized>(
+    mut reader: Box<R>,
+    sink: &mut Sink<'_>,
+    bridge: impl Fn(&mut R, &io::Error) -> Option<u64>,
+) -> io::Result<Ended> {
     let mut buffer = vec![0u8; CHUNK];
     let mut offset = 0u64;
     loop {
         let (filled, failed) = fill(&mut *reader, &mut buffer);
-        if filled > 0 {
-            let heard = sink(Emit::Bytes {
-                member: MEMBER,
-                offset,
-                bytes: Bytes::copy_from_slice(&buffer[..filled]),
-                provenance: Provenance::Fresh,
-            });
-            if !heard {
-                return Ok(Ended::Stopped);
+        if !say(sink, offset, &buffer[..filled], Provenance::Fresh) {
+            return Ok(Ended::Stopped);
+        }
+        offset += filled as u64;
+        match failed {
+            Some(error) => {
+                let len = bridge(&mut *reader, &error).ok_or(error)?;
+                let gap = vec![0u8; CHUNK];
+                let end = offset + len;
+                while offset < end {
+                    let part = usize::try_from(end - offset).map_or(CHUNK, |rest| rest.min(CHUNK));
+                    if !say(sink, offset, &gap[..part], Provenance::Damaged) {
+                        return Ok(Ended::Stopped);
+                    }
+                    offset += part as u64;
+                }
             }
-            offset += filled as u64;
-        }
-        if let Some(error) = failed {
-            return Err(error);
-        }
-        if filled < buffer.len() {
-            return Ok(Ended::Whole);
+            None if filled < buffer.len() => return Ok(Ended::Whole),
+            None => {}
         }
     }
 }
 
+// Bytes of the member to the sink, nothing for none; `false` once the owner
+// stopped listening.
+fn say(sink: &mut Sink<'_>, offset: u64, bytes: &[u8], provenance: Provenance) -> bool {
+    bytes.is_empty()
+        || sink(Emit::Bytes {
+            member: MEMBER,
+            offset,
+            bytes: Bytes::copy_from_slice(bytes),
+            provenance,
+        })
+}
+
 // As much of `buffer` as the stream holds, short only at its end or where
 // the decoder failed.
-fn fill(reader: &mut dyn Read, buffer: &mut [u8]) -> (usize, Option<io::Error>) {
+fn fill<R: Read + ?Sized>(reader: &mut R, buffer: &mut [u8]) -> (usize, Option<io::Error>) {
     let mut filled = 0;
     while filled < buffer.len() {
         match reader.read(&mut buffer[filled..]) {

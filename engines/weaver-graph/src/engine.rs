@@ -17,11 +17,29 @@ use std::sync::Arc;
 
 use crate::deliver::Emit;
 use crate::seek::Seek;
-use crate::volume::VolumeIndex;
+use crate::volume::{ByteRange, VolumeIndex};
+
+// Bytes of a volume nothing will bring: what a read that starts on them
+// fails with, as the payload of its `io::Error`, naming the whole span from
+// where the read started to the next byte that is there, within the read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{volume} lost {range}: nothing will bring those bytes")]
+pub struct Lost {
+    pub volume: VolumeIndex,
+    pub range: ByteRange,
+}
+
+impl Lost {
+    // The lost span a failed read names, when that is why it failed.
+    pub fn of(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref::<Self>().copied()
+    }
+}
 
 // A run's view of its volumes: files that may still be growing. A read waits
-// until the bytes are there, returns short only at a closed volume's end,
-// and fails when they will never come, or when the run was cancelled.
+// until the bytes are there, returns short where a closed volume ends or
+// where bytes nothing will bring begin, and fails when it starts on those,
+// with `Lost`, or when the run was cancelled.
 pub trait Volumes: Send + Sync {
     // The volume after `after` in the set's order, or its first for `None`;
     // `None` past the last bound once no member beside the volumes is still
@@ -34,6 +52,12 @@ pub trait Volumes: Send + Sync {
     fn len(&self, volume: VolumeIndex) -> Option<u64>;
 
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize>;
+
+    // The run read on past a span a read failed on as lost: what it builds
+    // holds that span as a gap marked damaged, at the place the span's bytes
+    // would have filled, which a recovery set over its output can rebuild.
+    // The lost read no longer ends the run.
+    fn bridged(&self, _lost: Lost) {}
 }
 
 // Where a run says what it found. `false` means stop: the run was cancelled

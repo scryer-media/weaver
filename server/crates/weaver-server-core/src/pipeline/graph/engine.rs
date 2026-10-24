@@ -306,9 +306,10 @@ impl Runs {
             let mut sink =
                 |emit| volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok();
             extraction.run(reader, &mut sink);
-            // A run that read bytes nothing will bring built on less than its
-            // volumes hold, and ends silent on the failed read: what it said
-            // is refused as damage nothing repairs.
+            // A run that read bytes nothing will bring, and did not read on
+            // past them, built on less than its volumes hold and ends silent
+            // on the failed read: what it said is refused as damage nothing
+            // repairs.
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }

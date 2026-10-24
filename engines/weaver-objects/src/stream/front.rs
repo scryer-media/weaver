@@ -53,6 +53,15 @@ impl Front {
         Ok(pieces)
     }
 
+    // Read on past the lost span a failed read stopped at, when that is why
+    // it failed: returns the span's length, which the joined bytes leave as
+    // a gap where the span's bytes would have been.
+    pub(crate) fn bridge(&mut self, error: &io::Error) -> Option<u64> {
+        let len = self.input.bridge(error)?;
+        self.at += len;
+        Some(len)
+    }
+
     fn len(&self) -> io::Result<u64> {
         Ok(self.input.closed_lens()?.iter().sum())
     }
