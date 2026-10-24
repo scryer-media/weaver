@@ -475,6 +475,10 @@ impl RepeatedArticles {
             .await;
         let (data, attempts, source) =
             Pipeline::download_data_from_decoded_trace(work.segment_id, trace);
+        // The one wire fetch here, credited exactly as a lane credits one.
+        if let Some(counters) = &work.counters {
+            super::owned_lane::credit_transfer(counters, &data);
+        }
         Reply {
             data,
             attempts,

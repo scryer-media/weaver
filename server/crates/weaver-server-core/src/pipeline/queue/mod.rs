@@ -114,6 +114,9 @@ pub struct JobRow {
     pub counters: Arc<JobCounters>,
     pub(crate) phases: HashMap<crate::jobs::phase_progress::JobPhase, counters::PhaseSample>,
     pub(crate) sampled_phases: Vec<crate::jobs::phase_progress::JobPhaseProgress>,
+    // The download rate over `counters.downloaded`, advanced on every metrics
+    // tick for as long as the row lives, on the global gauge's sample instants.
+    pub(crate) download_rate: Option<crate::operations::metrics::RateSeries>,
     pub(crate) admission: Option<PreparedAdd>,
 }
 
@@ -192,6 +195,7 @@ impl JobRow {
             counters: Arc::default(),
             phases: HashMap::new(),
             sampled_phases: Vec::new(),
+            download_rate: None,
             admission: None,
         }
     }

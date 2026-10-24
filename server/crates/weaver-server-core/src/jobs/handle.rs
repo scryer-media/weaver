@@ -365,7 +365,14 @@ impl SharedPipelineState {
     // sampling quickly until the gauges have settled.
     #[cfg(any(test, feature = "test-support"))]
     pub fn refresh_metrics_snapshot(&self, now: std::time::Instant) -> bool {
-        let snapshot = self.metrics.sample_totals(now, 0, 0, 0);
+        let snapshot = self.metrics.sample_totals(
+            now,
+            self.metrics
+                .bytes_downloaded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            0,
+        );
         let rates_moving = snapshot.current_download_speed > 0
             || snapshot.articles_per_sec > 0.0
             || snapshot.decode_rate_mbps > 0.0;

@@ -175,7 +175,7 @@ impl DownloadPressureReason {
 // it is advanced once per 100 ms metrics tick under the tracker mutex, and
 // once per active job phase on that same tick, so a job's displayed rate and
 // the global gauge are one estimator over one window and can be compared.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RateSeries {
     // Ring buffer of (timestamp, cumulative value) samples.
     samples: Vec<(Instant, u64)>,
@@ -194,6 +194,25 @@ impl RateSeries {
             pos: 0,
             rate: 0.0,
             last_ema_at: None,
+        }
+    }
+
+    // A series on this one's sample instants that has counted nothing yet:
+    // every past sample holds `cumulative` and the smoothed rate is zero.
+    //
+    // A counter that starts contributing to a total mid-window gets one of
+    // these from the total's series. Both are then the same linear estimator
+    // over the same instants, so the parts' rates sum to the total's rate.
+    pub(crate) fn aligned_from(&self, cumulative: u64) -> Self {
+        Self {
+            samples: self
+                .samples
+                .iter()
+                .map(|&(at, _)| (at, cumulative))
+                .collect(),
+            pos: self.pos,
+            rate: 0.0,
+            last_ema_at: self.last_ema_at,
         }
     }
 
@@ -894,9 +913,28 @@ impl PipelineMetrics {
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
-        self.sample_totals(Instant::now(), 0, 0, 0)
+        self.sample_totals(
+            Instant::now(),
+            self.bytes_downloaded.load(Ordering::Relaxed),
+            0,
+            0,
+        )
     }
 
+    // The global download series as it stands before this tick, holding
+    // nothing: what a job's download rate starts from, so the job's rate and
+    // the gauge share every sample instant.
+    pub(crate) fn download_rate_seed(&self) -> RateSeries {
+        self.speed_tracker
+            .lock()
+            .unwrap()
+            .bytes_downloaded
+            .aligned_from(0)
+    }
+
+    // `downloaded` is the wire-byte counter the download gauge integrates. The
+    // queue hands it the transfer total every job's own counter is credited
+    // beside, so the jobs' download rates sum to the gauge.
     pub(crate) fn sample_totals(
         &self,
         now: Instant,
@@ -910,7 +948,7 @@ impl PipelineMetrics {
         // One independent sampling tick advances every rate on the same clock.
         let rates = self.speed_tracker.lock().unwrap().update(
             now,
-            bytes_downloaded,
+            downloaded,
             segments_downloaded,
             bytes_decoded,
         );

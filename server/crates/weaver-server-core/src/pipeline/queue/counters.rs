@@ -92,6 +92,7 @@ impl Queue {
         if let Err(error) = self.sample_bandwidth(false) {
             tracing::warn!(%error, "failed to sample bandwidth usage");
         }
+        let seed = metrics.download_rate_seed();
         let snapshot = metrics.sample_totals(
             now,
             self.counters.bandwidth.total(),
@@ -107,6 +108,15 @@ impl Queue {
             inner.metrics = Some(snapshot);
             let epoch = crate::jobs::epoch_ms_now();
             for row in &mut inner.jobs {
+                // Every row's download series advances on every tick, whatever
+                // its phase, and starts from the gauge's own sample instants:
+                // the gauge integrates the transfer total each row's counter is
+                // credited beside, so the rows' rates sum to the gauge.
+                let downloaded = row.counters.downloaded.load(Ordering::Relaxed);
+                let download_rate = row
+                    .download_rate
+                    .get_or_insert_with(|| seed.clone())
+                    .update(now, downloaded);
                 if row.phases.is_empty() || row.intents.cancelled.is_some() {
                     continue;
                 }
@@ -118,8 +128,6 @@ impl Queue {
                 for (&phase, sample) in &mut row.phases {
                     let download = phase == JobPhase::Downloading;
                     if download && !downloading {
-                        sample.rate = RateSeries::new();
-                        sample.first = None;
                         continue;
                     }
                     let completed = if download {
@@ -133,17 +141,19 @@ impl Queue {
                     if total == 0 {
                         continue;
                     }
-                    let bytes = if download {
-                        row.counters.downloaded.load(Ordering::Relaxed)
+                    // The download rate needs no warm-up: it never starts a
+                    // window of its own.
+                    let (rate, warm) = if download {
+                        (download_rate, true)
                     } else {
-                        completed
+                        let rate = sample.rate.update(now, completed);
+                        let first = *sample.first.get_or_insert(now);
+                        (
+                            rate,
+                            now.duration_since(first) >= Duration::from_millis(250),
+                        )
                     };
-                    let rate = sample.rate.update(now, bytes);
-                    let rate_bps = (now.duration_since(*sample.first.get_or_insert(now))
-                        >= Duration::from_millis(250)
-                        && rate.is_finite()
-                        && rate >= 1.0)
-                        .then_some(rate as u64);
+                    let rate_bps = (warm && rate.is_finite() && rate >= 1.0).then_some(rate as u64);
                     phases.push(JobPhaseProgress {
                         phase,
                         completed_bytes: completed,
