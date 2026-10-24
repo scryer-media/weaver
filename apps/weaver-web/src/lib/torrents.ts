@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+import type { Translate } from "@/lib/context/translate-context";
+import type { ResolvedBy } from "./test-via.ts";
+
 /**
  * Whether archives are extracted, where a level may inherit it: null
  * inherits. Option labels are translation keys.
@@ -71,10 +74,15 @@ export type TrackerSource = "TORRENT" | "OPERATOR";
 /** Where the label for who named a tracker lives in the dictionary. */
 export const trackerSourceKey = (source: TrackerSource) => `next.torrent.trackerSource.${source}`;
 
+/** Where the label for who resolves a name lives in the dictionary. */
+export const resolvedByKey = (by: ResolvedBy) => `next.resolvedBy.${by}`;
+
 export interface TorrentTrackerData {
   tier: number;
   url: string;
   source: TrackerSource;
+  /** Who resolves its host; none for an address. */
+  resolvedBy: ResolvedBy | null;
   status: TrackerStatus;
   /** An announce to it is in flight. */
   updating: boolean;
@@ -198,4 +206,52 @@ export function removeOutcome(error: TorrentActionError | undefined): RemoveOutc
 /** The daemon's own text for a failed torrent action. */
 export function torrentErrorText(error: TorrentActionError): string {
   return error.graphQLErrors[0]?.message ?? error.message;
+}
+
+/** What a torrent session shows the trackers and peers it reaches. */
+export interface TorrentExposure {
+  resolvedBy: ResolvedBy | null;
+  /** The address a tracker sees; none until one is known. */
+  address: string | null;
+  /** The port announced; 0 when none is. */
+  announcedPort: number;
+  inbound: boolean;
+  udpTrackers: boolean;
+  dht: boolean;
+  utp: boolean;
+}
+
+/** An exposure as label and value pairs, in the order the views show them. */
+export function exposureValues(t: Translate, exposure: TorrentExposure): { label: string; value: string }[] {
+  const yesNo = (on: boolean) => t(on ? "next.common.yes" : "next.common.no");
+  return [
+    {
+      label: t("next.proxies.resolvedBy"),
+      value: exposure.resolvedBy === null ? "\u2014" : t(resolvedByKey(exposure.resolvedBy)),
+    },
+    { label: t("next.exposure.address"), value: exposure.address ?? t("next.exposure.unknown") },
+    { label: t("next.exposure.announcedPort"), value: String(exposure.announcedPort) },
+    { label: t("next.exposure.inbound"), value: yesNo(exposure.inbound) },
+    { label: t("next.exposure.udpTrackers"), value: yesNo(exposure.udpTrackers) },
+    { label: t("next.exposure.dht"), value: yesNo(exposure.dht) },
+    { label: t("next.exposure.utp"), value: yesNo(exposure.utp) },
+  ];
+}
+
+/** An exposure on one line. */
+export const exposureText = (t: Translate, exposure: TorrentExposure): string =>
+  exposureValues(t, exposure)
+    .map(({ label, value }) => `${label} ${value}`)
+    .join(" \u00b7 ");
+
+/**
+ * A torrent route's exposure cell: the open session's exposure, or, while it
+ * is closed, who resolves its names.
+ */
+export function routeExposureText(
+  t: Translate,
+  route: { resolvedBy: ResolvedBy | null; exposure: TorrentExposure | null },
+): string {
+  if (route.exposure !== null) return exposureText(t, route.exposure);
+  return route.resolvedBy === null ? "\u2014" : `${t("next.proxies.resolvedBy")} ${t(resolvedByKey(route.resolvedBy))}`;
 }

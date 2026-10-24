@@ -9,6 +9,7 @@ import { routeInput, routeProblem, type ConsumerKind, type NetworkRoute, type To
 import { proxyLabels } from "@/lib/proxies";
 import { proxyTestSentence } from "@/lib/proxy-fault";
 import { refusalMessage } from "@/lib/refusal";
+import { exposureValues } from "@/lib/torrents";
 import { cn } from "@/lib/utils";
 import {
   draftRoute,
@@ -334,6 +335,14 @@ function P2pRungs({ p2p }: { p2p: P2pTestResult }) {
           {t("next.networking.testVia.mappedPort", { port: p2p.mappedPort })}
         </li>
       )}
+      {p2p.exposure === null
+        ? null
+        : exposureValues(t, p2p.exposure).map(({ label, value }) => (
+            <li key={label} className="flex min-w-0 flex-wrap items-baseline gap-x-2 font-wv-mono text-[11px] leading-[1.5]">
+              <span className="w-[72px] flex-none text-wv-muted">{label}</span>
+              <span className="min-w-0 break-words text-wv-fg">{value}</span>
+            </li>
+          ))}
     </ul>
   );
 }

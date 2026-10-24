@@ -14,7 +14,8 @@ import {
   UPDATE_TORRENT_SETTINGS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { UNPACK_CHOICES, unpackChoice, unpackOf } from "@/lib/torrents";
+import { UNPACK_CHOICES, routeExposureText, unpackChoice, unpackOf, type TorrentExposure } from "@/lib/torrents";
+import type { ResolvedBy } from "@/lib/test-via";
 import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { NumberField, SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
@@ -329,6 +330,10 @@ interface TorrentRoute {
   externalAddresses: string[];
   /** Why the route's session is held closed, or why its leg is down. */
   reason: string | null;
+  /** Who resolves the names its sessions look up. */
+  resolvedBy: ResolvedBy | null;
+  /** What its session shows trackers and peers, while open. */
+  exposure: TorrentExposure | null;
 }
 
 const MAPPERS: Record<TorrentPortMapping["mapper"], string> = { UPNP: "UPnP", NAT_PMP: "NAT-PMP" };
@@ -358,12 +363,13 @@ function useTorrentRoutes(t: Translate): SettingsBlock {
     kind: "table",
     id: "torrentRoutes",
     title: t("next.torrents.routes"),
-    columns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1.2fr)",
+    columns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1.6fr) minmax(0, 1.2fr)",
     headers: [
       t("next.torrents.routeScopes"),
       t("next.torrents.routeListen"),
       t("next.torrents.routeMapping"),
       t("next.torrents.routeExternal"),
+      t("next.torrents.routeExposure"),
       t("next.torrents.routeStatus"),
     ],
     empty: t("next.torrents.routesEmpty"),
@@ -373,11 +379,12 @@ function useTorrentRoutes(t: Translate): SettingsBlock {
         route.listenAddress === null ? EM_DASH : `${route.listenAddress}${route.utp ? " TCP+uTP" : " TCP"}`;
       const mappings = route.mappings.length === 0 ? EM_DASH : route.mappings.map(mappingText).join("; ");
       const external = route.externalAddresses.length === 0 ? EM_DASH : route.externalAddresses.join(", ");
+      const exposure = routeExposureText(t, route);
       const status =
         route.reason ?? t(route.open ? "next.torrents.routeOpen" : "next.torrents.routeIdle");
       return {
         id: route.key,
-        searchText: [scopes, listen, mappings, external, status].join(" "),
+        searchText: [scopes, listen, mappings, external, exposure, status].join(" "),
         cells: [
           <Cell key="scopes" title={scopes}>
             {scopes || route.key}
@@ -395,6 +402,9 @@ function useTorrentRoutes(t: Translate): SettingsBlock {
           </Cell>,
           <Cell key="external" mono title={external}>
             {external}
+          </Cell>,
+          <Cell key="exposure" mono title={exposure}>
+            {exposure}
           </Cell>,
           <Cell
             key="status"

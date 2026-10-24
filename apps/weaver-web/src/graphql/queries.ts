@@ -1515,6 +1515,16 @@ export const TORRENT_ROUTES_QUERY = gql`
       }
       externalAddresses
       reason
+      resolvedBy
+      exposure {
+        resolvedBy
+        address
+        announcedPort
+        inbound
+        udpTrackers
+        dht
+        utp
+      }
     }
   }
 `;
@@ -1632,6 +1642,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         tier
         url
         source
+        resolvedBy
         status
         updating
         message

@@ -5,6 +5,7 @@ import type { Translate } from "@/lib/context/translate-context";
 import { directLeg, type Egress, type NetworkRoute, type ProxyPool } from "./networking.ts";
 import { proxyTestSentence } from "./proxy-fault.ts";
 import { codedSentence } from "./refusal.ts";
+import type { TorrentExposure } from "./torrents.ts";
 
 /**
  * What a test stacks on top of the route it is drafted through: one proxy,
@@ -43,8 +44,8 @@ export type PathTestResult = {
 /** The test torrent's steps, in the order a path takes them. */
 export type P2pStep = "TORRENT" | "ANNOUNCE" | "HANDSHAKE" | "PIECE" | "INBOUND";
 export type P2pRung = { step: P2pStep; outcome: "PASSED" | "FAILED" | "NOT_REACHED"; message: string | null };
-/** `mappedPort` is the port a tunnel's gateway opened, which the route now announces. */
-export type P2pTestResult = { rungs: P2pRung[]; mappedPort: number | null };
+/** `mappedPort` is the port a gateway mapped to the test session's listener. */
+export type P2pTestResult = { rungs: P2pRung[]; mappedPort: number | null; exposure: TorrentExposure | null };
 
 /** Who turned a test's host into addresses. */
 export type ResolvedBy = "LITERAL" | "HOST" | "SERVERS" | "PROXY" | "PROXY_SERVERS";

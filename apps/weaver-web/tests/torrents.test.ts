@@ -3,7 +3,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { removeOutcome, showsSeeding, trackerSourceKey, type TorrentData } from "../src/lib/torrents.ts";
+import {
+  removeOutcome,
+  routeExposureText,
+  showsSeeding,
+  trackerSourceKey,
+  type TorrentData,
+} from "../src/lib/torrents.ts";
 import { EM_DASH, formatRate, formatSize } from "../src/next/data/format.ts";
 import { informationFields, transferFields } from "../src/next/features/torrents/general.ts";
 import { englishTranslate as t } from "./english-translate.ts";
@@ -157,4 +163,29 @@ test("the information section names the pieces, the maker and where the torrent 
 test("a tracker row says whether the torrent or the operator named it", () => {
   assert.equal(t(trackerSourceKey("TORRENT")), "Torrent");
   assert.equal(t(trackerSourceKey("OPERATOR")), "Added");
+});
+
+test("a torrent route shows who resolves its names, and whether peers can reach its session", () => {
+  const exposure = {
+    resolvedBy: "PROXY" as const,
+    address: null,
+    announcedPort: 0,
+    inbound: false,
+    udpTrackers: false,
+    dht: false,
+    utp: false,
+  };
+  assert.equal(
+    routeExposureText(t, { resolvedBy: "PROXY", exposure }),
+    "Resolved by Proxy · Tracker sees Unknown · Announced port 0 · Inbound No · UDP trackers No · DHT No · uTP No",
+  );
+  assert.equal(
+    routeExposureText(t, {
+      resolvedBy: "HOST",
+      exposure: { ...exposure, resolvedBy: "HOST", address: "203.0.113.7", announcedPort: 40001, inbound: true },
+    }),
+    "Resolved by Host DNS · Tracker sees 203.0.113.7 · Announced port 40001 · Inbound Yes · UDP trackers No · DHT No · uTP No",
+  );
+  assert.equal(routeExposureText(t, { resolvedBy: "SERVERS", exposure: null }), "Resolved by DNS servers");
+  assert.equal(routeExposureText(t, { resolvedBy: null, exposure: null }), EM_DASH);
 });
