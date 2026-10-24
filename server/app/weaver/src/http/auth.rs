@@ -172,8 +172,30 @@ fn canonical_browser_origin(headers: &HeaderMap) -> Result<String, StatusCode> {
 // Same-origin GETs normally omit Origin. Use their Referer to keep session
 // discovery consistent with the mandatory Origin check on browser writes.
 fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> bool {
+    browser_origin_matches(headers, |origin| origin == session_origin)
+}
+
+// Whether a request sent with a cookie comes from a page of this listener:
+// the browser says so in `Sec-Fetch-Site`, or else its Origin, or Referer
+// without one, names the host and port the request was sent to. A request
+// with none of them came from no browser page.
+pub(super) fn same_origin_request(headers: &HeaderMap) -> bool {
+    let mut sites = headers.get_all("sec-fetch-site").iter();
+    if let Some(site) = sites.next() {
+        return sites.next().is_none() && matches!(site.to_str(), Ok("same-origin" | "none"));
+    }
+    let host = super::routes::host_header_authority(headers).ok().flatten();
+    browser_origin_matches(headers, |origin| {
+        host.as_ref()
+            .is_some_and(|host| origin_host_matches(origin, host))
+    })
+}
+
+// Whether the origin a request names, by its Origin or else its Referer, is
+// one `matches` accepts. A request that names none matches.
+fn browser_origin_matches(headers: &HeaderMap, matches: impl Fn(&str) -> bool) -> bool {
     if headers.contains_key(header::ORIGIN) {
-        return canonical_browser_origin(headers).ok().as_deref() == Some(session_origin);
+        return canonical_browser_origin(headers).is_ok_and(|origin| matches(&origin));
     }
     let mut values = headers.get_all(header::REFERER).iter();
     let Some(value) = values.next() else {
@@ -193,7 +215,7 @@ fn browser_session_origin_matches(headers: &HeaderMap, session_origin: &str) -> 
         && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
-        && url.origin().ascii_serialization() == session_origin
+        && matches(&url.origin().ascii_serialization())
 }
 
 // Whether a canonical browser origin names the same host and port as the

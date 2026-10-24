@@ -45,7 +45,7 @@ use weaver_server_core::torrents::{
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, SchedulerHandle};
 
-use super::auth::{LoginRateLimiter, login_client_id};
+use super::auth::{LoginRateLimiter, login_client_id, same_origin_request};
 
 #[cfg(test)]
 mod tests;
@@ -231,7 +231,7 @@ impl TorrentFacadeContext {
     // The caller: the login cookie, else an API key sent with the request
     // (bearer, `X-Api-Key`, or the password of basic auth). A cookie this
     // facade does not know leaves the request to its other credentials.
-    async fn caller(&self, headers: &HeaderMap) -> Result<CallerScope, StatusCode> {
+    async fn caller(&self, headers: &HeaderMap) -> Result<Caller, StatusCode> {
         let session = cookie(headers, "SID").and_then(|sid| {
             let key_hash = self
                 .sessions()
@@ -242,18 +242,44 @@ impl TorrentFacadeContext {
         });
         if let Some((sid, key_hash)) = session {
             match self.resolve_key_hash(key_hash).await? {
-                Some(scope) => return Ok(scope),
+                Some(scope) => {
+                    return Ok(Caller {
+                        scope,
+                        by_cookie: true,
+                    });
+                }
                 None => {
                     self.sessions().keys.remove(&sid);
                 }
             }
         }
-        if let Some(password) = basic_password(headers) {
-            return self.resolve(&password).await;
-        }
-        let mut headers = headers.clone();
-        headers.remove(header::COOKIE);
-        self.resolve_headers(&headers).await
+        let scope = match basic_password(headers) {
+            Some(password) => self.resolve(&password).await?,
+            None => {
+                let mut headers = headers.clone();
+                headers.remove(header::COOKIE);
+                self.resolve_headers(&headers).await?
+            }
+        };
+        Ok(Caller {
+            scope,
+            by_cookie: false,
+        })
+    }
+}
+
+// Who a request is from, and whether the login cookie said so.
+struct Caller {
+    scope: CallerScope,
+    by_cookie: bool,
+}
+
+impl Caller {
+    // Whether the request may change anything: its key's scope allows it,
+    // and a request the browser sent with the login cookie came from a page
+    // of this listener, whatever its method.
+    fn may_change(&self, headers: &HeaderMap) -> bool {
+        self.scope.can_control() && (!self.by_cookie || same_origin_request(headers))
     }
 }
 
@@ -435,6 +461,9 @@ async fn handle(
         }
         ("auth", "logout") => {
             if let Some(sid) = cookie(request.headers(), "SID") {
+                if !same_origin_request(request.headers()) {
+                    return forbidden();
+                }
                 ctx.sessions().keys.remove(&sid);
             }
             return ok();
@@ -442,15 +471,16 @@ async fn handle(
         _ => {}
     }
     // The caller is known before any of the body is read.
-    let Ok(scope) = ctx.caller(request.headers()).await else {
+    let Ok(caller) = ctx.caller(request.headers()).await else {
         return forbidden();
     };
     let Some(need) = need(&group, &action) else {
         return text(StatusCode::NOT_FOUND, "Not Found");
     };
+    let scope = caller.scope;
     let allowed = match need {
         Need::Read => scope.can_read(),
-        Need::Control => scope.can_control(),
+        Need::Control => caller.may_change(request.headers()),
     };
     if !allowed {
         return forbidden();

@@ -2328,3 +2328,95 @@ async fn a_read_key_sees_no_trackers_passkey() {
     assert_eq!(urls(READER).await, ["https://tracker.invalid:8443/…"]);
     assert_eq!(urls(ADMIN).await, [PRIVATE]);
 }
+
+// A request with the login cookie that changes anything must come from a
+// page of this listener, whatever its method; one that only reads, or one
+// carrying its key, need not.
+#[tokio::test]
+async fn a_cookie_changes_nothing_from_another_origin() {
+    let rig = rig().await;
+    let cookie = rig.send(login(ADMIN)).await.cookie.unwrap();
+    let sid = cookie.split(';').next().unwrap().to_owned();
+    let send = |path: &'static str,
+                credential: (&'static str, String),
+                headers: &[(&'static str, &'static str)]| {
+        let mut request = Request::get(path)
+            .header(header::HOST, "weaver.test:8080")
+            .header(credential.0, credential.1);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let rig = &rig;
+        let request = request.body(Body::empty()).unwrap();
+        async move { rig.send(request).await.status }
+    };
+    let by_cookie = || (header::COOKIE.as_str(), sid.clone());
+    let pause = "/api/v2/torrents/pause?hashes=all";
+    let read = "/api/v2/torrents/info";
+    let cases: [(&str, &[(&str, &str)], StatusCode); 9] = [
+        (
+            pause,
+            &[("sec-fetch-site", "cross-site")],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            pause,
+            &[("sec-fetch-site", "same-site")],
+            StatusCode::FORBIDDEN,
+        ),
+        (pause, &[("sec-fetch-site", "same-origin")], StatusCode::OK),
+        (pause, &[("sec-fetch-site", "none")], StatusCode::OK),
+        (
+            pause,
+            &[("origin", "http://elsewhere.test:8080")],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            pause,
+            &[("referer", "http://weaver.test:9090/page")],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            pause,
+            &[("origin", "http://weaver.test:8080")],
+            StatusCode::OK,
+        ),
+        (
+            pause,
+            &[("referer", "http://weaver.test:8080/page")],
+            StatusCode::OK,
+        ),
+        (read, &[("sec-fetch-site", "cross-site")], StatusCode::OK),
+    ];
+    for (path, headers, status) in cases {
+        assert_eq!(
+            send(path, by_cookie(), headers).await,
+            status,
+            "{path} {headers:?}"
+        );
+    }
+    // An automation client sends none of them.
+    assert_eq!(send(pause, by_cookie(), &[]).await, StatusCode::OK);
+    // A key is no cookie a page can borrow.
+    let by_key = || ("x-api-key", ADMIN.to_owned());
+    assert_eq!(
+        send(pause, by_key(), &[("sec-fetch-site", "cross-site")]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(pause, by_key(), &[("origin", "http://elsewhere.test:8080")]).await,
+        StatusCode::OK
+    );
+    // Nor does another page end the session.
+    let logout = "/api/v2/auth/logout";
+    assert_eq!(
+        send(logout, by_cookie(), &[("sec-fetch-site", "cross-site")]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(send(read, by_cookie(), &[]).await, StatusCode::OK);
+    assert_eq!(
+        send(logout, by_cookie(), &[("sec-fetch-site", "same-origin")]).await,
+        StatusCode::OK
+    );
+    assert_eq!(send(read, by_cookie(), &[]).await, StatusCode::FORBIDDEN);
+}
