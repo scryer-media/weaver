@@ -64,6 +64,60 @@ async fn repeated_article_cache_failure_refuses_admission_before_persistence() {
     assert!(pipeline.repeated_articles.contains_key(&id));
 }
 
+// Renaming an idle job moves its working directory with the repeated-article
+// cache inside it. The cache must follow: dropping it at archive cleans the
+// directory under the new name, never a path the rename already vacated.
+#[tokio::test]
+async fn a_rename_carries_the_repeated_article_cache_to_the_new_working_dir() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = handle(&pipeline);
+    let id = JobId(9203);
+    let mut spec = segmented_job_spec("cache rename fixture", "payload.bin", &[100, 100]);
+    spec.files[0].segments[1].message_id = spec.files[0].segments[0].message_id.clone();
+    handle
+        .add_job(
+            id,
+            spec,
+            PathBuf::from("cache-rename.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.repeated_articles.contains_key(&id));
+    let old_dir = pipeline.jobs[&id].working_dir.clone();
+    let caches = |dir: &std::path::Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join(".weaver-chunks"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("article-cache-"))
+            })
+            .collect()
+    };
+    assert_eq!(caches(&old_dir).len(), 1);
+
+    assert!(
+        pipeline
+            .rename_working_dir_when_quiet(id, "cache rename fixture renamed")
+            .await
+    );
+    let new_dir = pipeline.jobs[&id].working_dir.clone();
+    assert_ne!(new_dir, old_dir);
+    assert!(!old_dir.exists());
+    assert_eq!(caches(&new_dir).len(), 1);
+
+    pipeline.repeated_articles.remove(&id);
+    assert!(
+        caches(&new_dir).is_empty(),
+        "the dropped cache must remove its directory under the new name"
+    );
+}
+
 #[tokio::test]
 async fn shutdown_services_terminal_completion_needed_by_pending_readmission() {
     let temp = tempfile::tempdir().unwrap();
