@@ -62,18 +62,23 @@ impl Image {
                 .filter(|_| (disk as usize) < lengths.len())
                 .map(|before| before.iter().sum())
         };
+        // Where the records after the directory start.
+        let mut after = start + found.at;
         let end = match found.wide {
             true => {
-                let at = (start + found.at)
+                let at = after
                     .checked_sub(LOCATOR_LEN)
                     .ok_or(Unopened::Refused(Why::Unrepairable))?;
                 let mut locator = [0u8; LOCATOR_LEN as usize];
                 joined.read_exact(at, &mut locator)?;
                 let (disk, offset) =
                     records::locator(&locator).ok_or(Unopened::Refused(Why::Unrepairable))?;
-                let at = base(disk).ok_or(Unopened::Refused(Why::Unsupported))? + offset;
+                let at = base(disk)
+                    .and_then(|base| base.checked_add(offset))
+                    .ok_or(Unopened::Refused(Why::Unsupported))?;
                 let mut record = [0u8; END64_LEN as usize];
                 joined.read_exact(at, &mut record)?;
+                after = at;
                 records::end64(&record, found).ok_or(Unopened::Refused(Why::Unrepairable))?
             }
             false => found,
@@ -86,8 +91,15 @@ impl Image {
         if end.this_disk == 0 {
             return Ok(whole(joined));
         }
-        let directory =
-            base(end.directory_disk).ok_or(Unopened::Refused(Why::Unsupported))? + end.offset;
+        // A directory runs no further than the records after it.
+        let directory = base(end.directory_disk)
+            .and_then(|base| base.checked_add(end.offset))
+            .filter(|directory| {
+                directory
+                    .checked_add(end.size)
+                    .is_some_and(|end| end <= after)
+            })
+            .ok_or(Unopened::Refused(Why::Unsupported))?;
         let mut bytes = vec![0u8; end.size as usize];
         joined.read_exact(directory, &mut bytes)?;
         let rest = rewrite(&mut bytes, &end, directory, &base)
@@ -115,7 +127,7 @@ fn rewrite(
 ) -> Option<Vec<u8>> {
     let entries = records::directory(directory, end.entries)?;
     for entry in &entries {
-        let offset = base(entry.disk)? + entry.offset;
+        let offset = base(entry.disk)?.checked_add(entry.offset)?;
         put(directory, entry.offset_at, offset, 4)?;
         put(directory, entry.disk_at, 0, 2)?;
     }

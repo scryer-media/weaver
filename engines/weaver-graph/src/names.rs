@@ -203,17 +203,25 @@ impl NameLedger {
     }
 }
 
+// The directory of the working directory the job's own files live in:
+// scratch, repair and envelope files. No output is written under it.
+pub const INTERNAL_DIR: &str = ".weaver-chunks";
+
 // A name an archive gave, kept inside the folder it is written under: either
 // separator splits it, and empty, `.` and `..` parts are dropped, so a path
-// can neither climb out nor start at the root. A trailing separator, which
-// names a directory, is kept.
+// can neither climb out nor start at the root. A path that starts at the
+// internal directory starts at that directory's first suffixed name instead.
+// A trailing separator, which names a directory, is kept.
 fn confined(wanted: &str) -> String {
-    let parts: Vec<&str> = wanted
+    let outside = format!("{INTERNAL_DIR} (1)");
+    let mut parts: Vec<&str> = wanted
         .split(['/', '\\'])
         .filter(|part| !part.is_empty() && *part != "." && *part != "..")
         .collect();
-    if parts.is_empty() {
-        return "_".to_owned();
+    match parts.first_mut() {
+        None => return "_".to_owned(),
+        Some(first) if first.eq_ignore_ascii_case(INTERNAL_DIR) => *first = &outside,
+        Some(_) => {}
     }
     let mut name = parts.join("/");
     if wanted.ends_with(['/', '\\']) {
@@ -293,6 +301,24 @@ mod tests {
         assert_eq!(root(&mut ledger, 3, "deep/./dir\\"), "deep/dir/");
         assert_eq!(root(&mut ledger, 4, ".."), "_");
         assert_eq!(root(&mut ledger, 5, "plain.bin"), "plain.bin");
+    }
+
+    #[test]
+    fn no_name_lands_in_the_internal_directory() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(
+            root(&mut ledger, 1, ".weaver-chunks/a.bin"),
+            ".weaver-chunks (1)/a.bin"
+        );
+        assert_eq!(
+            root(&mut ledger, 2, "./.WEAVER-CHUNKS\\b.bin"),
+            ".weaver-chunks (1)/b.bin"
+        );
+        assert_eq!(root(&mut ledger, 3, ".weaver-chunks"), ".weaver-chunks (1)");
+        assert_eq!(
+            root(&mut ledger, 4, "dir/.weaver-chunks/c.bin"),
+            "dir/.weaver-chunks/c.bin"
+        );
     }
 
     #[test]

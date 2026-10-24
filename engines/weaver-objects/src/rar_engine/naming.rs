@@ -3,9 +3,16 @@
 
 // How a RAR set numbers its volumes in their names: `name.part1.rar`,
 // `name.part2.rar`, … counted from one, or the old `name.rar`, `name.r00`,
-// `name.r01`, … with `.sNN` numbered the same way. Case never matters.
+// … `name.r99`, then `name.s00` … `name.s99`, `name.t00` and on, a hundred
+// to a letter. Case never matters.
+
+use std::ops::RangeInclusive;
 
 use crate::engine::SetName;
+
+// The letters the old numbering runs through. It stops before `z`, whose
+// `.zNN` names are a split zip's.
+const OLD_LETTERS: RangeInclusive<u8> = b'r'..=b'y';
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Scheme {
@@ -66,11 +73,12 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
         return Some(0);
     }
     if lower.len() >= 4 {
-        let ext = &lower[lower.len() - 4..];
-        if (ext.starts_with(".r") || ext.starts_with(".s"))
-            && let Ok(n) = ext[2..].parse::<u32>()
+        let ext = lower[lower.len() - 4..].as_bytes();
+        if ext[0] == b'.'
+            && OLD_LETTERS.contains(&ext[1])
+            && let Ok(n) = lower[lower.len() - 2..].parse::<u32>()
         {
-            return Some(n + 1);
+            return Some(u32::from(ext[1] - OLD_LETTERS.start()) * 100 + n + 1);
         }
     }
     None
@@ -100,9 +108,15 @@ pub(crate) fn sibling(reference: &str, index: u32) -> Option<String> {
             ))
         }
         Scheme::Old if index == 0 => Some(format!("{base}.rar")),
-        // `parse` reads two digits after the letter, so `.r99` is the last
-        // old name it numbers.
-        Scheme::Old => (index <= 100).then(|| format!("{base}.r{:02}", index - 1)),
+        // `parse` reads two digits after the letter, a hundred names to each
+        // letter it numbers.
+        Scheme::Old => {
+            let letter = u32::from(*OLD_LETTERS.start()) + (index - 1) / 100;
+            let letter = u8::try_from(letter)
+                .ok()
+                .filter(|letter| OLD_LETTERS.contains(letter))?;
+            Some(format!("{base}.{}{:02}", letter as char, (index - 1) % 100))
+        }
     }
 }
 
@@ -148,11 +162,34 @@ mod tests {
         assert_eq!(sibling("a.part01.RAR", 9).as_deref(), Some("a.part10.RAR"));
         assert_eq!(sibling("a.r00", 0).as_deref(), Some("a.rar"));
         assert_eq!(sibling("a.rar", 1).as_deref(), Some("a.r00"));
-        assert_eq!(sibling("a.rar", 101), None);
-        for name in ["a.part3.rar", "a.r05", "a.rar"] {
+        for name in ["a.part3.rar", "a.r05", "a.rar", "a.r99", "a.s00", "a.y99"] {
             let index = parse(name).unwrap().index();
             assert_eq!(sibling(name, index).as_deref(), Some(name));
         }
+    }
+
+    #[test]
+    fn the_old_numbering_runs_a_hundred_to_a_letter_from_r() {
+        for (name, index) in [
+            ("a.rar", 0),
+            ("a.r00", 1),
+            ("a.r99", 100),
+            ("a.s00", 101),
+            ("A.S01", 102),
+            ("a.s99", 200),
+            ("a.t00", 201),
+            ("a.y99", 800),
+        ] {
+            assert_eq!(parse(name).unwrap().index(), index, "{name}");
+            assert_eq!(
+                sibling("a.rar", index).as_deref(),
+                Some(name.to_ascii_lowercase().as_str())
+            );
+        }
+        assert_eq!(sibling("a.rar", 801), None);
+        assert_eq!(parse("a.z01"), None);
+        assert_eq!(parse("a.q00"), None);
+        assert!(parse("a.s00").unwrap().same_set(&parse("a.r00").unwrap()));
     }
 
     #[test]

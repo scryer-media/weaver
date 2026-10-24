@@ -279,7 +279,11 @@ impl Shelf {
         match state.kept.entry(envelope) {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
-                let name = format!(".weaver-chunks/graph-envelope-{}-{envelope}", self.node.0);
+                let name = format!(
+                    "{}/graph-envelope-{}-{envelope}",
+                    weaver_graph::names::INTERNAL_DIR,
+                    self.node.0
+                );
                 let mut leaf = Leaf::at(&self.dir, &name)?;
                 leaf.truncate()?;
                 Ok(free.insert(Kept {

@@ -53,7 +53,11 @@ impl Zip {
             let Some(start) = self
                 .geometry
                 .global(VolumeIndex(disk), offset)
-                .filter(|start| start + END64_LEN <= range.start)
+                .filter(|start| {
+                    start
+                        .checked_add(END64_LEN)
+                        .is_some_and(|end| end <= range.start)
+                })
             else {
                 return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
             };

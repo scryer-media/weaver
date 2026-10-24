@@ -283,17 +283,19 @@ impl GraphJob {
     }
 }
 
-// A root member is the post's file of its number: its identity is that
-// index, never its name, which a recovery set's rename changes. That the
-// post is the one checkpointed, by its names, is the root's facts' check.
+// A root member the post carries is the post's file of its number: its
+// identity is that index, never its name, which a recovery set's rename
+// changes. That the post is the one checkpointed, by its names, is the
+// root's facts' check. The members past the post's files are files a
+// recovery set describes, which the root announced itself after them; a
+// further posting is the post's, so none of them is one.
 fn same_post(tree: &Tree, files: &[RootFile]) -> Result<(), RestoreFailure> {
     let Some(namespace) = tree.namespace(NodeId::ROOT) else {
         return Err(RestoreFailure::Post(0));
     };
-    match namespace
-        .records()
-        .find(|member| member.id.0 as usize >= files.len())
-    {
+    match namespace.records().find(|member| {
+        member.id.0 as usize >= files.len() && namespace.resolve(member.id) != member.id
+    }) {
         Some(member) => Err(RestoreFailure::Post(member.id.0)),
         None => Ok(()),
     }

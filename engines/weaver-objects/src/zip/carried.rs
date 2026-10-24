@@ -85,7 +85,11 @@ impl Zip {
         let Some((disk, offset)) = records::locator(self.kept.read(locator)?) else {
             return Some(None);
         };
-        let Some(start) = self.geometry.global(VolumeIndex(disk), offset) else {
+        let Some(start) = self
+            .geometry
+            .global(VolumeIndex(disk), offset)
+            .filter(|start| start.checked_add(END64_LEN).is_some())
+        else {
             return Some(None);
         };
         let record = ByteRange::at(start, END64_LEN);

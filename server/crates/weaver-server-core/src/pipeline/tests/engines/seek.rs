@@ -630,7 +630,13 @@ async fn a_recovery_seek_stands_across_a_restart() {
     let scenario = Scenario::new(posts).damaged(1, 2);
     let whole = run(&scenario, Engine::Graph).await;
     assert_members(&whole, &members);
-    let (status, order, requests) = run_restarting_once(&scenario).await;
+    let recovering = |pipeline: &Pipeline| {
+        pipeline
+            .jobs
+            .get(&JOB)
+            .is_some_and(|state| state.download_queue.has_recovery_work())
+    };
+    let (status, order, requests) = run_restarting_once(&scenario, recovering).await;
     assert_eq!(status, Some(JobStatus::Complete));
     assert_eq!(order, whole.order, "the restarted run's order");
     assert!(
@@ -639,10 +645,40 @@ async fn a_recovery_seek_stands_across_a_restart() {
     );
 }
 
-// A graph run restarted once, the moment the recovery seek was answered:
-// recovery work sits queued and none of it was handed out yet.
+// A file the set describes and no post carries is a root member the root
+// announced itself, past the post's files. A run restarted once that member
+// is in the checkpoint restores it beside the posted ones and rebuilds it.
+#[tokio::test]
+async fn a_root_member_the_set_announced_restores_across_a_restart() {
+    let lantern = payload(4 * ARTICLE, 75);
+    let quill = payload(3 * ARTICLE - 3, 76);
+    let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+    posts.extend(par2_set(
+        "lantern",
+        &[
+            ("lantern.bin", lantern.as_slice()),
+            ("quill.bin", quill.as_slice()),
+        ],
+        4,
+    ));
+    let posted = posts.len() as u32;
+    let scenario = Scenario::new(posts);
+    let announced = |pipeline: &Pipeline| {
+        pipeline.graph_jobs.get(&JOB).is_some_and(|job| {
+            job.tree()
+                .namespace(weaver_graph::NodeId::ROOT)
+                .is_some_and(|root| root.records().any(|member| member.id.0 >= posted))
+        })
+    };
+    let (status, _, _) = run_restarting_once(&scenario, announced).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+}
+
+// A graph run restarted once, after the first article that leaves `due`
+// true.
 async fn run_restarting_once(
     scenario: &Scenario,
+    due: impl Fn(&Pipeline) -> bool,
 ) -> (
     Option<JobStatus>,
     Vec<(u32, u32)>,
@@ -670,11 +706,7 @@ async fn run_restarting_once(
             *requests.entry(article).or_insert(0usize) += 1;
             order.push(article);
             serve(&mut pipeline, scenario, article).await;
-            let promoted = pipeline
-                .jobs
-                .get(&JOB)
-                .is_some_and(|state| state.download_queue.has_recovery_work());
-            if !restarted && promoted {
+            if !restarted && due(&pipeline) {
                 restarted = true;
                 pipeline = restart(&temp_dir, pipeline, scenario).await;
             }

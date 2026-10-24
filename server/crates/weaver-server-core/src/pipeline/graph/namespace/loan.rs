@@ -418,8 +418,10 @@ impl MemberAccess for Lent {
     // and namespace, so two repairs never share one.
     fn scratch(&mut self) -> Option<PathBuf> {
         let dir = self.working_dir.join(format!(
-            ".weaver-chunks/graph-recovery-{}-{}",
-            self.namespace.0, self.set.0
+            "{}/graph-recovery-{}-{}",
+            weaver_graph::names::INTERNAL_DIR,
+            self.namespace.0,
+            self.set.0
         ));
         super::remove_scratch(&dir);
         std::fs::create_dir_all(&dir).ok()?;

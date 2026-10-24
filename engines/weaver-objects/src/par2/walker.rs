@@ -113,7 +113,9 @@ impl Walker {
         let skip = self.next.saturating_sub(offset) as usize;
         let start = offset.max(self.next);
         let bytes = &bytes[skip..];
-        if self.held_bytes + bytes.len() > HOLD_CAP {
+        // Bytes at the front are walked whatever is held: they are what
+        // lets the held bytes drain. Only bytes that go on hold count.
+        if start > self.next && self.held_bytes + bytes.len() > HOLD_CAP {
             return;
         }
         self.hold(start, bytes);

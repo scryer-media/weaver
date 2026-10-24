@@ -826,13 +826,19 @@ impl NamespaceWriter {
                 .namespace(node)
                 .and_then(|namespace| namespace.get(*member))
                 .and_then(|record| record.length.filter(|_| record.is_complete()));
-            if let Some(length) = length
-                && let Some(leaf) = self
+            let has_file = self
+                .files
+                .get(&node)
+                .is_some_and(|files| files.leaves.contains_key(member));
+            if let Some(length) = length.filter(|_| has_file) {
+                self.admit_file(tree, node, *member, length)?;
+                if let Some(leaf) = self
                     .files
                     .get_mut(&node)
                     .and_then(|files| files.leaves.get_mut(member))
-            {
-                leaf.close(length)?;
+                {
+                    leaf.close(length)?;
+                }
             }
         }
         self.renamed = renamed;

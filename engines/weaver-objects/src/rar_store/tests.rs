@@ -932,6 +932,25 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
+#[test]
+fn a_volume_numbered_last_of_all_numbers_is_placed_nowhere() {
+    use super::claim::place;
+    use crate::quiet::Placed;
+    let mut facts = unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+        Cursor::new(fixture("rar5/rar5_store.rar")),
+        None,
+        Arc::new(unrar_rs::KdfCache::new()),
+    )
+    .unwrap()
+    .facts;
+    facts.is_volume = true;
+    let held = std::collections::BTreeMap::new();
+    facts.volume_number = Some(5);
+    assert_eq!(place(&facts, &held), Some(Placed::At(VolumeIndex(5))));
+    facts.volume_number = Some(u32::MAX);
+    assert_eq!(place(&facts, &held), None);
+}
+
 // A fixture written by RAR itself streams to what unrar-rs extracts from it.
 fn real_fixture(name: &str, password: &str) -> Owner {
     let bytes = fixture(&format!("rar5/{name}"));

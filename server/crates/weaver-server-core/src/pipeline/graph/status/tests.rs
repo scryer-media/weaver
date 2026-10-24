@@ -341,6 +341,14 @@ fn claims_read_complete_damaged_and_missing_off_the_namespace() {
     row.lost_bytes = 64;
     assert_eq!(row.failed_bytes(), 64);
     assert!(row.evidence, "thirty of a hundred bytes is a delivery");
+    // A damaged one owes its damage, retained with nothing lost or beside
+    // a smaller loss, and a larger loss as it stands.
+    let mut row = ClaimedMember::read(member(&names, 2), false);
+    assert_eq!(row.failed_bytes(), 40);
+    row.lost_bytes = 10;
+    assert_eq!(row.failed_bytes(), 40);
+    row.lost_bytes = 64;
+    assert_eq!(row.failed_bytes(), 64);
 }
 
 #[test]

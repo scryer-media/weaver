@@ -88,11 +88,14 @@ impl ClaimedMember {
 
     // The bytes the terminal record counts against the member. A complete
     // member owes nothing, whatever was lost on the way: a repair or a
-    // later article made it whole.
+    // later article made it whole. A damaged one owes its damaged bytes as
+    // well as its lost ones; a lost span read on past as damage is counted
+    // once.
     pub(crate) fn failed_bytes(&self) -> u64 {
         match self.claim {
             Claim::Complete => 0,
-            Claim::Damaged { .. } | Claim::Missing { .. } => self.lost_bytes,
+            Claim::Damaged { bytes } => self.lost_bytes.max(bytes),
+            Claim::Missing { .. } => self.lost_bytes,
         }
     }
 }

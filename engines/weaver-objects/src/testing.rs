@@ -61,6 +61,45 @@ pub(crate) fn payload(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
+// What a zip64 end record and its locator say, as `zip64_end` writes them.
+pub(crate) struct Zip64 {
+    // Where the locator says the zip64 record is, within its disk.
+    pub(crate) record: u64,
+    pub(crate) size: u64,
+    pub(crate) offset: u64,
+}
+
+// The last volume of a zip ended by zip64 records: its end record replaced
+// by a zip64 record, its locator and a saturated end record, with `edit`
+// changing what they say from what the end record said.
+pub(crate) fn zip64_end(last: &mut Vec<u8>, disks: u32, edit: impl FnOnce(&mut Zip64)) {
+    use crate::zip::records::{END, END64, END64_LEN, LOCATOR, find_end};
+    let end = find_end(last).unwrap();
+    last.truncate(end.at as usize);
+    let mut said = Zip64 {
+        record: last.len() as u64,
+        size: end.size,
+        offset: end.offset,
+    };
+    edit(&mut said);
+    last.extend(END64.to_le_bytes());
+    last.extend((END64_LEN - 12).to_le_bytes());
+    last.extend([45, 0, 45, 0]);
+    last.extend(end.this_disk.to_le_bytes());
+    last.extend(end.directory_disk.to_le_bytes());
+    last.extend(end.entries.to_le_bytes());
+    last.extend(end.entries.to_le_bytes());
+    last.extend(said.size.to_le_bytes());
+    last.extend(said.offset.to_le_bytes());
+    last.extend(LOCATOR.to_le_bytes());
+    last.extend(end.this_disk.to_le_bytes());
+    last.extend(said.record.to_le_bytes());
+    last.extend(disks.to_le_bytes());
+    last.extend(END.to_le_bytes());
+    last.extend([0xff; 16]);
+    last.extend(0u16.to_le_bytes());
+}
+
 // A PAR2 set over `files`, made by par2-rs's creator: the index first, then
 // the recovery volumes.
 pub(crate) fn par2_set(

@@ -918,3 +918,47 @@ fn damage_raises_the_smallest_volumes_its_shortfall_needs_and_defers_the_rest() 
                 && seek.range == ByteRange::new(ARTICLE, u64::MAX))
     );
 }
+
+// One recovery packet past the hold cap, every piece but its first article
+// arriving first: the hold fills to just under the cap, and the first
+// article, which would take it over, lands at the front, so it is walked
+// and the held bytes drain into the packet.
+#[test]
+fn the_article_that_closes_the_gap_is_walked_with_the_hold_full() {
+    use par2_rs::FileHashState;
+    use par2_rs::packet::{HEADER_SIZE, MAGIC};
+
+    use super::walker::{Found, Walker};
+
+    let data = payload(9, 8 * 1024 * 1024);
+    let length = (HEADER_SIZE + 4 + data.len()) as u64;
+    let mut packet = Vec::with_capacity(length as usize);
+    packet.extend_from_slice(MAGIC);
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.extend_from_slice(&[0; 16]);
+    packet.extend_from_slice(&[7; 16]);
+    packet.extend_from_slice(b"PAR 2.0\0RecvSlic");
+    packet.extend_from_slice(&3u32.to_le_bytes());
+    packet.extend_from_slice(&data);
+    let mut hasher = FileHashState::new();
+    hasher.update(&packet[32..]);
+    let hash = hasher.finalize();
+    packet[16..32].copy_from_slice(&hash);
+
+    let first = 4096;
+    let mut walker = Walker::default();
+    let mut found = Vec::new();
+    for (index, piece) in packet[first..].chunks(64 * 1024).enumerate() {
+        walker.deliver((first + index * 64 * 1024) as u64, piece, &mut found);
+    }
+    assert!(found.is_empty(), "nothing walks before the front arrives");
+    walker.deliver(0, &packet[..first], &mut found);
+    assert!(
+        matches!(
+            found.as_slice(),
+            [Found::Recovery { exponent: 3, range, .. }] if *range == ByteRange::new(0, length)
+        ),
+        "{found:?}"
+    );
+    assert_eq!(walker.front(), length);
+}

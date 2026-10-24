@@ -352,8 +352,8 @@ fn claim_names_the_volumes_of_its_own_set_only() {
     let mut old = named(&["set.rar"]);
     assert_eq!(old.claim("set.r00", b"", None), Some(VolumeIndex(1)));
     assert_eq!(old.claim("SET.R41", b"", None), Some(VolumeIndex(42)));
-    // `.sNN` is numbered as `.rNN` is.
-    assert_eq!(old.claim("set.s00", b"", None), Some(VolumeIndex(1)));
+    // `.sNN` follows `.r99`.
+    assert_eq!(old.claim("set.s00", b"", None), Some(VolumeIndex(101)));
     assert_eq!(old.claim("set.part2.rar", b"", None), None);
     assert_eq!(old.claim("set.rar", b"", None), Some(VolumeIndex(0)));
 }

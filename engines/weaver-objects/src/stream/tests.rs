@@ -709,3 +709,33 @@ fn a_decoder_reads_on_past_no_lost_span() {
     assert!(!emits.contains(&Emit::MemberClosed(MemberId(0))));
     assert!(volumes.bridged.lock().unwrap().is_empty());
 }
+
+// A set known by names alone claims only its own pieces: another set's
+// piece is not one of them, whichever of its pieces founded the stream.
+#[test]
+fn a_split_set_claims_only_pieces_of_its_own_stem() {
+    let plain = b"plain bytes, no signature";
+    let mut founded_by_first = stream::<Pieces>("alpha.bin.001");
+    assert_eq!(
+        founded_by_first.claim("alpha.bin.002", plain, Some(100)),
+        Some(VolumeIndex(1))
+    );
+    assert_eq!(
+        founded_by_first.claim("beta.bin.002", plain, Some(100)),
+        None
+    );
+    let mut founded_by_later = Stream::<Pieces>::new();
+    founded_by_later.bound(VolumeIndex(2), "alpha.bin.003", &[], None);
+    assert_eq!(
+        founded_by_later.claim("alpha.bin.001", plain, Some(100)),
+        Some(VolumeIndex(0))
+    );
+    assert_eq!(
+        founded_by_later.claim("beta.bin.001", plain, Some(100)),
+        None
+    );
+    assert_eq!(
+        Stream::<Pieces>::new().claim("beta.bin.002", plain, Some(100)),
+        Some(VolumeIndex(1))
+    );
+}

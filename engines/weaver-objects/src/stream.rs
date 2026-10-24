@@ -230,7 +230,9 @@ impl<D: Decoder> Object for Stream<D> {
     // known by names alone and else the first volume's own, whether that
     // place is held or not: a piece posted again is that piece. A name is all
     // that places a piece here, so it never outvotes a front a format
-    // names: that piece is the format's, wherever its name numbers it.
+    // names: that piece is the format's, wherever its name numbers it. A
+    // stream with a name counts from its own set's first piece, so only a
+    // piece of that set is claimed.
     fn claim(
         &mut self,
         name: &str,
@@ -242,7 +244,8 @@ impl<D: Decoder> Object for Stream<D> {
         }
         let piece = split::parse(name)?;
         let first = match D::FIRST_PIECE {
-            Some(number) => piece.numbered(number),
+            Some(number) if self.name.is_empty() => piece.numbered(number),
+            Some(number) => split::parse(&self.name)?.numbered(number),
             None => split::parse(&self.name)?,
         };
         piece.index_from(&first).map(VolumeIndex)

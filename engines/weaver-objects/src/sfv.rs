@@ -31,6 +31,11 @@ pub struct Sfv {
     id: ObjectId,
     // The text as far as it arrived contiguously.
     text: Vec<u8>,
+    // Pieces that arrived past the end of the text, by offset, until the
+    // text reaches them. A restart delivers every article again, so they
+    // are not facts.
+    #[serde(skip)]
+    held: BTreeMap<usize, Vec<u8>>,
     // Bound members and the CRC32 their entry gives.
     bound: BTreeMap<MemberId, u32>,
     // Each bound member's length once all of it arrived.
@@ -67,11 +72,21 @@ impl Sfv {
         Self {
             id,
             text: Vec::new(),
+            held: BTreeMap::new(),
             bound: BTreeMap::new(),
             lengths: BTreeMap::new(),
             grid: Grid::default(),
             outcome: None,
         }
+    }
+
+    // Bytes of the text at `offset`, which the text reaches.
+    fn write(&mut self, offset: usize, bytes: &[u8]) {
+        let end = offset + bytes.len();
+        if end > self.text.len() {
+            self.text.resize(end, 0);
+        }
+        self.text[offset..end].copy_from_slice(bytes);
     }
 
     fn verdict(&self, member: MemberId, expected: u32) -> SliceVerdict {
@@ -206,14 +221,23 @@ impl Object for Sfv {
         let Ok(offset) = usize::try_from(delivery.offset) else {
             return;
         };
-        if delivery.volume != VolumeIndex(0) || offset > self.text.len() || offset >= TEXT_CAP {
+        if delivery.volume != VolumeIndex(0) || offset >= TEXT_CAP {
             return;
         }
         let end = offset.saturating_add(delivery.bytes.len()).min(TEXT_CAP);
-        if end > self.text.len() {
-            self.text.resize(end, 0);
+        let bytes = &delivery.bytes[..end - offset];
+        if offset > self.text.len() {
+            self.held.insert(offset, bytes.to_vec());
+            return;
         }
-        self.text[offset..end].copy_from_slice(&delivery.bytes[..end - offset]);
+        self.write(offset, bytes);
+        while let Some(piece) = self.held.first_entry() {
+            if *piece.key() > self.text.len() {
+                break;
+            }
+            let (at, bytes) = piece.remove_entry();
+            self.write(at, &bytes);
+        }
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}

@@ -442,6 +442,40 @@ fn end_header(bytes: &[u8]) -> ByteRange {
     ByteRange::at(32 + offset, length)
 }
 
+// A signature header alone, declaring an end header right after it.
+fn signature_only(end_header_length: u64) -> Vec<u8> {
+    let mut tail = Vec::new();
+    tail.extend_from_slice(&0u64.to_le_bytes());
+    tail.extend_from_slice(&end_header_length.to_le_bytes());
+    tail.extend_from_slice(&0u32.to_le_bytes());
+    let mut bytes = super::header::MAGIC.to_vec();
+    bytes.extend_from_slice(&[0, 4]);
+    bytes.extend_from_slice(&crate::grid::crc32(&tail).to_le_bytes());
+    bytes.extend_from_slice(&tail);
+    bytes
+}
+
+#[test]
+fn an_end_header_declared_past_any_byte_holds_nothing_until_bytes_arrive() {
+    let bytes = signature_only(1 << 62);
+    let mut lone = store();
+    let mut out = Vec::new();
+    lone.deliver(
+        weaver_graph::Delivery {
+            volume: VolumeIndex(0),
+            offset: 0,
+            bytes: &bytes,
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut out,
+    );
+    assert_eq!(lone.kept.from(32), &[] as &[u8]);
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+}
+
 #[test]
 fn a_damaged_end_header_is_said_and_a_repair_gives_the_map() {
     let bytes = archive(copy(), false);

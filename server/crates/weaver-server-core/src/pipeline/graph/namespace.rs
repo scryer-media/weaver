@@ -1186,9 +1186,12 @@ impl NamespaceWriter {
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
             .ok_or(WriteError::UnknownMember { node, member })?;
-        let end = offset.saturating_add(bytes.len() as u64);
-        self.caps
-            .admit_write(tree, (node, member), end, self.free_disk.current())?;
+        // The leaf takes the member's length when it opens, so the file
+        // reaches that far from its first byte.
+        let end = offset
+            .saturating_add(bytes.len() as u64)
+            .max(record.length.unwrap_or(0));
+        self.admit_file(tree, node, member, end)?;
         let leaf = self.leaf(node, member, &record.output_name)?;
         leaf.write(offset, bytes, record.length)?;
         if let Some(length) = record.length.filter(|_| record.is_complete()) {
@@ -1216,7 +1219,21 @@ impl NamespaceWriter {
             return Ok(());
         }
         let output_name = record.output_name.clone();
+        self.admit_file(tree, node, member, length)?;
         self.leaf(node, member, &output_name)?.close(length)?;
+        Ok(())
+    }
+
+    // The member's file reaches `end`, by a write or by taking its length.
+    fn admit_file(
+        &mut self,
+        tree: &Tree,
+        node: NodeId,
+        member: MemberId,
+        end: u64,
+    ) -> Result<(), WriteError> {
+        self.caps
+            .admit_write(tree, (node, member), end, self.free_disk.current())?;
         Ok(())
     }
 
@@ -1341,7 +1358,11 @@ impl NamespaceWriter {
         let dir = self.working_dir.clone();
         let files = self.files_mut(node);
         if files.scratch.is_none() {
-            let name = format!(".weaver-chunks/graph-holds-{}.scratch", node.0);
+            let name = format!(
+                "{}/graph-holds-{}.scratch",
+                weaver_graph::names::INTERNAL_DIR,
+                node.0
+            );
             let mut scratch = Leaf::at(&dir, &name)?;
             scratch.truncate()?;
             files.scratch = Some(scratch);

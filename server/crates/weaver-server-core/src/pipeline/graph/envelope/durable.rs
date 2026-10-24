@@ -58,8 +58,10 @@ impl Envelopes {
         let shelf = self.shelf(record.node);
         self.marks.mark(record.node);
         let name = format!(
-            ".weaver-chunks/graph-envelope-{}-{}",
-            record.node.0, record.envelope
+            "{}/graph-envelope-{}-{}",
+            weaver_graph::names::INTERNAL_DIR,
+            record.node.0,
+            record.envelope
         );
         let leaf = Leaf::at(&shelf.dir, &name)?;
         let mut coverage = Coverage::new();
