@@ -138,11 +138,15 @@ pub(crate) fn rename_job_working_dir(
     new: &Path,
     id: JobId,
 ) -> Result<PathBuf, crate::SchedulerError> {
-    let dir = owned_working_directory(root, old)?;
-    if marker_job_id(&read_working_marker(&dir)?) != Some(id) || new.parent() != Some(root) {
-        return Err(
-            std::io::Error::other("rename directory belongs to another job or root").into(),
-        );
+    // The handle on the source closes before the move: a directory with an
+    // open handle cannot be renamed on Windows.
+    {
+        let dir = owned_working_directory(root, old)?;
+        if marker_job_id(&read_working_marker(&dir)?) != Some(id) || new.parent() != Some(root) {
+            return Err(
+                std::io::Error::other("rename directory belongs to another job or root").into(),
+            );
+        }
     }
     let journal = serde_json::to_string(&(old, new))
         .map_err(|error| crate::SchedulerError::Internal(error.to_string()))?;
@@ -174,9 +178,12 @@ pub(crate) fn recover_working_dir_rename(
         .into());
     }
     if old != new && old.try_exists()? {
-        let dir = owned_working_directory(root, &old)?;
-        if marker_job_id(&read_working_marker(&dir)?) != Some(id) {
-            return Err(std::io::Error::other("rename source belongs to another job").into());
+        // The handle on the source closes before the move, as above.
+        {
+            let dir = owned_working_directory(root, &old)?;
+            if marker_job_id(&read_working_marker(&dir)?) != Some(id) {
+                return Err(std::io::Error::other("rename source belongs to another job").into());
+            }
         }
         if let Err(error) = crate::runtime::fs::rename_path_exclusive(&old, &new) {
             db.delete_setting(&key)?;
