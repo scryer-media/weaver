@@ -279,12 +279,23 @@ test("Q4 and Q8 a started download with no server reads Queued with the reason, 
 test("Q6 a cancelled job leaves the queue only once its history row says cancelled by operator", async ({ request }) => {
   await updateConfiguredServer(request, "nntp2", { active: false });
   await updateConfiguredServer(request, "nntp", { connections: 1 });
+  // Both jobs are admitted under the global pause, so neither downloads
+  // before the other is in the queue. Each has 64 articles on one connection,
+  // so whichever the resume starts is far inside its download when the
+  // cancel lands, and the other cannot get a lease until it ends.
+  globalPauseByUs = true;
+  await graphql(request, "mutation WeaverE2EQ6Pause { pauseAll }");
   const tag = `q6-${Date.now()}`;
-  const downloading = await probeJob(request, tag, 4);
-  const queued = await probeJob(request, tag, 4);
-  started.push(downloading, queued);
-  const before = await waitFor(request, "one job downloading, one queued", (snap) =>
-    itemOf(snap, downloading)?.state === "DOWNLOADING" && itemOf(snap, queued)?.state === "QUEUED");
+  const jobs = [await probeJob(request, tag, 64), await probeJob(request, tag, 64)];
+  started.push(...jobs);
+  await waitFor(request, "both jobs admitted", (snap) => jobs.every((id) => itemOf(snap, id)));
+  await graphql(request, "mutation WeaverE2EQ6Resume { resumeAll }");
+  const before = await waitFor(request, "one job downloading, one queued", (snap) => {
+    const states = jobs.map((id) => itemOf(snap, id)?.state).sort();
+    return states[0] === "DOWNLOADING" && states[1] === "QUEUED";
+  });
+  globalPauseByUs = false;
+  const [downloading, queued] = itemOf(before, jobs[0]!)!.state === "DOWNLOADING" ? jobs : [jobs[1]!, jobs[0]!];
   const outputDirs = [downloading, queued]
     .map((id) => itemOf(before, id)?.outputDir)
     .filter((dir): dir is string => Boolean(dir))
