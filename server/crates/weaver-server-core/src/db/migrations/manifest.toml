@@ -1145,3 +1145,20 @@ kind = "sql"
 file = "migrations/0088_tracker_named_by/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 89
+description = "no mapped torrent port is kept outside the session that maps it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_forget_saved_mapped_ports/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_forget_saved_mapped_ports/postgres.sql"
+engine = "postgres"
+scope = "all"

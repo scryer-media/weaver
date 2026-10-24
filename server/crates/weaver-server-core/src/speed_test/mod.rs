@@ -12,7 +12,6 @@ mod failure;
 pub mod fixture;
 mod http;
 mod model;
-mod natpmp;
 mod nearest;
 mod overrides;
 mod progress;
@@ -31,7 +30,6 @@ mod tests;
 
 pub use failure::SpeedTestFailure;
 pub use model::*;
-pub(crate) use natpmp::gateway_of;
 pub use overrides::{TestedLeg, TestedRoute};
 pub use providers::{PROVIDERS, ProviderInfo, ProviderServer};
 pub use service::{

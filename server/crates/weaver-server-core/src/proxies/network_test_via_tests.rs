@@ -767,7 +767,6 @@ async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
             TestSubject::Route,
             None,
             fixture.source.clone(),
-            0,
         )
         .await
         .unwrap();

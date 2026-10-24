@@ -1580,12 +1580,13 @@ async fn udp_tracker_to_socket_addrs(
     Ok(res)
 }
 
-/// The `port` of an announce: the port peers reach this session on, or 1
-/// when it accepts no connections. An announce has no way to say "not
-/// reachable", and some trackers refuse port 0, so a session without a
-/// listener names port 1, which no peer is listening on.
+/// The `port` of an announce: the port peers reach this session on, or 0
+/// when it accepts no connections. Port 0 is the engine's one form for
+/// "unreachable": a peer at port 0 is never dialled and a DHT node at port 0
+/// is never used, so a session without a listener names no port anyone
+/// could answer on.
 fn announced_port(listen_port: Option<u16>) -> u16 {
-    listen_port.unwrap_or(1)
+    listen_port.unwrap_or(0)
 }
 
 /// How many peers an announce asks for: none with `stopped`, since the run

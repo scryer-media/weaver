@@ -25,8 +25,6 @@ async fn run_probe(fixture: &TorrentFixture, kind: LegKind, budget: Option<u64>)
         P2pPath {
             stage: loopback(),
             kind,
-            gateway: None,
-            internal_port: 0,
         },
         &P2pPlan {
             source: fixture.source.clone(),
@@ -232,8 +230,6 @@ async fn a_pull_counts_every_block_and_holds_no_more_than_it_keeps() {
     let path = P2pPath {
         stage: loopback(),
         kind: LegKind::Ladder,
-        gateway: None,
-        internal_port: 0,
     };
     let torrent = TestTorrent::fetch(path.stage.clone(), &fixture.source)
         .await

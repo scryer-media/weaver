@@ -44,7 +44,6 @@ pub const MAX_SESSIONS: usize = 8;
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 
 const SLOTS_KEY: &str = "torrent.session_slots";
-const MAPPED_KEY: &str = "torrent.mapped_ports";
 const CHOSEN_SSL_PORT_KEY: &str = "torrent.chosen_ssl_port";
 
 /// A resolved route's identity: the leg it dials over.
@@ -747,13 +746,12 @@ impl Sessions {
         .map_err(|error| error.to_string())
     }
 
-    // The route's port slot, read or taken off the async threads, and the
-    // port a gateway mapped to it.
-    async fn port_slot(&self, key: &RouteKey) -> Result<(u16, Option<u16>), String> {
+    // The route's port slot, read or taken off the async threads.
+    async fn port_slot(&self, key: &RouteKey) -> Result<u16, String> {
         let (db, key, table) = (self.db.clone(), key.clone(), Arc::clone(&self.port_slots));
         tokio::task::spawn_blocking(move || {
             let _table = table.lock().unwrap_or_else(PoisonError::into_inner);
-            Ok::<_, StateError>((port_slot(&db, &key)?, mapped_port(&db, &key)?))
+            port_slot(&db, &key)
         })
         .await
         .map_err(|error| error.to_string())?
@@ -767,8 +765,7 @@ impl Sessions {
         let released = tokio::task::spawn_blocking(move || {
             let _table = table.lock().unwrap_or_else(PoisonError::into_inner);
             let gone = |key: &str| !existing.iter().any(|kept| kept.as_str() == key);
-            release_slots(&db, gone)?;
-            release_mapped(&db, gone)
+            release_slots(&db, gone)
         })
         .await;
         match released {
@@ -906,7 +903,7 @@ impl Sessions {
         &self,
         plan: &RoutePlan,
         opener: &Identity,
-        slot: Result<(u16, Option<u16>), String>,
+        slot: Result<u16, String>,
         peers: usize,
         mappings: &PortMappings,
     ) -> Result<
@@ -919,15 +916,13 @@ impl Sessions {
         ),
         String,
     > {
-        let (slot, mapped) = slot?;
-        let mut torrent = self.config();
+        let slot = slot?;
+        let torrent = self.config();
         let port = slot_port(&torrent, slot).ok_or("no listen port is left for this route")?;
         let dir = self.env.root_of(&torrent).join(plan.key.as_str());
         std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
         let leg = self.routes.open(plan, peers).await?;
         let opening = Opening::of(&self.env, &torrent, leg.shape);
-        // A port a gateway mapped to the route is the one it announces.
-        torrent.announce_port = mapped.or(torrent.announce_port);
         let ip_filter = self.ip_filter(&torrent).await?;
         let ssl_port = if torrent.ssl_enabled {
             let base = self.ssl_base_port(torrent.ssl_port).await?;
@@ -1453,45 +1448,6 @@ pub fn chosen_ssl_port(db: &Database) -> Result<u16, StateError> {
     let port = 10_000 + u16::from_le_bytes(bytes) % 40_000;
     db.set_setting(CHOSEN_SSL_PORT_KEY, &port.to_string())?;
     Ok(port)
-}
-
-fn load_mapped(db: &Database) -> Result<BTreeMap<String, u16>, StateError> {
-    Ok(db
-        .get_setting(MAPPED_KEY)?
-        .and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_default())
-}
-
-fn save_mapped(db: &Database, mapped: &BTreeMap<String, u16>) -> Result<(), StateError> {
-    let value =
-        serde_json::to_string(mapped).map_err(|error| StateError::Database(error.to_string()))?;
-    db.set_setting(MAPPED_KEY, &value)
-}
-
-/// The port a tunnel's gateway mapped to the route, kept across restarts.
-pub fn mapped_port(db: &Database, key: &RouteKey) -> Result<Option<u16>, StateError> {
-    Ok(load_mapped(db)?.get(key.as_str()).copied())
-}
-
-/// Keep the port a tunnel's gateway mapped to the route: the route's
-/// session announces it from the next time it opens.
-pub fn set_mapped_port(db: &Database, key: &RouteKey, port: u16) -> Result<(), StateError> {
-    let mut mapped = load_mapped(db)?;
-    if mapped.insert(key.as_str().to_owned(), port) != Some(port) {
-        save_mapped(db, &mapped)?;
-    }
-    Ok(())
-}
-
-// Forget the mapped ports of the routes `gone` names.
-fn release_mapped(db: &Database, gone: impl Fn(&str) -> bool) -> Result<(), StateError> {
-    let mut mapped = load_mapped(db)?;
-    let before = mapped.len();
-    mapped.retain(|key, _| !gone(key));
-    if mapped.len() != before {
-        save_mapped(db, &mapped)?;
-    }
-    Ok(())
 }
 
 // Free the slots of the routes `gone` names.

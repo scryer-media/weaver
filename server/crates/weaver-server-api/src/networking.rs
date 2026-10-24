@@ -686,7 +686,7 @@ pub struct P2pRung {
 #[graphql(name = "P2pTestResult")]
 pub struct P2pTestResult {
     pub rungs: Vec<P2pRung>,
-    // The port a tunnel's gateway mapped; the route announces it.
+    // The port a gateway mapped to the test session's listener.
     pub mapped_port: Option<u16>,
 }
 impl From<weaver_server_core::speed_test::P2pReport> for P2pTestResult {
@@ -862,8 +862,7 @@ async fn test_via(
     > = Box::pin(runtime.network.test_via(route, subject, target));
     test.await.map_err(refusal_error)
 }
-// The test torrent over every path through a route of one torrent leg. A
-// port the leg's tunnel gateway maps becomes the port the route announces.
+// The test torrent over every path through a route of one torrent leg.
 async fn test_via_torrent(
     ctx: &Context<'_>,
     runtime: &ProxyRuntime,
@@ -871,25 +870,7 @@ async fn test_via_torrent(
     subject: core::TestSubject,
     target: Option<(String, u16)>,
 ) -> Result<Vec<core::PathTest>> {
-    use weaver_server_core::torrents::sessions;
-    let leg = route.legs.first().ok_or("the route has no leg")?;
-    let key = sessions::leg_key(&runtime.network, leg.egress_id, &leg.path);
-    // The settings the route's session opens under.
-    let torrent = ctx
-        .data::<weaver_server_core::settings::SharedConfig>()?
-        .read()
-        .await
-        .torrent
-        .clone();
-    let db = ctx.data::<Database>()?.clone();
-    let internal_port = {
-        let (db, key) = (db.clone(), key.clone());
-        spawn_blocking_db("network.test_via_torrent", move || {
-            sessions::listen_port(&db, &torrent, &key)
-        })
-        .await?
-        .ok_or("no listen port is left for this route")?
-    };
+    route.legs.first().ok_or("the route has no leg")?;
     // Tests point the test torrent at a loopback source.
     let source = ctx
         .data_opt::<weaver_server_core::speed_test::TestTorrentSource>()
@@ -904,25 +885,13 @@ async fn test_via_torrent(
                     > + Send
                     + '_,
             >,
-        > = Box::pin(runtime.network.test_via_torrent(
-            route,
-            subject,
-            target,
-            source,
-            internal_port,
-        ));
+        > = Box::pin(
+            runtime
+                .network
+                .test_via_torrent(route, subject, target, source),
+        );
         test.await.map_err(refusal_error)?
     };
-    let mapped = tests
-        .iter()
-        .filter(|test| test.leg == 0)
-        .find_map(|test| test.p2p.as_ref()?.mapped_port);
-    if let Some(port) = mapped {
-        spawn_blocking_db("network.test_via_torrent", move || {
-            sessions::set_mapped_port(&db, &key, port)
-        })
-        .await?;
-    }
     Ok(tests)
 }
 #[derive(Clone, Debug, InputObject)]

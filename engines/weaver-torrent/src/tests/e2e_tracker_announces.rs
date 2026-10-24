@@ -97,7 +97,7 @@ fn answer_with_peer(peer: SocketAddr) -> anyhow::Result<Vec<u8>> {
     Ok(body)
 }
 
-pub(super) fn tracker_session_opts() -> anyhow::Result<SessionOptions> {
+pub(crate) fn tracker_session_opts() -> anyhow::Result<SessionOptions> {
     Ok(SessionOptions {
         disable_trackers: false,
         http_client: Some(std::sync::Arc::new(|| {
@@ -172,11 +172,21 @@ async fn test_resumed_torrent_announces_only_this_runs_bytes() -> anyhow::Result
 
 /// The `port` of the `started` announce a session makes for a new torrent.
 async fn started_port(opts: SessionOptions) -> anyhow::Result<(String, Option<u16>)> {
+    started_port_after(opts, |_| {}).await
+}
+
+/// The `port` of the `started` announce a session makes for a new torrent
+/// added after `before` has run on the session.
+pub(crate) async fn started_port_after(
+    opts: SessionOptions,
+    before: impl FnOnce(&Session),
+) -> anyhow::Result<(String, Option<u16>)> {
     let t = TestTorrent::new("test_announced_port", 2048, 1024).await?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
     let out = TempDir::with_prefix("test_announced_port_out")?;
     let session = Session::new_with_opts(out.path().into(), opts).await?;
+    before(&session);
     session
         .add_torrent(
             AddTorrent::from_bytes(t.torrent.clone()),
@@ -200,10 +210,12 @@ async fn started_port(opts: SessionOptions) -> anyhow::Result<(String, Option<u1
 async fn test_announced_port_is_the_one_the_session_listens_on() -> anyhow::Result<()> {
     setup_test_logging();
 
-    // No listener: port 1, which no peer is listening on, never a made-up one.
+    // No listener: port 0, the engine's "unreachable", never port 1 or any
+    // other made-up one.
     let (port, listening) = started_port(tracker_session_opts()?).await?;
     assert_eq!(listening, None);
-    assert_eq!(port, "1");
+    assert_eq!(port, "0");
+    assert_ne!(port, "1");
 
     // A listener: its port.
     let (port, listening) = started_port(SessionOptions {

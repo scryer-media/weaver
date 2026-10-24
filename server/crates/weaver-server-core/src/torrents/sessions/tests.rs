@@ -428,21 +428,6 @@ async fn a_route_keeps_its_port_until_it_is_gone() {
 }
 
 #[test]
-fn mapped_ports_are_kept_until_the_route_is_gone() {
-    let db = Database::open_in_memory().unwrap();
-    let first = RouteKey::of(0, &EgressBinding::System, &ladder(1));
-    let second = RouteKey::of(0, &EgressBinding::System, &ladder(2));
-    assert_eq!(mapped_port(&db, &first).unwrap(), None);
-    set_mapped_port(&db, &first, 40_001).unwrap();
-    set_mapped_port(&db, &second, 40_002).unwrap();
-    set_mapped_port(&db, &first, 40_003).unwrap();
-    assert_eq!(mapped_port(&db, &first).unwrap(), Some(40_003));
-    release_mapped(&db, |key| key == first.as_str()).unwrap();
-    assert_eq!(mapped_port(&db, &first).unwrap(), None);
-    assert_eq!(mapped_port(&db, &second).unwrap(), Some(40_002));
-}
-
-#[test]
 fn a_route_without_a_slot_listens_on_the_first_slots_port() {
     let db = Database::open_in_memory().unwrap();
     let first = RouteKey::of(0, &EgressBinding::System, &ladder(1));
@@ -459,10 +444,9 @@ fn a_route_without_a_slot_listens_on_the_first_slots_port() {
     assert_eq!(listen_port(&db, &last, &second).unwrap(), None);
 }
 
-// A port a gateway mapped to a route is what its session announces, over
-// the configured announce port, from the next time the session opens.
+// A listening route's session announces the configured announce port.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_route_announces_the_port_mapped_to_it() {
+async fn a_route_announces_the_configured_port() {
     let dir = tempfile::tempdir().unwrap();
     let routes = Arc::new(FakeRoutes::default());
     routes.route(TorrentScope::Default, 1);
@@ -477,13 +461,6 @@ async fn a_route_announces_the_port_mapped_to_it() {
 
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert_eq!(session.announce_port(), Some(51_413));
-    set_mapped_port(&db, &plan.key, 40_001).unwrap();
-    sessions.drop_route(&plan.key).await;
-    let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
-    assert_eq!(session.announce_port(), Some(40_001));
-
-    sessions.forget_routes(BTreeSet::new()).await;
-    assert_eq!(mapped_port(&db, &plan.key).unwrap(), None);
     sessions.stop_all().await;
 }
 

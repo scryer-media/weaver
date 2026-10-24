@@ -969,8 +969,6 @@ impl ServiceInner {
         let path = P2pPath {
             stage,
             kind: LegKind::Ladder,
-            gateway: None,
-            internal_port: 0,
         };
         let stopped = std::pin::pin!(stop.stopped());
         let report = super::torrent::probe(path, &plan, stopped).await;
@@ -1296,8 +1294,6 @@ async fn execute(
                 P2pPath {
                     stage,
                     kind: LegKind::Ladder,
-                    gateway: None,
-                    internal_port: 0,
                 },
             )),
             Err(error) => return Outcome::Failed(error),

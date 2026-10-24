@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +27,6 @@ use weaver_torrent::{
 };
 use weaver_tunnel::pipe::Dialer;
 
-use super::natpmp;
 use super::progress::StreamProvider;
 use super::torrent_net::{PieceStore, ProbeSockets, Watched};
 use crate::proxies::{FetchPath, start_bridge};
@@ -122,7 +121,7 @@ pub enum PeerUpload {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct P2pReport {
     pub rungs: Vec<P2pRung>,
-    // The port a tunnel's gateway mapped to the path.
+    // The port a gateway mapped to the test session's listener.
     pub mapped_port: Option<u16>,
     pub upload: Option<PeerUpload>,
 }
@@ -139,11 +138,6 @@ impl P2pReport {
 pub(crate) struct P2pPath {
     pub stage: Arc<dyn Dialer>,
     pub kind: LegKind,
-    // The gateway asked for a port mapping, when the path ends in a
-    // WireGuard tunnel.
-    pub gateway: Option<IpAddr>,
-    // The port the mapping is asked for.
-    pub internal_port: u16,
 }
 
 pub(crate) struct P2pPlan {
@@ -476,7 +470,7 @@ async fn run(
         (_, Some(_)) => Some(PeerUpload::Failed("no piece arrived to serve".into())),
         (_, None) => None,
     };
-    let (inbound, mapped_port) = inbound(path, &watched).await;
+    let (inbound, mapped_port) = inbound(path, &watched);
     let report = rungs(
         torrent.name.clone(),
         &announces,
@@ -702,29 +696,8 @@ async fn serve(
     }
 }
 
-// Whether peers can connect in: the port a tunnel's gateway maps, else the
-// peers that did.
-async fn inbound(path: &P2pPath, watched: &Watched) -> (P2pOutcome, Option<u16>) {
-    if let Some(gateway) = path.gateway {
-        let Some(datagrams) = path.stage.clone().datagrams() else {
-            return (
-                P2pOutcome::Failed("the tunnel carries no datagrams".into()),
-                None,
-            );
-        };
-        let gateway = SocketAddr::new(gateway, natpmp::PORT);
-        let socket = match datagrams.bind(gateway).await {
-            Ok(socket) => socket,
-            Err(error) => return (P2pOutcome::Failed(error.to_string()), None),
-        };
-        return match natpmp::map_tcp(socket.as_ref(), gateway, path.internal_port).await {
-            Ok(port) => (
-                P2pOutcome::Passed(format!("{} mapped port {port}", gateway.ip())),
-                Some(port),
-            ),
-            Err(error) => (P2pOutcome::Failed(error), None),
-        };
-    }
+// Whether peers can connect in: the peers that did.
+fn inbound(path: &P2pPath, watched: &Watched) -> (P2pOutcome, Option<u16>) {
     if path.kind == LegKind::Ladder {
         return (
             P2pOutcome::Failed("this path cannot take peer connections".into()),

@@ -3545,6 +3545,42 @@ mod tests {
         assert_eq!(none.get(), None);
     }
 
+    // A listening session whose port a mapper got on the gateway announces
+    // the mapped port, not its listener's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mapped_session_announces_the_mapped_port() -> anyhow::Result<()> {
+        use crate::{
+            ListenerMode, ListenerOptions,
+            tests::e2e_tracker_announces::{started_port_after, tracker_session_opts},
+            upnp::{PortMapped, PortmapProtocol, PortmapTransport},
+        };
+        let (port, listening) = started_port_after(
+            SessionOptions {
+                listen: Some(ListenerOptions {
+                    mode: ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+                    ..Default::default()
+                }),
+                ..tracker_session_opts()?
+            },
+            |session| {
+                let local_port = session.listen_addr().unwrap().port();
+                session.announce_port.on_port_mapping(&PortMapped {
+                    transport: PortmapTransport::NatPmp,
+                    protocol: PortmapProtocol::Tcp,
+                    local_port,
+                    external_port: Some(50000),
+                    external_ip: None,
+                    error: None,
+                });
+            },
+        )
+        .await?;
+        assert_ne!(listening, Some(50000));
+        assert_eq!(port, "50000");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_dht_announces_a_port_that_changes_while_it_searches() {
         // libtorrent torrent::dht_announce reads the port at each announce.

@@ -19,6 +19,6 @@ mod e2e_session_stop;
 mod e2e_socket_factory;
 mod e2e_ssl;
 mod e2e_stream;
-mod e2e_tracker_announces;
+pub(crate) mod e2e_tracker_announces;
 pub mod embedder_util;
 pub mod test_util;
