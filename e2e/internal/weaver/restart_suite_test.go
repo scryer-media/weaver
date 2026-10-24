@@ -5,10 +5,13 @@ package weaver
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +78,44 @@ func TestRestartSeedProfileCoversEveryRestartCaseSlug(t *testing.T) {
 			if !seeded[slug] {
 				t.Errorf("%s names %s, which the restart seed profile does not seed", tc.Name, slug)
 			}
+		}
+	}
+}
+
+// The corpus hydration profile is the other place the restart fixtures are
+// listed. `corpus ensure --profile restart` fetches what it names, so it must
+// name exactly what the cases need, and the release gate's union profile must
+// cover it.
+func TestCorpusRestartProfileIsTheRestartCaseSlugs(t *testing.T) {
+	contents, err := os.ReadFile(repoPath("test-corpus", "profiles.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var table struct {
+		Profiles map[string]struct {
+			Include []string `json:"include"`
+		} `json:"profiles"`
+	}
+	if err := json.Unmarshal(contents, &table); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]string, 0)
+	for _, slug := range restartFixtureSlugs() {
+		want = append(want, "testdata/"+slug+"/**")
+	}
+	got := append([]string(nil), table.Profiles["restart"].Include...)
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("profiles.json restart profile is %v, the restart cases name %v", got, want)
+	}
+	gate := map[string]bool{}
+	for _, glob := range table.Profiles["release-gate"].Include {
+		gate[glob] = true
+	}
+	for _, glob := range want {
+		if !gate[glob] {
+			t.Errorf("profiles.json release-gate profile lacks %s, which the restart cases name", glob)
 		}
 	}
 }
