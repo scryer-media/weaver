@@ -3,7 +3,6 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_graphql::Request;
@@ -164,9 +163,7 @@ async fn queue_snapshots_use_published_speed_on_unrelated_events() {
     // Establish the independent ticker's baseline with the controlled clock.
     tokio::time::advance(Duration::from_millis(250)).await;
     tokio::task::yield_now().await;
-    h.metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
+    h.shared_state.record_wire_bytes(256 * 1024);
     let mut revisions = h.handle.subscribe_job_changes();
     tokio::time::advance(Duration::from_millis(250)).await;
     loop {
@@ -354,9 +351,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         "no pool means no servers to count"
     );
 
-    h.metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
+    h.shared_state.record_wire_bytes(256 * 1024);
     tokio::time::advance(Duration::from_millis(250)).await;
     h.shared_state
         .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
@@ -411,9 +406,7 @@ async fn system_metrics_updates_share_metrics_snapshot_speed() {
         .expect("second stream should stay open");
     assert!(first_b.errors.is_empty());
 
-    h.metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
+    h.shared_state.record_wire_bytes(256 * 1024);
     tokio::time::advance(Duration::from_millis(250)).await;
     h.shared_state
         .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());

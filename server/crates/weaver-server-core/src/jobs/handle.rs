@@ -365,14 +365,11 @@ impl SharedPipelineState {
     // sampling quickly until the gauges have settled.
     #[cfg(any(test, feature = "test-support"))]
     pub fn refresh_metrics_snapshot(&self, now: std::time::Instant) -> bool {
-        let snapshot = self.metrics.sample_totals(
-            now,
-            self.metrics
-                .bytes_downloaded
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            0,
-        );
+        // The gauge integrates the transfer total, the counter the queue tick
+        // hands it, so a test tick and a live tick feed one series.
+        let snapshot = self
+            .metrics
+            .sample_totals(now, self.queue.counters.bandwidth.total(), 0, 0);
         let rates_moving = snapshot.current_download_speed > 0
             || snapshot.articles_per_sec > 0.0
             || snapshot.decode_rate_mbps > 0.0;
@@ -381,6 +378,16 @@ impl SharedPipelineState {
             Change::unchanged(())
         });
         rates_moving
+    }
+
+    // Book wire bytes the way a lane and its completion do: the transfer total
+    // the download gauge integrates, and the lifetime downloaded counter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_wire_bytes(&self, bytes: u64) {
+        self.queue.counters.bandwidth.record(bytes);
+        self.metrics
+            .bytes_downloaded
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_paused(&self, paused: bool) {

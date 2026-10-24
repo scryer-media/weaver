@@ -20,9 +20,7 @@ fn shared_pipeline_metrics_snapshot_reads_do_not_resample_speed() {
     let now = std::time::Instant::now();
     shared_state.refresh_metrics_snapshot(now);
 
-    metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
+    shared_state.record_wire_bytes(256 * 1024);
     shared_state.refresh_metrics_snapshot(now + Duration::from_secs(1));
 
     let initial = shared_state.metrics_snapshot();
@@ -48,9 +46,7 @@ fn raw_metrics_snapshot_reads_do_not_cool_shared_speed_tracker() {
     let now = std::time::Instant::now();
     shared_state.refresh_metrics_snapshot(now);
 
-    metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
+    shared_state.record_wire_bytes(256 * 1024);
     shared_state.refresh_metrics_snapshot(now + Duration::from_secs(1));
 
     let initial = shared_state.metrics_snapshot();
