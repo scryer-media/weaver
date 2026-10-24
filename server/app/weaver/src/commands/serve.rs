@@ -744,7 +744,9 @@ mod restore_ticket_tests {
         );
         handle.pause_job(JobId(42)).await.unwrap();
         handle.cancel_job(JobId(7)).await.unwrap();
-        assert_eq!(handle.list_jobs().len(), 1);
+        // Still listed: a cancelled job leaves the queue only once its
+        // history row commits, and no actor runs here to commit it.
+        assert_eq!(handle.list_jobs().len(), 2);
         assert!(handle.queued_job_ids().contains(&JobId(7)));
     }
 }
