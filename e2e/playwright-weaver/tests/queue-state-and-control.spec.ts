@@ -18,18 +18,44 @@ import { nzbgetRpc, withControlKey } from "./support/script-settings";
 
 // What the queue says about a job, and what the operator's controls do to
 // it, read only through the API. Every job here is a probe of zero-filled
-// articles the spec posts itself; the fixture's slow_body keeps a job in its
-// download long enough to be read there, and every wait is on the job's own
-// state.
+// articles the spec posts itself. A job that must be read mid-download is
+// held there by the fixture's hold_body: the server serves one article and
+// part of the next, then every body blocks until the test lifts the hold, so
+// the job has progress and a download that cannot end on its own. Every wait
+// is on the job's own state.
 
 // One worker runs these in order; a failure does not skip the rest.
 test.describe.configure({ mode: "default" });
 
 const HOSTS = ["nntp", "nntp2"] as const;
-// 128 KiB is 1024 yEnc lines; at slow_body=10 an article takes about ten
-// seconds to serve whatever the machine.
 const ARTICLE_BYTES = 128 * 1024;
+// A probe article is 1024 yEnc lines of 128 bytes plus its =ybegin and
+// =yend lines. The hold lets one article and half of the next through.
+const ARTICLE_LINES = ARTICLE_BYTES / 128 + 2;
+const HOLD = `hold_body=${Math.floor(ARTICLE_LINES * 1.5)}`;
+// Articles per held job. A lane at its deepest rung (8) leases 18 articles a
+// refill and asks for 18 more once one lands, so a held job can have 36
+// leased; 64 keeps all of them inside the first job, and the job behind it
+// stays Queued with nothing leased.
+const HELD_ARTICLES = 64;
+// Q1 needs its jobs to complete, so it slows the server instead of holding
+// it: at slow_body=10 an article takes about ten seconds, long enough for
+// the jobs past capacity to be read Queued.
 const SLOW = "slow_body=10";
+
+async function holdDownloads(request: APIRequestContext): Promise<void> {
+  await updateConfiguredServer(request, "nntp2", { active: false });
+  await updateConfiguredServer(request, "nntp", { connections: 1 });
+  await setNntpChaos(HOLD, "nntp");
+}
+
+async function releaseDownloads(): Promise<void> {
+  await setNntpChaos("off", "nntp");
+}
+
+function heldMidDownload(item: Item | undefined): boolean {
+  return item?.state === "DOWNLOADING" && item.progressPercent > 0;
+}
 
 type Item = {
   id: number;
@@ -158,7 +184,6 @@ test.beforeEach(async ({ request }) => {
   pausedByUs = new Set();
   globalPauseByUs = false;
   started = [];
-  for (const host of HOSTS) await setNntpChaos(SLOW, host);
 });
 
 test.afterEach(async ({ request }) => {
@@ -180,6 +205,7 @@ test("Q1 jobs past the connection capacity wait as Queued and every one complete
   // complete.
   await updateConfiguredServer(request, "nntp2", { active: false });
   await updateConfiguredServer(request, "nntp", { connections: 2 });
+  await setNntpChaos(SLOW, "nntp");
   const tag = `q1-${Date.now()}`;
   const jobs: number[] = [];
   for (let index = 0; index < 4; index += 1) jobs.push(await probeJob(request, tag, 1));
@@ -201,18 +227,17 @@ test("Q1 jobs past the connection capacity wait as Queued and every one complete
 });
 
 test("Q2 the global pause holds every download and counts them paused", async ({ request }) => {
-  // One lane and 64 articles each: the hot job takes the lane and is far
-  // inside its download when the pause lands, and the other waits Queued
-  // behind it. The pause holds the one mid-download and counts both.
-  await updateConfiguredServer(request, "nntp2", { active: false });
-  await updateConfiguredServer(request, "nntp", { connections: 1 });
+  // One lane and the hold: the hot job takes the lane, lands one article and
+  // is held in its next when the pause lands, and the other waits Queued
+  // behind it. The pause holds the one mid-download and counts both. Nothing
+  // here needs the download to move again, so the hold lifts in afterEach.
+  await holdDownloads(request);
   const tag = `q2-${Date.now()}`;
-  const jobs = [await probeJob(request, tag, 64), await probeJob(request, tag, 64)];
+  const jobs = [await probeJob(request, tag, HELD_ARTICLES), await probeJob(request, tag, HELD_ARTICLES)];
   started.push(...jobs);
   await waitFor(request, "one job mid-download, the other queued", (snap) => {
     const items = jobs.map((id) => itemOf(snap, id));
-    return items.some((item) => item?.state === "DOWNLOADING" && item.progressPercent > 0)
-      && items.some((item) => item?.state === "QUEUED");
+    return items.some(heldMidDownload) && items.some((item) => item?.state === "QUEUED");
   });
 
   globalPauseByUs = true;
@@ -231,17 +256,13 @@ test("Q2 the global pause holds every download and counts them paused", async ({
 });
 
 test("Q3 a pause or resume answers with the state it applied", async ({ request }) => {
-  // One lane and 64 articles: the job is far inside its download when the
-  // pause lands and again when the resume does.
-  await updateConfiguredServer(request, "nntp2", { active: false });
-  await updateConfiguredServer(request, "nntp", { connections: 1 });
+  // The job is held in its download when the pause lands, and the hold is
+  // still on when the resume does, so neither answer can race the job's end.
+  await holdDownloads(request);
   const tag = `q3-${Date.now()}`;
-  const job = await probeJob(request, tag, 64);
+  const job = await probeJob(request, tag, HELD_ARTICLES);
   started.push(job);
-  await waitFor(request, "job mid-download", (snap) => {
-    const item = itemOf(snap, job);
-    return item?.state === "DOWNLOADING" && item.progressPercent > 0;
-  });
+  await waitFor(request, "job mid-download", (snap) => heldMidDownload(itemOf(snap, job)));
 
   pausedByUs.add(job);
   const pause = await graphql<{ pauseQueueItem: { success: boolean; item: { id: number; state: string } | null } }>(
@@ -264,19 +285,14 @@ test("Q3 a pause or resume answers with the state it applied", async ({ request 
 });
 
 test("Q4 and Q8 a started download with no server reads Queued with the reason, and the facade still counts it downloading", async ({ request }) => {
-  // One connection and many articles, so the job is still mid-download when
-  // the servers go off.
-  await updateConfiguredServer(request, "nntp2", { active: false });
-  await updateConfiguredServer(request, "nntp", { connections: 1 });
+  // The job is held in its download when the servers go off.
+  await holdDownloads(request);
   const tag = `q4-${Date.now()}`;
-  const job = await probeJob(request, tag, 64);
+  const job = await probeJob(request, tag, HELD_ARTICLES);
   started.push(job);
   // Started means at least one article landed, so the laneless job has
   // progress it must keep.
-  const before = await waitFor(request, "job downloading with progress", (snap) => {
-    const item = itemOf(snap, job);
-    return item?.state === "DOWNLOADING" && item.progressPercent > 0;
-  });
+  const before = await waitFor(request, "job downloading with progress", (snap) => heldMidDownload(itemOf(snap, job)));
   const pausedBefore = before.summary.pausedItems;
 
   for (const host of HOSTS) await updateConfiguredServer(request, host, { active: false });
@@ -297,21 +313,23 @@ test("Q4 and Q8 a started download with no server reads Queued with the reason, 
   expect.soft(groups.find((group) => group.NZBID === job), "listgroups reads the laneless job as queued").toMatchObject({ Status: "QUEUED" });
   expect.soft(status, "status does not report server standby for the laneless job").toMatchObject({ ServerStandBy: false });
 
+  // With the hold lifted and a server back, the laneless job's download
+  // resumes and runs to the end.
+  await releaseDownloads();
   await updateConfiguredServer(request, "nntp", { active: true, connections: 4 });
-  await waitFor(request, "job downloads again", (snap) => itemOf(snap, job)?.state === "DOWNLOADING");
+  expect((await waitTerminal(request, job)).state).toBe("COMPLETED");
 });
 
 test("Q6 a cancelled job leaves the queue only once its history row says cancelled by operator", async ({ request }) => {
-  await updateConfiguredServer(request, "nntp2", { active: false });
-  await updateConfiguredServer(request, "nntp", { connections: 1 });
+  await holdDownloads(request);
   // Both jobs are admitted under the global pause, so neither downloads
-  // before the other is in the queue. Each has 64 articles on one connection,
-  // so whichever the resume starts is far inside its download when the
-  // cancel lands, and the other cannot get a lease until it ends.
+  // before the other is in the queue. Whichever the resume starts is held in
+  // its download when the cancel lands, and the other cannot get the lane
+  // until it ends.
   globalPauseByUs = true;
   await graphql(request, "mutation WeaverE2EQ6Pause { pauseAll }");
   const tag = `q6-${Date.now()}`;
-  const jobs = [await probeJob(request, tag, 64), await probeJob(request, tag, 64)];
+  const jobs = [await probeJob(request, tag, HELD_ARTICLES), await probeJob(request, tag, HELD_ARTICLES)];
   started.push(...jobs);
   await waitFor(request, "both jobs admitted", (snap) => jobs.every((id) => itemOf(snap, id)));
   await graphql(request, "mutation WeaverE2EQ6Resume { resumeAll }");
