@@ -418,6 +418,17 @@ fn download_accounting_uses_control_and_terminal_lanes_over_stale_lifecycle_stat
         QueueItemState::Paused
     );
 
+    // The global pause holds a started download: the lifecycle status stays
+    // Downloading while no lane holds the job, and the counters read it
+    // Paused, not as a laneless active download.
+    let mut held = base_job(JobStatus::Downloading);
+    held.run_state = weaver_server_core::RunState::Paused;
+    held.download_state = weaver_server_core::DownloadState::Queued;
+    assert_eq!(
+        queue_item_state_from_job_info_for_download_accounting(&held),
+        QueueItemState::Paused
+    );
+
     let mut failed = base_job(JobStatus::Downloading);
     failed.post_state = weaver_server_core::PostState::Failed;
     assert_eq!(

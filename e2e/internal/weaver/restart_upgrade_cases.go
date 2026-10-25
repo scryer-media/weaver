@@ -66,9 +66,6 @@ func runPre65CheckpointRowRefused(ctx *restartCaseContext) (restartCaseResult, e
 	const slug = "single-mkv"
 	const checkpointBytes = 4 * 1024 * 1024
 	checkpointEnv := fmt.Sprintf("WEAVER_E2E_DOWNLOAD_RESTART_CHECKPOINT_BYTES=%d", checkpointBytes)
-	if currentWeaverDatastore() == weaverDatastorePostgres {
-		return restartCaseResult{}, fmt.Errorf("the pre-65 table is planted with SQLite DDL; run this case on sqlite")
-	}
 	jobID, pre, err := ctx.downloadThenInterrupt(slug, 4*checkpointBytes, checkpointEnv)
 	if err != nil {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", err.Error()), nil
@@ -78,8 +75,9 @@ func runPre65CheckpointRowRefused(ctx *restartCaseContext) (restartCaseResult, e
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	// The old shape, as migration 21 created it and 64 left it, with a floor
-	// that claims all but the last megabyte: far more than the stop wrote.
+	// The old shape, as migration 21 (SQLite) or the 25 baseline (Postgres)
+	// created it and 64 left it, with a floor that claims all but the last
+	// megabyte: far more than the stop wrote.
 	wrongFloor := info.Size() - 1024*1024
 	db, datastore, err := openWeaverStateDB(caseDBPath(ctx))
 	if err != nil {
@@ -87,12 +85,7 @@ func runPre65CheckpointRowRefused(ctx *restartCaseContext) (restartCaseResult, e
 	}
 	statements := []string{
 		`DROP TABLE active_file_progress`,
-		`CREATE TABLE active_file_progress (
-    job_id                  INTEGER NOT NULL,
-    file_index              INTEGER NOT NULL,
-    contiguous_bytes_written INTEGER NOT NULL,
-    PRIMARY KEY (job_id, file_index)
-) WITHOUT ROWID`,
+		pre65ActiveFileProgressDDL(datastore),
 		fmt.Sprintf(`INSERT INTO active_file_progress (job_id, file_index, contiguous_bytes_written) VALUES (%d, 0, %d)`, jobID, wrongFloor),
 		`DELETE FROM _sqlx_migrations WHERE version = 65`,
 	}
@@ -147,6 +140,25 @@ func runPre65CheckpointRowRefused(ctx *restartCaseContext) (restartCaseResult, e
 		wrongFloor, reapplied, servedBefore, refetched, statuses[jobID], outputOK)
 	pass := reapplied && servedBefore > 0 && refetched == servedBefore && statuses[jobID] == "COMPLETE" && outputOK
 	return classifyRestartResult(ctx.Profile, pass, "a pre-65 floor was refused and the file downloaded again from nothing: "+detail, false, "", "pre-65 checkpoint row: "+detail), nil
+}
+
+// pre65ActiveFileProgressDDL is the prefix-floor table each engine held before
+// migration 65: SQLite's from migration 21, Postgres's from its 25 baseline.
+func pre65ActiveFileProgressDDL(datastore weaverDatastore) string {
+	if datastore == weaverDatastorePostgres {
+		return `CREATE TABLE active_file_progress (
+    job_id                  BIGINT NOT NULL,
+    file_index              BIGINT NOT NULL,
+    contiguous_bytes_written BIGINT NOT NULL,
+    PRIMARY KEY (job_id, file_index)
+)`
+	}
+	return `CREATE TABLE active_file_progress (
+    job_id                  INTEGER NOT NULL,
+    file_index              INTEGER NOT NULL,
+    contiguous_bytes_written INTEGER NOT NULL,
+    PRIMARY KEY (job_id, file_index)
+) WITHOUT ROWID`
 }
 
 var ypartLine = regexp.MustCompile(`^=ypart begin=(\d+) end=(\d+)`)

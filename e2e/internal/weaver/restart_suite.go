@@ -546,18 +546,10 @@ func uniqueRestartSlugs(cases []restartCase) []string {
 		}
 	}
 	out := make([]string, 0, len(set))
-	staticCount := 0
-	for _, slug := range restartFixtureSlugs {
-		if set[slug] {
-			out = append(out, slug)
-			delete(set, slug)
-			staticCount++
-		}
-	}
 	for slug := range set {
 		out = append(out, slug)
 	}
-	sort.Strings(out[staticCount:])
+	sort.Strings(out)
 	return out
 }
 
@@ -634,7 +626,7 @@ func (ctx *restartCaseContext) startWeaverWithOptions(failpoint string, connecti
 		if strings.HasPrefix(entry, "WEAVER_E2E_FAILPOINT=") {
 			continue
 		}
-		if strings.HasPrefix(entry, "WEAVER_E2E_DELAY=") {
+		if strings.HasPrefix(entry, "WEAVER_E2E_DELAY=") || strings.HasPrefix(entry, "WEAVER_E2E_HOLD=") {
 			continue
 		}
 		if strings.HasPrefix(entry, "WEAVER_MAX_CONCURRENT_EXTRACTIONS=") {

@@ -47,7 +47,8 @@ async fn admission_and_intents_answer_without_a_running_pipeline() {
     let watermark = handle.job_revision();
     handle.cancel_job(id).await.unwrap();
     assert!(handle.job_revision() > watermark);
-    assert!(handle.get_job(id).is_err());
+    // Still listed: the job leaves the queue only once its history row commits.
+    assert_eq!(handle.get_job(id).unwrap().status, JobStatus::Paused);
     assert!(path.exists());
     assert!(pipeline.jobs.contains_key(&id));
 }
@@ -263,7 +264,7 @@ async fn retry_waits_for_cancelled_directory_cleanup_before_readmission() {
     let path = pipeline.jobs[&id].working_dir.clone();
     let mut events = handle.subscribe_events();
     handle.cancel_job(id).await.unwrap();
-    assert!(handle.get_job(id).is_err());
+    assert!(handle.get_job(id).is_ok());
     assert!(path.exists());
     pipeline.apply_queue_intents().await;
     finish_cancel_jobs(&mut pipeline).await;
@@ -460,7 +461,7 @@ async fn final_delete_archives_before_the_event_and_erases_history_after_cleanup
     let mut events = handle.subscribe_events();
     let mut revisions = handle.subscribe_job_changes();
     handle.cancel_job_and_delete_history(id).await.unwrap();
-    assert!(handle.get_job(id).is_err());
+    assert!(handle.get_job(id).is_ok());
     assert!(path.exists());
     assert!(pipeline.db.get_job_history(id.0).unwrap().is_none());
     pipeline.apply_queue_intents().await;
@@ -600,7 +601,6 @@ async fn held_segment_write_leaves_other_jobs_commands_answered() {
     let watermark = handle.job_revision();
     handle.cancel_job(b).await.unwrap();
     assert!(handle.job_revision() > watermark);
-    assert!(handle.get_job(b).is_err());
     assert!(
         handle
             .get_job(a)

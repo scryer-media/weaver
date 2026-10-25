@@ -604,7 +604,7 @@ async fn list_jobs_projects_downloading_while_extracting_with_active_download_wo
 }
 
 #[tokio::test]
-async fn list_jobs_keeps_a_lane_less_download_downloading_and_rewarms_its_phase_rate() {
+async fn lane_less_download_stays_downloading_and_resumes_on_the_gauge_window() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -643,6 +643,7 @@ async fn list_jobs_keeps_a_lane_less_download_downloading_and_rewarms_its_phase_
         .queue
         .sample_counters(&pipeline.metrics, &pipeline.event_tx, now);
     counters.downloaded.store(64, Ordering::Relaxed);
+    pipeline.shared_state.queue.counters.bandwidth.record(64);
     pipeline.shared_state.queue.sample_counters(
         &pipeline.metrics,
         &pipeline.event_tx,
@@ -683,7 +684,17 @@ async fn list_jobs_keeps_a_lane_less_download_downloading_and_rewarms_its_phase_
     assert_eq!(active.download_state, crate::DownloadState::Downloading);
     assert_eq!(active.phase_progress.len(), 1);
     assert_eq!(active.phase_progress[0].phase, JobPhase::Downloading);
-    assert!(active.phase_progress[0].rate_bps.is_none());
+    // The rate kept its window while no lane held the job, so it resumes on
+    // the gauge's figure rather than warming up a window of its own.
+    assert_eq!(
+        active.phase_progress[0].rate_bps,
+        Some(
+            pipeline
+                .shared_state
+                .metrics_snapshot()
+                .current_download_speed
+        )
+    );
 }
 
 #[tokio::test]
@@ -838,6 +849,130 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
     assert_eq!(info.phase_progress[0].progress_percent, 50.0);
     assert!(info.phase_progress[0].rate_bps.is_some());
     assert!(info.phase_progress[0].estimated_remaining_ms.is_some());
+}
+
+// A job whose lane lease starts downloading: the queue's counters linked to
+// the transfer total exactly as a handout links them.
+fn start_rate_sum_download(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+) -> Arc<crate::pipeline::queue::JobCounters> {
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.report_job(job_id);
+    pipeline.phase_begin(job_id, JobPhase::Downloading, Some(1 << 40));
+    let counters = pipeline.shared_state.queue.job_counters(job_id).unwrap();
+    counters
+        .totals
+        .get_or_init(|| pipeline.shared_state.queue.counters.clone());
+    counters
+}
+
+fn land_rate_sum_article(counters: &crate::pipeline::queue::JobCounters, wire: usize) {
+    crate::pipeline::download::owned_lane::credit_transfer(
+        counters,
+        &Ok(DownloadPayload::Raw(vec![0; wire].into())),
+    );
+}
+
+// Every downloading row's rate and the gauge on one tick.
+fn rate_sum_tick(pipeline: &Pipeline, at: std::time::Instant) -> (Vec<(JobId, u64)>, u64) {
+    pipeline
+        .shared_state
+        .queue
+        .sample_counters(&pipeline.metrics, &pipeline.event_tx, at);
+    (
+        pipeline.shared_state.job_download_rates(),
+        pipeline
+            .shared_state
+            .metrics_snapshot()
+            .current_download_speed,
+    )
+}
+
+fn assert_rates_sum_to_gauge(rates: &[(JobId, u64)], gauge: u64, tick: u32) {
+    let sum: u64 = rates.iter().map(|(_, rate)| rate).sum();
+    assert!(gauge > 0, "tick {tick}: the gauge reads traffic");
+    // Each row and the gauge truncate to whole bytes per second on their own.
+    assert!(
+        sum.abs_diff(gauge) <= rates.len() as u64,
+        "tick {tick}: rows {rates:?} sum to {sum}, gauge reads {gauge}"
+    );
+}
+
+#[tokio::test]
+async fn downloading_rows_rates_sum_to_the_global_speed_gauge() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let first = JobId(20040);
+    let second = JobId(20041);
+    insert_active_job(
+        &mut pipeline,
+        first,
+        standalone_job_spec("Rate Sum First", &[("first.bin".to_string(), 1 << 30)]),
+    )
+    .await;
+    let first_counters = start_rate_sum_download(&mut pipeline, first);
+    let start = std::time::Instant::now();
+    let at = |tick: u32| start + Duration::from_millis(250) * tick;
+
+    // The first job alone, at a rate that moves from tick to tick.
+    for tick in 0..12 {
+        land_rate_sum_article(&first_counters, 300_000 + 100_000 * (tick as usize % 4));
+        let (rates, gauge) = rate_sum_tick(&pipeline, at(tick));
+        if tick > 0 {
+            assert_eq!(rates.len(), 1, "tick {tick}");
+            assert_rates_sum_to_gauge(&rates, gauge, tick);
+        }
+    }
+
+    // A second job is added and starts mid-window: its rate is measured on
+    // the gauge's window, not on one of its own that begins now.
+    insert_active_job(
+        &mut pipeline,
+        second,
+        standalone_job_spec("Rate Sum Second", &[("second.bin".to_string(), 1 << 30)]),
+    )
+    .await;
+    let (_, _) = rate_sum_tick(&pipeline, at(12));
+    let second_counters = start_rate_sum_download(&mut pipeline, second);
+    for tick in 13..40 {
+        land_rate_sum_article(&first_counters, 250_000);
+        land_rate_sum_article(&second_counters, 600_000 + 200_000 * (tick as usize % 3));
+        let (rates, gauge) = rate_sum_tick(&pipeline, at(tick));
+        assert_eq!(rates.len(), 2, "tick {tick}");
+        assert_rates_sum_to_gauge(&rates, gauge, tick);
+    }
+
+    // Between lanes the second job shows no rate; once a lane holds it again
+    // its rate resumes on the same window, with no warm-up of its own.
+    pipeline.active_downloads_by_job.remove(&second);
+    pipeline.report_job(second);
+    for tick in 40..44 {
+        land_rate_sum_article(&first_counters, 250_000);
+        let (rates, _) = rate_sum_tick(&pipeline, at(tick));
+        assert_eq!(
+            rates.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![first]
+        );
+    }
+    pipeline.active_downloads_by_job.insert(second, 1);
+    pipeline.report_job(second);
+    for tick in 44..60 {
+        land_rate_sum_article(&first_counters, 250_000);
+        land_rate_sum_article(&second_counters, 500_000);
+        let (rates, gauge) = rate_sum_tick(&pipeline, at(tick));
+        assert_eq!(rates.len(), 2, "tick {tick}");
+        assert_rates_sum_to_gauge(&rates, gauge, tick);
+    }
 }
 
 #[tokio::test]

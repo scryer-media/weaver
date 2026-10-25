@@ -64,6 +64,60 @@ async fn repeated_article_cache_failure_refuses_admission_before_persistence() {
     assert!(pipeline.repeated_articles.contains_key(&id));
 }
 
+// Renaming an idle job moves its working directory with the repeated-article
+// cache inside it. The cache must follow: dropping it at archive cleans the
+// directory under the new name, never a path the rename already vacated.
+#[tokio::test]
+async fn a_rename_carries_the_repeated_article_cache_to_the_new_working_dir() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = handle(&pipeline);
+    let id = JobId(9203);
+    let mut spec = segmented_job_spec("cache rename fixture", "payload.bin", &[100, 100]);
+    spec.files[0].segments[1].message_id = spec.files[0].segments[0].message_id.clone();
+    handle
+        .add_job(
+            id,
+            spec,
+            PathBuf::from("cache-rename.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.repeated_articles.contains_key(&id));
+    let old_dir = pipeline.jobs[&id].working_dir.clone();
+    let caches = |dir: &std::path::Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join(".weaver-chunks"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("article-cache-"))
+            })
+            .collect()
+    };
+    assert_eq!(caches(&old_dir).len(), 1);
+
+    assert!(
+        pipeline
+            .rename_working_dir_when_quiet(id, "cache rename fixture renamed")
+            .await
+    );
+    let new_dir = pipeline.jobs[&id].working_dir.clone();
+    assert_ne!(new_dir, old_dir);
+    assert!(!old_dir.exists());
+    assert_eq!(caches(&new_dir).len(), 1);
+
+    pipeline.repeated_articles.remove(&id);
+    assert!(
+        caches(&new_dir).is_empty(),
+        "the dropped cache must remove its directory under the new name"
+    );
+}
+
 #[tokio::test]
 async fn shutdown_services_terminal_completion_needed_by_pending_readmission() {
     let temp = tempfile::tempdir().unwrap();
@@ -206,6 +260,73 @@ async fn retiring_jobs_refuse_new_mutations_before_archive_acknowledgement() {
     assert_eq!(
         pipeline.db.get_job_history(id.0).unwrap().unwrap().status,
         "complete"
+    );
+}
+
+// A cancelled job leaves the queue only when its row does: on the done event
+// after its history row has committed. Until then every queue reader still
+// lists it as it was, and mutations against it stay refused.
+#[tokio::test]
+async fn a_cancelled_job_stays_listed_until_its_history_row_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = handle(&pipeline);
+    let id = JobId(9210);
+    insert_active_job(
+        &mut pipeline,
+        id,
+        segmented_job_spec("cancel visibility fixture", "payload.bin", &[100]),
+    )
+    .await;
+    pipeline.report_all_for_test();
+    let listed = |pipeline: &Pipeline| {
+        pipeline
+            .shared_state
+            .queue
+            .read(|inner| inner.visible_jobs().any(|job| job.job_id == id))
+    };
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    pipeline
+        .db
+        .try_queue_write("hold_cancel_archive", move |_| {
+            let _ = released.recv();
+            Ok(())
+        })
+        .unwrap();
+    let mut events = handle.subscribe_events();
+
+    handle.cancel_job(id).await.unwrap();
+    assert!(
+        listed(&pipeline),
+        "the cancel intent alone must not hide the job"
+    );
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.shared_state.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .any(|row| row.id == id && row.report.retiring)
+    }));
+    assert!(
+        listed(&pipeline),
+        "the job stays listed while its archive is held"
+    );
+    assert!(handle.list_jobs().iter().any(|job| job.job_id == id));
+    assert_eq!(handle.get_job(id).unwrap().job_id, id);
+    assert!(matches!(
+        handle.pause_job(id).await,
+        Err(SchedulerError::JobNotFound(_))
+    ));
+
+    drop(release);
+    finish_cancel_jobs(&mut pipeline).await;
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    assert!(!listed(&pipeline), "the done event drops the row");
+    assert!(
+        pipeline.db.get_job_history(id.0).unwrap().is_some(),
+        "the row leaves only once its history row exists"
     );
 }
 

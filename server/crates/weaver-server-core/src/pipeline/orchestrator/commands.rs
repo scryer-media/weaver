@@ -158,6 +158,9 @@ impl Pipeline {
         };
         self.direct_store
             .relocate_working_dir(job_id, &old_dir, &new_dir);
+        if let Some(cache) = self.repeated_articles.get(&job_id) {
+            cache.relocate_working_dir(&old_dir, &new_dir);
+        }
         self.invalidate_par2_session_for_identity_rebind(job_id);
         if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
             for set in runtime.sets.values_mut() {

@@ -27,6 +27,9 @@ pub const DIRECT_STORE_POST_REPAIR_VERIFY: &str = "direct_store.post_repair_veri
 // A segment batch's disk write on the owner thread, before any byte lands.
 pub const DISK_WRITE: &str = "download.disk_write";
 
+// A PAR2 repair on its blocking worker, before the session reads anything.
+pub const PAR2_REPAIR_RUN: &str = "repair.par2_run";
+
 struct ConfiguredFailpoint {
     name: String,
     fired: AtomicBool,
@@ -37,6 +40,17 @@ struct ConfiguredDelay {
     millis: u64,
     fired: AtomicBool,
 }
+
+struct ConfiguredShutdownHold {
+    name: String,
+    fired: AtomicBool,
+}
+
+// Whether the scheduler has been told to shut down, for a hook held until
+// then. Set by [`release_shutdown_holds`], never cleared: a process that has
+// been told to stop is not told to carry on.
+static SHUTDOWN_SIGNALLED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static SHUTDOWN_WAKE: std::sync::Condvar = std::sync::Condvar::new();
 
 fn configured_failpoint() -> &'static Option<ConfiguredFailpoint> {
     static FAILPOINT: OnceLock<Option<ConfiguredFailpoint>> = OnceLock::new();
@@ -73,7 +87,64 @@ fn configured_delay() -> &'static Option<ConfiguredDelay> {
     })
 }
 
+fn configured_shutdown_hold() -> &'static Option<ConfiguredShutdownHold> {
+    static HOLD: OnceLock<Option<ConfiguredShutdownHold>> = OnceLock::new();
+    HOLD.get_or_init(|| {
+        std::env::var("WEAVER_E2E_HOLD")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|name| ConfiguredShutdownHold {
+                name,
+                fired: AtomicBool::new(false),
+            })
+    })
+}
+
+// Releases every hook held by `WEAVER_E2E_HOLD`, and lets any hook reached
+// afterwards through at once. Called when the scheduler is told to shut down.
+pub fn release_shutdown_holds() {
+    *SHUTDOWN_SIGNALLED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    SHUTDOWN_WAKE.notify_all();
+}
+
+// The first caller to reach `name`, when `WEAVER_E2E_HOLD` names it, parks
+// there until the scheduler is told to shut down.
+fn maybe_hold_until_shutdown(name: &str) {
+    let Some(configured) = configured_shutdown_hold().as_ref() else {
+        return;
+    };
+    if configured.name != name {
+        return;
+    }
+    if configured
+        .fired
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    tracing::warn!(hook = name, "holding e2e delay hook until shutdown");
+    let mut signalled = SHUTDOWN_SIGNALLED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while !*signalled {
+        signalled = SHUTDOWN_WAKE
+            .wait(signalled)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    drop(signalled);
+    tracing::warn!(hook = name, "releasing e2e delay hook for shutdown");
+}
+
+// A named delay hook: sleeps once for `WEAVER_E2E_DELAY=<name>=<millis>`, or
+// holds once for `WEAVER_E2E_HOLD=<name>` until the process is told to shut
+// down.
 pub fn maybe_delay(name: &str) {
+    maybe_hold_until_shutdown(name);
     let Some(configured) = configured_delay().as_ref() else {
         return;
     };

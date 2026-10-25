@@ -529,6 +529,64 @@ async fn a_health_abort_past_the_share_fails_with_the_sample_diagnosis() {
     );
 }
 
+// A health probe can finish before the download lanes have put a single first
+// article to a server: its STAT round is a few round trips, while the lanes
+// may be busy with other jobs. A round that comes back entirely missing then
+// holds on the sample like any other health abort, and the dead post fails
+// with the sample's diagnosis — the same verdict it gets when the lanes rule
+// first.
+#[tokio::test]
+async fn an_all_missing_probe_before_the_sample_waits_for_the_sample() {
+    use crate::jobs::model::HealthDeferralKind;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41710);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        multi_file_job_spec("Probe Outruns The Lanes", 10, 8),
+    )
+    .await;
+
+    // A probe round is in flight and nothing of the sample has been ruled.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.health_probing = true;
+        state.health_probe_round = 1;
+    }
+    pipeline.handle_probe_update(ProbeUpdate {
+        job_id,
+        probe_round: 0,
+        total: 10,
+        missed: 10,
+        unverified: 0,
+        done: true,
+        inconclusive: false,
+    });
+    assert!(
+        job_failed(&pipeline, job_id).is_none(),
+        "the probe must not rule while the sample can still decide"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().health_deferral.kind,
+        Some(HealthDeferralKind::FirstArticleSample)
+    );
+
+    let dispatched = serve_until_the_job_stops(&mut pipeline, job_id);
+
+    let error = job_failed(&pipeline, job_id).expect("the dead post must be refused");
+    assert_eq!(
+        error,
+        "aborted: 8 of 10 first articles are missing, the post cannot complete"
+    );
+    assert!(
+        dispatched
+            .iter()
+            .all(|segment_id| segment_id.segment_number == 0),
+        "only the sample is asked for: {dispatched:?}"
+    );
+}
+
 // A job whose payload files are `payload_segments` articles each (one entry
 // per file), followed by one PAR2 recovery volume of `recovery_segments`
 // articles.

@@ -143,7 +143,38 @@ pub(super) async fn rename_obfuscated_members(
         }
         None => Vec::new(),
     };
-    let named_by_content = weaver_nzb::plan_content_extensions(&entries, &renames);
+    // The policy judges the names the delivery ends up with. A name it would
+    // refuse on disk is never written, so a content-derived extension cannot
+    // deliver what the operator rejects. The payload's plan stands or falls
+    // whole: its helpers are not renamed around a payload that keeps its name.
+    let refused = |rename: &PlannedRename| {
+        policy
+            .unacceptable_extension_match(file_name_of(&rename.to))
+            .is_some()
+    };
+    if let Some(rename) = renames.iter().find(|rename| refused(rename)) {
+        debug!(
+            job_id = job_id.0,
+            member = %rename.from,
+            name = %rename.to,
+            "skipping member deobfuscation because the policy refuses the name it would write"
+        );
+        renames.clear();
+    }
+    let named_by_content = weaver_nzb::plan_content_extensions(&entries, &renames)
+        .into_iter()
+        .filter(|rename| {
+            let keep = !refused(rename);
+            if !keep {
+                debug!(
+                    job_id = job_id.0,
+                    member = %rename.from,
+                    name = %rename.to,
+                    "leaving a member without its content extension because the policy refuses it"
+                );
+            }
+            keep
+        });
     renames.extend(named_by_content);
     if renames.is_empty() {
         return Vec::new();
@@ -161,6 +192,11 @@ pub(super) async fn rename_obfuscated_members(
             Vec::new()
         }
     }
+}
+
+// The bare file name of a delivery-relative path.
+fn file_name_of(relative_path: &str) -> &str {
+    relative_path.rsplit('/').next().unwrap_or(relative_path)
 }
 
 // Walks the ladder that decides what the payload should be called: the srrdb
@@ -992,6 +1028,62 @@ mod tests {
         assert_eq!(
             delivered_names(root.path()),
             vec!["Yb5drZSkNi20UCMkb.iso".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_obfuscated_extensionless_member_keeps_its_name_when_the_policy_refuses_its_content()
+    {
+        let root = tempfile::tempdir().unwrap();
+        write_file_with_head(root.path(), "Yb5drZSkNi20UCMkb", 64 * MIB, MATROSKA_HEAD);
+        write_file(root.path(), "Yb5drZSkNi20UCMkb.nfo", 2048);
+        let policy = PostProcessingSettings {
+            unacceptable_extensions: vec!["MKV".into()],
+            ..PostProcessingSettings::default()
+        };
+
+        let renamed = rename_obfuscated_members(
+            JobId(14),
+            root.path(),
+            &plan("Silver Horizon S01E03"),
+            &policy,
+        )
+        .await;
+
+        // Neither the payload nor its helper moves: the policy would refuse
+        // the name the payload was about to take.
+        assert_eq!(renamed.len(), 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec![
+                "Yb5drZSkNi20UCMkb".to_string(),
+                "Yb5drZSkNi20UCMkb.nfo".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_readable_extensionless_member_keeps_its_name_when_the_policy_refuses_its_content() {
+        let root = tempfile::tempdir().unwrap();
+        write_file_with_head(
+            root.path(),
+            "Silver Horizon S01E03",
+            64 * MIB,
+            MATROSKA_HEAD,
+        );
+        let policy = PostProcessingSettings {
+            unacceptable_extensions: vec!["mkv".into()],
+            ..PostProcessingSettings::default()
+        };
+
+        let renamed =
+            rename_obfuscated_members(JobId(15), root.path(), &plan("Quiet Harbour"), &policy)
+                .await;
+
+        assert_eq!(renamed.len(), 0);
+        assert_eq!(
+            delivered_names(root.path()),
+            vec!["Silver Horizon S01E03".to_string()]
         );
     }
 

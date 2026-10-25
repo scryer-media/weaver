@@ -1140,10 +1140,13 @@ async fn held_writer_keeps_control_plane_and_counters_live_then_completes() {
     let watermark = handle.job_revision();
     handle.cancel_job(b).await.unwrap();
     assert!(handle.job_revision() > watermark);
-    assert!(handle.get_job(b).is_err());
+    // Still listed until the archive commits; the done event that sends
+    // JobCancelled drops the row on the same write.
+    assert!(handle.get_job(b).is_ok());
     while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == b)
     {
     }
+    assert!(handle.get_job(b).is_err());
     assert!(db.get_job_history(b.0).unwrap().is_some());
     handle.delete_history(b, false).await.unwrap();
     assert!(db.get_job_history(b.0).unwrap().is_none());

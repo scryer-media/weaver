@@ -23,6 +23,7 @@ import {
   NumberField,
   PrimaryButton,
   MultiSelect,
+  SecondaryButton,
   Segmented,
   Select,
   Slider,
@@ -393,6 +394,11 @@ export interface SettingsTableModel {
   onRowClick?: (id: string) => void;
   empty?: string;
   /**
+   * Why the list could not be read, drawn in place of the empty state: a list
+   * that failed to load is not an empty one.
+   */
+  failure?: { message: string; retry: { label: string; onClick: () => void } };
+  /**
    * This list's "Add", centred under the table whether or not it has rows.
    * Every list is added to from the same place, so it is never in the top bar.
    */
@@ -633,7 +639,19 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
               </Eyebrow>
             ))}
           </div>
-          {block.rows.length === 0 && groups.length === 0 ? (
+          {block.rows.length === 0 && groups.length === 0 && block.failure !== undefined ? (
+            <div
+              role="alert"
+              className={`flex items-center gap-4 px-4 sm:px-6 py-5 text-[13px] text-wv-error-text${
+                block.add === undefined ? "" : " border-b border-wv-hairline"
+              }`}
+            >
+              <span className="min-w-0">{block.failure.message}</span>
+              <SecondaryButton size="compact" icon="reset" onClick={block.failure.retry.onClick}>
+                {block.failure.retry.label}
+              </SecondaryButton>
+            </div>
+          ) : block.rows.length === 0 && groups.length === 0 ? (
             <div
               className={`px-4 sm:px-6 py-5 text-[13px] text-wv-muted${
                 block.add === undefined ? "" : " border-b border-wv-hairline"

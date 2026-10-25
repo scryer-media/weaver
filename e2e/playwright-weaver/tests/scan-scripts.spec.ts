@@ -87,6 +87,14 @@ async function queueItem(request: APIRequestContext, id: number) {
     "query($id: Int!) { queueItem(id: $id) { state duplicateSummary { semantic { normalizedKey score } } } }", { id })).queueItem;
 }
 
+// The job's own status. The global pause the spec holds makes every idle
+// queue item PAUSED, but it never sets a job's status; a pause of the job's
+// own does.
+async function jobStatus(request: APIRequestContext, id: number) {
+  return (await graphql<{ job: { status: string } | null }>(request,
+    "query($id: Int!) { job(id: $id) { status } }", { id })).job?.status;
+}
+
 test("SC01 a Parameter directive becomes a job attribute; an over-long name is refused", async ({ request }) => {
   note("discrepancy", "An invalid parameter name is reported as \"Invalid command\" at ERROR level, not WARNING.");
   const longName = "p".repeat(300);
@@ -151,7 +159,8 @@ test("SC09 a Paused directive adds the job paused", async ({ request }) => {
   const { result } = await scanned(request, "SC09", directive("PAUSED", "1"));
   expect(result?.accepted).toBe(true);
   expect((await queueItem(request, result!.jobId!))?.state).toBe("PAUSED");
-  expect((await queueItem(request, control))?.state).not.toBe("PAUSED");
+  expect(await jobStatus(request, result!.jobId!)).toBe("PAUSED");
+  expect(await jobStatus(request, control)).toBe("QUEUED");
 });
 
 test("SC10 a DupeKey directive sets the duplicate key", async ({ request }) => {

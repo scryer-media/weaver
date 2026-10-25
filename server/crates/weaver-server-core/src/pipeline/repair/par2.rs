@@ -2683,6 +2683,26 @@ impl Pipeline {
         cancellation
     }
 
+    // Await a PAR2 run the actor holds inline on a blocking worker.
+    //
+    // While it waits here the actor takes no command, so the shutdown check
+    // at the top of its loop cannot reach this run. Shutdown is watched beside
+    // the run instead: the moment it is signalled every job's token fires, the
+    // run stops at its next poll, and the await returns its cancelled result.
+    pub(crate) async fn await_inline_par2_run<T>(
+        &mut self,
+        mut run: tokio::task::JoinHandle<T>,
+    ) -> Result<T, tokio::task::JoinError> {
+        let queue = std::sync::Arc::clone(&self.shared_state.queue);
+        tokio::select! {
+            biased;
+            joined = &mut run => return joined,
+            () = queue.shutdown_requested() => {}
+        }
+        self.cancel_par2_work_for_shutdown();
+        run.await
+    }
+
     // Shutdown stops every PAR2 read this process still owns.
     //
     // A damaged-path analysis runs detached on a blocking worker, carrying

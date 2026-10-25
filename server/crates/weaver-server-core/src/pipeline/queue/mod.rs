@@ -114,6 +114,9 @@ pub struct JobRow {
     pub counters: Arc<JobCounters>,
     pub(crate) phases: HashMap<crate::jobs::phase_progress::JobPhase, counters::PhaseSample>,
     pub(crate) sampled_phases: Vec<crate::jobs::phase_progress::JobPhaseProgress>,
+    // The download rate over `counters.downloaded`, advanced on every metrics
+    // tick for as long as the row lives, on the global gauge's sample instants.
+    pub(crate) download_rate: Option<crate::operations::metrics::RateSeries>,
     pub(crate) admission: Option<PreparedAdd>,
 }
 
@@ -192,6 +195,7 @@ impl JobRow {
             counters: Arc::default(),
             phases: HashMap::new(),
             sampled_phases: Vec::new(),
+            download_rate: None,
             admission: None,
         }
     }
@@ -273,11 +277,10 @@ impl JobRow {
 }
 
 impl QueueInner {
+    // Every row the queue holds. A cancelled job stays listed, as it was,
+    // until its history row has committed and the done event drops the row.
     pub fn visible_jobs(&self) -> impl Iterator<Item = JobInfo> + '_ {
-        self.jobs
-            .iter()
-            .filter(|row| row.intents.cancelled.is_none())
-            .map(|row| row.info(&self.globals))
+        self.jobs.iter().map(|row| row.info(&self.globals))
     }
 }
 
@@ -362,6 +365,17 @@ impl Queue {
 
     pub(crate) async fn intent_changed(&self) {
         self.intent_wake.notified().await;
+    }
+
+    // Resolves once shutdown has been signalled. It watches the revision,
+    // which every write moves, so it takes no wake from the actor's loop.
+    pub(crate) async fn shutdown_requested(&self) {
+        let mut revision = self.subscribe();
+        while !self.read(|inner| inner.globals.shutting_down) {
+            if revision.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {

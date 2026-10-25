@@ -393,3 +393,45 @@ async fn a_checkpoint_behind_its_writes_throttles_until_the_barrier_runs() {
         "the barrier releases it"
     );
 }
+
+// Checkpoints for one file land in submission order, however the writer
+// schedules them: the row is replaced whole and coverage may shrink, so a
+// later, smaller checkpoint is the truth and an earlier, larger one must not
+// overwrite it.
+#[tokio::test]
+async fn successive_checkpoints_for_one_file_land_in_submission_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(41005);
+    let spec = segmented_job_spec(
+        "checkpoint order",
+        "sample.bin",
+        &[DECLARED_SEGMENT_BYTES; DECODED_PAYLOADS.len()],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let row = |written: &[usize]| {
+        vec![ActiveFileProgress {
+            job_id,
+            file_index: 0,
+            coverage: coverage_of(written),
+        }]
+    };
+    for written in [
+        &[0usize][..],
+        &[0, 1, 2],
+        &[0, 1, 2, 3, 4],
+        &[0, 2, 4],
+        &[2],
+    ] {
+        pipeline.queue_file_progress_batch(row(written)).unwrap();
+    }
+    pipeline.db.flush_write_queue().await.unwrap();
+
+    let recovered = pipeline.db.load_active_jobs().unwrap();
+    assert_eq!(
+        recovered[&job_id].file_progress.get(&0),
+        Some(&coverage_of(&[2])),
+        "the last checkpoint submitted is the one on the row"
+    );
+}

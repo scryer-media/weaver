@@ -387,8 +387,8 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 func runInterruptDuringVerifyingRefetchesNothing(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "par2-small-repair"
 	const hook = "status.enter_verifying"
-	delayEnv := "WEAVER_E2E_DELAY=" + hook + "=20000"
-	if err := ctx.startWeaverWithOptions("", 8, delayEnv); err != nil {
+	holdEnv := "WEAVER_E2E_HOLD=" + hook
+	if err := ctx.startWeaverWithOptions("", 8, holdEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
@@ -456,8 +456,8 @@ var par2PassLogNeedles = []string{
 func runInterruptDuringPar2PassStopsThePass(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "par2-heavy-damage"
 	const hook = "repair.task_start"
-	delayEnv := "WEAVER_E2E_DELAY=" + hook + "=20000"
-	if err := ctx.startWeaverWithOptions("", 8, delayEnv); err != nil {
+	holdEnv := "WEAVER_E2E_HOLD=" + hook
+	if err := ctx.startWeaverWithOptions("", 8, holdEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)

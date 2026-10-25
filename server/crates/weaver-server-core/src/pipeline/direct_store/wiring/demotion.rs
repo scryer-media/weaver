@@ -1051,11 +1051,8 @@ impl Pipeline {
                     file_index: *file_index,
                     coverage,
                 }];
-                if let Err(error) = self
-                    .db_blocking(move |db| db.upsert_file_progress_batch(&row))
-                    .await
-                {
-                    warn!(job_id = job_id.0, file_index, error = %error, "failed to persist reconstructed volume coverage");
+                if let Err(error) = self.queue_file_progress_batch(row) {
+                    warn!(job_id = job_id.0, file_index, error = %error, "failed to queue reconstructed volume coverage");
                 }
             }
             // Awaited, not fire-and-forget: the volume is about to be

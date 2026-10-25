@@ -441,6 +441,28 @@ impl BlockingDbOperation {
     }
 }
 
+// Fails every database task named `operation` while it is alive: the task's
+// blocking closure panics, so `spawn_blocking_db` returns an error for it.
+pub struct FailingDbOperation {
+    _guard: TestDbTaskHookGuard,
+    _serialize: StdMutexGuard<'static, ()>,
+}
+
+impl FailingDbOperation {
+    pub fn new(operation: &'static str) -> Self {
+        let serialize = blocking_db_operation_lock().lock().unwrap();
+        let guard = install_test_db_task_hook(move |current_operation| {
+            if current_operation == operation {
+                panic!("injected failure for db task {operation}");
+            }
+        });
+        Self {
+            _guard: guard,
+            _serialize: serialize,
+        }
+    }
+}
+
 // Generate a minimal valid NZB XML for testing.
 pub fn make_test_nzb(name: &str) -> String {
     // Use a unique message-id based on the name to avoid collisions.

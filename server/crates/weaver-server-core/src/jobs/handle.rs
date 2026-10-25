@@ -194,13 +194,9 @@ impl SharedPipelineState {
     // lock without copying a job.
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.queue.read(|inner| {
-            inner.history_summary.with_statuses(
-                inner
-                    .jobs
-                    .iter()
-                    .filter(|row| row.intents.cancelled.is_none())
-                    .map(|row| &row.report.job.status),
-            )
+            inner
+                .history_summary
+                .with_statuses(inner.jobs.iter().map(|row| &row.report.job.status))
         })
     }
 
@@ -245,7 +241,7 @@ impl SharedPipelineState {
             inner
                 .jobs
                 .iter()
-                .find(|row| row.id == job_id && row.intents.cancelled.is_none())
+                .find(|row| row.id == job_id)
                 .map(|row| row.info(&inner.globals))
                 .or_else(|| {
                     self.queue
@@ -369,7 +365,11 @@ impl SharedPipelineState {
     // sampling quickly until the gauges have settled.
     #[cfg(any(test, feature = "test-support"))]
     pub fn refresh_metrics_snapshot(&self, now: std::time::Instant) -> bool {
-        let snapshot = self.metrics.sample_totals(now, 0, 0, 0);
+        // The gauge integrates the transfer total, the counter the queue tick
+        // hands it, so a test tick and a live tick feed one series.
+        let snapshot = self
+            .metrics
+            .sample_totals(now, self.queue.counters.bandwidth.total(), 0, 0);
         let rates_moving = snapshot.current_download_speed > 0
             || snapshot.articles_per_sec > 0.0
             || snapshot.decode_rate_mbps > 0.0;
@@ -378,6 +378,16 @@ impl SharedPipelineState {
             Change::unchanged(())
         });
         rates_moving
+    }
+
+    // Book wire bytes the way a lane and its completion do: the transfer total
+    // the download gauge integrates, and the lifetime downloaded counter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_wire_bytes(&self, bytes: u64) {
+        self.queue.counters.bandwidth.record(bytes);
+        self.metrics
+            .bytes_downloaded
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -1690,6 +1700,9 @@ impl SchedulerHandle {
             inner.globals.shutting_down = true;
             Change::changed(())
         });
+        // An e2e hook held until shutdown is released by the same signal
+        // the pipeline reads.
+        crate::e2e_failpoint::release_shutdown_holds();
         Ok(())
     }
 }

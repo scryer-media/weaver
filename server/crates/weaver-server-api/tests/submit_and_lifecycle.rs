@@ -1152,6 +1152,7 @@ async fn resume_idempotent() {
 async fn cancel_queued_job() {
     let h = TestHarness::new().await;
     let id = h.submit_test_nzb("cancel-test").await;
+    let mut events = h.handle.subscribe_events();
 
     let resp = h
         .execute(&format!(
@@ -1161,6 +1162,11 @@ async fn cancel_queued_job() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["cancelQueueItem"]["success"].as_bool().unwrap());
+    // The job leaves the queue once its history row commits.
+    while !matches!(
+        events.recv().await.unwrap(),
+        weaver_server_core::events::model::PipelineEvent::JobCancelled { job_id } if job_id.0 == id
+    ) {}
 
     let resp = h.execute("{ queueItems { id } }").await;
     assert_no_errors(&resp);
@@ -1179,6 +1185,7 @@ async fn cancel_paused_job() {
         r#"mutation {{ pauseQueueItem(id: {id}) {{ success }} }}"#
     ))
     .await;
+    let mut events = h.handle.subscribe_events();
 
     let resp = h
         .execute(&format!(
@@ -1188,6 +1195,11 @@ async fn cancel_paused_job() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["cancelQueueItem"]["success"].as_bool().unwrap());
+    // The job leaves the queue once its history row commits.
+    while !matches!(
+        events.recv().await.unwrap(),
+        weaver_server_core::events::model::PipelineEvent::JobCancelled { job_id } if job_id.0 == id
+    ) {}
 
     let resp = h.execute("{ queueItems { id } }").await;
     assert_no_errors(&resp);

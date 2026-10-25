@@ -1569,14 +1569,11 @@ var chaosSeedFixtureSlugs = append(
 	chaosStatProbeSlug,
 )
 
-var restartFixtureSlugs = []string{
-	"direct-store-par2-alias-restart",
-	"direct-unpack-repair-unvouched",
-	"direct-unpack-restart",
-	"par2-heavy-damage",
-	"par2-heavy-damage-a",
-	"par2-small-repair",
-	"rar5-multi-member",
+// restartFixtureSlugs is every fixture a registered restart case names. The
+// preseeded restart image is built from this list and the restart suite seeds
+// nothing itself when that image is active, so the cases are the only source.
+func restartFixtureSlugs() []string {
+	return uniqueRestartSlugs(restartCases())
 }
 
 func fixtureSlugsForSeedProfile(profile string) []string {
@@ -1588,7 +1585,7 @@ func fixtureSlugsForSeedProfile(profile string) []string {
 	case "tcp-chaos":
 		return append([]string(nil), tcpChaosFixtureSlugs...)
 	case "restart":
-		return append([]string(nil), restartFixtureSlugs...)
+		return restartFixtureSlugs()
 	default:
 		log.Fatalf("invalid E2E_SEED_PROFILE=%q (expected functional|chaos|tcp-chaos|restart)", profile)
 		return nil
