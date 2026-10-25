@@ -8,8 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use tokio::time::Instant;
 use tracing::warn;
 use weaver_graph::holds::HoldBudgets;
 use weaver_graph::{MemberId, NodeId, Tree};
@@ -60,7 +61,10 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   entries            members of the live namespaces objects produced
 //   resident           what those namespaces keep in memory for their
 //                      members, against the memory limit
-//   deadline           the job's wall clock since its budget was built
+//   deadline           the wall clock since the first member an object
+//                      produced reached its namespace, as classic's runs
+//                      from the job's first extraction; the posts' own
+//                      writes are not under it
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
 //   content policy     the operator's unacceptable extensions, on every
@@ -70,7 +74,9 @@ pub(crate) struct Caps {
     policy: Result<Arc<PostProcessingSettings>, String>,
     // The bytes posted for each root member, by member id.
     declared: Vec<u64>,
-    started: Instant,
+    // When extraction began: the first time an object's namespace was
+    // charged. A job queued or paused before then has spent none of it.
+    started: Option<Instant>,
     debits: CapacityDebits,
     // How far each member an object produced is written.
     extents: BTreeMap<(NodeId, MemberId), u64>,
@@ -101,7 +107,7 @@ impl Caps {
             limits,
             policy,
             declared,
-            started: Instant::now(),
+            started: None,
             debits: CapacityDebits::default(),
             extents: BTreeMap::new(),
             written: 0,
@@ -136,12 +142,23 @@ impl Caps {
         self.refusal.as_ref()
     }
 
-    // The breach, if one stands, or the deadline's once it has passed.
-    pub(crate) fn check(&mut self) -> Result<(), ExtractionFailure> {
-        if let Some(refusal) = &self.refusal {
-            return Err(refusal.clone());
+    // The breach, if one stands.
+    pub(crate) fn check(&self) -> Result<(), ExtractionFailure> {
+        match &self.refusal {
+            Some(refusal) => Err(refusal.clone()),
+            None => Ok(()),
         }
-        if self.started.elapsed() > Duration::from_secs(self.limits.max_seconds) {
+    }
+
+    // A member of `node` changed. What an object produced is extraction:
+    // the first such change starts the clock, and every one after it is
+    // refused once the deadline has passed. The posts are not under it.
+    fn extracting(&mut self, tree: &Tree, node: NodeId) -> Result<(), ExtractionFailure> {
+        if !produced(tree, node) {
+            return Ok(());
+        }
+        let started = *self.started.get_or_insert_with(Instant::now);
+        if started.elapsed() > Duration::from_secs(self.limits.max_seconds) {
             let detail = format!(
                 "extraction exceeded the {} second deadline",
                 self.limits.max_seconds
@@ -180,6 +197,7 @@ impl Caps {
         member: MemberId,
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
+        self.extracting(tree, node)?;
         self.charge(tree, node, member);
         if self.entries > self.limits.max_entries {
             let detail = format!(
@@ -252,6 +270,7 @@ impl Caps {
         capacity: Capacity,
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
+        self.extracting(tree, node)?;
         if !produced(tree, node) {
             return Ok(());
         }

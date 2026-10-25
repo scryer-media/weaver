@@ -1376,3 +1376,68 @@ fn a_set_binding_a_member_by_content_logs_recovery_bound() {
         )]
     );
 }
+
+// The deadline runs from the first member an object produced, never from
+// when the job's budget was built: a job that sat queued past it extracts
+// its first bytes, and the posts' own writes are never under it. Once the
+// extraction itself overruns, its next write is refused.
+#[tokio::test(start_paused = true)]
+async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
+    use crate::pipeline::extraction::{ExtractionLimits, ExtractionRejectionReason};
+    use crate::post_processing::model::PostProcessingSettings;
+
+    const DEADLINE: u64 = 60;
+    let limits = ExtractionLimits {
+        max_job_bytes: u64::MAX,
+        max_member_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_ratio: u64::MAX,
+        ratio_floor_bytes: u64::MAX,
+        max_seconds: DEADLINE,
+        min_free_bytes: 0,
+        max_memory_bytes: u64::MAX,
+    };
+    let policy = PostProcessingSettings {
+        unacceptable_extensions: Vec::new(),
+        ..PostProcessingSettings::default()
+    };
+    let mut job = Job::new(PLENTY);
+    job.inner = 10;
+    job.writer = job.writer.capped(Caps::new(
+        Arc::new(limits),
+        Ok(Arc::new(policy)),
+        Vec::new(),
+    ));
+    let past = std::time::Duration::from_secs(DEADLINE + 1);
+
+    tokio::time::advance(past).await;
+    let plain = job.member("notes.bin", Some(5));
+    job.send(plain, 0, b"plain", Provenance::Fresh);
+    assert_eq!(job.file("notes.bin"), b"plain");
+
+    let store = job.member("show.rar", None);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    job.send(store, 0, &front, Provenance::Fresh);
+    assert!(job.tree.child_of(NodeId::ROOT, store).is_some());
+    assert!(job.writer.refusal().is_none());
+    assert_eq!(job.file("inner.bin")[..5], *b"hello");
+
+    tokio::time::advance(past).await;
+    let arrival = Arrival {
+        node: NodeId::ROOT,
+        member: store,
+        offset: front.len() as u64,
+        bytes: Bytes::from_static(b"world"),
+        provenance: Provenance::Fresh,
+    };
+    let mut build = job.build();
+    let refused = job
+        .writer
+        .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out);
+    assert!(refused.is_err());
+    assert_eq!(
+        job.writer.refusal().map(ExtractionFailure::reason),
+        Some(ExtractionRejectionReason::Deadline)
+    );
+}

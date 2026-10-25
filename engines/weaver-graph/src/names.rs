@@ -55,8 +55,7 @@ struct Entry {
 
 #[derive(Debug, Default)]
 pub struct NameLedger {
-    // Allocated name, lower-cased for case-insensitive file systems, to the
-    // member holding it.
+    // Allocated name, as its path on disk, to the member holding it.
     taken: HashMap<String, Holder>,
     entries: HashMap<Holder, Entry>,
 }
@@ -93,7 +92,9 @@ impl NameLedger {
         // member it moves can move into a file it has not yet left.
         let name = self.place(holder, &rank, &wanted, moved);
         if let Some(old) = old.filter(|old| *old != name) {
-            self.taken.remove(&old.to_ascii_lowercase());
+            if key(&old) != key(&name) {
+                self.taken.remove(&key(&old));
+            }
             moved.push(Moved {
                 holder,
                 old,
@@ -118,7 +119,7 @@ impl NameLedger {
     pub fn restore(&mut self, holder: Holder, position: Position, wanted: &str, held: &str) {
         let held = confined(held);
         let rank = (position, holder);
-        let name = match self.taken.entry(held.to_ascii_lowercase()) {
+        let name = match self.taken.entry(key(&held)) {
             std::collections::hash_map::Entry::Occupied(_) => {
                 self.place(holder, &rank, &confined(wanted), &mut Vec::new())
             }
@@ -139,7 +140,7 @@ impl NameLedger {
 
     pub fn release(&mut self, holder: Holder) {
         if let Some(entry) = self.entries.remove(&holder) {
-            self.taken.remove(&entry.name.to_ascii_lowercase());
+            self.taken.remove(&key(&entry.name));
         }
     }
 
@@ -168,7 +169,7 @@ impl NameLedger {
                 0 => wanted.to_owned(),
                 n => format!("{stem} ({n}){extension}"),
             };
-            let key = candidate.to_ascii_lowercase();
+            let key = key(&candidate);
             let outranked = match self.taken.get(&key) {
                 None => None,
                 Some(other) if *other == holder => None,
@@ -230,11 +231,24 @@ fn confined(wanted: &str) -> String {
     name
 }
 
+// The path a name takes on disk, lower-cased for case-insensitive file
+// systems. A directory and a file of one name are one path, so they share a
+// key and the ledger gives only one of them the name.
+fn key(name: &str) -> String {
+    name.strip_suffix('/').unwrap_or(name).to_ascii_lowercase()
+}
+
 // "subs.srt" -> ("subs", ".srt"); "archive.tar.gz" -> ("archive.tar", ".gz");
-// ".hidden" -> (".hidden", ""); "noext" -> ("noext", "").
+// ".hidden" -> (".hidden", ""); "noext" -> ("noext", "");
+// "v1.0/" -> ("v1.0", "/"), since a directory carries no extension and its
+// suffix goes before the separator; "a.d/noext" -> ("a.d/noext", "").
 fn split_extension(name: &str) -> (&str, &str) {
-    match name.rfind('.') {
-        Some(dot) if dot > 0 => name.split_at(dot),
+    if let Some(directory) = name.strip_suffix('/') {
+        return (directory, "/");
+    }
+    let leaf = name.rfind('/').map_or(0, |slash| slash + 1);
+    match name[leaf..].rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(leaf + dot),
         _ => (name, ""),
     }
 }
@@ -328,6 +342,42 @@ mod tests {
         root(&mut ledger, 2, "noext");
         assert_eq!(root(&mut ledger, 3, ".hidden"), ".hidden (1)");
         assert_eq!(root(&mut ledger, 4, "noext"), "noext (1)");
+    }
+
+    #[test]
+    fn a_second_directory_of_one_name_is_suffixed_before_its_separator() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(root(&mut ledger, 1, "docs/"), "docs/");
+        assert_eq!(root(&mut ledger, 2, "docs/"), "docs (1)/");
+        assert_eq!(root(&mut ledger, 3, "v1.0\\"), "v1.0/");
+        assert_eq!(root(&mut ledger, 4, "v1.0/"), "v1.0 (1)/");
+        assert_eq!(root(&mut ledger, 5, "a.d/noext"), "a.d/noext");
+        assert_eq!(root(&mut ledger, 6, "a.d/noext"), "a.d/noext (1)");
+    }
+
+    #[test]
+    fn a_directory_and_a_file_of_one_name_never_share_its_path() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(root(&mut ledger, 1, "folder"), "folder");
+        assert_eq!(root(&mut ledger, 2, "folder/"), "folder (1)/");
+
+        // Whichever arrives first, the one that ranks higher keeps the name.
+        let mut ledger = NameLedger::new();
+        assert_eq!(root(&mut ledger, 2, "folder/"), "folder/");
+        let mut moved = Vec::new();
+        let first = (ROOT, MemberId(1));
+        assert_eq!(
+            ledger.allocate(first, at(&[1]), "folder", &mut moved),
+            "folder"
+        );
+        assert_eq!(
+            moved,
+            vec![Moved {
+                holder: (ROOT, MemberId(2)),
+                old: "folder/".into(),
+                new: "folder (1)/".into(),
+            }]
+        );
     }
 
     // The members of the rulings below: a root member, a member two levels
