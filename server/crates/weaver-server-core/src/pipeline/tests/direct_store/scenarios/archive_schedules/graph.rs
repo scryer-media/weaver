@@ -120,35 +120,6 @@ pub(in super::super) fn rar_post(
     })
 }
 
-// A RAR post whose names and fronts leave its middle volumes to be ordered
-// by the volumes held beside them. A repair brings back a volume whose
-// first article is lost or whose posting is withheld, after the volumes
-// that arrived and the first volume, which states its own place. Two
-// adjacent middle volumes it brings back with the volume after them held
-// both fit beside a held volume, so nothing orders them and the post
-// delivers nothing; a run of them that reaches the last volume is placed
-// from its one held side, a volume at a time.
-fn unordered_middles(post: Deliverable, spec: &JobSpec, count: usize) -> Deliverable {
-    let layout: Vec<usize> = spec.files[..count]
-        .iter()
-        .map(|file| file.segments.len())
-        .collect();
-    Box::new(move |opens, interruption| {
-        let mut leaves = post(opens, interruption);
-        let mask = interruption.loss().map_or(0, |(mask, _)| mask);
-        let withheld = interruption.withheld().map(|(volume, _)| volume as usize);
-        let late = |volume: usize| {
-            Some(volume) == withheld || mask & (1 << article_slot(&layout, volume as u32, 0)) != 0
-        };
-        let unordered =
-            (1..count.saturating_sub(2)).any(|at| late(at) && late(at + 1) && !late(at + 2));
-        if leaves.mended && unordered {
-            leaves.deliverable.clear();
-        }
-        leaves
-    })
-}
-
 // The members a RAR post still holds whole as a schedule leaves it on the
 // server. A reader reaches a piece of a member through every header before
 // it in its volume, so a piece needs those headers, its own, and its data;
@@ -821,14 +792,13 @@ pub(in super::super) fn graph_fixture(format: Format, slots: usize) -> GraphFixt
         spec,
     } = slot_fixture(format, slots);
     let members = BTreeMap::from([(name.to_string(), payload)]);
-    let post = rar_post(&volumes, &spec, &members, format.options());
+    // A repair makes a volume whole, and every RAR set here with middle
+    // volumes states each volume's number in its headers, so a repaired
+    // middle volume is placed by its own number.
     GraphFixture {
         label: format!("{format:?}"),
         options: format.options(),
-        deliverable: match format.cell().orders_middles() {
-            true => post,
-            false => unordered_middles(post, &spec, volumes.len()),
-        },
+        deliverable: rar_post(&volumes, &spec, &members, format.options()),
         spec,
         volumes,
         described,
