@@ -34,8 +34,8 @@ use par3_rs::{HEADER_SIZE, MAGIC, Packet, PacketHeader, PacketType, Par3Set, Sca
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Namespace, Object, ObjectId,
-    Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
+    ByteRange, Coverage, Delivery, Emit, Extent, Kind, Member, MemberId, Namespace, Object,
+    ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
 };
 
 use crate::par2::combine;
@@ -125,11 +125,36 @@ impl Volume {
 }
 
 // A member that may be a described file no member carries: no described
-// name answers to it, and its length is that file's.
+// name answers to it, and its length fits that file's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Unnamed {
+    // Exact once any byte of it arrived checked; otherwise only the bound
+    // its post's encoded size sets, as a PAR2 member's is.
     length: u64,
+    intact: bool,
     complete: bool,
+}
+
+impl Unnamed {
+    fn of(member: &Member) -> Option<Self> {
+        Some(Self {
+            length: member.length?,
+            intact: member
+                .coverage
+                .runs()
+                .any(|run| run.provenance.is_verified()),
+            complete: member.is_complete(),
+        })
+    }
+
+    // Whether the member could be a described file of `long` bytes.
+    fn fits(self, long: u64) -> bool {
+        if self.intact {
+            self.length == long
+        } else {
+            long <= self.length
+        }
+    }
 }
 
 pub struct Par3 {
@@ -243,7 +268,7 @@ impl Par3 {
         let files: Vec<&FileLayout> = layouts.iter().flat_map(BlockLayout::files).collect();
         let mut read = 0;
         for (&member, unnamed) in &self.unnamed {
-            if !unnamed.complete || self.identified.contains_key(&member) {
+            if !unnamed.complete || !unnamed.intact || self.identified.contains_key(&member) {
                 continue;
             }
             let free = |path: &str| self.free(path);
@@ -251,6 +276,49 @@ impl Par3 {
             if let Some(path) = identity::identify(&files, free, access, member, len, &mut read) {
                 self.identified.insert(member, path.to_owned());
             }
+        }
+        // A member with no intact byte has nothing to say what it is, so it
+        // is what is left, as a PAR2 member no slice named is: longest file
+        // first, each free file no member is takes the member it fits most
+        // tightly, once the files those members could be are no more than
+        // they are. The repair makes every byte of it over.
+        let mut free: Vec<(String, u64)> = files
+            .iter()
+            .filter(|file| {
+                file.len != 0
+                    && self.free(&file.path)
+                    && !self.bound.contains_key(&file.path)
+                    && !self.identified.values().any(|path| *path == file.path)
+            })
+            .map(|file| (file.path.clone(), file.len))
+            .collect();
+        free.sort_by_key(|(_, long)| std::cmp::Reverse(*long));
+        free.dedup();
+        let mut blank: Vec<(MemberId, Unnamed)> = self
+            .unnamed
+            .iter()
+            .filter(|(member, unnamed)| {
+                unnamed.complete && !unnamed.intact && !self.identified.contains_key(member)
+            })
+            .map(|(member, unnamed)| (*member, *unnamed))
+            .collect();
+        while let Some((at, member)) = free.iter().enumerate().find_map(|(at, (_, long))| {
+            let fitting: Vec<usize> = (0..blank.len())
+                .filter(|candidate| blank[*candidate].1.fits(*long))
+                .collect();
+            let could_be = free
+                .iter()
+                .filter(|(_, other)| fitting.iter().any(|c| blank[*c].1.fits(*other)))
+                .count();
+            let tightest = fitting
+                .iter()
+                .copied()
+                .min_by_key(|candidate| blank[*candidate].1.length)
+                .filter(|_| could_be <= fitting.len())?;
+            Some((at, tightest))
+        }) {
+            let (path, _) = free.remove(at);
+            self.identified.insert(blank.swap_remove(member).0, path);
         }
         let found = self.by_content();
         self.bound.extend(found);
@@ -266,7 +334,7 @@ impl Par3 {
                 && self
                     .unnamed
                     .values()
-                    .any(|member| !member.complete && member.length == file.size())
+                    .any(|member| !member.complete && member.fits(file.size()))
         })
     }
 }
@@ -385,8 +453,18 @@ impl Object for Par3 {
             .then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
+    // An impossible verdict counted the blocks of the volumes bound then; a
+    // volume bound since may bring more, so the object is tried again.
+    // Without this the verdict would depend on whether a volume's front
+    // decided before or after the damage arrived.
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         self.volume(volume).named_blocks = recovery_volume::named_blocks(name, ".par3");
+        if matches!(
+            self.last,
+            Some(Ruling::Reached(RepairOutcome::Impossible { .. }))
+        ) {
+            self.last = None;
+        }
     }
 
     fn recovery(&self) -> Option<&dyn Recovery> {
@@ -425,16 +503,13 @@ impl Recovery for Par3 {
                 (file.path().to_owned(), carried)
             })
             .collect();
-        let free_size = |length: u64| {
-            files().any(|file| file.size() == length && described.get(file.path()) == Some(&false))
+        let fits_free = |unnamed: Unnamed| {
+            files()
+                .any(|file| unnamed.fits(file.size()) && described.get(file.path()) == Some(&false))
         };
         let unnamed: BTreeMap<MemberId, Unnamed> = others()
             .filter(|member| !files().any(|file| answers(&member.name, file)))
-            .filter_map(|member| {
-                let length = member.length.filter(|length| free_size(*length))?;
-                let complete = member.is_complete();
-                Some((member.id, Unnamed { length, complete }))
-            })
+            .filter_map(|member| Some((member.id, Unnamed::of(member).filter(|u| fits_free(*u))?)))
             .collect();
         // A verdict stands on what the object could bind when it ruled: the
         // files described, the members bound, and the members it may yet
@@ -451,7 +526,12 @@ impl Recovery for Par3 {
         self.identified
             .retain(|member, _| unnamed.contains_key(member));
         for (path, member) in self.by_content() {
-            let length = self.unnamed[&member].length;
+            let Some(length) = files()
+                .find(|file| file.path() == path)
+                .map(|file| file.size())
+            else {
+                continue;
+            };
             if namespace.recognise(member, &path, length).is_some() {
                 renamed.push(member);
             }
@@ -472,7 +552,7 @@ impl Recovery for Par3 {
             for file in set.files() {
                 let path = file.path();
                 let maybe = self.unnamed.iter().any(|(member, unnamed)| {
-                    unnamed.length == file.size()
+                    unnamed.fits(file.size())
                         && self.identified.get(member).is_none_or(|was| was == path)
                 });
                 let named = (path.to_owned(), file.size());

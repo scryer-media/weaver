@@ -2,11 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Which described file a member is, by its bytes, when no described name
-// answers to it. The rules are content discovery's: the
-// member's whole fingerprint names the one free description that carries
-// it, and failing that, a description whose block extents all match but one
-// interior one, over most of its bytes. A match proposes a name only; the
-// set still verifies and repairs the member as any other it binds.
+// answers to it. The member's whole fingerprint names the one free
+// description that carries it; failing that, as a PAR2 member is known by a
+// slice it holds, the one free description of its length one of whose blocks
+// it holds intact at that block's place. A hole or damage elsewhere in the
+// member does not hide what it is. A match proposes a name only; the set
+// still verifies and repairs the member as any other it binds.
 
 use par3_rs::Fingerprint;
 use par3_rs::hash::FingerprintHasher;
@@ -36,18 +37,29 @@ pub(super) fn identify<'a>(
     if eligible.is_empty() {
         return None;
     }
-    let fingerprint = fingerprint(access, member, ByteRange::new(0, len), read)?;
-    let damaged_name = if files.iter().any(|file| file.fingerprint == fingerprint) {
-        None
-    } else {
-        unique_damaged_name(eligible.iter().copied(), access, member, read)
+    let whole = fingerprint(access, member, ByteRange::new(0, len), read);
+    let matched: Vec<&FileLayout> = match whole {
+        Some(whole) if files.iter().any(|file| file.fingerprint == whole) => eligible
+            .iter()
+            .copied()
+            .filter(|file| file.fingerprint == whole)
+            .collect(),
+        _ => {
+            if eligible.iter().map(|file| file.len).sum::<u64>() > READ_LIMIT.saturating_sub(*read)
+            {
+                // An unexamined candidate is not a negative match.
+                return None;
+            }
+            eligible
+                .iter()
+                .copied()
+                .filter(|file| holds_block_of(access, member, file, read))
+                .collect()
+        }
     };
-    let mut matches = eligible.iter().filter(|file| {
-        file.fingerprint == fingerprint || damaged_name.as_deref() == Some(file.path.as_str())
-    });
-    let file = matches.next()?;
+    let file = matched.first()?;
     // Compatible aliases need independent output identities.
-    if matches.any(|other| other.path != file.path) {
+    if matched.iter().any(|other| other.path != file.path) {
         return None;
     }
     Some(&file.path)
@@ -66,89 +78,26 @@ fn eligible(file: &FileLayout, len: u64) -> bool {
             .any(|extent| matches!(extent.kind, ExtentKind::Unprotected))
 }
 
-fn unique_damaged_name<'a>(
-    files: impl Iterator<Item = &'a FileLayout> + Clone,
-    access: &mut dyn MemberAccess,
-    member: MemberId,
-    read: &mut u64,
-) -> Option<String> {
-    let required = files
-        .clone()
-        .try_fold(0u64, |total, file| total.checked_add(file.len));
-    if required.is_none_or(|bytes| bytes > READ_LIMIT.saturating_sub(*read))
-        || files.clone().any(|file| {
-            file.extents.iter().any(|extent| {
-                matches!(
-                    extent.kind,
-                    ExtentKind::Block {
-                        fingerprint: None,
-                        ..
-                    }
-                )
-            })
-        })
-    {
-        // An unexamined candidate is not a negative match. Never pick the
-        // first name merely because checking another exhausted the budget.
-        return None;
-    }
-    let mut matched: Option<&str> = None;
-    for file in files {
-        if matches_single_damaged_extent(access, member, file, read)? {
-            if matched.is_some_and(|name| name != file.path) {
-                return None;
-            }
-            matched = Some(&file.path);
-        }
-    }
-    matched.map(str::to_owned)
-}
-
-// Deliberately conservative: an exact-length image with authenticated
-// extents at both ends, every other extent matching but one interior
-// block, and most of the bytes authenticated. `None` when a read fails.
-fn matches_single_damaged_extent(
+// Whether the member holds one of the file's fingerprinted blocks intact at
+// its place: read back in order until one checks. A block that does not
+// read back proves nothing and the reading carries on past it.
+fn holds_block_of(
     access: &mut dyn MemberAccess,
     member: MemberId,
     file: &FileLayout,
     read: &mut u64,
-) -> Option<bool> {
-    let count = file.extents.len();
-    if count < 3
-        || file.len > READ_LIMIT.saturating_sub(*read)
-        || file.extents.range(0).is_none_or(|range| range.start != 0)
-        || file
-            .extents
-            .range(count - 1)
-            .is_none_or(|range| range.end != file.len)
-        || (1..count).any(|index| {
-            file.extents.range(index - 1).map(|range| range.end)
-                != file.extents.range(index).map(|range| range.start)
-        })
-    {
-        return Some(false);
-    }
-    let mut damaged = 0;
-    let mut matched_bytes = 0;
-    for (index, extent) in file.extents.iter().enumerate() {
+) -> bool {
+    file.extents.iter().any(|extent| {
         let ExtentKind::Block {
             fingerprint: Some(expected),
             ..
         } = extent.kind
         else {
-            return Some(false);
+            return false;
         };
         let range = ByteRange::new(extent.range.start, extent.range.end);
-        if fingerprint(access, member, range, read)? != expected {
-            damaged += 1;
-            if damaged > 1 || index == 0 || index + 1 == count {
-                return Some(false);
-            }
-        } else {
-            matched_bytes += range.len();
-        }
-    }
-    Some(damaged == 1 && matched_bytes > file.len / 2)
+        !range.is_empty() && fingerprint(access, member, range, read) == Some(expected)
+    })
 }
 
 // The fingerprint of a range of the member, read back a chunk at a time.
