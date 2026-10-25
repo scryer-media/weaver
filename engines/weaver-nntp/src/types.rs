@@ -215,8 +215,12 @@ impl Capabilities {
     }
 
     // Whether the server supports command pipelining (RFC 4644).
+    //
+    // Almost all commercial Usenet backbones (Highwinds, UsenetExpress/NewsgroupDirect,
+    // Eweka, Astraweb, Giganews, etc.) support pipelined BODY/ARTICLE commands over TCP,
+    // but many only advertise "VERSION 2" or "READER" rather than the RFC 4644 "PIPELINING" keyword.
     pub fn supports_pipelining(&self) -> bool {
-        self.has("PIPELINING")
+        self.has("PIPELINING") || self.has("VERSION") || self.has("READER")
     }
 }
 
@@ -283,6 +287,17 @@ mod tests {
         let caps = Capabilities::parse(b"");
         assert!(!caps.supports_starttls());
         assert!(!caps.has("ANYTHING"));
+    }
+
+    #[test]
+    fn capabilities_supports_pipelining_with_version_or_reader() {
+        let standard_usenet = b"VERSION 2\r\nREADER\r\n";
+        let caps = Capabilities::parse(standard_usenet);
+        assert!(caps.supports_pipelining());
+
+        let explicit_pipelining = b"VERSION 2\r\nPIPELINING\r\n";
+        let caps = Capabilities::parse(explicit_pipelining);
+        assert!(caps.supports_pipelining());
     }
 
     #[test]

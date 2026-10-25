@@ -3086,8 +3086,8 @@ pub(crate) fn compute_write_backlog_budget_bytes(
     let scratch_bytes = buffer_pool_total_bytes(buffers);
     let available_bytes = backlog_memory_ceiling_bytes(profile);
     let base = scratch_bytes
-        .max(64 * 1024 * 1024)
-        .min((available_bytes / 8).max(64 * 1024 * 1024));
+        .max(256 * 1024 * 1024)
+        .min((available_bytes / 4).max(64 * 1024 * 1024));
 
     match profile.disk.storage_class {
         StorageClass::Ssd => base,

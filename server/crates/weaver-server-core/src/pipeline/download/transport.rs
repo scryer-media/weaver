@@ -499,8 +499,11 @@ impl ServerPipelineExplorer {
     }
 
     pub(super) fn choose_mode(&self, pressure_clear: bool) -> DownloadLaneMode {
-        if !pressure_clear || self.pinned_sequential || !self.supports_pipelining {
+        if self.pinned_sequential || !self.supports_pipelining {
             return DownloadLaneMode::Sequential;
+        }
+        if !pressure_clear {
+            return DownloadLaneMode::from_depth(self.current_depth.clamp(2, 4));
         }
         DownloadLaneMode::from_depth(self.current_depth)
     }

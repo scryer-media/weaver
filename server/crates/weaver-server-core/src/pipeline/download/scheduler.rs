@@ -191,10 +191,9 @@ impl Pipeline {
             return Handout::Yield(reason);
         }
 
-        // Soft pressure keeps the link moving one article at a time per
-        // handout until the decode and write backlogs drain.
+        // Soft pressure paces work reservation without starving pipelined TCP lanes.
         let want = if pressure.state == DownloadPressureState::Soft {
-            want.min(1)
+            want.min(2)
         } else {
             want
         };

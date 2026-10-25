@@ -63,7 +63,10 @@ impl ServersMutation {
         let mut server = normalized.as_runtime_server_config(id);
         server.supports_pipelining = probe
             .as_ref()
-            .is_some_and(|result| result.supports_pipelining);
+            .map_or(true, |result| result.supports_pipelining);
+        if server.pipelining_depth.is_none() && server.supports_pipelining {
+            server.pipelining_depth = Some(8);
+        }
         note_probe_first_byte_latency(handle, id, probe.as_ref());
 
         let added = {
