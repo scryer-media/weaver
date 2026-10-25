@@ -12,6 +12,7 @@ on:
         default: all
         options:
           - all
+          - graph
           - par2-realism
           - damage
           - par3-breadth
@@ -129,6 +130,7 @@ jobs:
         run: |
           case "$ARCHIVE_FAMILY" in
             all) filter='all()' ;;
+            graph) filter='test(::graph::)' ;;
             par2-realism) filter='test(::tier2::par2_realism::)' ;;
             damage) filter='test(::tier2::damage::)' ;;
             par3-breadth) filter='test(::tier2::par3_breadth::)' ;;
