@@ -37,6 +37,7 @@ fn leg(kind: LegKind) -> P2pLeg {
         down: None,
         names: Some(ResolvedBy::Host),
         torrent: quiet(),
+        ip_filter: Ok(IpFilter::default()),
         allow_private_network: true,
     }
 }
@@ -388,10 +389,15 @@ fn route_fields(options: &SessionOptions) -> String {
 #[tokio::test]
 async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
     let dir = tempfile::tempdir().unwrap();
+    let sessions = filter_loader(dir.path());
+    let blocklist = dir.path().join("blocked.p2p");
+    std::fs::write(&blocklist, "test:127.0.0.1-127.0.0.1\n").unwrap();
     let settings = TorrentConfig {
         upnp: true,
         announce_port: Some(51_413),
         allow_multiple_connections_per_ip: false,
+        blocklist_enabled: true,
+        blocklist: Some(blocklist.display().to_string()),
         ..quiet()
     };
     for kind in [
@@ -402,6 +408,7 @@ async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
     ] {
         let path = P2pPath::open(P2pLeg {
             torrent: settings.clone(),
+            ip_filter: sessions.ip_filter(&settings).await,
             ..leg(kind.clone())
         })
         .await
@@ -419,12 +426,14 @@ async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
             &dir.path().join("route"),
             100,
             &settings,
-            IpFilter::default(),
+            sessions.ip_filter(&settings).await.unwrap(),
             &IDENTITY.identity(),
         );
-        let probe = path.session_options(&dir.path().join("probe"));
+        let probe = path.session_options(&dir.path().join("probe")).unwrap();
 
         assert_eq!(route_fields(&probe), route_fields(&route), "{kind:?}");
+        assert_eq!(probe.ip_filter, route.ip_filter, "{kind:?}");
+        assert!(probe.ip_filter.blocked.has("127.0.0.1".parse().unwrap()));
         assert_eq!(
             probe.socket_factory.is_some(),
             !route_leg.shape.own_sockets,
@@ -450,4 +459,136 @@ async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
             bridge.revoke().await;
         }
     }
+}
+
+fn filter_loader(dir: &Path) -> crate::torrents::sessions::Sessions {
+    crate::torrents::sessions::Sessions::new(
+        Arc::new(crate::torrents::sessions::tests::FakeRoutes::default()),
+        crate::torrents::sessions::tests::env(dir),
+        crate::Database::open_in_memory().unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_probe_dials_no_peer_blocked_by_the_routes_filter() {
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder()],
+        seeders: 1,
+        ..Answer::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let blocklist = dir.path().join("blocked.p2p");
+    let ip = fixture.seeder().ip();
+    std::fs::write(&blocklist, format!("peer:{ip}-{ip}\n")).unwrap();
+    let settings = TorrentConfig {
+        blocklist_enabled: true,
+        blocklist: Some(blocklist.display().to_string()),
+        filter_trackers: false,
+        ..quiet()
+    };
+    let path = P2pPath::open(P2pLeg {
+        ip_filter: filter_loader(dir.path()).ip_filter(&settings).await,
+        torrent: settings,
+        ..leg(source_address())
+    })
+    .await
+    .unwrap();
+    let plan = P2pPlan {
+        source: fixture.source.clone(),
+        upload_budget: None,
+    };
+    let torrent = TestTorrent::fetch(&path, &plan.source).await.unwrap();
+    let watched = Arc::new(Watched::new());
+    let store = PieceStore::new(vec![0]);
+    let joined = Joined::open(&torrent, &path, &store, &[], watched.clone())
+        .await
+        .unwrap();
+    let session = joined.session.clone();
+    let handle = joined.handle.clone();
+    // End this probe only once its own session has filtered the returned peer.
+    let stop = std::pin::pin!(async {
+        while session.stats_snapshot().counters.blocked_outgoing == 0
+            || announced(&handle.tracker_announces()).is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    });
+    let report = run_joined(&path, &plan, &torrent, store, watched.clone(), joined, stop).await;
+    assert!(report.passed(P2pStep::Announce), "{report:?}");
+    assert_eq!(watched.dials(), 0);
+    assert_eq!(
+        failed(&report, P2pStep::Handshake),
+        "the tracker returned no peer to dial"
+    );
+    assert_eq!(outcome(&report, P2pStep::Piece), &P2pOutcome::NotReached);
+    path.close().await;
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_probe_without_a_blocklist_dials_the_peer() {
+    let fixture = TorrentFixture::start(true).await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder()],
+        seeders: 1,
+        ..Answer::default()
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let settings = quiet();
+    let path = P2pPath::open(P2pLeg {
+        ip_filter: filter_loader(dir.path()).ip_filter(&settings).await,
+        torrent: settings,
+        ..leg(source_address())
+    })
+    .await
+    .unwrap();
+    let report = probe(
+        path,
+        &P2pPlan {
+            source: fixture.source.clone(),
+            upload_budget: None,
+        },
+        std::pin::pin!(std::future::pending::<()>()),
+    )
+    .await;
+    assert!(report.passed(P2pStep::Handshake), "{report:?}");
+    assert!(report.passed(P2pStep::Piece), "{report:?}");
+    fixture.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_probe_reports_a_blocklist_that_does_not_load() {
+    let fixture = TorrentFixture::start(true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = TorrentConfig {
+        blocklist_enabled: true,
+        blocklist: Some(dir.path().join("missing.p2p").display().to_string()),
+        ..quiet()
+    };
+    let path = P2pPath::open(P2pLeg {
+        ip_filter: filter_loader(dir.path()).ip_filter(&settings).await,
+        torrent: settings,
+        ..leg(source_address())
+    })
+    .await
+    .unwrap();
+    let report = probe(
+        path,
+        &P2pPlan {
+            source: fixture.source.clone(),
+            upload_budget: None,
+        },
+        std::pin::pin!(std::future::pending::<()>()),
+    )
+    .await;
+    assert!(
+        failed(&report, P2pStep::Announce).contains("the blocklist did not load"),
+        "{report:?}"
+    );
+    assert_eq!(
+        outcome(&report, P2pStep::Handshake),
+        &P2pOutcome::NotReached
+    );
+    fixture.stop().await;
 }

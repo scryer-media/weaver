@@ -2272,6 +2272,14 @@ impl TorrentService {
         self.inner.sessions.carries_dht(&plan).await
     }
 
+    /// The same loaded IP filter used when a route opens its session.
+    pub async fn ip_filter(
+        &self,
+        torrent: &TorrentConfig,
+    ) -> Result<weaver_torrent::IpFilter, String> {
+        self.inner.sessions.ip_filter(torrent).await
+    }
+
     pub async fn add(&self, request: AddRequest) -> Result<JobId, AddError> {
         if !self.inner.sessions.on() {
             return Err(AddError::Off);

@@ -68,7 +68,8 @@ pub(crate) struct FakeRoutes {
     pub(crate) opened: AtomicUsize,
     // The blocklist a fetch hands back, and the fetches made.
     pub(crate) blocklist: Mutex<Option<String>>,
-    pub(crate) fetched: AtomicUsize,
+    pub(crate) fetched: tokio::sync::watch::Sender<usize>,
+    pub(crate) blocklist_unanswered: tokio::sync::watch::Sender<bool>,
     // The network whose route gives each leg opened, when one is set: the
     // leg is its route's, and is revoked as the route changes.
     pub(crate) network: Mutex<Option<Arc<NetworkRuntime>>>,
@@ -183,7 +184,9 @@ impl Routes for FakeRoutes {
     }
 
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String> {
-        self.fetched.fetch_add(1, Ordering::SeqCst);
+        let mut unanswered = self.blocklist_unanswered.subscribe();
+        self.fetched.send_modify(|fetched| *fetched += 1);
+        let _ = unanswered.wait_for(|unanswered| !unanswered).await;
         let list = self
             .blocklist
             .lock()
@@ -1152,7 +1155,7 @@ async fn the_ip_filter_settings_reach_the_open_sessions() {
     });
     sessions.settled().await;
     assert!(Arc::ptr_eq(&session.ip_filter().blocked, &filter.blocked));
-    assert_eq!(routes.fetched.load(Ordering::SeqCst), 1);
+    assert_eq!(*routes.fetched.borrow(), 1);
 
     sessions.set_config(TorrentConfig::default());
     sessions.settled().await;
@@ -1241,7 +1244,7 @@ async fn every_route_shares_one_blocklist_load() {
     assert!(!Arc::ptr_eq(&a, &b));
     assert!(Arc::ptr_eq(&a.ip_filter().blocked, &b.ip_filter().blocked));
     assert!(a.ip_filter().blocked.has("10.0.0.1".parse().unwrap()));
-    assert_eq!(routes.fetched.load(Ordering::SeqCst), 1);
+    assert_eq!(*routes.fetched.borrow(), 1);
 
     sessions.drop_route(&first.key).await;
     sessions.set_config(TorrentConfig {
@@ -1252,7 +1255,7 @@ async fn every_route_shares_one_blocklist_load() {
         .session(&first, &IDENTITY.identity())
         .await
         .unwrap();
-    assert_eq!(routes.fetched.load(Ordering::SeqCst), 2);
+    assert_eq!(*routes.fetched.borrow(), 2);
     sessions.stop_all().await;
 }
 
