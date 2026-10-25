@@ -744,3 +744,20 @@ kind = "sql"
 file = "migrations/0065_file_coverage_checkpoint/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 66
+description = "durable NZB concurrency admission"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0066_nzb_admission/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0066_nzb_admission/postgres.sql"
+engine = "postgres"
+scope = "all"

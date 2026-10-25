@@ -128,6 +128,7 @@ fn config_roundtrip() {
         retry: None,
         max_download_speed: Some(1_000_000),
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {
             mode: crate::watch_folder::WatchFolderMode::Polling,

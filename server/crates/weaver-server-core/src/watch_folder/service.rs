@@ -403,6 +403,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             watch_folder,
             duplicate_policy: Default::default(),
             direct_store: None,

@@ -918,7 +918,11 @@ impl Pipeline {
             self.job_order.push(job_id);
         }
         if !reprocess {
-            self.raise_added_script_event(job_id);
+            if self.nzb_admitted.contains(&job_id) {
+                self.raise_added_script_event(job_id);
+            } else {
+                self.nzb_added_scripts_pending.insert(job_id);
+            }
         }
 
         crate::runtime::perf_probe::record(

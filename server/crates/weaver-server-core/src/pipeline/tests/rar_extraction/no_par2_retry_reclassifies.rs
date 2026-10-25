@@ -730,6 +730,7 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30077);
     let working_dir = intermediate_dir.join("rar-missing-tail");
+    pipeline.nzb_admitted.insert(job_id);
     let mut state = minimal_job_state(job_id, "RAR Missing Tail", working_dir);
     state.download_queue = DownloadQueue::new();
     state.recovery_queue = DownloadQueue::new();
@@ -2755,6 +2756,7 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30076);
     let working_dir = intermediate_dir.join("impossible-rar-state");
+    pipeline.nzb_admitted.insert(job_id);
     let mut state = minimal_job_state(job_id, "Impossible RAR State", working_dir);
     let topology = crate::jobs::assembly::ArchiveTopology {
         archive_type: crate::jobs::assembly::ArchiveType::Rar,

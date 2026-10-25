@@ -155,6 +155,7 @@ pub struct GeneralSettings {
     pub max_download_speed: u64,
     pub max_retries: u32,
     pub propagation_delay_secs: u32,
+    pub max_concurrent_nzbs: u32,
     pub enable_srrdb_lookup: bool,
     pub watch_folder: WatchFolderSettings,
     pub duplicate_policy: DuplicatePolicySettings,
@@ -168,6 +169,8 @@ pub struct GeneralSettingsInput {
     pub max_download_speed: Option<u64>,
     pub max_retries: Option<u32>,
     pub propagation_delay_secs: Option<u32>,
+    #[graphql(validator(minimum = 1, maximum = 2147483647))]
+    pub max_concurrent_nzbs: Option<u32>,
     pub enable_srrdb_lookup: Option<bool>,
     pub watch_folder: Option<WatchFolderSettingsInput>,
     pub duplicate_policy: Option<DuplicatePolicySettingsInput>,

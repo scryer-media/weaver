@@ -1470,6 +1470,17 @@ impl SchedulerHandle {
         Ok(())
     }
 
+    pub async fn set_max_concurrent_nzbs(
+        &self,
+        limit: std::num::NonZeroU32,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.max_concurrent_nzbs = Some(limit);
+            crate::pipeline::queue::Change::changed(())
+        });
+        Ok(())
+    }
+
     pub async fn set_propagation_delay(&self, seconds: u32) -> Result<(), SchedulerError> {
         self.state.queue.write_intent(|inner| {
             inner.globals.propagation_delay = Duration::from_secs(u64::from(seconds));

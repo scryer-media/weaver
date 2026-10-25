@@ -2651,6 +2651,7 @@ async fn postgres_runtime_smoke_when_configured() {
         max_download_speed: Some(12_345),
         cleanup_after_extract: Some(false),
         propagation_delay_secs: Some(0),
+        max_concurrent_nzbs: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,

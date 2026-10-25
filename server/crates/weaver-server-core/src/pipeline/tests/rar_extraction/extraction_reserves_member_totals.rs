@@ -2485,6 +2485,7 @@ async fn nested_single_stream_preserves_non_archive_sibling() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(100_710);
+    pipeline.nzb_admitted.insert(job_id);
     let staging_dir = temp_dir.path().join("nested-xz-with-sibling");
     tokio::fs::create_dir_all(&staging_dir).await.unwrap();
 

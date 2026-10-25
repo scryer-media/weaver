@@ -39,6 +39,9 @@ pub struct Config {
     // Minimum post age before downloading. Zero disables the hold.
     #[serde(default)]
     pub propagation_delay_secs: Option<u32>,
+    // NZBs admitted through terminal completion, across every Usenet provider.
+    #[serde(default)]
+    pub max_concurrent_nzbs: Option<std::num::NonZeroU32>,
     // Whether to delete intermediate files (NZB articles, PAR2, RAR volumes)
     // after successful extraction. Defaults to true.
     #[serde(default)]
@@ -117,6 +120,12 @@ impl Config {
             .as_ref()
             .and_then(|naming| naming.enable_srrdb_lookup)
             .unwrap_or(false)
+    }
+
+    // One default for new and upgraded installations.
+    pub fn max_concurrent_nzbs(&self) -> u32 {
+        self.max_concurrent_nzbs
+            .map_or(10, std::num::NonZeroU32::get)
     }
 
     // A saved setting takes precedence over the legacy environment override.
@@ -378,6 +387,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),
             direct_store: None,

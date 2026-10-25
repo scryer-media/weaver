@@ -91,6 +91,7 @@ pub struct Globals {
     pub speed_limit: u64,
     pub scheduled_speed_limit: Option<u64>,
     pub propagation_delay: std::time::Duration,
+    pub max_concurrent_nzbs: Option<std::num::NonZeroU32>,
     pub hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub hardware_profile_in_force: Option<crate::jobs::handle::HardwareProfileInForce>,
     pub scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,

@@ -57,7 +57,17 @@ impl Pipeline {
         let posted_at = self
             .jobs
             .get(&job_id)
-            .and_then(|state| Self::job_posted_at_epoch(&state.spec))?;
+            .and_then(|state| Self::job_posted_at_epoch(&state.spec))
+            .or_else(|| {
+                self.shared_state.queue.read(|inner| {
+                    let row = inner.jobs.iter().find(|row| row.id == job_id)?;
+                    row.admission
+                        .as_ref()
+                        .map(|job| &job.spec)
+                        .or_else(|| row.intents.restore.as_ref().map(|job| &job.spec))
+                        .and_then(Self::job_posted_at_epoch)
+                })
+            })?;
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())

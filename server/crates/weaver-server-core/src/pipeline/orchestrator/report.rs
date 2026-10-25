@@ -34,6 +34,14 @@ impl Pipeline {
                     return Change::unchanged(());
                 };
                 row.report.moving = moving;
+                if !self.nzb_admitted.contains(&job_id)
+                    && row.intents.paused == Some(false)
+                    && row.intents.cancelled.is_none()
+                {
+                    row.report.job.download_wait_reason =
+                        Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON.into());
+                    row.report.job.download_state = crate::DownloadState::Queued;
+                }
                 row.report.download_active = download_active;
                 row.report.download_work_pending = download_work_pending;
                 row.report.observed_byte_at_ms = row

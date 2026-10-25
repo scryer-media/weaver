@@ -153,6 +153,9 @@ impl SettingsMutation {
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
+        let max_concurrent_nzbs = input
+            .max_concurrent_nzbs
+            .and_then(std::num::NonZeroU32::new);
         let enable_srrdb_lookup = input.enable_srrdb_lookup;
         let duplicate_policy_update = input.duplicate_policy.clone();
         let watch_folder_update = input
@@ -182,6 +185,7 @@ impl SettingsMutation {
             duplicate_policy_update.clone(),
             enable_srrdb_lookup,
             propagation_delay_secs,
+            max_concurrent_nzbs,
         );
         let settings_persist = {
             let db = db.clone();
@@ -277,6 +281,9 @@ impl SettingsMutation {
                                 )?;
                             }
                         }
+                        if let Some(limit) = persist_input.9 {
+                            db.set_setting("max_concurrent_nzbs", &limit.to_string())?;
+                        }
                         if let Some(seconds) = persist_input.8 {
                             db.set_setting("propagation_delay_secs", &seconds.to_string())?;
                         }
@@ -318,6 +325,9 @@ impl SettingsMutation {
                 if let Some(speed) = max_download_speed {
                     cfg.max_download_speed = Some(speed);
                 }
+                if let Some(limit) = max_concurrent_nzbs {
+                    cfg.max_concurrent_nzbs = Some(limit);
+                }
                 if let Some(seconds) = propagation_delay_secs {
                     cfg.propagation_delay_secs = Some(seconds);
                 }
@@ -357,6 +367,7 @@ impl SettingsMutation {
                     cleanup_after_extract: cfg.cleanup_after_extract(),
                     max_download_speed: cfg.max_download_speed.unwrap_or(0),
                     propagation_delay_secs: cfg.propagation_delay_secs(),
+                    max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
                     max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                     enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
                     watch_folder: (&cfg.watch_folder).into(),
@@ -369,6 +380,9 @@ impl SettingsMutation {
 
         if let Some(seconds) = propagation_delay_secs {
             handle.set_propagation_delay(seconds).await?;
+        }
+        if let Some(limit) = max_concurrent_nzbs {
+            handle.set_max_concurrent_nzbs(limit).await?;
         }
         // Apply speed limit immediately.
         if let Some(speed) = max_download_speed {
@@ -680,6 +694,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,

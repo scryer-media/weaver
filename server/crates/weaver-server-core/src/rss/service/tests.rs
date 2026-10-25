@@ -736,6 +736,7 @@ fn build_service_with_security(
         retry: None,
         max_download_speed: None,
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),

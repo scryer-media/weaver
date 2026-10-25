@@ -16,6 +16,7 @@ mod extraction;
 mod health;
 mod infrastructure_retry;
 pub(crate) mod integrity;
+mod nzb_admission;
 mod orchestrator;
 mod progress;
 pub mod queue;
@@ -2600,6 +2601,11 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     // Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    pub(crate) nzb_admitted: HashSet<JobId>,
+    pub(crate) nzb_seen: HashSet<JobId>,
+    pub(crate) nzb_pause_releases: HashSet<JobId>,
+    pub(crate) nzb_added_scripts_pending: HashSet<JobId>,
+    pub(crate) nzb_reprocess_pending: HashSet<JobId>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

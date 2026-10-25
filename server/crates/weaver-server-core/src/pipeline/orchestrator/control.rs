@@ -8,12 +8,36 @@ impl Pipeline {
     pub(crate) async fn apply_queue_intents(&mut self) {
         self.answer_diagnostics_request();
         self.apply_queue_globals().await;
+        self.reconcile_nzb_admission().await;
         let restores = self.shared_state.queue.write(|inner| {
             Change::unchanged(
                 inner
                     .jobs
                     .iter_mut()
-                    .filter_map(|row| row.intents.restore.take())
+                    .filter(|row| {
+                        self.nzb_admitted.contains(&row.id)
+                            || row.intents.paused == Some(true)
+                            || row.intents.cancelled.is_some()
+                            || row
+                                .intents
+                                .restore
+                                .as_ref()
+                                .is_some_and(|request| request.status == JobStatus::Paused)
+                    })
+                    .filter_map(|row| {
+                        row.intents.restore.take().map(|mut request| {
+                            if !self.nzb_admitted.contains(&row.id) {
+                                if request.status != JobStatus::Paused {
+                                    request.paused_resume_status = Some(request.status.clone());
+                                    request.paused_resume_download_state = request.download_state;
+                                    request.paused_resume_post_state = request.post_state;
+                                }
+                                request.status = JobStatus::Paused;
+                                request.run_state = Some(crate::RunState::Paused);
+                            }
+                            request
+                        })
+                    })
                     .collect::<Vec<_>>(),
             )
         });
@@ -35,7 +59,23 @@ impl Pipeline {
                 inner
                     .jobs
                     .iter_mut()
-                    .filter_map(|row| row.admission.take().map(|job| (row.id, job)))
+                    .filter(|row| {
+                        self.nzb_admitted.contains(&row.id)
+                            || row.intents.paused == Some(true)
+                            || row.intents.cancelled.is_some()
+                            || row
+                                .admission
+                                .as_ref()
+                                .is_some_and(|job| job.options.initially_paused)
+                    })
+                    .filter_map(|row| {
+                        row.admission.take().map(|mut job| {
+                            if !self.nzb_admitted.contains(&row.id) {
+                                job.options.initially_paused = true;
+                            }
+                            (row.id, job)
+                        })
+                    })
                     .collect::<Vec<_>>(),
             )
         });
@@ -45,9 +85,12 @@ impl Pipeline {
                 .as_ref()
                 .is_some_and(|restart| restart.reprocess);
             self.install_prepared_add(id, job);
-            if reprocess {
+            self.nzb_reprocess_pending.remove(&id);
+            if reprocess && self.nzb_admitted.contains(&id) {
                 self.reload_metadata_from_disk(id).await;
                 self.check_job_completion(id).await;
+            } else if reprocess {
+                self.nzb_reprocess_pending.insert(id);
             }
         }
         let (order, pending) = self.shared_state.queue.read(|inner| {
@@ -73,12 +116,14 @@ impl Pipeline {
             .collect();
         if installed_order != self.job_order {
             self.job_order = installed_order;
-            let positions: Vec<_> = self
-                .job_order
-                .iter()
-                .enumerate()
-                .map(|(index, id)| (*id, index as i64))
-                .collect();
+            let positions: Vec<_> = self.shared_state.queue.read(|inner| {
+                inner
+                    .jobs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| (row.id, index as i64))
+                    .collect()
+            });
             if let Err(error) = self
                 .db
                 .try_queue_write("update_active_job_queue_positions", move |db| {
@@ -124,6 +169,18 @@ impl Pipeline {
             // intent the pipeline did not act on.
             let mut refused = false;
             if let Some(paused) = intents.paused.filter(|_| apply_pause) {
+                if !paused && !self.nzb_admitted.contains(&job_id) {
+                    self.report_job(job_id);
+                    continue;
+                }
+                if paused
+                    && let Err(error) = self
+                        .db_blocking(move |db| db.set_nzb_pause_release(job_id, true))
+                        .await
+                {
+                    error!(job_id = job_id.0, %error, "failed to persist NZB pause release");
+                    continue;
+                }
                 if paused {
                     self.demand_direct_store_barriers_for_pause(Some(job_id))
                         .await;
@@ -137,7 +194,29 @@ impl Pipeline {
                     Ok(()) => {
                         self.report_job(job_id);
                         if paused {
+                            self.nzb_pause_releases.insert(job_id);
                             self.emit_download_finished_if_active(job_id);
+                        } else {
+                            // Keep the interrupted-pause marker until the resumed
+                            // lifecycle has committed. A crash in between restores
+                            // a paused job instead of leaking an occupied slot.
+                            let result = match self.db.flush_write_queue().await {
+                                Ok(()) => {
+                                    self.db_blocking(move |db| {
+                                        db.set_nzb_pause_release(job_id, false)
+                                    })
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match result {
+                                Ok(()) => {
+                                    self.nzb_pause_releases.remove(&job_id);
+                                }
+                                Err(error) => {
+                                    error!(job_id = job_id.0, %error, "failed to settle NZB resume")
+                                }
+                            }
                         }
                         self.emit_job_event(if paused {
                             PipelineEvent::JobPaused { job_id }
@@ -147,6 +226,29 @@ impl Pipeline {
                     }
                     Err(error) => {
                         warn!(job_id = job_id.0, paused, %error, "pipeline refused the job's pause intent");
+                        if paused
+                            && let Err(error) = self
+                                .db_blocking(move |db| db.set_nzb_pause_release(job_id, false))
+                                .await
+                        {
+                            error!(job_id = job_id.0, %error, "failed to withdraw NZB pause release");
+                        }
+                        if !paused
+                            && self.jobs.get(&job_id).is_some_and(|state| {
+                                state.run_state == crate::jobs::model::RunState::Paused
+                            })
+                        {
+                            // A refused resume must return its newly acquired
+                            // slot once any recovery work has quiesced.
+                            if let Err(error) = self
+                                .db_blocking(move |db| db.set_nzb_pause_release(job_id, true))
+                                .await
+                            {
+                                error!(job_id = job_id.0, %error, "failed to persist refused NZB resume");
+                                continue;
+                            }
+                            self.nzb_pause_releases.insert(job_id);
+                        }
                         refused = true;
                     }
                 }
@@ -178,6 +280,24 @@ impl Pipeline {
             });
             self.report_job(job_id);
         }
+        let reprocess: Vec<_> = self
+            .nzb_reprocess_pending
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.nzb_admitted.contains(id)
+                    && self.jobs.get(id).is_some_and(|state| {
+                        state.run_state == crate::jobs::model::RunState::Active
+                    })
+            })
+            .collect();
+        for id in reprocess {
+            self.nzb_reprocess_pending.remove(&id);
+            self.reload_metadata_from_disk(id).await;
+            self.check_job_completion(id).await;
+        }
+        self.nzb_reprocess_pending
+            .retain(|id| self.jobs.contains_key(id));
         let renames = self.shared_state.queue.read(|inner| {
             inner
                 .jobs
