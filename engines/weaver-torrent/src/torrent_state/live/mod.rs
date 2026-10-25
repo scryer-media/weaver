@@ -605,6 +605,7 @@ impl TorrentStateLive {
             cancel_token: self.cancellation_token.child_token(),
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
+        let handler = PeerLifetime(Some(handler));
         let _token_guard = handler.cancel_token.clone().drop_guard();
         handler
             .counters
@@ -622,7 +623,7 @@ impl TorrentStateLive {
         );
         let res = tokio::select! {
             r = handler.task_peer_chunk_requester() => r,
-            r = connection.run(&handler, rx) => r,
+            r = connection.run(&*handler, rx) => r,
         };
         match res {
             Ok(()) => handler.on_peer_died(None)?,
@@ -735,6 +736,22 @@ impl TorrentStateLive {
         let held = self.hold_place_in(&mut places, checked_peer.addr, &tx, permit, slot);
         drop(places);
 
+        // Incoming peers are live before their task is polled, so its
+        // lifetime must already be owned when the task is scheduled.
+        let handler = PeerLifetime(Some(PeerHandler {
+            addr: checked_peer.addr,
+            incoming: true,
+            on_bitfield_notify: Default::default(),
+            speaks_v2: AtomicBool::new(false),
+            sent_dht_port: AtomicBool::new(false),
+            flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
+            state: self.clone(),
+            tx,
+            counters,
+            first_message_received: AtomicBool::new(false),
+            cancel_token: self.cancellation_token.child_token(),
+            client_name_and_version: self.shared.client_name_and_version().to_owned(),
+        }));
         self.spawn(
             debug_span!(
                 parent: self.shared.span.clone(),
@@ -747,7 +764,7 @@ impl TorrentStateLive {
             ),
             aframe!(
                 self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, held)
+                    .task_manage_incoming_peer(checked_peer, handler, rx, held)
             ),
         );
         Ok(AddIncomingPeerResult::Added)
@@ -780,32 +797,17 @@ impl TorrentStateLive {
     async fn task_manage_incoming_peer(
         self: Arc<Self>,
         checked_peer: CheckedIncomingConnection,
-        counters: Arc<AtomicPeerCounters>,
-        tx: PeerTx,
+        handler: PeerLifetime,
         rx: PeerRx,
         _held: Held,
     ) -> crate::Result<()> {
-        let handler = PeerHandler {
-            addr: checked_peer.addr,
-            incoming: true,
-            on_bitfield_notify: Default::default(),
-            speaks_v2: AtomicBool::new(false),
-            sent_dht_port: AtomicBool::new(false),
-            flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
-            state: self.clone(),
-            tx,
-            counters,
-            first_message_received: AtomicBool::new(false),
-            cancel_token: self.cancellation_token.child_token(),
-            client_name_and_version: self.shared.client_name_and_version().to_owned(),
-        };
         let _token_guard = handler.cancel_token.clone().drop_guard();
         let options = self.shared.options.peer_opts;
         let peer_connection = PeerConnection::new(
             checked_peer.addr,
             self.shared.info_hashes,
             self.shared.peer_id,
-            &handler,
+            &*handler,
             Some(options),
             self.shared.spawner.clone(),
             self.shared.connector.clone(),
@@ -865,6 +867,7 @@ impl TorrentStateLive {
             cancel_token: state.cancellation_token.child_token(),
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
+        let handler = PeerLifetime(Some(handler));
         let _token_guard = handler.cancel_token.clone().drop_guard();
 
         let options = PeerConnectionOptions {
@@ -875,7 +878,7 @@ impl TorrentStateLive {
             addr,
             state.shared.info_hashes,
             state.shared.peer_id,
-            &handler,
+            &*handler,
             Some(options),
             state.shared.spawner.clone(),
             state.shared.connector.clone(),
@@ -1972,6 +1975,37 @@ struct PeerHandler {
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
+}
+
+// A connection leaves the live set even when cancellation drops its task
+// before it can report a result. Both exits use the same transition.
+struct PeerLifetime(Option<PeerHandler>);
+
+impl std::ops::Deref for PeerLifetime {
+    type Target = PeerHandler;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("the connection still owns its handler")
+    }
+}
+
+impl PeerLifetime {
+    fn on_peer_died(mut self, error: Option<crate::Error>) -> crate::Result<()> {
+        self.0
+            .take()
+            .expect("the connection owns its handler")
+            .on_peer_died(error)
+    }
+}
+
+impl Drop for PeerLifetime {
+    fn drop(&mut self) {
+        if let Some(handler) = self.0.take() {
+            let _ = handler.on_peer_died(None);
+        }
+    }
 }
 
 /// The files with bytes in piece `piece`, by index. Files are in torrent
