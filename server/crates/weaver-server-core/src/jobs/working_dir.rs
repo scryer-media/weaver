@@ -22,10 +22,60 @@ pub fn compute_working_dir(intermediate_dir: &Path, job_id: JobId, name: &str) -
     if !candidate.exists() {
         candidate
     } else {
-        intermediate_dir.join(weaver_model::files::path_component_with_suffix(
-            &dir_name,
-            &format!(".#{}", job_id.0),
-        ))
+        suffixed_working_dir(intermediate_dir, &dir_name, job_id)
+    }
+}
+
+// The job-specific name a job falls back to when its plain name is taken.
+fn suffixed_working_dir(intermediate_dir: &Path, dir_name: &str, job_id: JobId) -> PathBuf {
+    intermediate_dir.join(weaver_model::files::path_component_with_suffix(
+        dir_name,
+        &format!(".#{}", job_id.0),
+    ))
+}
+
+// A working directory claimed for a job at admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedWorkingDir {
+    pub path: PathBuf,
+    // The directory was already on disk under the job's own suffixed name,
+    // left by an earlier admission of this same job.
+    pub existed: bool,
+}
+
+// Claims a job's working directory with the file system as the arbiter: the
+// plain name is created, not checked, so two admissions sanitizing to one
+// name cannot both take it. The one that finds the plain name taken takes
+// its job-suffixed name instead.
+pub fn claim_working_dir(
+    intermediate_dir: &Path,
+    job_id: JobId,
+    name: &str,
+) -> std::io::Result<ClaimedWorkingDir> {
+    std::fs::create_dir_all(intermediate_dir)?;
+    let dir_name = sanitize_dirname(name);
+    let candidate = intermediate_dir.join(&dir_name);
+    match std::fs::create_dir(&candidate) {
+        Ok(()) => {
+            return Ok(ClaimedWorkingDir {
+                path: candidate,
+                existed: false,
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let suffixed = suffixed_working_dir(intermediate_dir, &dir_name, job_id);
+    match std::fs::create_dir(&suffixed) {
+        Ok(()) => Ok(ClaimedWorkingDir {
+            path: suffixed,
+            existed: false,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(ClaimedWorkingDir {
+            path: suffixed,
+            existed: true,
+        }),
+        Err(error) => Err(error),
     }
 }
 
@@ -76,6 +126,98 @@ fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
 
 const MARKER_V1_PREFIX: &str = "weaver-job-v1:";
 const MARKER_V2_PREFIX: &str = "weaver-job-v2:";
+
+fn rename_journal_key(id: JobId) -> String {
+    format!("working_dir_rename:{}", id.0)
+}
+
+pub(crate) fn rename_job_working_dir(
+    db: &crate::Database,
+    root: &Path,
+    old: &Path,
+    new: &Path,
+    id: JobId,
+) -> Result<PathBuf, crate::SchedulerError> {
+    // The handle on the source closes before the move: a directory with an
+    // open handle cannot be renamed on Windows.
+    {
+        let dir = owned_working_directory(root, old)?;
+        if marker_job_id(&read_working_marker(&dir)?) != Some(id) || new.parent() != Some(root) {
+            return Err(
+                std::io::Error::other("rename directory belongs to another job or root").into(),
+            );
+        }
+    }
+    let journal = serde_json::to_string(&(old, new))
+        .map_err(|error| crate::SchedulerError::Internal(error.to_string()))?;
+    db.set_setting(&rename_journal_key(id), &journal)?;
+    recover_working_dir_rename(db, root, old, id)
+}
+
+// The journal precedes the atomic move. Either name can survive a process
+// interruption; the marker binds the same inode and job under both names.
+pub(crate) fn recover_working_dir_rename(
+    db: &crate::Database,
+    root: &Path,
+    current: &Path,
+    id: JobId,
+) -> Result<PathBuf, crate::SchedulerError> {
+    let key = rename_journal_key(id);
+    let Some(journal) = db.get_setting(&key)? else {
+        return Ok(current.to_path_buf());
+    };
+    let (old, new): (PathBuf, PathBuf) = serde_json::from_str(&journal)
+        .map_err(|error| crate::SchedulerError::Internal(error.to_string()))?;
+    if old.parent() != Some(root)
+        || new.parent() != Some(root)
+        || (current != old && current != new)
+    {
+        return Err(std::io::Error::other(
+            "rename journal does not belong to this working directory",
+        )
+        .into());
+    }
+    if old != new && old.try_exists()? {
+        // The handle on the source closes before the move, as above.
+        {
+            let dir = owned_working_directory(root, &old)?;
+            if marker_job_id(&read_working_marker(&dir)?) != Some(id) {
+                return Err(std::io::Error::other("rename source belongs to another job").into());
+            }
+        }
+        if let Err(error) = crate::runtime::fs::rename_path_exclusive(&old, &new) {
+            db.delete_setting(&key)?;
+            return Err(error.into());
+        }
+    }
+    let dir = open_working_directory(root, &new)?;
+    let stored = read_working_marker(&dir)?;
+    if marker_job_id(&stored) != Some(id)
+        || (matches!(
+            match_marker(&dir, &old, &stored, id)?,
+            MarkerMatch::Mismatch
+        ) && matches!(
+            match_marker(&dir, &new, &stored, id)?,
+            MarkerMatch::Mismatch
+        ))
+    {
+        return Err(
+            std::io::Error::other("rename destination has a foreign ownership marker").into(),
+        );
+    }
+    // Once the move succeeds the runtime must use its new path, even if a
+    // later persistence write fails. Keep the journal until every step commits.
+    let finish = || -> Result<(), crate::SchedulerError> {
+        upgrade_legacy_marker(&dir, &new, id)?;
+        db.update_active_job_output_dir(id, &new)?;
+        db.delete_setting(&key)?;
+        Ok(())
+    };
+    if let Err(error) = finish() {
+        tracing::error!(job_id = id.0, %error, "working directory moved; retaining rename journal for recovery");
+    }
+    Ok(new)
+}
 
 // The marker's identity hash.
 //
@@ -649,6 +791,47 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_takes_the_plain_name_once_and_the_jobs_own_name_after() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = claim_working_dir(temp.path(), JobId(1), "same name").unwrap();
+        let second = claim_working_dir(temp.path(), JobId(2), "same name").unwrap();
+        let again = claim_working_dir(temp.path(), JobId(2), "same name").unwrap();
+
+        assert_eq!(first.path, temp.path().join("same name"));
+        assert!(!first.existed);
+        assert_eq!(second.path, temp.path().join("same name.#2"));
+        assert!(!second.existed);
+        assert_eq!(again.path, second.path);
+        assert!(again.existed);
+        mark_weaver_owned_working_dir(temp.path(), &first.path, JobId(1)).unwrap();
+        mark_weaver_owned_working_dir(temp.path(), &second.path, JobId(2)).unwrap();
+    }
+
+    #[test]
+    fn concurrent_claims_of_one_name_never_share_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let claims = [JobId(7), JobId(8)].map(|job_id| {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let claimed = claim_working_dir(&root, job_id, "same name").unwrap();
+                mark_weaver_owned_working_dir(&root, &claimed.path, job_id).unwrap();
+                claimed
+            })
+        });
+        let [first, second] = claims.map(|claim| claim.join().unwrap());
+
+        assert_ne!(first.path, second.path);
+        assert!(!first.existed);
+        assert!(!second.existed);
+        assert!(is_weaver_owned_working_dir(&first.path));
+        assert!(is_weaver_owned_working_dir(&second.path));
+    }
+
+    #[test]
     fn output_ownership_marker_is_bound_to_its_directory() {
         let temp = tempfile::tempdir().unwrap();
         let owned = temp.path().join("owned");
@@ -664,5 +847,40 @@ mod tests {
         )
         .unwrap();
         assert!(!is_weaver_owned_output_dir(&copied));
+    }
+
+    #[test]
+    fn rename_journal_recovers_before_and_after_the_directory_move() {
+        for moved in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let old = root.join("original");
+            let new = root.join("renamed");
+            let id = JobId(9010);
+            let db = crate::Database::open_in_memory().unwrap();
+            std::fs::create_dir(&old).unwrap();
+            mark_weaver_owned_working_dir(root, &old, id).unwrap();
+            std::fs::write(old.join("payload"), b"kept").unwrap();
+            db.set_setting(
+                &rename_journal_key(id),
+                &serde_json::to_string(&(&old, &new)).unwrap(),
+            )
+            .unwrap();
+            if moved {
+                crate::runtime::fs::rename_path_exclusive(&old, &new).unwrap();
+            }
+            assert_eq!(
+                recover_working_dir_rename(&db, root, &old, id).unwrap(),
+                new
+            );
+            assert!(!old.exists());
+            assert_eq!(std::fs::read(new.join("payload")).unwrap(), b"kept");
+            assert!(is_weaver_owned_working_dir(&new));
+            assert!(db.get_setting(&rename_journal_key(id)).unwrap().is_none());
+            assert_eq!(
+                recover_working_dir_rename(&db, root, &new, id).unwrap(),
+                new
+            );
+        }
     }
 }

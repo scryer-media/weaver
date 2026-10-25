@@ -14,6 +14,8 @@ struct State {
     quarantine: bool,
     deadline: Option<Instant>,
     probe: Option<u64>,
+    // The quarantine is the server refusing this pool's credentials.
+    credentials: bool,
 }
 
 #[derive(Debug)]
@@ -78,6 +80,26 @@ impl RecoveryGate {
         duration: Duration,
         event: Option<(u64, u64)>,
     ) -> Option<Instant> {
+        self.quarantine_as(duration, event, false)
+    }
+
+    // A quarantine for a server that refused this pool's credentials. The
+    // refusal is an answer for its whole length, not a wait: see
+    // [`Self::refuses_credentials`].
+    pub(crate) fn quarantine_for_credentials(
+        &self,
+        duration: Duration,
+        event: Option<(u64, u64)>,
+    ) -> Option<Instant> {
+        self.quarantine_as(duration, event, true)
+    }
+
+    fn quarantine_as(
+        &self,
+        duration: Duration,
+        event: Option<(u64, u64)>,
+        credentials: bool,
+    ) -> Option<Instant> {
         let mut state = self.state.lock().expect("recovery gate poisoned");
         if event.is_some_and(|(epoch, id)| {
             epoch != state.epoch
@@ -91,6 +113,7 @@ impl RecoveryGate {
             .checked_add(1)
             .expect("recovery epoch exhausted");
         state.quarantine = true;
+        state.credentials = credentials;
         let until = Instant::now() + duration;
         state.deadline = Some(until);
         state.probe = None;
@@ -104,6 +127,21 @@ impl RecoveryGate {
         self.quarantined.store(true, Ordering::Release);
         self.publish();
         Some(until)
+    }
+
+    // Whether the server refused this pool's credentials and its quarantine
+    // still runs. Until the deadline nothing it could be asked would get a
+    // different answer, so the work it would serve is not waiting for it.
+    // Past the deadline the one probe is due and this answers no again: a
+    // probe out on a refusing server is a wait like any other.
+    pub(crate) fn refuses_credentials(&self) -> bool {
+        if !self.quarantined() {
+            return false;
+        }
+        let state = self.state.lock().expect("recovery gate poisoned");
+        state.quarantine
+            && state.credentials
+            && state.deadline.is_some_and(|at| at > Instant::now())
     }
 
     pub(crate) fn admit(self: &Arc<Self>, demanded: bool) -> Option<ConnectionHealthLease> {
@@ -157,6 +195,7 @@ impl ConnectionHealth {
             return false;
         }
         state.quarantine = false;
+        state.credentials = false;
         state.deadline = None;
         state.probe = None;
         self.probe.store(false, Ordering::Release);

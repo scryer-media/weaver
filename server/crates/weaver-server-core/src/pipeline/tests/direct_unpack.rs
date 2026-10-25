@@ -19,6 +19,44 @@ use crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime;
 mod repair_guards;
 mod staging;
 
+// Posts a part as two articles, the first `first_bytes` long, so a test can
+// hold a part's leading bytes committed without completing it.
+fn split_first_article(spec: &mut JobSpec, file_index: usize, first_bytes: u32) {
+    let file = &mut spec.files[file_index];
+    let total = file
+        .segments
+        .iter()
+        .map(|segment| segment.bytes)
+        .sum::<u32>();
+    let message_id = file.segments[0].message_id.clone();
+    file.segments = vec![
+        segment_spec! {
+            number: 0,
+            bytes: first_bytes,
+            message_id: message_id.clone(),
+        },
+        segment_spec! {
+            number: 1,
+            bytes: total - first_bytes,
+            message_id: format!("tail-{message_id}"),
+        },
+    ];
+}
+
+// Commits a part's first article the way the decode worker does: its
+// placement, then the commit. That article is the part's committed prefix.
+fn commit_first_article(pipeline: &mut Pipeline, file_id: NzbFileId, len: u32) {
+    let file = pipeline
+        .jobs
+        .get_mut(&file_id.job_id)
+        .unwrap()
+        .assembly
+        .file_mut(file_id)
+        .unwrap();
+    file.record_placement(0, 0, len);
+    file.commit_segment(0, len).unwrap();
+}
+
 // Turn the feature on for one pipeline, the way config would.
 fn enable_direct_unpack(pipeline: &mut Pipeline) {
     pipeline.direct_unpack = DirectUnpackRuntime::with_settings(DirectUnpackSettings {
@@ -402,14 +440,15 @@ async fn an_out_of_order_tail_does_not_inflate_the_seeded_watermark() {
     let set_name = "generated_split_store_plain.7z";
 
     let files = sevenz_fixture_bytes(set_name);
-    let spec = rar_job_spec("Silver Horizon Split", &files);
+    let mut spec = rar_job_spec("Silver Horizon Split", &files);
+    let floor = 8_192u64;
+    split_first_article(&mut spec, 1, floor as u32);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
 
     // Part two, arranged BEFORE the set arms: a contiguous prefix, then an
     // out-of-order tail at its true offset, leaving a hole between them. The
     // file is now longer than the verified prefix.
-    let floor = 8_192u64;
     let hole_end = 40_960u64;
     let part_two = working_dir.join(&files[1].0);
     {
@@ -425,14 +464,15 @@ async fn an_out_of_order_tail_does_not_inflate_the_seeded_watermark() {
         part_two_len > floor,
         "the fixture must leave a hole: len {part_two_len} vs floor {floor}"
     );
-    // Only the contiguous prefix is recorded as the floor, which is what the
-    // real drain records.
-    pipeline.pending_file_progress.insert(
+    // Only the contiguous prefix is committed, which is what the real drain
+    // commits.
+    commit_first_article(
+        &mut pipeline,
         NzbFileId {
             job_id,
             file_index: 1,
         },
-        floor,
+        floor as u32,
     );
 
     // Part one lands whole, which is what arms the set.
@@ -2377,6 +2417,7 @@ async fn a_late_par2_registration_leaves_the_chase_able_to_resolve_its_parts() {
 fn queue_download_work(pipeline: &mut Pipeline, job_id: JobId, message_id: &str) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.download_queue.push(DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id,

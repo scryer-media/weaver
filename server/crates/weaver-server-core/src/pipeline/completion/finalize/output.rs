@@ -1037,6 +1037,32 @@ impl Pipeline {
         // file, and refuses the delivery outright when a file was never
         // delivered and nothing accounts for it.
         self.reconcile_terminal_delivery(job_id)?;
+        // Serialize the final-move gate with pause and cancellation acceptance.
+        // An intent recorded before this boundary must hold the move.
+        self.report_job(job_id);
+        let (move_allowed, paused) = self.shared_state.queue.write(|inner| {
+            let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) else {
+                return crate::pipeline::queue::Change::unchanged((false, false));
+            };
+            if row.intents.cancelled.is_some() {
+                return crate::pipeline::queue::Change::unchanged((false, false));
+            }
+            if row.intents.paused == Some(true) {
+                return crate::pipeline::queue::Change::unchanged((false, true));
+            }
+            row.report.moving = true;
+            crate::pipeline::queue::Change::changed((true, false))
+        });
+        if !move_allowed {
+            if paused {
+                self.deferred_moves.insert(job_id);
+            }
+            return Ok(());
+        }
+        // Updates accepted while the preceding stage awaited I/O belong to
+        // this delivery. Read them after claiming the move boundary and before
+        // copying its category, name and naming metadata.
+        self.apply_pending_job_update(job_id);
 
         // Terminal transition: the job is leaving the verification question
         // behind. With no recovery set there was never a verdict to be had, so
@@ -1106,10 +1132,8 @@ impl Pipeline {
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);
 
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::MoveToCompleteStarted { job_id });
-        self.publish_snapshot();
+        self.emit_job_event(PipelineEvent::MoveToCompleteStarted { job_id });
+        self.report_job(job_id);
 
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
         let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
@@ -1194,9 +1218,7 @@ impl Pipeline {
                 state.working_dir = dest.clone();
                 state.staging_dir = None;
 
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::MoveToCompleteFinished { job_id });
+                self.emit_job_event(PipelineEvent::MoveToCompleteFinished { job_id });
                 debug!(
                     job_id = job_id.0,
                     moved = outcome.moved_entries,
@@ -1482,7 +1504,7 @@ impl Pipeline {
         // directory the move already emptied. A failed job is recorded too:
         // the outcome written above tells its restored scripts it failed.
         self.persist_active_runtime_at(job_id, delivered_dir);
-        self.publish_snapshot();
+        self.report_job(job_id);
         let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
         self.terminal_post_processing_cancellations
             .insert(job_id, cancellation_tx);
@@ -1737,7 +1759,7 @@ impl Pipeline {
             JobStatus::PostProcessing,
             Some("running post-processing scripts"),
         );
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     pub(crate) fn handle_terminal_post_processing_done(
@@ -1834,7 +1856,7 @@ impl Pipeline {
         self.transition_completed_runtime(job_id);
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
-            let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+            self.emit_job_event(PipelineEvent::DownloadFinished {
                 job_id,
                 finalization_pending: false,
             });
@@ -1848,7 +1870,7 @@ impl Pipeline {
             "job completed after terminal post-processing"
         );
         self.record_job_history(job_id, Some(PipelineEvent::JobCompleted { job_id }));
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     pub(in crate::pipeline) fn resolve_job_input_path(

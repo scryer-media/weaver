@@ -36,6 +36,7 @@ type SpeedTestRun = {
   tested: { legs: Array<{ position: number; down: boolean }>; overrides: { downRungs: Array<{ leg: number; rung: number }> } };
   result: {
     bytes: number; averageBps: number; peakBps: number;
+    samples: Array<{ atMs: number; leg: number; bytes: number }>;
     connections: Array<{ leg: number; path: DialPath; bytes: number; error: string | null }>;
     usenet: { articlesRequested: number; delivered: number; missing: number; failed: number; declaredBytes: number; decodedBytes: number } | null;
     bandwidth: { providerId: string | null; url: string; connections: number } | null;
@@ -44,10 +45,27 @@ type SpeedTestRun = {
 
 const RUN_FIELDS = `id consumer consumerName kind status phase failure { code message }
   tested { legs { position down } overrides { downRungs { leg rung } } }
-  result { bytes averageBps peakBps
+  result { bytes averageBps peakBps samples { atMs leg bytes }
     connections { leg bytes error path { egressId rung poolId memberId proxyIds } }
     usenet { articlesRequested delivered missing failed declaredBytes decodedBytes }
     bandwidth { providerId url connections } }`;
+
+// The sampler closes one bin per leg each second, the first and the final
+// partial one included, and each sample's atMs is where its bin ends. A bin's
+// width is read in whole milliseconds, so its true width is at most one
+// millisecond more and the rate computed with that width is a floor under the
+// rate the server saw. The run's peak must reach the first and the last bin.
+function expectPeakCoversFirstAndLastBins(result: NonNullable<SpeedTestRun["result"]>, describe: string) {
+  const bins = new Map<number, number>();
+  for (const sample of result.samples) bins.set(sample.atMs, (bins.get(sample.atMs) ?? 0) + sample.bytes);
+  const ends = [...bins.keys()].sort((a, b) => a - b);
+  expect(ends.length, `${describe} closed at least one sample bin`).toBeGreaterThan(0);
+  expect.soft([...bins.values()].reduce((sum, bytes) => sum + bytes, 0), `${describe} bins carry every byte`).toBe(result.bytes);
+  const floorRate = (index: number) => bins.get(ends[index])! / ((ends[index] - (index === 0 ? 0 : ends[index - 1]) + 1) / 1000);
+  expect(result.peakBps, `${describe} peak reaches the first bin`).toBeGreaterThanOrEqual(floorRate(0));
+  expect(result.peakBps, `${describe} peak reaches the last bin`).toBeGreaterThanOrEqual(floorRate(ends.length - 1));
+  expect(result.peakBps, `${describe} peak is no less than the average`).toBeGreaterThanOrEqual(result.averageBps);
+}
 
 async function speedTestRun(request: APIRequestContext, id: number): Promise<SpeedTestRun> {
   const run = (await graphql<{ speedTestRun: SpeedTestRun | null }>(request,
@@ -264,6 +282,7 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   expect(result1.bytes).toBeGreaterThan(0);
   expect(result1.usenet).toMatchObject({ articlesRequested: parts, delivered: parts, missing: 0, failed: 0 });
   expect(result1.usenet!.decodedBytes).toBeGreaterThan(0);
+  expectPeakCoversFirstAndLastBins(result1, "run 1");
   expect(result1.connections.length).toBeGreaterThan(0);
   for (const connection of result1.connections) {
     expect(connection.path, "every run-1 connection dials the proxy rung").toMatchObject({ egressId: a.id, rung: 0, proxyIds: [connect1.id] });

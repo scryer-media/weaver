@@ -611,7 +611,7 @@ async fn nzbget_append_accepts_arr_v16_base64_payload_and_preserves_drone() {
     use base64::Engine as _;
 
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db,
         handle.clone(),
@@ -675,7 +675,7 @@ async fn nzbget_append_takes_a_script_switch_as_a_plain_parameter_and_still_runs
             )
         })
         .unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db.clone(),
         handle.clone(),
@@ -741,7 +741,7 @@ async fn nzbget_append_takes_a_script_switch_as_a_plain_parameter_and_still_runs
 async fn nzbget_append_accepts_base64_payload_with_embedded_whitespace() {
     use base64::Engine as _;
 
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -858,7 +858,7 @@ fn category_of(entries: &serde_json::Value, id: u64) -> String {
 
 #[tokio::test]
 async fn nzbget_append_echoes_submitted_category_while_routing_by_the_configured_one() {
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -904,7 +904,7 @@ async fn nzbget_append_echoes_submitted_category_while_routing_by_the_configured
 #[tokio::test]
 async fn nzbget_category_echo_survives_into_history_and_follows_group_set_category() {
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let handle = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
     let app = nzbget_test_router(
         db,
         handle.clone(),
@@ -934,6 +934,7 @@ async fn nzbget_category_echo_survives_into_history_and_follows_group_set_catego
     let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
     assert_eq!(category_of(&groups, recategorised), "sonarr");
 
+    let mut events = handle.subscribe_events();
     // The history row carries the label the job was submitted with.
     assert_eq!(
         rpc_result(
@@ -944,13 +945,14 @@ async fn nzbget_category_echo_survives_into_history_and_follows_group_set_catego
         .await,
         true
     );
+    wait_for_cancelled(&mut events, JobId(archived)).await;
     let history = rpc_result(app.clone(), "history", serde_json::json!([])).await;
     assert_eq!(category_of(&history, archived), "tv");
 }
 
 #[tokio::test]
 async fn nzbget_category_label_yields_once_the_job_is_recategorised_elsewhere() {
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -980,7 +982,7 @@ async fn nzbget_append_rejects_unsafe_category_before_queuing() {
     use base64::Engine as _;
 
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db,
         handle.clone(),
@@ -1022,7 +1024,7 @@ async fn nzbget_append_rejection_returns_zero_for_invalid_nzb() {
     use base64::Engine as _;
 
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db,
         handle.clone(),
@@ -1063,7 +1065,7 @@ async fn nzbget_append_add_paused_is_initially_paused() {
     use base64::Engine as _;
 
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db,
         handle.clone(),
@@ -1133,7 +1135,7 @@ fn refuse_private_destinations(handle: &SchedulerHandle, db: &Database) {
 #[tokio::test]
 async fn nzbget_append_rejects_private_url_payloads_for_prowlarr_shape() {
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     refuse_private_destinations(&handle, &db);
     let app = nzbget_test_router(
         db,
@@ -1175,7 +1177,7 @@ async fn nzbget_append_rejects_private_url_payloads_for_prowlarr_shape() {
     assert!(handle.list_jobs().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     let job = nzbget_test_job(
         42,
@@ -1200,15 +1202,13 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
         ],
     );
     let metrics = PipelineMetrics::new();
-    let (cmd_tx, _cmd_rx) = mpsc::channel(1);
     let (event_tx, _) = broadcast::channel(1);
     let shared_state = SharedPipelineState::new(metrics.clone(), vec![job]);
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    metrics
-        .bytes_downloaded
-        .store(1_048_576, std::sync::atomic::Ordering::Relaxed);
-    shared_state.refresh_metrics_snapshot();
-    let handle = SchedulerHandle::new(cmd_tx, event_tx, shared_state);
+    shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    shared_state.record_wire_bytes(1_048_576);
+    shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
+    let handle = SchedulerHandle::new(event_tx, shared_state);
     let config = test_config();
     config
         .write()
@@ -1328,7 +1328,7 @@ async fn nzbget_listgroups_reports_a_started_download_with_no_live_lane_as_downl
     assert!(job.phase_progress.is_empty());
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
-        scheduler_handle_with_mock_commands(vec![job]),
+        scheduler_handle_with_jobs(vec![job]).await,
         test_config(),
         api_key_cache("control-key", "control"),
     );
@@ -1343,21 +1343,19 @@ async fn nzbget_listgroups_reports_a_started_download_with_no_live_lane_as_downl
     assert_eq!(status["ServerStandBy"], false);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn nzbget_status_clamps_download_rate_to_arr_int() {
     let metrics = PipelineMetrics::new();
-    let (cmd_tx, _cmd_rx) = mpsc::channel(1);
     let (event_tx, _) = broadcast::channel(1);
     let shared_state = SharedPipelineState::new(metrics.clone(), vec![]);
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    metrics
-        .bytes_downloaded
-        // Far past i32::MAX per second however long this runner takes between
-        // samples or since the router started: both rates divide by elapsed time.
-        .store(1 << 60, std::sync::atomic::Ordering::Relaxed);
-    shared_state.refresh_metrics_snapshot();
+    shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    // Far past i32::MAX per second however long this runner takes between
+    // samples or since the router started: both rates divide by elapsed time.
+    shared_state.record_wire_bytes(1 << 60);
+    shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
-    let handle = SchedulerHandle::new(cmd_tx, event_tx, shared_state);
+    let handle = SchedulerHandle::new(event_tx, shared_state);
     let config = test_config();
     {
         let mut config_write = config.write().await;
@@ -1567,7 +1565,7 @@ async fn nzbget_history_includes_terminal_memory_items_missing_from_db() {
             ("nzbget.dupe_mode".to_string(), "ALL".to_string()),
         ],
     );
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
@@ -1639,7 +1637,7 @@ async fn nzbget_history_prefers_persisted_rows_over_terminal_duplicates() {
     );
     let app = nzbget_test_router(
         db,
-        scheduler_handle_with_mock_commands(vec![job]),
+        scheduler_handle_with_jobs(vec![job]).await,
         test_config(),
         ApiKeyCache::default(),
     );
@@ -1693,7 +1691,7 @@ async fn nzbget_history_maps_cancelled_db_rows_to_manual_delete() {
     );
     let app = nzbget_test_router(
         db,
-        scheduler_handle_with_mock_commands(vec![terminal]),
+        scheduler_handle_with_jobs(vec![terminal]).await,
         test_config(),
         ApiKeyCache::default(),
     );
@@ -2050,7 +2048,9 @@ async fn nzbget_group_final_delete_does_not_resurface_cancelled_history() {
             "drone-delete".to_string(),
         )],
     );
-    let handle = scheduler_handle_with_mock_commands_and_db(vec![job], db.clone());
+    let handle = scheduler_handle_with_jobs_and_db(vec![job], db.clone()).await;
+    let mut events = handle.subscribe_events();
+    let mut revisions = handle.subscribe_job_changes();
     let app = nzbget_test_router(
         db.clone(),
         handle.clone(),
@@ -2071,7 +2071,16 @@ async fn nzbget_group_final_delete_does_not_resurface_cancelled_history() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
+    wait_for_cancelled(&mut events, JobId(77)).await;
     assert!(handle.list_jobs().is_empty());
+    loop {
+        revisions.mark_unchanged();
+        if db.get_job_history(77).unwrap().is_none() {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    db.flush_write_queue().await.unwrap();
     assert!(db.get_job_history(77).unwrap().is_none());
 
     let (status, history_payload) = post_nzbget(
@@ -2098,9 +2107,11 @@ async fn nzbget_editqueue_maps_arr_actions() {
         0,
         vec![],
     );
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_jobs_and_db(vec![job], db.clone()).await;
+    let mut events = handle.subscribe_events();
     let app = nzbget_test_router(
-        Database::open_in_memory().unwrap(),
+        db,
         handle.clone(),
         test_config(),
         api_key_cache("control-key", "control"),
@@ -2110,7 +2121,7 @@ async fn nzbget_editqueue_maps_arr_actions() {
         app.clone(),
         serde_json::json!({
             "method": "editqueue",
-            "params": ["GroupFinalDelete", 0, "", 77],
+            "params": ["GroupDelete", 0, "", 77],
             "id": "delete"
         }),
         "Bearer control-key",
@@ -2118,6 +2129,7 @@ async fn nzbget_editqueue_maps_arr_actions() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
+    wait_for_cancelled(&mut events, JobId(77)).await;
     assert!(handle.list_jobs().is_empty());
 
     let (status, payload) = post_nzbget(
@@ -2144,7 +2156,7 @@ async fn nzbget_editqueue_maps_arr_actions() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["result"], true);
+    assert_eq!(payload["result"], false);
 
     let (status, payload) = post_nzbget(
         app,
@@ -2170,7 +2182,7 @@ async fn nzbget_editqueue_supports_v13_three_param_shape_with_id_array() {
         0,
         vec![],
     );
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -2190,6 +2202,7 @@ async fn nzbget_editqueue_supports_v13_three_param_shape_with_id_array() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
+    wait_for_job_status(&handle, JobId(88), JobStatus::Paused).await;
     assert_eq!(handle.list_jobs()[0].status, JobStatus::Paused);
 
     let (status, payload) = post_nzbget(
@@ -2204,6 +2217,7 @@ async fn nzbget_editqueue_supports_v13_three_param_shape_with_id_array() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["result"], true);
+    wait_for_job_status(&handle, JobId(88), JobStatus::Queued).await;
     assert_eq!(handle.list_jobs()[0].status, JobStatus::Queued);
 }
 
@@ -2217,7 +2231,7 @@ async fn nzbget_editqueue_category_priority_and_parameter_updates() {
         0,
         vec![],
     );
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -2351,7 +2365,7 @@ async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
         0,
         vec![],
     );
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
@@ -2420,7 +2434,7 @@ async fn nzbget_status_classifies_downloading_while_extracting_as_active() {
     );
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
-        scheduler_handle_with_mock_commands(vec![job]),
+        scheduler_handle_with_jobs(vec![job]).await,
         test_config(),
         api_key_cache("control-key", "control"),
     );
@@ -2444,7 +2458,7 @@ async fn nzbget_status_classifies_downloading_while_extracting_as_active() {
 // of how loaded the machine is.
 #[tokio::test(start_paused = true)]
 async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -2527,7 +2541,7 @@ async fn nzbget_global_pause_resume_and_scheduleresume_auto_resume() {
 async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
     let db = Database::open_in_memory().unwrap();
     let config = test_config();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db.clone(),
         handle,
@@ -2678,10 +2692,17 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
     db.upsert_file_progress_batch(&[weaver_server_core::ActiveFileProgress {
         job_id: JobId(55),
         file_index: 0,
-        contiguous_bytes_written: 150_000,
+        coverage: weaver_server_core::jobs::assembly::FileCoverage::from_ordered_runs([
+            weaver_server_core::jobs::assembly::CoverageRun {
+                first_ordinal: 0,
+                ordinals: 1,
+                start: 0,
+                end: 150_000,
+            },
+        ]),
     }])
     .unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
 
     let (status, payload) = post_nzbget(
@@ -2747,7 +2768,7 @@ async fn nzbget_postqueue_and_group_post_fields_report_stage_progress() {
         vec![],
     );
     queued.post_state = weaver_server_core::PostState::QueuedPostProcessing;
-    let handle = scheduler_handle_with_mock_commands(vec![job, queued]);
+    let handle = scheduler_handle_with_jobs(vec![job, queued]).await;
     // Post-processing began with verification 10 s before the repair stage.
     let db = Database::open_in_memory().unwrap();
     db.insert_job_events(&[weaver_server_core::history::timeline::JobEvent {
@@ -2828,7 +2849,7 @@ async fn nzbget_log_and_loadlog_expose_job_events() {
         10,
         vec![],
     );
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
 
     let (status, payload) = post_nzbget(
@@ -2881,7 +2902,7 @@ async fn nzbget_log_and_loadlog_expose_job_events() {
 #[tokio::test]
 async fn nzbget_appendurl_validates_url_and_shape() {
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     refuse_private_destinations(&handle, &db);
     let app = nzbget_test_router(
         db,
@@ -2971,7 +2992,7 @@ async fn nzbget_xmlrpc_editqueue_nzb360_shape_pauses_group() {
         0,
         vec![],
     );
-    let handle = scheduler_handle_with_mock_commands(vec![job]);
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -2997,12 +3018,13 @@ async fn nzbget_xmlrpc_editqueue_nzb360_shape_pauses_group() {
         body.contains("<value><boolean>1</boolean></value>"),
         "unexpected body: {body}"
     );
+    wait_for_job_status(&handle, JobId(77), JobStatus::Paused).await;
     assert_eq!(handle.list_jobs()[0].status, JobStatus::Paused);
 
     // Read scope may not drive control methods over XML-RPC either.
     let read_app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
-        scheduler_handle_with_mock_commands(vec![]),
+        scheduler_handle_with_jobs(vec![]).await,
         test_config(),
         api_key_cache("read-key", "read"),
     );
@@ -3017,7 +3039,7 @@ async fn nzbget_xmlrpc_append_returns_job_id() {
     use base64::Engine as _;
 
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db,
         handle.clone(),
@@ -3090,11 +3112,12 @@ async fn nzbget_loadconfig_alias_exposes_categories() {
 
 #[tokio::test]
 async fn nzbget_editqueue_move_commands_reorder_queue() {
-    let handle = scheduler_handle_with_mock_commands(vec![
+    let handle = scheduler_handle_with_jobs(vec![
         reorder_test_job(1),
         reorder_test_job(2),
         reorder_test_job(3),
-    ]);
+    ])
+    .await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
@@ -3239,7 +3262,7 @@ async fn nzbget_servervolumes_report_quota_window_usage() {
 #[tokio::test]
 async fn nzbget_scheduleresume_persists_and_recovers_across_restart() {
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         db.clone(),
         handle.clone(),
@@ -3413,7 +3436,7 @@ async fn nzbget_rpc_routes_accept_bodies_beyond_default_axum_limit() {
 
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
-        scheduler_handle_with_mock_commands(vec![]),
+        scheduler_handle_with_jobs(vec![]).await,
         test_config(),
         api_key_cache("control-key", "control"),
     );
@@ -4394,7 +4417,7 @@ async fn nzbget_hidden_history_does_not_consume_the_visible_page() {
     );
     let app = nzbget_test_router(
         db.clone(),
-        scheduler_handle_with_mock_commands(vec![hidden_job]),
+        scheduler_handle_with_jobs(vec![hidden_job]).await,
         test_config(),
         api_key_cache("control-key", "control"),
     );
@@ -4414,7 +4437,7 @@ async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
         .unwrap();
     db.insert_job_history(&nzbget_history_row(502, "complete", 1_700_000_200, None))
         .unwrap();
-    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let handle = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
     let app = nzbget_test_router(
         db.clone(),
         handle,
@@ -4481,7 +4504,7 @@ async fn nzbget_history_delete_survives_reopening_the_database() {
         let db = Database::open(&path).unwrap();
         db.insert_job_history(&nzbget_history_row(601, "complete", 1_700_000_100, None))
             .unwrap();
-        let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+        let handle = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
         let app = nzbget_test_router(
             db,
             handle,
@@ -4497,7 +4520,7 @@ async fn nzbget_history_delete_survives_reopening_the_database() {
         assert_eq!(hidden, true);
     }
     let db = Database::open(&path).unwrap();
-    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let handle = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
     let app = nzbget_test_router(
         db,
         handle,
@@ -5011,7 +5034,7 @@ async fn editqueue(app: Router, params: serde_json::Value) -> serde_json::Value 
 
 #[tokio::test]
 async fn nzbget_group_set_name_renames_the_job() {
-    let handle = scheduler_handle_with_mock_commands(vec![reorder_test_job(1)]);
+    let handle = scheduler_handle_with_jobs(vec![reorder_test_job(1)]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),
@@ -5041,11 +5064,12 @@ async fn nzbget_group_set_name_renames_the_job() {
 
 #[tokio::test]
 async fn nzbget_group_sort_orders_by_each_key_and_direction() {
-    let handle = scheduler_handle_with_mock_commands(vec![
+    let handle = scheduler_handle_with_jobs(vec![
         sort_test_job(1, "Charlie", 300, "NORMAL", 1_000.0),
         sort_test_job(2, "alpha", 100, "LOW", 3_000.0),
         sort_test_job(3, "Bravo", 200, "HIGH", 2_000.0),
-    ]);
+    ])
+    .await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
@@ -5096,7 +5120,7 @@ async fn nzbget_group_sort_orders_by_each_key_and_direction() {
 #[tokio::test]
 async fn nzbget_group_move_before_and_after_land_next_to_the_anchor() {
     let handle =
-        scheduler_handle_with_mock_commands((1..=5).map(reorder_test_job).collect::<Vec<_>>());
+        scheduler_handle_with_jobs((1..=5).map(reorder_test_job).collect::<Vec<_>>()).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle,
@@ -5155,7 +5179,7 @@ async fn nzbget_history_marks_are_kept_and_reported() {
         ))
         .unwrap();
     }
-    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let handle = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
     let app = nzbget_test_router(
         db.clone(),
         handle,
@@ -5186,7 +5210,7 @@ async fn nzbget_history_marks_are_kept_and_reported() {
 
     // The marks are kept on the rows.
     let db = Database::open(&path).unwrap();
-    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let handle = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
     let app = nzbget_test_router(
         db,
         handle,
@@ -5212,7 +5236,7 @@ async fn nzbget_history_rows_can_be_renamed_recategorised_and_reparameterised() 
     let db = Database::open_in_memory().unwrap();
     db.insert_job_history(&nzbget_history_row(701, "complete", 1_700_000_000, None))
         .unwrap();
-    let handle = scheduler_handle_with_mock_commands_and_db(vec![], db.clone());
+    let handle = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
     let app = nzbget_test_router(
         db.clone(),
         handle,
@@ -5273,14 +5297,16 @@ async fn nzbget_history_rows_can_be_renamed_recategorised_and_reparameterised() 
 #[tokio::test]
 async fn nzbget_dupe_and_park_deletes_report_how_the_job_left() {
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_mock_commands_and_db(
+    let handle = scheduler_handle_with_jobs_and_db(
         vec![
             reorder_test_job(801),
             reorder_test_job(802),
             reorder_test_job(803),
         ],
         db.clone(),
-    );
+    )
+    .await;
+    let mut events = handle.subscribe_events();
     let app = nzbget_test_router(
         db,
         handle,
@@ -5298,6 +5324,12 @@ async fn nzbget_dupe_and_park_deletes_report_how_the_job_left() {
             true
         );
     }
+    let mut pending = std::collections::BTreeSet::from([801, 802, 803]);
+    while !pending.is_empty() {
+        if let PipelineEvent::JobCancelled { job_id } = events.recv().await.unwrap() {
+            pending.remove(&job_id.0);
+        }
+    }
     let entries = rpc_result(app.clone(), "history", serde_json::json!([])).await;
     for (id, delete, status) in [
         (801, "DUPE", "DELETED/DUPE"),
@@ -5309,7 +5341,7 @@ async fn nzbget_dupe_and_park_deletes_report_how_the_job_left() {
         assert_eq!(entry["Status"], status, "{entry}");
     }
 
-    // A retry of a failed job fetches it again.
+    // Persisted cancellation is a restartable failure, including after cleanup.
     assert_eq!(
         editqueue(app, serde_json::json!(["HistoryRetryFailed", "", [801]])).await,
         true
@@ -5328,7 +5360,7 @@ fn group_priority(groups: &serde_json::Value, id: u64) -> (i64, i64) {
 async fn nzbget_priority_reports_the_value_the_client_set() {
     use base64::Engine as _;
 
-    let handle = scheduler_handle_with_mock_commands(vec![]);
+    let handle = scheduler_handle_with_jobs(vec![]).await;
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
         handle.clone(),

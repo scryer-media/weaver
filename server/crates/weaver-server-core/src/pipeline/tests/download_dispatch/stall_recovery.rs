@@ -576,19 +576,19 @@ async fn operator_pause_and_resume_discard_pre_pause_stall_history() {
     insert_stalled_job(&mut pipeline, job, 3).await;
     verification_exclude_healthy_and_cool_remaining(&mut pipeline, job).await;
     verification_old_kick(&mut pipeline, &[job]);
-    let (reply, done) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PauseAll { reply })
-        .await;
-    done.await.unwrap();
+    crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_all()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.download_dispatch_stall.is_none());
     pipeline.dispatch_downloads();
     assert!(pipeline.download_dispatch_stall.is_none());
-    let (reply, done) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumeAll { reply })
-        .await;
-    done.await.unwrap();
+    crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_all()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     pipeline.dispatch_downloads();
     assert_eq!(releases(&pipeline), 0);
     assert_eq!(kicks(&pipeline), 0);
@@ -620,4 +620,57 @@ async fn a_valid_wait_after_kick_restarts_the_recovery_window() {
     assert_eq!(watch.since, ready_at);
     assert_eq!(releases(&pipeline), 0);
     assert_eq!(pipeline.jobs[&job].download_queue.len(), 3);
+}
+
+// The release books the download queue and leaves a parked recovery queue
+// where it is. The completion check that follows queues what it still wants
+// (the recovery article it promotes among it), the stall watch reopens on
+// that, and the next kick and release book it. The job ends: one watchdog
+// cycle per round of promotion, never a wait that nothing ends.
+#[tokio::test]
+async fn a_release_that_leaves_a_parked_recovery_queue_still_ends_the_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40006);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_with_par2_job_spec("Stalled Recovery", 128, 64),
+    )
+    .await;
+    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 2);
+    assert_eq!(pipeline.jobs[&job_id].recovery_queue.len(), 1);
+
+    let mut now = Instant::now();
+    let mut cycles = 0;
+    while pipeline.jobs.contains_key(&job_id) {
+        assert!(
+            cycles < 4,
+            "the job outlived every article it could promote"
+        );
+        cycles += 1;
+        pipeline.dispatch_downloads_at(now);
+        now += DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+        pipeline.dispatch_downloads_at(now);
+        assert_eq!(kicks(&pipeline), cycles);
+        now += DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER;
+        pipeline.dispatch_downloads_at(now);
+        assert_eq!(releases(&pipeline), cycles);
+        if cycles == 1 {
+            assert_eq!(
+                pipeline.jobs[&job_id].recovery_queue.len(),
+                1,
+                "the first release leaves the recovery queue parked"
+            );
+        }
+        while let Some(checked) = pipeline.pending_completion_checks.pop_front() {
+            pipeline.check_job_completion(checked).await;
+        }
+        pipeline.dispatch_downloads_at(now);
+    }
+
+    // Payload and index in the first, the recovery article the check promoted
+    // in the second, the article the last check queued in the third.
+    assert_eq!(cycles, 3);
+    assert!(pipeline.download_dispatch_stall.is_none());
 }

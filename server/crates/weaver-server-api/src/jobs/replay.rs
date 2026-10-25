@@ -507,12 +507,11 @@ fn progress_signature_has_progress(signature: &ProgressSignature) -> bool {
 mod tests {
     use super::*;
 
-    use tokio::sync::mpsc;
     use weaver_server_core::jobs::handle::{JobInfo, SharedPipelineState};
     use weaver_server_core::jobs::ids::JobId;
     use weaver_server_core::operations::metrics::PipelineMetrics;
     use weaver_server_core::settings::Config;
-    use weaver_server_core::{DownloadState, JobStatus, PostState, RunState, SchedulerCommand};
+    use weaver_server_core::{DownloadState, JobStatus, PostState, RunState};
 
     const PURGED_JOB_ID: u64 = 4242;
 
@@ -577,10 +576,9 @@ mod tests {
     // Seed the replay caches from a live finalizing job, then purge it from the
     // scheduler the way the pipeline does before its terminal event lands.
     fn purged_job_fixture() -> (SchedulerHandle, SharedConfig, QueueEventCaches) {
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);
         let (event_tx, _event_rx) = broadcast::channel(4);
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![finalizing_job_info()]);
-        let handle = SchedulerHandle::new(cmd_tx, event_tx, state.clone());
+        let handle = SchedulerHandle::new(event_tx, state.clone());
 
         let mut caches = QueueEventCaches::default();
         caches.seed_from_handle(&handle);
@@ -591,7 +589,6 @@ mod tests {
 
     #[tokio::test]
     async fn propagation_wait_changes_emit_live_item_updates() {
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);
         let (event_tx, _event_rx) = broadcast::channel(4);
         let mut job = JobInfo {
             status: JobStatus::Queued,
@@ -600,7 +597,7 @@ mod tests {
             ..finalizing_job_info()
         };
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![job.clone()]);
-        let handle = SchedulerHandle::new(cmd_tx, event_tx, state.clone());
+        let handle = SchedulerHandle::new(event_tx, state.clone());
         let config = test_config();
         let mut caches = QueueEventCaches::default();
         caches.seed_from_handle(&handle);
@@ -646,10 +643,9 @@ mod tests {
     // evicted-cache path is only the fallback.
     #[tokio::test]
     async fn completed_job_in_finished_snapshot_emits_item_completed() {
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(4);
         let (event_tx, _event_rx) = broadcast::channel(4);
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![finalizing_job_info()]);
-        let handle = SchedulerHandle::new(cmd_tx, event_tx, state.clone());
+        let handle = SchedulerHandle::new(event_tx, state.clone());
         let config = test_config();
 
         let mut caches = QueueEventCaches::default();

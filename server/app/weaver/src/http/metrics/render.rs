@@ -1444,6 +1444,7 @@ fn render_job_lifecycle(out: &mut Encoder, lifecycle: &JobLifecycleMetricsSnapsh
 }
 
 fn render_pipeline_histograms(out: &mut Encoder, histograms: &PipelineHistogramsSnapshot) {
+    render_histogram(out, &f::TURN_DURATION, &[], &histograms.turn_duration);
     render_histogram(
         out,
         &f::DISK_WRITE_DURATION,

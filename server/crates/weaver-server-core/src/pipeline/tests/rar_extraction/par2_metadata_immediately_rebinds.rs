@@ -3167,6 +3167,7 @@ async fn a_split_7z_short_of_a_part_the_nzb_never_carried_is_not_settled_clean_b
             state.download_queue = DownloadQueue::new();
             state.recovery_queue = DownloadQueue::new();
             state.recovery_queue.push(DownloadWork {
+                counters: None,
                 segment_id: SegmentId {
                     file_id: NzbFileId {
                         job_id,

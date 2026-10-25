@@ -41,7 +41,7 @@ pub use handle::{
     AddJobOptions, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState, EgressQuotaBlock,
     FINISHED_JOBS_RUNTIME_CAP, HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce,
     HistoryDeleteBatchOutcome, HistoryDeleteOutcome, JobInfo, NntpRuntimeActivation,
-    QueueMoveTarget, RestoreJobRequest, SchedulerCommand, SchedulerHandle, ServerTransportHealth,
+    QueueMoveTarget, RestoreJobRequest, SchedulerHandle, ServerTransportHealth,
     SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};

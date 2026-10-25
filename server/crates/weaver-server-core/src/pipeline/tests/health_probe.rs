@@ -641,6 +641,7 @@ async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1051,12 +1052,21 @@ async fn a_single_file_failing_while_the_job_lands_does_not_probe() {
 
 // Damage spread across files with no recovery data probes, and a round that
 // comes back entirely missing abandons the job.
+//
+// The post is below the first-article sample's size, so the probe's verdict is
+// the only one and the job fails in its words. A post the sample can speak for
+// is pinned in `first_article_gate`.
 #[tokio::test]
 async fn damage_across_files_without_recovery_probes_and_all_missing_aborts() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30332);
-    let spec = standalone_job_spec("Dead Release", &many_standalone_files("dead", 20));
+    // Two small files fail first, which keeps health above critical so the
+    // probe is what decides.
+    let files: Vec<(String, u32)> = (0..9)
+        .map(|idx| (format!("dead-{idx}.bin"), if idx < 2 { 64 } else { 512 }))
+        .collect();
+    let spec = standalone_job_spec("Dead Release", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     for file_index in 0..2u32 {
@@ -1114,6 +1124,7 @@ async fn booked_damage_promotes_recovery_before_any_checkpoint() {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,

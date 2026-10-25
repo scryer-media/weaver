@@ -796,6 +796,21 @@ async fn the_profile_in_force_is_reported_beside_the_choice() {
     assert_no_errors(&resp);
     let profile = &response_data(&resp)["setHardwareProfile"];
     assert_eq!(profile["selected"], "EFFICIENT");
+    let mut revisions = h.handle.subscribe_job_changes();
+    loop {
+        revisions.mark_unchanged();
+        if h.handle.hardware_profile_in_force().is_some_and(|profile| {
+            profile.active == weaver_server_core::runtime::HardwareProfile::Efficient
+        }) {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    let resp = h
+        .execute("{ hardwareProfile { selected active scheduled } }")
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["hardwareProfile"];
     assert_eq!(profile["active"], "EFFICIENT");
     assert!(profile["scheduled"].is_null());
 }

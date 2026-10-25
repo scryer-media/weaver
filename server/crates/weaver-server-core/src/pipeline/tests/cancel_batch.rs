@@ -17,16 +17,31 @@ async fn insert_queued_jobs(pipeline: &mut Pipeline, ids: &[JobId]) {
         )
         .await;
     }
-    pipeline.publish_snapshot();
+    pipeline.report_all_for_test();
 }
 
 async fn cancel_batch(pipeline: &mut Pipeline, ids: &[JobId]) -> crate::jobs::CancelJobsOutcome {
-    cancel_jobs_command(
-        pipeline,
-        ids.iter().copied().collect(),
-        CancellationOrigin::User,
-    )
-    .await
+    pipeline.report_all_for_test();
+    let mut events = pipeline.event_tx.subscribe();
+    let outcome = pipeline
+        .shared_state
+        .queue
+        .cancel_jobs(ids.iter().copied().collect(), CancellationOrigin::User);
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(pipeline).await;
+    // Every accepted id whose archive committed announces itself; one whose
+    // archive failed is live again instead.
+    let mut pending: BTreeSet<_> = outcome
+        .iter()
+        .filter_map(|(id, result)| result.is_ok().then_some(*id))
+        .filter(|id| !pipeline.jobs.contains_key(id))
+        .collect();
+    while !pending.is_empty() {
+        if let PipelineEvent::JobCancelled { job_id } = events.recv().await.unwrap() {
+            pending.remove(&job_id);
+        }
+    }
+    outcome
 }
 
 // Makes the history insert for `job_id` fail inside its archive transaction,
@@ -53,7 +68,7 @@ async fn fail_history_insert_for(pipeline: &Pipeline, job_id: JobId) {
 }
 
 #[tokio::test]
-async fn cancel_batch_of_queued_jobs_archives_every_row_in_one_command() {
+async fn cancel_batch_of_queued_jobs_archives_every_row() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let ids: Vec<JobId> = (31_001..31_006).map(JobId).collect();
@@ -77,6 +92,37 @@ async fn cancel_batch_of_queued_jobs_archives_every_row_in_one_command() {
             "cancelled"
         );
     }
+}
+
+#[tokio::test]
+async fn an_operator_cancel_is_recorded_as_cancelled_by_the_operator() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31_051);
+    insert_queued_jobs(&mut pipeline, &[job_id]).await;
+
+    let outcome = cancel_batch(&mut pipeline, &[job_id]).await;
+
+    assert!(outcome[&job_id].is_ok());
+    let row = pipeline
+        .db
+        .get_job_history(job_id.0)
+        .unwrap()
+        .expect("archived");
+    assert_eq!(row.status, "cancelled");
+    assert_eq!(
+        row.error_message.as_deref(),
+        Some(crate::jobs::model::OPERATOR_CANCELLED_ERROR)
+    );
+    assert_eq!(
+        crate::jobs::model::job_status_from_persisted_str(
+            &row.status,
+            row.error_message.as_deref()
+        ),
+        JobStatus::Failed {
+            error: "cancelled by operator".to_string()
+        }
+    );
 }
 
 #[tokio::test]
@@ -147,57 +193,6 @@ async fn cancel_event_follows_a_readable_history_row() {
 }
 
 #[tokio::test]
-async fn cancel_batch_keeps_every_job_live_until_its_archive_commits() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let ids = [JobId(31_301), JobId(31_302), JobId(31_303)];
-    insert_queued_jobs(&mut pipeline, &ids).await;
-    let mut events = pipeline.event_tx.subscribe();
-    let (reply, mut answered) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::CancelJobs {
-            job_ids: ids.iter().copied().collect(),
-            origin: CancellationOrigin::User,
-            reply,
-        })
-        .await;
-
-    // Between the cancel and the commit every job is still the live job, in
-    // memory and in the snapshot, and nothing has answered or been announced.
-    assert!(answered.try_recv().is_err());
-    let snapshot = pipeline.shared_state.list_jobs();
-    for job_id in &ids {
-        assert!(pipeline.jobs.contains_key(job_id));
-        assert!(snapshot.iter().any(|job| job.job_id == *job_id));
-    }
-    // A second cancel of a job already cancelling is refused, not archived twice.
-    let again = cancel_batch(&mut pipeline, &[ids[0]]).await;
-    assert!(matches!(
-        again[&ids[0]],
-        Err(crate::SchedulerError::Conflict(_))
-    ));
-
-    finish_cancel_jobs(&mut pipeline).await;
-    let outcome = answered.await.unwrap();
-    assert_eq!(outcome.len(), ids.len());
-    assert!(outcome.values().all(Result::is_ok));
-    let snapshot = pipeline.shared_state.list_jobs();
-    for job_id in &ids {
-        assert!(!pipeline.jobs.contains_key(job_id));
-        assert!(snapshot.iter().all(|job| job.job_id != *job_id));
-    }
-    assert!(pipeline.pending_cancellations.is_empty());
-    let mut announced = Vec::new();
-    while let Ok(event) = events.try_recv() {
-        if let PipelineEvent::JobCancelled { job_id } = event {
-            announced.push(job_id);
-        }
-    }
-    announced.sort();
-    assert_eq!(announced, ids.to_vec());
-}
-
-#[tokio::test]
 async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -209,14 +204,10 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
 
     let outcome = cancel_batch(&mut pipeline, &ids).await;
 
-    // The failed id says why, and stays the live job: in memory, in the
-    // snapshot, with its active row and no history row.
-    match &outcome[&failing] {
-        Err(crate::SchedulerError::State(crate::StateError::Database(message))) => {
-            assert!(message.contains("synthetic archive failure"), "{message}");
-        }
-        other => panic!("expected the archive failure, got {other:?}"),
-    }
+    // Every intent was recorded. The failed id stays the live job: in
+    // memory, visible in the Queue with no cancel pending, with its active
+    // row and no history row.
+    assert!(outcome.values().all(Result::is_ok));
     assert!(pipeline.jobs.contains_key(&failing));
     assert!(
         pipeline
@@ -225,6 +216,14 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
             .iter()
             .any(|job| job.job_id == failing)
     );
+    assert!(pipeline.shared_state.queue.read(|inner| {
+        inner.jobs.iter().any(|row| {
+            row.id == failing
+                && row.intents.cancelled.is_none()
+                && !row.intents.delete_history_after_cancel
+                && !row.report.retiring
+        })
+    }));
     assert!(pipeline.db.get_job_history(failing.0).unwrap().is_none());
     assert!(
         pipeline
@@ -233,10 +232,8 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
             .unwrap()
             .contains_key(&failing)
     );
-    assert!(pipeline.pending_cancellations.is_empty());
     // The rest of the batch committed and left, one `JobCancelled` each.
     for job_id in [ids[0], ids[2]] {
-        assert!(outcome[&job_id].is_ok());
         assert!(!pipeline.jobs.contains_key(&job_id));
         assert_eq!(
             pipeline
@@ -319,21 +316,18 @@ async fn failed_user_cancel_restores_repair_after_db_recovers() {
         .verify_active
         .fetch_add(1, Ordering::Relaxed);
     fail_history_insert_for(&pipeline, job_id).await;
-    let (commands, mut received) = mpsc::channel(1);
-    let handle = crate::SchedulerHandle::new(
-        commands,
-        pipeline.event_tx.clone(),
-        pipeline.shared_state.clone(),
-    );
-    let cancel = tokio::spawn(async move {
-        handle
-            .cancel_jobs([job_id].into_iter().collect(), CancellationOrigin::User)
-            .await
-    });
-    let command = received.recv().await.unwrap();
-    pipeline.handle_command(command).await;
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    // The reply records the intent; a failed archive restores the live row.
+    let outcome = handle
+        .cancel_jobs([job_id].into_iter().collect(), CancellationOrigin::User)
+        .await
+        .unwrap();
+    assert!(outcome[&job_id].is_ok());
+    pipeline.apply_queue_intents().await;
     finish_cancel_jobs(&mut pipeline).await;
-    assert!(cancel.await.unwrap().unwrap()[&job_id].is_err());
+    assert!(handle.get_job(job_id).is_ok());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
     assert!(pipeline.jobs.contains_key(&job_id));
     let datastore = pipeline.db.datastore();
     SqlRuntime::run_in_transaction(&datastore, "verification_clear_archive_fault", |tx| {

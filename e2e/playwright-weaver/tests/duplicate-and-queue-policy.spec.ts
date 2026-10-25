@@ -106,8 +106,15 @@ test("duplicate policy produces block, pause, and force decisions without pipeli
   );
   expect(locallyPaused.pauseQueueItem).toMatchObject({
     success: true,
-    item: { id: queued[0], state: "PAUSED" },
+    item: { id: queued[0] },
   });
+  await expect.poll(async () => {
+    const data = await graphql<{ queueItems: Array<{ id: number; state: string }> }>(
+      request,
+      "query WeaverE2EAppliedPause { queueItems { id state } }",
+    );
+    return data.queueItems.find((item) => item.id === queued[0])?.state;
+  }, { message: `job ${queued[0]} pause applied`, timeout: 0 }).toBe("PAUSED");
   const locallyResumed = await graphql<{
     resumeQueueItem: { success: boolean; item: { id: number; state: string } };
   }>(

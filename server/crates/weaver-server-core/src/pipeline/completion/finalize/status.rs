@@ -791,7 +791,7 @@ impl Pipeline {
 
         self.phase_end_extracting_if_idle(job_id);
         self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
-        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
+        self.emit_job_event(PipelineEvent::RepairStarted { job_id });
         true
     }
 
@@ -829,9 +829,7 @@ impl Pipeline {
         }
 
         self.transition_postprocessing_status(job_id, JobStatus::Extracting, Some("extracting"));
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::ExtractionReady { job_id });
+        self.emit_job_event(PipelineEvent::ExtractionReady { job_id });
         info!(job_id = job_id.0, "extraction ready");
         true
     }
@@ -844,7 +842,7 @@ impl Pipeline {
             return;
         };
         self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
-        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
+        self.emit_job_event(PipelineEvent::RepairStarted { job_id });
         self.schedule_job_completion_check(job_id);
     }
 
@@ -882,9 +880,7 @@ impl Pipeline {
                 JobStatus::Extracting,
                 Some("extracting"),
             );
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::ExtractionReady { job_id });
+            self.emit_job_event(PipelineEvent::ExtractionReady { job_id });
             self.schedule_job_completion_check(job_id);
         }
     }

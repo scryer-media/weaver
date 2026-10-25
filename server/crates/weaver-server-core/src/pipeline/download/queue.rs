@@ -8,6 +8,8 @@ use crate::jobs::ids::{MessageId, NzbFileId, SegmentId};
 // A work item representing a segment to download.
 #[derive(Clone)]
 pub struct DownloadWork {
+    // Attached at dispatch; queued articles do not allocate counters.
+    pub counters: Option<std::sync::Arc<crate::pipeline::queue::JobCounters>>,
     pub segment_id: SegmentId,
     pub message_id: MessageId,
     // The file's newsgroups, shared by every segment of the file rather than

@@ -241,10 +241,7 @@ impl Pipeline {
 
     // The gates that are about the link rather than about any job's queue.
     fn download_scheduler_link_gate(&mut self, pressure: DownloadPressure) -> Option<YieldReason> {
-        if self.global_paused
-            || self.shared_state.speed_test_paused()
-            || self.shared_state.schedule_replay_paused()
-        {
+        if self.shared_state.is_paused() || self.shared_state.schedule_replay_paused() {
             return Some(YieldReason::Paused);
         }
         if self.rate_limiter.should_wait() {
@@ -263,13 +260,22 @@ impl Pipeline {
     // then each spill candidate are drawn from: dispatch priority first,
     // submission order within a priority.
     pub(in crate::pipeline) fn download_scheduler_eligible_jobs(&self) -> Vec<JobId> {
+        let held = self.shared_state.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .filter(|row| row.intents.cancelled.is_some() || row.intents.paused == Some(true))
+                .map(|row| row.id)
+                .collect::<HashSet<_>>()
+        });
         let mut eligible = self
             .job_order
             .iter()
             .enumerate()
             .filter_map(|(index, job_id)| {
                 let state = self.jobs.get(job_id)?;
-                if state.download_queue.is_empty()
+                if held.contains(job_id)
+                    || state.download_queue.is_empty()
                     || !Self::status_allows_download_dispatch(&state.status)
                     || self.held_for_added_scripts(*job_id)
                 {
@@ -417,7 +423,7 @@ impl Pipeline {
                 // it as missing now rather than leave the job waiting.
                 let server_count = self.nntp.pool().server_count();
                 let retention = self.job_retention_excludes(job_id);
-                if Self::unavailable_server_count_from_excludes(server_count, &[], &retention)
+                if Self::unavailable_server_count_from_excludes(self.nntp.pool(), &[], &retention)
                     >= server_count
                 {
                     self.retire_unservable_queued_work(job_id);
@@ -474,7 +480,21 @@ impl Pipeline {
         }
     }
 
-    fn record_handout(&mut self, kind: HandoutKind, works: Vec<DownloadWork>) -> Handout {
+    fn record_handout(&mut self, kind: HandoutKind, mut works: Vec<DownloadWork>) -> Handout {
+        self.shared_state.queue.read(|inner| {
+            for work in &mut works {
+                work.counters = inner
+                    .jobs
+                    .iter()
+                    .find(|row| row.id == work.segment_id.file_id.job_id)
+                    .map(|row| {
+                        row.counters
+                            .totals
+                            .get_or_init(|| self.shared_state.queue.counters.clone());
+                        Arc::clone(&row.counters)
+                    });
+            }
+        });
         let counter = match kind {
             HandoutKind::Hot => &self.metrics.download_scheduler_handouts_total_hot,
             HandoutKind::Spill => &self.metrics.download_scheduler_handouts_total_spill,

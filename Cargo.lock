@@ -1430,9 +1430,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+checksum = "12218662ccac37d9714f2191252553d67585b97df8c839cbe49e0bde278dc865"
 dependencies = [
  "cmov",
 ]
@@ -5979,7 +5979,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "application-updater",
  "async-graphql",
@@ -6039,14 +6039,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6075,7 +6075,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "blake3",
  "quick-xml",
@@ -6088,7 +6088,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6119,7 +6119,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6194,7 +6194,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6217,7 +6217,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "cc",
  "crc-turbo",

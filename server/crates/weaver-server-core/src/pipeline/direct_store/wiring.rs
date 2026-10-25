@@ -234,6 +234,10 @@ pub(crate) struct DirectStoreRuntime {
     // to be handed over on the next turn. The booking that rules an article
     // missing cannot demote a set itself, so it notes the job here.
     end_header_verdicts: std::collections::BTreeSet<JobId>,
+    // Jobs a download admission pass found holding a set that cannot place
+    // another byte, to be handed over on the next turn. See
+    // `DirectStoreAdmission::unplaceable`.
+    pub(crate) unplaceable_verdicts: std::collections::BTreeSet<JobId>,
     // Destinations already created and marked sparse, per job. A member stored
     // inside a directory names a partial inside that directory and nothing
     // else creates it, and every destination has to carry the sparse attribute
@@ -348,6 +352,26 @@ impl DirectStoreRuntime {
     #[cfg(test)]
     pub(crate) fn with_settings(settings: DirectStoreSettings) -> Self {
         Self::with_working_capacity(settings, crate::operations::CapacityReader::unknown())
+    }
+
+    pub(crate) fn relocate_working_dir(
+        &mut self,
+        id: JobId,
+        old: &std::path::Path,
+        new: &std::path::Path,
+    ) {
+        for set in self.sets.get_mut(&id).into_iter().flatten() {
+            set.relocate_working_dir(old, new);
+        }
+        if let Some(paths) = self.prepared_destinations.get_mut(&id) {
+            *paths = paths
+                .drain()
+                .map(|path| {
+                    path.strip_prefix(old)
+                        .map_or_else(|_| path.clone(), |relative| new.join(relative))
+                })
+                .collect();
+        }
     }
 
     // Builds a runtime from the settings resolved at pipeline construction
@@ -1063,7 +1087,7 @@ impl Pipeline {
         };
         let (admitted, refused) =
             DirectSetPlan::discover(&state.spec, &state.working_dir, &destination_dir);
-        let password = state.spec.password.clone();
+        let password = self.job_password_at_boundary(job_id, state.spec.password.as_deref());
         let par2_available = super::plan::spec_carries_par2(&state.spec);
         let par3_available = self.par3_direct_checks_available(job_id);
         for (set_name, refusal) in refused {
@@ -1972,7 +1996,7 @@ impl Pipeline {
         let destination_dir = self.deterministic_extraction_staging_dir(job_id);
         let state = self.jobs.get(&job_id)?;
         let working_dir = state.working_dir.clone();
-        let password = state.spec.password.clone();
+        let password = self.job_password_at_boundary(job_id, state.spec.password.as_deref());
         let (expected_volumes, format) = self
             .direct_store
             .identity
@@ -2515,7 +2539,7 @@ impl Pipeline {
             let destination_dir = self.deterministic_extraction_staging_dir(job_id);
             let state = self.jobs.get(&job_id)?;
             let working_dir = state.working_dir.clone();
-            let password = state.spec.password.clone();
+            let password = self.job_password_at_boundary(job_id, state.spec.password.as_deref());
             let plan = DirectSetPlan {
                 set_name: format!("obfuscated-set.f{file_index}"),
                 format: crate::pipeline::direct_store::plan::SetFormat::Rar,
@@ -2571,7 +2595,7 @@ impl Pipeline {
         let destination_dir = self.deterministic_extraction_staging_dir(job_id);
         let state = self.jobs.get(&job_id)?;
         let working_dir = state.working_dir.clone();
-        let password = state.spec.password.clone();
+        let password = self.job_password_at_boundary(job_id, state.spec.password.as_deref());
         let plan = DirectSetPlan {
             set_name: format!("obfuscated-archive.f{file_index}"),
             format: crate::pipeline::direct_store::plan::SetFormat::Rar,
@@ -2614,7 +2638,7 @@ impl Pipeline {
         let destination_dir = self.deterministic_extraction_staging_dir(job_id);
         let state = self.jobs.get(&job_id)?;
         let working_dir = state.working_dir.clone();
-        let password = state.spec.password.clone();
+        let password = self.job_password_at_boundary(job_id, state.spec.password.as_deref());
         let plan = DirectSetPlan {
             set_name: format!("obfuscated-archive.f{file_index}"),
             format: crate::pipeline::direct_store::plan::SetFormat::SevenZip,
@@ -3640,11 +3664,12 @@ impl Pipeline {
         {
             return;
         }
-        let Some(password) = self
-            .jobs
-            .get(&job_id)
-            .and_then(|state| state.spec.password.clone())
-        else {
+        let Some(password) = self.job_password_at_boundary(
+            job_id,
+            self.jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.password.as_deref()),
+        ) else {
             return;
         };
         // The harvest `offer_direct_header_passwords` hands out is memoized per

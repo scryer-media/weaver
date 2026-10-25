@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// What an idle pipeline costs: no job snapshot publishes, a slow metrics
-// tick, and no completion checks for jobs that cannot have changed.
-//
-// Every test runs on the paused clock. Sleeping on it advances virtual time
-// only once every task is parked, so each periodic tick runs to completion
-// before the next one fires.
+// Exercise idle control-plane behavior through published events and metrics.
 
 use super::*;
 
@@ -49,10 +44,10 @@ async fn idle_pipeline(
         metrics: Default::default(),
         config_path: None,
     }));
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
+
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-    let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+    let handle = SchedulerHandle::new(event_tx.clone(), shared_state.clone());
     let profile = SystemProfile {
         cpu: CpuProfile {
             physical_cores: 4,
@@ -85,7 +80,6 @@ async fn idle_pipeline(
         large_count: 2,
     });
     let mut pipeline = Pipeline::new(
-        cmd_rx,
         event_tx,
         nntp,
         buffers,
@@ -114,6 +108,7 @@ async fn idle_pipeline(
         pipeline.jobs.insert(job_id, state);
         pipeline.job_order.push(job_id);
     }
+    pipeline.report_all_for_test();
     prepare(&mut pipeline);
     let task = tokio::spawn(async move { pipeline.run().await });
     IdlePipeline {
@@ -125,28 +120,6 @@ async fn idle_pipeline(
 }
 
 impl IdlePipeline {
-    // Wait until the startup publish has happened, so later revisions
-    // count only what the test causes.
-    async fn settled_revisions(&self) -> tokio::sync::watch::Receiver<u64> {
-        let mut revisions = self.handle.subscribe_job_changes();
-        revisions.wait_for(|revision| *revision > 0).await.unwrap();
-        revisions.mark_unchanged();
-        self.next_refresh().await;
-        revisions.mark_unchanged();
-        revisions
-    }
-
-    // Observe the completed turn containing the next metrics refresh.
-    async fn next_refresh(&self) -> crate::jobs::handle::PipelineTurnObservation {
-        let before = self.shared_state.metrics_refresh_count();
-        let mut turns = self.shared_state.turn_observation.subscribe();
-        let observed = turns
-            .wait_for(|turn| turn.is_some_and(|turn| turn.metrics_refreshes > before))
-            .await
-            .unwrap();
-        observed.unwrap()
-    }
-
     async fn shutdown(self) {
         self.handle.shutdown().await.unwrap();
         self.task.await.unwrap();
@@ -161,86 +134,104 @@ fn long_history() -> Vec<JobInfo> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn idle_pipeline_with_paused_jobs_and_history_publishes_nothing() {
+async fn idle_pipeline_preserves_paused_jobs_and_history_when_global_intents_change() {
     let pipeline = idle_pipeline(64, long_history(), |_| {}).await;
-    let revisions = pipeline.settled_revisions().await;
-    let published = *revisions.borrow();
-
-    let turn = pipeline.next_refresh().await;
-
-    assert!(
-        !revisions.has_changed().unwrap(),
-        "an idle pipeline republished its job snapshot"
-    );
-    assert_eq!(*revisions.borrow(), published);
-    assert_eq!(turn.job_revision, published);
-    assert_eq!(turn.period, Pipeline::IDLE_SNAPSHOT_INTERVAL);
-    pipeline.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn idle_pipeline_publishes_a_pause_change() {
-    let pipeline = idle_pipeline(8, long_history(), |_| {}).await;
-    let mut revisions = pipeline.settled_revisions().await;
-
-    // The reply and publication are separate events. Wait for the revision
-    // caused by this command, without racing the next metrics tick.
+    let before = pipeline.handle.list_jobs();
+    let mut events = pipeline.handle.subscribe_events();
+    let mut revisions = pipeline.handle.subscribe_job_changes();
+    revisions.mark_unchanged();
     pipeline.handle.pause_all().await.unwrap();
     revisions.changed().await.unwrap();
-    assert!(pipeline.shared_state.is_paused());
-    assert!(pipeline.handle.list_jobs().len() >= long_history().len());
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::GlobalPaused) {}
+    let after = pipeline.handle.list_jobs();
+    assert_eq!(after.len(), before.len());
+    for id in 1..=64 {
+        assert_eq!(
+            pipeline.shared_state.get_job(JobId(id)).unwrap().status,
+            JobStatus::Paused
+        );
+    }
     pipeline.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn metrics_tick_is_fast_while_live_and_slow_while_idle() {
-    let idle = idle_pipeline(8, Vec::new(), |_| {}).await;
-    idle.settled_revisions().await;
-    assert_eq!(
-        idle.next_refresh().await.period,
-        Pipeline::IDLE_SNAPSHOT_INTERVAL
+async fn idle_pipeline_records_production_turn_histogram() {
+    let pipeline = idle_pipeline(0, Vec::new(), |_| {}).await;
+    let shared = pipeline.shared_state.clone();
+    let mut events = pipeline.handle.subscribe_events();
+    pipeline.handle.pause_all().await.unwrap();
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::GlobalPaused) {}
+    pipeline.shutdown().await;
+    assert!(
+        shared
+            .metrics()
+            .pipeline_histograms
+            .turn_duration
+            .snapshot()
+            .count
+            > 0
     );
-    idle.shutdown().await;
-
-    // A phase past the download in flight keeps the pipeline live.
-    let live = idle_pipeline(8, Vec::new(), |pipeline| {
-        pipeline.phase_begin(JobId(1), JobPhase::Repairing, Some(1_000));
-    })
-    .await;
-    live.handle
-        .subscribe_job_changes()
-        .wait_for(|revision| *revision > 0)
-        .await
-        .unwrap();
-    assert_eq!(live.next_refresh().await.period, Duration::from_millis(100));
-    live.shutdown().await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn moving_rates_hold_the_fast_tick_until_a_refresh_reads_zero() {
-    // The pipeline starts as if the last refresh had seen bytes moving. The
-    // rate estimator runs on the wall clock, which the paused clock does not
-    // drive, so the test starts from the flag rather than from real bytes.
-    let pipeline = idle_pipeline(4, Vec::new(), |pipeline| {
-        pipeline.metrics_rates_moving = true;
-    })
-    .await;
-    pipeline.settled_revisions().await;
-    let settled = pipeline.shared_state.metrics_snapshot();
-    assert_eq!(settled.current_download_speed, 0);
-    assert_eq!(settled.articles_per_sec, 0.0);
-    assert_eq!(settled.decode_rate_mbps, 0.0);
-
-    // The refresh that read zero rates cleared the flag; the tick is slow.
+#[tokio::test]
+async fn idle_footprint_tick_tracks_queue_edits_while_globally_paused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.pause_all().await.unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.refresh_periodic_snapshot();
+    assert!(!pipeline.pipeline_is_live());
     assert_eq!(
-        pipeline.next_refresh().await.period,
-        Pipeline::IDLE_SNAPSHOT_INTERVAL
+        pipeline
+            .metrics
+            .download_jobs_eligible
+            .load(Ordering::Relaxed),
+        0
     );
-    pipeline.shutdown().await;
+
+    let id = JobId(31020);
+    insert_active_job(
+        &mut pipeline,
+        id,
+        standalone_job_spec("idle queue edit", &[("payload.bin".into(), 512)]),
+    )
+    .await;
+    pipeline.report_all_for_test();
+    pipeline.pending_completion_checks.clear();
+    assert!(!pipeline.pipeline_is_live());
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_jobs_eligible
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline.metrics.download_jobs_hot.load(Ordering::Relaxed),
+        1
+    );
+
+    handle.cancel_job(id).await.unwrap();
+    assert!(!pipeline.pipeline_is_live());
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(
+        pipeline
+            .metrics
+            .download_jobs_eligible
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        pipeline.metrics.download_jobs_hot.load(Ordering::Relaxed),
+        0
+    );
 }
 
 fn queued_work(job_id: JobId) -> DownloadWork {
     DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id,

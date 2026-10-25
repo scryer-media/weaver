@@ -322,6 +322,12 @@ impl Pipeline {
         }
         let sweep_held = self.demotion_sweep_held_file_indices(job_id);
         let direct_admission = self.direct_store_admission(job_id);
+        if direct_admission
+            .iter()
+            .any(DirectStoreAdmission::unplaceable)
+        {
+            self.direct_store.unplaceable_verdicts.insert(job_id);
+        }
         if let Err(blocked) = self.queued_file_may_pass(
             job_id,
             &direct_admission,
@@ -496,7 +502,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn activate_download_batch_lease(
+    pub(in crate::pipeline) fn activate_download_batch_lease(
         &mut self,
         lease: &DownloadBatchLease,
         activation_items: &[(SegmentId, NzbFileId, u64)],
@@ -509,7 +515,6 @@ impl Pipeline {
         self.book_download_lane_owner(lease, starts_connection);
         self.activate_download_batch(
             lease.job_id,
-            lease.works.iter().filter(|work| work.is_recovery).count(),
             lease.completion_critical,
             lease.lane_mode,
             activation_items,
@@ -520,7 +525,6 @@ impl Pipeline {
     pub(in crate::pipeline) fn activate_download_batch(
         &mut self,
         job_id: JobId,
-        recovery_count: usize,
         completion_critical: bool,
         lane_mode: DownloadLaneMode,
         activation_items: &[(SegmentId, NzbFileId, u64)],
@@ -531,7 +535,8 @@ impl Pipeline {
             return;
         }
 
-        self.active_downloads += work_count;
+        // The in-flight article gauges were raised when the lane's record
+        // took these articles (see `hold_lane_works`).
         self.metrics
             .download_lane_lease_items_total
             .fetch_add(work_count as u64, Ordering::Relaxed);
@@ -546,10 +551,7 @@ impl Pipeline {
                 self.book_completion_critical_connection(job_id);
             }
         }
-        self.active_recovery += recovery_count;
-        *self.active_downloads_by_job.entry(job_id).or_default() += work_count;
-        for (segment_id, file_id, estimate) in activation_items {
-            *self.active_downloads_by_file.entry(*file_id).or_default() += 1;
+        for (segment_id, _, estimate) in activation_items {
             self.reserve_rate_limit_for_dispatch(*segment_id, *estimate);
         }
         self.mark_download_pass_started(job_id);

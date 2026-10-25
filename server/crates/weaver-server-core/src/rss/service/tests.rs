@@ -20,11 +20,11 @@ use axum::routing::get;
 use flate2::{Compression, write::GzEncoder};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::RwLock;
 
 use crate::security::RuntimeSecurityConfig;
 use crate::settings::Config;
-use crate::{JobSpec, PipelineMetrics, SchedulerCommand, SharedPipelineState};
+use crate::{PipelineMetrics, SharedPipelineState};
 
 #[derive(Clone)]
 struct TestHttpState {
@@ -45,11 +45,6 @@ struct TestHttpState {
 struct FeedHold {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
-}
-
-#[derive(Clone)]
-struct CapturedSubmission {
-    spec: JobSpec,
 }
 
 #[tokio::test]
@@ -194,17 +189,15 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
     })
     .unwrap();
 
-    let submissions = Arc::new(StdMutex::new(Vec::new()));
-    let service = build_service(temp.path(), db.clone(), submissions.clone());
+    let service = build_service(temp.path(), db.clone());
     let report = service.run_all_sync().await.unwrap();
     assert_eq!(report.feeds_polled, 1);
     assert_eq!(report.items_submitted, 1);
-    assert_eq!(submissions.lock().unwrap().len(), 1);
-    let first = submissions.lock().unwrap()[0].clone();
-    assert_eq!(first.spec.category.as_deref(), Some("anime"));
+    assert_eq!(service.inner.handle.list_jobs().len(), 1);
+    let first = service.inner.handle.list_jobs().remove(0);
+    assert_eq!(first.category.as_deref(), Some("anime"));
     assert!(
         first
-            .spec
             .metadata
             .iter()
             .any(|(k, v)| k == "rss.feed_name" && v == "Test Feed")
@@ -214,11 +207,10 @@ async fn run_sync_submits_matching_items_and_dedupes_across_restart() {
     drop(db);
 
     let db = Database::open(&db_path).unwrap();
-    let submissions_restart = Arc::new(StdMutex::new(Vec::new()));
-    let service_restart = build_service(temp.path(), db, submissions_restart.clone());
+    let service_restart = build_service(temp.path(), db);
     let report = service_restart.run_all_sync().await.unwrap();
     assert_eq!(report.items_new, 0);
-    assert!(submissions_restart.lock().unwrap().is_empty());
+    assert!(service_restart.inner.handle.list_jobs().is_empty());
 
     server_task.abort();
 }
@@ -275,8 +267,7 @@ async fn run_sync_uses_conditional_get_and_basic_auth() {
     })
     .unwrap();
 
-    let submissions = Arc::new(StdMutex::new(Vec::new()));
-    let service = build_service(temp.path(), db.clone(), submissions);
+    let service = build_service(temp.path(), db.clone());
     let first = service.run_all_sync().await.unwrap();
     assert_eq!(first.items_submitted, 1);
     let second = service.run_all_sync().await.unwrap();
@@ -338,7 +329,7 @@ async fn failed_fetch_is_marked_seen_and_not_retried_immediately() {
     })
     .unwrap();
 
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db);
     let first = service.run_all_sync().await.unwrap();
     assert_eq!(first.items_submitted, 0);
     assert_eq!(first.items_new, 1);
@@ -402,7 +393,7 @@ async fn background_due_sync_skips_when_manual_sync_is_active() {
     })
     .unwrap();
 
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db);
     let running = {
         let service = service.clone();
         tokio::spawn(async move { service.run_all_sync().await.unwrap() })
@@ -510,12 +501,7 @@ async fn rss_private_network_hardening_rejects_loopback_feed() {
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = basic_auth_feed("http://127.0.0.1:8080/feed.xml".to_string());
     db.insert_rss_feed(&feed).unwrap();
-    let service = build_service_with_security(
-        temp.path(),
-        db,
-        Arc::new(StdMutex::new(Vec::new())),
-        security,
-    );
+    let service = build_service_with_security(temp.path(), db, security);
 
     let error = service.fetch_feed_response(&feed).await.unwrap_err();
     assert!(error.to_string().contains("not allowed"), "{error}");
@@ -530,7 +516,7 @@ async fn rss_basic_auth_is_sent_to_same_origin_feed_and_item_requests() {
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = basic_auth_feed(format!("{base_url}/resource"));
     db.insert_rss_feed(&feed).unwrap();
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db);
 
     service.fetch_feed_response(&feed).await.unwrap();
     service
@@ -554,7 +540,7 @@ async fn rss_basic_auth_is_not_sent_to_cross_origin_items() {
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = basic_auth_feed(format!("{feed_url}/resource"));
     db.insert_rss_feed(&feed).unwrap();
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db);
 
     service.fetch_feed_response(&feed).await.unwrap();
     service
@@ -580,7 +566,7 @@ async fn rss_basic_auth_follows_same_origin_redirects_and_strips_cross_origin_re
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let feed = basic_auth_feed(format!("{same_origin_url}/resource"));
     db.insert_rss_feed(&feed).unwrap();
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db);
 
     service
         .send_rss_request(&feed, &format!("{same_origin_url}/redirect"), false)
@@ -709,10 +695,7 @@ async fn assert_oversized_feed_is_rejected(mode: OversizedFeedBodyMode) {
     feed.username = None;
     feed.password = None;
     db.insert_rss_feed(&feed).unwrap();
-    let report = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())))
-        .run_all_sync()
-        .await
-        .unwrap();
+    let report = build_service(temp.path(), db).run_all_sync().await.unwrap();
 
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     assert_eq!(report.items_fetched, 0);
@@ -733,18 +716,13 @@ async fn rss_feed_body_limit_rejects_declared_chunked_and_compressed_bodies() {
     assert_oversized_feed_is_rejected(OversizedFeedBodyMode::Gzip).await;
 }
 
-fn build_service(
-    data_dir: &Path,
-    db: Database,
-    submissions: Arc<StdMutex<Vec<CapturedSubmission>>>,
-) -> RssService {
-    build_service_with_security(data_dir, db, submissions, RuntimeSecurityConfig::default())
+fn build_service(data_dir: &Path, db: Database) -> RssService {
+    build_service_with_security(data_dir, db, RuntimeSecurityConfig::default())
 }
 
 fn build_service_with_security(
     data_dir: &Path,
     db: Database,
-    submissions: Arc<StdMutex<Vec<CapturedSubmission>>>,
     security: RuntimeSecurityConfig,
 ) -> RssService {
     let config = Arc::new(RwLock::new(Config {
@@ -767,7 +745,7 @@ fn build_service_with_security(
         metrics: Default::default(),
         config_path: None,
     }));
-    let handle = test_scheduler_handle(submissions);
+    let handle = test_scheduler_handle(data_dir, db.clone());
     crate::ingest::init_job_counter(20_000);
     let service = RssService::new_with_security(handle, config, db.clone(), security);
     route_feeds(&service, &db);
@@ -781,22 +759,16 @@ fn route_feeds(service: &RssService, db: &Database) {
     );
 }
 
-fn test_scheduler_handle(submissions: Arc<StdMutex<Vec<CapturedSubmission>>>) -> SchedulerHandle {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
-    let (event_tx, _) = tokio::sync::broadcast::channel(8);
+fn test_scheduler_handle(data_dir: &Path, db: Database) -> SchedulerHandle {
+    let (events, _) = tokio::sync::broadcast::channel(8);
     let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-    tokio::spawn(async move {
-        while let Some(command) = cmd_rx.recv().await {
-            if let SchedulerCommand::AddJob { spec, reply, .. } = command {
-                submissions
-                    .lock()
-                    .unwrap()
-                    .push(CapturedSubmission { spec });
-                let _ = reply.send(Ok(()));
-            }
-        }
-    });
-    SchedulerHandle::new(cmd_tx, event_tx, state)
+    let _ = state
+        .queue
+        .resources
+        .set(crate::pipeline::test_support::admission_resources(
+            db, data_dir,
+        ));
+    SchedulerHandle::new(events, state)
 }
 
 async fn start_test_server(state: TestHttpState) -> (String, tokio::task::JoinHandle<()>) {
@@ -928,7 +900,7 @@ async fn pause_all_holds_regular_rss_but_not_manual_fetch() {
         scripts: Vec::new(),
     })
     .unwrap();
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db);
     service.set_scheduled_paused(true);
     assert!(matches!(
         service.try_run_due_sync().await.unwrap(),
@@ -966,7 +938,7 @@ fn scheduled_feed(id: u32, last_polled_at: Option<i64>) -> RssFeedRow {
 async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
     let temp = TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();
-    let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db.clone());
     db.insert_rss_feed(&scheduled_feed(1, Some(service.now())))
         .unwrap();
     route_feeds(&service, &db);
@@ -1018,7 +990,7 @@ async fn due_sync_uses_a_cached_schedule_until_the_actual_deadline() {
 async fn a_feed_without_a_route_waits_for_the_runtime_reload() {
     let temp = TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();
-    let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db.clone());
     let runtime =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     service.inner.handle.set_proxy_runtime(runtime.clone());
@@ -1051,7 +1023,7 @@ async fn a_feed_without_a_route_waits_for_the_runtime_reload() {
 async fn a_scheduled_pause_parks_the_due_timer_until_resume() {
     let temp = TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();
-    let service = build_service(temp.path(), db.clone(), Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db.clone());
     db.insert_rss_feed(&scheduled_feed(1, None)).unwrap();
     route_feeds(&service, &db);
     service.set_scheduled_paused(true);
@@ -1084,7 +1056,7 @@ async fn due_feed_selection_loads_only_the_due_feed() {
     db.insert_rss_feed(&scheduled_feed(1, Some(unix_now_secs())))
         .unwrap();
     db.insert_rss_feed(&scheduled_feed(2, None)).unwrap();
-    let service = build_service(temp.path(), db, Arc::new(StdMutex::new(Vec::new())));
+    let service = build_service(temp.path(), db);
 
     let due = service
         .load_target_feeds(crate::rss::poller::RssSyncTarget::AllEnabledFeeds, true)
@@ -1153,8 +1125,7 @@ async fn a_new_feeds_first_sweep_leaves_its_items_for_the_rule_added_after_it() 
         consecutive_failures: 0,
     })
     .unwrap();
-    let submissions = Arc::new(StdMutex::new(Vec::new()));
-    let service = build_service(temp.path(), db.clone(), submissions.clone());
+    let service = build_service(temp.path(), db.clone());
 
     // The sweep the new feed wakes, before any rule.
     let DueSyncOutcome::Completed(swept) = service.try_run_due_sync().await.unwrap() else {
@@ -1184,7 +1155,7 @@ async fn a_new_feeds_first_sweep_leaves_its_items_for_the_rule_added_after_it() 
         (1, 1, 1),
         "{first:?}"
     );
-    assert_eq!(submissions.lock().unwrap().len(), 1);
+    assert_eq!(service.inner.handle.list_jobs().len(), 1);
     let again = service.run_feed_sync(1).await.unwrap();
     assert_eq!((again.items_new, again.items_submitted), (0, 0));
     assert_eq!(state.nzb_requests.load(Ordering::SeqCst), 1);

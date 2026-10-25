@@ -1011,3 +1011,180 @@ async fn a_refetched_demotion_releases_the_holds_it_never_reads() {
         0
     );
 }
+
+// Lease and deliver the set's articles for as long as dispatch hands any
+// out, asserting at every step that the set never holds past its own
+// admission limit. Returns how many handouts there were, and the articles
+// delivered.
+async fn fill_holds_behind_the_header(
+    pipeline: &mut Pipeline,
+    volumes: &[(String, Vec<u8>)],
+) -> (usize, Vec<(u32, u32)>) {
+    let mut handouts = 0;
+    let mut delivered = Vec::new();
+    while let Some(lease) = pipeline.lease_for_server_for_test(0) {
+        assert_eq!(lease.job_id, JOB);
+        handouts += 1;
+        for work in lease.works {
+            let id = work.segment_id;
+            delivered.push((id.file_id.file_index, id.segment_number));
+            submit_volume_article(
+                pipeline,
+                JOB,
+                volumes,
+                id.file_id.file_index,
+                id.segment_number,
+            )
+            .await;
+        }
+        let set = pipeline.direct_store.set(JOB, 0).unwrap();
+        assert!(!set.is_demoted());
+        assert!(
+            set.router.staged_bytes() <= set.router.holds_admission_limit(),
+            "nothing may be taken into the holds past the set's own room"
+        );
+    }
+    (handouts, delivered)
+}
+
+// The header of volume 65 is ruled missing: nothing of that volume is
+// queued, retrying or in flight, so no article can ever let the volumes
+// behind it place. The set fills its own room at full rate and then, instead
+// of taking one later article at a time into the reserve until the scratch
+// ceiling ends it, is handed over keeping everything it holds.
+#[tokio::test]
+async fn a_set_whose_unread_header_cannot_arrive_hands_over_instead_of_crawling() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    take_queued_segment(&mut pipeline, JOB, segment(65, 0));
+
+    let (handouts, held) = fill_holds_behind_the_header(&mut pipeline, &volumes).await;
+    assert!(handouts > 2, "the set's own room still admits at full rate");
+    assert!(
+        !pipeline.jobs[&JOB].download_queue.is_empty(),
+        "the set stopped at its room, with the rest of it still owed"
+    );
+    assert!(
+        pipeline.direct_store.unplaceable_verdicts.contains(&JOB),
+        "the pass that found nothing admissible noted the set"
+    );
+    assert!(held.iter().all(|(file, _)| *file > 65));
+
+    pipeline.settle_direct_unplaceable_sets().await;
+    assert!(pipeline.direct_store.unplaceable_verdicts.is_empty());
+    assert!(
+        format!("{:?}", pipeline.direct_store.sets_for(JOB)).contains("HoldsScratchCeiling"),
+        "{:?}",
+        pipeline.direct_store.sets_for(JOB)
+    );
+    settle_direct_post_repair_work(&mut pipeline).await;
+
+    // Whole held volumes are rebuilt from the holds and none of their
+    // articles is fetched again.
+    let working = pipeline.jobs.get(&JOB).unwrap().working_dir.clone();
+    let state = pipeline.jobs.get_mut(&JOB).unwrap();
+    let owed = state.download_queue.drain_all();
+    let queued: Vec<(u32, u32)> = owed
+        .iter()
+        .map(|work| {
+            (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            )
+        })
+        .collect();
+    for work in owed {
+        state.download_queue.push(work);
+    }
+    for file in 66..84u32 {
+        if !(held.contains(&(file, 0)) && held.contains(&(file, 1))) {
+            continue;
+        }
+        let (name, bytes) = &volumes[file as usize];
+        assert_eq!(
+            &std::fs::read(working.join(name)).unwrap(),
+            bytes,
+            "held volume {name} must be rebuilt byte-exactly from its holds"
+        );
+    }
+    for arrival in &held {
+        assert!(
+            !queued.contains(arrival),
+            "held article {arrival:?} must not be fetched again"
+        );
+    }
+
+    // What is left goes out on the conventional path in whole handouts.
+    let lease = pipeline
+        .lease_for_server_for_test(0)
+        .expect("the handed-over set's queue is servable again");
+    assert!(
+        lease.works.len() > 1,
+        "the set is no longer fed one article at a time"
+    );
+}
+
+// The header of volume 65 is parked for a retry. The set fills its own room
+// and then waits for that retry without asking for anything past it, and
+// every handout in the meantime goes to the next job, whole.
+#[tokio::test]
+async fn a_set_waiting_on_a_parked_header_retry_leaves_the_link_to_other_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, volumes) = fixture();
+    let mut pipeline = prepared(&temp, &volumes).await;
+    let header = pipeline
+        .jobs
+        .get_mut(&JOB)
+        .unwrap()
+        .download_queue
+        .pop_first_matching(|work| work.segment_id == segment(65, 0))
+        .unwrap();
+    pipeline.note_retry_scheduled(header.segment_id);
+
+    let (_, held) = fill_holds_behind_the_header(&mut pipeline, &volumes).await;
+    assert!(!held.is_empty());
+    assert!(!pipeline.jobs[&JOB].download_queue.is_empty());
+    assert!(
+        pipeline.direct_store.unplaceable_verdicts.is_empty(),
+        "a retry still to come can place the holds, so the set waits for it"
+    );
+
+    let other = JobId(48006);
+    insert_active_job(
+        &mut pipeline,
+        other,
+        segmented_job_spec("Other", "other.bin", &[100; 64]),
+    )
+    .await;
+    assert_eq!(pipeline.current_hot_job(), Some(JOB));
+    let mut handouts = 0;
+    while !pipeline.jobs[&other].download_queue.is_empty() {
+        let before = pipeline.jobs[&other].download_queue.len();
+        let lease = pipeline
+            .lease_for_server_for_test(0)
+            .expect("a waiting set must not idle the link while another job has work");
+        assert_eq!(lease.job_id, other);
+        assert!(
+            lease.works.len() > 1 || before == 1,
+            "the other job is served whole, not one article at a time"
+        );
+        handouts += 1;
+    }
+    assert!(handouts < 64);
+    assert!(!pipeline.direct_store.set(JOB, 0).unwrap().is_demoted());
+
+    // The retry comes back, and it is the one article asked of the set.
+    pipeline.jobs.remove(&other);
+    pipeline.job_order.retain(|job_id| *job_id != other);
+    pipeline.note_retry_requeued(header.segment_id);
+    pipeline
+        .jobs
+        .get_mut(&JOB)
+        .unwrap()
+        .download_queue
+        .push(header);
+    let probe = pipeline.lease_for_server_for_test(0).unwrap();
+    assert_eq!(probe.works.len(), 1);
+    assert_eq!(probe.works[0].segment_id, segment(65, 0));
+}

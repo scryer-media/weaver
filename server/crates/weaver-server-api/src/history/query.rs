@@ -584,8 +584,8 @@ fn build_history_page_sql(
     })
 }
 
-// Ids of the jobs the scheduler still owns, i.e. whose status is neither of
-// the two terminal ones.
+// Ids of every row the queue still owns, including hidden cancellations and
+// terminal rows whose archive acknowledgement has not retired them yet.
 //
 // A job can have a history row while the scheduler still holds it: the row is
 // written before the job leaves the scheduler, and a re-queued job keeps its
@@ -594,18 +594,7 @@ fn build_history_page_sql(
 // is still live. Every history read surface applies this same predicate so the
 // single-item read, the lists, and the queue cannot disagree.
 pub(crate) fn live_job_ids(handle: &SchedulerHandle) -> HashSet<u64> {
-    handle
-        .list_jobs()
-        .into_iter()
-        .filter(|info| {
-            !matches!(
-                info.status,
-                weaver_server_core::JobStatus::Complete
-                    | weaver_server_core::JobStatus::Failed { .. }
-            )
-        })
-        .map(|info| info.job_id.0)
-        .collect()
+    handle.queued_job_ids().into_iter().map(|id| id.0).collect()
 }
 
 // Drop the history rows whose job is still live (see [`live_job_ids`]).
@@ -1345,10 +1334,8 @@ mod tests {
     // here drives the pipeline; the reads under test go straight to the
     // published list.
     fn scheduler_with_jobs(jobs: Vec<JobInfo>) -> SchedulerHandle {
-        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1);
         SchedulerHandle::new(
-            command_tx,
             event_tx,
             weaver_server_core::jobs::handle::SharedPipelineState::new(
                 weaver_server_core::operations::metrics::PipelineMetrics::new(),
@@ -1417,11 +1404,20 @@ mod tests {
             0
         );
 
-        // Once the scheduler reports it terminal, the same row is history again.
+        // A terminal report still belongs to the queue until retirement.
         let handle = scheduler_with_jobs(vec![resident_job(
             &row,
             weaver_server_core::JobStatus::Complete,
         )]);
+        let live = live_job_ids(&handle);
+        assert!(live.contains(&3));
+        let page = load_history_page(db.clone(), live, page_input(0, 25, None))
+            .await
+            .unwrap();
+        assert!(!page.items.iter().any(|item| item.id == 3));
+
+        // Only removal from the queue makes its durable row history.
+        let handle = scheduler_with_jobs(vec![]);
         let live = live_job_ids(&handle);
         assert!(live.is_empty());
         let page = load_history_page(db, live, page_input(0, 25, None))
@@ -1431,6 +1427,30 @@ mod tests {
         assert!(ids.contains(&3));
         assert_eq!(page.total_count, 7);
         assert_eq!(page.counts.success, 3);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_row_is_not_history_until_retirement() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let row = history_row(3, "cancelled", 1_200);
+        let handle = scheduler_with_jobs(vec![resident_job(
+            &row,
+            weaver_server_core::JobStatus::Queued,
+        )]);
+        handle
+            .cancel_job(weaver_server_core::JobId(3))
+            .await
+            .unwrap();
+        // Still listed: the job leaves the queue only once its history row commits.
+        assert!(handle.list_jobs().iter().any(|job| job.job_id.0 == 3));
+        let live = live_job_ids(&handle);
+        assert!(live.contains(&3));
+        let page = load_history_page(db, live, page_input(0, 25, None))
+            .await
+            .unwrap();
+        assert!(!page.items.iter().any(|item| item.id == 3));
+        assert_eq!(page.total_count, 6);
     }
 
     #[tokio::test]

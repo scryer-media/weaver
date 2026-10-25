@@ -9,11 +9,11 @@ use chrono::{
     DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone,
 };
 
-use crate::SchedulerError;
 use crate::bandwidth::QuotaWeekday;
 use crate::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use crate::pipeline::Pipeline;
 use crate::servers::{ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // Origin of a global download pause, so the download-block presentation can
 // distinguish a schedule-driven pause from a manual one across every refresh.
@@ -25,6 +25,45 @@ pub(crate) enum GlobalPause {
     Manual,
     // A bandwidth schedule paused downloads.
     Scheduled,
+}
+
+/// Written by transport lanes, sampled independently of pipeline completions.
+#[derive(Debug)]
+pub(crate) struct BandwidthCounters {
+    metered: AtomicU64,
+    unmetered: AtomicU64,
+    enabled: AtomicBool,
+}
+
+impl Default for BandwidthCounters {
+    fn default() -> Self {
+        Self {
+            metered: AtomicU64::new(0),
+            unmetered: AtomicU64::new(0),
+            enabled: AtomicBool::new(true),
+        }
+    }
+}
+
+impl BandwidthCounters {
+    pub(crate) fn record(&self, bytes: u64) {
+        let target = if self.enabled.load(Ordering::Relaxed) {
+            &self.metered
+        } else {
+            &self.unmetered
+        };
+        target.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.metered
+            .load(Ordering::Relaxed)
+            .saturating_add(self.unmetered.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_metering_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
 }
 
 const BANDWIDTH_LEDGER_RETENTION_DAYS: i64 = 90;
@@ -58,18 +97,53 @@ impl QuotaWindow {
 // It records every BODY byte once, tagged with whether quota metering was on
 // when it arrived, and flushes in batches. Download quotas themselves live on
 // each egress and server; nothing here refuses work.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BandwidthLedgerRuntime {
-    metering_suspended: bool,
+    sampled: [u64; 2],
     last_pruned_bucket_epoch_minute: Option<i64>,
     pending_usage_by_minute: BTreeMap<(i64, bool), u64>,
     pending_usage_bytes: u64,
     pending_usage_started_at: Option<Instant>,
+    // Batches handed to the writer whose write has not answered yet. A batch
+    // stays here until its write commits; a failed or dropped write puts its
+    // bytes back in the pending ledger.
+    unacknowledged_usage: Vec<UnacknowledgedUsage>,
+}
+
+#[derive(Debug)]
+struct UnacknowledgedUsage {
+    entries: Vec<(i64, bool, u64)>,
+    committed: tokio::sync::oneshot::Receiver<bool>,
 }
 
 impl BandwidthLedgerRuntime {
-    pub(crate) fn set_metering_enabled(&mut self, enabled: bool) {
-        self.metering_suspended = !enabled;
+    pub(crate) fn sample(
+        &mut self,
+        db: &crate::Database,
+        counters: &BandwidthCounters,
+        flush: bool,
+    ) -> Result<(), crate::StateError> {
+        for (index, total) in [
+            counters.unmetered.load(Ordering::Relaxed),
+            counters.metered.load(Ordering::Relaxed),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = total.saturating_sub(self.sampled[index]);
+            if bytes > 0 {
+                self.record_pending_usage(
+                    crate::e2e_clock::unix_seconds().div_euclid(60),
+                    bytes,
+                    index == 1,
+                );
+                self.sampled[index] = total;
+            }
+        }
+        if flush || self.should_flush_pending_usage() {
+            self.flush_pending_usage(db)?;
+        }
+        self.prune_if_due(db)
     }
 
     // Queues the delete of buckets past retention, once per minute. It goes
@@ -88,28 +162,17 @@ impl BandwidthLedgerRuntime {
         Ok(())
     }
 
-    pub(crate) fn record_download_bytes(
-        &mut self,
-        db: &crate::Database,
-        payload_bytes: u64,
-    ) -> Result<(), crate::StateError> {
-        let bucket_epoch_minute = crate::e2e_clock::unix_seconds().div_euclid(60);
-        self.record_pending_usage(bucket_epoch_minute, payload_bytes);
-        if self.should_flush_pending_usage() {
-            self.flush_pending_usage(db)?;
-            self.prune_if_due(db)?;
-        }
-        Ok(())
-    }
-
     // Hands the pending minutes to the ordered writer queue. The caller is
-    // the per-article download path, so the write itself never runs here; a
+    // independent counter ticker, so the write itself never runs here; a
     // batch lost to a crash only shortens the usage graph, and the queue's
     // order keeps the shutdown flush behind every batch handed over before it.
+    // A handed-over batch leaves the ledger only once its write commits: a
+    // write that fails returns its bytes to the next flush.
     pub(crate) fn flush_pending_usage(
         &mut self,
         db: &crate::Database,
     ) -> Result<(), crate::StateError> {
+        self.settle_unacknowledged_usage();
         if self.pending_usage_by_minute.is_empty() {
             return Ok(());
         }
@@ -118,24 +181,53 @@ impl BandwidthLedgerRuntime {
             .iter()
             .map(|((bucket, metered), bytes)| (*bucket, *metered, *bytes))
             .collect::<Vec<_>>();
+        let (committed_tx, committed) = tokio::sync::oneshot::channel();
+        let written = entries.clone();
         db.try_queue_write("bandwidth_usage_flush", move |db| {
             let started = std::time::Instant::now();
-            let result = db.add_metered_bandwidth_usage_minutes(&entries);
+            let result = db.add_metered_bandwidth_usage_minutes(&written);
             crate::runtime::perf_probe::record("bandwidth.flush_pending_usage", started.elapsed());
+            let _ = committed_tx.send(result.is_ok());
             result
         })?;
+        self.unacknowledged_usage
+            .push(UnacknowledgedUsage { entries, committed });
         self.pending_usage_by_minute.clear();
         self.pending_usage_bytes = 0;
         self.pending_usage_started_at = None;
         Ok(())
     }
 
-    fn record_pending_usage(&mut self, bucket_epoch_minute: i64, payload_bytes: u64) {
+    // Drops every batch whose write committed and merges back the bytes of
+    // every batch whose write failed or was dropped unrun. A batch whose write
+    // has not run yet stays.
+    fn settle_unacknowledged_usage(&mut self) {
+        let mut returned = Vec::new();
+        self.unacknowledged_usage
+            .retain_mut(|batch| match batch.committed.try_recv() {
+                Ok(true) => false,
+                Ok(false) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    returned.append(&mut batch.entries);
+                    false
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            });
+        for (bucket_epoch_minute, metered, bytes) in returned {
+            self.record_pending_usage(bucket_epoch_minute, bytes, metered);
+        }
+    }
+
+    fn record_pending_usage(
+        &mut self,
+        bucket_epoch_minute: i64,
+        payload_bytes: u64,
+        metered: bool,
+    ) {
         if self.pending_usage_by_minute.is_empty() {
             self.pending_usage_started_at = Some(Instant::now());
         }
         self.pending_usage_by_minute
-            .entry((bucket_epoch_minute, !self.metering_suspended))
+            .entry((bucket_epoch_minute, metered))
             .and_modify(|bytes| *bytes = bytes.saturating_add(payload_bytes))
             .or_insert(payload_bytes);
         self.pending_usage_bytes = self.pending_usage_bytes.saturating_add(payload_bytes);
@@ -147,14 +239,16 @@ impl BandwidthLedgerRuntime {
                 .pending_usage_started_at
                 .is_some_and(|started| started.elapsed() >= BANDWIDTH_USAGE_FLUSH_INTERVAL)
     }
+}
 
-    pub(crate) fn to_download_block_state(&self, pause: GlobalPause) -> DownloadBlockState {
+impl GlobalPause {
+    pub(crate) fn to_download_block_state(self) -> DownloadBlockState {
         // The origin of the pause is carried explicitly so every block-state
         // refresh reports the same kind: deriving it from a single
         // `global_paused` bool let a scheduled pause be silently reclassified
         // as manual by any later refresh. Quota blocks are laid over this by
         // the shared state.
-        let kind = match pause {
+        let kind = match self {
             GlobalPause::Manual => DownloadBlockKind::ManualPause,
             GlobalPause::Scheduled => DownloadBlockKind::Scheduled,
             GlobalPause::Running => DownloadBlockKind::None,
@@ -347,26 +441,9 @@ impl Pipeline {
     }
 
     pub(crate) fn publish_download_block(&mut self) {
-        let mut block = self
-            .bandwidth_ledger
-            .to_download_block_state(self.global_pause());
+        let mut block = self.global_pause().to_download_block_state();
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
         self.shared_state.set_download_block(block);
-    }
-
-    pub(crate) fn record_download_bandwidth_usage(
-        &mut self,
-        payload_bytes: u64,
-    ) -> Result<(), SchedulerError> {
-        self.bandwidth_ledger
-            .record_download_bytes(&self.db, payload_bytes)?;
-        Ok(())
-    }
-
-    pub(crate) fn flush_download_bandwidth_usage(&mut self) -> Result<(), SchedulerError> {
-        self.bandwidth_ledger.flush_pending_usage(&self.db)?;
-        self.bandwidth_ledger.prune_if_due(&self.db)?;
-        Ok(())
     }
 }
 

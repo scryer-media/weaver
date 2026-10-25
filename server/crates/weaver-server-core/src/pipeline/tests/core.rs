@@ -189,82 +189,24 @@ async fn spawn_capacity_limited_body_server(
 }
 
 #[tokio::test]
-async fn metrics_refresh_advances_during_continuous_download_result_turns() {
+async fn metrics_refresh_advances_without_pipeline_turns() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     tokio::time::pause();
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
-    let mut pending = VecDeque::new();
-    // Results already accepted before cancellation still traverse this seam.
-    // Keep more than one bounded batch queued for every observed refresh.
-    for segment_number in 0..160 {
-        pending.push_back(DownloadResult {
-            lane_id: 0,
-            job_id: JobId(991),
-            runtime_generation: 0,
-            segment_id: SegmentId {
-                file_id: NzbFileId {
-                    job_id: JobId(991),
-                    file_index: 0,
-                },
-                segment_number,
-            },
-            data: Ok(DownloadPayload::Raw(Bytes::new())),
-            attempts: vec![],
-            lane_observation: None,
-            source_server_idx: None,
-            origin: DownloadResultOrigin::NormalPrimary,
-            retry_count: 0,
-            exclude_servers: vec![],
-            release_connection_slot: false,
-        });
-    }
-    for downloaded in 1..=3 {
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut changes = handle.subscribe_job_changes();
+    for downloaded in [1, 2, 99] {
+        let watermark = *changes.borrow_and_update();
         pipeline
             .metrics
             .bytes_downloaded
             .store(downloaded, Ordering::Relaxed);
-        pipeline.snapshot_publish_pending = true;
-        tokio::time::advance(Duration::from_millis(100)).await;
-        assert_eq!(
-            pipeline
-                .process_download_result_turn(&mut pending, &mut interval)
-                .await,
-            16
-        );
-        assert!(!pending.is_empty());
-        assert_eq!(
-            pipeline.shared_state.metrics_snapshot().bytes_downloaded,
-            downloaded
-        );
-        assert!(!pipeline.snapshot_publish_pending);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        while pipeline.shared_state.metrics_snapshot().bytes_downloaded != downloaded {
+            changes.changed().await.unwrap();
+        }
+        assert!(*changes.borrow() > watermark);
     }
-    // Busy turns before the deadline must not oversample or reset the cadence.
-    pipeline
-        .metrics
-        .bytes_downloaded
-        .store(99, Ordering::Relaxed);
-    assert_eq!(
-        pipeline
-            .process_download_result_turn(&mut pending, &mut interval)
-            .await,
-        16
-    );
-    assert_eq!(pipeline.shared_state.metrics_snapshot().bytes_downloaded, 3);
-    pending.clear();
-    tokio::time::advance(Duration::from_secs(1)).await;
-    assert_eq!(
-        pipeline
-            .process_download_result_turn(&mut pending, &mut interval)
-            .await,
-        0
-    );
-    assert_eq!(
-        pipeline.shared_state.metrics_snapshot().bytes_downloaded,
-        99
-    );
 }
 
 #[tokio::test]
@@ -273,22 +215,49 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
     let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(99);
 
+    pipeline.shared_state.queue.write(|inner| {
+        inner
+            .jobs
+            .push(crate::pipeline::queue::JobRow::new(finished_job_info(
+                job_id,
+            )));
+        crate::pipeline::queue::Change::changed(())
+    });
     let repairing = pipeline.phase_begin(job_id, JobPhase::Repairing, Some(100));
     repairing.completed_bytes.store(25, Ordering::Relaxed);
     let extracting = pipeline.phase_begin(job_id, JobPhase::Extracting, Some(200));
     extracting.completed_bytes.store(50, Ordering::Relaxed);
-
-    pipeline.sample_phase_progress();
-    assert_eq!(
-        pipeline.phase_progress_snapshots.get(&job_id).map(Vec::len),
-        Some(2)
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        std::time::Instant::now(),
     );
-
+    assert_eq!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .phase_progress
+            .len(),
+        2
+    );
     pipeline.phase_end(job_id, JobPhase::Extracting);
-
-    let remaining = pipeline.phase_progress_snapshots.get(&job_id).unwrap();
+    let remaining = pipeline
+        .shared_state
+        .get_job(job_id)
+        .unwrap()
+        .phase_progress;
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].phase, JobPhase::Repairing);
+    pipeline.clear_job_phase_progress_runtime(job_id);
+    assert!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .phase_progress
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -677,7 +646,11 @@ async fn rename_preserves_an_existing_working_directory_collision() {
     std::fs::create_dir(&collision).unwrap();
     std::fs::write(collision.join("keep.bin"), b"another job's data").unwrap();
 
-    pipeline.rederive_unwritten_working_dir(job_id);
+    assert!(
+        !pipeline
+            .rename_working_dir_when_quiet(job_id, "renamed")
+            .await
+    );
 
     assert_eq!(
         std::fs::read(collision.join("keep.bin")).unwrap(),
@@ -726,7 +699,8 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
         job_id,
         minimal_job_state(job_id, job_name, working_dir.clone()),
     );
-
+    pipeline.job_order.push(job_id);
+    pipeline.report_all_for_test();
     pipeline.start_move_to_complete(job_id).await.unwrap();
     let done = pipeline.move_done_rx.recv().await.unwrap();
     let dest = done.dest.clone();
@@ -740,8 +714,14 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
 
     assert_eq!(dest, expected_dest);
     assert!(!pipeline.jobs.contains_key(&job_id));
-    assert!(pipeline.finished_jobs.iter().any(|job| job.job_id == job_id
-        && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap())));
+    assert!(
+        pipeline
+            .finished_jobs()
+            .await
+            .into_iter()
+            .any(|job| job.job_id == job_id
+                && job.output_dir.as_deref() == Some(expected_dest.to_str().unwrap()))
+    );
     assert!(!working_dir.exists());
     assert_eq!(
         tokio::fs::read(dest.join(payload_dir).join(episode_name))
@@ -769,7 +749,8 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
         job_id,
         minimal_job_state(job_id, job_name, missing_working_dir),
     );
-
+    pipeline.job_order.push(job_id);
+    pipeline.report_all_for_test();
     pipeline.check_job_completion(job_id).await;
     settle_inflight_moves(&mut pipeline).await;
     settle_inflight_moves(&mut pipeline).await;
@@ -856,7 +837,8 @@ async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts()
         job_id,
         minimal_job_state(job_id, job_name, working_dir.clone()),
     );
-
+    pipeline.job_order.push(job_id);
+    pipeline.report_all_for_test();
     pipeline.start_move_to_complete(job_id).await.unwrap();
 
     settle_inflight_moves(&mut pipeline).await;
@@ -1318,6 +1300,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     }
 
     let make_work = || DownloadWork {
+        counters: None,
         segment_id,
         message_id: MessageId::new("stale-exclusion@example.com"),
         groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
@@ -1511,10 +1494,11 @@ async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
     assert!(!pipeline.jobs.contains_key(&job_id));
     assert!(matches!(
         pipeline
-            .finished_jobs
-            .iter()
+            .finished_jobs()
+            .await
+            .into_iter()
             .find(|job| job.job_id == job_id)
-            .map(|job| &job.status),
+            .map(|job| job.status),
         Some(JobStatus::Failed { .. })
     ));
 }
@@ -1555,10 +1539,11 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     assert!(!pipeline.jobs.contains_key(&job_id));
     assert!(matches!(
         pipeline
-            .finished_jobs
-            .iter()
+            .finished_jobs()
+            .await
+            .into_iter()
             .find(|job| job.job_id == job_id)
-            .map(|job| &job.status),
+            .map(|job| job.status),
         Some(JobStatus::Complete)
     ));
 }
@@ -1644,6 +1629,85 @@ async fn repeated_articles_fetch_once_and_preserve_every_admitted_file() {
 #[tokio::test]
 async fn repeated_uuencode_articles_preserve_each_file_and_wire_accounting() {
     repeated_article_case(true).await;
+}
+
+#[tokio::test]
+async fn cancel_mid_download_archives_then_cleans_up() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write.write_all(b"200 fixture ready\r\n").await.unwrap();
+        let mut lines = BufReader::new(read).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.starts_with("BODY ") {
+                write.write_all(b"222 0 <held@example.com> body\r\n=ybegin line=128 size=100 name=payload.bin\r\n").await.unwrap();
+                started_tx.send(()).unwrap();
+                let _ = release_rx.await;
+                break;
+            }
+            let response: &[u8] = if line == "CAPABILITIES" {
+                b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+            } else if line.starts_with("GROUP ") {
+                b"211 1 1 1 alt.binaries.test\r\n"
+            } else {
+                b"500 unsupported\r\n"
+            };
+            write.write_all(response).await.unwrap();
+        }
+    });
+    let harness = TestHarness::new_with_nntp(capacity_test_client(port, 1), 1).await;
+    let id = JobId(80032);
+    let script =
+        crate::post_processing::events::hold_test_event_run(&harness.db, id.0, "cancel-cleanup");
+    let mut events = harness.handle.subscribe_events();
+    let mut revisions = harness.handle.subscribe_job_changes();
+    harness
+        .handle
+        .add_job(
+            id,
+            segmented_job_spec("Held download", "payload.bin", &[100]),
+            PathBuf::from("held.nzb"),
+            sample_nzb_zstd(),
+        )
+        .await
+        .unwrap();
+    started_rx.await.unwrap();
+    let path = PathBuf::from(harness.handle.get_job(id).unwrap().output_dir.unwrap());
+    let watermark = harness.handle.job_revision();
+    harness.handle.cancel_job(id).await.unwrap();
+    assert!(harness.handle.job_revision() > watermark);
+    assert!(path.exists());
+    release_tx.send(()).unwrap();
+    server.await.unwrap();
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id } if job_id == id)
+    {
+    }
+    assert_eq!(
+        harness.db.get_job_history(id.0).unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert!(path.exists());
+    drop(script);
+    loop {
+        revisions.mark_unchanged();
+        if !path.exists() {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    assert!(
+        !harness
+            .handle
+            .list_jobs()
+            .iter()
+            .any(|job| job.job_id == id)
+    );
+    harness.shutdown().await;
 }
 
 async fn repeated_article_case(uuencode: bool) {

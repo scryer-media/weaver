@@ -175,7 +175,7 @@ impl DownloadPressureReason {
 // it is advanced once per 100 ms metrics tick under the tracker mutex, and
 // once per active job phase on that same tick, so a job's displayed rate and
 // the global gauge are one estimator over one window and can be compared.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RateSeries {
     // Ring buffer of (timestamp, cumulative value) samples.
     samples: Vec<(Instant, u64)>,
@@ -197,10 +197,23 @@ impl RateSeries {
         }
     }
 
-    // Whether any sample has been recorded since construction.
-    #[cfg(test)]
-    pub(crate) fn has_samples(&self) -> bool {
-        !self.samples.is_empty()
+    // A series on this one's sample instants that has counted nothing yet:
+    // every past sample holds `cumulative` and the smoothed rate is zero.
+    //
+    // A counter that starts contributing to a total mid-window gets one of
+    // these from the total's series. Both are then the same linear estimator
+    // over the same instants, so the parts' rates sum to the total's rate.
+    pub(crate) fn aligned_from(&self, cumulative: u64) -> Self {
+        Self {
+            samples: self
+                .samples
+                .iter()
+                .map(|&(at, _)| (at, cumulative))
+                .collect(),
+            pos: self.pos,
+            rate: 0.0,
+            last_ema_at: self.last_ema_at,
+        }
     }
 
     // Record a sample and recompute the smoothed rate.
@@ -900,19 +913,49 @@ impl PipelineMetrics {
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
-        let segments_downloaded = self.segments_downloaded.load(Ordering::Relaxed);
-        let bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
-        // One mutex acquisition per 100 ms tick, on the metrics publisher — not
-        // a per-segment path. All three published rates advance together so they
-        // describe the same window.
-        let rates = self.speed_tracker.lock().unwrap().update(
+        self.sample_totals(
             Instant::now(),
-            bytes_downloaded,
+            self.bytes_downloaded.load(Ordering::Relaxed),
+            0,
+            0,
+        )
+    }
+
+    // The global download series as it stands before this tick, holding
+    // nothing: what a job's download rate starts from, so the job's rate and
+    // the gauge share every sample instant.
+    pub(crate) fn download_rate_seed(&self) -> RateSeries {
+        self.speed_tracker
+            .lock()
+            .unwrap()
+            .bytes_downloaded
+            .aligned_from(0)
+    }
+
+    // `downloaded` is the wire-byte counter the download gauge integrates. The
+    // queue hands it the transfer total every job's own counter is credited
+    // beside, so the jobs' download rates sum to the gauge.
+    pub(crate) fn sample_totals(
+        &self,
+        now: Instant,
+        downloaded: u64,
+        decoded: u64,
+        articles: u64,
+    ) -> MetricsSnapshot {
+        let bytes_downloaded = downloaded.max(self.bytes_downloaded.load(Ordering::Relaxed));
+        let segments_downloaded = articles.max(self.segments_downloaded.load(Ordering::Relaxed));
+        let bytes_decoded = decoded.max(self.bytes_decoded.load(Ordering::Relaxed));
+        // One independent sampling tick advances every rate on the same clock.
+        let rates = self.speed_tracker.lock().unwrap().update(
+            now,
+            downloaded,
             segments_downloaded,
             bytes_decoded,
         );
-        self.snapshot_with_speed(bytes_downloaded, rates)
+        let mut snapshot = self.snapshot_with_speed(bytes_downloaded, rates);
+        snapshot.bytes_decoded = bytes_decoded;
+        snapshot.segments_downloaded = segments_downloaded;
+        snapshot
     }
 
     // Return a fresh atomics-based metrics snapshot without advancing the
@@ -929,13 +972,6 @@ impl PipelineMetrics {
     // tick: only the intervals in which bytes arrived.
     pub fn download_time(&self) -> Duration {
         self.speed_tracker.lock().unwrap().download_time
-    }
-
-    // Forget every rate sample, so a test can start the global window at a
-    // known tick instead of at whatever moment the metrics were constructed.
-    #[cfg(test)]
-    pub(crate) fn reset_speed_tracker(&self) {
-        *self.speed_tracker.lock().unwrap() = SpeedTracker::new();
     }
 }
 

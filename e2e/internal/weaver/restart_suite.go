@@ -278,6 +278,69 @@ func restartCases() []restartCase {
 			Slugs:       []string{conventional7zRepairSlug},
 			Run:         runConventional7zDamagedBlockRepairsOnce,
 		},
+		{
+			Name:        "early_gap_restart_refetches_only_the_gap",
+			Description: "A restart after an early missing article keeps every covered ordinal past it and fetches only what the checkpoint did not cover",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     15 * time.Minute,
+			Run:         runEarlyGapRestartRefetchesOnlyTheGap,
+		},
+		{
+			Name:        "interrupt_during_verifying_refetches_nothing",
+			Description: "A Ctrl-C while a job verifies restarts verification from the files without a single fetch",
+			Slugs:       []string{"par2-small-repair"},
+			Timeout:     10 * time.Minute,
+			Run:         runInterruptDuringVerifyingRefetchesNothing,
+		},
+		{
+			Name:        "interrupt_during_par2_pass_stops_the_pass",
+			Description: "A Ctrl-C during a PAR2 pass stops the pass before the process exits, and the restart scans again and repairs",
+			Slugs:       []string{"par2-heavy-damage"},
+			Timeout:     15 * time.Minute,
+			Run:         runInterruptDuringPar2PassStopsThePass,
+		},
+		{
+			Name:        "credentials_refused_mid_job_settles",
+			Description: "The only server refuses the account mid-job; the queued articles are retired in one sweep and the job settles",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     10 * time.Minute,
+			Run:         runCredentialsRefusedMidJobSettles,
+		},
+		{
+			Name:        "shutdown_mid_batch_is_not_an_unclean_batch",
+			Description: "A Ctrl-C mid-batch records no unclean batch, keeps the persisted depth and dumps no stall diagnostics",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     10 * time.Minute,
+			Run:         runShutdownMidBatchIsNotAnUncleanBatch,
+		},
+		{
+			Name:        "early_gap_does_not_throttle",
+			Description: "With one early article missing, the rest of the file downloads while it is missing",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     10 * time.Minute,
+			Run:         runEarlyGapDoesNotThrottle,
+		},
+		{
+			Name:        "pre_65_checkpoint_row_refused",
+			Description: "A prefix floor left by a pre-65 database is dropped by the upgrade, and the file downloads again from nothing",
+			Slugs:       []string{"single-mkv"},
+			Timeout:     15 * time.Minute,
+			Run:         runPre65CheckpointRowRefused,
+		},
+		{
+			Name:        "poison_extent_does_not_spread",
+			Description: "An article whose yEnc extent runs into its neighbour stays its own failure across a restart",
+			Slugs:       []string{"par2-small-repair"},
+			Timeout:     10 * time.Minute,
+			Run:         runPoisonExtentDoesNotSpread,
+		},
+		{
+			Name:        "repair_data_wait_reads_fetching_repair_data",
+			Description: "A damaged job whose recovery data the server lacks reads FETCHING_REPAIR_DATA, then repairs once it is back",
+			Slugs:       []string{"par2-small-repair"},
+			Timeout:     10 * time.Minute,
+			Run:         runRepairDataWaitReadsFetchingRepairData,
+		},
 	}
 }
 
@@ -483,18 +546,10 @@ func uniqueRestartSlugs(cases []restartCase) []string {
 		}
 	}
 	out := make([]string, 0, len(set))
-	staticCount := 0
-	for _, slug := range restartFixtureSlugs {
-		if set[slug] {
-			out = append(out, slug)
-			delete(set, slug)
-			staticCount++
-		}
-	}
 	for slug := range set {
 		out = append(out, slug)
 	}
-	sort.Strings(out[staticCount:])
+	sort.Strings(out)
 	return out
 }
 
@@ -571,7 +626,7 @@ func (ctx *restartCaseContext) startWeaverWithOptions(failpoint string, connecti
 		if strings.HasPrefix(entry, "WEAVER_E2E_FAILPOINT=") {
 			continue
 		}
-		if strings.HasPrefix(entry, "WEAVER_E2E_DELAY=") {
+		if strings.HasPrefix(entry, "WEAVER_E2E_DELAY=") || strings.HasPrefix(entry, "WEAVER_E2E_HOLD=") {
 			continue
 		}
 		if strings.HasPrefix(entry, "WEAVER_MAX_CONCURRENT_EXTRACTIONS=") {
@@ -1119,15 +1174,23 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 		query string
 		apply func(*restartJobMetrics, int64, int64)
 	}
+	// A file's restart checkpoint is a coverage blob (migration 65), so its
+	// bytes are summed here from the decoded runs rather than in SQL.
+	coverage, err := readFileCoverageRows(db, datastore)
+	if err != nil {
+		return snapshot, err
+	}
+	for _, row := range coverage {
+		metrics := snapshot.JobMetrics[row.JobID]
+		metrics.Segments++
+		if row.Err == nil {
+			metrics.SegmentBytes += row.Coverage.CoveredBytes()
+			metrics.FileProgressBytes += row.Coverage.CoveredBytes()
+		}
+		snapshot.JobMetrics[row.JobID] = metrics
+	}
+
 	aggregates := []aggregateSpec{
-		{
-			query: `SELECT job_id, COUNT(*), COALESCE(SUM(contiguous_bytes_written), 0) FROM active_file_progress GROUP BY job_id`,
-			apply: func(m *restartJobMetrics, count, sum int64) {
-				m.Segments = int(count)
-				m.SegmentBytes = uint64(sum)
-				m.FileProgressBytes = uint64(sum)
-			},
-		},
 		{
 			query: `SELECT job_id, COUNT(*), 0 FROM active_files GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {

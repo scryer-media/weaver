@@ -621,6 +621,7 @@ async fn missing_middle_rar_volume_enters_authoritative_par2_repair() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -2034,6 +2035,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.download_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -2722,6 +2724,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
     pipeline.rar_unlock_priority_dirty_jobs.clear();
 
     pipeline.enqueue_download_work(DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: standalone_job_id,

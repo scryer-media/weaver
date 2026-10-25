@@ -1352,7 +1352,17 @@ async fn a_restored_job_with_a_conventional_floor_is_never_readmitted() {
             job_id,
             job_hash: [0; 32],
             spec,
-            file_progress: HashMap::from([(0u32, encoded_floor)]),
+            file_progress: HashMap::from([(
+                0u32,
+                crate::jobs::assembly::FileCoverage::from_ordered_runs([
+                    crate::jobs::assembly::CoverageRun {
+                        first_ordinal: 0,
+                        ordinals: 1,
+                        start: 0,
+                        end: split_at as u64,
+                    },
+                ]),
+            )]),
             complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
