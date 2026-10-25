@@ -28,6 +28,13 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
+    rig_on(Arc::new(
+        crate::torrents::sessions::tests::FakeRoutes::default(),
+    ))
+    .await
+}
+
+async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();
     let config = Arc::new(RwLock::new(Config {
@@ -90,7 +97,19 @@ async fn rig() -> Rig {
     handle.set_proxy_runtime(
         ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap(),
     );
-    let service = SpeedTestService::new(handle.clone(), config.clone(), db, true);
+    let service = SpeedTestService::new(handle.clone(), config.clone(), db.clone(), true);
+    let sessions = crate::torrents::sessions::Sessions::new(
+        routes,
+        crate::torrents::sessions::tests::env(dir.path()),
+        db.clone(),
+    );
+    service.use_torrents(crate::torrents::service::TorrentService::new(
+        db,
+        sessions,
+        crate::torrents::service::TorrentSettings::of(&*config.read().await),
+        crate::torrents::service::JobEnv::unbounded(),
+        Arc::new(crate::torrents::service::SystemClock),
+    ));
     Rig {
         service,
         handle,
@@ -1391,6 +1410,61 @@ fn torrent_request(egress_id: u32) -> SpeedTestRequest {
             max_duration: DEFAULT_TORRENT_DURATION,
         },
     }
+}
+
+#[tokio::test]
+async fn a_torrent_run_can_cancel_while_its_blocklist_is_loading() {
+    let routes = Arc::new(crate::torrents::sessions::tests::FakeRoutes::default());
+    routes.blocklist_unanswered.send_replace(true);
+    let mut fetched = routes.fetched.subscribe();
+    let rig = rig_on(routes.clone()).await;
+    torrents_on(&rig).await;
+    {
+        let mut config = rig.config.write().await;
+        config.torrent.blocklist_enabled = true;
+        config.torrent.blocklist = Some("https://lists.example/pending.p2p".into());
+    }
+    let started = rig
+        .service
+        .start(torrent_request(rig.loopback))
+        .await
+        .unwrap();
+    fetched.wait_for(|fetched| *fetched > 0).await.unwrap();
+    assert!(rig.service.cancel(started.id));
+    assert_eq!(
+        finished(&rig, started.id).await.status,
+        SpeedTestStatus::Cancelled
+    );
+    routes.blocklist_unanswered.send_replace(false);
+}
+
+// With no torrent client running, a torrent run filters peers as the
+// settings ask while they name no blocklist, and fails only once they name
+// one, which nothing is left to load.
+#[tokio::test]
+async fn without_a_torrent_client_only_a_named_blocklist_fails_a_torrent_run() {
+    let rig = rig().await;
+    let service = SpeedTestService::new(
+        rig.handle.clone(),
+        rig.config.clone(),
+        Database::open_in_memory().unwrap(),
+        true,
+    );
+    let banned = crate::settings::TorrentConfig {
+        banned_ips: vec!["192.0.2.7".into()],
+        ..crate::settings::TorrentConfig::default()
+    };
+    let filter = service.ip_filter(&banned).await.unwrap();
+    assert!(filter.blocked.has("192.0.2.7".parse().unwrap()));
+    assert!(!filter.blocked.has("192.0.2.8".parse().unwrap()));
+
+    let listed = crate::settings::TorrentConfig {
+        blocklist_enabled: true,
+        blocklist: Some("https://lists.example/blocked.p2p".into()),
+        ..banned
+    };
+    let error = service.ip_filter(&listed).await.unwrap_err();
+    assert!(error.contains("the blocklist did not load"), "{error}");
 }
 
 // A torrent rig: torrents on, and the test torrent taken from `fixture`.

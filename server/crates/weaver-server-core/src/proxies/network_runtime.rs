@@ -32,7 +32,8 @@ pub use torrent::{SessionTraffic, TorrentLeg};
 #[path = "network_test_via.rs"]
 mod test_via;
 pub use test_via::{
-    HostResolution, LookupError, LookupFailure, MAX_TEST_PATHS, PathTest, ResolvedBy, TestSubject,
+    HostResolution, LookupError, LookupFailure, MAX_TEST_PATHS, P2pTest, PathTest, ResolvedBy,
+    TestSubject,
 };
 
 // The health reason of an egress whose download quota is used up.

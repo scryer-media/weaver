@@ -162,6 +162,7 @@ pub(crate) struct P2pLeg {
     pub names: Option<ResolvedBy>,
     // The torrent settings as they stand.
     pub torrent: TorrentConfig,
+    pub ip_filter: Result<IpFilter, String>,
     pub allow_private_network: bool,
 }
 
@@ -175,6 +176,7 @@ pub(crate) struct P2pPath {
     down: Option<crate::torrents::sessions::RouteFailure>,
     names: Option<ResolvedBy>,
     torrent: TorrentConfig,
+    ip_filter: Result<IpFilter, String>,
     allow_private_network: bool,
 }
 
@@ -199,6 +201,7 @@ impl P2pPath {
                 down: leg.down,
                 names: leg.names,
                 torrent: leg.torrent,
+                ip_filter: leg.ip_filter,
                 allow_private_network: leg.allow_private_network,
             }),
             Err(error) => {
@@ -219,21 +222,21 @@ impl P2pPath {
     // The options of the test session keeping its state in `dir`: a route's
     // session's on the same leg, under the same settings, listening on a
     // port of its own and announcing that port, with the test's peer limit
-    // and the IP filter of no blocklist.
-    pub(crate) fn session_options(&self, dir: &Path) -> SessionOptions {
+    // and the route's loaded IP filter.
+    pub(crate) fn session_options(&self, dir: &Path) -> Result<SessionOptions, String> {
         let torrent = TorrentConfig {
             announce_port: None,
             ..self.torrent.clone()
         };
-        session_options(
+        Ok(session_options(
             &self.leg,
             0,
             dir,
             PEER_LIMIT,
             &torrent,
-            IpFilter::default(),
+            self.ip_filter.clone()?,
             &IDENTITY.identity(),
-        )
+        ))
     }
 }
 
@@ -439,7 +442,7 @@ impl Joined {
         let options = SessionOptions {
             socket_factory: Some(Arc::new(ProbeSockets::new(path.leg.sockets()?, watched))),
             port_map_events: Some(events),
-            ..path.session_options(dir.path())
+            ..path.session_options(dir.path())?
         };
         let session = Session::new_with_opts(dir.path().join("output"), options)
             .await
@@ -519,15 +522,28 @@ async fn run(
     path: &P2pPath,
     plan: &P2pPlan,
     torrent: &TestTorrent,
-    mut stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
+    stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
 ) -> P2pReport {
     let piece = 0u32;
     let watched = Arc::new(Watched::new());
     let store = PieceStore::new(vec![piece]);
-    let mut joined = match Joined::open(torrent, path, &store, &[], watched.clone()).await {
+    let joined = match Joined::open(torrent, path, &store, &[], watched.clone()).await {
         Ok(joined) => joined,
         Err(error) => return failed_at(P2pStep::Announce, error),
     };
+    run_joined(path, plan, torrent, store, watched, joined, stop).await
+}
+
+async fn run_joined(
+    path: &P2pPath,
+    plan: &P2pPlan,
+    torrent: &TestTorrent,
+    store: PieceStore,
+    watched: Arc<Watched>,
+    mut joined: Joined,
+    mut stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
+) -> P2pReport {
+    let piece = 0u32;
     let handle = &joined.handle;
 
     let mut verified = store.verified();

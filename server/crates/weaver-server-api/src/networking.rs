@@ -886,6 +886,10 @@ async fn test_via_torrent(
         .torrent
         .clone();
     let allow_private_network = runtime.allow_private_network();
+    let ip_filter = ctx
+        .data::<weaver_server_core::speed_test::SpeedTestService>()?
+        .ip_filter(&torrent)
+        .await;
     let tests = {
         let _guard = runtime.mutations.lock().await;
         let test: std::pin::Pin<
@@ -895,18 +899,17 @@ async fn test_via_torrent(
                     > + Send
                     + '_,
             >,
-        > = Box::pin(
-            runtime
-                .network
-                .test_via_torrent(
-                    route,
-                    subject,
-                    target,
-                    source,
-                    torrent,
-                    allow_private_network,
-                ),
-        );
+        > = Box::pin(runtime.network.test_via_torrent(
+            route,
+            subject,
+            target,
+            core::P2pTest {
+                source,
+                torrent,
+                ip_filter,
+                allow_private_network,
+            },
+        ));
         test.await.map_err(refusal_error)?
     };
     Ok(tests)

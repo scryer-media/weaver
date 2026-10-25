@@ -66,12 +66,12 @@ pub struct PathTest {
     pub p2p: Option<P2pReport>,
 }
 
-// A test torrent run over each path that reaches its target, under the
-// torrent settings as they stand.
-struct P2pTest {
-    source: TestTorrentSource,
-    torrent: TorrentConfig,
-    allow_private_network: bool,
+/// A test torrent and the route's settings and loaded filter at its start.
+pub struct P2pTest {
+    pub source: TestTorrentSource,
+    pub torrent: TorrentConfig,
+    pub ip_filter: Result<weaver_torrent::IpFilter, String>,
+    pub allow_private_network: bool,
 }
 
 // A path's stages: the one beneath the proxy under test, and that proxy on
@@ -190,18 +190,11 @@ impl NetworkRuntime {
         route: &Route,
         subject: TestSubject,
         target: Option<(String, u16)>,
-        source: TestTorrentSource,
-        torrent: TorrentConfig,
-        allow_private_network: bool,
+        p2p: P2pTest,
     ) -> Result<Vec<PathTest>, NetworkRefusal> {
         let target = target
             .filter(|(host, _)| !host.trim().is_empty())
-            .or_else(|| Some(source.target()));
-        let p2p = P2pTest {
-            source,
-            torrent,
-            allow_private_network,
-        };
+            .or_else(|| Some(p2p.source.target()));
         self.test_paths(route, subject, target, Some(p2p)).await
     }
 
@@ -554,6 +547,7 @@ impl Probe {
                     down: self.down.clone(),
                     names: self.names,
                     torrent: test.torrent.clone(),
+                    ip_filter: test.ip_filter.clone(),
                     allow_private_network: test.allow_private_network,
                 })
                 .await;

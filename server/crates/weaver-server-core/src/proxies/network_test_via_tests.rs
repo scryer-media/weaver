@@ -795,9 +795,12 @@ async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
             &route,
             TestSubject::Route,
             None,
-            fixture.source.clone(),
-            quiet,
-            true,
+            P2pTest {
+                source: fixture.source.clone(),
+                torrent: quiet,
+                ip_filter: Ok(weaver_torrent::IpFilter::default()),
+                allow_private_network: true,
+            },
         )
         .await
         .unwrap();

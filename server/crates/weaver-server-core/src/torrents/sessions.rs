@@ -845,7 +845,7 @@ impl Sessions {
     // The IP filter `torrent` asks for, its blocklist loaded when it names
     // another than the one loaded; a list that does not load fails the
     // session.
-    async fn ip_filter(&self, torrent: &TorrentConfig) -> Result<IpFilter, String> {
+    pub(crate) async fn ip_filter(&self, torrent: &TorrentConfig) -> Result<IpFilter, String> {
         let _loading = self.loading.lock().await;
         load_blocklist(&*self.routes, &self.config, torrent).await?;
         lock(&self.config)
@@ -1254,21 +1254,12 @@ impl Configured {
                 Arc::clone(blocked)
             }
             _ => {
-                let bans = IpRanges::of_inclusive(torrent.banned_ranges());
-                let blocked = match &list {
-                    Some(list) if torrent.banned_ips.is_empty() => Arc::clone(list),
-                    Some(list) => Arc::new(IpRanges::union([&**list, &bans])),
-                    None => Arc::new(bans),
-                };
+                let blocked = blocked_by(torrent, list.as_ref());
                 self.blocked = Some((list, torrent.banned_ips.clone(), Arc::clone(&blocked)));
                 blocked
             }
         };
-        Some(IpFilter {
-            blocked,
-            no_privileged_ports: torrent.block_privileged_ports,
-            trackers: torrent.filter_trackers,
-        })
+        Some(filter_over(torrent, blocked))
     }
 
     // Every open session holds to the settings' limits and, once the
@@ -1291,6 +1282,34 @@ impl Configured {
         });
         filter.is_some()
     }
+}
+
+// The addresses `torrent` blocks: `list`, the blocklist it names, with its
+// banned addresses added.
+fn blocked_by(torrent: &TorrentConfig, list: Option<&Arc<IpRanges>>) -> Arc<IpRanges> {
+    let bans = IpRanges::of_inclusive(torrent.banned_ranges());
+    match list {
+        Some(list) if torrent.banned_ips.is_empty() => Arc::clone(list),
+        Some(list) => Arc::new(IpRanges::union([&**list, &bans])),
+        None => Arc::new(bans),
+    }
+}
+
+fn filter_over(torrent: &TorrentConfig, blocked: Arc<IpRanges>) -> IpFilter {
+    IpFilter {
+        blocked,
+        no_privileged_ports: torrent.block_privileged_ports,
+        trackers: torrent.filter_trackers,
+    }
+}
+
+/// The IP filter `torrent` asks for while it names no blocklist; none while
+/// it names one, which only the sessions' loader loads.
+pub fn unlisted_filter(torrent: &TorrentConfig) -> Option<IpFilter> {
+    torrent
+        .blocklist_source()
+        .is_none()
+        .then(|| filter_over(torrent, blocked_by(torrent, None)))
 }
 
 // Load the blocklist `torrent` names into `config`, unless it is the one

@@ -152,6 +152,9 @@ pub fn build_schema_with_backup(
         context.db.clone(),
         context.security.rss_allow_private_network,
     );
+    if let Some(torrents) = &context.torrents {
+        speed_test.use_torrents(torrents.clone());
+    }
     let schema = apply_graphql_query_guards(Schema::build(
         QueryRoot::default(),
         MutationRoot::default(),

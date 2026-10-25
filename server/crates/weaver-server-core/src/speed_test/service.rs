@@ -71,6 +71,7 @@ pub struct SpeedTestService {
 
 pub struct ServiceInner {
     handle: SchedulerHandle,
+    torrents: Mutex<Option<crate::torrents::service::TorrentService>>,
     config: SharedConfig,
     db: Database,
     allow_private_network: bool,
@@ -150,6 +151,7 @@ impl SpeedTestService {
         Self {
             inner: Arc::new(ServiceInner {
                 handle,
+                torrents: Mutex::new(None),
                 config,
                 db,
                 allow_private_network,
@@ -167,6 +169,18 @@ impl SpeedTestService {
                 peer_budget: AtomicU64::new(PEER_UPLOAD_BYTES),
             }),
         }
+    }
+
+    pub fn use_torrents(&self, torrents: crate::torrents::service::TorrentService) {
+        *self.inner.torrents.lock().expect("torrent filter loader") = Some(torrents);
+    }
+
+    /// The route's loaded IP filter for a speed test or a path test.
+    pub async fn ip_filter(
+        &self,
+        torrent: &crate::settings::TorrentConfig,
+    ) -> Result<weaver_torrent::IpFilter, String> {
+        self.inner.ip_filter(torrent).await
     }
 
     // The scheduler's one service, created on first use. A handle runs one
@@ -948,6 +962,21 @@ impl ServiceInner {
         tested
     }
 
+    async fn ip_filter(
+        &self,
+        torrent: &crate::settings::TorrentConfig,
+    ) -> Result<weaver_torrent::IpFilter, String> {
+        let torrents = self.torrents.lock().expect("torrent filter loader").clone();
+        match torrents {
+            Some(torrents) => torrents.ip_filter(torrent).await,
+            // With no torrent client to load it, a blocklist the settings
+            // name does not load.
+            None => crate::torrents::sessions::unlisted_filter(torrent).ok_or_else(|| {
+                "the blocklist did not load: the torrent client is not running".to_owned()
+            }),
+        }
+    }
+
     // The test torrent's path over the draft's leg at `position`, as a
     // saved route's session would ride that leg.
     async fn p2p_path(
@@ -956,12 +985,15 @@ impl ServiceInner {
         position: usize,
     ) -> Result<P2pPath, String> {
         let (kind, down, names) = draft.torrent_leg(position)?;
+        let torrent = self.config.read().await.torrent.clone();
+        let ip_filter = self.ip_filter(&torrent).await;
         P2pPath::open(P2pLeg {
             kind,
             stage: draft.leg_stage(position)?,
             down,
             names,
-            torrent: self.config.read().await.torrent.clone(),
+            torrent,
+            ip_filter,
             allow_private_network: self
                 .runtime()
                 .map_err(|error| error.to_string())?
@@ -1285,7 +1317,12 @@ async fn execute(
     };
 
     let torrent = if let SpeedTestKind::Torrent { source, .. } = &cell.request.kind {
-        let path = match inner.p2p_path(&plan.draft, first.position).await {
+        let opened = tokio::select! {
+            biased;
+            _ = stop.stopped() => return Outcome::Cancelled,
+            opened = inner.p2p_path(&plan.draft, first.position) => opened,
+        };
+        let path = match opened {
             Ok(path) => path,
             Err(error) => return Outcome::Failed(error),
         };
@@ -1571,7 +1608,12 @@ async fn execute(
         });
         inner.bump();
         if inner.config.read().await.torrent.enabled {
-            let peers = match inner.p2p_path(&plan.draft, first.position).await {
+            let opened = tokio::select! {
+                biased;
+                _ = stop.stopped() => return Outcome::Cancelled,
+                opened = inner.p2p_path(&plan.draft, first.position) => opened,
+            };
+            let peers = match opened {
                 Ok(path) => inner.serve_test_torrent(path, &mut stop).await,
                 Err(error) => PeerUpload::Failed(error),
             };
