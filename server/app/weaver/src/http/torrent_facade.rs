@@ -1061,9 +1061,7 @@ async fn trackers(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScop
         Err(ActionError::NotFound(_)) => return not_found(),
         Err(error) => return internal(error),
     };
-    let dht = torrents
-        .carries_dht(torrents.scope_of(view.category.as_deref()))
-        .await;
+    let dht = torrents.carries_dht(view.scope).await;
     let mut list = sticky_trackers(
         view.private,
         &peers,

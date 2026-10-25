@@ -449,6 +449,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         detail: None,
         paused_by: None,
         category: None,
+        scope: TorrentScope::Default,
         private: false,
         forced: false,
         progress: 0.25,
@@ -905,6 +906,20 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
 // and nothing is asked.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_torrent_url_is_fetched_over_the_routes_one_leg_or_not_at_all() {
+    url_route(None, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_url_takes_its_matched_rules_route_before_its_categorys() {
+    url_route(Some("tv"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_url_without_a_matched_rule_takes_its_categorys_route() {
+    url_route(Some("tv"), false).await;
+}
+
+async fn url_route(category: Option<&str>, matched: bool) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let dir = tempfile::tempdir().unwrap();
@@ -917,7 +932,53 @@ async fn a_torrent_url_is_fetched_over_the_routes_one_leg_or_not_at_all() {
         Duration::from_secs(30),
     ));
     let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
+    let rule = db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: if matched {
+                    "127.0.0.1"
+                } else {
+                    "unmatched.test"
+                }
+                .into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: true,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
+                ssl: None,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
     service.open().await.unwrap();
+    service.reload_tracker_rules().await.unwrap();
+    let scope = if matched {
+        TorrentScope::TrackerRule(rule.id)
+    } else {
+        service.scope_of(category, None)
+    };
+    let category_config = &service.settings().categories[0];
+    db.insert_category(category_config).unwrap();
+    let category_scope = TorrentScope::Category(category_config.id);
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(category_scope),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: LegPath::Direct,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    proxies.reload().await.unwrap();
 
     let site = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url =
@@ -939,8 +1000,13 @@ async fn a_torrent_url_is_fetched_over_the_routes_one_leg_or_not_at_all() {
         stream.write_all(head.as_bytes()).await.unwrap();
         stream.write_all(body).await.unwrap();
     };
-    let (fetched, ()) = tokio::join!(service.fetch_url(&proxies, None, &url, None), served);
-    assert_eq!(fetched.unwrap(), body);
+    let (fetched, ()) =
+        tokio::try_join!(service.fetch_url(&proxies, category, &url, None), async {
+            served.await;
+            Ok::<_, String>(())
+        })
+        .unwrap();
+    assert_eq!(fetched, body);
 
     // The route's one leg on an interface the host does not have.
     let absent = db
@@ -957,7 +1023,7 @@ async fn a_torrent_url_is_fetched_over_the_routes_one_leg_or_not_at_all() {
         })
         .unwrap();
     db.save_proxy_routing_policy(
-        Consumer::Torrent(TorrentScope::Default),
+        Consumer::Torrent(scope),
         &RoutingPolicy {
             legs: vec![RouteLeg {
                 egress_id: absent.id,
@@ -973,12 +1039,38 @@ async fn a_torrent_url_is_fetched_over_the_routes_one_leg_or_not_at_all() {
         .inner
         .sessions
         .routes()
-        .plan(TorrentScope::Default)
+        .plan(scope)
         .unwrap()
         .down
         .expect("the leg is down");
 
-    let refused = service.fetch_url(&proxies, None, &url, None).await;
+    if matched {
+        assert!(
+            service
+                .inner
+                .sessions
+                .routes()
+                .plan(category_scope)
+                .unwrap()
+                .down
+                .is_none()
+        );
+    } else {
+        assert!(
+            service
+                .inner
+                .sessions
+                .routes()
+                .plan(TorrentScope::TrackerRule(rule.id))
+                .unwrap()
+                .down
+                .is_none()
+        );
+    }
+    let refused = tokio::select! {
+        refused = service.fetch_url(&proxies, category, &url, None) => refused,
+        asked = site.accept() => panic!("the down route reached the site: {asked:?}"),
+    };
     assert_eq!(refused, Err(format!("route down: {down}")));
     let site = site.into_std().unwrap();
     site.set_nonblocking(true).unwrap();

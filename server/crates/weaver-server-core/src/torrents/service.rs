@@ -479,6 +479,8 @@ pub struct TorrentView {
     /// Who holds it stopped, while a hold does.
     pub paused_by: Option<HoldOrigin>,
     pub category: Option<String>,
+    /// The scope selected by its tracker rule, category, or the default.
+    pub scope: TorrentScope,
     pub private: bool,
     pub forced: bool,
     pub progress: f64,
@@ -4291,6 +4293,7 @@ impl TorrentService {
             seeding_policy: policy.unwrap_or_default(),
             seeding_source: settings.seeding_source(record, rule),
             unpack: settings.unpack(record, rule),
+            scope: settings.scope(record.category_id, rule),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
             sequential: record.sequential,
@@ -4304,21 +4307,19 @@ impl TorrentService {
     /// One torrent, with its files and trackers.
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
         let settings = self.settings();
-        let rules = self.rules();
         let now = self.inner.clock.now_ms();
-        let (mut view, announces, scope) = {
+        let (mut view, announces) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
             let mut view = self.view(&settings, torrent, now);
             view.files = torrent.files();
-            let scope = settings.scope(torrent.record.category_id, torrent.rule(&rules));
-            (view, torrent.announces(), scope)
+            (view, torrent.announces())
         };
         let names = self
             .inner
             .sessions
             .routes()
-            .plan(scope)
+            .plan(view.scope)
             .ok()
             .and_then(|plan| plan.names);
         view.trackers = status::trackers(
@@ -4365,20 +4366,19 @@ impl TorrentService {
             .collect()
     }
 
-    /// The scope whose route a torrent added in `category` takes before its
-    /// trackers are known.
-    pub fn scope_of(&self, category: Option<&str>) -> TorrentScope {
+    /// The scope whose route a torrent added in `category` under `rule` takes.
+    pub fn scope_of(&self, category: Option<&str>, rule: Option<&TrackerRule>) -> TorrentScope {
         let settings = self.settings();
         let id = category
             .and_then(|name| resolve_category_config(&settings.categories, name))
             .map(|category| category.id);
-        settings.scope(id, None)
+        settings.scope(id, rule)
     }
 
     /// The bytes at `url` for a torrent added in `category`, fetched over
-    /// its route's one leg and nothing else, as the client of the tracker
-    /// rule whose pattern the URL's host matches. A leg that is down fetches
-    /// nothing: the add fails for the route being down.
+    /// the route of its matched tracker rule, else its category's, else the
+    /// default (see [`TorrentSettings::scope`]), as that rule's client. A leg
+    /// that is down fetches nothing: the add fails for the route being down.
     pub async fn fetch_url(
         &self,
         proxies: &crate::proxies::ProxyRuntime,
@@ -4386,12 +4386,14 @@ impl TorrentService {
         url: &reqwest::Url,
         cookie: Option<&str>,
     ) -> Result<Vec<u8>, String> {
-        let scope = self.scope_of(category);
+        let rules = self.rules();
+        let rule = tracker_rule_for(&rules, [url.as_str()]);
+        let scope = self.scope_of(category, rule);
         let plan = self.inner.sessions.routes().plan(scope)?;
         if let Some(reason) = plan.down {
             return Err(SessionError::RouteDown(reason).to_string());
         }
-        let client = client_of(tracker_rule_for(&self.rules(), [url.as_str()]));
+        let client = client_of(rule);
         crate::ingest::fetch_torrent_url(proxies, scope, url, cookie, client).await
     }
 }

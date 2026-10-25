@@ -42,8 +42,10 @@ const READER: &str = "facade-read-key";
 
 // A route that opens no session: nothing here reaches a network. It plans
 // down unless `up`, which lets a URL be fetched over its leg.
+#[derive(Default)]
 struct Offline {
     up: bool,
+    stream_only: Option<TorrentScope>,
 }
 
 impl Routes for Offline {
@@ -52,7 +54,11 @@ impl Routes for Offline {
             scope,
             policy: RoutingPolicy::default(),
             egress_id: SYSTEM_EGRESS_ID,
-            kind: LegKind::System,
+            kind: if self.stream_only == Some(scope) {
+                LegKind::Ladder
+            } else {
+                LegKind::System
+            },
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
             names: Some(ResolvedBy::Host),
             down: (!self.up).then(|| "offline".into()),
@@ -174,7 +180,7 @@ async fn rig_from(
     security: RuntimeSecurityConfig,
     handle: SchedulerHandle,
 ) -> Rig {
-    rig_on(torrents_on, security, handle, Offline { up: false }).await
+    rig_on(torrents_on, security, handle, Offline::default()).await
 }
 
 async fn rig_on(
@@ -396,6 +402,7 @@ fn view(state: TorrentState) -> TorrentView {
         detail: None,
         paused_by: None,
         category: None,
+        scope: TorrentScope::Default,
         private: false,
         forced: false,
         progress: 0.5,
@@ -977,6 +984,82 @@ async fn an_added_torrent_is_listed_with_its_paths_and_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
+    use weaver_server_core::categories::CategoryConfig;
+    use weaver_server_core::settings::model::TrackerRule;
+
+    let rig = rig_on(
+        true,
+        RuntimeSecurityConfig::default(),
+        scheduler(),
+        Offline {
+            stream_only: Some(TorrentScope::TrackerRule(1)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    torrents
+        .set_settings(TorrentSettings {
+            complete_dir: rig._dir.path().join("complete"),
+            categories: vec![CategoryConfig {
+                id: 7,
+                name: "tv".into(),
+                dest_dir: None,
+                aliases: String::new(),
+                seeding: None,
+                torrent_route: true,
+                unpack: None,
+            }],
+            seeding: None,
+            torrent: TorrentConfig::default(),
+        })
+        .await;
+    let mut rule = rig
+        .db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "tracker.test".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: true,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
+                ssl: None,
+            },
+            0,
+        )
+        .unwrap();
+    assert_eq!(rule.id, 1);
+    torrents.reload_tracker_rules().await.unwrap();
+    let tracker = "http://tracker.test/announce";
+    let mut bytes = format!("d8:announce{}:{tracker}", tracker.len()).into_bytes();
+    bytes.extend_from_slice(&metainfo("ruled.mkv", 3000, false)[1..]);
+    let added = rig
+        .add_file(&bytes, &[("category", "tv"), ("stopped", "true")])
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    let listed = rig.torrents().await;
+    let hash = listed[0]["hash"].as_str().unwrap();
+    let path = format!("/api/v2/torrents/trackers?hash={hash}");
+    assert!(torrents.carries_dht(TorrentScope::Category(7)).await);
+    let trackers = rig.get(&path).await.json();
+    assert_eq!(trackers[0]["url"], "** [DHT] **");
+    assert_eq!(trackers[0]["status"], 0);
+
+    rule.torrent_route = false;
+    rig.db.update_tracker_rule(&rule, 0).unwrap();
+    torrents.reload_tracker_rules().await.unwrap();
+    let trackers = rig.get(&path).await.json();
+    assert_eq!(trackers[0]["status"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1023,7 +1106,10 @@ async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
         true,
         RuntimeSecurityConfig::default(),
         handle,
-        Offline { up: true },
+        Offline {
+            up: true,
+            ..Default::default()
+        },
     )
     .await;
 
