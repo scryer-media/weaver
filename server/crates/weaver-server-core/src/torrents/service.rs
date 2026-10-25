@@ -62,8 +62,8 @@ use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{
-    NetworkRoutes, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView, Sessions,
-    encryption_policy,
+    NetworkRoutes, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView,
+    Sessions, TorrentRouteReason, encryption_policy, unplanned_key,
 };
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
@@ -305,7 +305,7 @@ pub struct TorrentRoute {
     pub scopes: Vec<(TorrentScope, Option<String>)>,
     pub session: Option<SessionView>,
     /// Why its leg is down, when it is.
-    pub down: Option<String>,
+    pub down: Option<RouteFailure>,
     /// Who resolves the names its sessions look up.
     pub names: Option<ResolvedBy>,
 }
@@ -1618,7 +1618,7 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 self.detach(torrent).await;
-                torrent.held = Some(Held::Off);
+                torrent.held = self.inner.sessions.off().map(Held::RouteDown);
             }
         }
         self.publish().await;
@@ -2719,7 +2719,18 @@ impl TorrentService {
         let scope = self.settings().scope(record.category_id, rule);
         let plan = match self.inner.sessions.routes().plan(scope) {
             Ok(plan) => plan,
-            Err(reason) => return self.held(job_id, None, Held::RouteDown(reason)).await,
+            Err(reason) => {
+                return self
+                    .held(
+                        job_id,
+                        None,
+                        Held::RouteDown(RouteFailure::with_detail(
+                            TorrentRouteReason::RoutePlanFailed,
+                            reason,
+                        )),
+                    )
+                    .await;
+            }
         };
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
             torrent.route = Some(plan.key.clone());
@@ -2825,7 +2836,15 @@ impl TorrentService {
         let plan = match self.inner.sessions.routes().plan(scope) {
             Ok(plan) => plan,
             Err(reason) => {
-                self.held(job_id, None, Held::RouteDown(reason)).await;
+                self.held(
+                    job_id,
+                    None,
+                    Held::RouteDown(RouteFailure::with_detail(
+                        TorrentRouteReason::RoutePlanFailed,
+                        reason,
+                    )),
+                )
+                .await;
                 return;
             }
         };
@@ -3801,7 +3820,7 @@ impl TorrentService {
         let outdated = self.inner.sessions.outdated().await;
         let running = self.inner.sessions.running().await;
         let mut reattach = Vec::new();
-        let mut down: BTreeMap<RouteKey, String> = BTreeMap::new();
+        let mut down = BTreeMap::new();
         let mut unresolved = Vec::new();
         {
             let mut live = self.inner.live.lock().await;
@@ -3851,7 +3870,10 @@ impl TorrentService {
                     }
                     Err(reason) => {
                         self.detach(torrent).await;
-                        torrent.held = Some(Held::RouteDown(reason));
+                        torrent.held = Some(Held::RouteDown(RouteFailure::with_detail(
+                            TorrentRouteReason::RoutePlanFailed,
+                            reason,
+                        )));
                     }
                 }
             }
@@ -4130,22 +4152,31 @@ impl TorrentService {
     }
 
     /// Every torrent route, by the scopes that plan to it, in their order,
-    /// then any session left on a route no scope plans to.
+    /// then any session left on a route no scope plans to. A scope whose
+    /// route cannot be planned is listed on its own, with why.
     pub async fn routes(&self) -> Vec<TorrentRoute> {
-        let routes = self.inner.sessions.routes();
+        let sessions = &self.inner.sessions;
         let mut listed: Vec<TorrentRoute> = Vec::new();
         for (scope, name) in self.route_scopes() {
-            let Ok(plan) = routes.plan(scope) else {
-                continue;
+            let (key, down, names) = match sessions.routes().plan(scope) {
+                Ok(plan) => (plan.key, plan.down, plan.names),
+                Err(error) => (
+                    unplanned_key(scope),
+                    Some(RouteFailure::with_detail(
+                        TorrentRouteReason::RoutePlanFailed,
+                        error,
+                    )),
+                    None,
+                ),
             };
-            match listed.iter_mut().find(|route| route.key == plan.key) {
+            match listed.iter_mut().find(|route| route.key == key) {
                 Some(route) => route.scopes.push((scope, name)),
                 None => listed.push(TorrentRoute {
-                    key: plan.key,
+                    key,
                     scopes: vec![(scope, name)],
                     session: None,
-                    down: plan.down,
-                    names: plan.names,
+                    down: sessions.off().or(down),
+                    names,
                 }),
             }
         }
@@ -4458,7 +4489,6 @@ fn held_by(error: SessionError) -> Held {
         SessionError::Cap => Held::SessionLimit,
         SessionError::RouteDown(reason) => Held::RouteDown(reason),
         SessionError::Build(error) => Held::Session(error),
-        SessionError::Off => Held::Off,
     }
 }
 

@@ -157,7 +157,7 @@ pub(crate) struct P2pLeg {
     // The leg's dialer.
     pub stage: Arc<dyn Dialer>,
     // Why the leg carries nothing now, when it does not.
-    pub down: Option<String>,
+    pub down: Option<crate::torrents::sessions::RouteFailure>,
     // Who resolves the names a session on the leg looks up.
     pub names: Option<ResolvedBy>,
     // The torrent settings as they stand.
@@ -172,7 +172,7 @@ pub(crate) struct P2pPath {
     stage: Arc<dyn Dialer>,
     leg: OpenLeg,
     bridge: Option<Arc<Bridge>>,
-    down: Option<String>,
+    down: Option<crate::torrents::sessions::RouteFailure>,
     names: Option<ResolvedBy>,
     torrent: TorrentConfig,
     allow_private_network: bool,

@@ -5246,7 +5246,7 @@ type TorrentRoute {
 	Why its session is closed: held closed, its leg down, or not opened
 	as nothing has asked it to open. None while open.
 	"""
-	reason: String
+	reason: TorrentRouteReason
 	"""
 	Who resolves the names its sessions look up.
 	"""
@@ -5255,6 +5255,30 @@ type TorrentRoute {
 	What its session shows trackers and peers, while open.
 	"""
 	exposure: TorrentExposure
+}
+
+"""
+Why a torrent route's session is unavailable.
+"""
+enum TorrentRouteReason {
+	NOT_ASKED_TO_OPEN
+	LEG_DOWN
+	LEG_MISSING
+	LEG_REVOKED
+	QUOTA_SILENCED
+	TORRENTS_DISABLED
+	TORRENT_ROUTE_LEGS
+	TORRENT_ROUTE_DIRECT_FALLBACK
+	TORRENT_ROUTE_RUNGS
+	TORRENT_ROUTE_POOL
+	ROUTE_PLAN_FAILED
+	LEG_OPEN_FAILED
+	STATE_DIRECTORY_FAILED
+	LISTEN_PORT_UNAVAILABLE
+	LISTEN_PORT_BIND_FAILED
+	SESSION_STATE_UNREADABLE
+	SESSION_BUILD_FAILED
+	BLOCKLIST_FAILED
 }
 
 """

@@ -230,7 +230,7 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "routing consumer no longer exists",
         ),
         (
-            R::TorrentRoutePool,
+            R::TorrentRouteExit(super::TorrentRouteFault::Pool),
             "TORRENT_ROUTE_POOL",
             "a torrent route cannot use a pool",
         ),
@@ -545,7 +545,7 @@ fn slot(refusal: &R) -> usize {
         R::TestSubjectInRoute => 79,
         R::TestPathCount { .. } => 80,
         R::TestNeedsRoute => 81,
-        R::TorrentRoutePool => 82,
+        R::TorrentRouteExit(super::TorrentRouteFault::Pool) => 82,
         R::BandwidthLimitTooLarge => 83,
         R::BandwidthSplitRange => 84,
         R::SpeedTestTorrentNeedsTorrentRoute => 85,

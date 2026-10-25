@@ -6,12 +6,23 @@ import { test } from "node:test";
 import {
   removeOutcome,
   routeExposureText,
+  routeReasonText,
+  TORRENT_ROUTE_REASONS,
   showsSeeding,
   trackerSourceKey,
   type TorrentData,
 } from "../src/lib/torrents.ts";
 import { EM_DASH, formatRate, formatSize } from "../src/next/data/format.ts";
 import { informationFields, transferFields } from "../src/next/features/torrents/general.ts";
+import { nextDe } from "../src/next/i18n/de.ts";
+import { nextEn } from "../src/next/i18n/en.ts";
+import { nextEs } from "../src/next/i18n/es.ts";
+import { nextFr } from "../src/next/i18n/fr.ts";
+import { nextIt } from "../src/next/i18n/it.ts";
+import { nextJa } from "../src/next/i18n/ja.ts";
+import { nextKo } from "../src/next/i18n/ko.ts";
+import { nextPt } from "../src/next/i18n/pt.ts";
+import { nextZh } from "../src/next/i18n/zh.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
 test("only a refusal over an unmet seeding goal asks for a second confirm", () => {
@@ -188,4 +199,27 @@ test("a torrent route shows who resolves its names, and whether peers can reach 
   );
   assert.equal(routeExposureText(t, { resolvedBy: "SERVERS", exposure: null }), "Resolved by DNS servers");
   assert.equal(routeExposureText(t, { resolvedBy: null, exposure: null }), EM_DASH);
+});
+
+test("every locale renders route reasons and reuses its route refusal wording", () => {
+  const faults = ["TORRENT_ROUTE_LEGS", "TORRENT_ROUTE_DIRECT_FALLBACK", "TORRENT_ROUTE_RUNGS", "TORRENT_ROUTE_POOL"] as const;
+  for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
+    const translate = (key: string) => {
+      const value = dictionary[key];
+      assert.ok(value?.trim(), `${locale}: missing ${key}`);
+      return value;
+    };
+    for (const reason of TORRENT_ROUTE_REASONS) {
+      assert.ok(routeReasonText(translate, reason).trim());
+    }
+    for (const reason of faults) {
+      assert.equal(routeReasonText(translate, reason), dictionary[`next.refusal.${reason}`]);
+      assert.equal(dictionary[`next.torrents.routeReason.${reason}`], undefined);
+    }
+  }
+  assert.equal(routeReasonText(t, "LEG_DOWN"), "Leg down");
+  assert.equal(routeReasonText(t, "ROUTE_PLAN_FAILED"), "Route planning failed");
+  assert.equal(routeReasonText(t, "LEG_OPEN_FAILED"), "Leg failed to open");
+  assert.equal(routeReasonText(t, "STATE_DIRECTORY_FAILED"), "State directory unavailable");
+  assert.equal(routeReasonText(t, "LISTEN_PORT_UNAVAILABLE"), "Listen port unavailable");
 });

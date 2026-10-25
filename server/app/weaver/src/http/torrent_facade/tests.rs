@@ -61,12 +61,19 @@ impl Routes for Offline {
             },
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
             names: Some(ResolvedBy::Host),
-            down: (!self.up).then(|| "offline".into()),
+            down: (!self.up).then(|| {
+                weaver_server_core::torrents::sessions::RouteFailure::leg_down("offline".into())
+            }),
         })
     }
 
-    fn leg_down(&self, _: &RoutePlan) -> Option<String> {
-        (!self.up).then(|| "offline".into())
+    fn leg_down(
+        &self,
+        _: &RoutePlan,
+    ) -> Option<weaver_server_core::torrents::sessions::RouteFailure> {
+        (!self.up).then(|| {
+            weaver_server_core::torrents::sessions::RouteFailure::leg_down("offline".into())
+        })
     }
 
     fn open<'life0, 'life1, 'async_trait>(

@@ -40,12 +40,12 @@ impl DraftNetworkRoute {
     ) -> Result<
         (
             crate::torrents::net::LegKind,
-            Option<String>,
+            Option<crate::torrents::sessions::RouteFailure>,
             Option<ResolvedBy>,
         ),
         String,
     > {
-        use crate::torrents::sessions::{leg_down, leg_kind, names_on};
+        use crate::torrents::sessions::{leg_kind, leg_unavailable, names_on};
         let leg = &self
             .legs
             .get(position)
@@ -53,7 +53,7 @@ impl DraftNetworkRoute {
             .definition;
         Ok((
             leg_kind(&self.isolated, leg.egress_id, &leg.path),
-            leg_down(&self.isolated, leg.egress_id),
+            leg_unavailable(&self.isolated, leg.egress_id),
             names_on(&self.isolated, &leg.path),
         ))
     }

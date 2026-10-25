@@ -750,7 +750,13 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
     );
     let held = rig.service.inner.sessions.views().await;
     assert_eq!(held.len(), 1);
-    assert_eq!(held[0].held.as_deref(), Some("tunnel gone"));
+    assert_eq!(
+        held[0]
+            .held
+            .as_ref()
+            .and_then(|failure| failure.detail.as_deref()),
+        Some("tunnel gone")
+    );
 
     rig.routes.set_down(None);
     rig.service.tick().await;
@@ -899,6 +905,169 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
         Some(Client::QBittorrent.name().user_agent())
     );
     service.stop().await;
+}
+
+#[tokio::test]
+async fn stored_route_faults_keep_their_typed_reason() {
+    use crate::proxies::{Rung, TorrentRouteFault};
+    use crate::torrents::sessions::{NetworkRoutes, TorrentRouteReason};
+
+    let direct = RouteLeg {
+        egress_id: SYSTEM_EGRESS_ID,
+        weight: 100,
+        path: LegPath::Direct,
+    };
+    let ladder = |rungs, direct_fallback| RouteLeg {
+        path: LegPath::Ladder {
+            rungs,
+            direct_fallback,
+        },
+        ..direct.clone()
+    };
+    for (legs, fault) in [
+        (
+            vec![direct.clone(), direct.clone()],
+            TorrentRouteFault::Legs,
+        ),
+        (
+            vec![ladder(vec![Rung::Proxy { id: 1 }], true)],
+            TorrentRouteFault::DirectFallback,
+        ),
+        (
+            vec![ladder(
+                vec![Rung::Proxy { id: 1 }, Rung::Proxy { id: 2 }],
+                false,
+            )],
+            TorrentRouteFault::Rungs,
+        ),
+        (
+            vec![ladder(vec![Rung::Pool { id: 1 }], false)],
+            TorrentRouteFault::Pool,
+        ),
+    ] {
+        let db = Database::open_in_memory().unwrap();
+        let proxies =
+            crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current())
+                .unwrap();
+        store_route_unchecked(
+            &db,
+            Consumer::Torrent(TorrentScope::Default),
+            &RoutingPolicy {
+                legs,
+                ..Default::default()
+            },
+        );
+        let routes = NetworkRoutes::new(db, Arc::clone(&proxies), Duration::from_secs(30));
+        let failure = routes.plan(TorrentScope::Default).unwrap().down.unwrap();
+        assert_eq!(failure.reason, TorrentRouteReason::RouteBroken(fault));
+        assert_eq!(failure.message(), fault.message());
+        proxies.network.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_missing_egress_has_a_typed_route_reason() {
+    use crate::torrents::sessions::{NetworkRoutes, TorrentRouteReason};
+    let db = Database::open_in_memory().unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    store_route_unchecked(
+        &db,
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: 999,
+                weight: 100,
+                path: LegPath::Direct,
+            }],
+            ..Default::default()
+        },
+    );
+    let routes = NetworkRoutes::new(db, Arc::clone(&proxies), Duration::from_secs(30));
+    assert_eq!(
+        routes
+            .plan(TorrentScope::Default)
+            .unwrap()
+            .down
+            .unwrap()
+            .reason,
+        TorrentRouteReason::LegMissing
+    );
+    proxies.network.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_route_plan_read_failure_stays_typed_in_the_torrents_status() {
+    use crate::persistence::sql_runtime::SqlRuntime;
+    use crate::torrents::sessions::{NetworkRoutes, TorrentRouteReason};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    store_route_unchecked(
+        &db,
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: 999,
+                weight: 100,
+                path: LegPath::Direct,
+            }],
+            ..Default::default()
+        },
+    );
+    let routes = Arc::new(NetworkRoutes::new(
+        db.clone(),
+        Arc::clone(&proxies),
+        Duration::from_secs(30),
+    ));
+    let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
+    service.open().await.unwrap();
+    let job_id = service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let store = db.datastore();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&store, "missing_routes_fixture", |tx| {
+            Box::pin(async move {
+                tx.execute("DROP TABLE proxy_routes", &[]).await?;
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+    service.tick().await;
+    let live = service.inner.live.lock().await;
+    let Some(Held::RouteDown(failure)) = &live[&job_id].held else {
+        panic!("the failed plan did not hold its torrent")
+    };
+    assert_eq!(failure.reason, TorrentRouteReason::RoutePlanFailed);
+    assert!(
+        failure
+            .detail
+            .as_ref()
+            .is_some_and(|detail| !detail.is_empty())
+    );
+    drop(live);
+    // The route view lists the scope with the same reason.
+    let listed = service.routes().await;
+    let route = listed
+        .iter()
+        .find(|route| {
+            route
+                .scopes
+                .iter()
+                .any(|(scope, _)| *scope == TorrentScope::Default)
+        })
+        .expect("the scope whose plan failed is listed");
+    assert_eq!(
+        route.down.as_ref().map(|failure| failure.reason),
+        Some(TorrentRouteReason::RoutePlanFailed)
+    );
+    service.stop().await;
+    proxies.network.shutdown().await;
 }
 
 // A torrent added by URL is fetched over its route's one leg: up, the
@@ -1071,7 +1240,11 @@ async fn url_route(category: Option<&str>, matched: bool) {
         refused = service.fetch_url(&proxies, category, &url, None) => refused,
         asked = site.accept() => panic!("the down route reached the site: {asked:?}"),
     };
-    assert_eq!(refused, Err(format!("route down: {down}")));
+    assert_eq!(
+        down.reason,
+        crate::torrents::sessions::TorrentRouteReason::LegDown
+    );
+    assert_eq!(refused, Err(format!("route down: {}", down.message())));
     let site = site.into_std().unwrap();
     site.set_nonblocking(true).unwrap();
     let asked = site.accept();
@@ -1129,10 +1302,21 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
         .unwrap();
     service.tick().await;
 
-    let refusal = "a torrent route has one leg";
+    let refusal = crate::torrents::sessions::TorrentRouteReason::RouteBroken(
+        crate::proxies::TorrentRouteFault::Legs,
+    );
     assert_eq!(
         service.inner.live.lock().await[&job_id].held,
-        Some(Held::RouteDown(refusal.into()))
+        Some(Held::RouteDown(
+            crate::torrents::sessions::TorrentRouteReason::RouteBroken(
+                crate::proxies::TorrentRouteFault::Legs
+            )
+            .into()
+        ))
+    );
+    assert_eq!(
+        service.torrent(job_id).await.unwrap().detail.as_deref(),
+        Some("Not downloading: route down (a torrent route has one leg)"),
     );
     let listed = service.routes().await;
     let held = listed
@@ -1144,9 +1328,17 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
                 .any(|(scope, _)| *scope == TorrentScope::Default)
         })
         .unwrap();
-    assert_eq!(held.down.as_deref(), Some(refusal));
     assert_eq!(
-        held.session.as_ref().unwrap().held.as_deref(),
+        held.down.as_ref().map(|failure| failure.reason),
+        Some(refusal)
+    );
+    assert_eq!(
+        held.session
+            .as_ref()
+            .unwrap()
+            .held
+            .as_ref()
+            .map(|failure| failure.reason),
         Some(refusal)
     );
 

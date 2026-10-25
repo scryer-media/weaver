@@ -244,6 +244,33 @@ export const exposureText = (t: Translate, exposure: TorrentExposure): string =>
     .map(({ label, value }) => `${label} ${value}`)
     .join(" \u00b7 ");
 
+export const TORRENT_ROUTE_REASONS = [
+  "NOT_ASKED_TO_OPEN",
+  "LEG_DOWN",
+  "LEG_MISSING",
+  "LEG_REVOKED",
+  "QUOTA_SILENCED",
+  "TORRENTS_DISABLED",
+  "TORRENT_ROUTE_LEGS",
+  "TORRENT_ROUTE_DIRECT_FALLBACK",
+  "TORRENT_ROUTE_RUNGS",
+  "TORRENT_ROUTE_POOL",
+  "ROUTE_PLAN_FAILED",
+  "LEG_OPEN_FAILED",
+  "STATE_DIRECTORY_FAILED",
+  "LISTEN_PORT_UNAVAILABLE",
+  "LISTEN_PORT_BIND_FAILED",
+  "SESSION_STATE_UNREADABLE",
+  "SESSION_BUILD_FAILED",
+  "BLOCKLIST_FAILED",
+] as const;
+
+export type TorrentRouteReason = (typeof TORRENT_ROUTE_REASONS)[number];
+
+export function routeReasonText(t: Translate, reason: TorrentRouteReason): string {
+  return t(reason.startsWith("TORRENT_ROUTE_") ? `next.refusal.${reason}` : `next.torrents.routeReason.${reason}`);
+}
+
 /**
  * A torrent route's exposure cell: the open session's exposure, or, while it
  * is closed, who resolves its names.

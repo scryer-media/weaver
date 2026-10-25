@@ -465,6 +465,12 @@ async fn a_used_up_egress_quota_takes_its_leg_down_and_its_share_moves_to_the_ot
         runtime.quota_blocked_egresses(),
         HashSet::from([metered.id])
     );
+    assert_eq!(
+        crate::torrents::sessions::leg_unavailable(&runtime, metered.id)
+            .unwrap()
+            .reason,
+        crate::torrents::sessions::TorrentRouteReason::QuotaSilenced,
+    );
     runtime.refresh_health();
     let allocations = route.weighted.allocations();
     assert_eq!(

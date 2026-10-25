@@ -23,6 +23,17 @@ use crate::{
     vectored_traits::AsyncReadVectored,
 };
 
+/// Why a session failed to build when its listeners could not start: a
+/// port of theirs could not be bound.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenFailed;
+
+impl std::fmt::Display for ListenFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("error starting listeners")
+    }
+}
+
 /// A listener's sockets, and the address they took.
 pub(crate) struct Listening {
     pub tcp_socket: Option<TcpListener>,

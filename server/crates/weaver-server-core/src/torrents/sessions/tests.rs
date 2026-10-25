@@ -146,13 +146,13 @@ impl Routes for FakeRoutes {
                 _ => ResolvedBy::Host,
             }),
             kind,
-            down: self.key_down(&key),
+            down: self.key_down(&key).map(RouteFailure::leg_down),
             key,
         })
     }
 
-    fn leg_down(&self, plan: &RoutePlan) -> Option<String> {
-        self.key_down(&plan.key)
+    fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure> {
+        self.key_down(&plan.key).map(RouteFailure::leg_down)
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
@@ -299,7 +299,11 @@ async fn a_route_whose_leg_is_revoked_opens_again_on_the_new_leg() {
     assert!(old_stage.is_revoked());
     sessions.revoked().await;
     let view = sessions.view(&plan.key).await.unwrap();
-    assert_eq!(view.held.as_deref(), Some(REVOKED));
+    assert_eq!(view.held.as_ref(), Some(&REVOKED));
+    assert_eq!(
+        view.held.as_ref().unwrap().reason,
+        TorrentRouteReason::LegRevoked
+    );
     assert_eq!((view.port, view.listen), (None, None));
     assert!(view.external.is_empty());
     assert_eq!(
@@ -550,6 +554,94 @@ async fn a_route_shows_where_it_listens_and_how_its_ports_are_mapped() {
     sessions.stop_all().await;
 }
 
+// A leg that listens, binding nothing on the host, but binds no datagram
+// socket: a session on it gets past its listener and fails to build at its
+// DHT.
+struct NoUdp;
+
+impl SocketFactory for NoUdp {
+    fn connect_tcp<'a>(
+        &'a self,
+        _: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(async { Err(io::Error::from(io::ErrorKind::Unsupported)) })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        Box::pin(async move { Ok(Box::new(Quiet(addr)) as Box<dyn StreamListener>) })
+    }
+
+    fn bind_udp<'a>(&'a self, _: SocketAddr) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async { Err(io::Error::from(io::ErrorKind::Unsupported)) })
+    }
+}
+
+// Each step of opening a session that fails holds its route closed with the
+// reason of that step.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_setup_failures_keep_the_cause_that_failed() {
+    for expected in [
+        TorrentRouteReason::LegOpenFailed,
+        TorrentRouteReason::StateDirectoryFailed,
+        TorrentRouteReason::ListenPortUnavailable,
+        TorrentRouteReason::SessionStateUnreadable,
+        TorrentRouteReason::SessionBuildFailed,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let routes = Arc::new(FakeRoutes::default());
+        let db = Database::open_in_memory().unwrap();
+        let root = dir.path().join("state");
+        let sessions = Sessions::new(routes.clone(), env(&root), db.clone());
+        match expected {
+            TorrentRouteReason::LegOpenFailed => routes.set_refused(Some("the leg failed to open")),
+            TorrentRouteReason::StateDirectoryFailed => {
+                std::fs::write(&root, "not a directory").unwrap()
+            }
+            TorrentRouteReason::ListenPortUnavailable => {
+                let first = RouteKey::of(9, &EgressBinding::System, &LegPath::Direct);
+                assert_eq!(port_slot(&db, &first).unwrap(), 0);
+                sessions.set_config(TorrentConfig {
+                    base_port: u16::MAX,
+                    ..Default::default()
+                });
+            }
+            TorrentRouteReason::SessionStateUnreadable => {
+                use crate::persistence::sql_runtime::SqlRuntime;
+                let store = db.datastore();
+                db.run_sql_blocking(async move {
+                    SqlRuntime::run_in_transaction(&store, "missing_settings_fixture", |tx| {
+                        Box::pin(async move {
+                            tx.execute("DROP TABLE settings", &[]).await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                })
+                .unwrap();
+            }
+            TorrentRouteReason::SessionBuildFailed => routes.set_leg(
+                LegKind::SourceAddress("127.0.0.1".parse().unwrap()),
+                Arc::new(NoUdp),
+            ),
+            _ => unreachable!(),
+        }
+        let plan = routes.plan(TorrentScope::Default).unwrap();
+        let Err(SessionError::Build(failure)) = sessions.session(&plan, &IDENTITY.identity()).await
+        else {
+            panic!("failed setup opened a session: {expected:?}");
+        };
+        assert_eq!(failure.reason, expected, "{failure:?}");
+        assert_eq!(
+            sessions.view(&plan.key).await.unwrap().held.unwrap().reason,
+            expected
+        );
+        sessions.stop_all().await;
+    }
+}
+
 // A route whose session could not listen holds closed with the reason, and
 // shows no address and no mapping.
 #[tokio::test(flavor = "multi_thread")]
@@ -570,8 +662,14 @@ async fn a_route_that_could_not_listen_shows_why() {
     };
 
     let view = sessions.view(&plan.key).await.unwrap();
-    assert_eq!(view.held.as_deref(), Some(error.as_str()));
-    assert!(error.contains("listen"), "{error}");
+    assert_eq!(
+        view.held
+            .as_ref()
+            .and_then(|failure| failure.detail.as_deref()),
+        error.detail.as_deref()
+    );
+    assert_eq!(error.reason, TorrentRouteReason::ListenPortBindFailed);
+    assert!(error.message().contains("listen"), "{error:?}");
     assert_eq!(view.listen, None);
     assert!(view.mappings.is_empty());
     assert!(view.external.is_empty());
@@ -952,7 +1050,10 @@ async fn a_route_with_no_transport_holds_closed() {
         Err(SessionError::Build(_))
     ));
     let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
-    assert!(held.contains("no way to connect to peers"), "{held}");
+    assert!(
+        held.message().contains("no way to connect to peers"),
+        "{held:?}"
+    );
     sessions.stop_all().await;
 }
 
@@ -979,7 +1080,11 @@ async fn a_route_whose_blocklist_does_not_load_holds_closed() {
         Err(SessionError::Build(_))
     ));
     let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
-    assert!(held.contains("the blocklist did not load"), "{held}");
+    assert_eq!(held.reason, TorrentRouteReason::BlocklistFailed);
+    assert!(
+        held.message().contains("the blocklist did not load"),
+        "{held:?}"
+    );
 
     // Once it is there, the route opens on its next session.
     std::fs::write(&missing, "test:10.0.0.1-10.0.0.1\n").unwrap();
@@ -1084,7 +1189,11 @@ async fn a_blocklist_that_does_not_load_holds_the_open_sessions_closed() {
     });
     sessions.settled().await;
     let held = sessions.view(&plan.key).await.unwrap().held.unwrap();
-    assert!(held.contains("the blocklist did not load"), "{held}");
+    assert_eq!(held.reason, TorrentRouteReason::BlocklistFailed);
+    assert!(
+        held.message().contains("the blocklist did not load"),
+        "{held:?}"
+    );
     session.cancellation_token().cancelled().await;
 
     *routes.blocklist.lock().unwrap() = Some("test:192.0.2.1-192.0.2.1\n".to_owned());
@@ -1486,17 +1595,26 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
     let plan = routes.plan(TorrentScope::Default).unwrap();
     let before = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
 
-    sessions.hold(&plan.key, "link down".into()).await;
+    sessions
+        .hold(&plan.key, RouteFailure::leg_down("link down".into()))
+        .await;
     before.cancellation_token().cancelled().await;
     let view = sessions.view(&plan.key).await.unwrap();
-    assert_eq!(view.held.as_deref(), Some("link down"));
+    assert_eq!(
+        view.held
+            .as_ref()
+            .and_then(|failure| failure.detail.as_deref()),
+        Some("link down")
+    );
     assert_eq!(view.port, None);
 
     routes.set_down(Some("link down"));
     let down = routes.plan(TorrentScope::Default).unwrap();
     assert_eq!(
         sessions.session(&down, &IDENTITY.identity()).await.err(),
-        Some(SessionError::RouteDown("link down".into()))
+        Some(SessionError::RouteDown(RouteFailure::leg_down(
+            "link down".into()
+        )))
     );
 
     routes.set_down(None);
@@ -1998,7 +2116,9 @@ async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up()
     // Held, its route down: nothing. The next request the tracker hears is
     // the next session's `started`.
     announced().await;
-    sessions.hold(&plan.key, "down".into()).await;
+    sessions
+        .hold(&plan.key, RouteFailure::leg_down("down".into()))
+        .await;
     sessions.closing.all_stopped().await;
 
     // Its leg revoked under it: nothing, from its own sockets either.
