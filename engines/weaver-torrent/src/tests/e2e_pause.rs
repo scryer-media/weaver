@@ -170,13 +170,8 @@ async fn test_a_paused_torrent_asks_nothing_of_its_tracker_or_peers() -> anyhow:
     let (dialed, stream) = dials.recv().await.context("no dial")?;
     assert_eq!(dialed, peer_addr);
     let mut peer = MockPeer::greet(stream, paused.shared().info_hashes).await;
-    let peers = |torrent: &crate::ManagedTorrent| {
-        torrent
-            .stats()
-            .live
-            .map_or(0, |live| live.snapshot.peer_stats.live)
-    };
-    while peers(&paused) != 1 {
+    let run = paused.live().context("the torrent is not live")?;
+    while run.stats_snapshot().peer_stats.live != 1 {
         tokio::task::yield_now().await;
     }
 
@@ -193,7 +188,7 @@ async fn test_a_paused_torrent_asks_nothing_of_its_tracker_or_peers() -> anyhow:
     // The peer is let go: its connection ends, and the torrent counts no
     // peer.
     assert_eq!(peer.next_request().await, None);
-    assert_eq!(peers(&paused), 0);
+    assert_eq!(run.stats_snapshot().peer_stats.live, 0);
 
     for _ in 0..2 {
         tokio::time::advance(Duration::from_secs(3600)).await;
