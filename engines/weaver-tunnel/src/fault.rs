@@ -412,6 +412,9 @@ pub fn classify(error: &TunnelError, wait: Duration) -> ProxyFault {
         TunnelError::Http3Tls { .. } => ProxyFault::Http3Tls,
         TunnelError::Http3ProxyStatus { status: 407 } => ProxyFault::CredentialsRejected,
         TunnelError::Http3ProxyStatus { status } => ProxyFault::ConnectRefused { status: *status },
+        TunnelError::AtCapacity { .. } => ProxyFault::Other {
+            detail: error.to_string(),
+        },
         TunnelError::Engine(text) => from_text(text, wait).unwrap_or_else(|| ProxyFault::Other {
             detail: text.clone(),
         }),

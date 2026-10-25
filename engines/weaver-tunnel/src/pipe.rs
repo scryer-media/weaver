@@ -409,6 +409,9 @@ impl DialError {
     fn hop(proxy: u32, source: TunnelError) -> Self {
         if matches!(source, TunnelError::HostKeyMismatch { .. }) {
             Self::Fatal(source)
+        } else if let TunnelError::AtCapacity { freed, .. } = &source {
+            // A full tunnel is working; it has room again once a socket closes.
+            Self::AtCapacity(vec![freed.notify()])
         } else if matches!(&source, TunnelError::Dial { detail, .. } if is_forwarding_refusal(detail))
         {
             // The proxy answered and refused to forward at all. That is the
