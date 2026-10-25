@@ -22,8 +22,9 @@ use weaver_tunnel::pipe::Dialer;
 use weaver_torrent::upnp::PortMapEvents;
 pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
-    ConnectionOptions, DhtSessionConfig, HttpClients, Identity, IpFilter, ListenerMode,
-    ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions, SocketFactory,
+    ConnectionOptions, DhtSessionConfig, HttpClients, Identity, IpFilter, ListenFailed,
+    ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions,
+    SocketFactory,
 };
 
 use crate::StateError;
@@ -47,6 +48,86 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(120);
 
 const SLOTS_KEY: &str = "torrent.session_slots";
 const CHOSEN_SSL_PORT_KEY: &str = "torrent.chosen_ssl_port";
+
+/// Why a torrent route has no open session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TorrentRouteReason {
+    NotAskedToOpen,
+    LegDown,
+    LegMissing,
+    LegRevoked,
+    QuotaSilenced,
+    TorrentsDisabled,
+    RouteBroken(crate::proxies::TorrentRouteFault),
+    RoutePlanFailed,
+    LegOpenFailed,
+    StateDirectoryFailed,
+    ListenPortUnavailable,
+    ListenPortBindFailed,
+    SessionStateUnreadable,
+    SessionBuildFailed,
+    BlocklistFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteFailure {
+    pub reason: TorrentRouteReason,
+    /// The underlying diagnostic for logs and protocol status, never a localized route label.
+    pub detail: Option<String>,
+}
+
+impl From<TorrentRouteReason> for RouteFailure {
+    fn from(reason: TorrentRouteReason) -> Self {
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+}
+
+impl RouteFailure {
+    pub fn with_detail(reason: TorrentRouteReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: Some(detail.into()),
+        }
+    }
+
+    pub fn leg_down(detail: String) -> Self {
+        Self::with_detail(TorrentRouteReason::LegDown, detail)
+    }
+
+    /// Text for protocols that carry a status sentence rather than a reason code.
+    pub fn message(&self) -> String {
+        if let Some(detail) = &self.detail {
+            return detail.clone();
+        }
+        match self.reason {
+            TorrentRouteReason::NotAskedToOpen => "not opened: nothing has asked it to open",
+            TorrentRouteReason::LegDown => "the route's leg is down",
+            TorrentRouteReason::LegMissing => "the route's egress is missing",
+            TorrentRouteReason::LegRevoked => "the route's leg was revoked",
+            TorrentRouteReason::QuotaSilenced => "quota reached",
+            TorrentRouteReason::TorrentsDisabled => crate::torrents::status::OFF,
+            TorrentRouteReason::RouteBroken(fault) => fault.message(),
+            TorrentRouteReason::RoutePlanFailed => "the route could not be planned",
+            TorrentRouteReason::LegOpenFailed => "the route's leg could not be opened",
+            TorrentRouteReason::StateDirectoryFailed => {
+                "the session's state directory could not be created"
+            }
+            TorrentRouteReason::ListenPortUnavailable => {
+                "no listen port is available for this route"
+            }
+            TorrentRouteReason::ListenPortBindFailed => "the listen port could not be bound",
+            TorrentRouteReason::SessionStateUnreadable => {
+                "the session's stored ports could not be read"
+            }
+            TorrentRouteReason::SessionBuildFailed => "the session could not be opened",
+            TorrentRouteReason::BlocklistFailed => "the blocklist could not be loaded",
+        }
+        .to_owned()
+    }
+}
 
 /// A resolved route's identity: the leg it dials over.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -80,13 +161,15 @@ pub fn leg_kind(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Leg
 
 /// Why a leg on egress `egress_id` may carry nothing now, when it may not:
 /// its egress is down, gone, or out of quota.
-pub fn leg_down(network: &NetworkRuntime, egress_id: u32) -> Option<String> {
+pub fn leg_unavailable(network: &NetworkRuntime, egress_id: u32) -> Option<RouteFailure> {
     let Some(egress) = leg_egress(network, egress_id) else {
-        return Some(format!("egress {egress_id} is missing"));
+        return Some(TorrentRouteReason::LegMissing.into());
     };
     match network.interfaces().health(&egress, None) {
-        EgressHealth::Down(reason) => Some(reason),
-        _ if network.quota_blocked_egresses().contains(&egress.id) => Some("quota reached".into()),
+        EgressHealth::Down(reason) => Some(RouteFailure::leg_down(reason)),
+        _ if network.quota_blocked_egresses().contains(&egress.id) => {
+            Some(TorrentRouteReason::QuotaSilenced.into())
+        }
         _ => None,
     }
 }
@@ -121,6 +204,13 @@ fn refused_key(route: &Route) -> RouteKey {
     RouteKey(hex::encode(&Sha1::digest(&encoded)[..8]))
 }
 
+/// The key of `scope`'s route while it cannot be planned: its own, so the
+/// scope is listed with why.
+pub fn unplanned_key(scope: TorrentScope) -> RouteKey {
+    let encoded = serde_json::to_vec(&("unplanned", scope)).expect("scopes always encode");
+    RouteKey(hex::encode(&Sha1::digest(&encoded)[..8]))
+}
+
 /// The position of a torrent route's one leg.
 pub const TORRENT_LEG: usize = 0;
 
@@ -134,7 +224,7 @@ pub struct RoutePlan {
     pub kind: LegKind,
     pub key: RouteKey,
     /// Why the leg is down, when it is.
-    pub down: Option<String>,
+    pub down: Option<RouteFailure>,
     /// Who resolves the names its sessions look up: the host's DNS on a
     /// direct leg, the exit proxy's naming on a ladder, none when the route
     /// names no proxy that is configured.
@@ -198,7 +288,7 @@ pub trait Routes: Send + Sync {
     fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String>;
     /// Why `plan`'s leg may carry nothing now, when it may not: its egress
     /// is down, gone, or out of quota. A route plans down for the same.
-    fn leg_down(&self, plan: &RoutePlan) -> Option<String>;
+    fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure>;
     /// Open `plan`'s leg for a session of at most `peers` peers.
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String>;
     /// The blocklist at `url`, which every route's session shares.
@@ -224,7 +314,6 @@ impl NetworkRoutes {
     fn network(&self) -> &NetworkRuntime {
         &self.proxies.network
     }
-
 }
 
 #[async_trait::async_trait]
@@ -238,11 +327,14 @@ impl Routes for NetworkRoutes {
         let route = policy.route();
         let leg = route.legs.first().ok_or("the route has no leg")?;
         let egress = leg_egress(self.network(), leg.egress_id);
-        let (key, down) = match consumer.validate_route(&route) {
-            Err(refusal) => (refused_key(&route), Some(refusal.to_string())),
+        let (key, down) = match crate::proxies::TorrentRouteFault::validate(&route) {
+            Err(fault) => (
+                refused_key(&route),
+                Some(TorrentRouteReason::RouteBroken(fault).into()),
+            ),
             Ok(()) => (
                 leg_key(self.network(), leg.egress_id, &leg.path),
-                leg_down(self.network(), leg.egress_id),
+                leg_unavailable(self.network(), leg.egress_id),
             ),
         };
         Ok(RoutePlan {
@@ -256,8 +348,8 @@ impl Routes for NetworkRoutes {
         })
     }
 
-    fn leg_down(&self, plan: &RoutePlan) -> Option<String> {
-        leg_down(self.network(), plan.egress_id)
+    fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure> {
+        leg_unavailable(self.network(), plan.egress_id)
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
@@ -501,16 +593,17 @@ pub fn session_options(
 pub enum SessionError {
     #[error("at most {MAX_SESSIONS} torrent routes can be in use at once")]
     Cap,
-    #[error("route down: {0}")]
-    RouteDown(String),
-    #[error("{0}")]
-    Build(String),
-    #[error("torrents are off")]
-    Off,
+    #[error("route down: {}", .0.message())]
+    RouteDown(RouteFailure),
+    #[error("{}", .0.message())]
+    Build(RouteFailure),
 }
 
 /// Why a session whose leg was revoked under it holds closed.
-pub(crate) const REVOKED: &str = "the route's leg was revoked";
+const REVOKED: RouteFailure = RouteFailure {
+    reason: TorrentRouteReason::LegRevoked,
+    detail: None,
+};
 
 enum Slot {
     Open {
@@ -525,7 +618,7 @@ enum Slot {
         opening: Opening,
     },
     Held {
-        reason: String,
+        reason: RouteFailure,
         kind: LegKind,
     },
 }
@@ -549,10 +642,10 @@ impl Slot {
 
     // Why the slot's session does not run, when it does not: it is held
     // closed, or the leg it opened on has been revoked under it.
-    fn held(&self) -> Option<&str> {
+    fn held(&self) -> Option<&RouteFailure> {
         match self {
             Self::Held { reason, .. } => Some(reason),
-            Self::Open { leg: Some(leg), .. } if leg.stage.is_revoked() => Some(REVOKED),
+            Self::Open { leg: Some(leg), .. } if leg.stage.is_revoked() => Some(&REVOKED),
             Self::Open { .. } => None,
         }
     }
@@ -617,7 +710,7 @@ pub struct SessionView {
     /// What it shows trackers and peers, while open.
     pub exposure: Option<Exposure>,
     /// Why it holds closed.
-    pub held: Option<String>,
+    pub held: Option<RouteFailure>,
 }
 
 /// The live sessions, by route.
@@ -684,11 +777,11 @@ impl Sessions {
                 () = stage.cancelled() => {
                     tracing::info!(
                         route = key.as_str(),
-                        reason = REVOKED,
+                        reason = ?REVOKED.reason,
                         "a route's leg was revoked under its open session"
                     );
                     if let Some(session) = session.upgrade() {
-                        withhold(&key, &session, REVOKED);
+                        withhold(&key, &session, &REVOKED);
                     }
                     revoked.notify_one();
                 }
@@ -814,6 +907,11 @@ impl Sessions {
         self.on.load(Ordering::Acquire)
     }
 
+    /// Why no route may open, while none may: torrents are off.
+    pub fn off(&self) -> Option<RouteFailure> {
+        (!self.on()).then(|| TorrentRouteReason::TorrentsDisabled.into())
+    }
+
     /// Let sessions open, or close every one and open none until turned on.
     pub async fn turn(&self, on: bool) {
         let mut slots = self.slots.lock().await;
@@ -863,8 +961,8 @@ impl Sessions {
         }
         let port_slot = self.port_slot(&plan.key).await;
         let mut slots = self.slots.lock().await;
-        if !self.on() {
-            return Err(SessionError::Off);
+        if let Some(off) = self.off() {
+            return Err(SessionError::RouteDown(off));
         }
         if let Some(session) = slots.get(&plan.key).and_then(Slot::running) {
             return Ok(Arc::clone(session));
@@ -944,21 +1042,35 @@ impl Sessions {
             Option<u16>,
             Opening,
         ),
-        String,
+        RouteFailure,
     > {
-        let slot = slot?;
+        let slot = slot.map_err(|detail| {
+            RouteFailure::with_detail(TorrentRouteReason::SessionStateUnreadable, detail)
+        })?;
         let torrent = self.config();
-        let port = slot_port(&torrent, slot).ok_or("no listen port is left for this route")?;
+        let port = slot_port(&torrent, slot)
+            .ok_or_else(|| RouteFailure::from(TorrentRouteReason::ListenPortUnavailable))?;
         let dir = self.env.root_of(&torrent).join(plan.key.as_str());
-        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        let leg = self.routes.open(plan, peers).await?;
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            RouteFailure::with_detail(TorrentRouteReason::StateDirectoryFailed, error.to_string())
+        })?;
+        let leg = self.routes.open(plan, peers).await.map_err(|detail| {
+            RouteFailure::with_detail(TorrentRouteReason::LegOpenFailed, detail)
+        })?;
         let opening = Opening::of(&self.env, &torrent, leg.shape);
-        let ip_filter = self.ip_filter(&torrent).await?;
+        let ip_filter = self.ip_filter(&torrent).await.map_err(|detail| {
+            RouteFailure::with_detail(TorrentRouteReason::BlocklistFailed, detail)
+        })?;
         let ssl_port = if torrent.ssl_enabled {
-            let base = self.ssl_base_port(torrent.ssl_port).await?;
+            let base = self
+                .ssl_base_port(torrent.ssl_port)
+                .await
+                .map_err(|detail| {
+                    RouteFailure::with_detail(TorrentRouteReason::SessionStateUnreadable, detail)
+                })?;
             let port = base
                 .checked_add(slot)
-                .ok_or("no SSL listen port is left for this route")?;
+                .ok_or_else(|| RouteFailure::from(TorrentRouteReason::ListenPortUnavailable))?;
             Some(port)
         } else {
             None
@@ -983,7 +1095,14 @@ impl Sessions {
         Session::new_with_opts(dir.join("output"), options)
             .await
             .map(|session| (session, leg.leg, port, maps, opening))
-            .map_err(|error| format!("{error:#}"))
+            .map_err(|error| {
+                let reason = if error.downcast_ref::<ListenFailed>().is_some() {
+                    TorrentRouteReason::ListenPortBindFailed
+                } else {
+                    TorrentRouteReason::SessionBuildFailed
+                };
+                RouteFailure::with_detail(reason, format!("{error:#}"))
+            })
     }
 
     /// The routes whose open session would open otherwise now: its leg was
@@ -1017,12 +1136,9 @@ impl Sessions {
 
     // Why `slot`'s session may send nothing more, when it may not: its leg
     // was revoked under it, or is down or out of quota now.
-    fn silenced(&self, slot: &Slot) -> Option<String> {
+    fn silenced(&self, slot: &Slot) -> Option<RouteFailure> {
         match slot {
-            Slot::Open { plan, .. } => slot
-                .held()
-                .map(str::to_owned)
-                .or_else(|| self.routes.leg_down(plan)),
+            Slot::Open { plan, .. } => slot.held().cloned().or_else(|| self.routes.leg_down(plan)),
             Slot::Held { reason, .. } => Some(reason.clone()),
         }
     }
@@ -1039,7 +1155,7 @@ impl Sessions {
 
     /// Close `key`'s session and hold it closed for `reason`, its route
     /// down: its trackers hear no `stopped` from it.
-    pub async fn hold(&self, key: &RouteKey, reason: String) {
+    pub async fn hold(&self, key: &RouteKey, reason: RouteFailure) {
         let mut slots = self.slots.lock().await;
         let Some(slot) = slots.remove(key) else {
             return;
@@ -1244,7 +1360,10 @@ async fn refilter(
                 }) = slots.remove(&key)
                 {
                     closing.close(&key, session, leg, maps);
-                    let reason = reason.clone();
+                    let reason = RouteFailure::with_detail(
+                        TorrentRouteReason::BlocklistFailed,
+                        reason.clone(),
+                    );
                     slots.insert(
                         key,
                         Slot::Held {
@@ -1305,7 +1424,7 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             mappings: Vec::new(),
             external: Vec::new(),
             exposure: None,
-            held: held.map(str::to_owned),
+            held: held.cloned(),
         },
     }
 }
@@ -1313,10 +1432,11 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
 // The session may send no more: its leg was revoked under it, or its route
 // is down. From here on its trackers hear no `stopped` from it, whatever
 // stops it or takes a torrent off it.
-fn withhold(key: &RouteKey, session: &Session, reason: &str) {
+fn withhold(key: &RouteKey, session: &Session, reason: &RouteFailure) {
     tracing::info!(
         route = key.as_str(),
-        reason,
+        reason = ?reason.reason,
+        detail = ?reason.detail,
         "a route's session sends its trackers no stopped announce"
     );
     session.withhold_stopped();

@@ -308,7 +308,9 @@ async fn a_down_leg_fetches_nothing() {
         upload_budget: None,
     };
     let path = P2pPath::open(P2pLeg {
-        down: Some("egress 3 is down".into()),
+        down: Some(crate::torrents::sessions::RouteFailure::leg_down(
+            "egress 3 is down".into(),
+        )),
         ..leg(source_address())
     })
     .await

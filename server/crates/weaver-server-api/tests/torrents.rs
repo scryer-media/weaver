@@ -37,12 +37,17 @@ impl Routes for Offline {
             kind: LegKind::System,
             key: RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct),
             names: Some(ResolvedBy::Host),
-            down: Some("offline".into()),
+            down: Some(
+                weaver_server_core::torrents::sessions::RouteFailure::leg_down("offline".into()),
+            ),
         })
     }
 
-    fn leg_down(&self, _: &RoutePlan) -> Option<String> {
-        Some("offline".into())
+    fn leg_down(
+        &self,
+        _: &RoutePlan,
+    ) -> Option<weaver_server_core::torrents::sessions::RouteFailure> {
+        Some(weaver_server_core::torrents::sessions::RouteFailure::leg_down("offline".into()))
     }
 
     fn open<'life0, 'life1, 'async_trait>(
@@ -285,6 +290,27 @@ async fn the_torrent_surface_says_when_torrents_are_off() {
     let harness = TestHarness::new().await;
     let response = harness.execute("{ torrents { id } }").await;
     assert_eq!(code(&response).as_deref(), Some("TORRENTS_DISABLED"));
+    // Turned on and then off, every route shows that torrents are off.
+    let rig = rig().await;
+    let settings = |enabled| TorrentSettings {
+        complete_dir: rig._dir.path().join("complete"),
+        categories: Vec::new(),
+        seeding: None,
+        torrent: TorrentConfig {
+            enabled,
+            ..TorrentConfig::default()
+        },
+    };
+    rig.torrents.set_settings(settings(true)).await;
+    rig.torrents.set_settings(settings(false)).await;
+    let response = rig.execute("{ torrentRoutes { reason } }").await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap()["torrentRoutes"],
+        serde_json::json!([
+            { "reason": "TORRENTS_DISABLED" }
+        ])
+    );
 }
 
 // The queue names a torrent's phase as itself, the state its history would.
@@ -1152,6 +1178,17 @@ async fn a_read_key_sees_no_trackers_passkey() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
     let rig = rig().await;
+    rig.torrents
+        .set_settings(TorrentSettings {
+            complete_dir: rig._dir.path().join("complete"),
+            categories: Vec::new(),
+            seeding: None,
+            torrent: TorrentConfig {
+                enabled: true,
+                ..TorrentConfig::default()
+            },
+        })
+        .await;
     let response = rig
         .execute(
             r#"mutation { saveTrackerRule(input: {
@@ -1186,7 +1223,7 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
             "utp": false,
             "mappings": [],
             "externalAddresses": [],
-            "reason": "offline",
+            "reason": "LEG_DOWN",
         }])
     );
 }
@@ -1318,7 +1355,7 @@ fn the_speed_test_shows_exposure_as_the_route_view_does() {
 // A route whose leg is up and that nothing has asked to open says so.
 #[test]
 fn a_route_nothing_asked_to_open_says_so() {
-    use weaver_server_api::torrents::types::{NOT_ASKED_TO_OPEN, TorrentRouteGql};
+    use weaver_server_api::torrents::types::{TorrentRouteGql, TorrentRouteReasonGql};
     use weaver_server_core::torrents::service::TorrentRoute;
 
     let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
@@ -1331,7 +1368,49 @@ fn a_route_nothing_asked_to_open_says_so() {
     });
     assert!(!route.open);
     assert_eq!(route.listen_address, None);
-    assert_eq!(route.reason.as_deref(), Some(NOT_ASKED_TO_OPEN));
+    assert_eq!(route.reason, Some(TorrentRouteReasonGql::NotAskedToOpen));
+}
+
+#[test]
+fn a_down_route_overrides_its_previous_session_state() {
+    use weaver_server_api::torrents::types::TorrentRouteGql;
+    use weaver_server_core::torrents::service::TorrentRoute;
+    use weaver_server_core::torrents::sessions::{RouteFailure, SessionView, TorrentRouteReason};
+
+    for reason in [
+        TorrentRouteReason::LegDown,
+        TorrentRouteReason::TorrentsDisabled,
+    ] {
+        for held in [None, Some(TorrentRouteReason::SessionBuildFailed.into())] {
+            let key = RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &LegPath::Direct);
+            let route = TorrentRouteGql::from(TorrentRoute {
+                key: key.clone(),
+                names: Some(ResolvedBy::Host),
+                scopes: vec![],
+                down: Some(RouteFailure {
+                    reason,
+                    detail: Some("link lost".into()),
+                }),
+                session: Some(SessionView {
+                    key,
+                    kind: LegKind::System,
+                    port: Some(6881),
+                    listen: Some("127.0.0.1:6881".parse().unwrap()),
+                    utp: true,
+                    mappings: vec![],
+                    external: vec!["203.0.113.7".parse().unwrap()],
+                    exposure: Some(exposure()),
+                    held,
+                }),
+            });
+            assert_eq!(route.reason, Some(reason.into()));
+            assert!(!route.open);
+            assert_eq!(route.listen_address, None);
+            assert!(!route.utp);
+            assert!(route.external_addresses.is_empty());
+            assert_eq!(route.exposure, None);
+        }
+    }
 }
 
 // The routes the network plans, on legs that never open: nothing in these
@@ -1343,7 +1422,10 @@ impl Routes for Planned {
         self.0.plan(scope)
     }
 
-    fn leg_down(&self, plan: &RoutePlan) -> Option<String> {
+    fn leg_down(
+        &self,
+        plan: &RoutePlan,
+    ) -> Option<weaver_server_core::torrents::sessions::RouteFailure> {
         self.0.leg_down(plan)
     }
 

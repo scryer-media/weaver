@@ -3,11 +3,12 @@
 
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Result, SimpleObject};
 use weaver_server_core::auth::CallerScope;
-use weaver_server_core::proxies::TorrentScope;
+use weaver_server_core::proxies::{TorrentRouteFault, TorrentScope};
 use weaver_server_core::torrents::service::{
     ScheduleSeeding, SeedingSource, TorrentRoute, TorrentView,
 };
 use weaver_server_core::torrents::net::Exposure;
+use weaver_server_core::torrents::sessions::TorrentRouteReason;
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_server_core::torrents::{
     ConnectionKind, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
@@ -254,29 +255,77 @@ pub struct TorrentRouteGql {
     pub external_addresses: Vec<String>,
     /// Why its session is closed: held closed, its leg down, or not opened
     /// as nothing has asked it to open. None while open.
-    pub reason: Option<String>,
+    pub reason: Option<TorrentRouteReasonGql>,
     /// Who resolves the names its sessions look up.
     pub resolved_by: Option<ResolvedBy>,
     /// What its session shows trackers and peers, while open.
     pub exposure: Option<TorrentExposureGql>,
 }
 
-/// The reason of a route with no session whose leg is up.
-pub const NOT_ASKED_TO_OPEN: &str = "not opened: nothing has asked it to open";
+/// Why a torrent route's session is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
+#[graphql(name = "TorrentRouteReason")]
+pub enum TorrentRouteReasonGql {
+    NotAskedToOpen,
+    LegDown,
+    LegMissing,
+    LegRevoked,
+    QuotaSilenced,
+    TorrentsDisabled,
+    TorrentRouteLegs,
+    TorrentRouteDirectFallback,
+    TorrentRouteRungs,
+    TorrentRoutePool,
+    RoutePlanFailed,
+    LegOpenFailed,
+    StateDirectoryFailed,
+    ListenPortUnavailable,
+    ListenPortBindFailed,
+    SessionStateUnreadable,
+    SessionBuildFailed,
+    BlocklistFailed,
+}
+
+impl From<TorrentRouteReason> for TorrentRouteReasonGql {
+    fn from(reason: TorrentRouteReason) -> Self {
+        match reason {
+            TorrentRouteReason::NotAskedToOpen => Self::NotAskedToOpen,
+            TorrentRouteReason::LegDown => Self::LegDown,
+            TorrentRouteReason::LegMissing => Self::LegMissing,
+            TorrentRouteReason::LegRevoked => Self::LegRevoked,
+            TorrentRouteReason::QuotaSilenced => Self::QuotaSilenced,
+            TorrentRouteReason::TorrentsDisabled => Self::TorrentsDisabled,
+            TorrentRouteReason::RouteBroken(fault) => match fault {
+                TorrentRouteFault::Legs => Self::TorrentRouteLegs,
+                TorrentRouteFault::DirectFallback => Self::TorrentRouteDirectFallback,
+                TorrentRouteFault::Rungs => Self::TorrentRouteRungs,
+                TorrentRouteFault::Pool => Self::TorrentRoutePool,
+            },
+            TorrentRouteReason::RoutePlanFailed => Self::RoutePlanFailed,
+            TorrentRouteReason::LegOpenFailed => Self::LegOpenFailed,
+            TorrentRouteReason::StateDirectoryFailed => Self::StateDirectoryFailed,
+            TorrentRouteReason::ListenPortUnavailable => Self::ListenPortUnavailable,
+            TorrentRouteReason::ListenPortBindFailed => Self::ListenPortBindFailed,
+            TorrentRouteReason::SessionStateUnreadable => Self::SessionStateUnreadable,
+            TorrentRouteReason::SessionBuildFailed => Self::SessionBuildFailed,
+            TorrentRouteReason::BlocklistFailed => Self::BlocklistFailed,
+        }
+    }
+}
 
 impl From<TorrentRoute> for TorrentRouteGql {
     fn from(route: TorrentRoute) -> Self {
-        let session = route.session;
-        let reason = match &session {
+        let reason = route.down.or_else(|| match &route.session {
             Some(session) => session.held.clone(),
-            None => Some(route.down.unwrap_or_else(|| NOT_ASKED_TO_OPEN.to_owned())),
-        };
+            None => Some(TorrentRouteReason::NotAskedToOpen.into()),
+        });
+        // A previous session can outlive the route becoming unavailable.
+        let session = route.session.filter(|_| reason.is_none());
+        let reason = reason.map(|failure| failure.reason.into());
         Self {
             key: route.key.as_str().to_owned(),
             scopes: route.scopes.into_iter().map(Into::into).collect(),
-            open: session
-                .as_ref()
-                .is_some_and(|session| session.held.is_none()),
+            open: session.is_some(),
             listen_address: session
                 .as_ref()
                 .and_then(|session| session.listen)

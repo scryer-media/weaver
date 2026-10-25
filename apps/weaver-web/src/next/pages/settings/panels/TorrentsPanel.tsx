@@ -14,7 +14,7 @@ import {
   UPDATE_TORRENT_SETTINGS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { UNPACK_CHOICES, routeExposureText, unpackChoice, unpackOf, type TorrentExposure } from "@/lib/torrents";
+import { UNPACK_CHOICES, routeExposureText, routeReasonText, type TorrentRouteReason, unpackChoice, unpackOf, type TorrentExposure } from "@/lib/torrents";
 import type { ResolvedBy } from "@/lib/test-via";
 import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
@@ -329,7 +329,7 @@ interface TorrentRoute {
   mappings: TorrentPortMapping[];
   externalAddresses: string[];
   /** Why the route's session is held closed, or why its leg is down. */
-  reason: string | null;
+  reason: TorrentRouteReason | null;
   /** Who resolves the names its sessions look up. */
   resolvedBy: ResolvedBy | null;
   /** What its session shows trackers and peers, while open. */
@@ -381,7 +381,9 @@ function useTorrentRoutes(t: Translate): SettingsBlock {
       const external = route.externalAddresses.length === 0 ? EM_DASH : route.externalAddresses.join(", ");
       const exposure = routeExposureText(t, route);
       const status =
-        route.reason ?? t(route.open ? "next.torrents.routeOpen" : "next.torrents.routeIdle");
+        route.reason === null
+          ? t(route.open ? "next.torrents.routeOpen" : "next.torrents.routeIdle")
+          : routeReasonText(t, route.reason);
       return {
         id: route.key,
         searchText: [scopes, listen, mappings, external, exposure, status].join(" "),

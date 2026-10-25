@@ -15,6 +15,7 @@ use crate::jobs::handle::HoldTarget;
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 use crate::proxies::ResolvedBy;
 use crate::settings::{SeedingGoalMode, SeedingPolicy};
+use crate::torrents::sessions::{RouteFailure, TorrentRouteReason};
 use crate::torrents::{
     NamedBy, TorrentCounters, TorrentIntent, TorrentState, TorrentTracker, TrackerEntry,
     TrackerStatus,
@@ -98,20 +99,24 @@ pub fn seeding(complete: bool, engine: &Engine) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Held {
     /// Its route is down, for the reason given.
-    RouteDown(String),
+    RouteDown(RouteFailure),
     /// Every session there can be is in use by other routes.
     SessionLimit,
     /// Its route's session could not be built.
-    Session(String),
-    /// Torrents are off: no session runs.
-    Off,
+    Session(RouteFailure),
 }
 
 impl Held {
+    // Torrents being off stops every torrent; any other hold stalls it.
+    fn off(&self) -> bool {
+        matches!(self, Self::RouteDown(failure) if failure.reason == TorrentRouteReason::TorrentsDisabled)
+    }
+
     fn state(&self) -> TorrentState {
-        match self {
-            Self::Off => TorrentState::Stopped,
-            _ => TorrentState::Stalled,
+        if self.off() {
+            TorrentState::Stopped
+        } else {
+            TorrentState::Stalled
         }
     }
 
@@ -122,11 +127,11 @@ impl Held {
             "Not downloading"
         };
         match self {
-            Self::RouteDown(reason) if reason.is_empty() => format!("{lead}: route down"),
-            Self::RouteDown(reason) => format!("{lead}: route down ({reason})"),
+            _ if self.off() => OFF.to_owned(),
+            Self::RouteDown(reason) if reason.message().is_empty() => format!("{lead}: route down"),
+            Self::RouteDown(reason) => format!("{lead}: route down ({})", reason.message()),
             Self::SessionLimit => format!("{lead}: session limit reached"),
-            Self::Session(error) => format!("{lead}: {error}"),
-            Self::Off => OFF.to_owned(),
+            Self::Session(error) => format!("{lead}: {}", error.message()),
         }
     }
 }
@@ -678,7 +683,7 @@ mod tests {
             project(&Observed {
                 paused_by: Some(HoldOrigin::SpeedTest),
                 complete: true,
-                held: Some(Held::RouteDown(String::new())),
+                held: Some(Held::RouteDown(RouteFailure::leg_down(String::new()))),
                 ..seen(Engine::Paused { finished: true })
             }),
             (TorrentState::Queued, Some("speed test".to_owned()))
@@ -686,7 +691,7 @@ mod tests {
         assert_eq!(
             project(&Observed {
                 intent: TorrentIntent::Paused,
-                held: Some(Held::RouteDown(String::new())),
+                held: Some(Held::RouteDown(RouteFailure::leg_down(String::new()))),
                 ..seen(live.clone())
             }),
             (TorrentState::Paused, None)
@@ -694,14 +699,16 @@ mod tests {
         assert_eq!(
             project(&Observed {
                 complete: true,
-                held: Some(Held::RouteDown(String::new())),
+                held: Some(Held::RouteDown(RouteFailure::leg_down(String::new()))),
                 ..seen(Engine::Absent)
             }),
             (TorrentState::Stalled, Some(ROUTE_DOWN_SEEDING.into()))
         );
         assert_eq!(
             project(&Observed {
-                held: Some(Held::RouteDown("tunnel gone".into())),
+                held: Some(Held::RouteDown(RouteFailure::leg_down(
+                    "tunnel gone".into()
+                ))),
                 ..seen(Engine::Absent)
             }),
             (
@@ -835,7 +842,10 @@ mod tests {
         );
         assert_eq!(
             project(&Observed {
-                held: Some(Held::Session("no listening port".into())),
+                held: Some(Held::Session(RouteFailure::with_detail(
+                    crate::torrents::sessions::TorrentRouteReason::ListenPortUnavailable,
+                    "no listening port"
+                ))),
                 ..seen(Engine::Absent)
             }),
             (
@@ -846,7 +856,7 @@ mod tests {
         assert_eq!(
             project(&Observed {
                 complete: true,
-                held: Some(Held::Off),
+                held: Some(Held::RouteDown(TorrentRouteReason::TorrentsDisabled.into())),
                 ..seen(Engine::Absent)
             }),
             (TorrentState::Stopped, Some(OFF.into()))

@@ -1289,7 +1289,7 @@ impl Session {
                             opts.socket_factory.as_ref(),
                         )
                         .await
-                        .context("error starting listeners")?,
+                        .context(crate::listen::ListenFailed)?,
                 )
             } else {
                 None

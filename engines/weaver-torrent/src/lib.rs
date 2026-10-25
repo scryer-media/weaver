@@ -84,7 +84,7 @@ pub use api::Api;
 pub use api_error::{ApiError, WithStatus, WithStatusError};
 pub use create_torrent_file::{CreateTorrentOptions, CreateTorrentResult, create_torrent};
 pub use ip_ranges::IpRanges;
-pub use listen::{ListenerMode, ListenerOptions};
+pub use listen::{ListenFailed, ListenerMode, ListenerOptions};
 pub use mse::{Encryption, EncryptionPolicy, MseError};
 pub use network::{SocketFactory, StreamListener};
 pub use peer_connection::PeerConnectionOptions;

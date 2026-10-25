@@ -60,7 +60,6 @@ pub enum NetworkRefusal {
     RouteChainTransport,
     RouteHasAdvancedLegs,
     RouteConsumerGone,
-    TorrentRoutePool,
     TorrentRouteExit(TorrentRouteFault),
 
     // WireGuard sessions across every route.
@@ -138,6 +137,51 @@ pub enum TorrentRouteFault {
     Legs,
     DirectFallback,
     Rungs,
+    Pool,
+}
+
+impl TorrentRouteFault {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Legs => "TORRENT_ROUTE_LEGS",
+            Self::DirectFallback => "TORRENT_ROUTE_DIRECT_FALLBACK",
+            Self::Rungs => "TORRENT_ROUTE_RUNGS",
+            Self::Pool => "TORRENT_ROUTE_POOL",
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Legs => "a torrent route has one leg",
+            Self::DirectFallback => "a torrent route has no direct fallback",
+            Self::Rungs => "a torrent route has one rung",
+            Self::Pool => "a torrent route cannot use a pool",
+        }
+    }
+
+    pub fn validate(route: &super::Route) -> Result<(), Self> {
+        use super::{LegPath, Rung};
+        let [leg] = route.legs.as_slice() else {
+            return Err(Self::Legs);
+        };
+        let LegPath::Ladder {
+            rungs,
+            direct_fallback,
+        } = &leg.path
+        else {
+            return Ok(());
+        };
+        if rungs.iter().any(|rung| matches!(rung, Rung::Pool { .. })) {
+            return Err(Self::Pool);
+        }
+        if *direct_fallback {
+            return Err(Self::DirectFallback);
+        }
+        if rungs.len() > 1 {
+            return Err(Self::Rungs);
+        }
+        Ok(())
+    }
 }
 
 // Whose download quota keeps a speed test from starting.
@@ -199,12 +243,7 @@ impl NetworkRefusal {
             Self::RouteChainTransport => "ROUTE_CHAIN_TRANSPORT",
             Self::RouteHasAdvancedLegs => "ROUTE_HAS_ADVANCED_LEGS",
             Self::RouteConsumerGone => "ROUTE_CONSUMER_NOT_FOUND",
-            Self::TorrentRoutePool => "TORRENT_ROUTE_POOL",
-            Self::TorrentRouteExit(TorrentRouteFault::Legs) => "TORRENT_ROUTE_LEGS",
-            Self::TorrentRouteExit(TorrentRouteFault::DirectFallback) => {
-                "TORRENT_ROUTE_DIRECT_FALLBACK"
-            }
-            Self::TorrentRouteExit(TorrentRouteFault::Rungs) => "TORRENT_ROUTE_RUNGS",
+            Self::TorrentRouteExit(fault) => fault.code(),
 
             Self::WireGuardPathConflict { .. } => "WIREGUARD_PROXY_PATH_CONFLICT",
             Self::WireGuardInstanceLimit { .. } => "WIREGUARD_INSTANCE_LIMIT",
@@ -349,12 +388,7 @@ impl std::fmt::Display for NetworkRefusal {
                 "this route has advanced legs; edit it in Networking instead of replacing its legacy projection"
             }
             Self::RouteConsumerGone => "routing consumer no longer exists",
-            Self::TorrentRoutePool => "a torrent route cannot use a pool",
-            Self::TorrentRouteExit(TorrentRouteFault::Legs) => "a torrent route has one leg",
-            Self::TorrentRouteExit(TorrentRouteFault::DirectFallback) => {
-                "a torrent route has no direct fallback"
-            }
-            Self::TorrentRouteExit(TorrentRouteFault::Rungs) => "a torrent route has one rung",
+            Self::TorrentRouteExit(fault) => fault.message(),
 
             Self::WireGuardPathConflict {
                 proxy,

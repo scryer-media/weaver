@@ -388,32 +388,11 @@ impl Consumer {
     // back to the egress. With one leg there is nothing to fail over to, so
     // the route's failover means nothing here.
     pub fn validate_route(self, route: &super::Route) -> Result<(), super::NetworkRefusal> {
-        use super::{LegPath, NetworkRefusal, Rung, TorrentRouteFault};
+        use super::{NetworkRefusal, TorrentRouteFault};
         if !matches!(self, Self::Torrent(_)) {
             return Ok(());
         }
-        let [leg] = route.legs.as_slice() else {
-            return Err(NetworkRefusal::TorrentRouteExit(TorrentRouteFault::Legs));
-        };
-        let LegPath::Ladder {
-            rungs,
-            direct_fallback,
-        } = &leg.path
-        else {
-            return Ok(());
-        };
-        if rungs.iter().any(|rung| matches!(rung, Rung::Pool { .. })) {
-            return Err(NetworkRefusal::TorrentRoutePool);
-        }
-        if *direct_fallback {
-            return Err(NetworkRefusal::TorrentRouteExit(
-                TorrentRouteFault::DirectFallback,
-            ));
-        }
-        if rungs.len() > 1 {
-            return Err(NetworkRefusal::TorrentRouteExit(TorrentRouteFault::Rungs));
-        }
-        Ok(())
+        TorrentRouteFault::validate(route).map_err(NetworkRefusal::TorrentRouteExit)
     }
 }
 

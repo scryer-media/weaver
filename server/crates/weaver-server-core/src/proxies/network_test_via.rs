@@ -18,7 +18,7 @@ use crate::settings::TorrentConfig;
 use crate::speed_test::torrent::{P2pLeg, P2pPath, P2pPlan, probe as p2p_probe};
 use crate::speed_test::{P2pReport, TestTorrentSource};
 use crate::torrents::net::LegKind;
-use crate::torrents::sessions::{leg_down, leg_kind, names_on};
+use crate::torrents::sessions::{leg_kind, leg_unavailable, names_on};
 
 // The most paths one test tries, counting a pool under test by its members.
 pub const MAX_TEST_PATHS: usize = 64;
@@ -91,7 +91,7 @@ struct Probe {
     // How a torrent session would ride the path, why it carries nothing
     // now when it does not, and who resolves its names.
     kind: LegKind,
-    down: Option<String>,
+    down: Option<crate::torrents::sessions::RouteFailure>,
     names: Option<ResolvedBy>,
 }
 
@@ -360,7 +360,7 @@ impl NetworkRuntime {
                 };
                 (
                     leg_kind(self, egress_id, &path),
-                    leg_down(self, egress_id),
+                    leg_unavailable(self, egress_id),
                     names_on(self, &path),
                 )
             };
