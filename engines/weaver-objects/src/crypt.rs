@@ -683,7 +683,12 @@ impl Chain {
         }
         let block_start = block_floor(range.start);
         let block_end = block_ceil(range.end);
-        let (mut cursor, seed) = self.seed(block_start);
+        let (seeded, seed) = self.seed(block_start);
+        // A staged block is posted as it came, whatever is before it: the
+        // walk starts at the last one at or below the range when it is past
+        // the seed, and the gap behind it is never enciphered again.
+        let mut cursor =
+            (self.staged.range(seeded..=block_start).next_back()).map_or(seeded, |(at, _)| *at);
         let mut preceding = Some(seed);
         let mut posted: Vec<u8> = Vec::with_capacity((block_end - block_start) as usize);
         while cursor < block_end {
