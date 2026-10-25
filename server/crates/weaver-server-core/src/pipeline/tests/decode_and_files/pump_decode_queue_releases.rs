@@ -3279,7 +3279,8 @@ async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
     pipeline.reprocess_job(job_id).await.unwrap();
 
     let state = pipeline.jobs.get(&job_id).unwrap();
-    assert_eq!(state.status, JobStatus::Extracting);
+    let (status, queue_empty) = reprocessed_shape();
+    assert_eq!(state.status, status);
     assert_eq!(state.spec.files.len(), 1);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert_eq!(
@@ -3292,7 +3293,16 @@ async fn reprocess_job_rebuilds_failed_history_from_streamed_persisted_nzb() {
             ),
         ]
     );
-    assert!(state.download_queue.is_empty());
+    assert_eq!(state.download_queue.is_empty(), queue_empty);
+}
+
+// What a reprocess over nothing on disk leaves: the classic engine trusts
+// the directory and moves on to extraction; the graph fetches again.
+fn reprocessed_shape() -> (JobStatus, bool) {
+    match crate::pipeline::graph::Engine::from_environment() {
+        crate::pipeline::graph::Engine::Classic => (JobStatus::Extracting, true),
+        crate::pipeline::graph::Engine::Graph => (JobStatus::Queued, false),
+    }
 }
 
 #[tokio::test]
@@ -3314,7 +3324,8 @@ async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
     pipeline.reprocess_job(job_id).await.unwrap();
 
     let state = pipeline.jobs.get(&job_id).unwrap();
-    assert_eq!(state.status, JobStatus::Extracting);
+    let (status, queue_empty) = reprocessed_shape();
+    assert_eq!(state.status, status);
     assert_eq!(state.spec.files.len(), 1);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert_eq!(
@@ -3327,7 +3338,7 @@ async fn reprocess_job_rebuilds_complete_history_from_streamed_persisted_nzb() {
             ),
         ]
     );
-    assert!(state.download_queue.is_empty());
+    assert_eq!(state.download_queue.is_empty(), queue_empty);
 }
 
 // A job with no recovery set has nothing to compare a whole-file MD5

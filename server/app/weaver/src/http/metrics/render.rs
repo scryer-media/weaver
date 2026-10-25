@@ -1700,6 +1700,7 @@ pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::QueuedPostProcessing => "queued_post_processing",
         JobStatus::PostProcessing => "post_processing",
         JobStatus::Complete => "complete",
+        JobStatus::Partial => "partial",
         JobStatus::Failed { .. } => "failed",
         JobStatus::Paused => "paused",
     }

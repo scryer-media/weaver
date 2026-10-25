@@ -347,6 +347,87 @@ async fn blocked_restore_recovered_on_startup_stays_paused_and_cancel_clears_gat
 }
 
 #[tokio::test]
+async fn blocked_restore_resumes_into_downloading_whatever_status_was_stored() {
+    let temp = tempfile::tempdir().unwrap();
+    let (pipeline, mut request, journal_dir) = retained_placement_fixture(&temp).await;
+    std::fs::write(journal_dir.join("journal.json"), b"broken").unwrap();
+    retire_pipeline_database(pipeline).await;
+    request.status = JobStatus::Paused;
+    request.paused_resume_status = Some(JobStatus::Extracting);
+    let job_id = request.job_id;
+    let (mut restored, _, _) = new_direct_pipeline(&temp).await;
+    restored.restore_job(request).await.unwrap();
+    assert!(restored.blocked_restores.contains_key(&job_id));
+    assert_eq!(
+        restored.jobs[&job_id].paused_resume_status,
+        Some(JobStatus::Downloading)
+    );
+    let row = restored
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&job_id)
+        .unwrap();
+    assert_eq!(row.paused_resume_status.as_deref(), Some("downloading"));
+}
+
+#[tokio::test]
+async fn blocked_non_paused_restore_resumes_into_the_status_its_lanes_name() {
+    for (status, download_state, post_state, resume, persisted) in [
+        (
+            JobStatus::Extracting,
+            crate::jobs::model::DownloadState::Complete,
+            crate::jobs::model::PostState::Extracting,
+            JobStatus::Downloading,
+            "downloading",
+        ),
+        (
+            JobStatus::Queued,
+            crate::jobs::model::DownloadState::Queued,
+            crate::jobs::model::PostState::Idle,
+            JobStatus::Queued,
+            "queued",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (pipeline, mut request, journal_dir) = retained_placement_fixture(&temp).await;
+        std::fs::write(journal_dir.join("journal.json"), b"broken").unwrap();
+        retire_pipeline_database(pipeline).await;
+        request.status = status.clone();
+        request.download_state = Some(download_state);
+        request.post_state = Some(post_state);
+        let job_id = request.job_id;
+        let (mut restored, _, _) = new_direct_pipeline(&temp).await;
+        restored.restore_job(request).await.unwrap();
+        assert!(
+            restored.blocked_restores.contains_key(&job_id),
+            "{status:?}"
+        );
+        assert_eq!(
+            restored.jobs[&job_id].status,
+            JobStatus::Paused,
+            "{status:?}"
+        );
+        assert_eq!(
+            restored.jobs[&job_id].paused_resume_status,
+            Some(resume),
+            "{status:?}"
+        );
+        let row = restored
+            .db
+            .load_active_jobs()
+            .unwrap()
+            .remove(&job_id)
+            .unwrap();
+        assert_eq!(
+            row.paused_resume_status.as_deref(),
+            Some(persisted),
+            "{status:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn placement_replay_invalidates_verdicts_before_completion_and_post_repair() {
     for phase in ["installation", "partial_binding", "rollback"] {
         for caller in ["apply", "completion", "post_repair"] {

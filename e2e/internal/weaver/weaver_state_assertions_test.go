@@ -1221,11 +1221,14 @@ func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t 
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("WEAVER_RAR_DIRECT_STORE", "1")
+	t.Setenv(weaverEngineEnv, "")
 	assertion := &ScenarioDirectStoreAssertion{
 		ExpectedDemotionReason:           "member_malformed_chain",
 		RequireRoutedByteMaterialization: true,
 		ForbidVolumeRefetch:              true,
 	}
+	scenario := &Scenario{Slug: "direct-store-malformed-chain", RuntimeAssertions: &ScenarioRuntimeAssertions{DirectStore: assertion}}
 
 	for _, test := range []struct {
 		name    string
@@ -1261,7 +1264,7 @@ func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t 
 			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			err := assertDirectStoreScenario(81, assertion)
+			err := assertDirectStoreScenario(81, scenario)
 			if test.wantErr == "" && err != nil {
 				t.Fatalf("assertion failed: %v", err)
 			}
@@ -1382,4 +1385,93 @@ func TestAssertHealthProbeScenarioCanForbidActivation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPartialDeliveryExpectsPartialHistoryBehindFailedFacade(t *testing.T) {
+	scenario := &Scenario{
+		Slug:                    "partial-delivery",
+		ExpectedOutcome:         "success",
+		ExpectedOutcomeByEngine: map[string]string{string(engineGraph): outcomePartialDelivery},
+	}
+
+	t.Setenv(weaverEngineEnv, string(engineGraph))
+	if got := scenario.expectedHistoryStatus("FAILED"); got != "PARTIAL" {
+		t.Fatalf("graph partial delivery history = %q, want PARTIAL", got)
+	}
+	if !scenario.deliveredOn("FAILED") {
+		t.Fatal("graph partial delivery must run the delivered-output checks behind a FAILED facade")
+	}
+	if got := scenario.expectedHistoryStatus("COMPLETE"); got != "COMPLETE" {
+		t.Fatalf("a completed facade still expects COMPLETE history, got %q", got)
+	}
+
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (11, 'partial')`)
+	if err := assertTerminalFixtureState(dbPath, 11, scenario.expectedHistoryStatus("FAILED")); err != nil {
+		t.Fatalf("partial history behind a FAILED facade must pass, got %v", err)
+	}
+
+	t.Setenv(weaverEngineEnv, string(engineClassic))
+	if got := scenario.expectedHistoryStatus("FAILED"); got != "FAILED" {
+		t.Fatalf("classic keeps the facade status, got %q", got)
+	}
+	if scenario.deliveredOn("FAILED") {
+		t.Fatal("a FAILED job the scenario does not expect to deliver in part has no delivered outputs to check")
+	}
+	if err := assertTerminalFixtureState(dbPath, 11, scenario.expectedHistoryStatus("FAILED")); err == nil {
+		t.Fatal("classic expects FAILED history, so a partial row must mismatch")
+	}
+	var nilScenario *Scenario
+	if got := nilScenario.expectedHistoryStatus("FAILED"); got != "FAILED" {
+		t.Fatalf("a scenario that failed to load expects the facade status, got %q", got)
+	}
+}
+
+func TestFileCompleteReadsTheEngineUnderTestsState(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "weaver.db")
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE active_files (job_id INTEGER NOT NULL, file_index INTEGER NOT NULL, filename TEXT NOT NULL)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE graph_members (job_id INTEGER NOT NULL, node_id INTEGER NOT NULL, member_id INTEGER NOT NULL, name TEXT NOT NULL, length INTEGER)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE graph_coverage (job_id INTEGER NOT NULL, node_id INTEGER NOT NULL, member_id INTEGER NOT NULL, range_start INTEGER NOT NULL, range_end INTEGER NOT NULL)`)
+
+	check := func(engine weaverEngine, want bool) {
+		t.Helper()
+		got, err := fileComplete(db, weaverDatastoreSQLite, engine, 7, "media.mkv")
+		if err != nil {
+			t.Fatalf("%s: %v", engine, err)
+		}
+		if got != want {
+			t.Fatalf("%s: complete = %v, want %v", engine, got, want)
+		}
+	}
+
+	// Nothing written yet.
+	check(engineClassic, false)
+	check(engineGraph, false)
+
+	// A root member whose length is unknown is not complete.
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_members VALUES (7, 0, 1, 'media.mkv', NULL)`)
+	check(engineGraph, false)
+
+	// Known length, with a hole in its runs.
+	mustExecWeaverStateSQL(t, db, `UPDATE graph_members SET length = 300`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES (7, 0, 1, 0, 100), (7, 0, 1, 200, 300)`)
+	check(engineGraph, false)
+
+	// The same name inside an archive, or in another job, does not count.
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_members VALUES (7, 3, 1, 'media.mkv', 100), (8, 0, 1, 'media.mkv', 100)`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES (7, 3, 1, 0, 100), (8, 0, 1, 0, 100)`)
+	check(engineGraph, false)
+
+	// Its runs cover every byte: complete for the graph, and the classic
+	// engine still waits on its own table.
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES (7, 0, 1, 100, 200)`)
+	check(engineGraph, true)
+	check(engineClassic, false)
+
+	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files VALUES (7, 0, 'media.mkv')`)
+	check(engineClassic, true)
 }

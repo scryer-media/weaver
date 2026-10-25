@@ -50,7 +50,17 @@ type Scenario struct {
 	// exercises the path under test; set this to a stable substring of the
 	// terminal error and the run has to fail for that reason. Matched
 	// case-insensitively against the job's terminal error message.
-	ExpectedErrorContains              string            `json:"expectedErrorContains,omitempty"`
+	ExpectedErrorContains string `json:"expectedErrorContains,omitempty"`
+	// ExpectedOutcomeByEngine and ExpectedErrorContainsByEngine replace
+	// expected_outcome and expectedErrorContains for the engine named by
+	// WEAVER_ENGINE (engineUnderTest), keyed by the engine's name ("graph");
+	// an engine the map does not name falls back to the unkeyed field. They
+	// exist for a fixture whose correct outcome is an engine ruling, not a
+	// product fault: the graph delivers both members of an archive whose names
+	// collide, and words its failures its own way. Read through
+	// Scenario.expectedOutcome and Scenario.expectedErrorContains.
+	ExpectedOutcomeByEngine            map[string]string `json:"expectedOutcomeByEngine,omitempty"`
+	ExpectedErrorContainsByEngine      map[string]string `json:"expectedErrorContainsByEngine,omitempty"`
 	Password                           string            `json:"password,omitempty"`
 	SegmentSize                        int               `json:"segment_size,omitempty"`
 	NZBSegmentNumbers                  []int             `json:"nzb_segment_numbers,omitempty"`
@@ -199,6 +209,62 @@ type ScenarioDirectUnpackAssertion struct {
 // still running.
 type ScenarioQueueLivenessAssertion struct {
 	ProbeSlug string `json:"probeSlug"`
+}
+
+// expectedOutcome is the outcome the scenario expects of the engine under test.
+func (s *Scenario) expectedOutcome() string {
+	return s.expectedOutcomeFor(engineUnderTest())
+}
+
+func (s *Scenario) expectedOutcomeFor(engine weaverEngine) string {
+	if outcome, ok := s.ExpectedOutcomeByEngine[string(engine)]; ok {
+		return outcome
+	}
+	return s.ExpectedOutcome
+}
+
+// outcomePartialDelivery is the expected outcome of a job that delivers some
+// outputs whole and others damaged: history records it PARTIAL, the facade
+// reports it FAILED, and the outputs the scenario lists are still checked as
+// delivered.
+const outcomePartialDelivery = "partial_delivery"
+
+// expectedHistoryStatus is the job_history status the scenario expects of a job
+// the facade reports terminal with `status`. A partial delivery is FAILED to the
+// facade and PARTIAL in history; every other outcome records what the facade
+// reports. A nil scenario expects the facade status.
+func (s *Scenario) expectedHistoryStatus(status string) string {
+	if s != nil && s.expectedOutcome() == outcomePartialDelivery && normalizeFacadeState(status) == "FAILED" {
+		return "PARTIAL"
+	}
+	return status
+}
+
+// deliveredOn reports whether a job the facade reports terminal with `status`
+// delivered outputs the scenario's post-terminal checks (events, digests,
+// runtime assertions) apply to: a completed job, or a partial delivery the
+// scenario expects.
+func (s *Scenario) deliveredOn(status string) bool {
+	switch normalizeFacadeState(status) {
+	case "COMPLETE":
+		return true
+	case "FAILED":
+		return s != nil && s.expectedOutcome() == outcomePartialDelivery
+	}
+	return false
+}
+
+// expectedErrorContains is the terminal error substring the scenario expects of
+// the engine under test.
+func (s *Scenario) expectedErrorContains() string {
+	return s.expectedErrorContainsFor(engineUnderTest())
+}
+
+func (s *Scenario) expectedErrorContainsFor(engine weaverEngine) string {
+	if expected, ok := s.ExpectedErrorContainsByEngine[string(engine)]; ok {
+		return expected
+	}
+	return s.ExpectedErrorContains
 }
 
 func (s *Scenario) fileIdentityRewriteAssertion() *ScenarioFileIdentityRewriteAssertion {
@@ -1977,7 +2043,7 @@ func cmdScenarios() {
 	fmt.Printf("%-25s %-5s %-22s %s\n", "SLUG", "CAT", "OUTCOME", "DESCRIPTION")
 	fmt.Println(strings.Repeat("-", 100))
 	for _, s := range loadScenariosForSlugs(canonicalFixtureSlugs) {
-		outcome := s.ExpectedOutcome
+		outcome := s.expectedOutcome()
 		if s.Disabled != "" {
 			outcome = "disabled"
 		}

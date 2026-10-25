@@ -2166,12 +2166,24 @@ async fn terminal_accounting_is_idempotent() {
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
 
-    // Reprocessing a job that is still resident rebuilds its assembly with
-    // every segment already committed, so the ledger has nothing left to book:
-    // delivery is a terminal state too, and it outranks a failure result.
+    // A reprocess is a new admission on the engine the switch names now. The
+    // classic engine trusts the working directory, so every segment is already
+    // committed and the ledger has nothing left to book: delivery is a
+    // terminal state too, and it outranks a failure result. The graph fetches
+    // every article again, so the article is pending and its loss books its
+    // declared bytes afresh.
+    let booked = match crate::pipeline::graph::Engine::from_environment() {
+        crate::pipeline::graph::Engine::Classic => 0,
+        crate::pipeline::graph::Engine::Graph => {
+            u64::from(pipeline.jobs[&job_id].spec.files[0].segments[0].bytes)
+        }
+    };
     pipeline.book_failed_segment(segment_id);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
-    assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, booked);
+    assert_eq!(
+        pipeline.segment_terminal_states.contains_key(&segment_id),
+        booked != 0
+    );
     pipeline.purge_terminal_job_runtime(job_id);
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
 }
@@ -4159,6 +4171,95 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
     pipeline.jobs.remove(&job_id);
     pipeline.shared_state.publish_jobs(Vec::new());
     runtime.network.shutdown().await;
+}
+
+#[tokio::test]
+async fn par2_metadata_bootstrap_holds_a_graph_jobs_payload_until_its_index_is_read() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    let job_id = JobId(40146);
+    let payload = (0..(7 * 128))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let index = build_test_par2_index("payload.mkv", &payload, 64);
+    let payload_segments = (0..7)
+        .map(|number| {
+            segment_spec! {
+                number: number,
+                bytes: 128,
+                message_id: format!("graph-payload-{number}@example.com"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let spec = JobSpec {
+        name: "Graph PAR2 Bootstrap".to_string(),
+        password: None,
+        total_bytes: (index.len() + payload.len()) as u64,
+        category: None,
+        metadata: vec![],
+        files: vec![
+            FileSpec {
+                filename: "00-index.par2".to_string(),
+                role: FileRole::Par2 {
+                    is_index: true,
+                    recovery_block_count: 0,
+                },
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: vec![segment_spec! {
+                    number: 0,
+                    bytes: index.len() as u32,
+                    message_id: "graph-index@example.com".to_string(),
+                }],
+            },
+            FileSpec {
+                filename: "payload.mkv".to_string(),
+                role: FileRole::Standalone,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: payload_segments,
+            },
+        ],
+    };
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec,
+        crate::pipeline::graph::Engine::Graph,
+    )
+    .await;
+    pipeline.admit_graph_job(job_id, crate::pipeline::graph::Engine::Graph);
+    assert!(pipeline.is_graph_job(job_id));
+    let queued = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
+    assert_eq!(queued, 8);
+
+    // The namespace holds the payload an index to come will place: only
+    // the index leases until it has been read, and nothing is refused.
+    let mut leased = Vec::new();
+    while let Some(lease) = pipeline.lease_for_server_for_test(0) {
+        leased.extend(lease.works.into_iter().map(|work| work.segment_id));
+    }
+    assert_eq!(
+        leased
+            .iter()
+            .map(|id| id.file_id.file_index)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "{leased:?}"
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        queued - 1
+    );
 }
 
 // A pipelined BODY batch that ended with its connection torn down.

@@ -31,6 +31,9 @@ pub struct ActiveJob {
     // its NZB fetch (`DnzbHeader`), in order. Database writes encrypt them as
     // one value; they are not in the NZB bytes, so a restart reads them from here.
     pub supplied_password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+    // The engine the job was admitted under. Stored on the row so a restart
+    // runs it on the same engine whatever WEAVER_ENGINE says by then.
+    pub engine: crate::pipeline::graph::Engine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

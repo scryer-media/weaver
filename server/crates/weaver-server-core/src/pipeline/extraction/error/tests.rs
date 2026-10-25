@@ -12,6 +12,7 @@ fn test_budget() -> (tempfile::TempDir, Arc<JobExtractionBudget>) {
         max_member_bytes: 1 << 40,
         max_entries: 1_000,
         max_ratio: 100,
+        ratio_floor_bytes: 1 << 30,
         max_seconds: 3_600,
         min_free_bytes: 1,
         max_memory_bytes: 1 << 30,

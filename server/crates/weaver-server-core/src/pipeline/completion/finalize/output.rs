@@ -684,6 +684,20 @@ async fn run_move_to_claimed_destination(
         );
     }
 
+    // The chunk workspace is the job's scratch: everything it backed has been
+    // published, so it goes with the working directory it lives in.
+    let chunks = working_dir.join(".weaver-chunks");
+    if let Err(error) = tokio::fs::remove_dir_all(&chunks).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            job_id = job_id.0,
+            path = %chunks.display(),
+            error = %error,
+            "failed to remove chunk workspace during final move"
+        );
+    }
+
     let marker_path = working_dir.join(WORKING_DIR_MARKER);
     if let Err(error) = tokio::fs::remove_file(&marker_path).await
         && error.kind() != std::io::ErrorKind::NotFound
@@ -1020,6 +1034,17 @@ impl Pipeline {
     //
     // Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
     pub(crate) async fn start_move_to_complete(&mut self, job_id: JobId) -> Result<(), String> {
+        self.start_move_to_complete_held(job_id, None).await
+    }
+
+    // [`Self::start_move_to_complete`], the move first holding at the named
+    // e2e delay hook. The hold is on the move's own task, so the job stands
+    // at `Moving` and nothing else waits on it.
+    pub(crate) async fn start_move_to_complete_held(
+        &mut self,
+        job_id: JobId,
+        hold: Option<&'static str>,
+    ) -> Result<(), String> {
         if self.inflight_moves.contains(&job_id) {
             return Ok(());
         }
@@ -1145,6 +1170,13 @@ impl Pipeline {
             "starting final move"
         );
         tokio::spawn(async move {
+            if let Some(hook) = hold {
+                // The hook sleeps its thread, so it is given one of its own.
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::e2e_failpoint::maybe_delay(hook);
+                })
+                .await;
+            }
             let move_started = Instant::now();
             let result = async {
                 if let Some((db, context)) = script_validation {
@@ -1353,7 +1385,7 @@ impl Pipeline {
             )
         ) {
             1
-        } else if self.par2_verified.contains(&job_id) {
+        } else if self.par2_verified.contains(&job_id) || self.graph_recovery_verified(job_id) {
             2
         } else {
             0
@@ -1367,6 +1399,7 @@ impl Pipeline {
             .extracted_archives
             .get(&job_id)
             .is_some_and(|archives| !archives.is_empty())
+            || self.graph_unpacked(job_id)
         {
             2
         } else {

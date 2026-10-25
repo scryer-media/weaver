@@ -116,43 +116,70 @@ impl Pipeline {
         exclude_servers: Vec<usize>,
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let file_idx = segment_id.file_id.file_index as usize;
-        let completion_critical = self.segment_is_completion_critical(segment_id);
+        // Built as a retry is: park/restore drops any rotation hint, which
+        // is advisory, and the next transport failure recomputes it.
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
+            return false;
+        };
+        let Some(work) = self.requeue_graph_work(work) else {
+            self.update_queue_metrics();
+            return true;
+        };
+        let parks = self.requeue_parks(&work);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return false;
         };
-        let Some(file_spec) = state.spec.files.get(file_idx) else {
-            return false;
-        };
-        let Some(seg_spec) = file_spec
-            .segments
-            .iter()
-            .find(|seg| seg.ordinal == segment_id.segment_number)
-        else {
-            return false;
-        };
-        let work = DownloadWork {
-            counters: None,
-            segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
-            priority: file_spec.role.download_priority(),
-            byte_estimate: seg_spec.bytes,
-            retry_count,
-            is_recovery: file_spec.role.is_recovery(),
-            completion_critical,
-            exclude_servers,
-            // Park/restore drops any rotation hint: it is advisory, and the
-            // next transport failure recomputes it.
-            avoid_server: None,
-        };
-        if work.is_recovery && !work.completion_critical {
+        if parks {
             state.recovery_queue.push(work);
         } else {
             state.download_queue.push(work);
         }
         self.update_queue_metrics();
         true
+    }
+
+    // The article's id in use is spent: it failed on every server it may use,
+    // or arrived and failed to decode. When the NZB gave the part another id,
+    // the article moves to it and is queued afresh; false when every id is
+    // spent and the article is lost.
+    pub(in crate::pipeline) fn spend_message_id(&mut self, segment_id: SegmentId) -> bool {
+        let moved = self
+            .jobs
+            .get_mut(&segment_id.file_id.job_id)
+            .and_then(|state| {
+                state
+                    .spec
+                    .files
+                    .get_mut(segment_id.file_id.file_index as usize)
+            })
+            .and_then(|file| {
+                file.segments
+                    .iter_mut()
+                    .find(|segment| segment.ordinal == segment_id.segment_number)
+            })
+            .is_some_and(|segment| segment.message_ids.spend());
+        let Some(work) = moved
+            .then(|| self.download_retry_work(segment_id, 0, Vec::new()))
+            .flatten()
+        else {
+            return false;
+        };
+        self.enqueue_download_work(work);
+        self.update_queue_metrics();
+        true
+    }
+
+    // Whether the NZB gave `segment_id`'s part an id behind the one in use.
+    pub(in crate::pipeline) fn message_id_left(&self, segment_id: SegmentId) -> bool {
+        self.jobs
+            .get(&segment_id.file_id.job_id)
+            .and_then(|state| state.spec.files.get(segment_id.file_id.file_index as usize))
+            .and_then(|file| {
+                file.segments
+                    .iter()
+                    .find(|segment| segment.ordinal == segment_id.segment_number)
+            })
+            .is_some_and(|segment| segment.message_ids.has_next())
     }
 
     pub(in crate::pipeline) fn refresh_server_quota_block_presentation(&self) {
@@ -206,7 +233,7 @@ impl Pipeline {
         })
     }
 
-    fn download_retry_work(
+    pub(in crate::pipeline) fn download_retry_work(
         &self,
         segment_id: SegmentId,
         retry_count: u32,
@@ -224,7 +251,7 @@ impl Pipeline {
         Some(DownloadWork {
             counters: None,
             segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+            message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
@@ -1257,14 +1284,18 @@ impl Pipeline {
                 };
 
                 if article_not_found_exhausted {
-                    self.metrics
-                        .articles_not_found
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.send_segment_event(|| PipelineEvent::ArticleNotFound {
-                        segment_id: result.segment_id,
-                    });
-                    if self.book_failed_segment(result.segment_id) {
-                        self.note_gap_servers_support_fact(job_id, &retry_exclude_servers);
+                    // Every server is missing the id in use: the article moves
+                    // to its next id, or with every id spent is booked missing.
+                    if !self.spend_message_id(result.segment_id) {
+                        self.metrics
+                            .articles_not_found
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.send_segment_event(|| PipelineEvent::ArticleNotFound {
+                            segment_id: result.segment_id,
+                        });
+                        if self.book_failed_segment(result.segment_id) {
+                            self.note_gap_servers_support_fact(job_id, &retry_exclude_servers);
+                        }
                     }
                 } else if credentials_exhausted {
                     self.book_unservable_segment(result.segment_id, &retry_exclude_servers);
@@ -1330,7 +1361,9 @@ impl Pipeline {
                             let work = DownloadWork {
                                 counters: None,
                                 segment_id: seg_id,
-                                message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+                                message_id: crate::jobs::ids::MessageId::new(
+                                    seg_spec.message_ids.in_use(),
+                                ),
                                 groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                                 priority,
                                 byte_estimate: seg_spec.bytes,

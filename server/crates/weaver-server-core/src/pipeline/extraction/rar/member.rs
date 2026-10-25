@@ -392,7 +392,7 @@ pub(crate) struct RarExtractionOpenSelection {
 // paths, `..`, root and prefix components, Windows drive letters, embedded NUL,
 // and the empty path. Shared with the direct-store coverage snapshot through
 // `pipeline::extraction`'s re-export — one validator, one stance.
-pub(crate) fn validate_sanitized_rar_member_path(member_name: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_relative_output_path(member_name: &str) -> Result<PathBuf, String> {
     if member_name.contains('\0') {
         return Err(format!("unsafe RAR member path: {member_name}"));
     }
@@ -541,7 +541,7 @@ fn ensure_unique_sanitized_rar_member_paths(
     let mut occupied = std::collections::HashSet::<String>::new();
     for raw_name in archive.started_member_names() {
         let member_name = unrar_rs::sanitize_path(raw_name);
-        let safe_path = validate_sanitized_rar_member_path(&member_name)
+        let safe_path = validate_relative_output_path(&member_name)
             .map_err(ExtractionError::structure_refused)?;
         let collision_key = safe_path
             .to_string_lossy()
@@ -645,7 +645,7 @@ impl Pipeline {
             ExtractionError::terminal(format!("member index {idx} missing from archive metadata"))
         })?;
         let member_name = member.name.clone();
-        let safe_member_path = validate_sanitized_rar_member_path(&member_name)
+        let safe_member_path = validate_relative_output_path(&member_name)
             .map_err(|error| budget.reject_unsafe_path(error))?;
         let unpacked_size = member.unpacked_size.unwrap_or(0);
         budget.check_member_metadata(&member_name, unpacked_size)?;
@@ -1661,6 +1661,7 @@ mod tests {
                 max_member_bytes: 16 * GIB,
                 max_entries: 16,
                 max_ratio: 1,
+                ratio_floor_bytes: 1 << 30,
                 max_seconds: 60,
                 min_free_bytes: 0,
                 max_memory_bytes: 4 * GIB,
@@ -1784,20 +1785,20 @@ mod tests {
 
     #[test]
     fn sanitized_rar_member_path_rejects_empty_and_parent_components() {
-        assert!(validate_sanitized_rar_member_path("").is_err());
-        assert!(validate_sanitized_rar_member_path("../escape.txt").is_err());
-        assert!(validate_sanitized_rar_member_path("nested/../../escape.txt").is_err());
+        assert!(validate_relative_output_path("").is_err());
+        assert!(validate_relative_output_path("../escape.txt").is_err());
+        assert!(validate_relative_output_path("nested/../../escape.txt").is_err());
     }
 
     #[test]
     fn sanitized_rar_member_path_rejects_absolute_and_drive_paths() {
-        assert!(validate_sanitized_rar_member_path("/absolute.txt").is_err());
-        assert!(validate_sanitized_rar_member_path("C:/windows.txt").is_err());
+        assert!(validate_relative_output_path("/absolute.txt").is_err());
+        assert!(validate_relative_output_path("C:/windows.txt").is_err());
     }
 
     #[test]
     fn sanitized_rar_member_path_accepts_nested_relative_paths() {
-        let path = validate_sanitized_rar_member_path("nested/movie.mkv").unwrap();
+        let path = validate_relative_output_path("nested/movie.mkv").unwrap();
 
         assert_eq!(path, PathBuf::from("nested").join("movie.mkv"));
     }

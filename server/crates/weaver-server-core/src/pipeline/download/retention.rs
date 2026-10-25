@@ -268,6 +268,11 @@ impl Pipeline {
         exclude_servers: &[usize],
         warn_per_article: bool,
     ) -> Vec<usize> {
+        // The id in use failed on every server it may use. When the NZB gave
+        // the part another id, the article moves to it instead of being booked.
+        if self.spend_message_id(segment_id) {
+            return Vec::new();
+        }
         let job_id = segment_id.file_id.job_id;
         let retention = self.job_retention_excludes(job_id);
         let pool = self.nntp.pool();

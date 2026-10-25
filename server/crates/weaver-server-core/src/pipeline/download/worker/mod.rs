@@ -650,8 +650,8 @@ impl Pipeline {
             let mut ineligible_jobs = Vec::new();
             for (i, jid) in self.job_order.iter().enumerate() {
                 if let Some(s) = self.jobs.get(jid) {
-                    let parked_recovery_only =
-                        s.download_queue.is_empty() && !s.recovery_queue.is_empty();
+                    let parked_recovery = self.parked_recovery(*jid);
+                    let parked_recovery_only = s.download_queue.is_empty() && parked_recovery;
                     let status_allows_dispatch = Self::status_allows_download_dispatch(&s.status);
                     let extraction_only_idle = parked_recovery_only
                         && matches!(s.status, JobStatus::QueuedExtract | JobStatus::Extracting);
@@ -707,7 +707,10 @@ impl Pipeline {
                         );
                     } else if matches!(
                         s.status,
-                        JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                        JobStatus::Paused
+                            | JobStatus::Complete
+                            | JobStatus::Partial
+                            | JobStatus::Failed { .. }
                     ) {
                         // A job someone paused, or one that is already over, is
                         // not dispatching because it was told not to. Warning
@@ -738,7 +741,7 @@ impl Pipeline {
                             "dispatch idle: parked recovery behind a non-dispatching phase"
                         );
                     } else if !status_allows_dispatch
-                        || (s.download_queue.is_empty() && s.recovery_queue.is_empty())
+                        || (s.download_queue.is_empty() && !parked_recovery)
                     {
                         // A job with nothing queued to fetch — its download is
                         // done and it is verifying, extracting or moving its

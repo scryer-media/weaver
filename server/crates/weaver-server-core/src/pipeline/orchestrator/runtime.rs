@@ -248,6 +248,9 @@ impl Pipeline {
             tuner.params().extract_thread_count,
         );
 
+        let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
+            crate::pipeline::graph::limits::budgets(&direct_store_settings, &tuner).0,
+        ));
         let mut pipeline = Self {
             _control_runtime: crate::pipeline::queue::RuntimeGuard(shared_state.queue.clone()),
             event_tx,
@@ -258,6 +261,10 @@ impl Pipeline {
             scheduled_hardware_profile: None,
             metrics,
             jobs: HashMap::new(),
+            graph_jobs: HashMap::new(),
+            graph_status: Default::default(),
+            graph_holds,
+            graph_runs: Default::default(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),
@@ -1212,6 +1219,7 @@ impl Pipeline {
             let mut turn_active = false;
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
+            turn_active |= self.hear_graph_runs();
             self.pump_decode_queue();
 
             // An ordinal can be retired from outside the result handlers — a
@@ -1330,6 +1338,9 @@ impl Pipeline {
                             event,
                             &mut pending_download_results,
                         );
+                    }
+                    Some(said) = self.graph_runs.recv() => {
+                        self.graph_run_said(said);
                     }
                     Some(result) = self.decode_done_rx.recv() => {
                         turn_timer.resume();
@@ -1467,7 +1478,7 @@ impl Pipeline {
                         // Folded over every job, so only while something
                         // is moving; an idle pipeline's health is unchanged.
                         let min_health: Option<u32> = live.then(|| self.jobs.values()
-                            .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete))
+                            .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial))
                             .filter(|s| s.spec.total_bytes > 0)
                             .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
                             .min()).flatten();
@@ -1607,12 +1618,15 @@ impl Pipeline {
 
     pub(crate) fn consume_due_checkpoint_rechecks(&mut self) {
         let now = Instant::now();
-        if self
+        let due: Vec<JobId> = self
             .download_restart_durable_lead_retry_after
-            .values()
-            .any(|ready_at| *ready_at <= now)
-        {
-            self.flush_file_progress_batch(
+            .iter()
+            .filter(|(_, ready_at)| **ready_at <= now)
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        for job_id in due {
+            self.advance_durable_download_floor(
+                job_id,
                 "download.file_progress.flush.restart_durable_lead_retry_recheck",
             );
         }
@@ -1805,18 +1819,23 @@ impl Pipeline {
             self.maybe_finish_download_pass(job_id);
             return;
         }
-        let completion_critical =
-            work.completion_critical || self.segment_is_completion_critical(segment_id);
-        let promoted_recovery = work.is_recovery && completion_critical;
+        // A graph job's root classes the work. A classic job's promotion says
+        // whether it is recovery a repair waits on, and puts it back at the
+        // promoted key on every retry.
+        let mut work = work;
+        let promoted_recovery = !self.graph_requeued(&mut work)
+            && work.is_recovery
+            && (work.completion_critical || self.segment_is_completion_critical(segment_id));
+        // Not promoted, so nothing waits on it: `work`'s own flag says so.
+        let parks = !promoted_recovery && self.requeue_parks(&work);
         let mark_rar_unlock_dirty =
             !promoted_recovery && self.rar_unlock_requeued_work_is_relevant(&work);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             if promoted_recovery {
-                let mut work = work;
                 work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
                 work.completion_critical = true;
                 state.download_queue.push(work);
-            } else if work.is_recovery {
+            } else if parks {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);
@@ -1825,6 +1844,23 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    // Put a graph job's article back through `enqueue_download_work`, under
+    // the class the root holds it in now, and hand a classic job's back to
+    // its caller to queue as that caller always has.
+    pub(in crate::pipeline) fn requeue_graph_work(
+        &mut self,
+        work: DownloadWork,
+    ) -> Option<DownloadWork> {
+        if self
+            .job_engine(work.segment_id.file_id.job_id)
+            .classic_switches_apply()
+        {
+            return Some(work);
+        }
+        self.enqueue_download_work(work);
+        None
     }
 
     pub(crate) async fn drain(&mut self) {
@@ -1842,6 +1878,11 @@ impl Pipeline {
         // conventional backlog the flush below writes out.
         self.settle_all_direct_placements().await;
         self.flush_quiescent_write_backlog().await;
+        // A graph job's run or repair still out on a thread speaks through
+        // the run mail; heard here, so nothing of a job is out when the
+        // pipeline is down and the checkpoint holds what it came to.
+        self.drain_graph_runs().await;
+        self.checkpoint_graph_holds();
 
         if self.active_downloads > 0
             || !self.active_decodes_by_job.is_empty()
@@ -1952,6 +1993,50 @@ impl Pipeline {
                         "timed out waiting for in-flight download/decode work during shutdown"
                     );
                     break;
+                }
+            }
+        }
+    }
+
+    // Every graph job pages what it holds in RAM to scratch and is
+    // checkpointed, before the database write queue is flushed: a restart
+    // then reads those holds back instead of fetching them again. A job whose
+    // page-out failed keeps the checkpoint it last wrote, which describes
+    // only bytes that were written.
+    fn checkpoint_graph_holds(&mut self) {
+        let jobs: Vec<JobId> = self.graph_jobs.keys().copied().collect();
+        for job_id in jobs {
+            let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+                continue;
+            };
+            if let Err(error) = graph.page_out_holds() {
+                warn!(job_id = job_id.0, %error, "could not page graph holds out at shutdown");
+                continue;
+            }
+            self.checkpoint_graph_job(job_id);
+        }
+    }
+
+    // Every run is heard out and stopped where it stands: a run waits for
+    // bytes, or for a member's owner, that nothing will bring once the
+    // pipeline is down, and what it read is on its shelf for the restored
+    // job. A repair out on its thread is heard to its end, and whatever its
+    // ruling starts is stopped in turn.
+    async fn drain_graph_runs(&mut self) {
+        loop {
+            self.hear_graph_runs();
+            let limit = self.graph_slot_limit();
+            for job in self.graph_jobs.values_mut() {
+                job.stop_runs(limit);
+            }
+            if !self.graph_jobs.values().any(|job| job.awaits_mail()) {
+                return;
+            }
+            match self.graph_runs.recv().await {
+                Some(said) => self.graph_run_said(said),
+                None => {
+                    warn!("shutdown drain channel closed before in-flight work completed");
+                    return;
                 }
             }
         }
@@ -3152,7 +3237,10 @@ pub(crate) fn timestamp_secs() -> u64 {
 }
 
 pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
-    matches!(status, JobStatus::Complete | JobStatus::Failed { .. })
+    matches!(
+        status,
+        JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }
+    )
 }
 
 #[cfg(test)]

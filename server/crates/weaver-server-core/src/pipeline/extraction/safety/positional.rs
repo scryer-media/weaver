@@ -231,6 +231,7 @@ mod tests {
             max_member_bytes: 24,
             max_entries: 8,
             max_ratio: 1,
+            ratio_floor_bytes: 1 << 30,
             max_seconds: 60,
             min_free_bytes: 1,
             max_memory_bytes: 64 * MIB,

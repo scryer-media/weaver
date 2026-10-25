@@ -858,6 +858,44 @@ async fn history_items_project_bulk_duplicate_summary() {
     );
 }
 
+// Clients do not model a partial delivery yet: its row reads as failed, and
+// asking for failed rows brings it back.
+#[tokio::test]
+async fn history_reports_a_partial_job_as_failed() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        1,
+        "whole-history",
+        "complete",
+        1_700_000_001,
+    ));
+    h.insert_history_row(&sample_history_row(
+        2,
+        "partial-history",
+        "partial",
+        1_700_000_002,
+    ));
+
+    let resp = h
+        .execute(
+            r#"{
+              historyItems(filter: { states: [FAILED] }, first: 10) {
+                id
+                state
+              }
+              historyItemsCount(filter: { states: [FAILED] })
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let items = data["historyItems"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"].as_u64().unwrap(), 2);
+    assert_eq!(items[0]["state"].as_str().unwrap(), "FAILED");
+    assert_eq!(data["historyItemsCount"].as_u64().unwrap(), 1);
+}
+
 #[tokio::test]
 async fn history_items_active_only_state_filter_returns_empty() {
     let h = TestHarness::new().await;

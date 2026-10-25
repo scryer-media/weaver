@@ -108,6 +108,17 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     // would be actively wrong here.
     table!("active_direct_coverage", ResetOnRestore, RequireEmpty),
     table!("active_repair_outputs", ResetOnRestore, RequireEmpty),
+    // A graph checkpoint describes bytes in the working directory, which a
+    // database restore does not bring back, so it goes with the other
+    // `active_*` rows.
+    table!("graph_nodes", ResetOnRestore, RequireEmpty),
+    table!("graph_members", ResetOnRestore, RequireEmpty),
+    table!("graph_coverage", ResetOnRestore, RequireEmpty),
+    table!("graph_envelopes", ResetOnRestore, RequireEmpty),
+    table!("graph_crypt", ResetOnRestore, RequireEmpty),
+    table!("graph_recovery", ResetOnRestore, RequireEmpty),
+    table!("graph_holds", ResetOnRestore, RequireEmpty),
+    table!("graph_facts_parts", ResetOnRestore, RequireEmpty),
     table!("integration_events", ResetOnRestore, Replace),
     table!("metrics_history_chunks", ResetOnRestore, Replace),
     table!("async_operations", ResetOnRestore, Replace),

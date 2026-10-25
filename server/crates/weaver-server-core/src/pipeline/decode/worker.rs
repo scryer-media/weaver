@@ -977,7 +977,7 @@ impl Pipeline {
                 DownloadWork {
                     counters: None,
                     segment_id,
-                    message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+                    message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                     priority: file_spec.role.download_priority(),
                     byte_estimate: seg_spec.bytes,
@@ -1288,6 +1288,26 @@ impl Pipeline {
         self.report_job(job_id);
     }
 
+    // Whether a body that failed to decode is fetched again: the job still
+    // downloads, and the article holds another message-id, or has decode
+    // retries left and a server that has not served it. With neither, none
+    // configured among them, the damage stands as it came.
+    pub(crate) fn decode_retry_left(&mut self, segment_id: SegmentId, exclude: &[usize]) -> bool {
+        let job_id = segment_id.file_id.job_id;
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| is_terminal_status(&state.status) || state.extraction_depth > 0)
+            || self.segment_terminal_states.contains_key(&segment_id)
+        {
+            return false;
+        }
+        let retries = self.decode_retries.get(&segment_id).copied().unwrap_or(0);
+        self.message_id_left(segment_id)
+            || retries < MAX_SEGMENT_RETRIES
+                && self.unavailable_server_count(job_id, exclude) < self.nntp.pool().server_count()
+    }
+
     // Handle a decode failure by re-queuing the segment for re-download.
     //
     // yEnc decode failures (CRC/size mismatch, malformed data) indicate the
@@ -1326,6 +1346,14 @@ impl Pipeline {
             return;
         }
 
+        // A body that arrived and did not decode spends its message-id while
+        // the article holds another: the next id is fetched, not this one
+        // from another server.
+        if self.spend_message_id(segment_id) {
+            warn!(segment = %segment_id, error, "decode failed; fetching the part's next message-id");
+            return;
+        }
+
         let retries = self
             .decode_retries
             .entry(segment_id)
@@ -1340,9 +1368,7 @@ impl Pipeline {
         // Re-queuing it would leave work no lane may serve sitting in the
         // queue forever while the job reports downloading at 0 B/s.
         let exclude = Self::decode_retry_exclude_servers(exclude_servers, source_server_idx);
-        let server_count = self.nntp.pool().server_count();
-        let no_server_left =
-            server_count > 0 && self.unavailable_server_count(job_id, &exclude) >= server_count;
+        let no_server_left = self.no_server_can_serve(job_id, &exclude);
 
         if retry_count > MAX_SEGMENT_RETRIES || no_server_left {
             if no_server_left {
@@ -1412,7 +1438,7 @@ impl Pipeline {
                 let work = DownloadWork {
                     counters: None,
                     segment_id,
-                    message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+                    message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
                     groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                     priority: file_spec.role.download_priority(),
                     byte_estimate: seg_spec.bytes,
@@ -1983,6 +2009,67 @@ impl Pipeline {
                 return;
             }
 
+            // A graph job's root takes an article's bytes once, so a body that
+            // failed its checksum goes to another server while one remains,
+            // and only the last server's copy stands as damage. Classic asks
+            // the same servers after keeping its copy on disk.
+            if retain_damage
+                && self.is_graph_job(job_id)
+                && self.decode_retry_left(
+                    segment_id,
+                    &Self::decode_retry_exclude_servers(
+                        &source.exclude_servers,
+                        source.source_server_idx,
+                    ),
+                )
+            {
+                if !crc_valid {
+                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                self.handle_decode_failure(
+                    segment_id,
+                    "damaged yEnc article; another server is asked before its bytes stand",
+                    &source.exclude_servers,
+                    source.source_server_idx,
+                );
+                return;
+            }
+            // A graph job's root takes the article as placed, damaged or not;
+            // a classic job has no root and this finds nothing. The graph is
+            // a graph job's only writer, so the classic write path below is
+            // skipped; only the job's progress counts the article.
+            if self.graph_article_decoded(
+                segment_id,
+                file_offset,
+                &data,
+                !retain_damage,
+                !encoding.is_uu(),
+                yenc_layout.file_size,
+                &segments,
+            ) {
+                if !crc_valid {
+                    self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                self.metrics
+                    .bytes_decoded
+                    .fetch_add(u64::from(decoded_size), Ordering::Relaxed);
+                self.metrics
+                    .segments_decoded
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.downloaded_bytes += u64::from(decoded_size);
+                    if let Some(category_bytes) = state.category_bytes.as_ref() {
+                        category_bytes.fetch_add(u64::from(decoded_size), Ordering::Relaxed);
+                    }
+                }
+                self.send_segment_event(|| PipelineEvent::SegmentDecoded {
+                    segment_id,
+                    decoded_size,
+                    file_offset,
+                    crc_valid,
+                });
+                return;
+            }
             if retain_damage {
                 if !crc_valid {
                     self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
@@ -3044,36 +3131,15 @@ impl Pipeline {
     // ordering reason rather than because anything was wrong with it.
     fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let completion_critical = self.segment_is_completion_critical(segment_id);
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(work) = self.download_retry_work(segment_id, 0, Vec::new()) else {
             return false;
         };
-        let file_idx = segment_id.file_id.file_index as usize;
-        let Some(file_spec) = state.spec.files.get(file_idx) else {
-            return false;
-        };
-        let Some(seg_spec) = file_spec
-            .segments
-            .iter()
-            .find(|segment| segment.ordinal == segment_id.segment_number)
-        else {
-            return false;
-        };
-
-        let work = DownloadWork {
-            counters: None,
-            segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
-            priority: file_spec.role.download_priority(),
-            byte_estimate: seg_spec.bytes,
-            retry_count: 0,
-            is_recovery: file_spec.role.is_recovery(),
-            completion_critical,
-            exclude_servers: Vec::new(),
-            avoid_server: None,
-        };
-        state.download_queue.push(work);
+        if let Some(work) = self.requeue_graph_work(work) {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                return false;
+            };
+            state.download_queue.push(work);
+        }
         self.update_queue_metrics();
         true
     }

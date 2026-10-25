@@ -1974,7 +1974,9 @@ impl Pipeline {
                                 file_id,
                                 segment_number: segment.ordinal,
                             },
-                            message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
+                            message_id: crate::jobs::ids::MessageId::new(
+                                segment.message_ids.in_use(),
+                            ),
                             groups: std::sync::Arc::from(file.groups.as_slice()),
                             priority: file.role.download_priority(),
                             byte_estimate: segment.bytes,
@@ -2096,6 +2098,9 @@ impl Pipeline {
         }
 
         let mut cleared_detected_file_ids = Vec::new();
+        // A graph job's refetch goes back through the root, which ranks it.
+        let classic = self.job_engine(job_id).classic_switches_apply();
+        let mut graph_work = Vec::new();
         {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return Ok(false);
@@ -2119,10 +2124,17 @@ impl Pipeline {
                     }
                 }
 
-                for work in retry_file.work.drain(..) {
-                    state.download_queue.push(work);
+                if classic {
+                    for work in retry_file.work.drain(..) {
+                        state.download_queue.push(work);
+                    }
+                } else {
+                    graph_work.append(&mut retry_file.work);
                 }
             }
+        }
+        for work in graph_work {
+            self.enqueue_download_work(work);
         }
 
         for file_id in cleared_detected_file_ids {

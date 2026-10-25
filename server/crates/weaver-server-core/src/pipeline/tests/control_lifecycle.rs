@@ -15,7 +15,7 @@ async fn repeated_article_cache_failure_refuses_admission_before_persistence() {
     let handle = handle(&pipeline);
     let id = JobId(9201);
     let mut spec = segmented_job_spec("cache admission fixture", "payload.bin", &[100, 100]);
-    spec.files[0].segments[1].message_id = spec.files[0].segments[0].message_id.clone();
+    spec.files[0].segments[1].message_ids = spec.files[0].segments[0].message_ids.clone();
     // Occupy the unsuffixed name first, so admission selects the same
     // job-specific directory in which the cache failure is staged.
     let collision =
@@ -74,7 +74,7 @@ async fn a_rename_carries_the_repeated_article_cache_to_the_new_working_dir() {
     let handle = handle(&pipeline);
     let id = JobId(9203);
     let mut spec = segmented_job_spec("cache rename fixture", "payload.bin", &[100, 100]);
-    spec.files[0].segments[1].message_id = spec.files[0].segments[0].message_id.clone();
+    spec.files[0].segments[1].message_ids = spec.files[0].segments[0].message_ids.clone();
     handle
         .add_job(
             id,

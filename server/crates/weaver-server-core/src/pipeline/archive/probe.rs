@@ -238,6 +238,11 @@ impl Pipeline {
         file_id: NzbFileId,
         allow_probe: bool,
     ) {
+        // Classifying, topology and the chases this arms are the classic
+        // engine's; for a graph job, live or restored, its objects own them.
+        if !self.job_engine(job_id).classic_switches_apply() {
+            return;
+        }
         // A direct set's source volume has no file: classifying
         // it probes a path that does not exist, and the topology update it
         // feeds would then dispatch incremental extraction over volumes nobody

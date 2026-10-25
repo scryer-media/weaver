@@ -6038,6 +6038,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-graph"
+version = "0.16.4"
+dependencies = [
+ "bytes",
+ "crc-turbo",
+ "rmp-serde",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "weaver-model"
 version = "0.16.5"
 dependencies = [
@@ -6084,6 +6095,31 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "weaver-model",
+]
+
+[[package]]
+name = "weaver-objects"
+version = "0.16.4"
+dependencies = [
+ "aws-lc-rs",
+ "brotli 8.0.4",
+ "bytes",
+ "bzip2",
+ "crc-turbo",
+ "flate2",
+ "lzma-turbo",
+ "par2-rs",
+ "par3-rs",
+ "rmp-serde",
+ "serde",
+ "sevenz-turbo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "unrar-rs",
+ "weaver-graph",
+ "zeroize",
+ "zip",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6182,9 +6218,11 @@ dependencies = [
  "unicode-normalization",
  "unrar-rs",
  "url",
+ "weaver-graph",
  "weaver-model",
  "weaver-nntp",
  "weaver-nzb",
+ "weaver-objects",
  "weaver-tunnel",
  "weaver-yenc",
  "windows-sys 0.61.2",

@@ -412,7 +412,8 @@ async fn superseded_admission_never_installs_a_queue_row() {
         panic!("initial candidate must be admitted");
     };
     let mut replacement = spec.clone();
-    replacement.files[0].segments[0].message_id = "replacement@fixture.invalid".into();
+    replacement.files[0].segments[0].message_ids =
+        crate::jobs::MessageIds::new(vec!["replacement@fixture.invalid".into()]);
     assert!(matches!(
         pipeline
             .db
@@ -555,6 +556,11 @@ async fn spawn_one_article_server(payload: Vec<u8>) -> u16 {
 // every one of them and the held job completes.
 #[tokio::test]
 async fn held_segment_write_leaves_other_jobs_commands_answered() {
+    // The held write is the classic disk owner's: a graph job writes from
+    // its runs, off the pipeline thread, and never reaches that failpoint.
+    // The engine is read once per process, so it is set before the pipeline
+    // starts; the test runner gives each test its own process.
+    unsafe { std::env::set_var(crate::pipeline::graph::ENGINE_VARIABLE, "classic") };
     let port = spawn_one_article_server(vec![b'x'; 100]).await;
     let server = weaver_nntp::ServerConfig {
         host: "127.0.0.1".to_string(),

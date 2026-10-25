@@ -35,6 +35,9 @@ pub(crate) struct ExtractionLimits {
     pub(crate) max_member_bytes: u64,
     pub(crate) max_entries: u64,
     pub(crate) max_ratio: u64,
+    // The output a job may always write, however little its archives
+    // declared: the ratio limit never falls under it.
+    pub(crate) ratio_floor_bytes: u64,
     pub(crate) max_seconds: u64,
     pub(crate) min_free_bytes: u64,
     pub(crate) max_memory_bytes: u64,
@@ -102,6 +105,7 @@ impl ExtractionLimits {
             max_member_bytes: parse_positive_u64("WEAVER_EXTRACTION_MAX_MEMBER_BYTES", TIB)?,
             max_entries: parse_positive_u64("WEAVER_EXTRACTION_MAX_ENTRIES", 100_000)?,
             max_ratio: parse_positive_u64("WEAVER_EXTRACTION_MAX_RATIO", 100)?,
+            ratio_floor_bytes: parse_positive_u64("WEAVER_EXTRACTION_RATIO_FLOOR_BYTES", GIB)?,
             max_seconds: parse_positive_u64("WEAVER_EXTRACTION_MAX_SECONDS", 43_200)?,
             min_free_bytes: parse_positive_u64(
                 "WEAVER_EXTRACTION_MIN_FREE_BYTES",
@@ -109,6 +113,24 @@ impl ExtractionLimits {
             )?,
             max_memory_bytes: parse_positive_u64(MAX_MEMORY_ENV, default_memory)?,
         })
+    }
+
+    // The most a job may write whose archives declared
+    // `declared_archive_bytes`, and the limit that sets it: the ratio over
+    // what was declared, never under the ratio floor, unless the job byte cap is
+    // tighter. A breach names whichever of the two it is.
+    pub(crate) fn job_output_limit(
+        &self,
+        declared_archive_bytes: u64,
+    ) -> (u64, ExtractionRejectionReason) {
+        let ratio_limit_bytes = declared_archive_bytes
+            .saturating_mul(self.max_ratio)
+            .max(self.ratio_floor_bytes);
+        if ratio_limit_bytes <= self.max_job_bytes {
+            (ratio_limit_bytes, ExtractionRejectionReason::Ratio)
+        } else {
+            (self.max_job_bytes, ExtractionRejectionReason::JobBytes)
+        }
     }
 }
 
@@ -174,13 +196,20 @@ impl ExtractionRejectionReason {
 // A refusal by the job's extraction budget: which limit or policy, and what
 // it refused. Carried typed by `ExtractionError` so a consumer never has to
 // recognise it from its rendering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExtractionFailure {
     reason: ExtractionRejectionReason,
     detail: String,
 }
 
 impl ExtractionFailure {
+    pub(crate) fn new(reason: ExtractionRejectionReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+
     pub(crate) fn reason(&self) -> ExtractionRejectionReason {
         self.reason
     }
@@ -900,8 +929,8 @@ pub(crate) struct JobExtractionBudget {
     process_memory: Arc<ProcessMemoryBudget>,
     decoder_memory_limit: u64,
     root_path: PathBuf,
-    ratio_limit_bytes: u64,
     effective_job_limit_bytes: u64,
+    job_limit_reason: ExtractionRejectionReason,
     started_at: Instant,
     total_written: AtomicU64,
     entry_count: AtomicU64,
@@ -977,10 +1006,8 @@ impl JobExtractionBudget {
         initial_bytes: u64,
         metrics: Arc<PipelineMetrics>,
     ) -> Result<Arc<Self>, ExtractionFailure> {
-        let ratio_limit_bytes = declared_archive_bytes
-            .saturating_mul(limits.max_ratio)
-            .max(GIB);
-        let effective_job_limit_bytes = limits.max_job_bytes.min(ratio_limit_bytes);
+        let (effective_job_limit_bytes, job_limit_reason) =
+            limits.job_output_limit(declared_archive_bytes);
         if capacity.current() == Capacity::Unknown {
             // The sampler logs the operating-system reason. The job proceeds
             // without a reserve check until a reading arrives; the extraction
@@ -1004,8 +1031,8 @@ impl JobExtractionBudget {
             process_memory,
             decoder_memory_limit,
             root_path,
-            ratio_limit_bytes,
             effective_job_limit_bytes,
+            job_limit_reason,
             started_at: Instant::now(),
             total_written: AtomicU64::new(initial_bytes),
             entry_count: AtomicU64::new(initial_entries),
@@ -1511,13 +1538,8 @@ impl JobExtractionBudget {
     }
 
     fn reject_job_bytes(&self, requested: u64, context: &str) -> ExtractionFailure {
-        let reason = if self.ratio_limit_bytes <= self.limits.max_job_bytes {
-            ExtractionRejectionReason::Ratio
-        } else {
-            ExtractionRejectionReason::JobBytes
-        };
         self.reject(
-            reason,
+            self.job_limit_reason,
             format!(
                 "{context} would reach {requested} bytes, effective job limit is {}",
                 self.effective_job_limit_bytes
@@ -2360,6 +2382,7 @@ mod tests {
             max_member_bytes: 24,
             max_entries: 8,
             max_ratio: 1,
+            ratio_floor_bytes: 1 << 30,
             max_seconds: 60,
             min_free_bytes: 1,
             max_memory_bytes: 64 * MIB,
@@ -2474,6 +2497,7 @@ mod tests {
             max_job_bytes: 2 * GIB,
             max_member_bytes: 2 * GIB,
             max_ratio: 1,
+            ratio_floor_bytes: 1 << 30,
             ..(*limits()).clone()
         });
         let ratio_budget = JobExtractionBudget::new(
@@ -3443,6 +3467,7 @@ mod tests {
                 max_job_bytes: 10_000,
                 max_member_bytes: 10_000,
                 max_ratio: 10_000,
+                ratio_floor_bytes: 1 << 30,
                 min_free_bytes: 500,
                 ..(*limits()).clone()
             }),

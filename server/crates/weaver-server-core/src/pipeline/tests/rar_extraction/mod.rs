@@ -194,7 +194,7 @@ async fn drain_completion_checks(pipeline: &mut Pipeline, rounds: usize) -> usiz
 // `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
 // emit). Every volume of such a set parses as volume 0; only the filename
 // says which volume a file is.
-fn single_member_rar4_old_numbering_set(
+pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
     base: &str,
     member_name: &str,
     payload: &[u8],
@@ -247,7 +247,7 @@ fn single_member_rar4_old_numbering_set(
 // builders leave it zero because weaver's own parser only warns on a
 // mismatch; the recovery restorer's validity probe does not, and a set
 // written to exercise it has to be one it would accept.
-fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
+pub(in crate::pipeline::tests) fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
     let mut offset = TEST_RAR4_SIG.len();
     while offset + 7 <= bytes.len() {
         let flags = u16::from_le_bytes([bytes[offset + 3], bytes[offset + 4]]);
@@ -273,7 +273,9 @@ fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
 // every data volume, padded to the longest, followed by the 7-byte footer
 // (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
 // restorer reads its geometry from.
-fn single_recovery_volume_for_rar4_set(volumes: &[&[u8]]) -> Vec<u8> {
+pub(in crate::pipeline::tests) fn single_recovery_volume_for_rar4_set(
+    volumes: &[&[u8]],
+) -> Vec<u8> {
     let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
     let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
     let mut rev = Vec::with_capacity(width + 7);

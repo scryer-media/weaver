@@ -611,7 +611,7 @@ impl Pipeline {
                                     counters: None,
                                     segment_id,
                                     message_id: crate::jobs::ids::MessageId::new(
-                                        &segment.message_id,
+                                        segment.message_ids.in_use(),
                                     ),
                                     groups: std::sync::Arc::from(file.groups.as_slice()),
                                     priority: file.role.download_priority(),
@@ -1554,7 +1554,9 @@ impl Pipeline {
         tokio::spawn(async move {
             let joined = tokio::task::spawn_blocking(move || {
                 pp_pool.install(move || {
-                    crate::e2e_failpoint::maybe_delay("direct_store.post_repair_verify");
+                    crate::e2e_failpoint::maybe_delay(
+                        crate::e2e_failpoint::DIRECT_STORE_POST_REPAIR_VERIFY,
+                    );
                     if to_read.is_empty() {
                         return par2_rs::VerificationResult {
                             files: Vec::new(),

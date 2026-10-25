@@ -8,6 +8,8 @@ impl Pipeline {
         self.queue_scripts_completed.remove(&job_id);
         self.added_script_holds.remove(&job_id);
         self.jobs.remove(&job_id);
+        self.forget_graph_repair(job_id);
+        self.graph_jobs.remove(&job_id);
         self.pipeline_failure_stages.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
         self.posted_name_disagreement_logged.remove(&job_id);
@@ -62,7 +64,10 @@ impl Pipeline {
         terminal_event: Option<PipelineEvent>,
     ) {
         if !self.jobs.get(&job_id).is_some_and(|state| {
-            matches!(state.status, JobStatus::Complete | JobStatus::Failed { .. })
+            matches!(
+                state.status,
+                JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }
+            )
         }) {
             return;
         }
@@ -109,14 +114,27 @@ impl Pipeline {
             }
         };
 
+        // A graph job's short delivery names the stage that left it short,
+        // and a repair that could not rebuild a member says why.
+        let graph_shortfall = matches!(state.status, JobStatus::Partial)
+            .then(|| self.graph_shortfall(job_id))
+            .flatten();
+        let shortfall = graph_shortfall
+            .as_ref()
+            .map(|(stage, _)| *stage)
+            .or_else(|| state.status.shortfall_stage());
         let (status_str, error_message) = match &state.status {
             JobStatus::Complete => ("complete".to_string(), None),
+            JobStatus::Partial => (
+                "partial".to_string(),
+                graph_shortfall.and_then(|(_, message)| message),
+            ),
             JobStatus::Failed { error } => ("failed".to_string(), Some(error.clone())),
             _ => {
                 return;
             }
         };
-        let completed = matches!(state.status, JobStatus::Complete);
+        let completed = matches!(state.status, JobStatus::Complete | JobStatus::Partial);
 
         // Low-frequency: one observation per job reaching a terminal status.
         // `created_at` is an `Instant` the job state already carries, so the
@@ -218,13 +236,14 @@ impl Pipeline {
             created_at_epoch_ms: state.created_at_epoch_ms,
         };
 
-        let typed_terminal_cause = if completed {
+        let whole = completed && shortfall.is_none();
+        let typed_terminal_cause = if whole {
             Some(crate::jobs::SemanticTerminalCause::Success)
         } else {
             self.semantic_terminal_causes.remove(&job_id)
         };
-        let failure_stage = self.pipeline_failure_stages.remove(&job_id);
-        let failure_kind = (!completed).then(|| {
+        let failure_stage = self.pipeline_failure_stages.remove(&job_id).or(shortfall);
+        let failure_kind = (!whole).then(|| {
             crate::history::HistoryFailureKind::derive(
                 failure_stage,
                 typed_terminal_cause,

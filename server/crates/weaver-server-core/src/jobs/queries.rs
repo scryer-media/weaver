@@ -224,6 +224,88 @@ impl Database {
         })
     }
 
+    // The engine an active job was stamped with, so a restore resumes it on
+    // that engine rather than on whatever the switch says now. `None` when the
+    // job has no active row.
+    pub fn load_active_job_engine(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<crate::pipeline::graph::Engine>, StateError> {
+        self.load_job_engine("SELECT engine FROM active_jobs WHERE job_id = {}", job_id)
+    }
+
+    // The engine a finished job ran on, carried over from its active row.
+    pub fn load_job_history_engine(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<crate::pipeline::graph::Engine>, StateError> {
+        self.load_job_engine("SELECT engine FROM job_history WHERE job_id = {}", job_id)
+    }
+
+    // The root phase of a graph job, which is its status while it runs its
+    // tree. A classic job never writes it, so its column stays NULL.
+    pub fn save_active_job_root_phase(
+        &self,
+        job_id: JobId,
+        phase: &'static str,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE active_jobs SET root_phase = {} WHERE job_id = {}",
+                &[
+                    SqlArg::Text(phase.to_string()),
+                    SqlArg::I64(job_id.0 as i64),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    pub fn load_active_job_root_phase(&self, job_id: JobId) -> Result<Option<String>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT root_phase FROM active_jobs WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            Ok(row
+                .map(|row| row.opt_text("root_phase"))
+                .transpose()?
+                .flatten())
+        })
+    }
+
+    fn load_job_engine(
+        &self,
+        sql: &'static str,
+        job_id: JobId,
+    ) -> Result<Option<crate::pipeline::graph::Engine>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                sql,
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            // An unknown stored value is a corrupt row, not a reason to guess
+            // an engine: running a job on the wrong one would misread its state.
+            row.map(|row| {
+                row.text("engine")?.parse().map_err(
+                    |error: crate::pipeline::graph::UnknownEngine| {
+                        StateError::Database(format!("job {}: {error}", job_id.0))
+                    },
+                )
+            })
+            .transpose()
+        })
+    }
+
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();

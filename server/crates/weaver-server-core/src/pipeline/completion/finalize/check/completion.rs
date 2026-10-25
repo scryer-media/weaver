@@ -432,6 +432,10 @@ impl Pipeline {
             self.deferred_post_processing.insert(job_id);
             return;
         }
+        if self.is_graph_job(job_id) {
+            crate::pipeline::graph::status::advance(self, job_id).await;
+            return;
+        }
         // A container set whose map nothing left in flight could read holds its
         // volumes off the conventional path forever, and holding them is
         // exactly what keeps this gate from ruling. Asked here because this is
@@ -509,6 +513,7 @@ impl Pipeline {
                     | JobStatus::QueuedPostProcessing
                     | JobStatus::PostProcessing
                     | JobStatus::Complete
+                    | JobStatus::Partial
                     | JobStatus::Failed { .. }
             ) {
                 return;

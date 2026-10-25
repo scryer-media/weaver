@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ByteRanges;
-use crate::pipeline::extraction::validate_sanitized_rar_member_path;
+use crate::pipeline::extraction::validate_relative_output_path;
 
 // `W`eaver `D`irect `S`tore `C`overage.
 pub(crate) const SNAPSHOT_MAGIC: [u8; 4] = *b"WDSC";
@@ -519,7 +519,7 @@ fn validate(snapshot: &CoverageSnapshot) -> Result<(), SnapshotError> {
         // the job. The house validator is the same one RAR extraction gates
         // member paths with: no absolute paths, no `..`, no root or prefix
         // components, no embedded NUL, never empty.
-        if let Err(error) = validate_sanitized_rar_member_path(&claim.relative_path) {
+        if let Err(error) = validate_relative_output_path(&claim.relative_path) {
             return Err(SnapshotError::Malformed(format!(
                 "destination claim has an unsafe path ({error})"
             )));
@@ -695,7 +695,7 @@ pub(crate) fn decode_installed(blob: &[u8]) -> Result<InstalledSet, SnapshotErro
         .map(|member| &member.relative_path)
         .chain(&installed.directories);
     for path in paths {
-        if let Err(error) = validate_sanitized_rar_member_path(path) {
+        if let Err(error) = validate_relative_output_path(path) {
             return Err(SnapshotError::Malformed(format!(
                 "installed output has an unsafe path ({error})"
             )));

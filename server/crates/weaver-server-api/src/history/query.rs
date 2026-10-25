@@ -697,8 +697,11 @@ fn history_query_plan(
         for state in states {
             match state {
                 QueueItemState::Completed => statuses.push("complete".to_string()),
+                // Clients see a partial delivery as failed, so asking for
+                // failed rows asks for partial ones too.
                 QueueItemState::Failed => {
                     statuses.push("failed".to_string());
+                    statuses.push("partial".to_string());
                     statuses.push("cancelled".to_string());
                 }
                 QueueItemState::Paused => statuses.push("paused".to_string()),

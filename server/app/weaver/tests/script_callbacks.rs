@@ -85,6 +85,7 @@ fn on(trigger: InstanceTrigger, script: &ScriptName) -> ScriptInstanceDraft {
 // An active download 42 for commands to be applied to.
 fn job(db: &Database, directory: &Path) -> JobExecutionContext {
     db.create_active_job(&ActiveJob {
+        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(42),
         nzb_hash: [42; 32],
         nzb_path: directory.join("source.nzb"),

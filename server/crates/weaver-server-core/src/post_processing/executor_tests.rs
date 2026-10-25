@@ -1214,6 +1214,7 @@ fn interrupted_job(
     })
     .unwrap();
     db.create_active_job(&crate::ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id: crate::JobId(job_id),
         nzb_hash: [job_id as u8; 32],
         nzb_path: "fixture.nzb".into(),

@@ -33,7 +33,7 @@ macro_rules! segment_spec {
             ordinal: $number,
             article_number: $number,
             bytes: $bytes,
-            message_id: $message_id,
+            message_ids: crate::jobs::MessageIds::new(vec![$message_id]),
         }
     };
     (ordinal: $ordinal:expr, article_number: $article_number:expr, bytes: $bytes:expr, message_id: $message_id:expr $(,)?) => {
@@ -41,7 +41,7 @@ macro_rules! segment_spec {
             ordinal: $ordinal,
             article_number: $article_number,
             bytes: $bytes,
-            message_id: $message_id,
+            message_ids: crate::jobs::MessageIds::new(vec![$message_id]),
         }
     };
 }
@@ -54,6 +54,7 @@ mod decode_and_files;
 mod direct_store;
 mod direct_unpack;
 mod download_dispatch;
+mod engines;
 mod full_file_names;
 mod hardware_profile;
 mod health_probe;
@@ -81,7 +82,10 @@ mod yenc_compatibility;
 mod zip64;
 
 impl Pipeline {
-    async fn restore_job(&mut self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
+    pub(in crate::pipeline) async fn restore_job(
+        &mut self,
+        request: RestoreJobRequest,
+    ) -> Result<(), SchedulerError> {
         let id = request.job_id;
         if self.jobs.contains_key(&id) {
             return Err(SchedulerError::JobExists(id));
@@ -234,7 +238,7 @@ fn sample_nzb_bytes() -> Vec<u8> {
         .to_vec()
 }
 
-fn sample_nzb_zstd() -> Vec<u8> {
+pub(in crate::pipeline) fn sample_nzb_zstd() -> Vec<u8> {
     crate::ingest::compress_nzb_bytes(&sample_nzb_bytes()).unwrap()
 }
 
@@ -653,7 +657,7 @@ pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBu
 // after the drop — so the flush moves those writes ahead of the reopen
 // instead of racing it, and loses nothing a plain drop would have kept. What
 // a crash does lose is the state that was never queued, and that stays lost.
-async fn retire_pipeline_database(pipeline: Pipeline) {
+pub(in crate::pipeline) async fn retire_pipeline_database(pipeline: Pipeline) {
     let db = pipeline.db.clone();
     drop(pipeline);
     db.flush_write_queue().await.unwrap();
@@ -664,6 +668,19 @@ async fn retire_pipeline_database(pipeline: Pipeline) {
         .await
         .expect("closing the database should not panic")
         .unwrap();
+}
+
+// Hear the run mail until the graph job has nothing out: a repair it lent
+// returns there, and is applied as it is heard.
+pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline
+        .graph_jobs
+        .get(&job_id)
+        .is_some_and(|job| job.awaits_mail())
+    {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
 }
 
 // [`new_direct_pipeline`] whose direct-store gate comes from configuration.
@@ -1216,7 +1233,7 @@ fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
     }
 }
 
-fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
+pub(in crate::pipeline) fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1934,7 +1951,11 @@ async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
     }
 }
 
-async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
+pub(in crate::pipeline) async fn insert_active_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+) -> PathBuf {
     insert_active_job_with_persisted_nzb(pipeline, job_id, spec, sample_nzb_zstd()).await
 }
 
@@ -1961,6 +1982,36 @@ async fn insert_active_job_with_persisted_nzb_named(
     nzb_zstd: Vec<u8>,
     nzb_file_name: Option<&str>,
 ) -> PathBuf {
+    insert_on(
+        pipeline,
+        job_id,
+        spec,
+        nzb_zstd,
+        nzb_file_name,
+        crate::pipeline::graph::Engine::Classic,
+    )
+    .await
+}
+
+// [`insert_active_job`] for a job admitted under `engine`: its row is
+// stamped with it and its queues are built as admission builds them for it.
+pub(in crate::pipeline) async fn insert_active_job_on(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    engine: crate::pipeline::graph::Engine,
+) -> PathBuf {
+    insert_on(pipeline, job_id, spec, sample_nzb_zstd(), None, engine).await
+}
+
+async fn insert_on(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    nzb_zstd: Vec<u8>,
+    nzb_file_name: Option<&str>,
+    engine: crate::pipeline::graph::Engine,
+) -> PathBuf {
     let nzb_file_name = nzb_file_name
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}.nzb", job_id.0));
@@ -1983,6 +2034,7 @@ async fn insert_active_job_with_persisted_nzb_named(
     pipeline
         .db
         .create_active_job(&crate::ActiveJob {
+            engine,
             job_id,
             nzb_hash: [0; 32],
             nzb_path: working_dir.join(&nzb_file_name),
@@ -2003,7 +2055,7 @@ async fn insert_active_job_with_persisted_nzb_named(
         })
         .unwrap();
     let (assembly, download_queue, recovery_queue) =
-        Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), engine);
     // Mirror admission: `add_job` registers a job's bare `.7z` files as
     // direct-unpack arming candidates, and this harness hand-builds the state
     // `add_job` would otherwise have produced.
@@ -2062,7 +2114,7 @@ async fn insert_active_job_with_persisted_nzb_named(
     working_dir
 }
 
-fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
+pub(in crate::pipeline) fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rar5")
@@ -2298,7 +2350,7 @@ fn two_segment_standalone_job_spec(
     }
 }
 
-async fn submit_decoded_segment(
+pub(in crate::pipeline) async fn submit_decoded_segment(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
     segment_number: u32,
@@ -2708,7 +2760,10 @@ fn unresolved_spans(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> Vec<(
     spans
 }
 
-fn job_status_for_assert(pipeline: &Pipeline, job_id: JobId) -> Option<JobStatus> {
+pub(in crate::pipeline) fn job_status_for_assert(
+    pipeline: &Pipeline,
+    job_id: JobId,
+) -> Option<JobStatus> {
     pipeline
         .jobs
         .get(&job_id)

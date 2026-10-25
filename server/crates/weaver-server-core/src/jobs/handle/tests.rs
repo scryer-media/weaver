@@ -104,7 +104,7 @@ fn make_spec(name: &str) -> JobSpec {
                 ordinal: 0,
                 article_number: 1,
                 bytes: 10,
-                message_id: "abc@test".into(),
+                message_ids: crate::jobs::MessageIds::new(vec!["abc@test".into()]),
             }],
         }],
         total_bytes: 10,

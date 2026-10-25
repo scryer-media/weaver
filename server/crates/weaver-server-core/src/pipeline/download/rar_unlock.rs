@@ -32,7 +32,12 @@ struct RarUnlockMemberCandidate<'a> {
 }
 
 impl Pipeline {
+    // The unlock plan ranks a classic job's RAR volumes. A graph job's root
+    // is its only ranker, so its job is never planned.
     pub(in crate::pipeline) fn mark_rar_unlock_priorities_dirty(&mut self, job_id: JobId) {
+        if !self.job_engine(job_id).classic_switches_apply() {
+            return;
+        }
         self.rar_unlock_priority_dirty_jobs.insert(job_id);
     }
 

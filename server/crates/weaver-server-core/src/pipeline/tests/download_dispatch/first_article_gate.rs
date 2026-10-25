@@ -842,7 +842,9 @@ async fn two_set_verdict(
     let mut second = spec.files.last().unwrap().clone();
     second.filename = "amber-lattice.b.vol00+32.par2".to_string();
     for segment in &mut second.segments {
-        segment.message_id = format!("amber-par2-b-{}@example.com", segment.ordinal);
+        segment.message_ids = format!("amber-par2-b-{}@example.com", segment.ordinal)
+            .as_str()
+            .into();
     }
     spec.total_bytes += second.segments.len() as u64 * 512;
     spec.files.push(second);

@@ -7,7 +7,7 @@
 
 use super::*;
 
-mod archive_schedules;
+pub(in crate::pipeline::tests) mod archive_schedules;
 
 mod chasing;
 mod classification_frontier;
@@ -24,7 +24,7 @@ mod quick_open;
 mod rar4_rar3_file_encryption;
 mod repaired_encrypted_spans;
 mod restart;
-mod sevenz_store;
+pub(in crate::pipeline::tests) mod sevenz_store;
 mod straddling_cipher_block;
 mod uu_isolation;
 mod waiting_for_targeted_recovery;
@@ -200,7 +200,7 @@ fn misaligned_parts(total: usize, count: usize) -> Vec<usize> {
 //   alone** and folds the whole-member CRC32 with that password's hash key,
 //   which is the shape RARLAB `rar` 7.20 writes: only the last part's checksum
 //   is the whole member's, so only that one is keyed.
-fn encrypted_store_set(
+pub(in crate::pipeline::tests) fn encrypted_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -363,7 +363,7 @@ async fn encrypted_routing_outcome(
 // The corpus-wide RAR4 fixture salt. RAR salts each *file* rather than the
 // archive, which is why the KDF tuple is per member here where RAR5's is per
 // archive.
-const TEST_RAR4_SALT: [u8; 8] = [0x9B; 8];
+pub(in crate::pipeline::tests) const TEST_RAR4_SALT: [u8; 8] = [0x9B; 8];
 
 // A stored, encrypted RAR4 file header: [`build_test_rar4_file_header`] plus
 // the `ENCRYPTED`/`SALT` flags and the 8-byte salt the format appends after the
@@ -419,7 +419,7 @@ fn build_test_rar4_encrypted_file_header(
 // - **no keyed checksum.** RAR4 has no hash-MAC flag, so the whole-member
 //   CRC32 below is the bare plaintext CRC32 and `convert_crc32_to_mac` is not
 //   applied to it. That is that finding stated as a fixture.
-fn encrypted_rar4_store_set(
+pub(in crate::pipeline::tests) fn encrypted_rar4_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -491,7 +491,7 @@ const TEST_HP_KDF_LG2: u8 = 4;
 
 // What a fixture's type-4 record claims about its password check.
 #[derive(Clone, Copy)]
-enum HeaderCheck {
+pub(in crate::pipeline::tests) enum HeaderCheck {
     // A check the parser will validate and hand out: the flag set, eight check
     // bytes from this password's KDF, and their real SHA-256 tag. What WinRAR
     // writes by default, and the only shape `-hp` admission accepts.
@@ -578,12 +578,50 @@ fn seal_test_rar_header(key: &[u8; 32], iv: &[u8; 16], header: &[u8]) -> Vec<u8>
 //   admission is decided on. The member-level check is always this password's,
 //   because a member that refuted it would be testing the admission gate
 //   rather than this one.
-fn header_encrypted_store_set(
+pub(in crate::pipeline::tests) fn header_encrypted_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
     password: &'static str,
     check: HeaderCheck,
+) -> Vec<(String, Vec<u8>)> {
+    header_encrypted_store_set_with_records(
+        member_name,
+        payload,
+        volume_count,
+        (password, check),
+        |_| None,
+    )
+}
+
+// [`header_encrypted_store_set`] with a RAR5 recovery record of `parity`
+// units in each volume over every byte before its `RR` header, as
+// `rar a -m0 -hp -rr` writes one: the header is enciphered with the rest,
+// the record's chunks are not.
+pub(in crate::pipeline::tests) fn protected_header_encrypted_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    password: &'static str,
+    parity: u16,
+) -> Vec<(String, Vec<u8>)> {
+    header_encrypted_store_set_with_records(
+        member_name,
+        payload,
+        volume_count,
+        (password, HeaderCheck::For(password)),
+        |protected| Some(weaver_objects::rar_record::encode::rar5(protected, parity)),
+    )
+}
+
+// [`header_encrypted_store_set`], each volume carrying the record `record`
+// makes of its bytes before the record's header, when it makes one.
+fn header_encrypted_store_set_with_records(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    (password, check): (&'static str, HeaderCheck),
+    record: impl Fn(&[u8]) -> Option<Vec<u8>>,
 ) -> Vec<(String, Vec<u8>)> {
     let header_key = unrar_rs::derive_rar5_material(password, &TEST_HP_SALT, TEST_HP_KDF_LG2)
         .expect("the fixture KDF count is derivable")
@@ -657,6 +695,14 @@ fn header_encrypted_store_set(
                 ),
             ));
             bytes.extend_from_slice(part);
+            if let Some(record) = record(&bytes) {
+                bytes.extend_from_slice(&seal(
+                    3,
+                    &mut iv,
+                    &build_test_rar_service_header("RR", record.len() as u64),
+                ));
+                bytes.extend(record);
+            }
             bytes.extend_from_slice(&seal(2, &mut iv, &build_test_rar_end_header(!is_last)));
 
             (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
@@ -742,12 +788,10 @@ fn header_encrypted_store_set_with_extra_member(
 // A RAR4 `-hp` volume: the archive header's `ENCRYPTED_HEADERS` flag and then
 // ciphertext.
 //
-// Deliberately not decryptable, and that costs nothing, because RAR4 `-hp` is
-// refused **at the flag** — the format carries no password-check value
-// anywhere, so there is nothing an admission gate could stand on and no
-// candidate can be proved before something is decrypted. What the bytes past
-// the flag are is exactly as irrelevant to this router as it is to a real
-// archive it has no key for.
+// Not decryptable: this router refuses RAR4 `-hp` at the flag, so the bytes
+// past it are never read. The graph's RAR store proves a candidate on the
+// first enciphered header's CRC instead, and its rows build sets that
+// decrypt.
 fn header_encrypted_rar4_set(volume_count: usize, body_bytes: usize) -> Vec<(String, Vec<u8>)> {
     (0..volume_count)
         .map(|volume| {

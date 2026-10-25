@@ -70,6 +70,7 @@ pub async fn recover_server_state(
                 active_volume_status = counts.active_volume_status,
                 active_rar_verified_suspect = counts.active_rar_verified_suspect,
                 active_direct_coverage = counts.active_direct_coverage,
+                graph_checkpoint = counts.graph_checkpoint,
                 "removed orphaned active-state rows before recovery"
             );
         }
@@ -93,7 +94,7 @@ pub async fn recover_server_state(
     for (job_id, recovered) in active_jobs {
         let is_finished = matches!(
             recovered.status.as_str(),
-            "complete" | "failed" | "cancelled"
+            "complete" | "partial" | "failed" | "cancelled"
         );
 
         if is_finished {
@@ -405,6 +406,7 @@ fn archive_unfinished_terminal_job(
 
     let (status_str, error_message) = match status {
         JobStatus::Complete => ("complete", None),
+        JobStatus::Partial => ("partial", None),
         JobStatus::Failed { error } => ("failed", Some(error.clone())),
         // Anything else reaching this branch is a status the active row calls
         // finished but the runtime does not model as terminal; leave it alone.
@@ -488,6 +490,7 @@ mod tests {
 
     fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
         ActiveJob {
+            engine: crate::pipeline::graph::Engine::Classic,
             job_id: JobId(id),
             nzb_hash: [0xAA; 32],
             nzb_path,

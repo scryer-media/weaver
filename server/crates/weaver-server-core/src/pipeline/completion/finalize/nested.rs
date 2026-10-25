@@ -475,6 +475,11 @@ impl Pipeline {
             self.deferred_post_processing.insert(job_id);
             return Ok(NestedExtractionDecision::Deferred);
         }
+        // A graph job's tree already holds every member its objects found, at
+        // any depth; scanning the output would only find them again.
+        if self.is_graph_job(job_id) {
+            return Ok(NestedExtractionDecision::NoNestedArchives);
+        }
         let mut current_archive_sources: HashSet<String> = self
             .jobs
             .get(&job_id)

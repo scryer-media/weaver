@@ -273,25 +273,43 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return 0;
         };
-        let floor = state
-            .assembly
-            .files()
-            .map(|file| {
-                if file.is_complete() {
-                    return file.total_bytes();
-                }
-                // The file's checkpointed coverage: every article the last
-                // barrier recorded, wherever it sits. A gap costs the floor
-                // the gap; bytes written since the barrier stay in the lead
-                // until the next one runs.
-                self.persisted_file_progress
-                    .get(&file.file_id())
-                    .copied()
-                    .unwrap_or(0)
-                    .min(file.total_bytes())
-            })
-            .sum::<u64>();
+        // A graph job's files are written by its graph, whose checkpoint is
+        // its barrier: the floor is what the last one settles.
+        let floor = self.graph_checkpointed_bytes(job_id).unwrap_or_else(|| {
+            state
+                .assembly
+                .files()
+                .map(|file| {
+                    if file.is_complete() {
+                        return file.total_bytes();
+                    }
+                    // The file's checkpointed coverage: every article the
+                    // last barrier recorded, wherever it sits. A gap costs
+                    // the floor the gap; bytes written since the barrier
+                    // stay in the lead until the next one runs.
+                    self.persisted_file_progress
+                        .get(&file.file_id())
+                        .copied()
+                        .unwrap_or(0)
+                        .min(file.total_bytes())
+                })
+                .sum::<u64>()
+        });
         floor.max(state.restored_download_floor_bytes)
+    }
+
+    // Run the barrier that moves the job's durable floor: a graph job's
+    // checkpoint, else the file coverage flush.
+    pub(in crate::pipeline) fn advance_durable_download_floor(
+        &mut self,
+        job_id: JobId,
+        label: &'static str,
+    ) {
+        if self.is_graph_job(job_id) {
+            self.checkpoint_graph_job(job_id);
+        } else {
+            self.flush_file_progress_batch(label);
+        }
     }
 
     pub(in crate::pipeline) fn estimated_undurable_download_bytes_for_job(

@@ -35,7 +35,12 @@ impl Pipeline {
                 .is_some_and(|file| file.promoted)
     }
 
+    // A graph job's root says which of its articles it waits on; the
+    // classic promotion state below is a classic job's.
     pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
+        if let Some(waited_on) = self.graph_article_waited_on(segment_id) {
+            return waited_on;
+        }
         self.par3_runtime.as_ref().is_some_and(|runtime| {
             runtime.article_promoted(
                 segment_id.file_id.job_id,
@@ -182,7 +187,17 @@ impl Pipeline {
             })
     }
 
+    // The job is fetching repair data once its payload is in. A graph job's
+    // root says so from its sets; a classic job reads it off its queues.
     fn job_fetching_repair_data(&self, job_id: JobId) -> bool {
+        match self.graph_jobs.get(&job_id) {
+            Some(graph) => graph.fetching_repair_data(),
+            None => self.job_fetching_recovery(job_id) && self.job_payload_fetched(job_id),
+        }
+    }
+
+    // Recovery articles of a classic job are still queued, retrying or out.
+    fn job_fetching_recovery(&self, job_id: JobId) -> bool {
         self.jobs
             .get(&job_id)
             .is_some_and(|state| state.download_queue.has_completion_critical_work())
@@ -905,7 +920,7 @@ impl Pipeline {
                         file_id: NzbFileId { job_id, file_index },
                         segment_number: segment.ordinal,
                     },
-                    message_id: crate::jobs::ids::MessageId::new(&segment.message_id),
+                    message_id: crate::jobs::ids::MessageId::new(segment.message_ids.in_use()),
                     groups: std::sync::Arc::from(file.groups.as_slice()),
                     priority,
                     byte_estimate: segment.bytes,
@@ -1414,9 +1429,7 @@ impl Pipeline {
             download_state,
             finalizing_download: !native_verifying
                 && self.jobs_finalizing_download.contains(&state.job_id),
-            fetching_repair_data: !native_verifying
-                && self.job_fetching_repair_data(state.job_id)
-                && self.job_payload_fetched(state.job_id),
+            fetching_repair_data: !native_verifying && self.job_fetching_repair_data(state.job_id),
             post_state,
             run_state,
             progress: Self::effective_progress(state),

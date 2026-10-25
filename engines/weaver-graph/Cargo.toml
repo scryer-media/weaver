@@ -1,0 +1,14 @@
+[package]
+name = "weaver-graph"
+description = "Weaver's download engine: smart objects per format behind format-blind interfaces"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+crc-turbo = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

@@ -92,7 +92,9 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
             weaver_server_core::JobStatus::Moving => Self::Finalizing,
             weaver_server_core::JobStatus::PostProcessing => Self::PostProcessing,
             weaver_server_core::JobStatus::Complete => Self::Completed,
-            weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
+            // Clients see a partial delivery as failed until they model it.
+            weaver_server_core::JobStatus::Partial
+            | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
         }
     }
@@ -1078,7 +1080,8 @@ impl From<&weaver_server_core::JobStatus> for JobStatusGql {
             weaver_server_core::JobStatus::QueuedPostProcessing => Self::QueuedPostProcessing,
             weaver_server_core::JobStatus::PostProcessing => Self::PostProcessing,
             weaver_server_core::JobStatus::Complete => Self::Complete,
-            weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
+            weaver_server_core::JobStatus::Partial
+            | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
         }
     }
@@ -1584,7 +1587,12 @@ fn terminal_queue_item_state(info: &weaver_server_core::JobInfo) -> Option<Queue
         weaver_server_core::DownloadState::Complete
     ) && matches!(info.post_state, weaver_server_core::PostState::Completed)
     {
-        return Some(QueueItemState::Completed);
+        // The lanes say the job delivered; its status says whether whole,
+        // and clients read a partial delivery as failed.
+        return Some(match QueueItemState::from(&info.status) {
+            QueueItemState::Failed => QueueItemState::Failed,
+            _ => QueueItemState::Completed,
+        });
     }
 
     None

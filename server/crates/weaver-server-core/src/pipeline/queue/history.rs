@@ -153,7 +153,9 @@ impl Queue {
                     );
                     if !matches!(
                         status,
-                        crate::JobStatus::Complete | crate::JobStatus::Failed { .. }
+                        crate::JobStatus::Complete
+                            | crate::JobStatus::Partial
+                            | crate::JobStatus::Failed { .. }
                     ) {
                         return Err(SchedulerError::Conflict(
                             "job is not complete or failed".into(),

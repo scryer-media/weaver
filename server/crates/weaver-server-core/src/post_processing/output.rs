@@ -620,6 +620,7 @@ mod tests {
 
     fn active(db: &Database, id: u64) {
         db.create_active_job(&crate::ActiveJob {
+            engine: crate::pipeline::graph::Engine::Classic,
             job_id: crate::JobId(id),
             nzb_hash: [id as u8; 32],
             nzb_path: "fixture.nzb".into(),

@@ -175,9 +175,11 @@ impl JobSpec {
             file.segments
                 .iter()
                 .fold(total.saturating_add(file_bytes), |bytes, segment| {
-                    bytes
-                        .saturating_add(per_segment)
-                        .saturating_add((segment.message_id.len() as u64).saturating_mul(4))
+                    bytes.saturating_add(per_segment).saturating_add(
+                        segment.message_ids.all().iter().fold(0u64, |ids, id| {
+                            ids.saturating_add((id.len() as u64).saturating_mul(4))
+                        }),
+                    )
                 })
         })
     }
@@ -309,8 +311,54 @@ pub struct SegmentSpec {
     pub article_number: u32,
     // Expected decoded size in bytes.
     pub bytes: u32,
-    // NNTP message-id (without angle brackets).
-    pub message_id: String,
+    // Every NNTP message-id the NZB gave this part.
+    pub message_ids: MessageIds,
+}
+
+// The message-ids (without angle brackets) the NZB gave one part, in NZB
+// order, and the one the article is fetched by. The article moves to the next
+// id only when the one in use is spent; a part listed once holds one id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageIds {
+    ids: Vec<String>,
+    in_use: usize,
+}
+
+impl MessageIds {
+    // `ids` must not be empty.
+    pub fn new(ids: Vec<String>) -> Self {
+        assert!(!ids.is_empty(), "a part has at least one message-id");
+        Self { ids, in_use: 0 }
+    }
+
+    // The id the article is fetched by.
+    pub fn in_use(&self) -> &str {
+        &self.ids[self.in_use]
+    }
+
+    // Every id, in NZB order.
+    pub fn all(&self) -> &[String] {
+        &self.ids
+    }
+
+    // Whether an id remains behind the one in use.
+    pub fn has_next(&self) -> bool {
+        self.in_use + 1 < self.ids.len()
+    }
+
+    // Spend the id in use: move to the next one, or answer false when every
+    // id is spent.
+    pub fn spend(&mut self) -> bool {
+        let next = self.has_next();
+        self.in_use += usize::from(next);
+        next
+    }
+}
+
+impl From<&str> for MessageIds {
+    fn from(id: &str) -> Self {
+        Self::new(vec![id.to_string()])
+    }
 }
 
 // Status of a job in the scheduler.
@@ -331,6 +379,9 @@ pub enum JobStatus {
     QueuedPostProcessing,
     PostProcessing,
     Complete,
+    // Delivered with what extracted; at least one member is damaged or
+    // missing. Terminal like Complete; clients see it as failed.
+    Partial,
     Failed { error: String },
     Paused,
 }
@@ -351,9 +402,18 @@ impl JobStatus {
             Self::QueuedPostProcessing => "queued_post_processing",
             Self::PostProcessing => "post_processing",
             Self::Complete => "complete",
+            Self::Partial => "partial",
             Self::Failed { .. } => "failed",
             Self::Paused => "paused",
         }
+    }
+
+    // The stage a terminal status names as failed by itself, when no step
+    // recorded one: a partial delivery left members short, which every
+    // reader outside the engine takes for a failed unpack.
+    pub fn shortfall_stage(&self) -> Option<crate::post_processing::model::PipelineFailureStage> {
+        matches!(self, Self::Partial)
+            .then_some(crate::post_processing::model::PipelineFailureStage::Extract)
     }
 }
 
@@ -535,6 +595,7 @@ pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobSt
         "queued_post_processing" => JobStatus::QueuedPostProcessing,
         "post_processing" => JobStatus::PostProcessing,
         "complete" => JobStatus::Complete,
+        "partial" => JobStatus::Partial,
         "failed" => JobStatus::Failed {
             error: error.unwrap_or("unknown error").to_string(),
         },
@@ -604,7 +665,7 @@ pub fn runtime_lanes_from_status_snapshot(
             PostState::PostProcessing,
             RunState::Active,
         ),
-        JobStatus::Complete => (
+        JobStatus::Complete | JobStatus::Partial => (
             DownloadState::Complete,
             PostState::Completed,
             RunState::Active,
@@ -849,6 +910,24 @@ mod tests {
             job_status_from_persisted_str("moving", None),
             JobStatus::Moving
         );
+    }
+
+    #[test]
+    fn partial_round_trips_through_its_persisted_string_and_ends_like_complete() {
+        assert_eq!(JobStatus::Partial.persisted_status(), "partial");
+        assert_eq!(
+            job_status_from_persisted_str("partial", None),
+            JobStatus::Partial
+        );
+        assert_eq!(
+            runtime_lanes_from_status_snapshot(&JobStatus::Partial),
+            runtime_lanes_from_status_snapshot(&JobStatus::Complete)
+        );
+        assert_eq!(
+            JobStatus::Partial.shortfall_stage(),
+            Some(crate::post_processing::model::PipelineFailureStage::Extract)
+        );
+        assert_eq!(JobStatus::Complete.shortfall_stage(), None);
     }
 
     #[test]

@@ -27,8 +27,10 @@ fn bounded_repair_reconstructs_a_missing_payload() {
     );
 }
 
-// Admission, authenticated metadata ingestion, the normal repair worker, and
-// final output reconciliation must all tolerate a payload with no disk inode.
+// Classic metadata ingestion, the normal repair worker, and final output
+// reconciliation must all tolerate a payload with no disk inode. The job is
+// classic: its carriers reach only the classic seams, never a graph root.
+// The graph's counterpart is in `engines::plain_par2`.
 #[tokio::test]
 async fn admitted_job_reconstructs_an_entirely_missing_payload() {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
@@ -68,17 +70,8 @@ async fn admitted_job_reconstructs_an_entirely_missing_payload() {
     let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(11738);
     let job_name = "Generated Missing Payload";
-    pipeline
-        .add_job(
-            job_id,
-            standalone_job_spec(job_name, &files),
-            PathBuf::from("missing.nzb"),
-            sample_nzb_zstd(),
-            crate::jobs::AddJobOptions::default(),
-        )
-        .await
-        .unwrap();
-    let working = pipeline.jobs[&job_id].working_dir.clone();
+    let working =
+        insert_active_job(&mut pipeline, job_id, standalone_job_spec(job_name, &files)).await;
     assert!(!working.join("payload.bin").exists());
     // The transport supplies completed carriers and a terminal not-found result
     // for the payload. No repair set or source binding is injected by the test.

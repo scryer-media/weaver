@@ -33,7 +33,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 65;
+const CURRENT_SCHEMA_VERSION: i64 = 72;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1494,6 +1494,68 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(depth, Some(8));
+    }
+
+    // Every job that existed before the engine stamp ran on the classic
+    // engine, so migration 65 must read it back as classic, active or
+    // finished, with no root phase.
+    #[tokio::test]
+    async fn sqlite_migration_65_stamps_existing_jobs_classic() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-engine-stamp.db");
+        let pool = open_test_pool(&db_path).await;
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(64), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            pragma_column_count(&pool, "active_jobs", &["engine", "root_phase"]).await,
+            0
+        );
+        sqlx::query(
+            "INSERT INTO active_jobs
+                (job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category, metadata)
+             VALUES (101, ?, 'active.nzb', 'active-output', 'queued', NULL, 1, NULL, NULL)",
+        )
+        .bind(vec![1_u8; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_history
+                (job_id, name, status, total_bytes, downloaded_bytes,
+                 optional_recovery_bytes, optional_recovery_downloaded_bytes,
+                 failed_bytes, health, created_at, completed_at)
+             VALUES (102, 'history', 'complete', 0, 0, 0, 0, 0, 1000, 1, 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let root_phase: Option<String> =
+            sqlx::query_scalar("SELECT root_phase FROM active_jobs WHERE job_id = 101")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(root_phase, None);
+        pool.close().await;
+
+        let db = crate::Database::open(&db_path).unwrap();
+        assert_eq!(
+            db.load_active_job_engine(crate::jobs::ids::JobId(101))
+                .unwrap(),
+            Some(crate::pipeline::graph::Engine::Classic)
+        );
+        assert_eq!(
+            db.load_job_history_engine(crate::jobs::ids::JobId(102))
+                .unwrap(),
+            Some(crate::pipeline::graph::Engine::Classic)
+        );
     }
 
     #[tokio::test]

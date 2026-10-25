@@ -185,10 +185,15 @@ impl Pipeline {
         work: DownloadWork,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
         if !self.primary_download_within_restart_durable_lead(job_id, &work) {
-            self.flush_file_progress_batch("download.file_progress.flush.restart_durable_lead");
+            self.advance_durable_download_floor(
+                job_id,
+                "download.file_progress.flush.restart_durable_lead",
+            );
             if !self.primary_download_within_restart_durable_lead(job_id, &work) {
                 self.note_checkpoint_dispatch_block(job_id);
-                if let Some(state) = self.jobs.get_mut(&job_id) {
+                if let Some(work) = self.requeue_graph_work(work)
+                    && let Some(state) = self.jobs.get_mut(&job_id)
+                {
                     state.download_queue.push(work);
                 }
                 self.update_queue_metrics();
@@ -201,6 +206,37 @@ impl Pipeline {
         Ok(Some(work))
     }
 
+    // Whether work going back on the queue waits in the recovery queue
+    // until something asks for it. Classic parks the recovery nothing waits
+    // on, for its completion check to promote. A graph job parks what its
+    // root holds parked: an article an object deferred while it was on the
+    // wire goes back parked, whatever server failed it, and the root's
+    // moves are the one way out.
+    pub(in crate::pipeline) fn requeue_parks(&self, work: &DownloadWork) -> bool {
+        match self.graph_article_parked(work.segment_id) {
+            Some(parked) => parked,
+            None => {
+                work.is_recovery
+                    && !work.completion_critical
+                    && self
+                        .job_engine(work.segment_id.file_id.job_id)
+                        .classic_switches_apply()
+            }
+        }
+    }
+
+    // Whether the job has recovery work parked for its completion check to
+    // promote. A graph job's root raises the recovery articles it wants into
+    // the download queue itself, so what its recovery queue still holds is
+    // what nothing has asked for, and no completion check changes that.
+    pub(in crate::pipeline::download) fn parked_recovery(&self, job_id: JobId) -> bool {
+        self.job_engine(job_id).classic_switches_apply()
+            && self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| !state.recovery_queue.is_empty())
+    }
+
     // Hold payload work only while declared PAR2 indexes are unresolved.
     //
     // Checkpoint cuts are fixed when a batch is leased, so an index already
@@ -211,6 +247,12 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Option<Vec<u32>> {
+        // The hold ends when the classic parse of the index publishes its
+        // grid. A graph job's root namespace holds its own payload for the
+        // indexes the post declares, as long as it says.
+        if !self.job_engine(job_id).classic_switches_apply() {
+            return self.graph_indexes_to_come(job_id);
+        }
         if self.par2_bypassed.contains(&job_id)
             || self
                 .jobs
@@ -246,12 +288,39 @@ impl Pipeline {
         }
     }
 
+    // The PAR2 indexes the post declares that a graph job's root namespace
+    // holds its payload for. Root members are numbered as the posted files
+    // they are.
+    fn graph_indexes_to_come(&self, job_id: JobId) -> Option<Vec<u32>> {
+        let (graph, state) = (self.graph_jobs.get(&job_id)?, self.jobs.get(&job_id)?);
+        let declared = state
+            .spec
+            .files
+            .iter()
+            .zip(0u32..)
+            .filter(|(file, _)| {
+                matches!(
+                    file.role,
+                    weaver_model::files::FileRole::Par2 { is_index: true, .. }
+                )
+            })
+            .map(|(_, index)| weaver_graph::MemberId(index));
+        graph
+            .indexes_to_come(declared)
+            .map(|held| held.into_iter().map(|member| member.0).collect())
+    }
+
     // While bootstrap is active, lease only tracked explicit-index work.
     pub(in crate::pipeline::download) fn par2_metadata_bootstrap_claims_work(
         &mut self,
         job_id: JobId,
         work: &DownloadWork,
     ) {
+        // The discovery states are the classic parse's; a graph job's root
+        // tells its own hold from its articles.
+        if !self.job_engine(job_id).classic_switches_apply() {
+            return;
+        }
         let file_index = work.segment_id.file_id.file_index;
         if !matches!(
             self.par2_discovery_state_for_candidate(job_id, file_index),

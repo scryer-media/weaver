@@ -43,15 +43,24 @@ pub struct NzbFile {
     pub segments: Vec<NzbSegment>,
 }
 
-// A single segment/article within a file.
+// A single segment/article within a file: one part number.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NzbSegment {
     // 1-based segment number.
     pub number: u32,
     // Expected size in bytes.
     pub bytes: u32,
-    // Message-ID without angle brackets.
-    pub message_id: String,
+    // Every message-ID the document gave this part number, without angle
+    // brackets, in document order; never empty. A part posted again is one
+    // segment holding both IDs.
+    pub message_ids: Vec<String>,
+}
+
+impl NzbSegment {
+    // The first message-ID the document gave this part.
+    pub fn message_id(&self) -> &str {
+        &self.message_ids[0]
+    }
 }
 
 impl NzbFile {

@@ -15,7 +15,7 @@ use crate::pipeline::FullSetExtractionOutcome;
 use crate::pipeline::extraction::{
     ExtractionRoot, JobExtractionBudget, apply_rar_member_filesystem_metadata,
     apply_server_rar_limits_with_memory_limit, rar_entry_via, rar_member_decoder_memory_bytes,
-    validate_sanitized_rar_member_path,
+    validate_relative_output_path,
 };
 
 pub(crate) struct RarChaseContext<'a> {
@@ -103,7 +103,7 @@ pub(crate) fn extract(
                     .member_info(index)
                     .ok_or("RAR member metadata disappeared")?;
                 let name = info.name.clone();
-                let relative = validate_sanitized_rar_member_path(&unrar_rs::sanitize_path(&name))?;
+                let relative = validate_relative_output_path(&unrar_rs::sanitize_path(&name))?;
                 if !destinations.insert(
                     relative
                         .to_string_lossy()
@@ -201,7 +201,7 @@ pub(crate) fn install(from: &Path, to: &Path, names: &[String]) -> Result<(), St
     let mut entries = Vec::with_capacity(names.len());
     let mut destinations = HashSet::new();
     for name in names {
-        let relative = validate_sanitized_rar_member_path(&unrar_rs::sanitize_path(name))?;
+        let relative = validate_relative_output_path(&unrar_rs::sanitize_path(name))?;
         if !destinations.insert(relative.to_string_lossy().to_ascii_lowercase()) {
             return Err(format!("duplicate chased destination: {name}"));
         }

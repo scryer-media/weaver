@@ -467,7 +467,7 @@ pub fn poster_tool(nzb: &Nzb) -> PosterTool {
     let mut hits: HashMap<PosterTool, u64> = HashMap::new();
     for segment in nzb.files.iter().flat_map(|file| &file.segments) {
         total += 1;
-        let Some(domain) = message_id_domain(&segment.message_id) else {
+        let Some(domain) = message_id_domain(segment.message_id()) else {
             continue;
         };
         if let Some((_, tool)) = TOOL_MARKERS
@@ -512,7 +512,7 @@ impl DomainSpread {
 pub fn domain_spread(nzb: &Nzb) -> DomainSpread {
     let mut domains = std::collections::HashSet::new();
     for segment in nzb.files.iter().flat_map(|file| &file.segments) {
-        if let Some(domain) = message_id_domain(&segment.message_id) {
+        if let Some(domain) = message_id_domain(segment.message_id()) {
             domains.insert(domain);
         }
     }

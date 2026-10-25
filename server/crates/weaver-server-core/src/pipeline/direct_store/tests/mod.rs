@@ -351,19 +351,25 @@ fn direct_job_spec() -> JobSpec {
                     ordinal: 0,
                     article_number: 1,
                     bytes: 10,
-                    message_id: "one@example.invalid".to_string(),
+                    message_ids: crate::jobs::MessageIds::new(vec![
+                        "one@example.invalid".to_string(),
+                    ]),
                 },
                 SegmentSpec {
                     ordinal: 1,
                     article_number: 2,
                     bytes: 20,
-                    message_id: "two@example.invalid".to_string(),
+                    message_ids: crate::jobs::MessageIds::new(vec![
+                        "two@example.invalid".to_string(),
+                    ]),
                 },
                 SegmentSpec {
                     ordinal: 2,
                     article_number: 3,
                     bytes: 30,
-                    message_id: "three@example.invalid".to_string(),
+                    message_ids: crate::jobs::MessageIds::new(vec![
+                        "three@example.invalid".to_string(),
+                    ]),
                 },
             ],
         }],
@@ -382,6 +388,7 @@ fn segment(segment_number: u32) -> SegmentId {
 
 fn direct_active_job() -> crate::ActiveJob {
     crate::ActiveJob {
+        engine: crate::pipeline::graph::Engine::Classic,
         job_id: JOB,
         nzb_hash: [0xAA; 32],
         nzb_path: std::path::PathBuf::from("/tmp/silver-horizon.nzb"),

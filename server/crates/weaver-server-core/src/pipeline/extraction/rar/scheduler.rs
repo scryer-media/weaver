@@ -455,6 +455,7 @@ impl Pipeline {
                 | JobStatus::Checking
                 | JobStatus::Moving
                 | JobStatus::Complete
+                | JobStatus::Partial
                 | JobStatus::Failed { .. }
                 | JobStatus::Verifying
                 | JobStatus::Repairing

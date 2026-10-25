@@ -173,11 +173,14 @@ impl Pipeline {
                 self.give_up_unanchored(dependent);
             }
         }
-        // The first-article sample is read before the health arithmetic: when
-        // it can answer, it answers about the whole post rather than about a
-        // byte count, and it needs no probe of its own to do it.
-        self.note_first_article_settled(seg_id);
-        self.check_health(job_id);
+        // A graph job's root marks the article's range damaged, and its objects
+        // rule on the loss. A classic job has no root: its first-article sample
+        // is read, then its health arithmetic, the sample first because it
+        // answers about the whole post rather than about a byte count.
+        if !self.graph_article_lost(seg_id) {
+            self.note_first_article_settled(seg_id);
+            self.check_health(job_id);
+        }
         true
     }
 
@@ -433,6 +436,9 @@ impl Pipeline {
         lease: DownloadBatchLease,
     ) {
         for work in lease.works {
+            let Some(work) = self.requeue_graph_work(work) else {
+                continue;
+            };
             if let Some(state) = self.jobs.get_mut(&lease.job_id) {
                 state.download_queue.push(work);
             }
@@ -1141,10 +1147,16 @@ impl Pipeline {
             self.note_download_activity(job_id);
         }
 
+        let Some(work) = self.requeue_graph_work(work) else {
+            self.update_queue_metrics();
+            self.publish_active_stage_metrics();
+            return;
+        };
+        let parks = self.requeue_parks(&work);
         if let Some(state) = self.jobs.get_mut(&job_id)
             && !is_terminal_status(&state.status)
         {
-            if work.is_recovery && !work.completion_critical {
+            if parks {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);

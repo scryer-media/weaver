@@ -28,7 +28,7 @@ fn split_first_article(spec: &mut JobSpec, file_index: usize, first_bytes: u32) 
         .iter()
         .map(|segment| segment.bytes)
         .sum::<u32>();
-    let message_id = file.segments[0].message_id.clone();
+    let message_id = file.segments[0].message_ids.in_use().to_string();
     file.segments = vec![
         segment_spec! {
             number: 0,
@@ -3017,6 +3017,7 @@ fn chase_budget_over(
         max_member_bytes: 1024 * GIB,
         max_entries: 100_000,
         max_ratio: 100,
+        ratio_floor_bytes: 1 << 30,
         max_seconds: 43_200,
         min_free_bytes: 1,
         max_memory_bytes: GIB,

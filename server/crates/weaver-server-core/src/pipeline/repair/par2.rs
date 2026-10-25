@@ -1909,6 +1909,10 @@ impl Pipeline {
     // when a batch is leased. Served-set selection is a UI/repair view and
     // must not remove geometry needed by another file in the same job.
     pub(crate) fn par2_checkpoint_plan(&self, job_id: JobId) -> weaver_yenc::CheckpointPlan {
+        // A graph job's sets are its recovery objects', not this runtime's.
+        if let Some(graph) = self.graph_jobs.get(&job_id) {
+            return weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan;
+        }
         self.par2_runtime(job_id)
             .and_then(|runtime| runtime.checkpoint_plan.clone())
             .unwrap_or(weaver_yenc::CheckpointPlan::None)

@@ -13,6 +13,7 @@ mod direct_store;
 pub mod direct_unpack;
 pub mod download;
 mod extraction;
+pub mod graph;
 mod health;
 mod infrastructure_retry;
 pub(crate) mod integrity;
@@ -25,13 +26,14 @@ mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub(crate) use orchestrator::is_terminal_status;
 pub(crate) use orchestrator::{
     close_cached_write_handles_under, release_cached_write_handle,
     remove_file_after_cached_write_handle,
 };
 #[cfg(test)]
 use orchestrator::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
-use orchestrator::{is_terminal_status, write_segment_to_disk, write_segments_to_disk};
+use orchestrator::{write_segment_to_disk, write_segments_to_disk};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -2600,6 +2602,17 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     // Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
+    // The graph runtime of each job admitted under the graph engine. A job
+    // without one is a classic job.
+    pub(super) graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    // The repair slots graph jobs share, and what each job's recovery
+    // objects said when it last advanced.
+    pub(super) graph_status: graph::status::GraphStatus,
+    // The holds accountant every graph job's namespaces share, so the
+    // budgets bound the process, not each job.
+    pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
+    // Where the engines graph jobs run say what they found.
+    pub(super) graph_runs: graph::engine::RunMail,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,

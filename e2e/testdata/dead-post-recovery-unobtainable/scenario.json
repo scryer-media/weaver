@@ -5,6 +5,9 @@
   "category": "2000",
   "expected_outcome": "health_failure",
   "expectedErrorContains": "PAR2 metadata discovery exhausted",
+  "expectedErrorContainsByEngine": {
+    "graph": "below critical"
+  },
   "fixtureAssets": [
     "par2-multivolume/archive.part1.rar",
     "par2-multivolume/archive.part2.rar",
