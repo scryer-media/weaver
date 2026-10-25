@@ -1416,11 +1416,29 @@ mod tests {
         let mut explorer = ServerPipelineExplorer::default();
         explorer.note_supports_pipelining(false);
         assert_eq!(explorer.choose_mode(true), DownloadLaneMode::Sequential);
+        assert_eq!(explorer.choose_mode(false), DownloadLaneMode::Sequential);
         explorer.note_supports_pipelining(true);
         assert_eq!(
             explorer.choose_mode(true),
             DownloadLaneMode::Pipelined { depth: 2 }
         );
-        assert_eq!(explorer.choose_mode(false), DownloadLaneMode::Sequential);
+        assert_eq!(
+            explorer.choose_mode(false),
+            DownloadLaneMode::Pipelined { depth: 2 }
+        );
+    }
+
+    #[test]
+    fn backpressure_clamps_pipelining_depth_instead_of_dropping_to_sequential() {
+        let mut explorer = ServerPipelineExplorer::seeded(Some(8), None, None);
+        explorer.note_supports_pipelining(true);
+        assert_eq!(
+            explorer.choose_mode(true),
+            DownloadLaneMode::Pipelined { depth: 8 }
+        );
+        assert_eq!(
+            explorer.choose_mode(false),
+            DownloadLaneMode::Pipelined { depth: 4 }
+        );
     }
 }
