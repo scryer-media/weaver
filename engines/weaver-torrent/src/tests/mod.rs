@@ -9,6 +9,7 @@ mod e2e;
 mod e2e_another_local_client;
 mod e2e_client_identity;
 mod e2e_dht_identity;
+mod e2e_dht_pause;
 mod e2e_initial_have;
 mod e2e_mse;
 mod e2e_pause;
