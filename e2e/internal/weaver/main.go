@@ -445,6 +445,8 @@ func Run(args []string, programName string) {
 		cmdRestartAll()
 	case "restart-test":
 		cmdRestartTest(args[1:])
+	case "adversarial":
+		cmdAdversarial(args[1:])
 	case "chaos":
 		if len(args) < 2 {
 			log.Fatalf("usage: %s chaos <config>  (e.g. 'drop_conn=10,slow_body=50' or 'off')", cliProgramName)
@@ -488,6 +490,7 @@ Commands:
   container-restart    Restart the Docker Weaver service and verify its persisted encryption key
   restart-all           Run the restart/crash litmus suite
   restart-test [case...] Run specific restart case(s)
+  adversarial [slug...] Run the adversarial-archives scenarios on SQLite
   chaos <config>        Configure NNTP chaos on the primary server
   chaos-test            Run the NNTP chaos suite
   tcp-chaos             Run the TCP chaos suite
@@ -536,6 +539,7 @@ Environment:
   E2E_RESTART_ONLY_CASE       Limit restart-all to a specific restart case name
   E2E_RESTART_TIMEOUT_SEC     Per-case timeout for restart suite (default: 900)
   E2E_RESTART_KEEP_ARTIFACTS  Keep restart artifacts under E2E_RUN_DIR (default: true)
+  E2E_ADVERSARIAL_TIMEOUT_SEC Bound on the whole adversarial lane (default: 3600)
   CHAOS_ONLY_ROUND     Limit chaos-test to a specific round number
   TCP_CHAOS_ONLY_ROUND Limit tcp-chaos to a specific round number`, cliProgramName)
 }
@@ -1586,8 +1590,10 @@ func fixtureSlugsForSeedProfile(profile string) []string {
 		return append([]string(nil), tcpChaosFixtureSlugs...)
 	case "restart":
 		return restartFixtureSlugs()
+	case "adversarial":
+		return adversarialFixtureSlugs()
 	default:
-		log.Fatalf("invalid E2E_SEED_PROFILE=%q (expected functional|chaos|tcp-chaos|restart)", profile)
+		log.Fatalf("invalid E2E_SEED_PROFILE=%q (expected functional|chaos|tcp-chaos|restart|adversarial)", profile)
 		return nil
 	}
 }

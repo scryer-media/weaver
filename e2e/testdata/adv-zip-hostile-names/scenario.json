@@ -1,0 +1,14 @@
+{
+  "slug": "adv-zip-hostile-names",
+  "title": "E2E.Adversarial.Zip.Hostile.Names.2026-TESTGRP",
+  "description": "Members named with control characters, a NUL, an overlong UTF-8 '/', reserved Windows device names, an over-long run of two-byte characters and a 4 KiB name. The job settles with a named verdict and an overlong '/' never climbs out of the output. unicode-filenames covers well-formed CJK names.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "settles",
+    "escapeNames": [
+      "../../adv-overlong-escape.txt"
+    ]
+  }
+}

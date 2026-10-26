@@ -1,0 +1,11 @@
+{
+  "slug": "adv-zip-truncated-directory",
+  "title": "E2E.Adversarial.Zip.Truncated.Directory.2026-TESTGRP",
+  "description": "A zip whose end-of-central-directory record is missing its last ten bytes. The job settles with a named verdict.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "settles"
+  }
+}

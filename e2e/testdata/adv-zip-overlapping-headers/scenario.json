@@ -1,0 +1,11 @@
+{
+  "slug": "adv-zip-overlapping-headers",
+  "title": "E2E.Adversarial.Zip.Overlapping.Headers.2026-TESTGRP",
+  "description": "Two central directory records pointing at one local header. The job settles with a named verdict and writes nothing outside its output.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "settles"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "slug": "adv-par2-lie-length-long",
+  "title": "E2E.Adversarial.Par2.Lie.Length.Long.2026-TESTGRP",
+  "description": "An intact payload beside a PAR2 set that tells the length-long lie of the graph engine's breadth campaign in every file. As that campaign rules, the job either completes with the payload's exact bytes or fails named and delivers none of them, and never hangs.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "either"
+  },
+  "expectedOutputBLAKE3": {
+    "lie-payload.bin": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "slug": "adv-rar-named-mkv",
+  "title": "E2E.Adversarial.Rar.Named.Mkv.2026-TESTGRP",
+  "description": "rar5-single's archive posted under a .mkv name. The graph opens it by content and delivers its member, not the archive.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "rar5-single/archive.rar::adversarial.show.mkv"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1,
+    "forbiddenOutputs": [
+      "adversarial.show.mkv"
+    ]
+  }
+}
