@@ -13,6 +13,10 @@ use std::path::{Path, PathBuf};
 
 pub(in crate::pipeline::tests) mod scenarios;
 
+mod tests {
+    mod par2_schedules;
+}
+
 // A real NZB's `<segment bytes=…>` is the yEnc-**encoded** article size, about
 // 3% larger than the decoded payload. Every fixture here declares inflated
 // sizes so no routing arithmetic can accidentally be right by reading an NZB
