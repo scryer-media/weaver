@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::pipeline::direct_store::sparse::{SparseCreateError, SparseMarking, create_sparse};
+use crate::pipeline::direct_store::sparse::{SparseMarking, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
@@ -176,15 +176,8 @@ impl Leaf {
     fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
             create_parent(&self.path)?;
-            let file = create_sparse(&self.path, &SparseMarking::Platform).map_err(|error| {
-                let source = match error {
-                    SparseCreateError::Open(source) | SparseCreateError::Mark(source) => source,
-                };
-                LeafError::Io {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
+            let file = create_sparse(&self.path, &SparseMarking::Platform)
+                .map_err(LeafError::io(&self.path))?;
             if let Some(length) = length {
                 let current = file.metadata().map_err(LeafError::io(&self.path))?.len();
                 if current < length {

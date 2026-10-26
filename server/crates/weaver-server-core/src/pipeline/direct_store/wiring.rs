@@ -78,10 +78,6 @@ const REARM_CHUNK_BYTES: usize = 256 * 1024;
 // whether to reconstruct conventional volumes or retain verified repair output.
 #[derive(Debug)]
 pub(crate) enum DirectPlacementError {
-    Sparse {
-        path: PathBuf,
-        error: std::io::Error,
-    },
     Write(std::io::Error),
 }
 
@@ -496,9 +492,7 @@ impl DirectStoreRuntime {
         self.repair_defer_waves.insert(job_id, waves);
     }
 
-    // Test hook: make every sparse marking attempt fail, which is the only way
-    // to reach the sparse-marking demotion arm on a platform whose marker
-    // cannot fail.
+    // Test hook: exercise the ordinary allocation fallback on any platform.
     #[cfg(test)]
     pub(crate) fn set_sparse_marking(&mut self, marking: SparseMarking) {
         self.sparse = marking;

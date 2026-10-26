@@ -230,10 +230,6 @@ pub(crate) enum ReconstructionFailure {
     UnverifiableRun { volume_index: u32, offset: u64 },
     // The volume file could not be written.
     WriteFailed { volume_index: u32, error: String },
-    // The volume file could not be marked sparse. Refused **before** `set_len`
-    // opens a hole, so on Windows nothing has been allocated yet and the
-    // refetch pays only what the conventional path always pays.
-    SparseMarkFailed { volume_index: u32, error: String },
     // The set routed an **encrypted** member whose posted bytes the provider
     // overlay cannot reproduce.
     //
@@ -260,7 +256,6 @@ impl ReconstructionFailure {
             Self::ChecksumMismatch { .. } => "checksum_mismatch",
             Self::UnverifiableRun { .. } => "unverifiable_run",
             Self::WriteFailed { .. } => "write_failed",
-            Self::SparseMarkFailed { .. } => "sparse_mark_failed",
             Self::EncryptedPostedBytes => "encrypted_posted_bytes",
             Self::SweepUnreported { .. } => "sweep_unreported",
         }
@@ -298,13 +293,6 @@ impl std::fmt::Display for ReconstructionFailure {
             } => write!(
                 formatter,
                 "volume {volume_index} could not be written: {error}"
-            ),
-            Self::SparseMarkFailed {
-                volume_index,
-                error,
-            } => write!(
-                formatter,
-                "volume {volume_index} could not be marked sparse: {error}"
             ),
             Self::EncryptedPostedBytes => write!(
                 formatter,
@@ -401,25 +389,14 @@ fn reconstruct_volume(
     let mut reader = provider
         .open(volume.volume_index)
         .ok_or(ReconstructionFailure::NoLayout)?;
-    // Marked sparse at creation and **before** the `set_len` below: the sweep
-    // seeks past every hole, so on Windows an unmarked file would have NTFS
-    // allocate and zero-fill the whole volume the moment the length is set. A
-    // marking failure is refused here, with no hole yet in existence.
-    let mut file =
-        super::sparse::create_sparse(&volume.path, &sparse).map_err(|error| match error {
-            // An ordinary create failure is the write failure it has always
-            // been; only a refused *marking* is its own bucket.
-            super::sparse::SparseCreateError::Open(error) => ReconstructionFailure::WriteFailed {
-                volume_index: volume.volume_index,
-                error: error.to_string(),
-            },
-            super::sparse::SparseCreateError::Mark(error) => {
-                ReconstructionFailure::SparseMarkFailed {
-                    volume_index: volume.volume_index,
-                    error: error.to_string(),
-                }
-            }
-        })?;
+    // Attempt sparse marking before `set_len` to avoid allocating holes where
+    // supported. Otherwise the filesystem may allocate and zero-fill them.
+    let mut file = super::sparse::create_sparse(&volume.path, &sparse).map_err(|error| {
+        ReconstructionFailure::WriteFailed {
+            volume_index: volume.volume_index,
+            error: error.to_string(),
+        }
+    })?;
     // Opened without truncating, so the sweep can leave holes for the refetch to
     // fill rather than rewriting them as zeros — but a file already sitting at
     // this path (an interrupted earlier attempt, a refetch that started and

@@ -92,10 +92,9 @@
 //
 // - **Windows sparse marking.** [`sparse`] marks every file this subsystem
 //   creates with holes in it — member partials, envelopes, repair and holds
-//   scratch — at creation and before any length is set or byte written. A
-//   marking failure demotes before a long-lived hole exists, so the worst case
-//   is a set on the conventional path rather than one silently paying 1× per
-//   volume in NTFS-allocated zeros.
+//   scratch — at creation and before any length is set or byte written.
+//   Marking is best-effort: refusal keeps direct placement running with the
+//   filesystem's ordinary allocation and zero-fill costs.
 // - **A real config surface.** [`DirectStoreSettings`] resolves the gate and
 //   the per-set scratch ceiling from `Config`, with the `WEAVER_*` variables
 //   overriding it in both directions for incident response: config *and* env

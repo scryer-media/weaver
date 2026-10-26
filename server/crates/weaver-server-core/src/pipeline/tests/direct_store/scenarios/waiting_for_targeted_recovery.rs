@@ -1572,11 +1572,10 @@ async fn the_config_gate_routes_and_a_config_off_restart_sweeps_and_redownloads(
     );
 }
 
-// A destination that cannot be marked sparse demotes the set, and the refusal
-// happens before the file holds a hole — so nothing it created is left on
-// disk.
+// Sparse marking is an allocation optimization. Refusal must keep the member
+// and envelope writable and allow the direct job to complete.
 #[tokio::test]
-async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_hole() {
+async fn a_destination_that_cannot_be_marked_sparse_completes_directly() {
     use crate::pipeline::direct_store::sparse::SparseMarking;
 
     let member_name = "Silver.Horizon.S01E53.mkv";
@@ -1584,7 +1583,7 @@ async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_ho
     let volumes = single_member_store_set(member_name, &payload, 3);
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline
         .direct_store
@@ -1595,34 +1594,48 @@ async fn a_destination_that_cannot_be_marked_sparse_demotes_before_it_holds_a_ho
 
     submit_volume_article(&mut pipeline, job_id, &volumes, 0, 0).await;
 
-    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
+    assert!(!pipeline.direct_store.set(job_id, 0).unwrap().is_demoted());
+    assert!(direct_partial(&temp_dir, job_id, member_name).exists());
     assert!(
-        shape.contains("Demoted(SparseMarkFailed)"),
-        "a destination that cannot be marked sparse must demote with its own reason, got {shape}"
-    );
-    assert!(
-        !direct_partial(&temp_dir, JobId(41091), member_name).exists(),
-        "the refused destination must not be left behind"
-    );
-    assert!(
-        !working_dir
+        working_dir
             .join("silver.horizon.f0.vol00000.envelope")
-            .exists(),
-        "nor the envelope the same batch would have created"
+            .exists()
+    );
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) != (0, 0) {
+            submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number)
+                .await;
+        }
+    }
+    assert!(!pipeline.direct_store.set(job_id, 0).unwrap().is_demoted());
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(member.as_deref(), Some(payload.as_slice()));
+    assert_eq!(location, Some("complete"));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists())
     );
 }
 
 #[tokio::test]
-async fn direct_repair_placement_preserves_verified_output_on_sparse_failure() {
-    failed_direct_repair_placement(true).await;
+async fn direct_repair_placement_succeeds_on_sparse_failure() {
+    direct_repair_placement_with_destination_failure(true).await;
 }
 
 #[tokio::test]
 async fn direct_repair_placement_preserves_verified_output_on_write_failure() {
-    failed_direct_repair_placement(false).await;
+    direct_repair_placement_with_destination_failure(false).await;
 }
 
-async fn failed_direct_repair_placement(sparse_failure: bool) {
+async fn direct_repair_placement_with_destination_failure(sparse_failure: bool) {
     use crate::pipeline::direct_store::sparse::SparseMarking;
     use crate::pipeline::direct_store::wiring::DirectPlacementError;
 
@@ -1654,27 +1667,27 @@ async fn failed_direct_repair_placement(sparse_failure: bool) {
     } else {
         std::fs::create_dir(&envelope).unwrap();
     }
-    let failure = pipeline
-        .try_place_direct_spans(job_id, 0, &spans)
-        .await
-        .unwrap_err();
-    match failure {
-        DirectPlacementError::Sparse { path, error } => {
-            assert!(sparse_failure);
-            assert_eq!(path, envelope);
-            assert!(error.to_string().contains("test injection"));
-        }
-        DirectPlacementError::Write(error) => {
-            assert!(!sparse_failure);
-            assert!(
-                error.raw_os_error().is_some(),
-                "the original OS error must survive"
-            );
-        }
+    let result = pipeline.try_place_direct_spans(job_id, 0, &spans).await;
+    if sparse_failure {
+        result.unwrap();
+        assert!(envelope.is_file());
+    } else {
+        let DirectPlacementError::Write(error) = result.unwrap_err();
+        assert!(
+            error.raw_os_error().is_some(),
+            "the original OS error must survive"
+        );
     }
     let set = pipeline.direct_store.set(job_id, 0).unwrap();
     assert!(!set.is_demoted());
-    assert_eq!(set.volume_coverage(1), before);
+    if sparse_failure {
+        assert_eq!(
+            set.volume_coverage(1).contiguous_from_zero(),
+            volumes[1].1.len() as u64
+        );
+    } else {
+        assert_eq!(set.volume_coverage(1), before);
+    }
     assert_eq!(set.volume_coverage(0), clean_coverage);
     assert!(!pipeline.direct_demotion_in_flight.contains_key(&job_id));
     assert_eq!(std::fs::read(installed).unwrap(), volumes[1].1);
@@ -1684,7 +1697,7 @@ async fn failed_direct_repair_placement(sparse_failure: bool) {
 // The same rule for the holds scratch, which the router creates itself rather
 // than through the destination-preparation seam.
 #[tokio::test]
-async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
+async fn a_holds_scratch_that_cannot_be_marked_sparse_completes_directly() {
     use crate::pipeline::direct_store::sparse::SparseMarking;
 
     let member_name = "Silver.Horizon.S01E54.mkv";
@@ -1692,7 +1705,7 @@ async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
     let volumes = single_member_store_set(member_name, &payload, 3);
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     pipeline.direct_store.set_gate(DirectStoreGate::Enabled);
     pipeline.direct_store.set_holds_budget(64);
     pipeline
@@ -1706,20 +1719,39 @@ async fn a_holds_scratch_that_cannot_be_marked_sparse_demotes_the_set() {
     // 64-byte budget forces the very first hold to page.
     submit_volume_article(&mut pipeline, job_id, &volumes, 0, 1).await;
 
-    let shape = format!("{:?}", pipeline.direct_store.sets_for(job_id));
-    assert!(
-        shape.contains("Demoted(HoldsScratchFailed)"),
-        "an unmarkable scratch must demote with the scratch's own reason, got {shape}"
-    );
+    let set = pipeline.direct_store.set(job_id, 0).unwrap();
+    assert!(!set.is_demoted(), "scratch fallback demoted: {set:?}");
     let scratch_files: Vec<String> = std::fs::read_dir(&working_dir)
         .unwrap()
-        .flatten()
+        .map(Result::unwrap)
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .filter(|name| name.starts_with(".weaver-holds."))
         .collect();
     assert!(
-        scratch_files.is_empty(),
-        "the scratch it could not mark must not survive, got {scratch_files:?}"
+        !scratch_files.is_empty(),
+        "the hold must have paged to scratch despite the marking refusal"
+    );
+
+    for (file_index, segment_number) in in_order_arrivals(volumes.len()) {
+        if (file_index, segment_number) != (0, 1) {
+            submit_volume_article(&mut pipeline, job_id, &volumes, file_index, segment_number)
+                .await;
+        }
+    }
+    assert!(!pipeline.direct_store.set(job_id, 0).unwrap().is_demoted());
+    drain_rar_refreshes(&mut pipeline).await;
+    drive_extractions_to_terminal(&mut pipeline, job_id, 64).await;
+    let (member, location) = member_after_gate(&complete_dir, &working_dir, member_name);
+    assert_eq!(member.as_deref(), Some(payload.as_slice()));
+    assert_eq!(location, Some("complete"));
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+    assert!(
+        volumes
+            .iter()
+            .all(|(filename, _)| !working_dir.join(filename).exists())
     );
 }
 

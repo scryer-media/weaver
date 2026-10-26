@@ -1754,30 +1754,45 @@ fn creating_a_sparse_file_over_an_existing_one_keeps_its_bytes() {
 }
 
 #[test]
-fn a_marking_failure_removes_the_file_it_created_but_never_a_pre_existing_one() {
+fn a_marking_failure_keeps_new_and_existing_files_writable() {
     use super::super::sparse::{SparseMarking, create_sparse};
+    use std::io::{Seek, SeekFrom, Write};
 
     let dir = tempfile::tempdir().unwrap();
     let fresh = dir.path().join("fresh.f0.direct.partial");
     let existing = dir.path().join("existing.f0.direct.partial");
     std::fs::write(&existing, b"routed bytes").unwrap();
 
-    create_sparse(&fresh, &SparseMarking::AlwaysFail)
-        .expect_err("an unmarkable destination must be refused");
-    assert!(
-        !fresh.exists(),
-        "the caller demotes, so nothing it created may be left for the restart \
-         sweep to reason about"
-    );
+    let mut file =
+        create_sparse(&fresh, &SparseMarking::AlwaysFail).expect("sparse marking is best-effort");
+    file.set_len(8192).unwrap();
+    file.seek(SeekFrom::Start(4096)).unwrap();
+    file.write_all(b"routed bytes").unwrap();
+    let mut expected = vec![0; 8192];
+    expected[4096..4108].copy_from_slice(b"routed bytes");
+    assert_eq!(std::fs::read(&fresh).unwrap(), expected);
 
-    create_sparse(&existing, &SparseMarking::AlwaysFail)
-        .expect_err("an unmarkable destination must be refused");
+    let mut file = create_sparse(&existing, &SparseMarking::AlwaysFail)
+        .expect("restart may continue without sparse marking");
     assert_eq!(
         std::fs::read(&existing).unwrap(),
         b"routed bytes",
-        "a marking failure on restart must not destroy the bytes the \
-         conventional path is about to reconstruct from"
+        "a marking failure on restart must preserve routed bytes"
     );
+    file.seek(SeekFrom::End(0)).unwrap();
+    file.write_all(b" continued").unwrap();
+    assert_eq!(std::fs::read(&existing).unwrap(), b"routed bytes continued");
+}
+
+#[test]
+fn best_effort_sparse_marking_does_not_hide_open_failures() {
+    use super::super::sparse::{SparseMarking, create_sparse};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing").join("output.bin");
+    let error = create_sparse(&path, &SparseMarking::AlwaysFail).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(!path.exists());
 }
 
 #[test]
@@ -1788,16 +1803,13 @@ fn the_platform_marker_reports_success_where_holes_are_free() {
     let path = dir.path().join("probe.bin");
     let file = std::fs::File::create(&path).unwrap();
 
-    // Unix files are sparse by writing past a hole, so the marker must succeed
-    // rather than report `Unsupported` — the caller's failure arm is a
-    // demotion, and demoting every set on Linux would be an outage.
+    // Unix needs no explicit sparse attribute.
     #[cfg(not(windows))]
     SparseMarking::Platform
         .mark_sparse(&file)
         .expect("the unix marker is a no-op that succeeds");
     // On Windows this is the real `FSCTL_SET_SPARSE`; a temp dir on NTFS
-    // supports it, and a filesystem that does not is exactly the case the
-    // demotion arm exists for.
+    // supports it; other filesystems can use the ordinary allocation fallback.
     #[cfg(windows)]
     let _ = SparseMarking::Platform.mark_sparse(&file);
     let _ = file;
@@ -1807,8 +1819,7 @@ fn the_platform_marker_reports_success_where_holes_are_free() {
 fn every_reconstruction_failure_has_its_own_metric_label() {
     use super::super::reconstruct::ReconstructionFailure;
 
-    // `sparse_mark_failed` is a later addition, and a duplicate label would
-    // silently merge two very different diagnoses in the demotion counters.
+    // Duplicate labels would merge different diagnoses in the counters.
     let labels = [
         ReconstructionFailure::NoLayout.metric(),
         ReconstructionFailure::MissingBytes {
@@ -1831,15 +1842,9 @@ fn every_reconstruction_failure_has_its_own_metric_label() {
             error: String::new(),
         }
         .metric(),
-        ReconstructionFailure::SparseMarkFailed {
-            volume_index: 0,
-            error: String::new(),
-        }
-        .metric(),
     ];
     let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
     assert_eq!(unique.len(), labels.len(), "labels must be distinct");
-    assert!(unique.contains("sparse_mark_failed"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2260,7 +2265,6 @@ fn every_demotion_reason_states_what_its_consumers_need() {
         // The overlay's own files are what is failing, or are half renamed
         // away.
         DemotionReason::DestinationWriteFailed,
-        DemotionReason::SparseMarkFailed,
         DemotionReason::FinalizationFailed,
     ];
 
@@ -2296,7 +2300,7 @@ fn every_demotion_reason_states_what_its_consumers_need() {
         "two demotion reasons in this table share a metric label"
     );
     assert_eq!(
-        total, 45,
+        total, 44,
         "a demotion reason was added or retired; classify it above and update this count"
     );
 }
