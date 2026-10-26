@@ -460,6 +460,15 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
 mod tests {
     use super::*;
 
+    // A torrent that holds `0` on its leg.
+    struct Holds(super::super::SessionTraffic);
+
+    impl super::super::LegTenant for Holds {
+        fn traffic(&self) -> super::super::SessionTraffic {
+            self.0
+        }
+    }
+
     #[test]
     fn leg_dials_count_per_egress_and_result() {
         // A private egress id keeps this test independent of any other test
@@ -500,18 +509,19 @@ mod tests {
         };
         assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0, 0));
 
-        runtime.hold_torrent_traffic([(
-            (consumer, 0),
-            super::super::SessionTraffic {
+        let tenancy = runtime.tenant_torrent(
+            consumer,
+            0,
+            Holds(super::super::SessionTraffic {
                 open: 63,
                 opening: 5,
                 bytes_per_second: 31_000_000,
-            },
-        )]);
+            }),
+        );
         assert_eq!(leg(&snapshot(&runtime)), (true, 63, 5, 31_000_000));
 
         // The sessions let the leg go: it holds nothing.
-        runtime.hold_torrent_traffic([]);
+        drop(tenancy);
         assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0, 0));
     }
 
@@ -594,13 +604,14 @@ mod tests {
             accepted.push(peers.accept().await.unwrap());
         }
         let row = |established: u64| {
-            runtime.hold_torrent_traffic([(
-                (consumer, 0),
-                super::super::SessionTraffic {
+            let _tenancy = runtime.tenant_torrent(
+                consumer,
+                0,
+                Holds(super::super::SessionTraffic {
                     open: established,
                     ..Default::default()
-                },
-            )]);
+                }),
+            );
             let metrics = snapshot(&runtime);
             let row = metrics
                 .legs

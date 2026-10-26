@@ -51,7 +51,9 @@ use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::{PieceLayout, PieceRoot};
 use crate::pipeline::graph::status::RepairSlots;
-use crate::proxies::{Consumer, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope};
+use crate::proxies::{
+    Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
+};
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{
     Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption,
@@ -803,12 +805,38 @@ struct Attached {
 // The leg of a scope's route a session runs on.
 struct OnLeg {
     network: Arc<NetworkRuntime>,
-    scope: TorrentScope,
-    position: usize,
     egress_id: u32,
-    // A session on the leg's own sockets passes no route, so the leg hears
-    // its connections and throughput from the session.
+    // The torrent's place on the leg, which counts what it holds there
+    // until the torrent leaves its session.
+    tenancy: Arc<LegTenancy>,
+}
+
+// A torrent on its leg, as its run holds it now: its established peers
+// count on every leg. A session on the leg's own sockets passes no route,
+// so the leg hears from the torrent its peers in their handshake and what
+// it receives too.
+struct LegTorrent {
+    handle: Arc<ManagedTorrent>,
     own_sockets: bool,
+}
+
+impl LegTenant for LegTorrent {
+    fn traffic(&self) -> SessionTraffic {
+        let Some(run) = self.handle.gauges() else {
+            return SessionTraffic::default();
+        };
+        let peers = run.peers();
+        let (opening, bytes_per_second) = if self.own_sockets {
+            (u64::from(peers.connecting), run.download_bps())
+        } else {
+            (0, 0)
+        };
+        SessionTraffic {
+            open: u64::from(peers.live),
+            opening,
+            bytes_per_second,
+        }
+    }
 }
 
 // A magnet's metadata fetch on its route's session, for the run that
@@ -3152,21 +3180,27 @@ impl TorrentService {
                     }
                 }
                 torrent.settle(self.inner.clock.now_ms());
+                let leg = self
+                    .queue()
+                    .and_then(|queue| queue.proxy_runtime())
+                    .map(|proxies| OnLeg {
+                        network: proxies.network.clone(),
+                        egress_id: plan.egress_id,
+                        tenancy: proxies.network.tenant_torrent(
+                            Consumer::Torrent(scope),
+                            crate::torrents::sessions::TORRENT_LEG,
+                            LegTorrent {
+                                handle: handle.clone(),
+                                own_sockets: plan.kind.own_sockets(),
+                            },
+                        ),
+                    });
                 torrent.attached = Some(Attached {
                     session,
                     handle,
                     terms,
                     ssl,
-                    leg: self
-                        .queue()
-                        .and_then(|queue| queue.proxy_runtime())
-                        .map(|proxies| OnLeg {
-                            network: proxies.network.clone(),
-                            scope,
-                            position: crate::torrents::sessions::TORRENT_LEG,
-                            egress_id: plan.egress_id,
-                            own_sockets: plan.kind.own_sockets(),
-                        }),
+                    leg,
                 });
                 torrent.route = Some(plan.key);
                 torrent.held = None;
@@ -4146,31 +4180,6 @@ impl TorrentService {
                 // order they were read.
                 landings.extend(self.queue_resume(torrent, now, at_once));
             }
-            // What the sessions hold on the legs they run on: their
-            // established peers on every leg, and the peers in their
-            // handshake and the bytes they receive on their own sockets,
-            // which no route sees.
-            let mut legs = std::collections::HashMap::<_, SessionTraffic>::new();
-            for torrent in live.values() {
-                let Some(leg) = torrent
-                    .attached
-                    .as_ref()
-                    .and_then(|attached| attached.leg.as_ref())
-                else {
-                    continue;
-                };
-                let traffic = legs
-                    .entry((Consumer::Torrent(leg.scope), leg.position))
-                    .or_default();
-                traffic.open += u64::from(torrent.peers.0);
-                if leg.own_sockets {
-                    traffic.opening += u64::from(torrent.peers.2);
-                    traffic.bytes_per_second += torrent.speeds.0;
-                }
-            }
-            if let Some(proxies) = self.queue().and_then(|queue| queue.proxy_runtime()) {
-                proxies.network.hold_torrent_traffic(legs);
-            }
         }
         for landing in landings {
             let _ = self.landed(Some(landing)).await;
@@ -4679,7 +4688,7 @@ impl TorrentService {
                 .attached
                 .as_ref()
                 .and_then(|attached| attached.leg.as_ref())
-                .map(|leg| (Consumer::Torrent(leg.scope).key(), leg.position)),
+                .map(|leg| leg.tenancy.leg().clone()),
             fetch: torrent.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
             seeding: SeedingSeries::of(policy.as_ref(), &reading.counters, torrent.total, now),
         }

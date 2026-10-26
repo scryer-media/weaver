@@ -28,7 +28,7 @@ mod draft;
 pub use draft::DraftNetworkRoute;
 #[path = "network_torrent.rs"]
 mod torrent;
-pub use torrent::{SessionTraffic, TorrentLeg};
+pub use torrent::{LegTenancy, LegTenant, SessionTraffic, TorrentLeg};
 #[path = "network_test_via.rs"]
 mod test_via;
 pub use test_via::{
@@ -208,9 +208,9 @@ pub struct NetworkRuntime {
     // republishes only when one of these moved; an idle daemon otherwise
     // recomputes nothing.
     health_inputs: Mutex<Option<(InterfaceSnapshot, HashSet<u32>)>>,
-    // What torrent sessions hold on the legs they run on their own sockets,
-    // by consumer key and leg position.
-    torrent_legs: Mutex<HashMap<(String, usize), SessionTraffic>>,
+    // The torrents sessions run on the legs, each counted on its leg while
+    // its tenancy lives.
+    torrent_legs: Mutex<Vec<std::sync::Weak<torrent::LegTenancy>>>,
 }
 
 impl NetworkRuntime {

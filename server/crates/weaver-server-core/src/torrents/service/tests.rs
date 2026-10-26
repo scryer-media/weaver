@@ -1974,6 +1974,18 @@ async fn fetching_from(service: &TorrentService, hash: &str, port: u16) -> JobId
 // A session on loopback seeding `metainfo` from `files` under `dir`, with
 // no DHT, trackers or discovery.
 async fn seeder(dir: &std::path::Path, metainfo: &[u8], files: &[(&str, &[u8])]) -> Arc<Session> {
+    let (session, handle) = sharing(dir, metainfo, files).await;
+    handle.wait_until_completed().await.unwrap();
+    session
+}
+
+// A session on loopback running `metainfo` with `files` under `dir` in
+// hand and wanting the rest, with no DHT, trackers or discovery.
+async fn sharing(
+    dir: &std::path::Path,
+    metainfo: &[u8],
+    files: &[(&str, &[u8])],
+) -> (Arc<Session>, Arc<ManagedTorrent>) {
     use weaver_torrent::{
         AddTorrent, AddTorrentOptions, ListenerMode, ListenerOptions, SessionOptions,
     };
@@ -2015,8 +2027,120 @@ async fn seeder(dir: &std::path::Path, metainfo: &[u8], files: &[(&str, &[u8])])
         .unwrap()
         .into_handle()
         .unwrap();
-    handle.wait_until_completed().await.unwrap();
-    session
+    (session, handle)
+}
+
+// A queue whose network is `proxies`', published to `service`: the
+// torrents it runs count on their legs of that network's routes.
+fn counted_on(service: &TorrentService, proxies: &Arc<crate::proxies::ProxyRuntime>) {
+    let queue = queue();
+    queue.set_proxy_runtime(Arc::clone(proxies));
+    service.publish_to(queue);
+}
+
+// The default torrent leg as a network snapshot reads it now: whether it
+// is live, and its open and opening connections.
+fn default_torrent_leg(network: &NetworkRuntime) -> (bool, u64, u64) {
+    let snapshot = crate::proxies::network_metrics::snapshot(network);
+    let leg = snapshot
+        .legs
+        .iter()
+        .find(|leg| {
+            leg.consumer == Consumer::Torrent(TorrentScope::Default).key()
+                && leg.position == crate::torrents::sessions::TORRENT_LEG
+        })
+        .expect("the default torrent leg");
+    (leg.live, leg.open, leg.opening)
+}
+
+// Two files of whole pieces: a sharer holding only the first and the rig's
+// torrent connect, and neither has anything of the second, so neither only
+// uploads and the connection stays up. Returns the sharer's session and the
+// rig's torrent, attached on the default leg of `proxies`' network and told
+// of the sharer by a loopback tracker.
+async fn connected_to_a_sharer(
+    rig: &Rig,
+    proxies: &Arc<crate::proxies::ProxyRuntime>,
+    seeds: &std::path::Path,
+) -> (JobId, Arc<Session>, Arc<ManagedTorrent>) {
+    let (first, second) = (vec![1u8; 2048], vec![2u8; 2048]);
+    let files = [
+        ("pair/a.bin", first.as_slice()),
+        ("pair/b.bin", second.as_slice()),
+    ];
+    let bytes = metainfo("pair", &files, 1024, false);
+    let (session, _) = sharing(seeds, &bytes, &files[..1]).await;
+    let std::net::SocketAddr::V4(peer) = session.listen_addr().unwrap() else {
+        panic!("the sharer listens on IPv4 loopback");
+    };
+    let url = tracker(peer).await;
+    on_loopback(&rig.routes);
+    counted_on(&rig.service, proxies);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    let torrent = handle_of(&rig.service, job_id).await;
+    (job_id, session, torrent)
+}
+
+// Until `torrent`'s run holds an established peer, read from its gauge
+// after each turn the other workers run the sessions in; returns how many
+// it holds. The engine publishes no wake for a peer becoming established,
+// and adding one would put a lock on that path.
+async fn established(torrent: &ManagedTorrent) -> u32 {
+    loop {
+        let held = torrent.gauges().map_or(0, |run| run.peers().live);
+        if held > 0 {
+            return held;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+// A torrent's leg shows the peers the torrent holds the instant a network
+// snapshot is taken: no tick ran since the peer was established.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_leg_shows_an_established_peer_the_instant_it_is_read() {
+    let rig = rig(set_clock());
+    let proxies =
+        crate::proxies::ProxyRuntime::new(rig.db.clone(), tokio::runtime::Handle::current())
+            .unwrap();
+    let seeds = tempfile::tempdir().unwrap();
+    assert_eq!(default_torrent_leg(&proxies.network), (false, 0, 0));
+    let (_, sharer, torrent) = connected_to_a_sharer(&rig, &proxies, seeds.path()).await;
+
+    let held = established(&torrent).await;
+    assert_eq!(
+        default_torrent_leg(&proxies.network),
+        (true, u64::from(held), 0)
+    );
+    rig.service.stop().await;
+    sharer.stop().await;
+    proxies.network.shutdown().await;
+}
+
+// A removed torrent leaves nothing on its leg: the next snapshot reads the
+// leg empty, though the tick before the removal saw the torrent's peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_torrent_leaves_its_leg_empty_at_the_next_snapshot() {
+    let rig = rig(set_clock());
+    let proxies =
+        crate::proxies::ProxyRuntime::new(rig.db.clone(), tokio::runtime::Handle::current())
+            .unwrap();
+    let seeds = tempfile::tempdir().unwrap();
+    let (job_id, sharer, torrent) = connected_to_a_sharer(&rig, &proxies, seeds.path()).await;
+    established(&torrent).await;
+    rig.service.tick().await;
+
+    rig.service.remove(job_id, false, false).await.unwrap();
+    assert_eq!(default_torrent_leg(&proxies.network), (false, 0, 0));
+    rig.service.stop().await;
+    sharer.stop().await;
+    proxies.network.shutdown().await;
 }
 
 // A full disk puts the session in upload mode: the torrent shows the disk as

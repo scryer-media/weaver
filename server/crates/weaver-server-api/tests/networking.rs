@@ -604,28 +604,35 @@ async fn default_torrent_leg(h: &TestHarness) -> (u64, u64, String, u64) {
 // is up while it holds them.
 #[tokio::test]
 async fn a_torrent_leg_on_its_own_sockets_shows_the_sessions_peers_in_the_flow() {
-    use weaver_server_core::proxies::{Consumer, SessionTraffic, TorrentScope};
+    use weaver_server_core::proxies::{Consumer, LegTenant, SessionTraffic, TorrentScope};
+    struct Holds(SessionTraffic);
+    impl LegTenant for Holds {
+        fn traffic(&self) -> SessionTraffic {
+            self.0
+        }
+    }
     let h = harness().await;
     let runtime = h.handle.proxy_runtime().unwrap();
     let consumer = Consumer::Torrent(TorrentScope::Default);
     assert_eq!(consumer.key(), "torrent:default");
     assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
 
-    runtime.network.hold_torrent_traffic([(
-        (consumer, 0),
-        SessionTraffic {
+    let tenancy = runtime.network.tenant_torrent(
+        consumer,
+        0,
+        Holds(SessionTraffic {
             open: 3,
             opening: 2,
             bytes_per_second: 4_000_000,
-        },
-    )]);
+        }),
+    );
     assert_eq!(
         default_torrent_leg(&h).await,
         (3, 2, "UP".into(), 4_000_000)
     );
 
     // The session lets the leg go: it is idle again.
-    runtime.network.hold_torrent_traffic([]);
+    drop(tenancy);
     assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
     runtime.stop_all().await;
 }

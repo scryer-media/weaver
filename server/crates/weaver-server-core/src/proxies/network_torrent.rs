@@ -152,6 +152,27 @@ impl SessionTraffic {
     }
 }
 
+/// A torrent a session runs on a leg, as it holds it now.
+pub trait LegTenant: Send + Sync {
+    /// What the torrent holds on its leg at this instant.
+    fn traffic(&self) -> SessionTraffic;
+}
+
+/// A torrent's place on the leg its session runs it on: the leg counts what
+/// the torrent holds while this lives, and nothing of it once it is dropped.
+pub struct LegTenancy {
+    leg: (String, usize),
+    tenant: Box<dyn LegTenant>,
+}
+
+impl LegTenancy {
+    /// The leg the torrent holds its place on: its consumer's key and its
+    /// position on that consumer's route.
+    pub fn leg(&self) -> &(String, usize) {
+        &self.leg
+    }
+}
+
 impl NetworkRuntime {
     /// Count bytes a torrent session moved over `egress_id` as every byte
     /// through an egress is counted: those received in its download total,
@@ -170,27 +191,45 @@ impl NetworkRuntime {
         }
     }
 
-    /// What torrent sessions hold now on the legs they run on, by consumer
-    /// and leg position, in place of what they held before.
-    pub fn hold_torrent_traffic(
+    /// `tenant` runs on the leg at `position` of `consumer`'s route, and
+    /// counts there for as long as the tenancy returned lives.
+    pub fn tenant_torrent(
         &self,
-        legs: impl IntoIterator<Item = ((Consumer, usize), SessionTraffic)>,
-    ) {
-        let legs = legs
-            .into_iter()
-            .map(|((consumer, position), traffic)| ((consumer.key(), position), traffic))
-            .collect();
-        *self
-            .torrent_legs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = legs;
-    }
-
-    pub fn torrent_traffic(&self) -> HashMap<(String, usize), SessionTraffic> {
+        consumer: Consumer,
+        position: usize,
+        tenant: impl LegTenant + 'static,
+    ) -> Arc<LegTenancy> {
+        let tenancy = Arc::new(LegTenancy {
+            leg: (consumer.key(), position),
+            tenant: Box::new(tenant),
+        });
         self.torrent_legs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .push(Arc::downgrade(&tenancy));
+        tenancy
+    }
+
+    /// What torrent sessions hold now on the legs they run on, by consumer
+    /// key and leg position: each tenant's figures as it reads them now.
+    pub fn torrent_traffic(&self) -> HashMap<(String, usize), SessionTraffic> {
+        let mut legs = HashMap::<_, SessionTraffic>::new();
+        let mut tenancies = self
+            .torrent_legs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tenancies.retain(|tenancy| {
+            let Some(tenancy) = tenancy.upgrade() else {
+                return false;
+            };
+            let now = tenancy.tenant.traffic();
+            let traffic = legs.entry(tenancy.leg.clone()).or_default();
+            traffic.open += now.open;
+            traffic.opening += now.opening;
+            traffic.bytes_per_second += now.bytes_per_second;
+            true
+        });
+        legs
     }
 
     /// Bytes ever uploaded over `egress_id`, as its upload count holds them.
