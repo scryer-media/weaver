@@ -63,6 +63,7 @@ tracing = { workspace = true, features = ["attributes"] }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4"] }
 walkdir = { workspace = true }
+weaver-model = { path = "../../shared/crates/weaver-model", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }

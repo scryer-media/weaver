@@ -21,6 +21,8 @@ pub struct Magnet {
     /// The web seeds the link names (`ws`), BEP 19 URLs as written.
     pub web_seeds: Vec<String>,
     pub name: Option<String>,
+    /// The torrent's length in bytes, as the link states it (`xl`).
+    pub exact_length: Option<u64>,
     select_only: Option<Vec<usize>>,
 }
 
@@ -61,6 +63,7 @@ impl Magnet {
             peers: Vec::new(),
             web_seeds: Vec::new(),
             name,
+            exact_length: None,
             select_only: None,
         }
     }
@@ -73,6 +76,7 @@ impl Magnet {
             peers: Vec::new(),
             web_seeds: Vec::new(),
             name: None,
+            exact_length: None,
             select_only,
         }
     }
@@ -93,6 +97,7 @@ impl Magnet {
             peers: Vec::new(),
             web_seeds: Vec::new(),
             name: None,
+            exact_length: None,
             select_only,
         })
     }
@@ -109,6 +114,7 @@ impl Magnet {
                 trackers: vec![],
                 peers: vec![],
                 web_seeds: vec![],
+                exact_length: None,
                 select_only: None,
             });
         }
@@ -120,6 +126,7 @@ impl Magnet {
         let mut id20: Option<Id20> = None;
         let mut id32: Option<Id32> = None;
         let mut name: Option<String> = None;
+        let mut exact_length: Option<u64> = None;
         let mut trackers = Vec::<String>::new();
         let mut peers = Vec::<SocketAddr>::new();
         let mut web_seeds = Vec::<String>::new();
@@ -149,6 +156,7 @@ impl Magnet {
                 "ws" => web_seeds.push(value.into_owned()),
                 "dn" if !value.is_empty() => name = Some(value.into_owned()),
                 "dn" => {}
+                "xl" => exact_length = value.trim().parse().ok(),
                 "so" => {
                     // Process 'so' values, but silently ignore any which fail parsing
                     for file_desc in value.split(',') {
@@ -182,6 +190,7 @@ impl Magnet {
                 peers,
                 web_seeds,
                 name,
+                exact_length,
                 select_only: if files.is_empty() { None } else { Some(files) },
             }),
             false => {

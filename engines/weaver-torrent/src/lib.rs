@@ -24,6 +24,7 @@ macro_rules! aframe {
 #[macro_use]
 mod stat_gen;
 
+pub mod analysis;
 pub mod api;
 mod api_error;
 pub mod bencode;

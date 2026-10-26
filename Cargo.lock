@@ -6524,6 +6524,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "weaver-model",
  "windows",
 ]
 
