@@ -6448,3 +6448,107 @@ async fn a_torrent_removed_and_added_again_takes_a_new_identity() {
     assert_ne!(second.peer_id, first.peer_id);
     rig.service.stop().await;
 }
+
+// The figures the exporter reads are the ones the tick read: a torrent
+// whose ledger and policy are known renders them, its trackers one series
+// per host, and each add and removal counts once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_metrics_carry_what_the_tick_read() {
+    use crate::torrents::metrics::{FetchOutcome, SeedingGoal, TorrentEvent};
+
+    let clock = set_clock();
+    let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
+    // No session is built while the route is down, so nothing but the
+    // test moves the ledger.
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            category: Some("tv".into()),
+            policy_override: Some(SeedingPolicy {
+                ratio_goal: Some(3.0),
+                seed_time_goal_minutes: Some(10),
+                inactive_goal_minutes: None,
+                mode: SeedingGoalMode::All,
+                action: SeedingAction::Stop,
+                max_upload_bps: None,
+            }),
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    let gone = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("gone", 2))))
+        .await
+        .unwrap();
+    rig.service
+        .add_trackers(
+            job_id,
+            vec![
+                vec!["http://127.0.0.1:1/announce".to_owned()],
+                vec!["http://127.0.0.1:2/announce".to_owned()],
+            ],
+        )
+        .await
+        .unwrap();
+    rig.service.remove(gone, true, false).await.unwrap();
+    {
+        let mut live = rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&job_id).unwrap();
+        torrent.counters.downloaded_bytes = 3000;
+        torrent.counters.uploaded_bytes = 6000;
+        torrent.counters.finished_duration_s = 120;
+    }
+    clock.0.fetch_add(TICK.as_millis() as i64, Ordering::SeqCst);
+    rig.service.tick().await;
+
+    let metrics = rig.service.metrics();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    let published = &metrics.published;
+    assert_eq!(published.torrents.len(), 1, "{published:?}");
+    let job = published.job(job_id).unwrap();
+    let torrent = job.torrent;
+    assert_eq!(torrent.category, "tv");
+    assert_eq!(Some(torrent.route.as_str()), view.route.as_deref());
+    assert_eq!(torrent.total_bytes, 3000);
+    assert_eq!(torrent.wanted_bytes, 3000);
+    assert_eq!(torrent.downloaded_bytes, 3000);
+    assert_eq!(torrent.uploaded_bytes, 6000);
+    assert_eq!(torrent.seeding_seconds, 120);
+    assert_eq!(torrent.ratio, 2.0);
+    assert_eq!(torrent.ratio, view.ratio);
+    assert_eq!(torrent.state, view.state);
+    assert_eq!(torrent.fetch, None);
+    assert_eq!(
+        torrent.seeding.goals,
+        [
+            (SeedingGoal::Ratio, 3.0, 1.0),
+            (SeedingGoal::SeedTime, 600.0, 480.0)
+        ]
+    );
+    assert!(!torrent.seeding.met);
+    // Both trackers are on one host: one series, the first listed.
+    assert_eq!(torrent.trackers.len(), 1, "{:?}", torrent.trackers);
+    assert_eq!(torrent.trackers[0].host, "127.0.0.1");
+    assert_eq!(torrent.trackers[0].status, view.trackers[0].status);
+    assert_eq!(torrent.trackers[0].last_announce_ms, None);
+    // The route is down: no session runs on it.
+    assert!(job.session.is_none_or(|session| !session.open));
+
+    assert_eq!(
+        metrics.events,
+        [
+            (TorrentEvent::Added, 2),
+            (TorrentEvent::Completed, 0),
+            (TorrentEvent::Removed, 1),
+            (TorrentEvent::Failed, 0),
+        ]
+    );
+    assert_eq!(
+        metrics.fetches,
+        FetchOutcome::ALL.map(|outcome| (outcome, 0)).to_vec()
+    );
+    rig.service.stop().await;
+}

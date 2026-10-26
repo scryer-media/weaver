@@ -4,6 +4,7 @@
 pub mod admission;
 pub mod identity;
 pub(crate) mod intake;
+pub mod metrics;
 pub mod model;
 pub mod net;
 pub mod persistence;
@@ -20,8 +21,8 @@ pub use model::{
 };
 pub use weaver_torrent::tracker::redacted_tracker_url;
 pub use weaver_torrent::{
-    ConnectionKind, Encryption, NamedBy, PeerFlags, PeerInfo, PeerSourceFlag, PeerSources,
-    TorrentVersion,
+    ConnectionKind, Encryption, FetchPhase, NamedBy, PeerFlags, PeerInfo, PeerSourceFlag,
+    PeerSources, TorrentVersion,
 };
 
 #[cfg(test)]

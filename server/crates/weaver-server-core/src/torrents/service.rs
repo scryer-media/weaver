@@ -60,6 +60,10 @@ use crate::settings::{
 use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
+use crate::torrents::metrics::{
+    Counters, FetchOutcome, Published, SeedingSeries, SessionSeries, TorrentEvent, TorrentMetrics,
+    TorrentSeries,
+};
 use crate::torrents::rate::limit_kind;
 use crate::torrents::sessions::{
     NetworkRoutes, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView,
@@ -1254,6 +1258,50 @@ struct Reading {
     peers: (u32, u32, u32),
 }
 
+// What the exporter reads of a torrent beside its view.
+struct Unviewed {
+    wanted_bytes: u64,
+    hash_failed_bytes: u64,
+    redundant_bytes: u64,
+    seeding_seconds: u64,
+    peers_connecting: u32,
+    leg: Option<(String, usize)>,
+    fetch: Option<weaver_torrent::FetchPhase>,
+    seeding: SeedingSeries,
+}
+
+impl Unviewed {
+    // The torrent's figures: its view's, with these and its trackers.
+    fn series(self, view: &TorrentView, announces: &[TrackerAnnounce]) -> TorrentSeries {
+        TorrentSeries {
+            job_id: view.job_id,
+            category: view.category.clone().unwrap_or_default(),
+            route: view.route.clone().unwrap_or_default(),
+            state: view.state,
+            have_bytes: view.have_bytes,
+            total_bytes: view.total_bytes,
+            wanted_bytes: self.wanted_bytes,
+            pieces: view.pieces,
+            downloaded_bytes: view.downloaded_bytes,
+            uploaded_bytes: view.uploaded_bytes,
+            hash_failed_bytes: self.hash_failed_bytes,
+            redundant_bytes: self.redundant_bytes,
+            active_seconds: view.active_seconds,
+            seeding_seconds: self.seeding_seconds,
+            download_bps: view.download_bps,
+            upload_bps: view.upload_bps,
+            ratio: view.ratio,
+            peers_established: view.peers,
+            peers_connecting: self.peers_connecting,
+            peer_seeders: view.seeds,
+            leg: self.leg,
+            fetch: self.fetch,
+            seeding: self.seeding,
+            trackers: crate::torrents::metrics::trackers(&view.trackers, announces),
+        }
+    }
+}
+
 // Bytes a torrent received and threw away since it was added in this
 // process: pieces that failed their check, and blocks that arrived when
 // already in hand.
@@ -1467,6 +1515,13 @@ struct Inner {
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
     // Rung by a settings change: the tick runs then, not at its next turn.
     settings_changed: Notify,
+    // The torrents and their sessions as last published, for the exporter.
+    published: watch::Sender<Arc<Published>>,
+    // Each route's session as the tick last read it. Only the tick reads
+    // them, under the sessions' lock it takes anyway: a publish from an
+    // action never waits on a session that is opening.
+    sessions_read: Mutex<Vec<SessionSeries>>,
+    counters: Counters,
 }
 
 #[derive(Clone)]
@@ -1501,6 +1556,9 @@ impl TorrentService {
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
                 settings_changed: Notify::new(),
+                published: watch::channel(Arc::default()).0,
+                sessions_read: Mutex::default(),
+                counters: Counters::default(),
             }),
         }
     }
@@ -1709,11 +1767,34 @@ impl TorrentService {
             .clone()
     }
 
-    // The torrents, as queue items, into the published queue.
+    // The torrents, as queue items, into the published queue, and with
+    // their sessions as the tick last read them, as the exporter reads
+    // them: one reading of each torrent.
     async fn publish(&self) {
+        let now = self.inner.clock.now_ms();
+        let listed = self.listed(None, now).await;
+        let sessions = self
+            .inner
+            .sessions_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let (views, torrents): (Vec<TorrentView>, Vec<TorrentSeries>) = listed.into_iter().unzip();
+        self.inner
+            .published
+            .send_replace(Arc::new(Published { torrents, sessions }));
         if let Some(queue) = self.queue() {
-            queue.publish_owned_jobs(self.job_infos().await);
+            queue.publish_owned_jobs(job_infos(views, now));
         }
+    }
+
+    /// The torrents and their sessions as last published, with the
+    /// service's event counts as they stand.
+    pub fn metrics(&self) -> TorrentMetrics {
+        TorrentMetrics::of(
+            Arc::clone(&self.inner.published.borrow()),
+            &self.inner.counters,
+        )
     }
 
     /// Stop the tick and the job tasks, and close every session.
@@ -2069,6 +2150,7 @@ impl TorrentService {
             }
             torrent.settle(now);
             torrent.record.completed_at_ms = Some(now);
+            self.inner.counters.event(TorrentEvent::Completed);
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
@@ -2438,6 +2520,7 @@ impl TorrentService {
                 self.inner.live.lock().await.insert(job_id, torrent);
                 self.apply_queue().await;
                 self.attach(job_id, None).await;
+                self.inner.counters.event(TorrentEvent::Added);
                 self.publish().await;
                 Ok(job_id)
             }
@@ -2496,6 +2579,7 @@ impl TorrentService {
                 self.inner.live.lock().await.insert(job_id, torrent);
                 self.spawn_resolve(job_id, plan, uri, None, identity, terms)
                     .await;
+                self.inner.counters.event(TorrentEvent::Added);
                 self.publish().await;
                 Ok(job_id)
             }
@@ -2677,6 +2761,7 @@ impl TorrentService {
             Ok(session) => session,
             Err(error) => {
                 self.fetch_ended(job_id).await;
+                self.inner.counters.fetch(FetchOutcome::NoSession);
                 return self.held(job_id, Some(plan.key), held_by(error)).await;
             }
         };
@@ -2696,17 +2781,20 @@ impl TorrentService {
             }
         };
         let (listed, ()) = tokio::join!(fetch, fetching);
+        // A fetch ended first was counted where it was ended.
         if !self.fetch_ended(job_id).await {
             return;
         }
         let listed = match listed {
             Ok(AddTorrentResponse::ListOnly(listed)) => listed,
             Ok(_) => {
+                self.inner.counters.fetch(FetchOutcome::Failed);
                 self.fail(job_id, "the session did not return the metainfo".into())
                     .await;
                 return;
             }
             Err(error) => {
+                self.inner.counters.fetch(FetchOutcome::Failed);
                 self.fail(job_id, format!("{error:#}")).await;
                 return;
             }
@@ -2718,8 +2806,12 @@ impl TorrentService {
             identity,
             trackers,
         });
-        if let Err(error) = self.resolved(job_id, listed.torrent_bytes, fetched).await {
-            self.fail(job_id, error.to_string()).await;
+        match self.resolved(job_id, listed.torrent_bytes, fetched).await {
+            Ok(()) => self.inner.counters.fetch(FetchOutcome::Resolved),
+            Err(error) => {
+                self.inner.counters.fetch(FetchOutcome::Failed);
+                self.fail(job_id, error.to_string()).await;
+            }
         }
     }
 
@@ -3132,6 +3224,7 @@ impl TorrentService {
     async fn fail(&self, job_id: JobId, error: String) {
         let torrent = self.inner.live.lock().await.remove(&job_id);
         let Some(mut torrent) = torrent else { return };
+        self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
         self.retire(torrent, "failed", Some(error)).await;
     }
@@ -3164,6 +3257,7 @@ impl TorrentService {
             (report, hashes_of(&torrent.record).best(), landing)
         };
         let _ = self.landed(landing).await;
+        self.inner.counters.event(TorrentEvent::Failed);
         self.apply_queue().await;
         self.finish(report, "failed", hash, now).await;
     }
@@ -3234,6 +3328,7 @@ impl TorrentService {
         drop(live);
         if let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
             fetch.abort();
+            self.inner.counters.fetch(FetchOutcome::Cancelled);
         }
         self.detach(&mut torrent).await;
         if delete_files && let Some(dir) = torrent.record.storage_dir.clone() {
@@ -3251,6 +3346,7 @@ impl TorrentService {
             (false, Some(refusal)) => ("failed", Some(refusal)),
             (false, None) => ("cancelled", None),
         };
+        self.inner.counters.event(TorrentEvent::Removed);
         self.retire(torrent, status, error).await;
         Ok(())
     }
@@ -3496,6 +3592,7 @@ impl TorrentService {
         self.with_torrent(job_id, |torrent| {
             if let Some(Resolving::Fetching(fetch)) = &torrent.resolving {
                 fetch.abort();
+                self.inner.counters.fetch(FetchOutcome::Cancelled);
                 torrent.resolving = Some(Resolving::Paused);
                 // A paused magnet shows no fetch's table, as one paused
                 // before its fetch began.
@@ -3934,6 +4031,12 @@ impl TorrentService {
         self.apply_picking().await;
         self.apply_limits().await;
         self.drop_idle_sessions().await;
+        let sessions = self.inner.sessions.metrics().await;
+        *self
+            .inner
+            .sessions_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = sessions;
         self.publish().await;
         self.inner.ticks.send_modify(|ticks| *ticks += 1);
     }
@@ -3970,6 +4073,7 @@ impl TorrentService {
                         });
                     if moved && let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
                         fetch.abort();
+                        self.inner.counters.fetch(FetchOutcome::Cancelled);
                         torrent.fetching = None;
                     }
                     if moved || torrent.held.is_some() {
@@ -4375,7 +4479,16 @@ impl TorrentService {
     fn view(&self, settings: &TorrentSettings, torrent: &Live, now: i64) -> TorrentView {
         // The session as it is now, not as the last tick found it: the
         // state and every figure from one reading of it.
-        let reading = torrent.reading(now);
+        self.view_of(settings, torrent, torrent.reading(now), now)
+    }
+
+    fn view_of(
+        &self,
+        settings: &TorrentSettings,
+        torrent: &Live,
+        reading: Reading,
+        now: i64,
+    ) -> TorrentView {
         let (state, why) = status::project(&torrent.observed(reading.engine));
         let (detail, route_reason) = status::Why::split(why);
         let counters = &reading.counters;
@@ -4492,14 +4605,30 @@ impl TorrentService {
     /// Every torrent, or a category's, in the order they were added, each
     /// with its trackers.
     pub async fn torrents(&self, category: Option<&str>) -> Vec<TorrentView> {
-        let settings = self.settings();
         let now = self.inner.clock.now_ms();
+        self.listed(category, now)
+            .await
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect()
+    }
+
+    // Every torrent, or a category's, in the order they were added, each
+    // with its trackers, and its figures as the exporter reads them: both
+    // from one reading of its session.
+    async fn listed(&self, category: Option<&str>, now: i64) -> Vec<(TorrentView, TorrentSeries)> {
+        let settings = self.settings();
         let mut listed = self.inner.db.torrent_trackers_by_job().unwrap_or_default();
-        let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>)> = {
+        let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>, Unviewed)> = {
             let live = self.inner.live.lock().await;
             live.values()
-                .map(|torrent| (self.view(&settings, torrent, now), torrent.announces()))
-                .filter(|(view, _)| {
+                .map(|torrent| {
+                    let reading = torrent.reading(now);
+                    let unviewed = self.unviewed(&settings, torrent, &reading, now);
+                    let view = self.view_of(&settings, torrent, reading, now);
+                    (view, torrent.announces(), unviewed)
+                })
+                .filter(|(view, ..)| {
                     category.is_none_or(|name| {
                         view.category
                             .as_deref()
@@ -4509,13 +4638,51 @@ impl TorrentService {
                 .collect()
         };
         let mut names = HashMap::new();
-        for (view, announces) in &mut views {
+        for (view, announces, _) in &mut views {
             let listed = listed.remove(&view.job_id).unwrap_or_default();
             self.track(view, listed, announces, &mut names);
         }
-        let mut views: Vec<TorrentView> = views.into_iter().map(|(view, _)| view).collect();
-        views.sort_by_key(|view| (view.added_at_ms, view.job_id));
+        let mut views: Vec<(TorrentView, TorrentSeries)> = views
+            .into_iter()
+            .map(|(view, announces, unviewed)| {
+                let series = unviewed.series(&view, &announces);
+                (view, series)
+            })
+            .collect();
+        views.sort_by_key(|(view, _)| (view.added_at_ms, view.job_id));
         views
+    }
+
+    // What the exporter reads of `torrent` that its view does not carry,
+    // from `reading`.
+    fn unviewed(
+        &self,
+        settings: &TorrentSettings,
+        torrent: &Live,
+        reading: &Reading,
+        now: i64,
+    ) -> Unviewed {
+        let rules = self.rules();
+        let policy = settings.policy(&torrent.record, torrent.rule(&rules));
+        let (wanted_bytes, _) = wanted(
+            torrent.layout.as_deref(),
+            &torrent.levels,
+            &reading.file_have,
+        );
+        Unviewed {
+            wanted_bytes,
+            hash_failed_bytes: reading.seen.failed_bytes,
+            redundant_bytes: reading.seen.redundant_bytes,
+            seeding_seconds: reading.counters.finished_duration_s,
+            peers_connecting: reading.peers.2,
+            leg: torrent
+                .attached
+                .as_ref()
+                .and_then(|attached| attached.leg.as_ref())
+                .map(|leg| (Consumer::Torrent(leg.scope).key(), leg.position)),
+            fetch: torrent.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
+            seeding: SeedingSeries::of(policy.as_ref(), &reading.counters, torrent.total, now),
+        }
     }
 
     // A view's trackers: those listed for it, as its run announces to
@@ -4542,14 +4709,7 @@ impl TorrentService {
     /// The torrents as queue items.
     pub async fn job_infos(&self) -> Vec<JobInfo> {
         let now = self.inner.clock.now_ms();
-        self.torrents(None)
-            .await
-            .into_iter()
-            .map(|view| {
-                let status = job_status(&view);
-                report(view, status, now).job_info()
-            })
-            .collect()
+        job_infos(self.torrents(None).await, now)
     }
 
     /// The scope whose route a torrent added in `category` under `rule` takes.
@@ -4662,6 +4822,17 @@ pub fn disk_warning(volume: &Path, waiting: &[&str]) -> String {
         volume.display(),
         waiting.join(", ")
     )
+}
+
+// `views` as queue items at `now_ms`.
+fn job_infos(views: Vec<TorrentView>, now_ms: i64) -> Vec<JobInfo> {
+    views
+        .into_iter()
+        .map(|view| {
+            let status = job_status(&view);
+            report(view, status, now_ms).job_info()
+        })
+        .collect()
 }
 
 fn job_status(view: &TorrentView) -> JobStatus {

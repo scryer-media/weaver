@@ -1201,6 +1201,22 @@ impl Sessions {
         slots.iter().map(|(key, slot)| view(key, slot)).collect()
     }
 
+    /// Each route's session as the exporter reads it: from its counters
+    /// while it runs, and as held while it does not.
+    pub(crate) async fn metrics(&self) -> Vec<crate::torrents::metrics::SessionSeries> {
+        use crate::torrents::metrics::SessionSeries;
+        let slots = self.slots.lock().await;
+        slots
+            .iter()
+            .map(|(key, slot)| match (slot, slot.held()) {
+                (Slot::Open { session, port, .. }, None) => {
+                    SessionSeries::open(key.as_str(), session, *port)
+                }
+                _ => SessionSeries::held(key.as_str()),
+            })
+            .collect()
+    }
+
     pub async fn stop_all(&self) {
         let mut slots = self.slots.lock().await;
         close_all(std::mem::take(&mut *slots)).await;
