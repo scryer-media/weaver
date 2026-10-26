@@ -30,6 +30,10 @@ use weaver_server_core::proxies::network_metrics::{
     PoolMetrics, RungStateLabel, proxy_kind_label,
 };
 use weaver_server_core::settings::PerJobSeries;
+use weaver_server_core::torrents::metrics::{
+    FETCH_PHASES, SessionSeries, TORRENT_STATES, TRACKER_STATUSES, TorrentMetrics, TorrentSeries,
+    TrackerSeries, fetch_phase_str, tracker_status_str,
+};
 use weaver_server_core::{
     DownloadPressureReason, DownloadPressureState, JobInfo, JobStatus, MetricsSnapshot,
     PAR3_STALL_THRESHOLD_MS, Par3AdmissionReason, Par3EngineNarrowing, Par3EngineRefusal,
@@ -78,6 +82,9 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) network: Option<&'a NetworkMetricsSnapshot>,
     pub(crate) tunnel: Option<&'a TunnelMetricsSnapshot>,
     pub(crate) speed_tests: Option<&'a weaver_server_core::speed_test::SpeedTestMetricsSnapshot>,
+    // The torrents as their service last published them. Absent when the
+    // server runs no torrent service.
+    pub(crate) torrents: Option<&'a TorrentMetrics>,
     pub(crate) build: BuildInfo,
     pub(crate) start_time_seconds: f64,
     pub(crate) per_job_series: PerJobSeries,
@@ -121,6 +128,7 @@ impl<'a> PrometheusRenderInput<'a> {
             network: None,
             tunnel: None,
             speed_tests: None,
+            torrents: None,
             build: BuildInfo {
                 version: env!("CARGO_PKG_VERSION"),
                 commit: option_env!("WEAVER_GIT_COMMIT").unwrap_or("unknown"),
@@ -183,6 +191,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         network,
         tunnel,
         speed_tests,
+        torrents,
         build,
         start_time_seconds,
         per_job_series,
@@ -297,6 +306,9 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
     if let Some(metrics) = speed_tests {
         render_speed_tests(&mut out, metrics);
+    }
+    if let Some(metrics) = torrents {
+        render_torrents(&mut out, metrics);
     }
 
     let logs = weaver_server_core::runtime::log_delivery::counter_snapshot();
@@ -2240,5 +2252,542 @@ pub(crate) fn render_speed_tests(
             &[("consumer", consumer.as_str()), ("kind", kind.as_str())],
             *bps,
         );
+    }
+}
+
+// The torrent families: each torrent, each of its trackers, each route's
+// session, then the event counters. Every family is written whole before the
+// next, so a family's samples stay together whatever the number of torrents.
+pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics) {
+    let published = &metrics.published;
+    let torrents: Vec<(String, &TorrentSeries)> = published
+        .torrents
+        .iter()
+        .map(|torrent| (torrent.job_id.0.to_string(), torrent))
+        .collect();
+
+    // One sample per torrent, labelled by it and `extra`.
+    fn each<'a, T>(
+        out: &mut Encoder,
+        family: &'static MetricFamily,
+        torrents: &'a [(String, &'a TorrentSeries)],
+        mut sample: impl FnMut(&'a TorrentSeries) -> Vec<(Vec<(&'static str, String)>, T)>,
+        write: impl Fn(&mut Encoder, &'static MetricFamily, &[(&str, &str)], T),
+    ) {
+        for (job_id, torrent) in torrents {
+            for (extra, value) in sample(torrent) {
+                let mut labels: Vec<(&str, &str)> = vec![
+                    ("job_id", job_id.as_str()),
+                    ("category", torrent.category.as_str()),
+                    ("route", torrent.route.as_str()),
+                ];
+                labels.extend(extra.iter().map(|(key, value)| (*key, value.as_str())));
+                write(out, family, &labels, value);
+            }
+        }
+    }
+    let int = |out: &mut Encoder, family, labels: &[(&str, &str)], value: u64| {
+        out.sample(family, labels, value)
+    };
+    let float = |out: &mut Encoder, family, labels: &[(&str, &str)], value: f64| {
+        out.sample_f64(family, labels, value)
+    };
+    let one = |value: u64| vec![(Vec::new(), value)];
+
+    each(
+        out,
+        &f::TORRENT_STATE,
+        &torrents,
+        |torrent| {
+            TORRENT_STATES
+                .iter()
+                .map(|state| {
+                    (
+                        vec![("state", state.as_str().to_owned())],
+                        u64::from(*state == torrent.state),
+                    )
+                })
+                .collect()
+        },
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_HAVE_BYTES,
+        &torrents,
+        |t| one(t.have_bytes),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_TOTAL_BYTES,
+        &torrents,
+        |t| one(t.total_bytes),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_WANTED_BYTES,
+        &torrents,
+        |t| one(t.wanted_bytes),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_PIECES,
+        &torrents,
+        |t| {
+            t.pieces
+                .iter()
+                .map(|pieces| (Vec::new(), u64::from(pieces.count)))
+                .collect()
+        },
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_PIECES_HAVE,
+        &torrents,
+        |t| {
+            t.pieces
+                .iter()
+                .map(|pieces| (Vec::new(), u64::from(pieces.have)))
+                .collect()
+        },
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_DOWNLOADED_BYTES,
+        &torrents,
+        |t| one(t.downloaded_bytes),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_UPLOADED_BYTES,
+        &torrents,
+        |t| one(t.uploaded_bytes),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_WASTED_BYTES,
+        &torrents,
+        |t| {
+            vec![
+                (
+                    vec![("reason", "hash_failed".to_owned())],
+                    t.hash_failed_bytes,
+                ),
+                (vec![("reason", "redundant".to_owned())], t.redundant_bytes),
+            ]
+        },
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_ACTIVE_SECONDS,
+        &torrents,
+        |t| one(t.active_seconds),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_SEEDING_SECONDS,
+        &torrents,
+        |t| one(t.seeding_seconds),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_DOWNLOAD_RATE,
+        &torrents,
+        |t| one(t.download_bps),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_UPLOAD_RATE,
+        &torrents,
+        |t| one(t.upload_bps),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_RATIO,
+        &torrents,
+        |t| vec![(Vec::new(), t.ratio)],
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_PEERS,
+        &torrents,
+        |t| {
+            vec![
+                (
+                    vec![("state", "established".to_owned())],
+                    u64::from(t.peers_established),
+                ),
+                (
+                    vec![("state", "connecting".to_owned())],
+                    u64::from(t.peers_connecting),
+                ),
+            ]
+        },
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_PEER_SEEDERS,
+        &torrents,
+        |t| one(u64::from(t.peer_seeders)),
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_ROUTE_LEG,
+        &torrents,
+        |t| {
+            t.leg
+                .iter()
+                .map(|(consumer, position)| {
+                    (
+                        vec![
+                            ("consumer", consumer.clone()),
+                            ("position", position.to_string()),
+                        ],
+                        1,
+                    )
+                })
+                .collect()
+        },
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_METADATA_FETCH_PHASE,
+        &torrents,
+        |t| {
+            t.fetch
+                .iter()
+                .flat_map(|current| {
+                    FETCH_PHASES.iter().map(move |phase| {
+                        (
+                            vec![("phase", fetch_phase_str(*phase).to_owned())],
+                            u64::from(phase == current),
+                        )
+                    })
+                })
+                .collect()
+        },
+        int,
+    );
+    each(
+        out,
+        &f::TORRENT_SEEDING_GOAL,
+        &torrents,
+        |t| {
+            t.seeding
+                .goals
+                .iter()
+                .map(|(goal, target, _)| (vec![("goal", goal.as_str().to_owned())], *target))
+                .collect()
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_SEEDING_GOAL_REMAINING,
+        &torrents,
+        |t| {
+            t.seeding
+                .goals
+                .iter()
+                .map(|(goal, _, left)| (vec![("goal", goal.as_str().to_owned())], *left))
+                .collect()
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_SEEDING_GOALS_MET,
+        &torrents,
+        |t| one(u64::from(t.seeding.met)),
+        int,
+    );
+
+    // Per tracker: one sample per tracker host of each torrent.
+    fn per_tracker(
+        torrent: &TorrentSeries,
+        pick: impl Fn(&TrackerSeries) -> Vec<(Vec<(&'static str, String)>, f64)>,
+    ) -> Vec<(Vec<(&'static str, String)>, f64)> {
+        torrent
+            .trackers
+            .iter()
+            .flat_map(|tracker| {
+                pick(tracker).into_iter().map(|(mut extra, value)| {
+                    extra.insert(0, ("tracker", tracker.host.clone()));
+                    (extra, value)
+                })
+            })
+            .collect()
+    }
+    let seconds = |ms: Option<i64>| ms.map(|ms| ms as f64 / 1000.0);
+    each(
+        out,
+        &f::TORRENT_TRACKER_STATUS,
+        &torrents,
+        |t| {
+            per_tracker(t, |tracker| {
+                TRACKER_STATUSES
+                    .iter()
+                    .map(|status| {
+                        (
+                            vec![("status", tracker_status_str(*status).to_owned())],
+                            f64::from(u8::from(*status == tracker.status)),
+                        )
+                    })
+                    .collect()
+            })
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_TRACKER_LAST_ANNOUNCE,
+        &torrents,
+        |t| {
+            per_tracker(t, |tracker| {
+                seconds(tracker.last_announce_ms)
+                    .map(|at| (Vec::new(), at))
+                    .into_iter()
+                    .collect()
+            })
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_TRACKER_NEXT_ANNOUNCE,
+        &torrents,
+        |t| {
+            per_tracker(t, |tracker| {
+                seconds(tracker.next_announce_ms)
+                    .map(|at| (Vec::new(), at))
+                    .into_iter()
+                    .collect()
+            })
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_TRACKER_INTERVAL,
+        &torrents,
+        |t| {
+            per_tracker(t, |tracker| {
+                tracker
+                    .interval_seconds
+                    .map(|interval| (Vec::new(), interval as f64))
+                    .into_iter()
+                    .collect()
+            })
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_TRACKER_SWARM_PEERS,
+        &torrents,
+        |t| {
+            per_tracker(t, |tracker| {
+                [("seeders", tracker.seeders), ("leechers", tracker.leechers)]
+                    .into_iter()
+                    .filter_map(|(role, count)| {
+                        count.map(|count| (vec![("role", role.to_owned())], f64::from(count)))
+                    })
+                    .collect()
+            })
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_TRACKER_SWARM_COMPLETED,
+        &torrents,
+        |t| {
+            per_tracker(t, |tracker| {
+                tracker
+                    .completed
+                    .map(|count| (Vec::new(), f64::from(count)))
+                    .into_iter()
+                    .collect()
+            })
+        },
+        float,
+    );
+    each(
+        out,
+        &f::TORRENT_TRACKER_FAILURES,
+        &torrents,
+        |t| per_tracker(t, |tracker| vec![(Vec::new(), f64::from(tracker.fails))]),
+        float,
+    );
+
+    render_torrent_sessions(out, &published.sessions);
+
+    for (event, count) in &metrics.events {
+        out.sample(&f::TORRENT_LIFECYCLE, &[("event", event.as_str())], *count);
+    }
+    for (outcome, count) in &metrics.fetches {
+        out.sample(
+            &f::TORRENT_METADATA_FETCHES,
+            &[("outcome", outcome.as_str())],
+            *count,
+        );
+    }
+}
+
+// Each route's session, one family at a time.
+fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
+    for session in sessions {
+        out.sample(
+            &f::TORRENT_SESSION_OPEN,
+            &[("route", session.route.as_str())],
+            u8::from(session.open),
+        );
+    }
+    for session in sessions {
+        out.sample(
+            &f::TORRENT_SESSION_LISTENING,
+            &[("route", session.route.as_str())],
+            u8::from(session.listen_port.is_some()),
+        );
+    }
+    for session in sessions {
+        if let Some(port) = session.listen_port {
+            out.sample(
+                &f::TORRENT_SESSION_LISTEN_PORT,
+                &[("route", session.route.as_str())],
+                port,
+            );
+        }
+    }
+    for session in sessions {
+        out.sample(
+            &f::TORRENT_SESSION_EXTERNAL_ADDRESSES,
+            &[("route", session.route.as_str())],
+            session.external_addresses,
+        );
+    }
+    for session in sessions {
+        out.sample(
+            &f::TORRENT_SESSION_UPTIME,
+            &[("route", session.route.as_str())],
+            session.uptime_seconds,
+        );
+    }
+    for (family, payload, protocol) in [
+        (
+            &f::TORRENT_SESSION_RECEIVED_BYTES,
+            (|s: &SessionSeries| s.received_payload_bytes) as fn(&SessionSeries) -> u64,
+            (|s: &SessionSeries| s.received_protocol_bytes) as fn(&SessionSeries) -> u64,
+        ),
+        (
+            &f::TORRENT_SESSION_SENT_BYTES,
+            |s: &SessionSeries| s.sent_payload_bytes,
+            |s: &SessionSeries| s.sent_protocol_bytes,
+        ),
+    ] {
+        for session in sessions {
+            let route = session.route.as_str();
+            out.sample(
+                family,
+                &[("route", route), ("kind", "payload")],
+                payload(session),
+            );
+            out.sample(
+                family,
+                &[("route", route), ("kind", "protocol")],
+                protocol(session),
+            );
+        }
+    }
+    for session in sessions {
+        let route = session.route.as_str();
+        out.sample(
+            &f::TORRENT_SESSION_BLOCKED,
+            &[("route", route), ("direction", "incoming")],
+            session.blocked_incoming,
+        );
+        out.sample(
+            &f::TORRENT_SESSION_BLOCKED,
+            &[("route", route), ("direction", "outgoing")],
+            session.blocked_outgoing,
+        );
+    }
+    for session in sessions {
+        for (state, count) in &session.peers {
+            out.sample(
+                &f::TORRENT_SESSION_PEERS,
+                &[("route", session.route.as_str()), ("state", state)],
+                *count,
+            );
+        }
+    }
+    for session in sessions {
+        for (transport, family, [attempts, _, _]) in &session.connects {
+            out.sample(
+                &f::TORRENT_SESSION_CONNECT_ATTEMPTS,
+                &[
+                    ("route", session.route.as_str()),
+                    ("transport", transport),
+                    ("family", family),
+                ],
+                *attempts,
+            );
+        }
+    }
+    for session in sessions {
+        for (transport, family, [_, successes, errors]) in &session.connects {
+            for (result, count) in [("succeeded", successes), ("failed", errors)] {
+                out.sample(
+                    &f::TORRENT_SESSION_CONNECT_RESULTS,
+                    &[
+                        ("route", session.route.as_str()),
+                        ("transport", transport),
+                        ("family", family),
+                        ("result", result),
+                    ],
+                    *count,
+                );
+            }
+        }
+    }
+    for session in sessions {
+        if let Some((v4, v6, _)) = session.dht {
+            let route = session.route.as_str();
+            out.sample(
+                &f::TORRENT_DHT_NODES,
+                &[("route", route), ("family", "v4")],
+                v4,
+            );
+            out.sample(
+                &f::TORRENT_DHT_NODES,
+                &[("route", route), ("family", "v6")],
+                v6,
+            );
+        }
+    }
+    for session in sessions {
+        if let Some((_, _, outstanding)) = session.dht {
+            out.sample(
+                &f::TORRENT_DHT_OUTSTANDING,
+                &[("route", session.route.as_str())],
+                outstanding,
+            );
+        }
     }
 }

@@ -40,7 +40,7 @@ pub(super) use render::PrometheusRenderInput;
 #[cfg(test)]
 pub(super) use render::{
     OBSERVED_LIMITERS, job_status_label, render_post_processing, render_prometheus_metrics,
-    render_prometheus_metrics_input,
+    render_prometheus_metrics_input, render_torrents,
 };
 
 // Reasons the extraction guardrails refuse an archive entry, in the order
@@ -163,6 +163,8 @@ pub(crate) struct PrometheusMetricsExporter {
     // The configured schedule rules; absent when the exporter is built
     // without a schedule evaluator.
     schedules: Option<weaver_server_core::bandwidth::schedule::SharedSchedules>,
+    // The torrent service; absent when the server runs none.
+    torrents: Option<weaver_server_core::torrents::service::TorrentService>,
     build: BuildInfo,
 }
 
@@ -187,6 +189,7 @@ impl PrometheusMetricsExporter {
             config,
             buffers,
             schedules: None,
+            torrents: None,
             build,
         }
     }
@@ -196,6 +199,14 @@ impl PrometheusMetricsExporter {
         schedules: weaver_server_core::bandwidth::schedule::SharedSchedules,
     ) -> Self {
         self.schedules = Some(schedules);
+        self
+    }
+
+    pub(crate) fn with_torrents(
+        mut self,
+        torrents: Option<weaver_server_core::torrents::service::TorrentService>,
+    ) -> Self {
+        self.torrents = torrents;
         self
     }
 
@@ -251,6 +262,8 @@ impl PrometheusMetricsExporter {
         });
         let tunnel = weaver_server_core::proxies::network_metrics::tunnel::snapshot();
         let speed_tests = weaver_server_core::speed_test::speed_test_metrics_snapshot();
+        // What the torrent service last published, and its event counters.
+        let torrents = self.torrents.as_ref().map(|torrents| torrents.metrics());
         // The samplers' last readings: a scrape never stats a filesystem, so a
         // slow mount cannot hold it.
         let disk_space = disk_space.snapshots();
@@ -289,6 +302,7 @@ impl PrometheusMetricsExporter {
         input.network = network.as_ref();
         input.tunnel = Some(&tunnel);
         input.speed_tests = Some(&speed_tests);
+        input.torrents = torrents.as_ref();
         input.build = self.build;
         input.start_time_seconds = process_start_epoch_seconds();
         input.per_job_series = per_job_series;

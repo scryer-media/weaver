@@ -1453,6 +1453,153 @@ fn sample_speed_tests() -> weaver_server_core::speed_test::SpeedTestMetricsSnaps
     metrics
 }
 
+// Two torrents on one route: a seeding one with every figure, two trackers
+// and a seeding policy, and a magnet still fetching its metadata; one open
+// session with a DHT and one held route.
+fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMetrics {
+    use weaver_server_core::torrents::metrics::{
+        FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
+        TorrentMetrics, TorrentSeries, TrackerSeries,
+    };
+    use weaver_server_core::torrents::service::TorrentPieces;
+    use weaver_server_core::torrents::{FetchPhase, TorrentState, TrackerStatus};
+
+    let seeding = TorrentSeries {
+        job_id: JobId(7),
+        category: "linux".into(),
+        route: "00aa11bb22cc33dd".into(),
+        state: TorrentState::Seeding,
+        have_bytes: 4096,
+        total_bytes: 8192,
+        wanted_bytes: 4096,
+        pieces: Some(TorrentPieces {
+            count: 8,
+            size: 1024,
+            have: 4,
+        }),
+        downloaded_bytes: 5000,
+        uploaded_bytes: 12_500,
+        hash_failed_bytes: 1024,
+        redundant_bytes: 16,
+        active_seconds: 900,
+        seeding_seconds: 600,
+        download_bps: 0,
+        upload_bps: 2048,
+        ratio: 2.5,
+        peers_established: 6,
+        peers_connecting: 2,
+        peer_seeders: 1,
+        leg: Some(("torrent:category:3".into(), 1)),
+        fetch: None,
+        seeding: SeedingSeries {
+            goals: vec![
+                (SeedingGoal::Ratio, 3.0, 0.5),
+                (SeedingGoal::SeedTime, 3600.0, 3000.0),
+            ],
+            met: false,
+        },
+        trackers: vec![
+            TrackerSeries {
+                host: "tracker.example".into(),
+                status: TrackerStatus::Working,
+                last_announce_ms: Some(1_700_000_000_000),
+                next_announce_ms: Some(1_700_001_800_500),
+                interval_seconds: Some(1800),
+                seeders: Some(40),
+                leechers: Some(3),
+                completed: Some(912),
+                fails: 0,
+            },
+            TrackerSeries {
+                host: "backup.example".into(),
+                status: TrackerStatus::Unreachable,
+                last_announce_ms: None,
+                next_announce_ms: None,
+                interval_seconds: None,
+                seeders: None,
+                leechers: None,
+                completed: None,
+                fails: 4,
+            },
+        ],
+    };
+    let magnet = TorrentSeries {
+        job_id: JobId(8),
+        category: String::new(),
+        route: "00aa11bb22cc33dd".into(),
+        state: TorrentState::FetchingMetadata,
+        have_bytes: 0,
+        total_bytes: 0,
+        wanted_bytes: 0,
+        pieces: None,
+        downloaded_bytes: 0,
+        uploaded_bytes: 0,
+        hash_failed_bytes: 0,
+        redundant_bytes: 0,
+        active_seconds: 12,
+        seeding_seconds: 0,
+        download_bps: 0,
+        upload_bps: 0,
+        ratio: 0.0,
+        peers_established: 0,
+        peers_connecting: 3,
+        peer_seeders: 0,
+        leg: None,
+        fetch: Some(FetchPhase::Discovery),
+        seeding: SeedingSeries::default(),
+        trackers: Vec::new(),
+    };
+    let open = SessionSeries {
+        route: "00aa11bb22cc33dd".into(),
+        open: true,
+        listen_port: Some(6881),
+        external_addresses: 1,
+        uptime_seconds: 1200,
+        received_payload_bytes: 5000,
+        received_protocol_bytes: 700,
+        sent_payload_bytes: 12_500,
+        sent_protocol_bytes: 900,
+        blocked_incoming: 2,
+        blocked_outgoing: 5,
+        peers: vec![
+            ("established", 6),
+            ("connecting", 5),
+            ("queued", 9),
+            ("dead", 4),
+            ("not_needed", 1),
+        ],
+        connects: vec![
+            ("tcp", "v4", [30, 20, 9]),
+            ("tcp", "v6", [0, 0, 0]),
+            ("utp", "v4", [12, 7, 5]),
+            ("utp", "v6", [0, 0, 0]),
+        ],
+        dht: Some((150, 20, 6)),
+    };
+    let held = SessionSeries {
+        route: "ff00ee11dd22cc33".into(),
+        ..SessionSeries::default()
+    };
+    TorrentMetrics {
+        published: Arc::new(Published {
+            torrents: vec![seeding, magnet],
+            sessions: vec![open, held],
+        }),
+        events: vec![
+            (TorrentEvent::Added, 5),
+            (TorrentEvent::Completed, 3),
+            (TorrentEvent::Removed, 1),
+            (TorrentEvent::Failed, 0),
+        ],
+        fetches: vec![
+            (FetchOutcome::Resolved, 2),
+            (FetchOutcome::Failed, 1),
+            (FetchOutcome::NoSession, 0),
+            (FetchOutcome::Cancelled, 1),
+        ],
+    }
+}
+
 fn fully_populated_render() -> String {
     let snapshot = populated_metrics_snapshot();
     let block = manual_pause_block();
@@ -1468,6 +1615,7 @@ fn fully_populated_render() -> String {
     let network = sample_network();
     let tunnel = sample_tunnel();
     let speed_tests = sample_speed_tests();
+    let torrents = sample_torrent_metrics();
     let collection = CollectionFixtures::new();
 
     let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
@@ -1484,6 +1632,7 @@ fn fully_populated_render() -> String {
     input.network = Some(&network);
     input.tunnel = Some(&tunnel);
     input.speed_tests = Some(&speed_tests);
+    input.torrents = Some(&torrents);
     input.runtime_generation = 3;
     input.start_time_seconds = 1_700_000_000.0;
     collection.apply(&mut input);

@@ -511,6 +511,115 @@ metric_families! {
     NETWORK_LEG_REVOCATIONS = ("weaver_network_leg_revocations_total", Counter, [],
         "Route stages revoked, closing the connections that ran over them.");
 
+    // ---- torrents ----------------------------------------------------------------
+    // Each torrent's series carry its category (empty when it has none) and the
+    // route its session runs on, or would (empty before it has one). Every
+    // per-torrent and per-tracker series is absent once the torrent is gone.
+    TORRENT_STATE = ("weaver_torrent_state", Gauge, ["job_id", "category", "route", "state"],
+        "State of each torrent; exactly one state is 1.");
+    TORRENT_HAVE_BYTES = ("weaver_torrent_have_bytes", Gauge, ["job_id", "category", "route"],
+        "Bytes of the torrent's files in hand.");
+    TORRENT_TOTAL_BYTES = ("weaver_torrent_total_bytes", Gauge, ["job_id", "category", "route"],
+        "Bytes of every file in the torrent; 0 while a magnet has no metadata.");
+    TORRENT_WANTED_BYTES = ("weaver_torrent_wanted_bytes", Gauge, ["job_id", "category", "route"],
+        "Bytes of the files the torrent fetches; files set to skip are not counted.");
+    TORRENT_PIECES = ("weaver_torrent_pieces", Gauge, ["job_id", "category", "route"],
+        "Pieces in the torrent; absent while a magnet has no metadata.");
+    TORRENT_PIECES_HAVE = ("weaver_torrent_pieces_have", Gauge, ["job_id", "category", "route"],
+        "Pieces the torrent holds and has checked; absent while a magnet has no metadata.");
+    TORRENT_DOWNLOADED_BYTES = ("weaver_torrent_downloaded_bytes_total", Counter,
+        ["job_id", "category", "route"], "Payload bytes the torrent received from peers over its life.");
+    TORRENT_UPLOADED_BYTES = ("weaver_torrent_uploaded_bytes_total", Counter,
+        ["job_id", "category", "route"], "Payload bytes the torrent sent to peers over its life.");
+    TORRENT_WASTED_BYTES = ("weaver_torrent_wasted_bytes_total", Counter,
+        ["job_id", "category", "route", "reason"],
+        "Bytes the torrent received and threw away since this process took it up, by reason: pieces that failed their hash check, or blocks already in hand.");
+    TORRENT_ACTIVE_SECONDS = ("weaver_torrent_active_seconds_total", Counter,
+        ["job_id", "category", "route"], "Time the torrent has run, downloading or seeding, over its life.");
+    TORRENT_SEEDING_SECONDS = ("weaver_torrent_seeding_seconds_total", Counter,
+        ["job_id", "category", "route"], "Time the torrent has run complete, seeding, over its life.");
+    TORRENT_DOWNLOAD_RATE = ("weaver_torrent_download_bytes_per_second", Gauge,
+        ["job_id", "category", "route"], "Payload bytes per second the torrent receives.");
+    TORRENT_UPLOAD_RATE = ("weaver_torrent_upload_bytes_per_second", Gauge,
+        ["job_id", "category", "route"], "Payload bytes per second the torrent sends.");
+    TORRENT_RATIO = ("weaver_torrent_ratio", Gauge, ["job_id", "category", "route"],
+        "Bytes uploaded over bytes downloaded, or over the torrent's size while it downloaded under a hundredth of it; the ratio seeding goals are measured by.");
+    TORRENT_PEERS = ("weaver_torrent_peers", Gauge, ["job_id", "category", "route", "state"],
+        "Peers of the torrent, connected or connecting.");
+    TORRENT_PEER_SEEDERS = ("weaver_torrent_peer_seeders", Gauge, ["job_id", "category", "route"],
+        "Connected peers that hold the whole torrent.");
+    TORRENT_ROUTE_LEG = ("weaver_torrent_route_leg", Gauge,
+        ["job_id", "category", "route", "consumer", "position"],
+        "The route leg the torrent's session runs on; always 1, absent while it runs on none. Join on consumer and position to the weaver_network_leg series.");
+    TORRENT_METADATA_FETCH_PHASE = ("weaver_torrent_metadata_fetch_phase", Gauge,
+        ["job_id", "category", "route", "phase"],
+        "Phase of a magnet's metadata fetch; exactly one phase is 1, absent while no fetch runs.");
+    TORRENT_SEEDING_GOAL = ("weaver_torrent_seeding_goal", Gauge,
+        ["job_id", "category", "route", "goal"],
+        "Each goal the seeding policy in force sets, a ratio or seconds; absent for a goal it does not set.");
+    TORRENT_SEEDING_GOAL_REMAINING = ("weaver_torrent_seeding_goal_remaining", Gauge,
+        ["job_id", "category", "route", "goal"],
+        "What is left of each seeding goal, in the goal's unit; 0 once it is reached.");
+    TORRENT_SEEDING_GOALS_MET = ("weaver_torrent_seeding_goals_met", Gauge,
+        ["job_id", "category", "route"],
+        "Whether the seeding policy in force counts the torrent's goals met, any or all as it says; 0 while it sets none.");
+    TORRENT_TRACKER_STATUS = ("weaver_torrent_tracker_status", Gauge,
+        ["job_id", "category", "route", "tracker", "status"],
+        "Status of announcing to each tracker host of a torrent; exactly one status is 1. A host listed twice is the first listing.");
+    TORRENT_TRACKER_LAST_ANNOUNCE = ("weaver_torrent_tracker_last_announce_timestamp_seconds", Gauge,
+        ["job_id", "category", "route", "tracker"],
+        "When the torrent last announced to the tracker, as a unix timestamp; absent until it has.");
+    TORRENT_TRACKER_NEXT_ANNOUNCE = ("weaver_torrent_tracker_next_announce_timestamp_seconds", Gauge,
+        ["job_id", "category", "route", "tracker"],
+        "When the torrent next announces to the tracker, as a unix timestamp; absent while none is planned.");
+    TORRENT_TRACKER_INTERVAL = ("weaver_torrent_tracker_announce_interval_seconds", Gauge,
+        ["job_id", "category", "route", "tracker"],
+        "Announce interval the tracker's last accepted answer asked for; absent until one is accepted.");
+    TORRENT_TRACKER_SWARM_PEERS = ("weaver_torrent_tracker_swarm_peers", Gauge,
+        ["job_id", "category", "route", "tracker", "role"],
+        "Seeders and leechers in the swarm as the tracker's last answer counted them; absent when it gave no count.");
+    TORRENT_TRACKER_SWARM_COMPLETED = ("weaver_torrent_tracker_swarm_completed", Gauge,
+        ["job_id", "category", "route", "tracker"],
+        "Completed downloads of the torrent as the tracker's last answer counted them; absent when it gave no count.");
+    TORRENT_TRACKER_FAILURES = ("weaver_torrent_tracker_consecutive_failures", Gauge,
+        ["job_id", "category", "route", "tracker"],
+        "Announces to the tracker that failed in a row since it last answered.");
+    TORRENT_SESSION_OPEN = ("weaver_torrent_session_open", Gauge, ["route"],
+        "Whether the torrent session of each route that has one runs; 0 while the route is held.");
+    TORRENT_SESSION_LISTENING = ("weaver_torrent_session_listening", Gauge, ["route"],
+        "Whether the session has a listener bound for incoming peers.");
+    TORRENT_SESSION_LISTEN_PORT = ("weaver_torrent_session_listen_port", Gauge, ["route"],
+        "Port the session listens for peers on; absent while it has no listener.");
+    TORRENT_SESSION_EXTERNAL_ADDRESSES = ("weaver_torrent_session_external_addresses", Gauge,
+        ["route"], "Addresses, one per family, the session has settled on as its own as the internet sees it.");
+    TORRENT_SESSION_UPTIME = ("weaver_torrent_session_uptime_seconds", Gauge, ["route"],
+        "Time the session has been open.");
+    TORRENT_SESSION_RECEIVED_BYTES = ("weaver_torrent_session_received_bytes_total", Counter,
+        ["route", "kind"],
+        "Bytes the session received from peers since it opened, by kind: piece payload or protocol.");
+    TORRENT_SESSION_SENT_BYTES = ("weaver_torrent_session_sent_bytes_total", Counter,
+        ["route", "kind"],
+        "Bytes the session sent to peers since it opened, by kind: piece payload or protocol.");
+    TORRENT_SESSION_BLOCKED = ("weaver_torrent_session_blocked_connections_total", Counter,
+        ["route", "direction"],
+        "Peer connections the session's address filter refused since it opened, by direction.");
+    TORRENT_SESSION_PEERS = ("weaver_torrent_session_peers", Gauge, ["route", "state"],
+        "Peers of every torrent on the session, by state.");
+    TORRENT_SESSION_CONNECT_ATTEMPTS = ("weaver_torrent_session_connect_attempts_total", Counter,
+        ["route", "transport", "family"],
+        "Outgoing peer connections the session attempted since it opened, by transport and address family.");
+    TORRENT_SESSION_CONNECT_RESULTS = ("weaver_torrent_session_connect_results_total", Counter,
+        ["route", "transport", "family", "result"],
+        "Outgoing peer connections that ended their attempt since the session opened, by transport, address family and result.");
+    TORRENT_DHT_NODES = ("weaver_torrent_dht_nodes", Gauge, ["route", "family"],
+        "Nodes in the session's DHT routing tables, by address family; absent while it runs no DHT.");
+    TORRENT_DHT_OUTSTANDING = ("weaver_torrent_dht_outstanding_requests", Gauge, ["route"],
+        "DHT requests the session sent that wait for an answer; absent while it runs no DHT.");
+    TORRENT_LIFECYCLE = ("weaver_torrent_lifecycle_events_total", Counter, ["event"],
+        "Torrents added, completed, removed or failed since this process started. Every event is emitted, so the series pre-exist at zero.");
+    TORRENT_METADATA_FETCHES = ("weaver_torrent_metadata_fetches_total", Counter, ["outcome"],
+        "Magnet metadata fetches that ended since this process started, by outcome. Every outcome is emitted, so the series pre-exist at zero.");
+
     // ---- speed tests -------------------------------------------------------
     SPEED_TEST_RUNS = ("weaver_speed_test_runs_total", Counter, ["kind", "status"],
         "Speed tests that finished, by kind and final status. Every combination is emitted, so the series pre-exist at zero.");

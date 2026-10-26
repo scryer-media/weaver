@@ -467,7 +467,8 @@ pub(crate) async fn run(
         shared_config.clone(),
         buffers,
     )
-    .with_schedules(shared_schedules);
+    .with_schedules(shared_schedules)
+    .with_torrents(torrents.clone());
 
     let mut pipeline_task = tokio::spawn(async move {
         pipeline.run().await;
