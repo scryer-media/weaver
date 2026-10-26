@@ -14,18 +14,8 @@ pub struct OrphanActiveStateCounts {
     pub active_file_progress: usize,
     pub active_files: usize,
     pub active_file_identities: usize,
-    pub active_par2: usize,
-    pub active_par2_files: usize,
     pub active_extracted: usize,
-    pub active_failed_extractions: usize,
-    pub active_extraction_chunks: usize,
-    pub active_archive_headers: usize,
-    pub active_rar_volume_facts: usize,
     pub active_detected_archives: usize,
-    pub active_volume_status: usize,
-    pub active_rar_verified_suspect: usize,
-    pub active_direct_coverage: usize,
-    pub active_repair_outputs: usize,
     // Every graph checkpoint table together.
     pub graph_checkpoint: usize,
 }
@@ -35,40 +25,20 @@ impl OrphanActiveStateCounts {
         self.active_file_progress
             + self.active_files
             + self.active_file_identities
-            + self.active_par2
-            + self.active_par2_files
             + self.active_extracted
-            + self.active_failed_extractions
-            + self.active_extraction_chunks
-            + self.active_archive_headers
-            + self.active_rar_volume_facts
             + self.active_detected_archives
-            + self.active_volume_status
-            + self.active_rar_verified_suspect
-            + self.active_direct_coverage
-            + self.active_repair_outputs
             + self.graph_checkpoint
     }
 }
 
 const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 23] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 13] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
-    "active_par2",
-    "active_par2_files",
     "active_extracted",
-    "active_failed_extractions",
-    "active_extraction_chunks",
-    "active_archive_headers",
-    "active_rar_volume_facts",
     "active_detected_archives",
-    "active_volume_status",
-    "active_rar_verified_suspect",
-    "active_direct_coverage",
-    "active_repair_outputs",
     "graph_nodes",
     "graph_members",
     "graph_coverage",
@@ -276,15 +246,6 @@ async fn archive_job_sql(
                     ],
                 )
                 .await?;
-                // History keeps the engine the job ran on. A job with no
-                // active row left keeps the engine its history row has.
-                tx.execute(
-                    "UPDATE job_history
-                        SET engine = COALESCE((SELECT engine FROM active_jobs WHERE job_id = {}), engine)
-                      WHERE job_id = {}",
-                    &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(job_id.0 as i64)],
-                )
-                .await?;
                 replace_job_history_attributes_tx(tx, row).await?;
                 crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
                     tx,
@@ -365,46 +326,10 @@ impl Database {
                                 "active_file_identities",
                             )
                             .await?,
-                            active_par2: delete_orphan_rows(tx, "active_par2").await?,
-                            active_par2_files: delete_orphan_rows(tx, "active_par2_files").await?,
                             active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
-                            active_failed_extractions: delete_orphan_rows(
-                                tx,
-                                "active_failed_extractions",
-                            )
-                            .await?,
-                            active_extraction_chunks: delete_orphan_rows(
-                                tx,
-                                "active_extraction_chunks",
-                            )
-                            .await?,
-                            active_archive_headers: delete_orphan_rows(
-                                tx,
-                                "active_archive_headers",
-                            )
-                            .await?,
-                            active_rar_volume_facts: delete_orphan_rows(
-                                tx,
-                                "active_rar_volume_facts",
-                            )
-                            .await?,
                             active_detected_archives: delete_orphan_rows(
                                 tx,
                                 "active_detected_archives",
-                            )
-                            .await?,
-                            active_volume_status: delete_orphan_rows(tx, "active_volume_status")
-                                .await?,
-                            active_rar_verified_suspect: delete_orphan_rows(
-                                tx,
-                                "active_rar_verified_suspect",
-                            )
-                            .await?,
-                            active_repair_outputs: delete_orphan_rows(tx, "active_repair_outputs")
-                                .await?,
-                            active_direct_coverage: delete_orphan_rows(
-                                tx,
-                                "active_direct_coverage",
                             )
                             .await?,
                             graph_checkpoint: {

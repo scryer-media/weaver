@@ -22,7 +22,7 @@ const RESTART_AFTER_FIRST: usize = 96;
 // pieces, which only a name could order, go where the refused set went
 // and the job fails with nothing delivered.
 #[tokio::test]
-async fn a_hex_named_solid_7z_set_restarted_after_its_first_piece_fails_under_graph() {
+async fn a_hex_named_solid_7z_set_restarted_after_its_first_piece_fails() {
     cell_case(
         Cell {
             container: Container::SevenZipSolid,

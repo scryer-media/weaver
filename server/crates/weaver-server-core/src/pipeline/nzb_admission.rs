@@ -275,39 +275,12 @@ impl Pipeline {
                 .pending_released_download_results_by_job
                 .get(&id)
                 .is_some_and(|count| *count > 0)
-            || self.jobs.get(&id).is_some_and(|job| job.health_probing)
             || self
                 .graph_jobs
                 .get(&id)
                 .is_some_and(|job| job.awaits_mail())
-            || self
-                .direct_barrier_flights
-                .keys()
-                .any(|(job, _)| *job == id)
-            || self
-                .direct_placement_lanes
-                .keys()
-                .any(|(job, _)| *job == id)
-            || self
-                .direct_rearm_in_flight
-                .iter()
-                .any(|(job, _)| *job == id)
-            || self.direct_post_repair_in_flight.contains_key(&id)
-            || self.direct_tolerated_in_flight.contains_key(&id)
-            || self.direct_demotion_in_flight.contains_key(&id)
-            || self.par2_analysis_in_flight.contains_key(&id)
-            || self.job_has_active_extraction_tasks(id)
             || self.inflight_terminal_post_processing.contains(&id)
             || self.added_script_holds.contains(&id)
             || self.inflight_moves.contains(&id)
-            || self.direct_unpack.has_job_work_in_flight(id)
-            || self
-                .par3_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.has_worker_in_flight(id))
-            || self
-                .rar_refresh_state
-                .iter()
-                .any(|((job, _), state)| *job == id && state.in_flight.is_some())
     }
 }

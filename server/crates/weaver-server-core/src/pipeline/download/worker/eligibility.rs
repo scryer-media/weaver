@@ -26,24 +26,18 @@ impl Pipeline {
         job_id: JobId,
     ) -> bool {
         let uu_capped = !self.uu_files.is_empty() && self.uu_spool_dispatch_capped();
-        let direct_admission = self.direct_store_admission(job_id);
-        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
         let checkpoint = self.checkpoint_admission(job_id);
         self.jobs.get(&job_id).is_some_and(|state| {
             if !Self::status_allows_download_dispatch(&state.status) {
                 return false;
             }
-            // A retained-byte cap is local to its set, so raw queue occupancy
+            // The checkpoint holds articles one by one, so raw queue occupancy
             // would overstate what this job can hand out right now.
-            if !direct_admission.is_empty() || sweep_held.is_some() || checkpoint.enforced {
+            if checkpoint.enforced {
                 return state
                     .download_queue
                     .peek_first_matching(|work| {
-                        direct_admission.iter().all(|set| set.allows(work))
-                            && checkpoint.decision(work, &[]).allows()
-                            && sweep_held.as_deref().is_none_or(|held| {
-                                !held.contains(&work.segment_id.file_id.file_index)
-                            })
+                        checkpoint.decision(work, &[]).allows()
                             && (!uu_capped
                                 || self
                                     .uu_files
@@ -111,24 +105,18 @@ impl Pipeline {
         if self.nntp.pool().server_count() == 0 {
             return Some("no_server");
         }
-        let direct_admission = self.direct_store_admission(job_id);
         let checkpoint = self.checkpoint_admission(job_id);
-        if direct_admission.is_empty() && !checkpoint.enforced {
+        if !checkpoint.enforced {
             return None;
         }
-        let mut reason = None;
-        let open = state.download_queue.peek_first_matching(|work| {
-            if !direct_admission.iter().all(|set| set.allows(work)) {
-                reason.get_or_insert("direct_store");
-                false
-            } else if !checkpoint.decision(work, &[]).allows() {
-                reason.get_or_insert("checkpoint");
-                false
-            } else {
-                true
-            }
-        });
-        if open.is_some() { None } else { reason }
+        let open = state
+            .download_queue
+            .peek_first_matching(|work| checkpoint.decision(work, &[]).allows());
+        if open.is_some() {
+            None
+        } else {
+            Some("checkpoint")
+        }
     }
 
     // A hold lands or lifts, and a job gains or loses its lanes, with no job

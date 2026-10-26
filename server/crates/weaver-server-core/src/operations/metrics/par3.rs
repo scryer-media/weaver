@@ -542,19 +542,6 @@ impl Par3Metrics {
         std::array::from_fn(|index| self.admission_refused[index].load(Ordering::Relaxed))
     }
 
-    // Publish the engine's categorised ledger. Called once per work-unit
-    // handback: two relaxed stores per category and nothing else.
-    pub fn store_ledger(
-        &self,
-        current: [u64; PAR3_MEMORY_CATEGORIES],
-        peak: [u64; PAR3_MEMORY_CATEGORIES],
-    ) {
-        for index in 0..PAR3_MEMORY_CATEGORIES {
-            self.ledger_bytes[index].store(current[index], Ordering::Relaxed);
-            self.ledger_peak_bytes[index].store(peak[index], Ordering::Relaxed);
-        }
-    }
-
     pub fn ledger_bytes(&self) -> [u64; PAR3_MEMORY_CATEGORIES] {
         std::array::from_fn(|index| self.ledger_bytes[index].load(Ordering::Relaxed))
     }
@@ -563,51 +550,16 @@ impl Par3Metrics {
         std::array::from_fn(|index| self.ledger_peak_bytes[index].load(Ordering::Relaxed))
     }
 
-    // Fold one handback's refused admissions in, by cause.
-    pub fn note_engine_refusals(&self, deltas: [u64; Par3EngineRefusal::COUNT]) {
-        for cause in Par3EngineRefusal::ALL {
-            let delta = deltas[cause.index()];
-            if delta != 0 {
-                self.engine_refusals[cause.index()].fetch_add(delta, Ordering::Relaxed);
-            }
-        }
-    }
-
     pub fn engine_refusals(&self) -> [u64; Par3EngineRefusal::COUNT] {
         std::array::from_fn(|index| self.engine_refusals[index].load(Ordering::Relaxed))
-    }
-
-    // Fold one handback's narrowed admissions in, by the width that gave.
-    pub fn note_engine_narrowed(&self, deltas: [u64; Par3EngineNarrowing::COUNT]) {
-        for width in Par3EngineNarrowing::ALL {
-            let delta = deltas[width.index()];
-            if delta != 0 {
-                self.engine_narrowed[width.index()].fetch_add(delta, Ordering::Relaxed);
-            }
-        }
     }
 
     pub fn engine_narrowed(&self) -> [u64; Par3EngineNarrowing::COUNT] {
         std::array::from_fn(|index| self.engine_narrowed[index].load(Ordering::Relaxed))
     }
 
-    pub fn note_outcome(&self, class: Par3OutcomeClass) {
-        self.outcomes[class.index()].fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn outcomes(&self) -> [u64; Par3OutcomeClass::COUNT] {
         std::array::from_fn(|index| self.outcomes[index].load(Ordering::Relaxed))
-    }
-
-    // Fold one engine stage delta in. Called once per work-unit handback,
-    // never inside the engine's own loops.
-    pub fn note_stage_delta(&self, stage: Par3Stage, calls: u64, millis: u64) {
-        if calls != 0 {
-            self.stage_calls[stage.index()].fetch_add(calls, Ordering::Relaxed);
-        }
-        if millis != 0 {
-            self.stage_ms[stage.index()].fetch_add(millis, Ordering::Relaxed);
-        }
     }
 
     pub fn stage_calls(&self) -> [u64; Par3Stage::COUNT] {

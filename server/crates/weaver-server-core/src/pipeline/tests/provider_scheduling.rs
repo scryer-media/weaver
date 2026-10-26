@@ -138,7 +138,6 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
             pipeline.shared_state.queue.read(|inner| inner.jobs.len()),
             124
         );
-        assert!(pipeline.jobs.keys().all(|id| pipeline.is_graph_job(*id)));
         pipeline.shared_state.queue.read(|inner| {
             assert_eq!(inner.globals.nntp_generation, pipeline.pool_generation);
             for row in &inner.jobs {

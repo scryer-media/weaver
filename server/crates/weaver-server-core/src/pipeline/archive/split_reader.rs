@@ -32,20 +32,6 @@ impl SplitFileReader {
         Self::open_parts(paths, None)
     }
 
-    // Concatenate validated logical prefixes while retaining the source files.
-    pub(crate) fn open_with_lengths(
-        paths: &[impl AsRef<Path>],
-        lengths: &[u64],
-    ) -> io::Result<Self> {
-        if paths.len() != lengths.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "part length count mismatch",
-            ));
-        }
-        Self::open_parts(paths, Some(lengths))
-    }
-
     fn open_parts(paths: &[impl AsRef<Path>], lengths: Option<&[u64]>) -> io::Result<Self> {
         if paths.is_empty() {
             return Err(io::Error::new(

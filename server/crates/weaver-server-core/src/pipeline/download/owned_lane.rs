@@ -11,26 +11,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
-// How long a lane-side probe waits for a worker to pick its request up.
-//
-// An idle worker picks up immediately. This only bounds the case where the
-// worker took a lease between the idle marker being read and the request
-// arriving: rather than sit behind a whole lease, the probe gives up on that
-// worker and tries the next one, or the async client. It bounds the pickup
-// alone, never the answer: once a lane has taken the batch its STAT and HEAD
-// round trips take as long as the wire takes, and a far provider must not be
-// mistaken for a busy one.
-const LANE_PROBE_PICKUP_TIMEOUT: Duration = Duration::from_millis(250);
-
-// How long a probe waits for a *busy* lane to take it up.
-//
-// A busy worker looks at its commands once per ring response, and at the
-// dry point it sits on the actor's refill answer for up to the idle hold, so
-// the pickup is bounded by one article's transfer plus that hold. The wait
-// pays off: the alternative is a cold dial for a permit the busy lanes are
-// holding, which never completes while they are.
-const LANE_PROBE_BUSY_PICKUP_TIMEOUT: Duration = Duration::from_secs(3);
-
 pub(crate) struct OwnedDownloadLanePool {
     shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
     #[cfg(test)]
@@ -48,14 +28,6 @@ pub(crate) struct OwnedDownloadLanePool {
 // already happened. It is taken at lease boundaries only — never per article.
 struct OwnedLanePoolShared {
     workers: Vec<OwnedLaneWorkerSlot>,
-    // Jobs whose probe batch asked every lane and got no pickup.
-    //
-    // Read by the dispatch eligibility walk, which withholds the job's next
-    // handout while it is in here, so the next lane to come free finds no
-    // work waiting for it and takes the probe instead. No lane is reserved
-    // and no count changes: the job simply stops being offered the one
-    // handout its own probe is waiting behind.
-    probe_starved_jobs: std::collections::HashSet<u64>,
     // Runs that arrived while every worker was busy. Whichever worker
     // finishes first drains this before it publishes itself idle, so a lease
     // never sits behind one busy worker's private channel.
@@ -69,12 +41,6 @@ struct OwnedLaneWorkerSlot {
     // the same worker, and a worker that is already spoken for is not offered
     // a second lease.
     idle: Option<IdleOwnedLaneWorker>,
-    // The server a running worker's connection belongs to, published once
-    // its lease has a connection and cleared when it is back at the lease
-    // boundary. It is how a probe reaches a server none of the idle lanes
-    // is holding: the worker answers on its own socket once its ring has
-    // drained, which costs the probe one drain and the lease nothing.
-    busy_server: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -124,334 +90,6 @@ impl IdleOwnedLane {
     }
 }
 
-// Cloneable view of the owned-lane pool that the health probe uses to ask an
-// idle lane a STAT batch on the connection it is already holding.
-//
-// Owned lanes hold their server's connection permits for as long as they are
-// cached, which is the point: a lane that keeps its socket starts its next
-// lease with no dial at all. The cost used to fall on the probe, which had to
-// prise a permit loose and open its own connection — four and a half round
-// trips of TCP, TLS, greeting and authentication before its first STAT. Now
-// it borrows the lane's connection for the length of one batch instead.
-#[derive(Clone)]
-pub(crate) struct OwnedLaneProbeHandle {
-    shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
-    // The job whose release this probe is sampling. A starved batch asks
-    // dispatch to hold *this* job back, because it is the job holding every
-    // lane the batch could have used.
-    job_id: u64,
-}
-
-impl OwnedLaneProbeHandle {
-    // Existence for a batch of message-ids, answered on idle owned lanes.
-    //
-    // Returns `None` when no owned lane could answer at all, which is the
-    // caller's signal to fall back to the async client. Otherwise the result
-    // has the same shape as the client's own probe, and `servers_settled`
-    // names the servers whose lanes answered conclusively, so the caller can
-    // tell which servers a miss has already been put to.
-    //
-    // Production callers select one eligible provider and pass only the
-    // articles that may reach it. The unfiltered variant is a test seam for
-    // the owned-socket transport; provider policy lives in the shared client.
-    async fn probe_server(
-        &self,
-        message_ids: &[String],
-        server: Option<usize>,
-        guard: Option<ProbeGuard>,
-        pool: Option<Arc<weaver_nntp::pool::NntpPool>>,
-    ) -> Option<LaneProbeOutcome> {
-        if message_ids.is_empty() {
-            return Some(LaneProbeOutcome {
-                result: weaver_nntp::client::ProbeBatchResult {
-                    exists: Vec::new(),
-                    inconclusive: false,
-                },
-                servers_settled: Vec::new(),
-            });
-        }
-
-        // One lane per server: a second lane on a server already being asked
-        // can say nothing the first will not. Idle lanes answer on the spot,
-        // so they are preferred; a server only busy lanes are holding is
-        // asked through one of them, which answers once its ring drains.
-        let mut candidates: Vec<(usize, std_mpsc::Sender<OwnedLanePoolCommand>, Duration)> =
-            Vec::new();
-        for (server_idx, sender) in self.idle_workers() {
-            let Some(server_idx) = server_idx else {
-                continue;
-            };
-            if candidates
-                .iter()
-                .any(|(server, _, _)| *server == server_idx)
-            {
-                continue;
-            }
-            candidates.push((server_idx, sender, LANE_PROBE_PICKUP_TIMEOUT));
-        }
-        for (server_idx, sender) in self.busy_workers() {
-            if candidates
-                .iter()
-                .any(|(server, _, _)| *server == server_idx)
-            {
-                continue;
-            }
-            candidates.push((server_idx, sender, LANE_PROBE_BUSY_PICKUP_TIMEOUT));
-        }
-        candidates.retain(|(idx, _, _)| server.is_none_or(|server| server == *idx));
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let request: Arc<[String]> = Arc::from(message_ids.to_vec());
-        if let Some(outcome) = self
-            .ask_lanes(
-                &candidates,
-                &request,
-                message_ids.len(),
-                guard.clone(),
-                pool.clone(),
-            )
-            .await
-        {
-            return Some(outcome);
-        }
-
-        // Nobody picked the batch up. The job whose release this probe is
-        // sampling is the job holding the lanes, so the only way the batch
-        // gets one is for that job to stop being handed the next article.
-        // Dispatch withholds it while this guard stands, which means the next
-        // lane to come free finds nothing queued for it and takes the probe.
-        // Bounded by the same pickup timeout, and released whatever happens.
-        let _yield = self.hold_dispatch_for_starved_probe();
-        self.ask_lanes(&candidates, &request, message_ids.len(), guard, pool)
-            .await
-    }
-
-    // Put one batch to every candidate lane at once and fold their answers.
-    //
-    // `None` when not one of them answered, which is what separates "no lane
-    // would take it" from "the lanes took it and it was inconclusive".
-    async fn ask_lanes(
-        &self,
-        candidates: &[(usize, std_mpsc::Sender<OwnedLanePoolCommand>, Duration)],
-        request: &Arc<[String]>,
-        batch_len: usize,
-        guard: Option<ProbeGuard>,
-        pool: Option<Arc<weaver_nntp::pool::NntpPool>>,
-    ) -> Option<LaneProbeOutcome> {
-        // A `JoinSet` rather than detached tasks: dropping it aborts whatever
-        // is still outstanding, which is what tells a worker that has not
-        // picked the request up to leave it alone — the same contract the
-        // dropped pickup receiver carries.
-        let mut asking = tokio::task::JoinSet::new();
-        for (server, sender, pickup) in candidates {
-            let batch = Arc::clone(request);
-            let sender = sender.clone();
-            let (server, pickup) = (*server, *pickup);
-            let guard = guard.clone();
-            let expected_socket = ProbeSocket {
-                server,
-                pool: pool.clone(),
-            };
-            asking.spawn(async move {
-                (
-                    server,
-                    Self::ask_lane(sender, expected_socket, batch, pickup, guard).await,
-                )
-            });
-        }
-
-        let mut exists = vec![false; batch_len];
-        let mut servers_settled: Vec<usize> = Vec::new();
-        let mut answered = false;
-        let mut inconclusive = false;
-        while let Some(joined) = asking.join_next().await {
-            let Ok((server, Some(answer))) = joined else {
-                continue;
-            };
-            answered = true;
-            if answer.inconclusive {
-                inconclusive = true;
-                debug!(
-                    server,
-                    batch_len, "owned lane probe: server left the batch unverified"
-                );
-                continue;
-            }
-            servers_settled.push(server);
-            for (slot, found) in answer.exists.iter().enumerate() {
-                if *found && let Some(known) = exists.get_mut(slot) {
-                    *known = true;
-                }
-            }
-        }
-
-        answered.then_some(LaneProbeOutcome {
-            result: weaver_nntp::client::ProbeBatchResult {
-                exists,
-                inconclusive,
-            },
-            servers_settled,
-        })
-    }
-
-    // Ask dispatch to withhold this job's next handout until the guard drops.
-    pub(in crate::pipeline) fn hold_dispatch_for_starved_probe(&self) -> StarvedProbeYield {
-        lock_pool(&self.shared)
-            .probe_starved_jobs
-            .insert(self.job_id);
-        debug!(
-            job_id = self.job_id,
-            "owned lane probe: no lane picked the batch up; holding this job's next handout"
-        );
-        StarvedProbeYield {
-            shared: Arc::clone(&self.shared),
-            job_id: self.job_id,
-        }
-    }
-
-    // Puts one batch to one lane and waits for its verdict.
-    //
-    // `None` covers every way a lane can decline to answer — a worker that
-    // has gone away, one that did not pick the request up inside
-    // `pickup` because it took a lease or is still reading a ring, and one
-    // that dropped the request — none of which is a verdict about the
-    // articles. The timeout bounds the pickup alone: once a lane has taken
-    // the batch, its STAT and HEAD round trips take as long as the wire
-    // takes, and a busy lane's drain comes before them.
-    async fn ask_lane(
-        sender: std_mpsc::Sender<OwnedLanePoolCommand>,
-        expected_socket: ProbeSocket,
-        message_ids: Arc<[String]>,
-        pickup: Duration,
-        guard: Option<ProbeGuard>,
-    ) -> Option<weaver_nntp::client::ProbeBatchResult> {
-        let (picked_up_tx, picked_up_rx) = oneshot::channel();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        sender
-            .send(OwnedLanePoolCommand::Probe {
-                expected_socket,
-                message_ids,
-                guard,
-                picked_up: picked_up_tx,
-                reply: reply_tx,
-            })
-            .ok()?;
-        if !matches!(tokio::time::timeout(pickup, picked_up_rx).await, Ok(Ok(()))) {
-            return None;
-        }
-        reply_rx.await.ok().flatten()
-    }
-
-    // Every worker that is mid-lease on a connection it has published the
-    // server of. One that is still dialling has nothing to answer on yet.
-    fn busy_workers(&self) -> Vec<(usize, std_mpsc::Sender<OwnedLanePoolCommand>)> {
-        let shared = lock_pool(&self.shared);
-        shared
-            .workers
-            .iter()
-            .filter(|worker| worker.idle.is_none())
-            .filter_map(|worker| Some((worker.busy_server?, worker.sender.clone())))
-            .collect()
-    }
-
-    // Every worker that is currently idle, with the server index of the
-    // connection it kept — `None` when it sits idle without one.
-    fn idle_workers(&self) -> Vec<(Option<usize>, std_mpsc::Sender<OwnedLanePoolCommand>)> {
-        let shared = lock_pool(&self.shared);
-        shared
-            .workers
-            .iter()
-            .filter_map(|worker| {
-                let idle = worker.idle.as_ref()?;
-                Some((
-                    idle.lane.as_ref().map(|lane| lane.server.0),
-                    worker.sender.clone(),
-                ))
-            })
-            .collect()
-    }
-
-    // Existence for a batch, preferring idle owned lanes and falling back to
-    // the async client for whatever they could not settle.
-    //
-    // The fallback is deliberately narrow: it runs only when no lane answered
-    // at all, when a lane could not settle its batch, or when some usable
-    // server has no idle lane and could still hold an article the settled
-    // servers do not — and then it asks only those servers. The ones whose
-    // lanes have answered are left out, because their connection permits are
-    // exactly what those idle lanes are holding: queueing behind them would
-    // wait out the client's whole acquire deadline for a verdict already in
-    // hand. A miss that every usable server has been asked about is final,
-    // and costs no connection.
-    pub(crate) async fn confirm_exists_for_probe(
-        &self,
-        nntp: &weaver_nntp::NntpClient,
-        message_ids: &[String],
-        exclude: &[usize],
-        state: &crate::jobs::handle::SharedPipelineState,
-        generation: u64,
-    ) -> weaver_nntp::client::ProbeBatchResult {
-        let guard_state = state.clone();
-        let job_id = JobId(self.job_id);
-        let nntp =
-            nntp.with_work_guard(move |_| job_work_is_current(&guard_state, job_id, generation));
-        let borrowed: Vec<_> = message_ids.iter().map(String::as_str).collect();
-        let pool = nntp.pool();
-        nntp.confirm_exists_for_probe_using(&borrowed, exclude, |server, batch, guard| async move {
-            if !job_work_is_current(state, JobId(self.job_id), generation) {
-                return Some(weaver_nntp::client::ProbeBatchResult {
-                    exists: vec![false; batch.len()],
-                    inconclusive: true,
-                });
-            }
-            let outcome = self
-                .probe_server(&batch, Some(server), Some(guard), Some(Arc::clone(pool)))
-                .await?;
-            (outcome.result.inconclusive || outcome.servers_settled.contains(&server))
-                .then_some(outcome.result)
-        })
-        .await
-        .unwrap_or_else(|| weaver_nntp::client::ProbeBatchResult {
-            exists: vec![false; message_ids.len()],
-            inconclusive: true,
-        })
-    }
-
-    #[cfg(test)]
-    async fn probe(&self, message_ids: &[String]) -> Option<LaneProbeOutcome> {
-        self.probe_server(message_ids, None, None, None).await
-    }
-}
-
-// The withheld handout, for as long as a starved probe batch needs it.
-//
-// A guard rather than a pair of calls so the hold cannot outlive the batch:
-// every way out of the retry — an answer, a second timeout, a dropped future
-// — releases it.
-pub(in crate::pipeline) struct StarvedProbeYield {
-    shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
-    job_id: u64,
-}
-
-impl Drop for StarvedProbeYield {
-    fn drop(&mut self) {
-        lock_pool(&self.shared)
-            .probe_starved_jobs
-            .remove(&self.job_id);
-    }
-}
-
-// What the idle owned lanes could say about one probe batch.
-struct LaneProbeOutcome {
-    result: weaver_nntp::client::ProbeBatchResult,
-    // Server indexes whose lanes answered conclusively, so the caller knows
-    // which providers a miss has actually been put to and need not be asked
-    // again.
-    servers_settled: Vec<usize>,
-}
-
 struct OwnedLaneRun {
     nntp: Arc<weaver_nntp::NntpClient>,
     state: crate::jobs::handle::SharedPipelineState,
@@ -459,25 +97,6 @@ struct OwnedLaneRun {
     refill_tx: mpsc::Sender<DownloadLaneRefillRequest>,
     parked_tx: mpsc::Sender<DownloadLaneParked>,
     initial_lease: DownloadBatchLease,
-}
-
-type ProbeGuard = Arc<dyn Fn() -> bool + Send + Sync>;
-
-struct ProbeSocket {
-    server: usize,
-    // Production probes bind to the configuration that selected the server.
-    // Transport-only tests may omit the pool identity.
-    pool: Option<Arc<weaver_nntp::pool::NntpPool>>,
-}
-
-impl ProbeSocket {
-    fn matches(&self, server: usize, nntp: &weaver_nntp::NntpClient) -> bool {
-        self.server == server
-            && self
-                .pool
-                .as_ref()
-                .is_none_or(|pool| Arc::ptr_eq(pool, nntp.pool()))
-    }
 }
 
 enum OwnedLanePoolCommand {
@@ -498,33 +117,6 @@ enum OwnedLanePoolCommand {
     // A warm lane is an idle lane: it is not counted as an active download
     // connection anywhere, and if no lease ever comes it parks with the rest.
     Warm(Box<OwnedLaneWarm>),
-    // Answer an existence probe on this worker's cached connection. The reply
-    // is `None` when the worker has no cached lane to answer with.
-    Probe {
-        expected_socket: ProbeSocket,
-        message_ids: Arc<[String]>,
-        guard: Option<ProbeGuard>,
-        // Signalled the moment the worker takes the request up. A caller
-        // that has stopped listening by then has moved on, and the request
-        // is dropped rather than answered into the void.
-        picked_up: oneshot::Sender<()>,
-        reply: oneshot::Sender<Option<weaver_nntp::client::ProbeBatchResult>>,
-    },
-}
-
-// A probe a worker has taken up mid-lease: the ids to look for, and the
-// channel its verdict is owed on once the lane's ring has drained.
-type PendingProbe = (
-    Arc<[String]>,
-    Option<ProbeGuard>,
-    oneshot::Sender<Option<weaver_nntp::client::ProbeBatchResult>>,
-);
-
-fn obsolete_probe(batch_len: usize) -> weaver_nntp::client::ProbeBatchResult {
-    weaver_nntp::client::ProbeBatchResult {
-        exists: vec![false; batch_len],
-        inconclusive: true,
-    }
 }
 
 struct CachedOwnedLane {
@@ -592,11 +184,6 @@ impl OwnedLanePoolShared {
         index: usize,
         lane: Option<IdleOwnedLane>,
     ) -> Option<Box<OwnedLaneRun>> {
-        if let Some(worker) = self.workers.get_mut(index) {
-            // Back at the boundary: whatever connection the last run used is
-            // no longer "the one this worker is busy on".
-            worker.busy_server = None;
-        }
         if let Some(run) = self.queued_runs.pop_front() {
             return Some(run);
         }
@@ -604,13 +191,6 @@ impl OwnedLanePoolShared {
             worker.idle = Some(IdleOwnedLaneWorker { lane });
         }
         None
-    }
-
-    // Publish the server a running worker's connection belongs to.
-    fn note_busy_server(&mut self, index: usize, server: Option<usize>) {
-        if let Some(worker) = self.workers.get_mut(index) {
-            worker.busy_server = server;
-        }
     }
 
     // Update what an already-idle worker is holding. A worker that has been
@@ -650,7 +230,6 @@ impl OwnedDownloadLanePool {
             shared: Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
                 workers: Vec::new(),
                 queued_runs: VecDeque::new(),
-                probe_starved_jobs: std::collections::HashSet::new(),
             })),
             #[cfg(test)]
             reset_calls: AtomicUsize::new(0),
@@ -665,26 +244,11 @@ impl OwnedDownloadLanePool {
         while shared.workers.len() < worker_count {
             let index = shared.workers.len();
             let sender = spawn_owned_lane_worker(index, Arc::clone(&self.shared));
-            shared.workers.push(OwnedLaneWorkerSlot {
-                sender,
-                idle: None,
-                busy_server: None,
-            });
+            shared
+                .workers
+                .push(OwnedLaneWorkerSlot { sender, idle: None });
         }
         shared.workers.truncate(worker_count);
-    }
-
-    pub(crate) fn probe_handle(&self, job_id: u64) -> OwnedLaneProbeHandle {
-        OwnedLaneProbeHandle {
-            shared: Arc::clone(&self.shared),
-            job_id,
-        }
-    }
-
-    // Whether this job's probe is waiting for a lane none of them would give
-    // it. Read by the dispatch eligibility walk.
-    pub(crate) fn probe_is_starved_by(&self, job_id: u64) -> bool {
-        lock_pool(&self.shared).probe_starved_jobs.contains(&job_id)
     }
 
     // The servers of the connections idle workers are keeping, one entry
@@ -766,8 +330,7 @@ impl OwnedDownloadLanePool {
                 OwnedLanePoolCommand::Run(run) => run.initial_lease,
                 OwnedLanePoolCommand::Reset
                 | OwnedLanePoolCommand::RecallSocket(_)
-                | OwnedLanePoolCommand::Warm(_)
-                | OwnedLanePoolCommand::Probe { .. } => {
+                | OwnedLanePoolCommand::Warm(_) => {
                     unreachable!("only a Run command is sent from submit")
                 }
             })
@@ -827,10 +390,6 @@ fn run_owned_lane_worker(
     shared: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
 ) {
     let mut cached_lane: Option<CachedOwnedLane> = None;
-    // Commands that reached the worker mid-lease and were not a probe. They
-    // are answered here, at the boundary, in the order they arrived and ahead
-    // of anything newer on the channel.
-    let mut backlog: VecDeque<OwnedLanePoolCommand> = VecDeque::new();
     'work: loop {
         // Drain the pool's queue before going to sleep, and publish this
         // worker as idle only when there is nothing left to take.
@@ -839,16 +398,7 @@ fn run_owned_lane_worker(
             cached_lane.as_ref().map(IdleOwnedLane::from_cached),
         );
         if let Some(run) = queued {
-            let link = WorkerLink {
-                index,
-                shared,
-                commands: &rx,
-            };
-            backlog.extend(run_owned_blocking_download_lane(
-                &mut cached_lane,
-                *run,
-                Some(link),
-            ));
+            run_owned_blocking_download_lane(&mut cached_lane, *run);
             continue;
         }
 
@@ -866,35 +416,22 @@ fn run_owned_lane_worker(
                     }
                 }));
             }
-            let command = match backlog.pop_front() {
-                Some(command) => command,
-                None => match rx.recv_timeout(CACHED_LANE_LIVENESS_INTERVAL) {
-                    Ok(command) => command,
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                        // A server that times out an idle connection leaves
-                        // the socket half-closed on this side, and the worker
-                        // would keep the pool permit for it until a lease was
-                        // routed here. Give the permit back as soon as that
-                        // is noticed.
-                        if discard_closed_cached_lane(&mut cached_lane) {
-                            lock_pool(shared).note_idle_lane(index, None);
-                        }
-                        continue;
+            let command = match rx.recv_timeout(CACHED_LANE_LIVENESS_INTERVAL) {
+                Ok(command) => command,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    // A server that times out an idle connection leaves the
+                    // socket half-closed on this side, and the worker would
+                    // keep the pool permit for it until a lease was routed
+                    // here. Give the permit back as soon as that is noticed.
+                    if discard_closed_cached_lane(&mut cached_lane) {
+                        lock_pool(shared).note_idle_lane(index, None);
                     }
-                    Err(std_mpsc::RecvTimeoutError::Disconnected) => break 'work,
-                },
+                    continue;
+                }
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break 'work,
             };
             if let Some(run) = answer_idle_command(index, shared, &mut cached_lane, command) {
-                let link = WorkerLink {
-                    index,
-                    shared,
-                    commands: &rx,
-                };
-                backlog.extend(run_owned_blocking_download_lane(
-                    &mut cached_lane,
-                    *run,
-                    Some(link),
-                ));
+                run_owned_blocking_download_lane(&mut cached_lane, *run);
                 continue 'work;
             }
         }
@@ -935,59 +472,8 @@ fn answer_idle_command(
             lock_pool(shared)
                 .note_idle_lane(index, cached_lane.as_ref().map(IdleOwnedLane::from_cached));
         }
-        OwnedLanePoolCommand::Probe {
-            expected_socket,
-            message_ids,
-            guard,
-            picked_up,
-            reply,
-        } => {
-            if picked_up.send(()).is_err() {
-                // The caller gave up waiting for pickup while this worker was
-                // on a lease; nobody wants the answer now.
-                return None;
-            }
-            if cached_lane.as_ref().is_none_or(|cached| {
-                !expected_socket.matches(cached.lane.server_id().0, &cached.nntp)
-            }) {
-                let _ = reply.send(None);
-                return None;
-            }
-            if guard.as_ref().is_some_and(|guard| !guard()) {
-                let _ = reply.send(Some(obsolete_probe(message_ids.len())));
-                return None;
-            }
-            // The lane keeps its cached connection and its idle marker across
-            // a probe: a borrow of the socket, not a lease.
-            discard_closed_cached_lane(cached_lane);
-            if let Some(cached) = cached_lane.as_ref() {
-                cached.lane.mark_active();
-            }
-            let answer = cached_lane
-                .as_mut()
-                .map(|cached: &mut CachedOwnedLane| cached.lane.probe_exists(&message_ids));
-            // A probe that faulted the connection must not leave a dead lane
-            // cached for the next lease to inherit.
-            if cached_lane
-                .as_ref()
-                .is_some_and(|cached| !cached.lane.is_healthy())
-            {
-                lock_pool(shared).note_idle_lane(index, None);
-                park_cached_lane(cached_lane);
-            }
-            let _ = reply.send(answer);
-        }
     }
     None
-}
-
-// How a run reaches back to the worker it is running on: the slot to
-// publish its connection's server on, and the command channel it polls
-// between ring responses so a probe can reach a busy lane.
-struct WorkerLink<'a> {
-    index: usize,
-    shared: &'a Arc<std::sync::Mutex<OwnedLanePoolShared>>,
-    commands: &'a std_mpsc::Receiver<OwnedLanePoolCommand>,
 }
 
 impl CachedOwnedLane {
@@ -1367,17 +853,9 @@ fn lease_is_current(
 }
 
 // Run one lease to its park on this worker's connection.
-//
-// Returns the commands that reached the worker mid-lease and belong to the
-// lease boundary instead: the worker answers them before it goes idle.
 #[allow(clippy::too_many_lines)]
-fn run_owned_blocking_download_lane(
-    cached_lane: &mut Option<CachedOwnedLane>,
-    run: OwnedLaneRun,
-    link: Option<WorkerLink<'_>>,
-) -> Vec<OwnedLanePoolCommand> {
+fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, run: OwnedLaneRun) {
     let fetch_started = Instant::now();
-    let mut deferred: Vec<OwnedLanePoolCommand> = Vec::new();
     let OwnedLaneRun {
         nntp,
         state,
@@ -1390,7 +868,7 @@ fn run_owned_blocking_download_lane(
 
     if !lease_is_current(&state, &nntp, &lease) {
         let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::LeaseObsolete { lease });
-        return deferred;
+        return;
     }
 
     if cached_lane
@@ -1441,14 +919,14 @@ fn run_owned_blocking_download_lane(
                     "download.fetch_body.owned",
                     fetch_started.elapsed(),
                 );
-                return deferred;
+                return;
             }
         }
     }
 
     if !lease_is_current(&state, &nntp, &lease) {
         let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::LeaseObsolete { lease });
-        return deferred;
+        return;
     }
 
     let lane = &mut cached_lane
@@ -1456,9 +934,6 @@ fn run_owned_blocking_download_lane(
         .expect("owned lane cache populated before run")
         .lane;
     let server_idx = lane.server_id().0;
-    if let Some(link) = link.as_ref() {
-        lock_pool(link.shared).note_busy_server(link.index, Some(server_idx));
-    }
     let supports_pipelining = lane.supports_pipelining();
     let recovery_probe = lane.is_recovery_probe();
 
@@ -1497,66 +972,16 @@ fn run_owned_blocking_download_lane(
         .is_err()
         {
             park_cached_lane(cached_lane);
-            return deferred;
+            return;
         }
     }
     let mut inflight: VecDeque<(DownloadWork, Arc<LaneLeaseContext>)> = VecDeque::new();
-    // Probes taken up mid-lease, answered together once the ring is dry.
-    let mut probes: VecDeque<PendingProbe> = VecDeque::new();
     let mut pending_refill: Option<oneshot::Receiver<DownloadLaneRefillResponse>> = None;
     let mut refill_denied = false;
     let mut stop: Option<LaneStop> = None;
     let mut stats_mark = lane.stats();
 
     let (park_reason, keep_cached_lane) = loop {
-        // Commands that reached this worker mid-lease. A probe is taken up
-        // here and answered below once the ring has drained; everything else
-        // belongs to the lease boundary and waits there.
-        if let Some(link) = link.as_ref() {
-            while let Ok(command) = link.commands.try_recv() {
-                match command {
-                    OwnedLanePoolCommand::Probe {
-                        expected_socket,
-                        message_ids,
-                        guard,
-                        picked_up,
-                        reply,
-                    } => {
-                        if picked_up.send(()).is_ok() {
-                            if !expected_socket.matches(server_idx, &nntp) {
-                                let _ = reply.send(None);
-                            } else if guard.as_ref().is_some_and(|guard| !guard()) {
-                                let _ = reply.send(Some(obsolete_probe(message_ids.len())));
-                            } else {
-                                probes.push_back((message_ids, guard, reply));
-                            }
-                        }
-                    }
-                    other => deferred.push(other),
-                }
-            }
-        }
-        // With a probe waiting, nothing new is issued and the ring drains at
-        // its own pace: at most one pipe of responses, one round trip plus
-        // their transfer. Then the socket is exactly where a STAT expects it,
-        // the batch runs on it, and issuing resumes. No dial, no permit.
-        if !probes.is_empty() && stop.is_none() && lane.ring_outstanding() == 0 {
-            while let Some((message_ids, guard, reply)) = probes.pop_front() {
-                if guard.as_ref().is_some_and(|guard| !guard()) {
-                    let _ = reply.send(Some(obsolete_probe(message_ids.len())));
-                    continue;
-                }
-                let answer = lane.probe_exists(&message_ids);
-                let _ = reply.send(Some(answer));
-                if !lane.is_healthy() {
-                    // Anything still queued for this probe is dropped with
-                    // the lane, which tells its caller to ask elsewhere.
-                    stop = Some(LaneStop::ConnectionLost);
-                    break;
-                }
-            }
-        }
-
         // Adopt an answered refill without waiting for it. Taking it here is
         // what puts the next lease's first BODY on the wire before the current
         // lease's last response has been read.
@@ -1603,7 +1028,7 @@ fn run_owned_blocking_download_lane(
         }
 
         // Top the ring back up to the depth in force.
-        while stop.is_none() && probes.is_empty() && lane.ring_outstanding() < context.depth() {
+        while stop.is_none() && lane.ring_outstanding() < context.depth() {
             if !lane.accepts_new_work() {
                 stop = Some(LaneStop::Quarantined);
                 break;
@@ -1932,7 +1357,6 @@ fn run_owned_blocking_download_lane(
         release_connection_slot: true,
     });
     crate::runtime::perf_probe::record("download.fetch_body.owned", fetch_started.elapsed());
-    deferred
 }
 
 // Consume a prefetched refill response on a park/error path so its leased
@@ -2282,8 +1706,7 @@ fn test_lease(
 // An idle marker standing for a cached connection on `server`.
 //
 // The client is a dangling `Weak`, which is what an idle marker looks like
-// once its client has been retired: it can serve nothing, so routing skips it
-// while the probe still recognises it as a connection on that server.
+// once its client has been retired: it can serve nothing, so routing skips it.
 #[cfg(test)]
 fn test_idle_lane(server: usize) -> IdleOwnedLane {
     IdleOwnedLane {
@@ -2295,84 +1718,6 @@ fn test_idle_lane(server: usize) -> IdleOwnedLane {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Every configured server's lane holds the same batch at the same time.
-    //
-    // A missing article is only missing once every server has said so, so a
-    // probe asked one lane at a time costs the sum of the answers where the
-    // wire only requires the longest of them — and the recovery that verdict
-    // releases waits out the difference. Each fake lane here refuses to answer
-    // conclusively until the other is holding the batch too, which only a
-    // probe that asked them together can satisfy.
-    #[tokio::test]
-    async fn every_idle_lane_holds_the_batch_at_once() {
-        const LANES: usize = 2;
-        let holding = Arc::new(AtomicUsize::new(0));
-        let mut workers = Vec::new();
-        let mut lanes = Vec::new();
-        for server in 0..LANES {
-            let (sender, receiver) = std_mpsc::channel();
-            workers.push(OwnedLaneWorkerSlot {
-                sender,
-                idle: Some(IdleOwnedLaneWorker {
-                    lane: Some(test_idle_lane(server)),
-                }),
-                busy_server: None,
-            });
-            let holding = Arc::clone(&holding);
-            lanes.push(std::thread::spawn(move || {
-                let Ok(OwnedLanePoolCommand::Probe {
-                    message_ids,
-                    picked_up,
-                    reply,
-                    ..
-                }) = receiver.recv()
-                else {
-                    return;
-                };
-                let _ = picked_up.send(());
-                holding.fetch_add(1, Ordering::SeqCst);
-                // Every lane holds its probe until all of them are held, so
-                // a probe that asks in sequence never answers and the runner
-                // ends the test.
-                while holding.load(Ordering::SeqCst) != LANES {
-                    std::thread::yield_now();
-                }
-                let _ = reply.send(Some(weaver_nntp::client::ProbeBatchResult {
-                    exists: vec![false; message_ids.len()],
-                    inconclusive: false,
-                }));
-            }));
-        }
-
-        let probe = OwnedLaneProbeHandle {
-            job_id: 0,
-            shared: Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
-                workers,
-                queued_runs: VecDeque::new(),
-                probe_starved_jobs: std::collections::HashSet::new(),
-            })),
-        };
-        let outcome = probe
-            .probe(&["<withheld@silver.horizon>".to_string()])
-            .await
-            .expect("both lanes answered");
-        for lane in lanes {
-            lane.join().expect("the fake lanes finish");
-        }
-
-        assert!(
-            !outcome.result.inconclusive,
-            "each lane must have been holding the batch while the other was: \
-             asked in sequence, the first one never answers"
-        );
-        assert_eq!(
-            outcome.servers_settled.len(),
-            LANES,
-            "and both servers' verdicts count towards the answer"
-        );
-        assert_eq!(outcome.result.exists, vec![false]);
-    }
 
     // Two leases are on the ring at a lease boundary, so a response has to
     // carry its own lease's identity, not whichever lease the lane happens to
@@ -2962,11 +2307,9 @@ mod routing_tests {
                 .map(|idle| OwnedLaneWorkerSlot {
                     sender: std_mpsc::channel().0,
                     idle,
-                    busy_server: None,
                 })
                 .collect(),
             queued_runs: VecDeque::new(),
-            probe_starved_jobs: std::collections::HashSet::new(),
         }
     }
 
@@ -3326,236 +2669,6 @@ mod routing_tests {
             shared.workers[0].idle.is_none(),
             "its next lease is already on the way"
         );
-    }
-}
-
-#[cfg(test)]
-mod probe_tests {
-    use super::*;
-
-    // Waits for every worker's first idle publish before taking control of
-    // its idle state. A probe reply is a barrier without changing that state.
-    async fn quiesce(pool: &OwnedDownloadLanePool) {
-        let senders: Vec<_> = lock_pool(&pool.shared)
-            .workers
-            .iter()
-            .map(|worker| worker.sender.clone())
-            .collect();
-        for sender in senders {
-            let (picked_up, picked_up_rx) = oneshot::channel();
-            let (reply, reply_rx) = oneshot::channel();
-            assert!(
-                sender
-                    .send(OwnedLanePoolCommand::Probe {
-                        expected_socket: ProbeSocket {
-                            server: 0,
-                            pool: None
-                        },
-                        message_ids: Arc::from([]),
-                        guard: None,
-                        picked_up,
-                        reply,
-                    })
-                    .is_ok()
-            );
-            async {
-                picked_up_rx.await.expect("worker picked up startup probe");
-                assert!(
-                    reply_rx
-                        .await
-                        .expect("worker answered startup probe")
-                        .is_none()
-                );
-            }
-            .await;
-        }
-        let mut shared = lock_pool(&pool.shared);
-        for index in 0..shared.workers.len() {
-            shared.mark_busy(index);
-        }
-    }
-
-    fn set_idle(pool: &OwnedDownloadLanePool, index: usize, lane: Option<IdleOwnedLane>) {
-        lock_pool(&pool.shared).workers[index].idle = Some(IdleOwnedLaneWorker { lane });
-    }
-
-    // A worker with no cached lane answers the probe with `None` rather than
-    // with a batch of missing verdicts, so the caller knows to ask elsewhere.
-    #[tokio::test]
-    async fn a_worker_without_a_cached_lane_declines_the_probe() {
-        let pool = OwnedDownloadLanePool::new(1);
-        let handle = pool.probe_handle(0);
-        quiesce(&pool).await;
-        // Idle, but holding nothing: the state a worker is in before its
-        // first lease, and after a park that dropped the socket.
-        set_idle(&pool, 0, None);
-
-        let outcome = handle.probe(&["<probe@silver.horizon>".to_string()]).await;
-
-        assert!(
-            outcome.is_none(),
-            "a worker with no connection cannot settle anything"
-        );
-    }
-
-    // A worker that is busy but has not published its server yet is still
-    // dialling: there is no connection to answer on, so it is never asked
-    // and the probe reports that no lane could answer.
-    #[tokio::test]
-    async fn a_busy_worker_without_a_connection_is_not_asked() {
-        let pool = OwnedDownloadLanePool::new(2);
-        let handle = pool.probe_handle(0);
-        quiesce(&pool).await;
-
-        assert!(handle.idle_workers().is_empty());
-        assert!(
-            handle
-                .probe(&["<probe@silver.horizon>".to_string()])
-                .await
-                .is_none()
-        );
-    }
-
-    // A pool of hand-built slots whose command channels the test holds, so
-    // it can see exactly which workers a probe reaches.
-    fn handle_over(
-        slots: Vec<(Option<IdleOwnedLaneWorker>, Option<usize>)>,
-    ) -> (
-        OwnedLaneProbeHandle,
-        Vec<std_mpsc::Receiver<OwnedLanePoolCommand>>,
-    ) {
-        let mut receivers = Vec::new();
-        let workers = slots
-            .into_iter()
-            .map(|(idle, busy_server)| {
-                let (sender, receiver) = std_mpsc::channel();
-                receivers.push(receiver);
-                OwnedLaneWorkerSlot {
-                    sender,
-                    idle,
-                    busy_server,
-                }
-            })
-            .collect();
-        let shared = Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
-            workers,
-            queued_runs: VecDeque::new(),
-            probe_starved_jobs: std::collections::HashSet::new(),
-        }));
-        (OwnedLaneProbeHandle { shared, job_id: 0 }, receivers)
-    }
-
-    // Answer the next probe on `receiver` with `exists`, off the runtime.
-    fn answer_probe(
-        receiver: std_mpsc::Receiver<OwnedLanePoolCommand>,
-        exists: Vec<bool>,
-    ) -> tokio::task::JoinHandle<std_mpsc::Receiver<OwnedLanePoolCommand>> {
-        tokio::task::spawn_blocking(move || {
-            let command = receiver.recv().expect("probe routed to this worker");
-            let OwnedLanePoolCommand::Probe {
-                picked_up, reply, ..
-            } = command
-            else {
-                panic!("only probes reach a worker here");
-            };
-            picked_up.send(()).unwrap();
-            reply
-                .send(Some(weaver_nntp::client::ProbeBatchResult {
-                    exists,
-                    inconclusive: false,
-                }))
-                .unwrap();
-            receiver
-        })
-    }
-
-    // One lane per server, idle before busy.
-    //
-    // Under a saturated pool every worker is mid-lease, and a server only
-    // busy lanes are holding used to be unreachable: the probe went to the
-    // async client, which had no permit to dial with and timed out. A busy
-    // lane answers instead, once its ring drains. An idle lane on the same
-    // server answers on the spot and is asked in its place, and a lane that
-    // is still dialling has nothing to answer on.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_server_only_busy_lanes_hold_is_asked_through_one_of_them() {
-        let (handle, mut receivers) = handle_over(vec![
-            (
-                Some(IdleOwnedLaneWorker {
-                    lane: Some(test_idle_lane(0)),
-                }),
-                None,
-            ),
-            (None, Some(1)),
-            (None, Some(0)),
-            (None, None),
-        ]);
-        let busy_on_a_covered_server = receivers.pop().unwrap();
-        let still_dialling = receivers.pop().unwrap();
-        // The vector was popped back to front.
-        let (busy_on_a_covered_server, still_dialling) = (still_dialling, busy_on_a_covered_server);
-        let busy_answering = receivers.pop().unwrap();
-        let idle_answering = receivers.pop().unwrap();
-        let idle = answer_probe(idle_answering, vec![true]);
-        let busy = answer_probe(busy_answering, vec![false]);
-
-        let outcome = handle
-            .probe(&["<probe@silver.horizon>".to_string()])
-            .await
-            .expect("two lanes answered");
-
-        let mut settled = outcome.servers_settled.clone();
-        settled.sort_unstable();
-        assert_eq!(settled, vec![0, 1]);
-        assert_eq!(outcome.result.exists, vec![true]);
-        assert!(!outcome.result.inconclusive);
-        idle.await.unwrap();
-        busy.await.unwrap();
-        assert!(
-            matches!(
-                busy_on_a_covered_server.try_recv(),
-                Err(std_mpsc::TryRecvError::Empty)
-            ),
-            "a busy lane on a server an idle lane already covers is left alone"
-        );
-        assert!(
-            matches!(
-                still_dialling.try_recv(),
-                Err(std_mpsc::TryRecvError::Empty)
-            ),
-            "a worker without a connection yet is not asked"
-        );
-    }
-
-    // An empty batch never touches a lane and is trivially settled.
-    #[tokio::test]
-    async fn an_empty_batch_needs_no_lane() {
-        let pool = OwnedDownloadLanePool::new(1);
-        let outcome = pool
-            .probe_handle(0)
-            .probe(&[])
-            .await
-            .expect("an empty batch is always answerable");
-
-        assert!(outcome.result.exists.is_empty());
-        assert!(!outcome.result.inconclusive);
-        assert!(outcome.servers_settled.is_empty());
-    }
-
-    #[tokio::test]
-    async fn the_probe_handle_tracks_pool_resizes() {
-        let mut pool = OwnedDownloadLanePool::new(1);
-        let handle = pool.probe_handle(0);
-        pool.resize(4);
-        quiesce(&pool).await;
-        set_idle(&pool, 3, Some(test_idle_lane(0)));
-
-        assert_eq!(handle.idle_workers().len(), 1);
-
-        pool.resize(2);
-        assert_eq!(lock_pool(&handle.shared).workers.len(), 2);
-        quiesce(&pool).await;
-        assert!(handle.idle_workers().is_empty());
     }
 }
 

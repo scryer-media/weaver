@@ -17,7 +17,6 @@ impl Pipeline {
         }
         self.pipeline_failure_stages.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
-        self.posted_name_disagreement_logged.remove(&job_id);
         self.retire_stalled_download_lanes(job_id);
         self.job_scheduling_memory.remove(&job_id);
         self.repeated_articles.remove(&job_id);
@@ -32,10 +31,6 @@ impl Pipeline {
         self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_extraction_runtime(job_id);
-        self.extraction_budgets.remove(&job_id);
-        self.unacceptable_extension_policies.remove(&job_id);
         self.inflight_moves.remove(&job_id);
         self.deferred_moves.remove(&job_id);
         self.deferred_post_processing.remove(&job_id);
@@ -46,7 +41,6 @@ impl Pipeline {
         self.active_completion_critical_connections_by_job
             .remove(&job_id);
         self.job_last_download_activity.remove(&job_id);
-        self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
         self.clear_job_phase_progress_runtime(job_id);

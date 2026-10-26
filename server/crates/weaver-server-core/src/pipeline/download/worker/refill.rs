@@ -351,14 +351,8 @@ impl Pipeline {
         }
         let mut returned = 0;
         for work in works {
-            let Some(work) = self.requeue_graph_work(work) else {
-                returned += 1;
-                continue;
-            };
-            if let Some(state) = self.jobs.get_mut(&job_id) {
-                state.download_queue.push(work);
-                returned += 1;
-            }
+            self.enqueue_download_work(work);
+            returned += 1;
         }
         if returned > 0 {
             self.update_queue_metrics();
@@ -387,7 +381,12 @@ impl Pipeline {
             completion_critical,
             effective_exclude_servers: self.effective_exclude_servers(job_id, &[]),
             dial_exclude_servers,
-            checkpoint_plan: self.par2_checkpoint_plan(job_id),
+            checkpoint_plan: self
+                .graph_jobs
+                .get(&job_id)
+                .map_or(weaver_yenc::CheckpointPlan::None, |graph| {
+                    weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan
+                }),
             pressure_clear: pressure.state == DownloadPressureState::Clear,
             works: reserved,
         })

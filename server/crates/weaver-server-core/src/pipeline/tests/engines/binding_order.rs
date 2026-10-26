@@ -7,8 +7,6 @@
 // repair count, the bytes delivered or what is fetched. At the root each
 // row serves the posts whole, one after another, in two orders; two deep,
 // inside `level.rar` in `lantern.7z`, the order is the order of the entries.
-// Classic repairs nothing inside an archive, so the rows two deep run under
-// graph alone.
 
 use std::collections::BTreeSet;
 
@@ -20,7 +18,6 @@ use super::rar::posts as rar_posts;
 use super::rar_rev::{body as rev_body, rar5_revs};
 use super::restart::{Down, Restarted, run_restarting_at};
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::single_member_store_set;
 
 fn ember() -> Vec<u8> {
@@ -124,7 +121,7 @@ async fn two_deep_in(
     let outer = two_deep(&entries);
     let ordinal = articles_inside(&outer, damaged)[0];
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).damaged(0, ordinal);
-    run(&shape(scenario), Engine::Graph).await
+    run(&shape(scenario)).await
 }
 
 // `ember.bin` with its second article damaged, served whole before its

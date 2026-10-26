@@ -11,7 +11,5 @@
 use super::*;
 
 mod depth;
-mod formats;
 mod graph;
 mod repair;
-mod tier2;

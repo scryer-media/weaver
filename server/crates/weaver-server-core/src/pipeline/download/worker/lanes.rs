@@ -116,11 +116,6 @@ impl Pipeline {
         terminal_state: SegmentTerminalState,
     ) -> bool {
         let job_id = seg_id.file_id.job_id;
-        // A segment can become a PAR2 metadata probe after an earlier ordinary
-        // attempt already exhausted it. The ledger stays idempotent below,
-        // but discovery must still learn that its newly queued probe cannot
-        // produce metadata or it will wait forever in `work_is_queued`.
-        self.mark_promoted_recovery_segment_unavailable(seg_id);
         if self.segment_already_delivered(seg_id) {
             // Delivery is a terminal state too, and it is held in the assembly
             // bitmap. A late failure result for an ordinal that already landed
@@ -138,22 +133,9 @@ impl Pipeline {
                 slot.insert(terminal_state);
             }
         }
-        // A container set whose map this article closed cannot read it now.
-        self.note_direct_article_terminal(seg_id);
         self.note_gap_support_fact(seg_id, terminal_state);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
-            // The failing-file set follows the same rule as the bytes: a lost
-            // recovery volume is not damage to the release.
-            let file_index = seg_id.file_id.file_index;
-            if state
-                .spec
-                .files
-                .get(file_index as usize)
-                .is_some_and(|file| file.role.counts_toward_health())
-            {
-                state.health_failing_files.insert(file_index);
-            }
         }
         self.skip_failed_uu_segment(seg_id);
         // This ordinal will not be asked for again, which is the last thing
@@ -173,14 +155,9 @@ impl Pipeline {
                 self.give_up_unanchored(dependent);
             }
         }
-        // A graph job's root marks the article's range damaged, and its objects
-        // rule on the loss. A classic job has no root: its first-article sample
-        // is read, then its health arithmetic, the sample first because it
-        // answers about the whole post rather than about a byte count.
-        if !self.graph_article_lost(seg_id) {
-            self.note_first_article_settled(seg_id);
-            self.check_health(job_id);
-        }
+        // The job's root marks the article's range damaged, and its objects
+        // rule on the loss.
+        self.graph_article_lost(seg_id);
         true
     }
 
@@ -209,24 +186,6 @@ impl Pipeline {
             .get(&seg_id.file_id.job_id)
             .and_then(|state| state.assembly.file(seg_id.file_id))
             .is_some_and(|file| file.anchor_end_after(seg_id.segment_number, true).is_some())
-    }
-
-    // A verified late replacement settles a previously damaged ordinal once.
-    pub(in crate::pipeline) fn clear_replaced_damage_failure(&mut self, segment_id: SegmentId) {
-        let Some(terminal_state) = self.segment_terminal_states.remove(&segment_id) else {
-            return;
-        };
-        self.forget_gap_support_fact(segment_id, terminal_state);
-        let bytes = self.health_counted_segment_bytes(segment_id);
-        let file_has_failures = self.file_terminal_failed_bytes(segment_id.file_id) > 0;
-        if let Some(state) = self.jobs.get_mut(&segment_id.file_id.job_id) {
-            state.failed_bytes = state.failed_bytes.saturating_sub(bytes);
-            if !file_has_failures {
-                state
-                    .health_failing_files
-                    .remove(&segment_id.file_id.file_index);
-            }
-        }
     }
 
     // The job's failed bytes as the terminal states alone define them.
@@ -325,62 +284,9 @@ impl Pipeline {
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = 0;
-            state.probe_projected_failed_bytes = 0;
-            state.health_failing_files.clear();
-            state.early_recovery_requested_blocks = 0;
         }
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
-    }
-
-    // Count the files this job could not assemble from articles.
-    //
-    // Called once the download pipeline has drained with data files still
-    // incomplete: that is the moment the remaining segments are known to be
-    // unavailable across every configured server rather than merely late.
-    // A file is counted **once**, with the number of segments still missing
-    // at that moment — not once per failed segment — and the per-job guard
-    // set keeps the many re-entries of the completion check from counting it
-    // again. PAR2 may still rebuild the file afterwards; that is a repair,
-    // and `weaver_repairs_total` is where it is accounted for. What this
-    // counter answers is how much of the payload Usenet itself could not
-    // supply.
-    //
-    // Per-file, per-job: a `HashMap` lookup and a `HashSet` insert here are
-    // the same class of work `check_job_completion` around it already does,
-    // and nothing on a per-segment path reaches this.
-    pub(in crate::pipeline) fn note_incomplete_files_after_download_drain(
-        &mut self,
-        job_id: JobId,
-    ) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let incomplete: Vec<(NzbFileId, u64)> = state
-            .assembly
-            .files()
-            .filter(|file| !file.is_complete())
-            // Recovery volumes are optional by design: an absent PAR2 block is
-            // not a file the job failed to assemble, it is recovery capacity
-            // that was never needed or never fetched.
-            .filter(|file| {
-                !matches!(
-                    file.role(),
-                    weaver_model::files::FileRole::Par2 {
-                        is_index: false,
-                        ..
-                    }
-                )
-            })
-            .map(|file| (file.file_id(), u64::from(file.missing_count())))
-            .collect();
-        for (file_id, missing_segments) in incomplete {
-            if self.files_counted_missing.insert(file_id) {
-                self.metrics
-                    .job_lifecycle
-                    .note_file_missing(missing_segments);
-            }
-        }
     }
 
     fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
@@ -436,12 +342,7 @@ impl Pipeline {
         lease: DownloadBatchLease,
     ) {
         for work in lease.works {
-            let Some(work) = self.requeue_graph_work(work) else {
-                continue;
-            };
-            if let Some(state) = self.jobs.get_mut(&lease.job_id) {
-                state.download_queue.push(work);
-            }
+            self.enqueue_download_work(work);
         }
         self.update_queue_metrics();
     }
@@ -1150,21 +1051,7 @@ impl Pipeline {
             self.note_download_activity(job_id);
         }
 
-        let Some(work) = self.requeue_graph_work(work) else {
-            self.update_queue_metrics();
-            self.publish_active_stage_metrics();
-            return;
-        };
-        let parks = self.requeue_parks(&work);
-        if let Some(state) = self.jobs.get_mut(&job_id)
-            && !is_terminal_status(&state.status)
-        {
-            if parks {
-                state.recovery_queue.push(work);
-            } else {
-                state.download_queue.push(work);
-            }
-        }
+        self.enqueue_download_work(work);
         self.update_queue_metrics();
         self.publish_active_stage_metrics();
     }

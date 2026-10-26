@@ -37,4 +37,3 @@ pub use submission::{
     submit_uploaded_nzb_reader, submit_uploaded_nzb_reader_with_options,
 };
 pub use xz::{XZ_DECODER_MEMORY_LIMIT_BYTES, xz_multistream_decoder};
-pub(crate) use xz::{XzFilesystemDecoderKind, xz_filesystem_decoder_kind, xz_parallel_decoder};

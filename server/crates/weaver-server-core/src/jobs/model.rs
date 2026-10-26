@@ -12,7 +12,7 @@ use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
 use crate::jobs::server_attribution::JobServerAttribution;
-use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
+use crate::pipeline::download::queue::DownloadQueue;
 use weaver_model::files::FileRole;
 
 // Why a payload file left the delivery accounting entirely.
@@ -675,57 +675,6 @@ pub fn runtime_lanes_from_status_snapshot(
     }
 }
 
-// Why a job's health failure is being held back rather than acted on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthDeferralKind {
-    // A loaded recovery set may still cover the damage.
-    Par2Recovery,
-    // A probe round is still running and may yet revise the estimate.
-    ProbeConfirmation,
-    // The first-article sample still has articles outstanding and can still
-    // rule the post dead, which is the diagnosis the failure should carry.
-    FirstArticleSample,
-}
-
-impl HealthDeferralKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Par2Recovery => "par2_recovery",
-            Self::ProbeConfirmation => "probe_confirmation",
-            Self::FirstArticleSample => "first_article_sample",
-        }
-    }
-}
-
-// A spell of deferring a job's health failure, and how long it ran for.
-//
-// The condition holds for as long as a damaged job keeps booking terminal
-// segments, so a line per deferral is a line per failed segment — on a badly
-// damaged release, hundreds of thousands of them. The spell announces itself
-// once when it starts and once when it ends, carrying the count it swallowed
-// in between.
-#[derive(Debug, Clone, Default)]
-pub struct HealthDeferral {
-    pub kind: Option<HealthDeferralKind>,
-    pub deferrals: u64,
-}
-
-// Fingerprints of the periodic checkpoint lines a job has already announced.
-//
-// The completion checkpoint is re-entered on a timer for as long as a job is
-// waiting, and a waiting job re-enters it with the same answer every time.
-// Holding the last announced content lets the announcement follow the state
-// rather than the timer: a line whose fingerprint is unchanged has nothing to
-// add and drops to the diagnostic level. They live in the job's state, so a
-// job leaving the pipeline takes them with it.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AnnouncedCheckpoints {
-    // The RAR completion checkpoint's whole payload, bar its timestamp.
-    pub rar_completion: Option<u64>,
-    // Which demoted direct-store file is holding PAR2 settlement up, and why.
-    pub demoted_materialization: Option<u64>,
-}
-
 // Internal state for a running job.
 pub struct JobState {
     pub job_id: JobId,
@@ -738,8 +687,6 @@ pub struct JobState {
     pub post_state: PostState,
     pub run_state: RunState,
     pub assembly: JobAssembly,
-    // Number of nested archive extraction passes already performed.
-    pub extraction_depth: u32,
     pub created_at: std::time::Instant,
     // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
@@ -778,66 +725,18 @@ pub struct JobState {
     // This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,
     // Bytes from segments that are permanently lost (430 / max retries
-    // exhausted). See [`JobState::probe_projected_failed_bytes`] for the
-    // estimate that is deliberately kept out of it.
+    // exhausted).
     //
     // Derived state: the sum of the *declared* sizes of the segments holding a
     // terminal state. Only the pipeline's single terminal-state transition
     // moves it, and nothing may add to it directly.
     pub failed_bytes: u64,
-    // What the last conclusive health-probe round estimated was already dead,
-    // extrapolated from its sample across the whole payload.
-    //
-    // Deliberately not folded into `failed_bytes`: it is an estimate over a
-    // sample rather than a per-segment fact, and mixing the two is what once
-    // let a job book more failed bytes than the job contained. Only the health
-    // policy reads it, and only to fail a dead release early.
-    pub probe_projected_failed_bytes: u64,
     // Total bytes of PAR2 recovery files, cached from spec at job creation.
     pub par2_bytes: u64,
-    // Whether health probes have been dispatched for this job.
-    pub health_probing: bool,
-    // The health-failure deferral currently in force, if any, and how many
-    // times it has deferred since it began.
-    pub health_deferral: HealthDeferral,
-    // What the recurring checkpoint lines last announced for this job, so a
-    // repeat with nothing new to say is not announced again.
-    pub announced_checkpoints: AnnouncedCheckpoints,
-    // Probe activation counter used to rotate sampled segments across rounds.
-    pub health_probe_round: u32,
-    // How many files had already lost a segment when the last probe round was
-    // armed.
-    //
-    // A round is armed on a state change, not on every terminal segment: the
-    // failed-byte watermark below, or a file that had not failed before. The
-    // tenth dead article in a volume nobody posted tells the policy nothing
-    // the first one did not.
-    pub health_probe_failing_files: usize,
-    // Indexes of the health-counted files this job has lost at least one
-    // segment of, kept on the booking edge alongside `failed_bytes`.
-    //
-    // The probe policy reads its file count on every terminal segment; a
-    // count derived by walking the terminal-state ledger there would be a
-    // scan of every failure per failure, quadratic on exactly the release
-    // the probe exists to abandon quickly.
-    pub health_failing_files: std::collections::HashSet<u32>,
-    // Recovery blocks early promotion has already asked the queues for.
-    //
-    // Promotion walks the parked and queued recovery work to select blocks,
-    // so it runs only when the shortfall has grown past this figure, not on
-    // every failure that leaves it unchanged.
-    pub early_recovery_requested_blocks: u32,
-    // Highest failed-byte watermark that has already been health-probed.
-    pub last_health_probe_failed_bytes: u64,
-    // Minimum failed-byte watermark required before arming another probe round.
-    pub next_health_probe_failed_bytes: u64,
     // Persisted probe facts used for pre-extraction classification.
     pub detected_archives: std::collections::HashMap<u32, DetectedArchiveIdentity>,
     // Mutable file identity used by runtime/archive logic after rename/classification.
     pub file_identities: std::collections::HashMap<u32, ActiveFileIdentity>,
-    // Segments pulled from queues while health probe runs. Restored on
-    // probe pass, dropped on probe fail.
-    pub held_segments: Vec<DownloadWork>,
     // Primary download queue (data files, PAR2 index, RAR volumes).
     pub download_queue: DownloadQueue,
     // Recovery download queue (PAR2 repair blocks, spare bandwidth).

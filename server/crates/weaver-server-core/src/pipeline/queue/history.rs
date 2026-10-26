@@ -15,7 +15,6 @@ pub(crate) async fn clear_restart_artifacts(
     // alone are never permission to remove an arbitrary directory.
     crate::post_processing::events::wait_for_job_events_stopped(&resources.db, id.0).await?;
     if tokio::fs::try_exists(working_dir).await? {
-        crate::pipeline::close_cached_write_handles_under(working_dir).await;
         if working_dir.starts_with(&resources.intermediate_dir) {
             use crate::jobs::working_dir::{
                 HistoryWorkingDir, prepare_history_working_dir, remove_job_working_dir,
@@ -64,7 +63,6 @@ pub(crate) async fn clear_restart_artifacts(
             ));
         }
         Ok(_) => {
-            crate::pipeline::close_cached_write_handles_under(&staging).await;
             tokio::fs::remove_dir_all(staging).await?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The deeper schedule families under the graph: a fifth article slot, a
-// second duplicate, and two interruptions in one schedule.
+// The deeper schedule families: a fifth article slot, a second duplicate,
+// and two interruptions in one schedule.
 //
-// A family's graph pool is its classic pool less the demoting cases, under
-// the same replay indices and the same shards. Every case is judged as the
+// Every case is judged as the
 // four-slot matrix is: the member is delivered whole unless the schedule
 // starves the recovery set, and then only if the post still holds it whole;
 // no article is asked twice but those a restart or a crash dropped.
@@ -16,10 +15,7 @@ use super::*;
 
 async fn graph_family_campaign(family: Family, format: Format, selection: Selection) {
     eprintln!("graph {family:?} {format:?} selection={selection:?}");
-    let cases = family
-        .selected(format, selection)
-        .into_iter()
-        .filter(|(_, (_, interruption))| runs_under_graph(*interruption));
+    let cases = family.selected(format, selection);
     assert_cells(&graph_fixture_cases(&graph_fixture(format, family.slots()), cases).await);
 }
 
@@ -55,8 +51,7 @@ graph_depth_smoke!(
     two_interruption_rar5_four_volume_smoke TwoInterruptions Rar5FourVolumes,
 );
 
-// One module per family and format, its shards those of the classic
-// campaign.
+// One module per family and format, sharded as the campaign is.
 macro_rules! graph_depth_campaigns {
     ($module:ident, $family:ident; $($name:ident $format:ident $decades:tt),+ $(,)?) => {
         mod $module {

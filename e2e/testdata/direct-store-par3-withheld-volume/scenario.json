@@ -14,10 +14,5 @@
   ],
   "deleteSubjectContains": [
     "archive.part2.rar"
-  ],
-  "runtimeAssertions": {
-    "healthProbe": {
-      "forbidActivated": true
-    }
-  }
+  ]
 }

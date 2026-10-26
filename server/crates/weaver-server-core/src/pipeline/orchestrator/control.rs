@@ -96,7 +96,6 @@ impl Pipeline {
             self.install_prepared_add(id, job);
             self.nzb_reprocess_pending.remove(&id);
             if reprocess && self.nzb_admitted.contains(&id) {
-                self.reload_metadata_from_disk(id).await;
                 self.check_job_completion(id).await;
             } else if reprocess {
                 self.nzb_reprocess_pending.insert(id);
@@ -189,10 +188,6 @@ impl Pipeline {
                 {
                     error!(job_id = job_id.0, %error, "failed to persist NZB pause release");
                     continue;
-                }
-                if paused {
-                    self.demand_direct_store_barriers_for_pause(Some(job_id))
-                        .await;
                 }
                 let result = if paused {
                     self.pause_job_runtime(job_id)
@@ -302,7 +297,6 @@ impl Pipeline {
             .collect();
         for id in reprocess {
             self.nzb_reprocess_pending.remove(&id);
-            self.reload_metadata_from_disk(id).await;
             self.check_job_completion(id).await;
         }
         self.nzb_reprocess_pending
@@ -373,18 +367,11 @@ impl Pipeline {
             .read(|inner| inner.globals.random_read_iops);
         if let Some(iops) = iops.filter(|iops| self.applied_random_read_iops != Some(*iops)) {
             self.applied_random_read_iops = Some(iops);
-            let previous = self.tuner.max_concurrent_extractions();
             self.tuner.set_random_read_iops(iops);
-            if self.tuner.max_concurrent_extractions() > previous {
-                self.promote_queued_extractions();
-            }
         }
         let globals = self.shared_state.queue.read(|inner| inner.globals.clone());
         if globals.paused != self.global_paused || globals.scheduled_pause != self.scheduled_pause {
             self.download_dispatch_stall = None;
-            if globals.paused {
-                self.demand_direct_store_barriers_for_pause(None).await;
-            }
             self.global_paused = globals.paused;
             self.scheduled_pause = globals.scheduled_pause;
             if globals.paused {
@@ -405,9 +392,6 @@ impl Pipeline {
             });
         }
         if globals.speed_test_paused != self.applied_speed_test_pause {
-            if globals.speed_test_paused {
-                self.demand_direct_store_barriers_for_pause(None).await;
-            }
             self.applied_speed_test_pause = globals.speed_test_paused;
             self.download_restart_durable_lead_retry_after.clear();
         }
@@ -463,18 +447,9 @@ impl Pipeline {
         }
         if paused {
             self.terminal_post_processing_executor.pause();
-            if let Some(runtime) = self.par3_runtime.as_mut() {
-                runtime.admission_paused = true;
-            }
             return;
         }
         self.terminal_post_processing_executor.resume();
-        if let Some(runtime) = self.par3_runtime.as_mut() {
-            runtime.admission_paused = false;
-            if let Err(error) = runtime.dispatch() {
-                error!(%error, "PAR3 dispatch failed on post-processing resume");
-            }
-        }
         let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
         for job_id in deferred_moves {
             if self.shared_state.queue.read(|inner| {
@@ -499,8 +474,6 @@ impl Pipeline {
                 self.fail_job(job_id, error);
             }
         }
-        self.promote_queued_repairs();
-        self.promote_queued_extractions();
         let jobs: Vec<_> = self.deferred_post_processing.drain().collect();
         for job_id in jobs {
             if self.shared_state.queue.read(|inner| {
@@ -513,14 +486,9 @@ impl Pipeline {
                 continue;
             }
             self.apply_pending_job_update(job_id);
-            let Some(state) = self.jobs.get(&job_id) else {
+            if !self.jobs.contains_key(&job_id) {
                 continue;
-            };
-            let files: Vec<_> = state.assembly.files().map(|file| file.file_id()).collect();
-            for file_id in files {
-                self.try_arm_direct_unpack_for_file(job_id, file_id);
             }
-            self.try_rar_extraction(job_id).await;
             self.schedule_job_completion_check(job_id);
         }
     }

@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The two engines timed on one representative job set, in one process, one
-// job at a time: a table of each run's time, the ratio classic/graph (above
-// 1 the graph is faster), and the counts a run's cost is read from. Nothing
-// here asserts a time; a run that stalls is listed as stalled.
+// The graph engine timed on one representative job set, in one process, one
+// job at a time: a table of each run's time and the counts a run's cost is
+// read from. Nothing here asserts a time; a run that stalls is listed as
+// stalled.
 
 use std::time::{Duration, Instant};
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, try_run};
 use super::nesting::{CHAIN, chained, noise, sevenz_of};
 use super::streams::xz;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
 use crate::pipeline::tests::rar5_fixture_bytes;
 
@@ -104,20 +103,17 @@ struct Timed {
     outcome: Option<Outcome>,
 }
 
-async fn timed(scenario: &Scenario, engine: Engine) -> Timed {
+async fn timed(scenario: &Scenario) -> Timed {
     let start = Instant::now();
-    let result = try_run(scenario, engine).await;
+    let result = try_run(scenario).await;
     let wall = start.elapsed();
     match result {
-        Ok(outcome) => {
-            let observed = outcome.graph.as_ref().map(|view| view.observed);
-            Timed {
-                took: wall - observed.unwrap_or_default(),
-                said: format!("{:?}/{}", outcome.status, outcome.files.len()),
-                requests: outcome.requests.values().sum(),
-                outcome: Some(outcome),
-            }
-        }
+        Ok(outcome) => Timed {
+            took: wall - outcome.graph.observed,
+            said: format!("{:?}/{}", outcome.status, outcome.files.len()),
+            requests: outcome.requests.values().sum(),
+            outcome: Some(outcome),
+        },
         Err(stall) => Timed {
             took: wall,
             said: format!("stalled {:?}", stall.status),
@@ -132,22 +128,16 @@ fn ms(took: Duration) -> f64 {
 }
 
 async fn row(name: &str, scenario: Scenario) {
-    let classic = timed(&scenario, Engine::Classic).await;
-    let graph = timed(&scenario, Engine::Graph).await;
+    let graph = timed(&scenario).await;
     let tally = graph
         .outcome
         .as_ref()
-        .and_then(|outcome| outcome.graph.as_ref())
-        .map(|view| view.checkpoints)
+        .map(|outcome| outcome.graph.checkpoints)
         .unwrap_or_default();
     eprintln!(
-        "PERF | {name:<14} | {:>10.1} | {:>10.1} | {:>6.2} | {:<28} | {:<28} | {:>6} | {:>6} | {:>6} | {:>9} | {:>7}",
-        ms(classic.took),
+        "PERF | {name:<14} | {:>10.1} | {:<28} | {:>6} | {:>6} | {:>9} | {:>7}",
         ms(graph.took),
-        ms(classic.took) / ms(graph.took),
-        classic.said,
         graph.said,
-        classic.requests,
         graph.requests,
         tally.checkpoints,
         tally.facts,
@@ -157,9 +147,9 @@ async fn row(name: &str, scenario: Scenario) {
 
 #[tokio::test]
 #[ignore = "timings, run on request: no assertion"]
-async fn the_engines_timed_on_the_representative_jobs() {
+async fn the_graph_engine_timed_on_the_representative_jobs() {
     eprintln!(
-        "PERF | scenario       |  classic ms |   graph ms |  c/g   | classic                      | graph                        | c reqs | g reqs | ckpts  | facts B   | rows"
+        "PERF | scenario       |   graph ms | outcome                      |   reqs | ckpts  | facts B   | rows"
     );
     row("par2_damaged", par2_damaged()).await;
     row("rar_store_20", rar_store_20()).await;

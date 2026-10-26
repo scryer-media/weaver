@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The grouping cross under the graph engine, judged by the graph matrix's
-// one rule set.
+// The grouping cross, judged by the matrix's one rule set.
 //
-// The cells are the classic cross's: a cell exists when [`rule`] says a
+// A cell exists when [`rule`] says a
 // single job can present it. What a job delivers follows from the post
 // alone. The [`Fixture`] says which volumes the archive is written as,
 // which of them go up under which names, and which members the archive
@@ -191,7 +190,7 @@ async fn run_cell_under(cell: Cell, cases: Vec<(usize, Schedule)>, only: Option<
     let (options, described) = cell.binding.drive(&fixture);
     let mut layouts: Vec<(ScheduleOptions, Vec<(usize, Schedule)>)> = Vec::new();
     for (case, schedule) in cases {
-        if !runs_under_graph(schedule.1) || !cell.presents(schedule.1) {
+        if !cell.presents(schedule.1) {
             continue;
         }
         for layout in recovery_layouts(options, schedule.1)

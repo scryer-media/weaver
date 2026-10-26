@@ -704,11 +704,6 @@ impl JobLifecycleMetrics {
         self.stage_duration[stage.index()].observe(elapsed);
     }
 
-    // Low-frequency: one per PAR2 verification pass.
-    pub fn note_verification(&self, outcome: VerificationOutcomeKind) {
-        self.verifications[outcome.index()].fetch_add(1, Ordering::Relaxed);
-    }
-
     // Low-frequency: one per PAR2 repair attempt.
     pub fn note_repair(&self, outcome: StageOutcomeKind, slices_repaired: u64) {
         self.repairs[outcome.index()].fetch_add(1, Ordering::Relaxed);
@@ -716,11 +711,6 @@ impl JobLifecycleMetrics {
             self.repair_slices_repaired_total
                 .fetch_add(slices_repaired, Ordering::Relaxed);
         }
-    }
-
-    // Low-frequency: one per archive extraction.
-    pub fn note_extraction(&self, outcome: StageOutcomeKind) {
-        self.extractions[outcome.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     // Low-frequency: one per file that could not be assembled.
@@ -902,22 +892,10 @@ impl PipelineHistograms {
         }
     }
 
-    // Hot-path safe: called from the decode worker's disk-write path with the
-    // `Duration` that path already measured for `disk_write_latency_us`.
-    pub fn observe_disk_write(&self, elapsed: Duration) {
-        self.disk_write_duration.observe(elapsed);
-    }
-
     // Hot-path safe when the caller already holds a wall-clock measurement.
     pub fn observe_decode_task(&self, elapsed: Duration) {
         self.decode_task_observed.store(1, Ordering::Relaxed);
         self.decode_task_duration.observe(elapsed);
-    }
-
-    // Low-frequency: one per extracted archive member.
-    pub fn observe_extract_member(&self, elapsed: Duration) {
-        self.extract_member_observed.store(1, Ordering::Relaxed);
-        self.extract_member_duration.observe(elapsed);
     }
 
     pub fn snapshot(&self) -> PipelineHistogramsSnapshot {

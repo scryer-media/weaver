@@ -10,25 +10,10 @@ pub const STATUS_ENTER_REPAIRING: &str = "status.enter_repairing";
 pub const STATUS_ENTER_QUEUED_REPAIR: &str = "status.enter_queued_repair";
 pub const STATUS_ENTER_QUEUED_EXTRACT: &str = "status.enter_queued_extract";
 
-// Direct-store coverage barrier step boundaries. One name per
-// step so a container crash test can budget exactly one run each and assert
-// that floors are published only after the checkpoint is durable. The sync hook
-// trips *after* a destination is synced, so it reproduces a mid-sync crash —
-// one file durable, the next not — rather than a crash before any sync.
-pub const DIRECT_STORE_BARRIER_DRAIN: &str = "direct_store.barrier.drain";
-pub const DIRECT_STORE_BARRIER_SYNC: &str = "direct_store.barrier.sync";
-pub const DIRECT_STORE_BARRIER_PERSIST: &str = "direct_store.barrier.persist";
-pub const DIRECT_STORE_BARRIER_PUBLISH: &str = "direct_store.barrier.publish";
-
 // After a recovery set's repair has ruled and before the job's delivery
-// moves anything, off the pipeline's loop: whichever engine owns that moment
-// holds here, so a held job stands still while the queue keeps moving.
+// moves anything, off the pipeline's loop, so a held job stands still while the
+// queue keeps moving.
 pub const DIRECT_STORE_POST_REPAIR_VERIFY: &str = "direct_store.post_repair_verify";
-// A segment batch's disk write on the owner thread, before any byte lands.
-pub const DISK_WRITE: &str = "download.disk_write";
-
-// A PAR2 repair on its blocking worker, before the session reads anything.
-pub const PAR2_REPAIR_RUN: &str = "repair.par2_run";
 
 struct ConfiguredFailpoint {
     name: String,
@@ -184,73 +169,4 @@ pub fn maybe_trip(name: &str) {
 
     tracing::warn!(failpoint = name, "tripping e2e failpoint");
     std::process::abort();
-}
-
-// A test holds a named point for every caller whose path lies under one
-// root, until it releases it. Keyed by root so a hold reaches only the test
-// that installed it. Compiled only into tests.
-#[cfg(test)]
-pub(crate) struct Hold {
-    name: &'static str,
-    root: std::path::PathBuf,
-    released: std::sync::Mutex<bool>,
-    wake: std::sync::Condvar,
-    arrived: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-static HOLDS: std::sync::Mutex<Vec<std::sync::Arc<Hold>>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(test)]
-impl Hold {
-    pub(crate) fn install(name: &'static str, root: &std::path::Path) -> std::sync::Arc<Self> {
-        let hold = std::sync::Arc::new(Self {
-            name,
-            root: root.to_path_buf(),
-            released: std::sync::Mutex::new(false),
-            wake: std::sync::Condvar::new(),
-            arrived: tokio::sync::Notify::new(),
-        });
-        HOLDS
-            .lock()
-            .expect("hold registry poisoned")
-            .push(std::sync::Arc::clone(&hold));
-        hold
-    }
-
-    // Resolves once a caller has reached the point and is parked there.
-    pub(crate) async fn arrived(&self) {
-        self.arrived.notified().await;
-    }
-
-    pub(crate) fn release(self: &std::sync::Arc<Self>) {
-        HOLDS
-            .lock()
-            .expect("hold registry poisoned")
-            .retain(|hold| !std::sync::Arc::ptr_eq(hold, self));
-        *self.released.lock().expect("hold poisoned") = true;
-        self.wake.notify_all();
-    }
-}
-
-// Parks the caller while a test holds `name` for a root above `path`.
-pub fn maybe_hold(name: &str, path: &std::path::Path) {
-    #[cfg(test)]
-    {
-        let hold = HOLDS
-            .lock()
-            .expect("hold registry poisoned")
-            .iter()
-            .find(|hold| hold.name == name && path.starts_with(&hold.root))
-            .cloned();
-        if let Some(hold) = hold {
-            hold.arrived.notify_one();
-            let mut released = hold.released.lock().expect("hold poisoned");
-            while !*released {
-                released = hold.wake.wait(released).expect("hold poisoned");
-            }
-        }
-    }
-    #[cfg(not(test))]
-    let _ = (name, path);
 }

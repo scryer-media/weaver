@@ -81,7 +81,7 @@ impl Family {
                 let orders: BTreeSet<Order> = orders.into_iter().step_by(2).collect();
                 assert_eq!(orders.len(), 660);
                 let cases = single_interruption_cases(5, &orders, |_| true);
-                assert_eq!(cases.len(), 69_489);
+                assert_eq!(cases.len(), 48_137);
                 cases
             }
             Self::SecondDuplicate => {
@@ -93,7 +93,7 @@ impl Family {
                     let distinct: BTreeSet<_> = received.iter().collect();
                     received.len() - distinct.len() >= 2
                 });
-                assert_eq!(cases.len(), 37_680);
+                assert_eq!(cases.len(), 26_008);
                 cases
             }
             Self::TwoInterruptions => {
@@ -101,7 +101,7 @@ impl Family {
                 orders.extend(four);
                 assert_eq!(orders.len(), 168);
                 let cases = two_interruption_cases(&orders);
-                assert_eq!(cases.len(), 70_392);
+                assert_eq!(cases.len(), 32_552);
                 cases
             }
         }
@@ -123,7 +123,6 @@ impl Family {
             .into_iter()
             .enumerate()
             .filter(|(case, (_, interruption))| match selection {
-                Selection::Case(selected) => *case == selected,
                 Selection::Shard(shard) => {
                     assert!(shard < shards);
                     case % shards == shard
@@ -133,10 +132,7 @@ impl Family {
                     Some(range) => range.contains(case),
                     None => kinds.insert(kind(*interruption)) || case % stride == stride / 2,
                 },
-                Selection::FineShard(_) => panic!("{self:?} cuts its own shards"),
-                Selection::WrongPassword | Selection::WrongPasswordPart(_) => {
-                    panic!("{self:?} carries no password schedules")
-                }
+                Selection::WrongPassword => panic!("{self:?} carries no password schedules"),
             })
             .collect()
     }
@@ -168,7 +164,6 @@ fn kind(interruption: Interruption) -> (u8, BoundaryAction, BoundaryAction, bool
     match interruption {
         Interruption::None => (0, Action::None, Action::None, false),
         Interruption::Restart(_) => (1, Action::Restart, Action::None, false),
-        Interruption::Demote(_) => (1, Action::Demote, Action::None, false),
         Interruption::Crash(_) => (1, Action::Crash, Action::None, false),
         Interruption::Loss { .. } => (2, Action::None, Action::None, false),
         Interruption::Combined { action, .. } => (3, action, Action::None, false),
@@ -230,8 +225,8 @@ fn lost(mask: u8, (file, article): (u32, u32)) -> bool {
 
 // The archive matrix's cases for any slot count and arrival orders, in its
 // order: every loss subset with the index first or last, uninterrupted and
-// restarted or demoted at every received boundary; the lossless orders
-// uninterrupted and restarted or demoted before their last arrival; a crash
+// restarted at every received boundary; the lossless orders uninterrupted
+// and restarted before their last arrival; a crash
 // wherever a restart was tried; and every lossy received sequence with
 // nothing to repair it from. Received sequences `keep` refuses are left out.
 fn single_interruption_cases(
@@ -261,17 +256,15 @@ fn single_interruption_cases(
                         .iter()
                         .filter(|&&a| !lost(mask, a))
                         .count();
-                    for action in [BoundaryAction::Restart, BoundaryAction::Demote] {
-                        cases.insert((
-                            received.clone(),
-                            Interruption::Combined {
-                                mask,
-                                index_first,
-                                action,
-                                at,
-                            },
-                        ));
-                    }
+                    cases.insert((
+                        received.clone(),
+                        Interruption::Combined {
+                            mask,
+                            index_first,
+                            action: BoundaryAction::Restart,
+                            at,
+                        },
+                    ));
                 }
             }
         }
@@ -281,7 +274,6 @@ fn single_interruption_cases(
         cases.push((order.clone(), Interruption::None));
         for at in 0..order.len() {
             cases.push((order.clone(), Interruption::Restart(at)));
-            cases.push((order.clone(), Interruption::Demote(at)));
         }
     }
     let mut crashes = BTreeSet::new();
@@ -326,25 +318,13 @@ fn single_interruption_cases(
 }
 
 // An ordered pair of boundary actions at boundaries `first_at <= second_at`.
-// Two demotions at one boundary are one: nothing arrives between them to
-// give the second anything new to claim.
 fn action_pairs(boundaries: &[usize]) -> Vec<(BoundaryAction, usize, BoundaryAction, usize)> {
-    const ACTIONS: [BoundaryAction; 3] = [
-        BoundaryAction::Restart,
-        BoundaryAction::Demote,
-        BoundaryAction::Crash,
-    ];
+    const ACTIONS: [BoundaryAction; 2] = [BoundaryAction::Restart, BoundaryAction::Crash];
     let mut pairs = Vec::new();
     for first in ACTIONS {
         for second in ACTIONS {
             for &first_at in boundaries {
                 for &second_at in boundaries.iter().filter(|&&at| at >= first_at) {
-                    if first_at == second_at
-                        && first == BoundaryAction::Demote
-                        && second == BoundaryAction::Demote
-                    {
-                        continue;
-                    }
                     pairs.push((first, first_at, second, second_at));
                 }
             }
@@ -408,31 +388,6 @@ fn two_interruption_cases(orders: &BTreeSet<Order>) -> Vec<Schedule> {
     cases
 }
 
-async fn family_campaign(
-    family: Family,
-    format: Format,
-    profile: ExtractionProfile,
-    selection: Selection,
-) {
-    eprintln!("{family:?} {format:?} profile={profile:?} selection={selection:?}");
-    let cases = family.selected(format, selection);
-    let known_defect: KnownDefect = match family {
-        Family::FifthArticle => |_, _, _, _| false,
-        Family::SecondDuplicate => |_, _, _, _| false,
-        Family::TwoInterruptions => |_, _, _, _| false,
-    };
-    slot_campaign(
-        format,
-        selection,
-        profile,
-        family.slots(),
-        Vec::new(),
-        cases,
-        known_defect,
-    )
-    .await;
-}
-
 // The family's generator, given the archive matrix's own slots and orders,
 // builds the archive matrix case for case.
 #[test]
@@ -446,50 +401,6 @@ fn single_interruption_cases_reproduce_the_archive_matrix() {
         .collect();
     assert_eq!(single_interruption_cases(4, &orders, |_| true), expected);
 }
-
-macro_rules! depth_smoke {
-    ($($name:ident $family:ident $format:ident $profile:ident),+ $(,)?) => {
-        $(
-            #[tokio::test]
-            async fn $name() {
-                family_campaign(
-                    Family::$family,
-                    Format::$format,
-                    ExtractionProfile::$profile,
-                    Selection::Smoke,
-                )
-                .await;
-            }
-        )+
-    };
-}
-
-depth_smoke!(
-    fifth_article_rar4_schedules FifthArticle Rar4 DirectStore,
-    fifth_article_rar5_schedules FifthArticle Rar5 DirectStore,
-    fifth_article_rar4_encrypted_schedules FifthArticle Rar4Encrypted DirectStore,
-    fifth_article_rar5_encrypted_schedules FifthArticle Rar5Encrypted DirectStore,
-    fifth_article_rar4_four_volume_schedules FifthArticle Rar4FourVolumes DirectStore,
-    fifth_article_rar5_four_volume_schedules FifthArticle Rar5FourVolumes DirectStore,
-    fifth_article_chase_rar5_schedules FifthArticle Rar5 Chase,
-    fifth_article_conventional_rar5_schedules FifthArticle Rar5 Conventional,
-    second_duplicate_rar4_schedules SecondDuplicate Rar4 DirectStore,
-    second_duplicate_rar5_schedules SecondDuplicate Rar5 DirectStore,
-    second_duplicate_rar4_encrypted_schedules SecondDuplicate Rar4Encrypted DirectStore,
-    second_duplicate_rar5_encrypted_schedules SecondDuplicate Rar5Encrypted DirectStore,
-    second_duplicate_rar4_four_volume_schedules SecondDuplicate Rar4FourVolumes DirectStore,
-    second_duplicate_rar5_four_volume_schedules SecondDuplicate Rar5FourVolumes DirectStore,
-    second_duplicate_chase_rar5_schedules SecondDuplicate Rar5 Chase,
-    second_duplicate_conventional_rar5_schedules SecondDuplicate Rar5 Conventional,
-    two_interruption_rar4_schedules TwoInterruptions Rar4 DirectStore,
-    two_interruption_rar5_schedules TwoInterruptions Rar5 DirectStore,
-    two_interruption_rar4_encrypted_schedules TwoInterruptions Rar4Encrypted DirectStore,
-    two_interruption_rar5_encrypted_schedules TwoInterruptions Rar5Encrypted DirectStore,
-    two_interruption_rar4_four_volume_schedules TwoInterruptions Rar4FourVolumes DirectStore,
-    two_interruption_rar5_four_volume_schedules TwoInterruptions Rar5FourVolumes DirectStore,
-    two_interruption_chase_rar5_schedules TwoInterruptions Rar5 Chase,
-    two_interruption_conventional_rar5_schedules TwoInterruptions Rar5 Conventional,
-);
 
 // Shards of a campaign named in decades, so a campaign's shard count is ten
 // times the decades it lists. Each shard calls `$run` with the bracketed
@@ -593,61 +504,3 @@ macro_rules! depth_shards {
     };
 }
 pub(super) use depth_shards;
-
-// One module per family, format and profile.
-macro_rules! depth_campaigns {
-    ($module:ident, $family:ident; $($name:ident $format:ident $decades:tt),+ $(,)?) => {
-        mod $module {
-            use super::*;
-            $(
-                mod $name {
-                    use super::*;
-                    depth_campaigns!(
-                        @profiles $family, $format, $decades;
-                        direct DirectStore,
-                        chase Chase,
-                        conventional Conventional
-                    );
-                }
-            )+
-        }
-    };
-    (@profiles $family:ident, $format:ident, $decades:tt; $($name:ident $profile:ident),+) => {
-        $(
-            mod $name {
-                use super::*;
-                depth_shards!(
-                    family_campaign,
-                    [Family::$family, Format::$format, ExtractionProfile::$profile],
-                    Family::$family.shards(Format::$format);
-                    $decades
-                );
-            }
-        )+
-    };
-}
-
-depth_campaigns!(combined_fifth_article, FifthArticle;
-    rar4 Rar4 [0 1 2 3 4 5 6 7],
-    rar5 Rar5 [0 1 2 3 4 5 6 7],
-    rar4_encrypted Rar4Encrypted [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
-    rar5_encrypted Rar5Encrypted [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
-    rar4_four_volume Rar4FourVolumes [0 1 2 3 4 5 6 7],
-    rar5_four_volume Rar5FourVolumes [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
-);
-depth_campaigns!(combined_second_duplicate, SecondDuplicate;
-    rar4 Rar4 [0 1 2 3],
-    rar5 Rar5 [0 1 2 3],
-    rar4_encrypted Rar4Encrypted [0 1 2 3 4 5 6 7],
-    rar5_encrypted Rar5Encrypted [0 1 2 3],
-    rar4_four_volume Rar4FourVolumes [0 1 2 3],
-    rar5_four_volume Rar5FourVolumes [0 1 2 3],
-);
-depth_campaigns!(combined_two_interruptions, TwoInterruptions;
-    rar4 Rar4 [0 1 2 3 4 5 6 7],
-    rar5 Rar5 [0 1 2 3 4 5 6 7],
-    rar4_encrypted Rar4Encrypted [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15],
-    rar5_encrypted Rar5Encrypted [0 1 2 3 4 5 6 7],
-    rar4_four_volume Rar4FourVolumes [0 1 2 3 4 5 6 7],
-    rar5_four_volume Rar5FourVolumes [0 1 2 3 4 5 6 7],
-);

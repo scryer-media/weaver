@@ -67,7 +67,7 @@ impl Pipeline {
         let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
         let decode_backlog_budget_bytes =
             compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
-        let (hardware_profile, direct_store_settings, direct_unpack_settings, propagation_delay) = {
+        let (hardware_profile, hold_settings, propagation_delay) = {
             let cfg = config.read().await;
             // An install that never chose one — every upgraded install — runs
             // the profile this machine is recommended. A saved choice the
@@ -77,27 +77,20 @@ impl Pipeline {
                 .filter(|chosen| chosen.unmet_requirement(&profile).is_none())
                 .unwrap_or_else(|| crate::runtime::HardwareProfile::recommended(&profile));
             // The resident holds default is sized once, under the profile in
-            // force at startup, like every other direct-store limit below.
+            // force at startup, and every hold setting is resolved once and
+            // held for the life of the pipeline.
             let resident_default_cap = hardware_profile
                 .tuning(&profile)
                 .direct_store_resident_default_cap_bytes;
             (
                 hardware_profile,
-                // Config, with `WEAVER_RAR_DIRECT_STORE`
-                // overriding it. Resolved once here and held for the life of
-                // the pipeline — a set admitted under an enabled gate must not
-                // find it disabled at finalization, and the kill switch's
-                // contract is that turning it off at *startup* sweeps and
-                // redownloads mid-flight direct work, not that it takes effect
-                // mid-job.
-                crate::pipeline::direct_store::DirectStoreSettings::resolve_on(
+                crate::pipeline::graph::limits::HoldSettings::resolve(
                     &cfg,
-                    crate::pipeline::direct_store::HostFacts::probe(&intermediate_dir)
-                        .with_resident_default_cap(resident_default_cap),
+                    crate::pipeline::graph::limits::HostFacts::probe(
+                        &intermediate_dir,
+                        resident_default_cap,
+                    ),
                 ),
-                // Same contract, same reason: resolved once so a set admitted
-                // under an enabled gate cannot find it disabled mid-chase.
-                crate::pipeline::direct_unpack::DirectUnpackSettings::resolve(&cfg),
                 Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
@@ -129,7 +122,6 @@ impl Pipeline {
         let profile_tuning = hardware_profile.tuning(&profile);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
-        crate::pipeline::repair::par3::budget::set_memory_share(profile_tuning.par3_memory);
         shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
             active: hardware_profile,
             scheduled: None,
@@ -145,22 +137,13 @@ impl Pipeline {
             total_connections,
             "pipeline tuner initialized"
         );
-        if direct_store_settings.gate.is_enabled() {
-            // Logged only when on: the default is off, and an operator reading
-            // a startup log wants to see the non-default. The ceiling goes with
-            // it because the two are configured together and a demotion for
-            // `holds_scratch_ceiling` is otherwise unattributable.
-            info!(
-                holds_scratch_ceiling_bytes = direct_store_settings.holds_scratch_ceiling_bytes,
-                holds_resident_limit_bytes = direct_store_settings.holds_resident_limit_bytes,
-                holds_scratch_total_bytes = direct_store_settings.holds_scratch_total_bytes,
-                holds_disk_reserve_bytes = direct_store_settings.holds_disk_reserve_bytes,
-                "RAR direct-store routing enabled"
-            );
-        }
-        if direct_unpack_settings.gate.is_enabled() {
-            info!("7z direct unpack enabled");
-        }
+        info!(
+            holds_scratch_ceiling_bytes = hold_settings.scratch_ceiling_bytes,
+            holds_resident_limit_bytes = hold_settings.resident_limit_bytes,
+            holds_scratch_total_bytes = hold_settings.scratch_total_bytes,
+            holds_disk_reserve_bytes = hold_settings.disk_reserve_bytes,
+            "graph engine hold limits resolved"
+        );
 
         tokio::fs::create_dir_all(&data_dir).await?;
         // A download folder on a drive that is gone must not stop Weaver from
@@ -195,11 +178,7 @@ impl Pipeline {
         let (owned_download_lane_event_tx, owned_download_lane_event_rx) = mpsc::channel(128);
         let (decode_done_tx, decode_done_rx) = mpsc::channel(256);
         let (retry_tx, retry_rx) = mpsc::channel(256);
-        let (probe_result_tx, probe_result_rx) = mpsc::channel(16);
         let (nntp_handoff_drained_tx, nntp_handoff_drained_rx) = mpsc::channel(4);
-        let (extract_done_tx, extract_done_rx) = mpsc::channel(32);
-        let (rar_refresh_done_tx, rar_refresh_done_rx) = mpsc::channel(32);
-        let (rar_capacity_retry_tx, rar_capacity_retry_rx) = mpsc::channel(32);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
@@ -212,13 +191,6 @@ impl Pipeline {
             })
             .await??;
         }
-        let (direct_post_repair_done_tx, direct_post_repair_done_rx) = mpsc::channel(32);
-        let (direct_tolerated_done_tx, direct_tolerated_done_rx) = mpsc::channel(32);
-        let (direct_barrier_done_tx, direct_barrier_done_rx) = mpsc::channel(32);
-        let (direct_placement_done_tx, direct_placement_done_rx) = mpsc::channel(64);
-        let (direct_rearm_done_tx, direct_rearm_done_rx) = mpsc::channel(32);
-        let (repair_work_done_tx, repair_work_done_rx) = mpsc::channel(32);
-        let (direct_demotion_done_tx, direct_demotion_done_rx) = mpsc::channel(32);
         let scripts_directory = db
             .initialize_post_processing_script_directory(
                 &std::path::PathBuf::from(&data_dir),
@@ -255,12 +227,9 @@ impl Pipeline {
         let pp_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
             tuner.params().extract_thread_count,
         );
-        let chase_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
-            tuner.params().extract_thread_count,
-        );
 
         let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
-            crate::pipeline::graph::limits::budgets(&direct_store_settings, &tuner).0,
+            hold_settings.budgets(),
         ));
         let mut pipeline = Self {
             _control_runtime: crate::pipeline::queue::RuntimeGuard(shared_state.queue.clone()),
@@ -328,71 +297,11 @@ impl Pipeline {
             uu_spool_min_free_bytes: UU_SPOOL_MIN_FREE_BYTES,
             #[cfg(test)]
             uu_spool_available_bytes_for_test: None,
-            pending_file_progress: HashMap::new(),
-            unpersisted_coverage_bytes: 0,
             dirty_server_attribution: HashSet::new(),
             dirty_support_facts: HashSet::new(),
             server_attribution_checkpoint_at: Instant::now(),
-            persisted_file_progress: HashMap::new(),
-            file_hash_states: HashMap::new(),
-            deferred_file_hash_data: HashMap::new(),
-            deferred_file_hash_data_bytes: 0,
-            deferred_file_hash_ranges: HashMap::new(),
-            expected_file_crcs: HashMap::new(),
-            untrusted_file_crcs: HashSet::new(),
-            file_hash_reread_required: HashSet::new(),
-            #[cfg(test)]
-            try_update_archive_topology_calls: 0,
-            #[cfg(test)]
-            par2_lower_bound_preflight_calls: 0,
-            #[cfg(test)]
-            par2_authoritative_verify_calls: 0,
-            #[cfg(test)]
-            par2_selective_verify_calls: 0,
-            #[cfg(test)]
-            par2_quick_verify_calls: 0,
-            #[cfg(test)]
-            par2_quick_partial_verify_calls: 0,
-            #[cfg(test)]
-            par2_scan_carry_seeded_calls: 0,
-            #[cfg(test)]
-            par2_scan_carry_stashed_calls: 0,
-            #[cfg(test)]
-            par2_host_carry_builds: 0,
             #[cfg(test)]
             par2_ignore_extensions_override: None,
-            #[cfg(test)]
-            par2_recovery_salvage_scans: 0,
-            #[cfg(test)]
-            par2_unserved_set_warnings: 0,
-            #[cfg(test)]
-            par2_repairer_analyze_calls: 0,
-            #[cfg(test)]
-            par2_authoritative_bytes_read: Vec::new(),
-            #[cfg(test)]
-            par2_session_opens: 0,
-            #[cfg(test)]
-            par2_session_source_scan_passes: 0,
-            #[cfg(test)]
-            par2_session_recovery_merges: 0,
-            #[cfg(test)]
-            par2_repairs_from_parked_verdict: 0,
-            #[cfg(test)]
-            par2_repairer_execute_calls: 0,
-            #[cfg(test)]
-            stateful_par2_session_forced: None,
-            #[cfg(test)]
-            direct_session_pass_calls: 0,
-            #[cfg(test)]
-            direct_verify_read_splits: Vec::new(),
-            #[cfg(test)]
-            par2_post_repair_read_splits: Vec::new(),
-            #[cfg(test)]
-            sfv_verify_read_splits: Vec::new(),
-            #[cfg(test)]
-            direct_post_repair_read_splits: Vec::new(),
-            #[cfg(test)]
-            last_direct_verdict: None,
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             blocked_restores: HashMap::new(),
@@ -413,16 +322,8 @@ impl Pipeline {
             pool_generation: 0,
             server_counters,
             job_stage_started_at: HashMap::new(),
-            probe_result_tx,
-            probe_result_rx,
             nntp_handoff_drained_tx,
             nntp_handoff_drained_rx,
-            extract_done_tx,
-            extract_done_rx,
-            rar_refresh_done_tx,
-            rar_refresh_done_rx,
-            rar_capacity_retry_tx,
-            rar_capacity_retry_rx,
             move_done_tx,
             move_done_rx,
             terminal_post_processing_done_tx,
@@ -472,7 +373,6 @@ impl Pipeline {
             download_retry_storm_window: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
-            duplicate_arrival_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
             last_download_lanes_under_cap_log_at: None,
@@ -481,113 +381,26 @@ impl Pipeline {
             uu_spooled_bytes: 0,
             uu_spooled_segments: 0,
             uu_parked_segments: 0,
-            write_buffers: HashMap::new(),
-            file_prefix_16k: HashMap::new(),
-            file_proven_par2_fingerprint: HashMap::new(),
-            file_declared_size: HashMap::new(),
             uu_files: HashMap::new(),
             uu_park_requeues: HashMap::new(),
             unanchored_parked: HashMap::new(),
             unanchored_requeues: HashMap::new(),
             pending_unanchored_release: Vec::new(),
-            par2_runtime: HashMap::new(),
-            par3_runtime: None,
-            par3_inside_probes: Default::default(),
-            #[cfg(test)]
-            par2_binding_resolver_calls: std::sync::atomic::AtomicU64::new(0),
-            block_crcs: crate::pipeline::integrity::BlockCrcCollector::new(),
-            direct_store:
-                crate::pipeline::direct_store::wiring::DirectStoreRuntime::with_working_capacity(
-                    direct_store_settings,
-                    storage_capacity.reader(crate::operations::StorageRoot::Intermediate),
-                ),
             storage_capacity,
-            direct_unpack:
-                crate::pipeline::direct_unpack::wiring::DirectUnpackRuntime::with_settings(
-                    direct_unpack_settings,
-                ),
             extraction_limits,
             process_memory_budget,
             job_scheduling_memory: HashMap::new(),
             repeated_articles: HashMap::new(),
-            chase_pool,
-            extraction_budgets: HashMap::new(),
-            unacceptable_extension_policies: HashMap::new(),
-            extracted_members: HashMap::new(),
-            extracted_archives: HashMap::new(),
-            missing_volume_archive_sets: HashMap::new(),
             decode_retries: HashMap::new(),
-            unverified_segments: HashMap::new(),
-            file_crc_recoveries: HashMap::new(),
-            inflight_extractions: HashMap::new(),
             phase_progress: HashMap::new(),
             job_retention_exclude_cache: HashMap::new(),
             no_eligible_server_warn_throttle: Default::default(),
             body_lane_capacity_log_throttle: Default::default(),
             body_fetch_failure_log_throttle: Default::default(),
-            par2_cancellations: HashMap::new(),
-            next_direct_post_repair_work_id: 0,
-            direct_post_repair_in_flight: HashMap::new(),
-            direct_post_repair_results: HashMap::new(),
-            direct_post_repair_done_tx,
-            direct_post_repair_done_rx,
-            direct_post_repair_carry: HashMap::new(),
-            next_direct_tolerated_work_id: 0,
-            direct_tolerated_in_flight: HashMap::new(),
-            direct_tolerated_results: HashMap::new(),
-            direct_tolerated_done_tx,
-            direct_tolerated_done_rx,
-            direct_barrier_flights: HashMap::new(),
-            next_direct_barrier_flight_id: 0,
-            direct_barrier_done_tx,
-            direct_barrier_done_rx,
-            direct_placement_lanes: HashMap::new(),
-            completion_checks_awaiting_placements: HashSet::new(),
-            par3_publications_awaiting_placements: HashSet::new(),
-            next_direct_placement_flight_id: 0,
-            direct_placement_done_tx,
-            direct_placement_done_rx,
-            #[cfg(test)]
-            direct_placement_hold: None,
-            #[cfg(test)]
-            direct_placement_panics: false,
-            direct_rearm_in_flight: HashSet::new(),
-            direct_rearm_done_tx,
-            direct_rearm_done_rx,
-            next_par2_analysis_work_id: 0,
-            par2_analysis_in_flight: HashMap::new(),
-            par2_analysis_results: HashMap::new(),
-            repair_work_done_tx,
-            repair_work_done_rx,
-            next_direct_demotion_work_id: 0,
-            direct_demotion_in_flight: HashMap::new(),
-            direct_demotion_done_tx,
-            direct_demotion_done_rx,
             inflight_moves: HashSet::new(),
             deferred_moves: HashSet::new(),
             deferred_post_processing: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
-            failed_extractions: HashMap::new(),
-            known_damaged_archive_sets: HashMap::new(),
-            eagerly_deleted: HashMap::new(),
-            rar_sets: HashMap::new(),
-            rar_refresh_state: HashMap::new(),
-            rar_unlock_priority_dirty_jobs: HashSet::new(),
-            rar_unlock_boosted_files: HashMap::new(),
-            pending_rar_capacity_retries: HashSet::new(),
-            rar_waiting_members: HashMap::new(),
-            normalization_retried: HashSet::new(),
-            pending_concat: HashMap::new(),
-            par2_bypassed: HashSet::new(),
-            par2_discovery_wait_logged: HashSet::new(),
-            posted_name_disagreement_logged: HashSet::new(),
-            par2_verified: HashSet::new(),
-            par2_joined_split_sets: HashMap::new(),
-            recovery_unposted_outputs: HashMap::new(),
-            par2_pre_repair_dir_entries: HashMap::new(),
-            sfv_checked: HashSet::new(),
-            jobs_with_verification_outcome: HashSet::new(),
-            unavailable_promoted_recovery_segments: HashSet::new(),
             shared_state,
             db,
             fire_and_forget_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
@@ -755,201 +568,14 @@ impl Pipeline {
         state.assembly.progress().max(byte_progress).clamp(0.0, 1.0)
     }
 
-    // A conventional file's written coverage moved: some of its articles
-    // reached disk, wherever in the file they sit.
-    //
-    // Coverage is the assembly's committed articles, so nothing is copied
-    // here; the file is only marked for the restart barrier, which encodes its
-    // coverage and replaces the file's one checkpoint row. The barrier runs
-    // once coverage over every file has moved by one checkpoint interval, on
-    // demand when the restart guard needs it, and at drain, so a restart loses
-    // at most one interval of written work. A gap anywhere in a file never
-    // holds that back: an article written past it is coverage the moment its
-    // write returns.
-    pub(crate) fn note_file_coverage(&mut self, file_id: NzbFileId, force_flush: bool) {
-        // A direct set's source volume has no file, so it never carries a
-        // conventional checkpoint — an older binary then sees no coverage and
-        // redownloads instead of trusting bytes that were never written there.
-        // The routing seam already returns before this is reached; the guard is
-        // here so any *other* caller inherits the same rule.
-        if self.is_direct_source_file(file_id) {
-            return;
-        }
-        // A uuencode file has no resumable checkpoint, so it never writes one.
-        // Its parts are assembled through a sequential cursor that only
-        // decoding from ordinal 0 builds — a part's offset is the decoded
-        // length of its whole prefix, and the cursor naming it lives in memory
-        // only — so a restart cannot resume a uuencode file at any ordinal but
-        // the first, whatever its coverage says.
-        //
-        // Suppressing the checkpoint costs a partial uuencode file its resume
-        // and nothing else: with no coverage recorded, the restart finds
-        // nothing to skip and the file downloads from ordinal 0 with a cursor
-        // that agrees. The tombstone left by `finish_uu_file` keeps this
-        // holding for the file's final write too, which lands after the
-        // completion branch has run.
-        if self.uu_files.contains_key(&file_id) {
-            return;
-        }
-        // Retained damage is never coverage: a damaged ordinal is not
-        // committed until a clean copy replaces it, and nothing at or past the
-        // retained-damage floor is coverage either, so a restart refetches it.
-        let Some(covered) = self
-            .jobs
-            .get(&file_id.job_id)
-            .and_then(|state| state.assembly.file(file_id))
-            .map(crate::jobs::assembly::FileAssembly::durable_received_bytes)
-        else {
-            return;
-        };
-        let current = self
-            .pending_file_progress
-            .get(&file_id)
-            .copied()
-            .or_else(|| self.persisted_file_progress.get(&file_id).copied())
-            .unwrap_or(0);
-        if covered == current && !force_flush {
-            return;
-        }
-        self.pending_file_progress.insert(file_id, covered);
-        self.unpersisted_coverage_bytes = self
-            .unpersisted_coverage_bytes
-            .saturating_add(covered.abs_diff(current));
-        let threshold_flush =
-            self.unpersisted_coverage_bytes >= download_restart_checkpoint_bytes();
-        if force_flush || threshold_flush {
-            let label = if force_flush {
-                "download.file_progress.flush.force"
-            } else {
-                "download.file_progress.flush.threshold"
-            };
-            self.flush_file_progress_batch(label);
-            if threshold_flush {
-                crate::e2e_failpoint::maybe_delay("download.after_progress_floor_flush");
-            }
-        }
-    }
-
-    // The restart barrier's rows: each marked file's coverage, encoded from
-    // its assembly, with the persisted byte account moved up to match.
-    fn take_file_coverage_batch(&mut self) -> Vec<ActiveFileProgress> {
-        let pending = std::mem::take(&mut self.pending_file_progress);
-        self.unpersisted_coverage_bytes = 0;
-        let mut batch = Vec::with_capacity(pending.len());
-        for (file_id, covered_bytes) in pending {
-            let Some(file) = self
-                .jobs
-                .get(&file_id.job_id)
-                .and_then(|state| state.assembly.file(file_id))
-            else {
-                continue;
-            };
-            self.persisted_file_progress.insert(file_id, covered_bytes);
-            batch.push(ActiveFileProgress {
-                job_id: file_id.job_id,
-                file_index: file_id.file_index,
-                coverage: file.durable_coverage(),
-            });
-        }
-        batch
-    }
-
-    // The barrier's rows go to the ordered writer, each job's on its own
-    // lane, so two checkpoints for one file land in submission order and a
-    // job's archive waits for the checkpoints queued before it. A detached
-    // task would let an older snapshot overwrite a newer one: the row is
-    // replaced whole, and coverage may shrink, so no merge rule in the
-    // statement could tell the two apart.
-    pub(crate) fn queue_file_progress_batch(
-        &self,
-        batch: Vec<ActiveFileProgress>,
-    ) -> Result<(), crate::StateError> {
-        let mut by_job = HashMap::<JobId, Vec<ActiveFileProgress>>::new();
-        for entry in batch {
-            by_job.entry(entry.job_id).or_default().push(entry);
-        }
-        for (job_id, rows) in by_job {
-            self.db
-                .try_queue_job_write(job_id, "active_file_progress", move |db| {
-                    db.upsert_file_progress_batch(&rows)
-                })?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn flush_file_progress_batch(&mut self, label: &'static str) {
-        if self.pending_file_progress.is_empty() {
-            return;
-        }
-        let _probe = crate::runtime::perf_probe::scope(label);
-        let batch = self.take_file_coverage_batch();
-        if batch.is_empty() {
-            return;
-        }
-        let count = batch.len();
-        if let Err(error) = self.queue_file_progress_batch(batch) {
-            tracing::error!(count, error = %error, "failed to queue file coverage checkpoints");
-        }
-    }
-
-    // The same rows on the same lanes, then the writer drained: the caller
-    // needs the checkpoint committed, and it must still land after any
-    // checkpoint queued before it. A write the writer could not apply is
-    // logged there, not returned here.
-    pub(crate) async fn flush_file_progress_batch_awaited(
-        &mut self,
-        label: &'static str,
-    ) -> Result<(), crate::StateError> {
-        if self.pending_file_progress.is_empty() {
-            return Ok(());
-        }
-        let _probe = crate::runtime::perf_probe::scope(label);
-        let batch = self.take_file_coverage_batch();
-        if batch.is_empty() {
-            return Ok(());
-        }
-        self.queue_file_progress_batch(batch)?;
-        self.db.flush_write_queue().await
-    }
-
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
         self.dirty_server_attribution.remove(&job_id);
         self.dirty_support_facts.remove(&job_id);
         self.blocked_restores.remove(&job_id);
-        self.pending_file_progress
-            .retain(|file_id, _| file_id.job_id != job_id);
-        self.persisted_file_progress
-            .retain(|file_id, _| file_id.job_id != job_id);
-        self.file_hash_states
-            .retain(|file_id, _| file_id.job_id != job_id);
-        self.expected_file_crcs
-            .retain(|file_id, _| file_id.job_id != job_id);
-        self.untrusted_file_crcs
-            .retain(|file_id| file_id.job_id != job_id);
-        self.file_hash_reread_required
-            .retain(|file_id| file_id.job_id != job_id);
-        self.unverified_segments
-            .retain(|file_id, _| file_id.job_id != job_id);
-        self.file_crc_recoveries
-            .retain(|file_id, _| file_id.job_id != job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
         self.checkpoint_progress_articles.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
-        // The direct-store runtime is per-job state like every map
-        // above it. Left behind, its sets keep a removed job "active" and the
-        // barrier poll keeps demanding checkpoints for a working directory that
-        // is being deleted.
-        self.direct_store.clear_job(job_id);
-        self.drop_direct_placements_for_job(job_id);
-        self.forget_direct_tolerated_work(job_id);
-        self.forget_par2_analysis_work(job_id);
-        self.forget_direct_demotion_work(job_id);
-        // Same reasoning, one step further: a direct-unpack worker is a
-        // *blocking thread* parked on this job's bytes. Left behind it is not
-        // merely stale state — it never wakes, and the working directory it
-        // holds open is about to be deleted underneath it.
-        self.direct_unpack_forget_job(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {
@@ -970,12 +596,6 @@ impl Pipeline {
                 job_id,
                 finalization_pending,
             });
-        }
-    }
-
-    pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
-        if self.jobs_finalizing_download.remove(&job_id) {
-            self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
         }
     }
 
@@ -1014,13 +634,7 @@ impl Pipeline {
                 }
                 continue;
             }
-            let candidate = state.download_queue.is_empty()
-                || unanchored.contains(job_id)
-                || self
-                    .direct_store
-                    .sets_for(*job_id)
-                    .iter()
-                    .any(|set| !set.is_demoted() && !set.is_finalized());
+            let candidate = state.download_queue.is_empty() || unanchored.contains(job_id);
             if !candidate {
                 continue;
             }
@@ -1031,7 +645,6 @@ impl Pipeline {
                 state.failed_bytes,
                 state.download_queue.len(),
                 state.recovery_queue.len(),
-                state.health_probing,
             );
             if self.reconcile_signatures.get(job_id) != Some(&signature) {
                 self.reconcile_signatures.insert(*job_id, signature);
@@ -1053,7 +666,7 @@ impl Pipeline {
             .jobs
             .iter()
             .filter_map(|(job_id, state)| {
-                if !matches!(state.status, JobStatus::Downloading) || state.health_probing {
+                if !matches!(state.status, JobStatus::Downloading) {
                     return None;
                 }
 
@@ -1122,9 +735,6 @@ impl Pipeline {
             || !self.pending_released_download_results_by_job.is_empty()
             || !self.pending_unanchored_release.is_empty()
             || self.write_buffered_bytes > 0
-            || !self.direct_barrier_flights.is_empty()
-            || !self.direct_placement_lanes.is_empty()
-            || self.direct_unpack.has_work_in_flight()
             || !self.dirty_server_attribution.is_empty()
             || self.metrics_rates_moving
             || self.post_download_phases > 0
@@ -1195,7 +805,6 @@ impl Pipeline {
                 &turn_metrics.pipeline_histograms.turn_duration,
             );
             if queue.read(|inner| inner.globals.shutting_down) {
-                self.cancel_par2_work_for_shutdown();
                 // Readmission can wait for cancellation cleanup, whose terminal
                 // completion event releases the last script cancellation sender.
                 // Keep servicing those events while accepted admissions settle.
@@ -1221,10 +830,6 @@ impl Pipeline {
                     };
                     self.handle_terminal_post_processing_event(event).await;
                 }
-                self.demand_direct_store_barriers_for_all_jobs(
-                    crate::pipeline::direct_store::barrier::BarrierDemand::Shutdown,
-                )
-                .await;
                 break;
             }
             self.apply_queue_intents().await;
@@ -1246,17 +851,6 @@ impl Pipeline {
                 turn_active = true;
                 self.release_settled_unanchored_runs().await;
                 self.pump_decode_queue();
-            }
-            // A container set whose end header was ruled missing hands over
-            // before it holds anything more.
-            if self.has_direct_end_header_verdicts() {
-                turn_active = true;
-                self.settle_direct_end_header_verdicts().await;
-            }
-            // So does a set whose holds nothing left to arrive can place.
-            if !self.direct_store.unplaceable_verdicts.is_empty() {
-                turn_active = true;
-                self.settle_direct_unplaceable_sets().await;
             }
 
             let pending_completion_checks = self.pending_completion_checks.len();
@@ -1282,15 +876,6 @@ impl Pipeline {
             {
                 self.dispatch_downloads();
             }
-            // The byte and age triggers are polled on the loop's
-            // existing periodic seam rather than on a timer of their own, so an
-            // idle set still checkpoints and a busy one is never checked more
-            // often than the pipeline turns.
-            self.poll_direct_store_barriers().await;
-            // Joins chases that finished or were aborted since the last turn.
-            // Polled here for the same reason: a chase must never be awaited
-            // inline, because it is still following a live download.
-            self.reap_direct_unpack().await;
 
             let rate_delay = self.rate_limiter.time_until_ready();
             let rate_sleep = tokio::time::sleep(rate_delay);
@@ -1365,78 +950,14 @@ impl Pipeline {
                         );
                         self.handle_decode_done(result).await;
                     }
-                    Some(update) = self.probe_result_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = update.job_id;
-                        self.handle_probe_update(update);
-                        self.report_job(reported_job);
-                    }
                     Some(generation) = self.nntp_handoff_drained_rx.recv() => {
                         turn_timer.resume();
                         self.handle_nntp_handoff_drained(generation);
-                    }
-                    Some(done) = self.extract_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = match &done {
-                            ExtractionDone::Batch { job_id, .. } | ExtractionDone::FullSet { job_id, .. } => *job_id,
-                        };
-                        self.handle_extraction_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(done) = self.rar_refresh_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_rar_refresh_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(retry) = self.rar_capacity_retry_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_rar_capacity_retry(retry).await;
                     }
                     Some(done) = self.move_done_rx.recv() => {
                         turn_timer.resume();
                         let reported_job = done.job_id;
                         self.handle_move_to_complete_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(done) = self.direct_post_repair_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_direct_post_repair_done(done);
-                        self.report_job(reported_job);
-                    }
-                    Some(done) = self.direct_tolerated_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_direct_tolerated_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(done) = self.direct_barrier_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_direct_barrier_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(done) = self.direct_placement_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_direct_placement_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(done) = self.direct_rearm_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_direct_rearm_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(done) = self.repair_work_done_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_repair_work_done(done).await;
-                    }
-                    Some(done) = self.direct_demotion_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_direct_demotion_done(done).await;
                         self.report_job(reported_job);
                     }
                     Ok(()) = self.script_effects_rx.changed() => {
@@ -1478,11 +999,6 @@ impl Pipeline {
                     _ = tune_interval.tick() => {
                         turn_timer.resume();
                         idle_tick = true;
-                        // An empty write backlog has nothing to flush.
-                        if self.write_buffered_bytes > 0 {
-                            self.flush_quiescent_write_backlog().await;
-                        }
-                        self.relieve_latched_write_backlog().await;
                         self.refresh_download_pressure();
                         self.publish_download_transport_health();
 
@@ -1623,14 +1139,6 @@ impl Pipeline {
         );
     }
 
-    pub(crate) async fn demand_direct_store_barriers_for_pause(&mut self, scope: Option<JobId>) {
-        let demand = crate::pipeline::direct_store::barrier::BarrierDemand::Pause;
-        match scope {
-            Some(job_id) => self.demand_direct_store_barriers(job_id, demand).await,
-            None => self.demand_direct_store_barriers_for_all_jobs(demand).await,
-        }
-    }
-
     pub(crate) fn consume_due_checkpoint_rechecks(&mut self) {
         let now = Instant::now();
         let due: Vec<JobId> = self
@@ -1640,10 +1148,7 @@ impl Pipeline {
             .map(|(job_id, _)| *job_id)
             .collect();
         for job_id in due {
-            self.advance_durable_download_floor(
-                job_id,
-                "download.file_progress.flush.restart_durable_lead_retry_recheck",
-            );
+            self.advance_durable_download_floor(job_id);
         }
         self.download_restart_durable_lead_retry_after
             .retain(|_, ready_at| *ready_at > now);
@@ -1834,65 +1339,23 @@ impl Pipeline {
             self.maybe_finish_download_pass(job_id);
             return;
         }
-        // A graph job's root classes the work. A classic job's promotion says
-        // whether it is recovery a repair waits on, and puts it back at the
-        // promoted key on every retry.
+        // The job's root classes the work.
         let mut work = work;
-        let promoted_recovery = !self.graph_requeued(&mut work)
-            && work.is_recovery
-            && (work.completion_critical || self.segment_is_completion_critical(segment_id));
-        // Not promoted, so nothing waits on it: `work`'s own flag says so.
-        let parks = !promoted_recovery && self.requeue_parks(&work);
-        let mark_rar_unlock_dirty =
-            !promoted_recovery && self.rar_unlock_requeued_work_is_relevant(&work);
+        self.graph_requeued(&mut work);
+        let parks = self.requeue_parks(&work);
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            if promoted_recovery {
-                work.priority = crate::pipeline::repair::PROMOTED_RECOVERY_PRIORITY;
-                work.completion_critical = true;
-                state.download_queue.push(work);
-            } else if parks {
+            if parks {
                 state.recovery_queue.push(work);
             } else {
                 state.download_queue.push(work);
-                if mark_rar_unlock_dirty {
-                    self.mark_rar_unlock_priorities_dirty(job_id);
-                }
             }
         }
     }
 
-    // Put a graph job's article back through `enqueue_download_work`, under
-    // the class the root holds it in now, and hand a classic job's back to
-    // its caller to queue as that caller always has.
-    pub(in crate::pipeline) fn requeue_graph_work(
-        &mut self,
-        work: DownloadWork,
-    ) -> Option<DownloadWork> {
-        if self
-            .job_engine(work.segment_id.file_id.job_id)
-            .classic_switches_apply()
-        {
-            return Some(work);
-        }
-        self.enqueue_download_work(work);
-        None
-    }
-
     pub(crate) async fn drain(&mut self) {
-        // First, because a parked chase is a blocking thread that nothing else
-        // here will ever wake: the pipeline's other state dies with the struct,
-        // but a thread waiting on a condvar does not. Release it before joining
-        // the remaining data-plane work.
-        self.direct_unpack_shutdown("pipeline shutting down").await;
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;
-        // The articles the drain routed are still writing, off this task; the
-        // select loop that would have committed them is gone, so they are
-        // joined here — and any a failed write handed back rejoin the
-        // conventional backlog the flush below writes out.
-        self.settle_all_direct_placements().await;
-        self.flush_quiescent_write_backlog().await;
         // A graph job's run or repair still out on a thread speaks through
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.
@@ -1918,12 +1381,6 @@ impl Pipeline {
                 active = self.active_downloads,
                 "draining in-flight downloads"
             );
-        }
-        if let Err(error) = self
-            .flush_file_progress_batch_awaited("download.file_progress.flush.drain")
-            .await
-        {
-            warn!(error = %error, "failed to flush file progress floors during drain");
         }
         self.flush_server_attribution();
         self.flush_support_facts();
@@ -2064,1115 +1521,6 @@ enum ShutdownDrainEvent {
     Decode(DecodeDone),
 }
 
-pub(crate) async fn write_segment_to_disk(
-    path: &std::path::Path,
-    offset: u64,
-    segment: BufferedDecodedSegment,
-) -> Result<BufferedDecodedSegment, std::io::Error> {
-    let path = path.to_owned();
-    let started = Instant::now();
-    let result = disk_write_owner_pool()
-        .write_batch(path, vec![(offset, segment)])
-        .await
-        .and_then(|mut written| {
-            written
-                .pop()
-                .map(|(_, segment)| segment)
-                .ok_or_else(|| SegmentWriteBatchError {
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "disk write owner returned no written segment",
-                    ),
-                    written,
-                    unwritten: Vec::new(),
-                })
-        })
-        .map_err(|error| error.source);
-    crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
-    result
-}
-
-pub(crate) struct SegmentWriteBatchError {
-    pub(crate) source: std::io::Error,
-    pub(crate) written: Vec<(u64, BufferedDecodedSegment)>,
-    pub(crate) unwritten: Vec<(u64, BufferedDecodedSegment)>,
-}
-
-const DISK_WRITE_OWNER_THREADS: usize = 8;
-// Cached write handles per owner thread. Batches are routed by path hash, so a
-// file's handle lives on exactly one thread and the cap bounds total fds at
-// DISK_WRITE_OWNER_THREADS * DISK_WRITE_HANDLE_CACHE_CAP.
-const DISK_WRITE_HANDLE_CACHE_CAP: usize = 16;
-// Backstop for eviction seams that have no explicit close hook (failed jobs,
-// maintenance sweepers): an idle handle never outlives the TTL, so a deleted
-// file's inode is released and its path becomes safe to reuse shortly after.
-const DISK_WRITE_HANDLE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-const DISK_WRITE_OWNER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-struct DiskWriteOwnerPool {
-    senders: Vec<std::sync::mpsc::Sender<DiskWriteCommand>>,
-}
-
-enum DiskSyncRequest {
-    // One flush, off the owner thread. `file` is a duplicate of the owner's
-    // cached handle, so the flush covers every byte written through the
-    // original, and the owner's cache is untouched whether it succeeds or not.
-    Sync {
-        path: std::path::PathBuf,
-        file: std::fs::File,
-        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
-    },
-    // Answered once every sync queued before it has finished and dropped its
-    // duplicate handle. A duplicate outliving the owner's close would keep
-    // the file open past the close's acknowledgement — on Windows, a
-    // delete-pending file whose path cannot be reused — so a close waits on
-    // this after the owners have answered.
-    Fence(tokio::sync::oneshot::Sender<()>),
-}
-
-// The flush a coverage barrier relies on.
-//
-// `sync_data` everywhere, and on Apple platforms that is `fcntl(F_FULLFSYNC)`
-// — the device barrier, which local volumes implement and which stays the
-// call made. A mount that does not implement it — SMB is the common one —
-// *refuses* it with `ENOTSUP`, and only that refusal is answered with the
-// plain `fsync` such a mount does implement: the strongest promise it can
-// make, and the same one every other platform's `sync_data` makes. Any other
-// failure is a failed flush and is reported as one.
-fn durable_sync(file: &std::fs::File) -> std::io::Result<()> {
-    match file.sync_data() {
-        #[cfg(target_vendor = "apple")]
-        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::ENOTTY)) => {
-            use std::os::fd::AsRawFd;
-            crate::runtime::perf_probe::record_value("download.disk_sync.fullfsync_refused", 1);
-            // SAFETY: `fsync` takes only the descriptor, which `file` keeps
-            // open for the whole call.
-            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        }
-        result => result,
-    }
-}
-
-// The one path-to-thread mapping the owner and sync pools share.
-fn sync_index_for_path(path: &std::path::Path, threads: usize) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    (hasher.finish() as usize) % threads
-}
-
-// Sync threads, one per owner thread and routed by the same path hash, so
-// two syncs of one file stay ordered while syncs of different files run in
-// parallel — the same shape the writes have.
-fn disk_sync_senders() -> &'static [std::sync::mpsc::Sender<DiskSyncRequest>] {
-    static SENDERS: std::sync::OnceLock<Vec<std::sync::mpsc::Sender<DiskSyncRequest>>> =
-        std::sync::OnceLock::new();
-    SENDERS.get_or_init(|| {
-        (0..DISK_WRITE_OWNER_THREADS)
-            .map(|index| {
-                let (tx, rx) = std::sync::mpsc::channel::<DiskSyncRequest>();
-                std::thread::Builder::new()
-                    .name(format!("weaver-disk-sync-{index}"))
-                    .spawn(move || {
-                        for request in rx {
-                            match request {
-                                DiskSyncRequest::Sync {
-                                    path,
-                                    file,
-                                    response,
-                                } => {
-                                    let started = Instant::now();
-                                    let result = durable_sync(&file);
-                                    drop(file);
-                                    crate::runtime::perf_probe::record(
-                                        "download.disk_sync.flush",
-                                        started.elapsed(),
-                                    );
-                                    if result.is_err() {
-                                        // The owner keeps a handle a sync just
-                                        // failed through; drop it so the next
-                                        // write reopens, exactly as the inline
-                                        // sync used to.
-                                        release_cached_write_handle(&path);
-                                    }
-                                    let _ = response.send(result);
-                                }
-                                DiskSyncRequest::Fence(ack) => {
-                                    let _ = ack.send(());
-                                }
-                            }
-                        }
-                    })
-                    .expect("failed to spawn Weaver disk sync thread");
-                tx
-            })
-            .collect()
-    })
-}
-
-enum DiskWriteCommand {
-    Batch {
-        path: std::path::PathBuf,
-        segments: Vec<(u64, BufferedDecodedSegment)>,
-        queued_at: Instant,
-        response: tokio::sync::oneshot::Sender<
-            Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError>,
-        >,
-    },
-    // One direct-store destination's share of a routed article.
-    //
-    // Raw bytes rather than a `BufferedDecodedSegment`, because a routed run is
-    // a *fragment* of an article: one decoded span is split across a member
-    // partial and the set's envelope, and neither piece is a segment.
-    RawBatch {
-        path: std::path::PathBuf,
-        writes: Vec<(u64, Vec<bytes::Bytes>)>,
-        queued_at: Instant,
-        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
-    },
-    // Durably syncs one destination. The owner thread only duplicates the
-    // cached handle — no I/O — and hands the duplicate to a sync thread, so
-    // the file's writes keep flowing while its dirty pages are flushed.
-    //
-    // Queued behind the batches submitted before it, which is all the
-    // barrier needs: a coverage barrier only claims writes the owner has
-    // already acknowledged, and a sync through any handle flushes the whole
-    // inode. What it must **not** do is hold this thread for the flush's
-    // duration: on a network share that is seconds per barrier, and every
-    // write to the file — the download itself — would queue behind it.
-    SyncPath {
-        path: std::path::PathBuf,
-        response: tokio::sync::oneshot::Sender<std::io::Result<()>>,
-    },
-    CloseHandles {
-        scope: CloseHandleScope,
-        ack: Option<tokio::sync::oneshot::Sender<()>>,
-    },
-    // Close the cached handle for `path` and unlink the file, in that order
-    // and on the closer thread, so the unlink never lands on an open file.
-    RemoveFile {
-        path: std::path::PathBuf,
-    },
-}
-
-#[derive(Clone)]
-enum CloseHandleScope {
-    Path(std::path::PathBuf),
-    Prefix(std::path::PathBuf),
-}
-
-impl CloseHandleScope {
-    fn matches(&self, path: &std::path::Path) -> bool {
-        match self {
-            Self::Path(target) => path == target,
-            Self::Prefix(prefix) => path.starts_with(prefix),
-        }
-    }
-}
-
-impl DiskWriteOwnerPool {
-    fn new() -> Self {
-        let (closer, closer_rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("weaver-disk-close".to_string())
-            .spawn(move || run_disk_handle_closer(closer_rx))
-            .expect("failed to spawn Weaver disk handle closer thread");
-        let mut senders = Vec::with_capacity(DISK_WRITE_OWNER_THREADS);
-        for index in 0..DISK_WRITE_OWNER_THREADS {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let closer = closer.clone();
-            std::thread::Builder::new()
-                .name(format!("weaver-disk-wr-{index}"))
-                .spawn(move || run_disk_write_owner(rx, closer))
-                .expect("failed to spawn Weaver disk write owner thread");
-            senders.push(tx);
-        }
-
-        Self { senders }
-    }
-
-    // Batches for a path must all land on the owner thread caching its handle;
-    // per-thread FIFO then guarantees a queued CloseHandles runs after every
-    // batch submitted before it.
-    fn owner_index_for_path(&self, path: &std::path::Path) -> usize {
-        sync_index_for_path(path, self.senders.len())
-    }
-
-    async fn write_batch(
-        &self,
-        path: std::path::PathBuf,
-        segments: Vec<(u64, BufferedDecodedSegment)>,
-    ) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
-        let queued_at = Instant::now();
-        crate::runtime::perf_probe::record_value("download.disk_write.owner.submitted", 1);
-        let (response, response_rx) = tokio::sync::oneshot::channel();
-        let sender_index = self.owner_index_for_path(&path);
-        let command = DiskWriteCommand::Batch {
-            path,
-            segments,
-            queued_at,
-            response,
-        };
-
-        if let Err(error) = self.senders[sender_index].send(command) {
-            let DiskWriteCommand::Batch { segments, .. } = error.0 else {
-                unreachable!("disk write batch send returned a different command");
-            };
-            return Err(SegmentWriteBatchError {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "disk write owner thread stopped",
-                ),
-                written: Vec::new(),
-                unwritten: segments,
-            });
-        }
-
-        response_rx.await.unwrap_or_else(|error| {
-            Err(SegmentWriteBatchError {
-                source: std::io::Error::other(error),
-                written: Vec::new(),
-                unwritten: Vec::new(),
-            })
-        })
-    }
-
-    // Queues one destination's sub-batch and hands back its completion. Split
-    // from awaiting so a multi-path article submits every sub-batch first and
-    // only then joins them — otherwise the fan-out would be a sequence.
-    fn submit_raw_batch(
-        &self,
-        path: std::path::PathBuf,
-        writes: Vec<(u64, Vec<bytes::Bytes>)>,
-    ) -> tokio::sync::oneshot::Receiver<std::io::Result<()>> {
-        let (response, response_rx) = tokio::sync::oneshot::channel();
-        let sender_index = self.owner_index_for_path(&path);
-        let command = DiskWriteCommand::RawBatch {
-            path,
-            writes,
-            queued_at: Instant::now(),
-            response,
-        };
-        if let Err(error) = self.senders[sender_index].send(command) {
-            let DiskWriteCommand::RawBatch { response, .. } = error.0 else {
-                unreachable!("raw batch send returned a different command");
-            };
-            let _ = response.send(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "disk write owner thread stopped",
-            )));
-        }
-        response_rx
-    }
-
-    // Queues one sync without waiting for it, so a caller with several
-    // destinations can have them all in flight before it awaits any.
-    fn submit_sync_path(
-        &self,
-        path: std::path::PathBuf,
-    ) -> tokio::sync::oneshot::Receiver<std::io::Result<()>> {
-        let (response, response_rx) = tokio::sync::oneshot::channel();
-        let sender_index = self.owner_index_for_path(&path);
-        if let Err(error) =
-            self.senders[sender_index].send(DiskWriteCommand::SyncPath { path, response })
-        {
-            let DiskWriteCommand::SyncPath { response, .. } = error.0 else {
-                unreachable!("sync path send returned a different command");
-            };
-            let _ = response.send(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "disk write owner thread stopped",
-            )));
-        }
-        response_rx
-    }
-
-    fn release_handle(&self, path: &std::path::Path) {
-        let index = self.owner_index_for_path(path);
-        let _ = self.senders[index].send(DiskWriteCommand::CloseHandles {
-            scope: CloseHandleScope::Path(path.to_path_buf()),
-            ack: None,
-        });
-    }
-
-    fn remove_file(&self, path: &std::path::Path) {
-        let index = self.owner_index_for_path(path);
-        if let Err(std::sync::mpsc::SendError(DiskWriteCommand::RemoveFile { path })) =
-            self.senders[index].send(DiskWriteCommand::RemoveFile {
-                path: path.to_path_buf(),
-            })
-        {
-            // The owner is gone and its handles with it: nothing is open.
-            remove_closed_file(&path);
-        }
-    }
-
-    async fn close_handles_matching(&self, scope: CloseHandleScope) {
-        let mut acks = Vec::with_capacity(self.senders.len());
-        for sender in &self.senders {
-            let (ack, ack_rx) = tokio::sync::oneshot::channel();
-            let command = DiskWriteCommand::CloseHandles {
-                scope: scope.clone(),
-                ack: Some(ack),
-            };
-            // A send error means the owner thread is gone and its cache (and
-            // handles) dropped with it, which is exactly the state we want.
-            if sender.send(command).is_ok() {
-                acks.push(ack_rx);
-            }
-        }
-        for ack in acks {
-            let _ = ack.await;
-        }
-        // The owners have closed, so no new duplicate can be made; fence the
-        // sync threads so the duplicates already out are dropped too.
-        let mut fences = Vec::with_capacity(DISK_WRITE_OWNER_THREADS);
-        for sender in disk_sync_senders() {
-            let (ack, ack_rx) = tokio::sync::oneshot::channel();
-            if sender.send(DiskSyncRequest::Fence(ack)).is_ok() {
-                fences.push(ack_rx);
-            }
-        }
-        for fence in fences {
-            let _ = fence.await;
-        }
-    }
-}
-
-static DISK_WRITE_OWNER_POOL: std::sync::OnceLock<DiskWriteOwnerPool> = std::sync::OnceLock::new();
-
-fn disk_write_owner_pool() -> &'static DiskWriteOwnerPool {
-    DISK_WRITE_OWNER_POOL.get_or_init(DiskWriteOwnerPool::new)
-}
-
-// Drop the cached write handle for `path` on its owner thread, if any.
-// Fire-and-forget: queued behind any in-flight batches for the path, so the
-// handle closes only after those writes land.
-pub(crate) fn release_cached_write_handle(path: &std::path::Path) {
-    let Some(pool) = DISK_WRITE_OWNER_POOL.get() else {
-        return;
-    };
-    pool.release_handle(path);
-}
-
-// Close the cached write handle for `path`, if any, then unlink the file,
-// both on the closer thread in the order given. Fire-and-forget like
-// [`release_cached_write_handle`], and queued behind it: a caller that
-// released the path earlier gets the unlink after that close too.
-//
-// This is the only way to delete a file the owner pool may still hold open.
-// Unlinking it from the caller instead races the close, and on a network
-// share the race is lost visibly: the file is renamed to a `.nfs…` sibling
-// that refuses to be unlinked until the handle closes, and the directory
-// it sits in cannot be removed until then.
-pub(crate) fn remove_file_after_cached_write_handle(path: &std::path::Path) {
-    match DISK_WRITE_OWNER_POOL.get() {
-        Some(pool) => pool.remove_file(path),
-        None => remove_closed_file(path),
-    }
-}
-
-// Close every cached write handle for paths under `dir` and wait until the
-// owner threads acknowledge. Must be awaited before renaming, moving, or
-// deleting a job's working files: working-dir paths are reused verbatim after
-// deletion, and a stale cached handle would silently swallow a later job's
-// writes into the old unlinked inode.
-pub(crate) async fn close_cached_write_handles_under(dir: &std::path::Path) {
-    // A direct-store placement writing under `dir` right now would open its
-    // destination again after the close, through a handle nothing then
-    // closes — and into a file the caller is about to move or delete.
-    wait_for_direct_placements_under(dir).await;
-    let Some(pool) = DISK_WRITE_OWNER_POOL.get() else {
-        return;
-    };
-    pool.close_handles_matching(CloseHandleScope::Prefix(dir.to_path_buf()))
-        .await;
-}
-
-struct CachedDiskWriteHandle {
-    file: std::fs::File,
-    last_used: Instant,
-}
-
-// Handles leaving an owner's cache, closed on the closer thread.
-//
-// The last close of a freshly written file is where the kernel flushes its
-// dirty pages (tens of milliseconds for a large file on macOS), and an owner
-// thread serves every file that hashes to it. The owner hands the handle
-// off so a completed file's
-// flush never queues behind another file's writes. The closer is FIFO, so an
-// `ack` is sent only once every close queued before it — including earlier
-// fire-and-forget releases of the same path — has actually happened, which is
-// what a rename or delete waiting on the ack needs on Windows.
-struct HandleCloseRequest {
-    files: Vec<std::fs::File>,
-    ack: Option<tokio::sync::oneshot::Sender<()>>,
-    // A path to unlink once `files` are closed. An unlink that races the
-    // close is not a delete on a network share: NFS renames a still-open
-    // file to a `.nfs…` sibling and only removes that on the last close,
-    // and the sibling refuses `unlink` with `EBUSY` until then — which is
-    // how a job's staging directory outlives its own cleanup, empty. The
-    // close and the unlink stay in FIFO order here, behind every earlier
-    // close of the same path.
-    remove: Option<std::path::PathBuf>,
-}
-
-fn run_disk_handle_closer(rx: std::sync::mpsc::Receiver<HandleCloseRequest>) {
-    while let Ok(request) = rx.recv() {
-        let started = Instant::now();
-        let closed = request.files.len();
-        drop(request.files);
-        if closed > 0 {
-            crate::runtime::perf_probe::record(
-                "download.disk_write.handle_close",
-                started.elapsed(),
-            );
-        }
-        if let Some(path) = request.remove {
-            remove_closed_file(&path);
-        }
-        if let Some(ack) = request.ack {
-            let _ = ack.send(());
-        }
-    }
-}
-
-// Unlinks a scratch file whose cached handle is closed. One that is already
-// gone is the outcome wanted; anything else is worth a line, since the file
-// would otherwise sit in the job's staging directory until the job is
-// removed.
-fn remove_closed_file(path: &std::path::Path) {
-    if let Err(error) = std::fs::remove_file(path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            path = %path.display(),
-            error = %error,
-            "failed to remove a direct-store scratch file after closing it"
-        );
-    }
-}
-
-#[derive(Default)]
-struct DiskWriteHandleCache {
-    entries: std::collections::HashMap<std::path::PathBuf, CachedDiskWriteHandle>,
-    // The closer thread's queue. `None` closes inline (tests).
-    closer: Option<std::sync::mpsc::Sender<HandleCloseRequest>>,
-}
-
-impl DiskWriteHandleCache {
-    fn open_or_reuse(&mut self, path: &std::path::Path) -> std::io::Result<&mut std::fs::File> {
-        if !self.entries.contains_key(path) {
-            crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.miss", 1);
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(path)?;
-            self.evict_to_cap();
-            self.entries.insert(
-                path.to_path_buf(),
-                CachedDiskWriteHandle {
-                    file,
-                    last_used: Instant::now(),
-                },
-            );
-        } else {
-            crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.hit", 1);
-        }
-        let entry = self
-            .entries
-            .get_mut(path)
-            .expect("cached disk write handle present after insert");
-        entry.last_used = Instant::now();
-        Ok(&mut entry.file)
-    }
-
-    fn discard(&mut self, path: &std::path::Path) {
-        if let Some(entry) = self.entries.remove(path) {
-            self.close_files(vec![entry.file], None, None);
-        }
-    }
-
-    // Drop the handle for `path`, if any, and unlink the file once it is
-    // closed. The request travels even with nothing cached: the unlink must
-    // still queue behind an earlier fire-and-forget release of the path.
-    fn close_and_remove(&mut self, path: &std::path::Path) {
-        let files = self
-            .entries
-            .remove(path)
-            .map(|entry| vec![entry.file])
-            .unwrap_or_default();
-        self.close_files(files, None, Some(path.to_path_buf()));
-    }
-
-    // Drop every handle `scope` matches. `ack` fires once they are closed,
-    // and only after every close queued ahead of it.
-    fn close_matching(
-        &mut self,
-        scope: &CloseHandleScope,
-        ack: Option<tokio::sync::oneshot::Sender<()>>,
-    ) {
-        let files = self
-            .entries
-            .extract_if(|path, _| scope.matches(path))
-            .map(|(_, entry)| entry.file)
-            .collect();
-        self.close_files(files, ack, None);
-    }
-
-    fn close_idle(&mut self, ttl: std::time::Duration) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        let files = self
-            .entries
-            .extract_if(|_, entry| now.duration_since(entry.last_used) >= ttl)
-            .map(|(_, entry)| entry.file)
-            .collect();
-        self.close_files(files, None, None);
-    }
-
-    // Hand `files` to the closer thread, or close them here when there is
-    // none. An empty request still travels when it carries an ack or an
-    // unlink: their promise is that earlier closes of the path have landed,
-    // not that this call found something to close.
-    fn close_files(
-        &self,
-        files: Vec<std::fs::File>,
-        ack: Option<tokio::sync::oneshot::Sender<()>>,
-        remove: Option<std::path::PathBuf>,
-    ) {
-        if files.is_empty() && ack.is_none() && remove.is_none() {
-            return;
-        }
-        let request = HandleCloseRequest { files, ack, remove };
-        let request = match &self.closer {
-            Some(closer) => match closer.send(request) {
-                Ok(()) => return,
-                Err(std::sync::mpsc::SendError(request)) => request,
-            },
-            None => request,
-        };
-        drop(request.files);
-        if let Some(path) = request.remove {
-            remove_closed_file(&path);
-        }
-        if let Some(ack) = request.ack {
-            let _ = ack.send(());
-        }
-    }
-
-    fn evict_to_cap(&mut self) {
-        while self.entries.len() >= DISK_WRITE_HANDLE_CACHE_CAP {
-            let Some(least_recent) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            crate::runtime::perf_probe::record_value("download.disk_write.handle_cache.evicted", 1);
-            if let Some(entry) = self.entries.remove(&least_recent) {
-                self.close_files(vec![entry.file], None, None);
-            }
-        }
-    }
-}
-
-fn run_disk_write_owner(
-    rx: std::sync::mpsc::Receiver<DiskWriteCommand>,
-    closer: std::sync::mpsc::Sender<HandleCloseRequest>,
-) {
-    crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-    let mut handles = DiskWriteHandleCache {
-        closer: Some(closer),
-        ..DiskWriteHandleCache::default()
-    };
-    let mut last_sweep = Instant::now();
-    loop {
-        match rx.recv_timeout(DISK_WRITE_OWNER_SWEEP_INTERVAL) {
-            Ok(DiskWriteCommand::Batch {
-                path,
-                segments,
-                queued_at,
-                response,
-            }) => {
-                let result =
-                    write_segments_to_disk_blocking(&mut handles, path, segments, queued_at);
-                let _ = response.send(result);
-            }
-            Ok(DiskWriteCommand::RawBatch {
-                path,
-                writes,
-                queued_at,
-                response,
-            }) => {
-                let result = write_raw_batch_blocking(&mut handles, path, writes, queued_at);
-                let _ = response.send(result);
-            }
-            Ok(DiskWriteCommand::SyncPath { path, response }) => {
-                let file = match handles
-                    .open_or_reuse(&path)
-                    .and_then(|file| file.try_clone())
-                {
-                    Ok(file) => file,
-                    Err(error) => {
-                        handles.discard(&path);
-                        let _ = response.send(Err(error));
-                        continue;
-                    }
-                };
-                let senders = disk_sync_senders();
-                let index = sync_index_for_path(&path, senders.len());
-                if let Err(std::sync::mpsc::SendError(DiskSyncRequest::Sync { response, .. })) =
-                    senders[index].send(DiskSyncRequest::Sync {
-                        path,
-                        file,
-                        response,
-                    })
-                {
-                    let _ = response.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "disk sync thread stopped",
-                    )));
-                }
-            }
-            Ok(DiskWriteCommand::CloseHandles { scope, ack }) => {
-                handles.close_matching(&scope, ack);
-            }
-            Ok(DiskWriteCommand::RemoveFile { path }) => {
-                handles.close_and_remove(&path);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        // The idle sweep is a 30 s backstop, not per-batch bookkeeping: a busy
-        // owner walks its handles once per sweep interval, an idle one on the
-        // receive timeout, instead of after every command it serves.
-        if last_sweep.elapsed() >= DISK_WRITE_OWNER_SWEEP_INTERVAL {
-            handles.close_idle(DISK_WRITE_HANDLE_IDLE_TTL);
-            last_sweep = Instant::now();
-        }
-    }
-}
-
-fn write_segments_to_disk_blocking(
-    handles: &mut DiskWriteHandleCache,
-    path: std::path::PathBuf,
-    segments: Vec<(u64, BufferedDecodedSegment)>,
-    queued_at: Instant,
-) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
-    crate::e2e_failpoint::maybe_hold(crate::e2e_failpoint::DISK_WRITE, &path);
-    let task_started = Instant::now();
-    crate::runtime::perf_probe::record(
-        "download.disk_write.owner.queue_wait",
-        task_started.duration_since(queued_at),
-    );
-    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.disk_write.task");
-
-    let file = match handles.open_or_reuse(&path) {
-        Ok(file) => file,
-        Err(source) => {
-            return Err(SegmentWriteBatchError {
-                source,
-                written: Vec::new(),
-                unwritten: segments,
-            });
-        }
-    };
-
-    let result = write_segments_into_file(file, segments);
-    if result.is_err() {
-        // A failed seek/write leaves the handle in an unknown state (the path
-        // may even have vanished); drop it so the next batch reopens fresh,
-        // matching the old open-per-batch recovery behavior.
-        handles.discard(&path);
-        return result;
-    }
-
-    crate::runtime::perf_probe::record("download.disk_write.task", task_started.elapsed());
-    result
-}
-
-fn write_damaged_segment(
-    file: &mut std::fs::File,
-    offset: u64,
-    data: &DecodedChunk,
-    spans: &[std::ops::Range<usize>],
-) -> std::io::Result<()> {
-    use std::io::Seek;
-    let mut chunks = Vec::new();
-    data.push_io_slices(&mut chunks);
-    let mut slices = Vec::new();
-    for span in spans {
-        slices.clear();
-        let mut chunk_start = 0;
-        for chunk in &chunks {
-            let chunk_end = chunk_start + chunk.len();
-            let start = span.start.max(chunk_start);
-            let end = span.end.min(chunk_end);
-            if start < end {
-                slices.push(std::io::IoSlice::new(
-                    &chunk[start - chunk_start..end - chunk_start],
-                ));
-            }
-            chunk_start = chunk_end;
-            if chunk_start >= span.end {
-                break;
-            }
-        }
-        file.seek(std::io::SeekFrom::Start(offset + span.start as u64))?;
-        write_all_vectored(file, &mut slices).map_err(|(error, _)| error)?;
-    }
-    Ok(())
-}
-
-fn write_segments_into_file(
-    file: &mut std::fs::File,
-    mut segments: Vec<(u64, BufferedDecodedSegment)>,
-) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
-    use std::io::Seek;
-
-    // A batch for one file is mostly a contiguous run of articles; each run
-    // is one seek and one vectored write, however many articles and decode
-    // batches it spans, instead of a write per batch of every article.
-    let mut slices: Vec<std::io::IoSlice<'_>> = Vec::new();
-    let mut next_file_offset = None;
-    let mut completed = 0usize;
-    let failure = loop {
-        if completed == segments.len() {
-            return Ok(segments);
-        }
-        if let Some(damage) = segments[completed].1.damaged_source.as_ref() {
-            let (offset, segment) = &segments[completed];
-            if let Err(error) =
-                write_damaged_segment(file, *offset, &segment.data, &damage.write_spans)
-            {
-                break error;
-            }
-            completed += 1;
-            next_file_offset = None;
-            continue;
-        }
-        let run_start = completed;
-        let run_offset = segments[run_start].0;
-        let mut run_end = run_start;
-        let mut run_len = 0u64;
-        while run_end < segments.len()
-            && segments[run_end].0 == run_offset + run_len
-            && segments[run_end].1.damaged_source.is_none()
-        {
-            run_len += segments[run_end].1.data.len_bytes() as u64;
-            run_end += 1;
-        }
-
-        if next_file_offset != Some(run_offset)
-            && let Err(source) = file.seek(std::io::SeekFrom::Start(run_offset))
-        {
-            break source;
-        }
-        slices.clear();
-        for (_, segment) in &segments[run_start..run_end] {
-            segment.data.push_io_slices(&mut slices);
-        }
-        match write_all_vectored(file, &mut slices) {
-            Ok(()) => {
-                completed = run_end;
-                next_file_offset = Some(run_offset + run_len);
-            }
-            Err((source, written_bytes)) => {
-                // Every segment the written prefix covers whole is done; the
-                // one it cuts through is retried whole with the rest.
-                let mut covered = written_bytes;
-                for (_, segment) in &segments[run_start..run_end] {
-                    let len = segment.data.len_bytes();
-                    if covered < len {
-                        break;
-                    }
-                    covered -= len;
-                    completed += 1;
-                }
-                break source;
-            }
-        }
-    };
-
-    let unwritten = segments.split_off(completed);
-    Err(SegmentWriteBatchError {
-        source: failure,
-        written: segments,
-        unwritten,
-    })
-}
-
-// Writes every slice in order, retrying short and interrupted writes. On
-// failure, reports how many bytes landed before the error so the caller can
-// account for the fully-written prefix.
-fn write_all_vectored<W: std::io::Write>(
-    file: &mut W,
-    mut slices: &mut [std::io::IoSlice<'_>],
-) -> Result<(), (std::io::Error, usize)> {
-    let mut written = 0usize;
-    std::io::IoSlice::advance_slices(&mut slices, 0);
-    while !slices.is_empty() {
-        match file.write_vectored(slices) {
-            Ok(0) => {
-                return Err((
-                    std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write whole buffer",
-                    ),
-                    written,
-                ));
-            }
-            Ok(n) => {
-                written += n;
-                std::io::IoSlice::advance_slices(&mut slices, n);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err((error, written)),
-        }
-    }
-    Ok(())
-}
-
-// How many `IoSlice`s one `write_vectored` is given. `IOV_MAX` is 1024 on the
-// platforms with a real vectored write, and a routed run can carry more pieces
-// than that — one per decoded batch of every article in it. The budget keeps
-// each syscall inside the limit, and the loop around it is what makes the
-// count irrelevant: a run drains over as many calls as it takes.
-const WRITE_IOV_BUDGET: usize = 256;
-
-// One contiguous run, written in order at the current file position.
-//
-// Chunked at [`WRITE_IOV_BUDGET`] and written in sequence, so the position
-// carries from one chunk to the next and no chunk needs a seek of its own.
-// `write_all_vectored` handles a short write inside a chunk, advancing across
-// piece boundaries, so a writer that takes an arbitrary number of bytes per
-// call still sees every byte exactly once and in order.
-fn write_run_vectored<W: std::io::Write>(
-    file: &mut W,
-    slices: &mut [std::io::IoSlice<'_>],
-) -> Result<(), (std::io::Error, usize)> {
-    let mut written = 0usize;
-    for chunk in slices.chunks_mut(WRITE_IOV_BUDGET) {
-        // Measured before the call: `advance_slices` shortens the element it
-        // stopped inside, so the chunk no longer describes its own length once
-        // the write has run.
-        let chunk_len: usize = chunk.iter().map(|slice| slice.len()).sum();
-        if let Err((error, partial)) = write_all_vectored(file, chunk) {
-            return Err((error, written + partial));
-        }
-        written += chunk_len;
-    }
-    Ok(())
-}
-
-fn write_raw_batch_blocking(
-    handles: &mut DiskWriteHandleCache,
-    path: std::path::PathBuf,
-    writes: Vec<(u64, Vec<bytes::Bytes>)>,
-    queued_at: Instant,
-) -> std::io::Result<()> {
-    use std::io::Seek;
-
-    crate::runtime::perf_probe::record(
-        "download.disk_write.owner.queue_wait",
-        Instant::now().duration_since(queued_at),
-    );
-    let file = handles.open_or_reuse(&path)?;
-    let mut slices: Vec<std::io::IoSlice<'_>> = Vec::new();
-    let mut next_offset = None;
-    let mut index = 0usize;
-    while index < writes.len() {
-        let run_offset = writes[index].0;
-        let mut run_len = 0u64;
-        slices.clear();
-        // One seek per contiguous run, as before: the pieces of a write are
-        // contiguous by construction and adjacent writes are coalesced by the
-        // offset comparison, so the run is still the unit the file position
-        // follows.
-        while index < writes.len() && writes[index].0 == run_offset + run_len {
-            for piece in &writes[index].1 {
-                if piece.is_empty() {
-                    continue;
-                }
-                slices.push(std::io::IoSlice::new(piece));
-                run_len += piece.len() as u64;
-            }
-            index += 1;
-        }
-        if next_offset != Some(run_offset)
-            && let Err(source) = file.seek(std::io::SeekFrom::Start(run_offset))
-        {
-            handles.discard(&path);
-            return Err(source);
-        }
-        if let Err((source, _)) = write_run_vectored(file, &mut slices) {
-            handles.discard(&path);
-            return Err(source);
-        }
-        next_offset = Some(run_offset + run_len);
-    }
-    Ok(())
-}
-
-// One routed article's fragments, grouped into one sub-batch per destination
-// file: `(destination path, [(offset, pieces)])`.
-//
-// A fragment's payload is a list of refcounted views of the decoder's own
-// buffers rather than an owned copy, and the owner thread writes the views
-// directly with a vectored write.
-pub(crate) type DirectWriteBatches = Vec<(std::path::PathBuf, Vec<(u64, Vec<bytes::Bytes>)>)>;
-
-// The destinations each direct-store placement task is writing right now,
-// keyed by a process-wide ticket number. A handle close waits on the ones
-// under its root; see [`close_cached_write_handles_under`].
-//
-// Process-wide rather than the pipeline's, because the closes that need it
-// run on tasks of their own after the pipeline has let the job go.
-static DIRECT_PLACEMENTS_IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<PlacementsInFlight>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-// Ticket number to the destinations a placement task claims and the watcher
-// its ticket releases.
-type PlacementsInFlight = HashMap<u64, (Vec<std::path::PathBuf>, tokio::sync::watch::Receiver<()>)>;
-
-static NEXT_DIRECT_PLACEMENT_TICKET: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-// A placement task's claim on its destinations. Dropped when the task's
-// writes have all returned, which is what releases a close waiting on it.
-pub(crate) struct DirectPlacementTicket {
-    id: u64,
-    _released: tokio::sync::watch::Sender<()>,
-}
-
-impl Drop for DirectPlacementTicket {
-    fn drop(&mut self) {
-        if let Ok(mut flights) = DIRECT_PLACEMENTS_IN_FLIGHT.lock() {
-            flights.remove(&self.id);
-        }
-    }
-}
-
-// Claims `paths` for a placement task about to write them. Taken on the
-// pipeline task, before the writer is spawned, so a close the pipeline asks
-// for afterwards always sees it.
-pub(crate) fn register_direct_placement(paths: Vec<std::path::PathBuf>) -> DirectPlacementTicket {
-    let id = NEXT_DIRECT_PLACEMENT_TICKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (released, watcher) = tokio::sync::watch::channel(());
-    if let Ok(mut flights) = DIRECT_PLACEMENTS_IN_FLIGHT.lock() {
-        flights.insert(id, (paths, watcher));
-    }
-    DirectPlacementTicket {
-        id,
-        _released: released,
-    }
-}
-
-// Waits until no placement task is writing a destination under `dir`.
-pub(crate) async fn wait_for_direct_placements_under(dir: &std::path::Path) {
-    let mut watchers: Vec<tokio::sync::watch::Receiver<()>> =
-        match DIRECT_PLACEMENTS_IN_FLIGHT.lock() {
-            Ok(flights) => flights
-                .values()
-                .filter(|(paths, _)| paths.iter().any(|path| path.starts_with(dir)))
-                .map(|(_, watcher)| watcher.clone())
-                .collect(),
-            Err(_) => return,
-        };
-    for watcher in &mut watchers {
-        // Nothing is ever sent; the channel closes when the ticket drops.
-        while watcher.changed().await.is_ok() {}
-    }
-}
-
-// Writes one routed article's fragments to **every** destination it touches,
-// fanning the per-path sub-batches out to their owner threads and joining them
-// all.
-//
-// The article counts as placed only when every destination write returned;
-// a partial failure is reported as an error and leaves orphan bytes, which is
-// safe because the coverage map — not the bytes — is the truth.
-pub(crate) async fn write_direct_batches(batches: DirectWriteBatches) -> std::io::Result<()> {
-    if batches.is_empty() {
-        return Ok(());
-    }
-    let pool = disk_write_owner_pool();
-    // Every sub-batch is queued before any of them is awaited, so the owner
-    // threads run in parallel; joining them all is what makes the article
-    // "placed only when every destination write returned".
-    let mut pending = Vec::with_capacity(batches.len());
-    for (path, writes) in batches {
-        pending.push(pool.submit_raw_batch(path, writes));
-    }
-    let mut first_error = None;
-    for response in pending {
-        let result = response
-            .await
-            .unwrap_or_else(|error| Err(std::io::Error::other(error)));
-        if let Err(error) = result
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-// Durably syncs every destination one coverage barrier touched, in parallel.
-//
-// Same shape as [`write_direct_batches`], and for the same reason: every sync
-// is queued to its owner thread before any of them is awaited. Envelope v2
-// turned a barrier's sync set from two destinations into `members + volumes`,
-// so awaiting them one at a time serialized `n` independent fsyncs behind each
-// other on the pipeline task. The ordering guarantee is unchanged — the barrier
-// still sees every sync's outcome before it persists anything.
-//
-// The flush itself runs on a sync thread through a duplicate of the owner's
-// handle (see [`DiskWriteCommand::SyncPath`]), so the destination keeps taking
-// writes for as long as the flush lasts.
-pub(crate) async fn sync_direct_destinations(
-    paths: Vec<std::path::PathBuf>,
-) -> Vec<std::io::Result<()>> {
-    let pool = disk_write_owner_pool();
-    let pending: Vec<_> = paths
-        .into_iter()
-        .map(|path| pool.submit_sync_path(path))
-        .collect();
-    let mut results = Vec::with_capacity(pending.len());
-    for response in pending {
-        results.push(
-            response
-                .await
-                .unwrap_or_else(|error| Err(std::io::Error::other(error))),
-        );
-    }
-    results
-}
-
-pub(crate) async fn write_segments_to_disk(
-    path: &std::path::Path,
-    segments: Vec<(u64, BufferedDecodedSegment)>,
-) -> Result<Vec<(u64, BufferedDecodedSegment)>, SegmentWriteBatchError> {
-    let path = path.to_owned();
-    let started = Instant::now();
-    let result = disk_write_owner_pool().write_batch(path, segments).await;
-    crate::runtime::perf_probe::record("download.disk_write.await", started.elapsed());
-    result
-}
-
 pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
     buffers: &Arc<BufferPool>,
@@ -3256,487 +1604,4 @@ pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
         status,
         JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }
     )
-}
-
-#[cfg(test)]
-mod disk_write_handle_cache_tests {
-    use super::*;
-    use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
-
-    #[test]
-    fn a_handle_close_waits_for_a_direct_placement_writing_under_its_root() {
-        use std::future::Future;
-        let temp_dir = tempfile::tempdir().unwrap();
-        let root = temp_dir.path().join("job");
-        let other = temp_dir.path().join("other-job");
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-
-        let ticket = register_direct_placement(vec![root.join("feature.mkv.direct.partial")]);
-        let mut under = std::pin::pin!(wait_for_direct_placements_under(&root));
-        assert!(under.as_mut().poll(&mut cx).is_pending());
-        let mut elsewhere = std::pin::pin!(wait_for_direct_placements_under(&other));
-        assert!(elsewhere.as_mut().poll(&mut cx).is_ready());
-
-        drop(ticket);
-        assert!(under.as_mut().poll(&mut cx).is_ready());
-    }
-
-    // Accepts a fixed number of bytes per call, whatever it was offered, so a
-    // write lands in the middle of an `IoSlice` and the next call has to
-    // resume there.
-    struct ShortWriter {
-        per_call: usize,
-        written: Vec<u8>,
-        calls: usize,
-    }
-
-    impl std::io::Write for ShortWriter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            let take = buffer.len().min(self.per_call);
-            self.written.extend_from_slice(&buffer[..take]);
-            self.calls += 1;
-            Ok(take)
-        }
-
-        fn write_vectored(&mut self, slices: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
-            let mut budget = self.per_call;
-            let mut taken = 0usize;
-            for slice in slices {
-                if budget == 0 {
-                    break;
-                }
-                let take = slice.len().min(budget);
-                self.written.extend_from_slice(&slice[..take]);
-                budget -= take;
-                taken += take;
-            }
-            self.calls += 1;
-            Ok(taken)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_run_of_more_pieces_than_one_syscall_takes_is_written_whole_and_in_order() {
-        // More pieces than the iovec budget, so the run needs several vectored
-        // calls, and a per-call byte count that lands inside a piece rather than
-        // on its boundary, so every call has to resume mid-slice.
-        let pieces: Vec<bytes::Bytes> = (0..WRITE_IOV_BUDGET * 3 + 7)
-            .map(|index| {
-                let len = 1 + index % 13;
-                bytes::Bytes::from(vec![(index % 251) as u8; len])
-            })
-            .collect();
-        let expected: Vec<u8> = pieces.iter().flat_map(|piece| piece.to_vec()).collect();
-        let mut slices: Vec<std::io::IoSlice<'_>> = pieces
-            .iter()
-            .map(|piece| std::io::IoSlice::new(piece))
-            .collect();
-        let mut writer = ShortWriter {
-            per_call: 17,
-            written: Vec::new(),
-            calls: 0,
-        };
-        write_run_vectored(&mut writer, &mut slices).expect("the run drains");
-        assert_eq!(
-            writer.written, expected,
-            "every byte of every piece lands exactly once, in order"
-        );
-        assert!(
-            writer.calls > expected.len() / 17,
-            "a writer that takes 17 bytes a call cannot have drained the run in fewer"
-        );
-    }
-
-    #[test]
-    fn a_run_written_through_the_batch_seam_lands_at_its_offset_in_one_seek() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("envelope.bin");
-        std::fs::write(&path, vec![0u8; 16]).unwrap();
-        let mut handles = DiskWriteHandleCache::default();
-        // Two contiguous runs and a gap: 4..8 and 8..12 coalesce, 14..16 does
-        // not, and the sub-batch arrives sorted by offset as the commit seam
-        // sorts it.
-        let writes = vec![
-            (
-                4u64,
-                vec![
-                    bytes::Bytes::from_static(b"ab"),
-                    bytes::Bytes::from_static(b"cd"),
-                ],
-            ),
-            (8u64, vec![bytes::Bytes::from_static(b"efgh")]),
-            (14u64, vec![bytes::Bytes::from_static(b"zz")]),
-        ];
-        write_raw_batch_blocking(&mut handles, path.clone(), writes, Instant::now()).unwrap();
-        let mut expected = vec![0u8; 16];
-        expected[4..12].copy_from_slice(b"abcdefgh");
-        expected[14..16].copy_from_slice(b"zz");
-        assert_eq!(std::fs::read(&path).unwrap(), expected);
-    }
-
-    #[test]
-    fn masked_damage_writes_only_permitted_spans_and_propagates_io_errors() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("masked.bin");
-        std::fs::write(&path, b"........").unwrap();
-        let data = DecodedChunk::from(vec![
-            b"abc".to_vec().into_boxed_slice(),
-            b"defgh".to_vec().into_boxed_slice(),
-        ]);
-        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        write_damaged_segment(&mut file, 0, &data, &[1..4, 6..8]).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b".bcd..gh");
-        let mut read_only = std::fs::File::open(&path).unwrap();
-        write_damaged_segment(&mut read_only, 0, &data, &[]).unwrap();
-        assert!(write_damaged_segment(&mut read_only, 0, &data, &[0..2, 4..6]).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b".bcd..gh");
-    }
-
-    fn segment(bytes: &[u8]) -> BufferedDecodedSegment {
-        BufferedDecodedSegment {
-            damaged_source: None,
-            encoding: SegmentEncoding::Yenc,
-            segment_id: SegmentId {
-                file_id: NzbFileId {
-                    job_id: JobId(1),
-                    file_index: 0,
-                },
-                segment_number: 1,
-            },
-            decoded_size: bytes.len() as u32,
-            data: DecodedChunk::from(bytes.to_vec()),
-            part_crc: 0,
-            part_crc_verified: false,
-            declared_file_len: 0,
-            yenc_name: String::new(),
-            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
-            segments: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn batches_reuse_cached_handle_and_preserve_prior_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("part.bin");
-        let mut cache = DiskWriteHandleCache::default();
-
-        let first = write_segments_to_disk_blocking(
-            &mut cache,
-            path.clone(),
-            vec![(0, segment(b"hello"))],
-            Instant::now(),
-        )
-        .map_err(|error| error.source)
-        .unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(cache.entries.len(), 1);
-
-        let second = write_segments_to_disk_blocking(
-            &mut cache,
-            path.clone(),
-            vec![(5, segment(b" world"))],
-            Instant::now(),
-        )
-        .map_err(|error| error.source)
-        .unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(cache.entries.len(), 1);
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
-    }
-
-    // Contiguous articles, multi-batch ones included, land through one
-    // vectored write per run; a gap starts a new run at its own offset.
-    #[test]
-    fn contiguous_runs_and_gaps_write_the_exact_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("part.bin");
-        let mut cache = DiskWriteHandleCache::default();
-
-        let mut batched = segment(b"cdef");
-        batched.data = DecodedChunk::from(vec![
-            b"cd".to_vec().into_boxed_slice(),
-            b"ef".to_vec().into_boxed_slice(),
-        ]);
-
-        let written = write_segments_to_disk_blocking(
-            &mut cache,
-            path.clone(),
-            vec![
-                (0, segment(b"ab")),
-                (2, batched),
-                (6, segment(b"gh")),
-                (10, segment(b"kl")),
-                (12, segment(b"mn")),
-            ],
-            Instant::now(),
-        )
-        .map_err(|error| error.source)
-        .unwrap();
-
-        assert_eq!(written.len(), 5);
-        assert_eq!(std::fs::read(&path).unwrap(), b"abcdefgh\0\0klmn");
-    }
-
-    #[test]
-    fn open_failure_returns_all_segments_unwritten_and_caches_nothing() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("missing-dir").join("part.bin");
-        let mut cache = DiskWriteHandleCache::default();
-
-        let error = write_segments_to_disk_blocking(
-            &mut cache,
-            path,
-            vec![(0, segment(b"a")), (1, segment(b"b"))],
-            Instant::now(),
-        )
-        .map(|written| written.len())
-        .unwrap_err();
-
-        assert!(error.written.is_empty());
-        assert_eq!(error.unwritten.len(), 2);
-        assert!(cache.entries.is_empty());
-    }
-
-    #[test]
-    fn write_failure_splits_batch_and_discards_cached_handle() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("part.bin");
-        std::fs::write(&path, b"seed").unwrap();
-
-        // A read-only handle makes every write fail while seeks still succeed,
-        // standing in for a handle that went bad mid-batch.
-        let mut cache = DiskWriteHandleCache::default();
-        cache.entries.insert(
-            path.clone(),
-            CachedDiskWriteHandle {
-                file: std::fs::File::open(&path).unwrap(),
-                last_used: Instant::now(),
-            },
-        );
-
-        let error = write_segments_to_disk_blocking(
-            &mut cache,
-            path.clone(),
-            vec![(0, segment(b"a")), (1, segment(b"b"))],
-            Instant::now(),
-        )
-        .map(|written| written.len())
-        .unwrap_err();
-
-        assert!(error.written.is_empty());
-        assert_eq!(error.unwritten.len(), 2);
-        assert!(
-            cache.entries.is_empty(),
-            "failed handle must be dropped so the next batch reopens the path"
-        );
-    }
-
-    #[test]
-    fn cache_evicts_least_recent_handle_at_cap() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut cache = DiskWriteHandleCache::default();
-
-        for index in 0..DISK_WRITE_HANDLE_CACHE_CAP + 2 {
-            let path = temp.path().join(format!("part-{index}.bin"));
-            cache.open_or_reuse(&path).unwrap();
-        }
-
-        assert_eq!(cache.entries.len(), DISK_WRITE_HANDLE_CACHE_CAP);
-        let newest = temp
-            .path()
-            .join(format!("part-{}.bin", DISK_WRITE_HANDLE_CACHE_CAP + 1));
-        assert!(cache.entries.contains_key(&newest));
-    }
-
-    // With a closer attached, a close leaves the owner's cache at once and
-    // the ack fires from the closer only after the handle is really gone —
-    // including an ack that found nothing left to close, which must still
-    // queue behind the earlier fire-and-forget release of the same path.
-    #[test]
-    fn close_matching_hands_handles_to_the_closer_and_acks_after_close() {
-        let temp = tempfile::tempdir().unwrap();
-        let (closer, closer_rx) = std::sync::mpsc::channel();
-        let mut cache = DiskWriteHandleCache {
-            closer: Some(closer),
-            ..DiskWriteHandleCache::default()
-        };
-        let path = temp.path().join("part.bin");
-        cache.open_or_reuse(&path).unwrap();
-
-        cache.close_matching(&CloseHandleScope::Path(path.clone()), None);
-        assert!(cache.entries.is_empty());
-        let (ack, mut ack_rx) = tokio::sync::oneshot::channel();
-        cache.close_matching(&CloseHandleScope::Path(path.clone()), Some(ack));
-
-        let release = closer_rx.try_recv().unwrap();
-        assert_eq!(release.files.len(), 1);
-        assert!(release.ack.is_none());
-        let acked = closer_rx.try_recv().unwrap();
-        assert!(acked.files.is_empty());
-        assert!(acked.ack.is_some());
-        assert!(
-            ack_rx.try_recv().is_err(),
-            "ack fired before the closer closed anything"
-        );
-
-        let closer = std::thread::spawn(move || {
-            for request in [release, acked] {
-                drop(request.files);
-                if let Some(ack) = request.ack {
-                    let _ = ack.send(());
-                }
-            }
-        });
-        closer.join().unwrap();
-        assert!(ack_rx.try_recv().is_ok());
-    }
-
-    // A removal leaves the owner's cache at once and reaches the closer as
-    // one request that closes first and unlinks second, queued behind an
-    // earlier release of the same path; the file is on disk until the
-    // closer runs that request, and gone once it has.
-    #[test]
-    fn close_and_remove_unlinks_on_the_closer_after_the_close() {
-        let temp = tempfile::tempdir().unwrap();
-        let (closer, closer_rx) = std::sync::mpsc::channel();
-        let mut cache = DiskWriteHandleCache {
-            closer: Some(closer),
-            ..DiskWriteHandleCache::default()
-        };
-        let path = temp.path().join("part.bin");
-        cache.open_or_reuse(&path).unwrap();
-
-        cache.close_matching(&CloseHandleScope::Path(path.clone()), None);
-        cache.close_and_remove(&path);
-        assert!(cache.entries.is_empty());
-
-        let release = closer_rx.try_recv().unwrap();
-        assert_eq!(release.files.len(), 1);
-        assert!(release.remove.is_none());
-        let removal = closer_rx.try_recv().unwrap();
-        assert!(
-            removal.files.is_empty(),
-            "the release already took the handle"
-        );
-        assert_eq!(removal.remove.as_deref(), Some(path.as_path()));
-        assert!(path.exists(), "unlinked before the closer ran");
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let closer = std::thread::spawn(move || run_disk_handle_closer(rx));
-        tx.send(release).unwrap();
-        tx.send(removal).unwrap();
-        drop(tx);
-        closer.join().unwrap();
-        assert!(!path.exists(), "the closer must unlink after closing");
-    }
-
-    // Without a closer the removal is inline, and a path with no cached
-    // handle is still unlinked.
-    #[test]
-    fn close_and_remove_without_a_closer_unlinks_inline() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut cache = DiskWriteHandleCache::default();
-        let cached = temp.path().join("cached.bin");
-        let uncached = temp.path().join("uncached.bin");
-        cache.open_or_reuse(&cached).unwrap();
-        std::fs::write(&uncached, b"x").unwrap();
-
-        cache.close_and_remove(&cached);
-        cache.close_and_remove(&uncached);
-
-        assert!(cache.entries.is_empty());
-        assert!(!cached.exists());
-        assert!(!uncached.exists());
-    }
-
-    // What the final move relies on: a removal queued before it closes a
-    // root's handles is **done** by the time that close returns, on every
-    // owner and on the closer, so the walk that follows never meets the file.
-    //
-    // Through the real pool: the files are written by it, so each handle is
-    // cached on whichever owner its path hashes to, and enough of them that
-    // the removals land on more than one owner.
-    #[tokio::test]
-    async fn a_removal_queued_before_a_root_close_is_done_when_the_close_returns() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("job");
-        std::fs::create_dir_all(&root).unwrap();
-        let paths: Vec<std::path::PathBuf> = (0..DISK_WRITE_OWNER_THREADS * 4)
-            .map(|index| root.join(format!("set.f0.vol{index:05}.envelope")))
-            .collect();
-        write_direct_batches(
-            paths
-                .iter()
-                .map(|path| {
-                    (
-                        path.clone(),
-                        vec![(0, vec![bytes::Bytes::from_static(b"volume bytes")])],
-                    )
-                })
-                .collect(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            paths.iter().all(|path| path.exists()),
-            "non-vacuity: every file must exist before its removal"
-        );
-
-        for path in &paths {
-            remove_file_after_cached_write_handle(path);
-        }
-        close_cached_write_handles_under(&root).await;
-
-        let left: Vec<_> = std::fs::read_dir(&root)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .collect();
-        assert!(
-            left.is_empty(),
-            "a removal queued before the close must be complete when it returns, found {left:?}"
-        );
-    }
-
-    #[test]
-    fn close_matching_honors_path_and_prefix_scopes() {
-        let temp = tempfile::tempdir().unwrap();
-        let job_a = temp.path().join("job-a");
-        let job_b = temp.path().join("job-b");
-        std::fs::create_dir_all(&job_a).unwrap();
-        std::fs::create_dir_all(&job_b).unwrap();
-
-        let mut cache = DiskWriteHandleCache::default();
-        let a1 = job_a.join("part-1.bin");
-        let a2 = job_a.join("part-2.bin");
-        let b1 = job_b.join("part-1.bin");
-        for path in [&a1, &a2, &b1] {
-            cache.open_or_reuse(path).unwrap();
-        }
-
-        cache.close_matching(&CloseHandleScope::Prefix(job_a.clone()), None);
-        assert_eq!(cache.entries.len(), 1);
-        assert!(cache.entries.contains_key(&b1));
-
-        cache.close_matching(&CloseHandleScope::Path(b1.clone()), None);
-        assert!(cache.entries.is_empty());
-    }
-
-    #[test]
-    fn close_idle_drops_handles_past_ttl() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut cache = DiskWriteHandleCache::default();
-        cache.open_or_reuse(&temp.path().join("part.bin")).unwrap();
-
-        cache.close_idle(std::time::Duration::from_secs(3600));
-        assert_eq!(cache.entries.len(), 1);
-
-        cache.close_idle(std::time::Duration::ZERO);
-        assert!(cache.entries.is_empty());
-    }
 }

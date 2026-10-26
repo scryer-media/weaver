@@ -71,22 +71,16 @@ type fullSuiteOptions struct {
 }
 
 var fullPhaseDefinitions = []fullPhaseDefinition{
-	// Direct-store routing is on for the functional corpus rather than in a
-	// phase of its own. It began as a duplicate phase re-running all 92 fixtures
-	// with the gate flipped, which cost a second full run to learn very little:
-	// most of the corpus is archives direct-store is *right* to refuse, so the
-	// phase mostly measured refusals. The corpus now carries `direct-store-*`
-	// fixtures built to route direct, the gate is on for every functional run,
-	// and `assertDirectStoreEngagement` asserts from weaver's own counters that
-	// those sets really did route — the only external evidence available, since
-	// direct output is byte-identical to the conventional path.
-	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
-	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	// The functional corpus carries `direct-store-*` fixtures built to be read
+	// in place, and `assertDirectStoreEngagement` asserts from the graph's lines
+	// that those sets really were: stored output is byte-identical either way.
+	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
 	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
 	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},
-	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
-	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
+	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
+	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
 	{name: "Product Behavior Gate", command: "release-gate", slug: "product-behavior", skipSeed: true, datastore: weaverDatastoreSQLite},
 }
 
@@ -190,7 +184,6 @@ type childRunResult struct {
 type phaseRunStatus struct {
 	Phase            string         `json:"phase"`
 	Command          string         `json:"command"`
-	Engine           weaverEngine   `json:"engine"`
 	Datastore        string         `json:"datastore"`
 	Project          string         `json:"project"`
 	RootDir          string         `json:"root_dir"`
@@ -218,7 +211,6 @@ type fullRunManifest struct {
 	OwnerPID  int                 `json:"owner_pid"`
 	StartedAt time.Time           `json:"started_at"`
 	TempRoot  string              `json:"temp_root"`
-	Engine    weaverEngine        `json:"engine"`
 	Phases    []fullRunPhaseEntry `json:"phases"`
 	// KeepStacks records E2E_KEEP_STACKS: the stacks were left up on purpose
 	// and stay up while the bundle is retained.
@@ -806,7 +798,6 @@ func runParallelFullSuiteWithOptions(options fullSuiteOptions) {
 	if err := writeFullRunManifest(manifestPath, tempRoot, phases); err != nil {
 		log.Fatalf("write full-run manifest: %v", err)
 	}
-	log.Printf("engine under test: %s (%s)", engineUnderTest(), weaverEngineEnv)
 	if err := cleanupAbandonedFullRuns(); err != nil {
 		log.Printf("warning: cleanup abandoned full runs: %v", err)
 	}
@@ -1735,7 +1726,6 @@ func newPhaseRunRecorderAt(
 		state: phaseRunStatus{
 			Phase:            phase.Name,
 			Command:          command,
-			Engine:           engineUnderTest(),
 			Datastore:        normalizedWeaverDatastoreForPhase(phase.Datastore),
 			Project:          phase.Project,
 			RootDir:          phase.RootDir,
@@ -1867,7 +1857,6 @@ func writeFullRunManifest(path, tempRoot string, phases []*fullPhaseContext) err
 		OwnerPID:   os.Getpid(),
 		StartedAt:  time.Now(),
 		TempRoot:   tempRoot,
-		Engine:     engineUnderTest(),
 		Phases:     make([]fullRunPhaseEntry, 0, len(phases)),
 		KeepStacks: envBool("E2E_KEEP_STACKS", false),
 	}

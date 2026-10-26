@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Repair below the root under both engines: a split 7z's volumes repaired
+// Repair below the root: a split 7z's volumes repaired
 // by a PAR2 set posted beside them inside stored 7z containers one, two and
 // three deep; two sets sharing one recovery file; a described file no post
-// carries; and a damaged member no set covers, two deep. Classic runs no
-// repair inside an archive, so each nested row names how the engines part.
+// carries; and a damaged member no set covers, two deep.
 
 use std::io::Cursor;
 
@@ -14,9 +13,8 @@ use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMet
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, par2_set, payload, run,
 };
-use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 
 // A stored 7z of `entries`, in order.
@@ -133,48 +131,29 @@ fn assert_repaired_below(graph: &Outcome) {
     assert_eq!(graph.graph().claims["lantern.7z"], Claim::Damaged);
 }
 
-// Classic refetches the damaged article, which comes back damaged again, and
-// fails the job unpacking the outer archive: its repair does not reach a set
-// inside an archive.
-fn assert_classic_fails_unpacking(classic: &Outcome) {
-    assert_eq!(
-        classic.failure.as_deref(),
-        Some("archive file lantern.7z is incomplete after downloads and recovery settled")
-    );
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
-    assert!(!classic.refetched().is_empty(), "classic refetched nothing");
+#[tokio::test]
+async fn a_split_7z_one_deep_is_repaired_by_the_par2_set_beside_it() {
+    let graph = run(&nested(1)).await;
+    assert_repaired_below(&graph);
 }
 
 #[tokio::test]
-async fn a_split_7z_one_deep_is_repaired_by_the_par2_set_beside_it_under_graph_and_fails_under_classic()
- {
-    let (classic, graph) = run_both(&nested(1)).await;
+async fn a_split_7z_two_deep_is_repaired_by_the_par2_set_beside_it() {
+    let graph = run(&nested(2)).await;
     assert_repaired_below(&graph);
-    assert_classic_fails_unpacking(&classic);
 }
 
 #[tokio::test]
-async fn a_split_7z_two_deep_is_repaired_by_the_par2_set_beside_it_under_graph_and_fails_under_classic()
- {
-    let (classic, graph) = run_both(&nested(2)).await;
+async fn a_split_7z_three_deep_is_repaired_by_the_par2_set_beside_it() {
+    let graph = run(&nested(3)).await;
     assert_repaired_below(&graph);
-    assert_classic_fails_unpacking(&classic);
-}
-
-#[tokio::test]
-async fn a_split_7z_three_deep_is_repaired_by_the_par2_set_beside_it_under_graph_and_fails_under_classic()
- {
-    let (classic, graph) = run_both(&nested(3)).await;
-    assert_repaired_below(&graph);
-    assert_classic_fails_unpacking(&classic);
 }
 
 // Two sets whose recovery packets share one file, `ab.vol00+5.par2`, made
 // by concatenating each set's own volume. One article of each set's file is
 // served damaged; each set rebuilds its own.
 #[tokio::test]
-async fn two_sets_sharing_one_recovery_file_each_repair_their_own_file_under_both_engines() {
+async fn two_sets_sharing_one_recovery_file_each_repair_their_own_file() {
     let alpha = payload(4 * ARTICLE, 71);
     let bravo = payload(5 * ARTICLE + 9, 72);
     let [index_a, volume_a]: [Post; 2] = par2_set("a", &[("alpha.bin", alpha.as_slice())], 2)
@@ -196,26 +175,11 @@ async fn two_sets_sharing_one_recovery_file_each_repair_their_own_file_under_bot
     ])
     .damaged(0, 1)
     .damaged(1, 2);
-    let (classic, graph) = run_both(&scenario).await;
-    for outcome in [&classic, &graph] {
-        assert!(
-            outcome.completed(),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.failure
-        );
-        assert!(
-            outcome.files[&delivered("alpha.bin")] == alpha,
-            "{}",
-            outcome.engine
-        );
-        assert!(
-            outcome.files[&delivered("bravo.bin")] == bravo,
-            "{}",
-            outcome.engine
-        );
-    }
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(graph.files[&delivered("alpha.bin")] == alpha, "",);
+    assert!(graph.files[&delivered("bravo.bin")] == bravo, "",);
+    assert_fetched_once(&graph);
     // One recovery object holds both sets, and rebuilds a slice of each.
     assert_eq!(
         graph.graph().outcomes,
@@ -227,7 +191,7 @@ async fn two_sets_sharing_one_recovery_file_each_repair_their_own_file_under_bot
 // A file the set describes and no post carries is announced, every slice
 // missing, and rebuilt whole from the recovery blocks.
 #[tokio::test]
-async fn a_described_file_no_post_carries_is_rebuilt_whole_under_both_engines() {
+async fn a_described_file_no_post_carries_is_rebuilt_whole() {
     let lantern = payload(4 * ARTICLE, 73);
     let quill = payload(3 * ARTICLE - 3, 74);
     let set = par2_set(
@@ -240,26 +204,11 @@ async fn a_described_file_no_post_carries_is_rebuilt_whole_under_both_engines() 
     );
     let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
     posts.extend(set);
-    let (classic, graph) = run_both(&Scenario::new(posts)).await;
-    for outcome in [&classic, &graph] {
-        assert!(
-            outcome.completed(),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.failure
-        );
-        assert!(
-            outcome.files[&delivered("quill.bin")] == quill,
-            "{}",
-            outcome.engine
-        );
-        assert!(
-            outcome.files[&delivered("lantern.bin")] == lantern,
-            "{}",
-            outcome.engine
-        );
-    }
-    assert_same(&classic, &graph);
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(graph.files[&delivered("quill.bin")] == quill, "",);
+    assert!(graph.files[&delivered("lantern.bin")] == lantern, "",);
+    assert_fetched_once(&graph);
     assert_eq!(
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 3 })]
@@ -267,19 +216,16 @@ async fn a_described_file_no_post_carries_is_rebuilt_whole_under_both_engines() 
 }
 
 // A member two deep that no set covers, with one outer article served
-// damaged inside it. Graph refuses the archive the damage has no cover in,
-// and delivers that archive as it stands beside the member it had closed
-// whole; classic fails unpacking the outer one after fetching the article
-// again.
+// damaged inside it. The archive the damage has no cover in is refused and
+// delivered as it stands beside the member it had closed whole.
 #[tokio::test]
-async fn an_uncovered_damaged_member_two_deep_is_refused_to_its_archive_under_graph_and_fails_under_classic()
- {
+async fn an_uncovered_damaged_member_two_deep_is_refused_to_its_archive() {
     let entries = members();
     let borrowed: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (*n, b.as_slice())).collect();
     let (outer, _) = wrapped(vec![Post::plain("level.7z", stored(&borrowed))], 1);
     let ordinal = article_inside(&outer, &entries[0].1);
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).damaged(0, ordinal);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     // The refused archive is delivered as it stands: the job ends Partial.
     assert_eq!(
         graph.status,
@@ -298,5 +244,4 @@ async fn an_uncovered_damaged_member_two_deep_is_refused_to_its_archive_under_gr
     assert!(graph.graph().outcomes.is_empty());
     assert_eq!(graph.graph().claims["lantern.7z"], Claim::Damaged);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert_classic_fails_unpacking(&classic);
 }

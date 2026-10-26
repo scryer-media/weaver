@@ -528,7 +528,7 @@ impl Pipeline {
         if let Some(cache) = RepeatedArticles::new(
             &state.spec,
             &state.working_dir,
-            self.process_memory_budget.for_job(state.job_id.0),
+            Arc::clone(&self.process_memory_budget),
         )
         .map_err(crate::SchedulerError::InvalidInput)?
         {
@@ -784,13 +784,16 @@ mod tests {
         let DecodedChunk::Shared(body) = &replayed.data else {
             panic!("a stored body replays shared")
         };
-        let pieces = replayed.data.pieces();
-        let inner = body.data.pieces();
+        let mut pieces = Vec::new();
+        replayed
+            .data
+            .for_each_slice(|piece| pieces.push((piece.as_ptr(), piece.to_vec())));
+        let mut inner = Vec::new();
+        body.data.for_each_slice(|piece| inner.push(piece.as_ptr()));
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].as_ref(), bytes.as_slice());
+        assert_eq!(pieces[0].1, bytes);
         assert_eq!(
-            pieces[0].as_ptr(),
-            inner[0].as_ptr(),
+            pieces[0].0, inner[0],
             "a shared article hands out the body's own buffer, never a copy"
         );
     }

@@ -406,17 +406,6 @@ impl Queue {
         self.intent_wake.notified().await;
     }
 
-    // Resolves once shutdown has been signalled. It watches the revision,
-    // which every write moves, so it takes no wake from the actor's loop.
-    pub(crate) async fn shutdown_requested(&self) {
-        let mut revision = self.subscribe();
-        while !self.read(|inner| inner.globals.shutting_down) {
-            if revision.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
-        }
-    }
-
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.revision.subscribe()
     }

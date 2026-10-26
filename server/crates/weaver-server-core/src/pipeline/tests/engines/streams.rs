@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Compressed streams and tars under both engines: one file compressed by
+// Compressed streams and tars: one file compressed by
 // each stream kind the objects read, a tar of two members, the same tar
 // gzipped, and a compressed subtitle posted beside the plain one it holds.
 
 use std::io::Write;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, payload, run, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload, run,
 };
 use crate::history::HistoryFailureKind;
-use crate::pipeline::graph::Engine;
 
 fn ember() -> Vec<u8> {
     payload(9 * ARTICLE + 21, 61)
@@ -79,39 +78,29 @@ fn delivered(name: &str) -> String {
 
 // The job completed and delivered exactly `expected`.
 fn assert_delivered(outcome: &Outcome, expected: &[(&str, Vec<u8>)]) {
-    assert!(
-        outcome.completed(),
-        "{}: {:?}",
-        outcome.engine,
-        outcome.failure
-    );
+    assert!(outcome.completed(), "{:?}", outcome.failure);
     let mut names: Vec<String> = expected.iter().map(|(name, _)| delivered(name)).collect();
     names.sort();
     assert_eq!(
         outcome.files.keys().cloned().collect::<Vec<_>>(),
         names,
-        "{}: delivered names",
-        outcome.engine
+        "delivered names",
     );
     for (name, bytes) in expected {
-        assert!(
-            outcome.files[&delivered(name)] == *bytes,
-            "{}: {name} bytes",
-            outcome.engine
-        );
+        assert!(outcome.files[&delivered(name)] == *bytes, "{name} bytes",);
     }
 }
 
-// One compressed post, delivered as the file it holds under both engines.
+// One compressed post, delivered as the file it holds.
 async fn one_stream(name: &str, compressed: Vec<u8>) {
     let scenario = Scenario::new(vec![Post::plain(name, compressed)]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_delivered(&graph, &[("ember.bin", ember())]);
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 #[tokio::test]
-async fn an_xz_stream_delivers_the_file_it_holds_under_both_engines() {
+async fn an_xz_stream_delivers_the_file_it_holds() {
     one_stream("ember.bin.xz", xz(&ember())).await;
 }
 
@@ -126,32 +115,32 @@ async fn an_xz_stream_split_into_numbered_pieces_delivers_the_file_it_holds() {
         .zip(1..)
         .map(|(bytes, number)| Post::plain(&format!("ember.bin.xz.{number:03}"), bytes.to_vec()))
         .collect();
-    let graph = run(&Scenario::new(pieces), Engine::Graph).await;
+    let graph = run(&Scenario::new(pieces)).await;
     assert_delivered(&graph, &[("ember.bin", ember())]);
 }
 
 #[tokio::test]
-async fn a_gzip_stream_delivers_the_file_it_holds_under_both_engines() {
+async fn a_gzip_stream_delivers_the_file_it_holds() {
     one_stream("ember.bin.gz", gzip(&ember())).await;
 }
 
 #[tokio::test]
-async fn a_bzip2_stream_delivers_the_file_it_holds_under_both_engines() {
+async fn a_bzip2_stream_delivers_the_file_it_holds() {
     one_stream("ember.bin.bz2", bzip2(&ember())).await;
 }
 
 #[tokio::test]
-async fn a_zstd_stream_delivers_the_file_it_holds_under_both_engines() {
+async fn a_zstd_stream_delivers_the_file_it_holds() {
     one_stream("ember.bin.zst", zstd(&ember())).await;
 }
 
 #[tokio::test]
-async fn a_brotli_stream_delivers_the_file_it_holds_under_both_engines() {
+async fn a_brotli_stream_delivers_the_file_it_holds() {
     one_stream("ember.bin.br", brotli(&ember())).await;
 }
 
 #[tokio::test]
-async fn a_raw_deflate_stream_delivers_the_file_it_holds_under_both_engines() {
+async fn a_raw_deflate_stream_delivers_the_file_it_holds() {
     one_stream("ember.bin.deflate", deflate(&ember())).await;
 }
 
@@ -160,25 +149,24 @@ pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
 }
 
 #[tokio::test]
-async fn a_tar_delivers_its_members_under_both_engines() {
+async fn a_tar_delivers_its_members() {
     let scenario = Scenario::new(vec![Post::plain("lantern.tar", tar(&members()))]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_delivered(&graph, &members());
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 #[tokio::test]
-async fn a_gzipped_tar_delivers_its_members_under_both_engines() {
+async fn a_gzipped_tar_delivers_its_members() {
     let scenario = Scenario::new(vec![Post::plain("lantern.tar.gz", gzip(&tar(&members())))]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_delivered(&graph, &members());
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 // One post cut into articles of every size from the whole file down to a
-// byte (4 KiB is the whole file again): one outcome and one set of files
-// under both engines, neither refetches, and the graph reads it through
-// `kinds`.
+// byte (4 KiB is the whole file again): one outcome and one set of files,
+// nothing is refetched, and the graph reads it through `kinds`.
 async fn delivers_alike_in_every_frame_size(
     name: &str,
     bytes: Vec<u8>,
@@ -188,11 +176,10 @@ async fn delivers_alike_in_every_frame_size(
     let mut seen = None;
     for size in [usize::MAX, 4096, 64, 1] {
         let scenario = Scenario::new(vec![Post::plain(name, bytes.clone())]).framed(size);
-        let (classic, graph) = run_both(&scenario).await;
-        assert_delivered(&classic, expected);
+        let graph = run(&scenario).await;
         assert_delivered(&graph, expected);
         assert_eq!(kinds(&graph), expected_kinds, "frames of {size} bytes");
-        assert_same(&classic, &graph);
+        assert_fetched_once(&graph);
         let files = seen.get_or_insert_with(|| graph.files.clone());
         assert_eq!(*files, graph.files, "frames of {size} bytes");
     }
@@ -203,42 +190,42 @@ async fn one_stream_in_every_frame_size(name: &str, compressed: Vec<u8>, kind: &
 }
 
 #[tokio::test]
-async fn an_xz_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn an_xz_stream_delivers_alike_in_every_frame_size() {
     one_stream_in_every_frame_size("ember.bin.xz", xz(&ember()), "stream_xz").await;
 }
 
 #[tokio::test]
-async fn a_gzip_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_gzip_stream_delivers_alike_in_every_frame_size() {
     one_stream_in_every_frame_size("ember.bin.gz", gzip(&ember()), "stream_gz").await;
 }
 
 #[tokio::test]
-async fn a_bzip2_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_bzip2_stream_delivers_alike_in_every_frame_size() {
     one_stream_in_every_frame_size("ember.bin.bz2", bzip2(&ember()), "stream_bzip2").await;
 }
 
 #[tokio::test]
-async fn a_zstd_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_zstd_stream_delivers_alike_in_every_frame_size() {
     one_stream_in_every_frame_size("ember.bin.zst", zstd(&ember()), "stream_zstd").await;
 }
 
 #[tokio::test]
-async fn a_brotli_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_brotli_stream_delivers_alike_in_every_frame_size() {
     one_stream_in_every_frame_size("ember.bin.br", brotli(&ember()), "stream_brotli").await;
 }
 
 #[tokio::test]
-async fn a_raw_deflate_stream_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_raw_deflate_stream_delivers_alike_in_every_frame_size() {
     one_stream_in_every_frame_size("ember.bin.deflate", deflate(&ember()), "stream_deflate").await;
 }
 
 #[tokio::test]
-async fn a_tar_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_tar_delivers_alike_in_every_frame_size() {
     delivers_alike_in_every_frame_size("lantern.tar", tar(&members()), &members(), &["tar"]).await;
 }
 
 #[tokio::test]
-async fn a_gzipped_tar_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_gzipped_tar_delivers_alike_in_every_frame_size() {
     delivers_alike_in_every_frame_size(
         "lantern.tar.gz",
         gzip(&tar(&members())),
@@ -249,8 +236,7 @@ async fn a_gzipped_tar_delivers_alike_in_every_frame_size_under_both_engines() {
 }
 
 // The compressed subtitle holds a different file of the plain one's name.
-// Neither is written over the other. Classic writes the inner file over the
-// plain one.
+// Neither is written over the other.
 #[tokio::test]
 async fn subs_srt_beside_subs_srt_gz_delivers_both_and_overwrites_nothing() {
     let plain = payload(2 * ARTICLE + 5, 63);
@@ -259,9 +245,7 @@ async fn subs_srt_beside_subs_srt_gz_delivers_both_and_overwrites_nothing() {
         Post::plain("subs.srt", plain.clone()),
         Post::plain("subs.srt.gz", gzip(&inner)),
     ]);
-    let classic = run(&scenario, Engine::Classic).await;
-    assert_delivered(&classic, &[("subs.srt", inner.clone())]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_delivered(&graph, &[("subs.srt", plain), ("subs (1).srt", inner)]);
 }
 
@@ -277,7 +261,7 @@ async fn an_xz_damaged_at_its_front_beside_a_par2_set_covering_nothing_ends_with
     let other = payload(2 * ARTICLE + 7, 65);
     let mut posts = vec![Post::plain("ember.bin.xz", xz(&ember()))];
     posts.extend(par2_set("tinder", &[("tinder.bin", &other)], 2));
-    let graph = run(&Scenario::new(posts).damaged(0, 0), Engine::Graph).await;
+    let graph = run(&Scenario::new(posts).damaged(0, 0)).await;
     assert!(
         graph.failure.as_deref().is_some_and(
             |error| error.starts_with("PAR2 recovery failed for 1 set(s): tinder.par2")
@@ -319,22 +303,18 @@ fn tar_with_empty_directory(member: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn a_tar_holding_an_empty_directory_delivers_it_under_both_engines() {
+async fn a_tar_holding_an_empty_directory_delivers_it() {
     let member = members()[0].1.clone();
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.tar",
         tar_with_empty_directory(&member),
     )]);
-    let (classic, graph) = run_both(&scenario).await;
-    assert!(classic.completed(), "classic: {:?}", classic.failure);
-    let hollow = [delivered("hollow/")];
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
     assert_eq!(
-        (
-            classic.empty.iter().collect::<Vec<_>>(),
-            graph.empty.iter().collect::<Vec<_>>()
-        ),
-        (hollow.iter().collect(), hollow.iter().collect()),
-        "(classic, graph) empty directories"
+        graph.empty.iter().collect::<Vec<_>>(),
+        [&delivered("hollow/")],
+        "empty directories"
     );
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }

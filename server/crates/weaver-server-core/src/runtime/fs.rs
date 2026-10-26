@@ -3,8 +3,6 @@
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
-#[cfg(unix)]
-use std::sync::OnceLock;
 
 use crate::runtime::file_cache;
 
@@ -27,18 +25,6 @@ pub(crate) struct DirectoryFingerprint {
     volume_serial_number: u32,
     #[cfg(windows)]
     file_index: u64,
-}
-
-// An atomic regular-file move with no copy or hard-link fallback. Callers
-// journaling both names can replay an interruption without partial outputs.
-pub(crate) fn rename_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
-    if !std::fs::symlink_metadata(src)?.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "move source is not a regular file",
-        ));
-    }
-    rename_path_exclusive(src, dst)
 }
 
 // Atomic for both directories and files; never replaces an existing target.
@@ -256,155 +242,6 @@ pub(crate) fn destination_parent_matches(
     directory_fingerprint_from_path(parent).map(|actual| &actual == expected)
 }
 
-pub(crate) fn normalize_extracted_paths(root: &Path, members: &[String]) -> io::Result<()> {
-    for member in members {
-        let relative = Path::new(member);
-        if relative.as_os_str().is_empty()
-            || relative
-                .components()
-                .any(|part| !matches!(part, std::path::Component::Normal(_)))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid extracted member path",
-            ));
-        }
-        let mut path = root.to_path_buf();
-        for component in relative.components() {
-            match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid extracted member parent",
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-                Err(error) => return Err(error),
-            }
-            normalize_extracted_path(&path, false)?;
-            path.push(component);
-        }
-        normalize_extracted_path(&path, false)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(test, unix))]
-fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
-    normalize_extracted_path(path, true)
-}
-
-fn normalize_extracted_path(path: &Path, recursive: bool) -> io::Result<()> {
-    if let Err(error) = std::fs::symlink_metadata(path) {
-        if error.kind() == io::ErrorKind::NotFound {
-            return Ok(());
-        }
-        return Err(error);
-    }
-
-    #[cfg(unix)]
-    {
-        normalize_extracted_tree_unix(path, recursive)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (path, recursive);
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn normalize_extracted_tree_unix(path: &Path, recursive: bool) -> io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn normalize_one(
-        path: &Path,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-        umask: u32,
-        recursive: bool,
-    ) -> io::Result<()> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("path contains NUL byte: {}", path.display()),
-            )
-        })?;
-
-        if metadata.uid() != uid || metadata.gid() != gid {
-            let chown_result = unsafe { libc::lchown(path_c.as_ptr(), uid, gid) };
-            if chown_result != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::NotFound {
-                    return Ok(());
-                }
-                return Err(error);
-            }
-        }
-
-        if metadata.file_type().is_symlink() {
-            return Ok(());
-        }
-
-        let mode = (if metadata.is_dir() { 0o777 } else { 0o666 }) & !umask;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(mode);
-        if let Err(error) = std::fs::set_permissions(path, permissions) {
-            if error.kind() == io::ErrorKind::NotFound {
-                return Ok(());
-            }
-            return Err(error);
-        }
-
-        if recursive && metadata.is_dir() {
-            let entries = match std::fs::read_dir(path) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                };
-                normalize_one(&entry.path(), uid, gid, umask, true)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    normalize_one(
-        path,
-        unsafe { libc::geteuid() },
-        unsafe { libc::getegid() },
-        current_umask(),
-        recursive,
-    )
-}
-
-#[cfg(unix)]
-fn current_umask() -> u32 {
-    static UMASK: OnceLock<u32> = OnceLock::new();
-    *UMASK.get_or_init(|| {
-        let mask = unsafe { libc::umask(0o022) };
-        unsafe {
-            libc::umask(mask);
-        }
-        mask as u32
-    })
-}
-
 fn path_equivalence_key(path: &Path) -> String {
     let normalized = lexical_normalize(path);
     let key = normalized.to_string_lossy();
@@ -550,24 +387,6 @@ mod tests {
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
     }
 
-    #[test]
-    fn rename_file_exclusive_moves_once_and_never_replaces() {
-        let temp = tempfile::tempdir().unwrap();
-        let src = temp.path().join("src.bin");
-        let dst = temp.path().join("dst.bin");
-        std::fs::write(&src, b"source").unwrap();
-
-        rename_file_exclusive(&src, &dst).unwrap();
-        assert!(!src.exists());
-        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
-
-        std::fs::write(&src, b"second").unwrap();
-        let error = rename_file_exclusive(&src, &dst).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&src).unwrap(), b"second");
-        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
-    }
-
     #[cfg(unix)]
     #[test]
     fn rename_no_overwrite_moves_symlink_without_following_target() {
@@ -611,106 +430,5 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn normalize_extracted_members_leaves_live_sources_unchanged() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("out");
-        let nested = root.join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        let member = nested.join("movie.mkv");
-        let source = nested.join("live.partial");
-        std::fs::write(&member, b"media").unwrap();
-        std::fs::write(&source, b"source").unwrap();
-        std::fs::set_permissions(&member, std::fs::Permissions::from_mode(0o777)).unwrap();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let before = std::fs::metadata(&source).unwrap();
-
-        normalize_extracted_paths(&root, &["nested/movie.mkv".to_owned()]).unwrap();
-
-        let after = std::fs::metadata(&source).unwrap();
-        assert_eq!(before.mode(), after.mode());
-        assert_eq!(
-            (before.ctime(), before.ctime_nsec()),
-            (after.ctime(), after.ctime_nsec())
-        );
-        assert_eq!(std::fs::read(&source).unwrap(), b"source");
-        assert_eq!(
-            std::fs::metadata(&member).unwrap().mode() & 0o777,
-            0o666 & !current_umask()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn normalize_extracted_tree_applies_runtime_umask_modes() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("out");
-        let dir = root.join("nested");
-        let file = dir.join("movie.mkv");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&file, b"media").unwrap();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o777)).unwrap();
-
-        normalize_extracted_tree(&root).unwrap();
-
-        let mask = current_umask();
-        assert_eq!(
-            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-            0o777 & !mask
-        );
-        assert_eq!(
-            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-            0o777 & !mask
-        );
-        assert_eq!(
-            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-            0o666 & !mask
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn normalize_extracted_tree_treats_missing_paths_as_already_gone() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("vanished");
-
-        normalize_extracted_tree(&root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn normalize_extracted_tree_does_not_follow_symlink_targets() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("out");
-        let target = temp.path().join("target.bin");
-        let link = root.join("link.bin");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(&target, b"target").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        normalize_extracted_tree(&root).unwrap();
-
-        assert!(
-            std::fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
     }
 }

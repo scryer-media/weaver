@@ -7,7 +7,7 @@
 // must finish as a run that never restarted finishes, and the only articles
 // it asks for again are the ones it held in memory when it went down.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use sevenz_turbo::EncoderMethod;
 
@@ -20,7 +20,6 @@ use super::streams::{brotli, bzip2, gzip, members, tar, xz, zstd};
 use super::zip;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::download::queue::DownloadWork;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
     Entry, build_7z_shaped, split_volumes,
@@ -33,8 +32,8 @@ use crate::pipeline::tests::direct_store::{
     protected_store_set, single_member_store_set,
 };
 use crate::pipeline::tests::{
-    insert_active_job, insert_active_job_on, job_status_for_assert,
-    new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues, retire_pipeline_database,
+    insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::pipeline::{Pipeline, PipelineEvent};
 
@@ -93,10 +92,7 @@ pub(super) async fn run_restarting_at(
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
-    stamp_graph(&pipeline.db);
-    pipeline.admit_graph_job(JOB, Engine::Graph);
-    assert!(pipeline.is_graph_job(JOB));
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
 
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
@@ -106,7 +102,7 @@ pub(super) async fn run_restarting_at(
     let mut in_memory = BTreeSet::new();
     let mut restarts = 0;
     let mut quiet = 0;
-    let mut graph = Some(GraphView::default());
+    let mut graph = GraphView::default();
     let mut reads = 0;
     loop {
         while let Some(work) = next_work(&mut pipeline, scenario) {
@@ -151,9 +147,6 @@ pub(super) async fn run_restarting_at(
             break;
         }
         let before = requests.values().sum::<usize>();
-        if pipeline.write_buffered_bytes > 0 {
-            pipeline.flush_quiescent_write_backlog().await;
-        }
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }
@@ -203,7 +196,7 @@ pub(super) async fn run_restarting_at(
         in_memory,
         restarts,
         order,
-        graph: graph.unwrap_or_default(),
+        graph,
     }
 }
 
@@ -311,11 +304,8 @@ async fn restart_heard(
             job_id: JOB,
             job_hash: [0; 32],
             spec: scenario.spec(),
-            complete_files: HashSet::new(),
-            file_progress: Default::default(),
             detected_archives: Default::default(),
             file_identities: Default::default(),
-            extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             download_state: None,
             post_state: None,
@@ -358,7 +348,7 @@ pub(super) fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
 }
 
 pub(super) async fn restart_row(scenario: Scenario) {
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);
@@ -423,9 +413,7 @@ async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
-    stamp_graph(&pipeline.db);
-    pipeline.admit_graph_job(JOB, Engine::Graph);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     let mut sent = pipeline.event_tx.subscribe();
     let mut events = Vec::new();
     let mut in_memory = BTreeSet::new();
@@ -461,9 +449,6 @@ async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
             continue;
         }
         let before = asked;
-        if pipeline.write_buffered_bytes > 0 {
-            pipeline.flush_quiescent_write_backlog().await;
-        }
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }
@@ -534,9 +519,7 @@ pub(super) async fn run_restarted_while_repairing(scenario: &Scenario) -> (Resta
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
-    stamp_graph(&pipeline.db);
-    pipeline.admit_graph_job(JOB, Engine::Graph);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     let mut sent = pipeline.event_tx.subscribe();
     let mut events = Vec::new();
     let mut in_memory = BTreeSet::new();
@@ -556,9 +539,6 @@ pub(super) async fn run_restarted_while_repairing(scenario: &Scenario) -> (Resta
             break;
         }
         let before = asked;
-        if pipeline.write_buffered_bytes > 0 {
-            pipeline.flush_quiescent_write_backlog().await;
-        }
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }
@@ -742,16 +722,15 @@ async fn an_xz_stream_inside_a_rar_volume_restarted_after_every_article_delivers
     .await;
 }
 
-// A job stamped graph whose checkpoint is gone is not restored wrong: it is
-// held back as a restore that could not be made.
+// A job with no checkpoint has nothing that says what its files hold, so
+// restore admits it afresh and it fetches every article from the start.
 #[tokio::test]
-async fn a_graph_job_with_no_checkpoint_is_refused_at_restore() {
+async fn a_job_with_no_checkpoint_is_admitted_afresh_at_restore() {
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(3 * ARTICLE, 76))]);
     let temp_dir = tempfile::tempdir().unwrap();
     let working_dir = {
         let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
         let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
-        stamp_graph(&pipeline.db);
         retire_pipeline_database(pipeline).await;
         working_dir
     };
@@ -761,11 +740,8 @@ async fn a_graph_job_with_no_checkpoint_is_refused_at_restore() {
             job_id: JOB,
             job_hash: [0; 32],
             spec: scenario.spec(),
-            complete_files: HashSet::new(),
-            file_progress: Default::default(),
             detected_archives: Default::default(),
             file_identities: Default::default(),
-            extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             download_state: None,
             post_state: None,
@@ -778,8 +754,10 @@ async fn a_graph_job_with_no_checkpoint_is_refused_at_restore() {
             working_dir,
         })
         .await;
-    assert!(pipeline.blocked_restores.contains_key(&JOB));
-    assert!(!pipeline.graph_jobs.contains_key(&JOB));
+    assert!(!pipeline.blocked_restores.contains_key(&JOB));
+    assert!(pipeline.graph_jobs.contains_key(&JOB));
+    let queued = pipeline.jobs[&JOB].download_queue.len();
+    assert_eq!(queued, scenario.spec().files[0].segments.len());
 }
 
 // A restored graph job's durable download floor is what its checkpoints
@@ -794,9 +772,7 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
-    stamp_graph(&pipeline.db);
-    pipeline.admit_graph_job(JOB, Engine::Graph);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     for _ in 0..4 {
         let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
         let article = (
@@ -822,13 +798,6 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
         );
         serve(&mut pipeline, &scenario, article).await;
     }
-    assert!(
-        !pipeline
-            .pending_file_progress
-            .keys()
-            .any(|file| file.job_id == JOB),
-        "a graph job leaves the file coverage barrier nothing to flush"
-    );
     let floor = pipeline.durable_download_floor_bytes_for_job(JOB);
     assert_eq!(
         floor,
@@ -853,26 +822,6 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
         "a restored graph job must not drop to one article at a time"
     );
     retire_pipeline_database(pipeline).await;
-}
-
-// The row stamped graph as an admission stamps it, with no checkpoint
-// written beside it.
-pub(in crate::pipeline::tests) fn stamp_graph(db: &crate::Database) {
-    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-    let datastore = db.datastore();
-    db.run_sql_blocking(async move {
-        SqlRuntime::execute(
-            datastore.read_exec(),
-            "UPDATE active_jobs SET engine = {} WHERE job_id = {}",
-            &[
-                SqlArg::Text(Engine::Graph.as_str().to_string()),
-                SqlArg::I64(JOB.0 as i64),
-            ],
-        )
-        .await?;
-        Ok(())
-    })
-    .unwrap();
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -944,7 +893,7 @@ async fn no_checkpoint_of_an_encrypted_rar_holds_its_password_or_keys() {
     })
     .await;
     assert!(seen > 0);
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     assert_restarted(&restarted, &whole);
 }
@@ -1169,7 +1118,7 @@ fn nameless_header_encrypted_second_first() -> Scenario {
 // The run shut down and restored after each article `at` picks finishes as
 // the run that never restarted does, and fetches nothing it had on disk.
 async fn shut_down_after(scenario: Scenario, at: &dyn Fn(usize) -> bool) {
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Shutdown, at).await;
     assert_restarted(&restarted, &whole);
@@ -1288,7 +1237,7 @@ async fn an_aes_zip_restarted_after_every_article_delivers_its_members_and_no_ch
     })
     .await;
     assert!(seen > 0);
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     assert_restarted(&restarted, &whole);
 }
@@ -1314,7 +1263,7 @@ async fn a_buried_refusal_restarted_after_every_article_is_offered_to_no_later_s
             .take(2),
     );
     let scenario = Scenario::new(posts).framed(512);
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     let mut buried = false;
     let restarted = run_restarting(&scenario, &mut |rows| {
         let Some(row) = rows
@@ -1354,7 +1303,7 @@ async fn a_set_missing_a_volume_restarted_after_every_article_still_fails() {
             .map(|((_, bytes), name)| Post::plain(name, bytes))
             .collect();
     let scenario = Scenario::new(posts).password(SECRET);
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert_eq!(
         whole.failure.as_deref(),
         Some("no file was delivered whole; 2 short: ember.rar, ember.r01")

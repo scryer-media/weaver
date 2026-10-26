@@ -19,7 +19,6 @@ use super::harness::{ARTICLE, Outcome, Post, Scenario, kinds, par2_set, payload,
 use super::sevenz::SECRET;
 use super::streams::{gzip, xz};
 use crate::history::HistoryFailureKind;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_store_set, header_encrypted_store_set,
@@ -138,8 +137,8 @@ fn spanning() -> Vec<(String, Vec<u8>)> {
 }
 
 #[tokio::test]
-async fn a_stored_7z_crossing_both_volume_boundaries_of_a_three_volume_rar_delivers_under_graph() {
-    let graph = run(&Scenario::new(posts(&spanning())), Engine::Graph).await;
+async fn a_stored_7z_crossing_both_volume_boundaries_of_a_three_volume_rar_delivers() {
+    let graph = run(&Scenario::new(posts(&spanning()))).await;
     assert_whole(
         &graph,
         &[("glass.bin", &glass()), ("glass.extras.bin", &extras())],
@@ -151,8 +150,7 @@ async fn a_stored_7z_crossing_both_volume_boundaries_of_a_three_volume_rar_deliv
 // its last article: the RAR is the 7z's raw bytes, so seeks into it wait for
 // the end header instead of sending the 7z to an engine.
 #[tokio::test]
-async fn a_stored_rar_inside_a_stored_7z_whose_end_header_is_in_the_last_article_delivers_under_graph()
- {
+async fn a_stored_rar_inside_a_stored_7z_whose_end_header_is_in_the_last_article_delivers() {
     let ember = payload(4 * ARTICLE + 17, 75);
     let outer = sevenz(
         &[Entry::File(
@@ -170,11 +168,7 @@ async fn a_stored_rar_inside_a_stored_7z_whose_end_header_is_in_the_last_article
     assert_eq!(header + length, outer.len());
     assert!(header <= (outer.len() - 1) / ARTICLE * ARTICLE);
     assert!(outer.len() > 4 * ARTICLE, "the 7z spans several articles");
-    let graph = run(
-        &Scenario::new(vec![Post::plain("lantern.7z", outer)]),
-        Engine::Graph,
-    )
-    .await;
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", outer)])).await;
     assert_whole(&graph, &[("ember.bin", &ember)]);
     // The kinds are a set in name order: both stores, and no engine.
     assert_eq!(kinds(&graph), ["rar_store", "sevenz_store"]);
@@ -184,7 +178,7 @@ async fn a_stored_rar_inside_a_stored_7z_whose_end_header_is_in_the_last_article
 // of the middle volume, all of it the 7z's bytes, served damaged: the set
 // repairs the volume and the 7z read through it delivers its member whole.
 #[tokio::test]
-async fn a_root_par2_set_repairs_a_volume_a_child_7z_crosses_and_the_child_delivers_under_graph() {
+async fn a_root_par2_set_repairs_a_volume_a_child_7z_crosses_and_the_child_delivers() {
     let volumes = spanning();
     let described: Vec<(&str, &[u8])> = volumes
         .iter()
@@ -192,7 +186,7 @@ async fn a_root_par2_set_repairs_a_volume_a_child_7z_crosses_and_the_child_deliv
         .collect();
     let mut posted = posts(&volumes);
     posted.extend(par2_set("lantern", &described, 2));
-    let graph = run(&Scenario::new(posted).damaged(1, 1), Engine::Graph).await;
+    let graph = run(&Scenario::new(posted).damaged(1, 1)).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     for (name, bytes) in [("glass.bin", glass()), ("glass.extras.bin", extras())] {
         assert!(graph.files[&delivered(name)] == bytes, "{name}");
@@ -209,8 +203,7 @@ async fn a_root_par2_set_repairs_a_volume_a_child_7z_crosses_and_the_child_deliv
 // the root: never completed, on the password, the archive withheld, and
 // the same files delivered.
 #[tokio::test]
-async fn an_aes_stored_7z_one_deep_offered_only_a_wrong_candidate_ends_as_at_the_root_under_graph()
-{
+async fn an_aes_stored_7z_one_deep_offered_only_a_wrong_candidate_ends_as_at_the_root() {
     let vesper = payload(4 * ARTICLE + 1, 73);
     let locked = sevenz(
         &[Entry::File("vesper.bin", &vesper)],
@@ -218,19 +211,14 @@ async fn an_aes_stored_7z_one_deep_offered_only_a_wrong_candidate_ends_as_at_the
         Some(SECRET),
         false,
     );
-    let root = run(
-        &Scenario::new(vec![Post::plain("cinder.7z", locked.clone())]).global_password(WRONG),
-        Engine::Graph,
-    )
-    .await;
-    let nested = run(
-        &Scenario::new(vec![Post::plain(
-            "lantern.rar",
-            rar(&[("cinder.7z", locked)]),
-        )])
-        .global_password(WRONG),
-        Engine::Graph,
-    )
+    let root =
+        run(&Scenario::new(vec![Post::plain("cinder.7z", locked.clone())]).global_password(WRONG))
+            .await;
+    let nested = run(&Scenario::new(vec![Post::plain(
+        "lantern.rar",
+        rar(&[("cinder.7z", locked)]),
+    )])
+    .global_password(WRONG))
     .await;
     for outcome in [&root, &nested] {
         assert!(!outcome.completed(), "{:?}", outcome.status);
@@ -251,7 +239,7 @@ async fn an_aes_stored_7z_one_deep_offered_only_a_wrong_candidate_ends_as_at_the
 // A compressed AES 7z under the job's password holding a stored AES 7z
 // under another, a candidate: each level opens with its own password.
 #[tokio::test]
-async fn two_levels_under_two_passwords_each_open_with_their_own_under_graph() {
+async fn two_levels_under_two_passwords_each_open_with_their_own() {
     let hollow = payload(4 * ARTICLE + 3, 74);
     let inner = sevenz(
         &[Entry::File("hollow.bin", &hollow)],
@@ -271,7 +259,7 @@ async fn two_levels_under_two_passwords_each_open_with_their_own_under_graph() {
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)])
         .password(SECRET)
         .global_password(INNER);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_whole(
         &graph,
         &[("hollow.bin", &hollow), ("hollow.extras.bin", &extras())],
@@ -287,7 +275,7 @@ async fn two_levels_under_two_passwords_each_open_with_their_own_under_graph() {
 // under the job's password: the engine's output binds the RAR, and the
 // password opens it too.
 #[tokio::test]
-async fn an_encrypted_rar5_inside_a_header_encrypted_compressed_7z_delivers_under_graph() {
+async fn an_encrypted_rar5_inside_a_header_encrypted_compressed_7z_delivers() {
     let jade = payload(4 * ARTICLE + 5, 75);
     let (_, inner) =
         encrypted_store_set("jade.bin", &jade, 1, SECRET, Some(SECRET), false).remove(0);
@@ -298,7 +286,7 @@ async fn an_encrypted_rar5_inside_a_header_encrypted_compressed_7z_delivers_unde
         true,
     );
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).password(SECRET);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_whole(&graph, &[("jade.bin", &jade)]);
     assert!(kinds(&graph).contains(&"rar_store"), "{:?}", kinds(&graph));
 }
@@ -318,10 +306,10 @@ async fn store_out_of_a_sealed_engine(scenario: impl Fn(Scenario) -> Scenario) {
         Some(SECRET),
         true,
     );
-    let graph = run(
-        &scenario(Scenario::new(vec![Post::plain("lantern.7z", outer)])),
-        Engine::Graph,
-    )
+    let graph = run(&scenario(Scenario::new(vec![Post::plain(
+        "lantern.7z",
+        outer,
+    )])))
     .await;
     assert_whole(
         &graph,
@@ -335,13 +323,12 @@ async fn store_out_of_a_sealed_engine(scenario: impl Fn(Scenario) -> Scenario) {
 }
 
 #[tokio::test]
-async fn a_stored_7z_inside_a_header_encrypted_compressed_7z_opened_by_the_job_password_delivers_under_graph()
- {
+async fn a_stored_7z_inside_a_header_encrypted_compressed_7z_opened_by_the_job_password_delivers() {
     store_out_of_a_sealed_engine(|scenario| scenario.password(SECRET)).await;
 }
 
 #[tokio::test]
-async fn a_stored_7z_inside_a_header_encrypted_compressed_7z_opened_by_a_candidate_after_a_wrong_job_password_delivers_under_graph()
+async fn a_stored_7z_inside_a_header_encrypted_compressed_7z_opened_by_a_candidate_after_a_wrong_job_password_delivers()
  {
     store_out_of_a_sealed_engine(|scenario| scenario.password(WRONG).global_password(SECRET)).await;
 }
@@ -350,7 +337,7 @@ async fn a_stored_7z_inside_a_header_encrypted_compressed_7z_opened_by_a_candida
 // the job's password: the store deciphers the member and the 7z bound out
 // of it opens on the same password.
 #[tokio::test]
-async fn an_aes_7z_inside_a_header_encrypted_rar5_delivers_under_graph() {
+async fn an_aes_7z_inside_a_header_encrypted_rar5_delivers() {
     let iron = payload(4 * ARTICLE + 11, 77);
     let inner = sevenz(
         &[Entry::File("iron.bin", &iron)],
@@ -360,11 +347,7 @@ async fn an_aes_7z_inside_a_header_encrypted_rar5_delivers_under_graph() {
     );
     let volumes =
         header_encrypted_store_set("inner.7z", &inner, 1, SECRET, HeaderCheck::For(SECRET));
-    let graph = run(
-        &Scenario::new(posts(&volumes)).password(SECRET),
-        Engine::Graph,
-    )
-    .await;
+    let graph = run(&Scenario::new(posts(&volumes)).password(SECRET)).await;
     assert_whole(&graph, &[("iron.bin", &iron)]);
     assert_eq!(kinds(&graph), ["rar_store", "sevenz_store"]);
 }
@@ -373,7 +356,7 @@ async fn an_aes_7z_inside_a_header_encrypted_rar5_delivers_under_graph() {
 // an empty directory: every one is delivered at depth two, the empty file
 // empty and the directories as directories.
 #[tokio::test]
-async fn a_7z_one_deep_delivers_its_directory_empty_file_and_empty_directory_under_graph() {
+async fn a_7z_one_deep_delivers_its_directory_empty_file_and_empty_directory() {
     let pine = payload(4 * ARTICLE + 13, 78);
     let pack = sevenz(
         &[
@@ -387,7 +370,7 @@ async fn a_7z_one_deep_delivers_its_directory_empty_file_and_empty_directory_und
         false,
     );
     let scenario = Scenario::new(vec![Post::plain("lantern.rar", rar(&[("pack.7z", pack)]))]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_whole(
         &graph,
         &[("pack/empty.marker", &[]), ("pack/pine.bin", &pine)],
@@ -417,7 +400,7 @@ async fn a_7z_one_deep_delivers_its_directory_empty_file_and_empty_directory_und
 // Two gzip streams of one name in two directories of a stored 7z: each
 // decodes into its own directory and neither overwrites the other.
 #[tokio::test]
-async fn streams_of_one_name_in_two_directories_both_land_under_graph() {
+async fn streams_of_one_name_in_two_directories_both_land() {
     let first = payload(2 * ARTICLE + 1, 79);
     let second = payload(2 * ARTICLE + 1, 80);
     let (first_gz, second_gz) = (gzip(&first), gzip(&second));
@@ -430,11 +413,7 @@ async fn streams_of_one_name_in_two_directories_both_land_under_graph() {
         None,
         false,
     );
-    let graph = run(
-        &Scenario::new(vec![Post::plain("lantern.7z", store)]),
-        Engine::Graph,
-    )
-    .await;
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", store)])).await;
     assert_whole(
         &graph,
         &[("CD1/subs.srt", &first), ("CD2/subs.srt", &second)],
@@ -445,14 +424,14 @@ async fn streams_of_one_name_in_two_directories_both_land_under_graph() {
 // the store's bytes, so the job ends without waiting for bytes no article
 // will bring, and the file it never finished is not delivered whole.
 #[tokio::test]
-async fn a_truncated_xz_inside_a_store_ends_the_job_without_its_file_whole_under_graph() {
+async fn a_truncated_xz_inside_a_store_ends_the_job_without_its_file_whole() {
     let mut compressed = xz(&payload(4 * ARTICLE + 15, 81));
     compressed.truncate(compressed.len() / 2);
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.rar",
         rar(&[("leaf.bin.xz", compressed)]),
     )]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(!graph.completed(), "{:?}", graph.status);
     let delivery = &graph.graph().delivery;
     assert!(
@@ -464,7 +443,7 @@ async fn a_truncated_xz_inside_a_store_ends_the_job_without_its_file_whole_under
 // An xz member of a compressed 7z: the stream binds out of the engine's
 // output and decodes beside the member next to it.
 #[tokio::test]
-async fn an_xz_member_of_a_compressed_7z_decodes_and_lands_under_graph() {
+async fn an_xz_member_of_a_compressed_7z_decodes_and_lands() {
     let first = payload(3 * ARTICLE + 2, 82);
     let held = payload(3 * ARTICLE + 4, 83);
     let stream = xz(&held);
@@ -477,11 +456,7 @@ async fn an_xz_member_of_a_compressed_7z_decodes_and_lands_under_graph() {
         None,
         false,
     );
-    let graph = run(
-        &Scenario::new(vec![Post::plain("lantern.7z", outer)]),
-        Engine::Graph,
-    )
-    .await;
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", outer)])).await;
     assert_whole(&graph, &[("first.bin", &first), ("inner", &held)]);
     assert!(kinds(&graph).contains(&"stream_xz"), "{:?}", kinds(&graph));
 }

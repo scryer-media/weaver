@@ -12,7 +12,7 @@
 
 use std::io;
 
-use super::safety::{ExtractionFailure, JobExtractionBudget};
+use super::safety::ExtractionFailure;
 
 mod adapters;
 
@@ -23,18 +23,12 @@ pub(crate) enum ExtractionErrorClass {
     Rejected,
     // No supplied password opens the archive or member.
     PasswordRequired,
-    // The archive's own structure is refused before a member is read: two
-    // members that land on one path, or a path that escapes the output root.
-    // No repair or retry changes the names an archive carries.
-    StructureRefused,
     // The extraction ran ahead of what the set's topology knows: a volume
     // the reader asked for is not there yet, or a member is not where the
     // headers placed it. A topology refresh can change the answer.
     StaleTopology,
     // The process ran out of file descriptors. Retried later as it stands.
     CapacityPressure,
-    // A RAR set has no first volume to open from.
-    MissingFirstVolume,
     // The archive's bytes are wrong: a checksum that does not match, a block
     // that does not decode, a read that came back short. A repair of those
     // bytes can change the answer.
@@ -67,26 +61,6 @@ impl ExtractionError {
         Self::new(ExtractionErrorClass::Terminal, message)
     }
 
-    pub(crate) fn recoverable(message: impl Into<String>) -> Self {
-        Self::new(ExtractionErrorClass::Recoverable, message)
-    }
-
-    pub(crate) fn password_required(message: impl Into<String>) -> Self {
-        Self::new(ExtractionErrorClass::PasswordRequired, message)
-    }
-
-    pub(crate) fn structure_refused(message: impl Into<String>) -> Self {
-        Self::new(ExtractionErrorClass::StructureRefused, message)
-    }
-
-    pub(crate) fn stale_topology(message: impl Into<String>) -> Self {
-        Self::new(ExtractionErrorClass::StaleTopology, message)
-    }
-
-    pub(crate) fn missing_first_volume(message: impl Into<String>) -> Self {
-        Self::new(ExtractionErrorClass::MissingFirstVolume, message)
-    }
-
     pub(crate) fn rejected(failure: ExtractionFailure) -> Self {
         Self {
             class: ExtractionErrorClass::Rejected,
@@ -100,54 +74,12 @@ impl ExtractionError {
         Self::new(io_error_class(error), message)
     }
 
-    // The I/O error itself, rendered as it stands.
-    pub(crate) fn io(error: &io::Error) -> Self {
-        Self::from_io(error.to_string(), error)
-    }
-
-    pub(crate) fn from_rar(message: impl Into<String>, error: &unrar_rs::RarError) -> Self {
-        Self::new(rar_error_class(error), message)
-    }
-
-    pub(crate) fn from_zip(message: impl Into<String>, error: &zip::result::ZipError) -> Self {
-        Self::new(zip_error_class(error), message)
-    }
-
     pub(crate) fn class(&self) -> ExtractionErrorClass {
         self.class
     }
 
-    pub(crate) fn is(&self, class: ExtractionErrorClass) -> bool {
-        self.class == class
-    }
-
-    pub(crate) fn message(&self) -> &str {
-        &self.message
-    }
-
     pub(crate) fn rejection(&self) -> Option<&ExtractionFailure> {
         self.rejection.as_ref()
-    }
-
-    // The same failure under a reworded message.
-    pub(crate) fn map_message(mut self, reword: impl FnOnce(String) -> String) -> Self {
-        self.message = reword(self.message);
-        self
-    }
-
-    // The failure as the worker that met it reports it. A worker whose budget
-    // has stopped ended on the budget's refusal, whatever error the stop
-    // surfaced through: a read that the budget failed, a decoder that gave up
-    // when its output was refused.
-    pub(crate) fn settle(mut self, budget: &JobExtractionBudget) -> Self {
-        if self.class == ExtractionErrorClass::Rejected {
-            return self;
-        }
-        if let Some(failure) = budget.stopped_failure() {
-            self.class = ExtractionErrorClass::Rejected;
-            self.rejection = Some(failure);
-        }
-        self
     }
 
     // The reason a job keeps when it fails on this. A content-policy refusal
@@ -186,18 +118,6 @@ impl From<ExtractionFailure> for ExtractionError {
 impl From<ExtractionError> for String {
     fn from(error: ExtractionError) -> Self {
         error.message
-    }
-}
-
-// A weaver failure that carries no cause a repair or retry could change,
-// reported as terminal where it happens.
-pub(crate) trait OrTerminal<T> {
-    fn or_terminal(self) -> Result<T, ExtractionError>;
-}
-
-impl<T> OrTerminal<T> for Result<T, String> {
-    fn or_terminal(self) -> Result<T, ExtractionError> {
-        self.map_err(ExtractionError::terminal)
     }
 }
 
@@ -268,9 +188,10 @@ pub(crate) fn rar_error_class(error: &unrar_rs::RarError) -> ExtractionErrorClas
         RarError::ResourceLimit { .. }
         | RarError::AllocationFailed { .. }
         | RarError::Internal { .. } => ExtractionErrorClass::Terminal,
-        error if crate::pipeline::Pipeline::rar_error_is_password_related(error) => {
-            ExtractionErrorClass::PasswordRequired
-        }
+        RarError::EncryptedArchive
+        | RarError::EncryptedMember { .. }
+        | RarError::InvalidPassword
+        | RarError::WrongPassword { .. } => ExtractionErrorClass::PasswordRequired,
         // A BLAKE2 mismatch is the same damage as a CRC mismatch, and so is
         // data cut short; both have always been terminal here, and stay so
         // until the routing is ruled on.
@@ -318,13 +239,6 @@ pub(crate) fn zip_error_class(error: &zip::result::ZipError) -> ExtractionErrorC
         ZipError::InvalidPassword => ExtractionErrorClass::PasswordRequired,
         _ => ExtractionErrorClass::Terminal,
     }
-}
-
-// Whether a 7z header listing failed because a Zstandard frame needs a
-// larger window than the listing allowed it. The reader's own memory refusals
-// are typed; the zstd decoder's is text.
-pub(crate) fn zstd_frame_exceeds_window(error: &io::Error) -> bool {
-    adapters::zstd_0_13_frame_exceeds_window(&error.to_string())
 }
 
 #[cfg(test)]

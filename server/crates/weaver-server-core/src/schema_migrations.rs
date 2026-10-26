@@ -33,7 +33,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 73;
+const CURRENT_SCHEMA_VERSION: i64 = 74;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1496,27 +1496,26 @@ mod tests {
         assert_eq!(depth, Some(8));
     }
 
-    // Every job that existed before the engine stamp ran on the classic
-    // engine, so migration 65 must read it back as classic, active or
-    // finished, with no root phase.
+    // A job that was active or finished before migration 74 keeps its row
+    // when the engine column goes, active or finished.
     #[tokio::test]
-    async fn sqlite_migration_65_stamps_existing_jobs_classic() {
+    async fn sqlite_migration_74_drops_the_engine_column_and_keeps_jobs() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("pre-engine-stamp.db");
+        let db_path = temp.path().join("pre-graph-engine.db");
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(64), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(73), true)
             .await
             .unwrap();
         assert_eq!(
-            pragma_column_count(&pool, "active_jobs", &["engine", "root_phase"]).await,
-            0
+            pragma_column_count(&pool, "active_jobs", &["engine"]).await,
+            1
         );
         sqlx::query(
             "INSERT INTO active_jobs
-                (job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category, metadata)
-             VALUES (101, ?, 'active.nzb', 'active-output', 'queued', NULL, 1, NULL, NULL)",
+                (job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category, metadata, engine)
+             VALUES (101, ?, 'active.nzb', 'active-output', 'queued', NULL, 1, NULL, NULL, 'classic')",
         )
         .bind(vec![1_u8; 32])
         .execute(&pool)
@@ -1526,8 +1525,8 @@ mod tests {
             "INSERT INTO job_history
                 (job_id, name, status, total_bytes, downloaded_bytes,
                  optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                 failed_bytes, health, created_at, completed_at)
-             VALUES (102, 'history', 'complete', 0, 0, 0, 0, 0, 1000, 1, 2)",
+                 failed_bytes, health, created_at, completed_at, engine)
+             VALUES (102, 'history', 'complete', 0, 0, 0, 0, 0, 1000, 1, 2, 'classic')",
         )
         .execute(&pool)
         .await
@@ -1537,25 +1536,26 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        let root_phase: Option<String> =
-            sqlx::query_scalar("SELECT root_phase FROM active_jobs WHERE job_id = 101")
+        assert_eq!(
+            pragma_column_count(&pool, "active_jobs", &["engine"]).await,
+            0
+        );
+        assert_eq!(
+            pragma_column_count(&pool, "job_history", &["engine"]).await,
+            0
+        );
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_jobs WHERE job_id = 101")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 1);
+        let finished: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_history WHERE job_id = 102")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(root_phase, None);
+        assert_eq!(finished, 1);
         pool.close().await;
-
-        let db = crate::Database::open(&db_path).unwrap();
-        assert_eq!(
-            db.load_active_job_engine(crate::jobs::ids::JobId(101))
-                .unwrap(),
-            Some(crate::pipeline::graph::Engine::Classic)
-        );
-        assert_eq!(
-            db.load_job_history_engine(crate::jobs::ids::JobId(102))
-                .unwrap(),
-            Some(crate::pipeline::graph::Engine::Classic)
-        );
     }
 
     #[tokio::test]
@@ -1666,16 +1666,8 @@ mod tests {
         for table in [
             "active_file_progress",
             "active_files",
-            "active_par2",
-            "active_par2_files",
             "active_extracted",
-            "active_failed_extractions",
-            "active_extraction_chunks",
-            "active_archive_headers",
-            "active_rar_volume_facts",
             "active_detected_archives",
-            "active_volume_status",
-            "active_rar_verified_suspect",
             "active_file_identities",
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table}");
@@ -1740,12 +1732,6 @@ mod tests {
                 Some("idle".to_string()),
             )
         );
-
-        let mut tx = pool.begin().await.unwrap();
-        restart_active_jobs_drop_active_segments_v28(&mut tx)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -1886,15 +1872,8 @@ mod tests {
             pragma_column_count(&pool, "servers", &["priority", "tls_ca_cert"]).await,
             2
         );
-        assert_eq!(
-            pragma_column_count(
-                &pool,
-                "active_extraction_chunks",
-                &["appended", "start_offset", "end_offset"]
-            )
-            .await,
-            3
-        );
+        // A later version drops the table these columns were added to.
+        assert!(!sqlite_table_exists(&pool, "active_extraction_chunks").await);
     }
 
     #[tokio::test]

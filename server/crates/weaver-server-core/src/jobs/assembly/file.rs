@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use weaver_model::files::FileRole;
 
-use super::coverage::{CoverageRun, FileCoverage};
+use super::coverage::CoverageRun;
 use super::error::AssemblyError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,18 +172,6 @@ impl FileAssembly {
         }
     }
 
-    // A planned output reconstructed without any NZB articles.
-    pub(crate) fn repair_output(file_id: NzbFileId, filename: String) -> Self {
-        let role = FileRole::from_filename(&filename);
-        let mut file = Self::new(file_id, filename, role, Vec::new());
-        file.repair_output_ready = Some(false);
-        file
-    }
-
-    pub(crate) fn is_repair_output(&self) -> bool {
-        self.repair_output_ready.is_some()
-    }
-
     // The neighbouring segment this placement would run into, if any.
     //
     // Segments tile the file in ordinal order, so a placement is legitimate
@@ -235,10 +223,6 @@ impl FileAssembly {
         self.placements.insert(segment_number, (offset, len));
     }
 
-    pub(crate) fn record_reconstructed_placement(&mut self, ordinal: u32, offset: u64, len: u32) {
-        self.reconstructed_placements.insert(ordinal, (offset, len));
-    }
-
     // Where an ordinal was placed, if it has arrived.
     //
     // Sequential assembly needs this to re-place a duplicate at the offset its
@@ -248,51 +232,9 @@ impl FileAssembly {
         self.placements.get(&segment_number).copied()
     }
 
-    // Where a demotion handback rebuilt an ordinal, if it did. These bytes
-    // are on disk but carry no streamed checksum evidence, which is why
-    // [`placement_of`](Self::placement_of) does not report them.
-    pub(crate) fn reconstructed_placement_of(&self, segment_number: u32) -> Option<(u64, u32)> {
-        self.reconstructed_placements.get(&segment_number).copied()
-    }
-
     // How many ordinals have a recorded placement.
     pub(crate) fn placed_segment_count(&self) -> usize {
         self.placements.len()
-    }
-
-    pub(crate) fn note_retained_damage(
-        &mut self,
-        segment_number: u32,
-        offset: u64,
-        len: u32,
-        truncation_only: bool,
-        declared_end: Option<u64>,
-    ) {
-        self.damaged_segments.insert(segment_number, (offset, len));
-        match declared_end {
-            Some(end) => {
-                self.declared_damage_ends.insert(segment_number, end);
-            }
-            None => {
-                self.declared_damage_ends.remove(&segment_number);
-            }
-        }
-        if truncation_only {
-            self.truncation_only_damage.insert(segment_number);
-        } else {
-            self.truncation_only_damage.remove(&segment_number);
-        }
-        let floor = offset.min(self.segment_offset(segment_number));
-        self.retained_damage_floor = Some(
-            self.retained_damage_floor
-                .map_or(floor, |old| old.min(floor)),
-        );
-    }
-
-    pub(crate) fn clear_retained_damage(&mut self, segment_number: u32) -> bool {
-        self.truncation_only_damage.remove(&segment_number);
-        self.declared_damage_ends.remove(&segment_number);
-        self.damaged_segments.remove(&segment_number).is_some()
     }
 
     // The end offset a part may be laid after, when it declared no start of
@@ -332,44 +274,6 @@ impl FileAssembly {
         Some(offset.saturating_add(u64::from(len)))
     }
 
-    // Only accepted bytes may exclude writes of a damaged candidate.
-    //
-    // An ordinal a restart brought back with no extent at all (a
-    // completed-file row, or a direct-store skip) records no placement; its
-    // declared bounds stand in, since they reach at least as far as the
-    // decoded bytes it holds.
-    pub(crate) fn protected_write_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        let unmeasured = self
-            .restored_ordinals
-            .iter_ones()
-            .map(|ordinal| ordinal as u32)
-            .filter(|&ordinal| {
-                self.has_segment(ordinal)
-                    && !self.placements.contains_key(&ordinal)
-                    && !self.reconstructed_placements.contains_key(&ordinal)
-                    && !self
-                        .restored_runs
-                        .range(..=ordinal)
-                        .next_back()
-                        .is_some_and(|(_, run)| run.contains(ordinal))
-            })
-            .filter_map(|ordinal| self.segment_bounds(ordinal));
-        self.restored_runs
-            .values()
-            .map(|run| (run.start, run.end))
-            .chain(
-                self.placements
-                    .values()
-                    .chain(self.reconstructed_placements.values())
-                    .map(|&(offset, len)| (offset, offset.saturating_add(u64::from(len)))),
-            )
-            .chain(unmeasured)
-    }
-
-    pub(crate) fn has_retained_damage(&self) -> bool {
-        !self.damaged_segments.is_empty()
-    }
-
     pub(crate) fn segment_has_retained_damage(&self, segment_number: u32) -> bool {
         self.damaged_segments.contains_key(&segment_number)
     }
@@ -380,16 +284,8 @@ impl FileAssembly {
         self.truncation_only_damage.contains(&segment_number)
     }
 
-    pub(crate) fn requires_file_verification(&self) -> bool {
-        self.has_retained_damage() || self.geometry_requires_verification
-    }
-
     pub(crate) fn require_geometry_verification(&mut self) {
         self.geometry_requires_verification = true;
-    }
-
-    pub(crate) fn clear_geometry_verification(&mut self) {
-        self.geometry_requires_verification = false;
     }
 
     // Record the runs a restart restored. Their ordinals must already be
@@ -398,29 +294,6 @@ impl FileAssembly {
     // Called once the restart has committed every ordinal it skips.
     pub(crate) fn note_restored_ordinals(&mut self) {
         self.restored_ordinals.clone_from(&self.received);
-    }
-
-    pub(crate) fn note_restored_coverage(&mut self, coverage: &FileCoverage) {
-        for run in coverage.runs() {
-            if (run.first_ordinal..run.end_ordinal()).all(|ordinal| self.has_segment(ordinal)) {
-                self.restored_runs.insert(run.first_ordinal, *run);
-            }
-        }
-    }
-
-    // Whether `segment_number` is the first article still missing after a
-    // restored run: the part whose decoded offset is where that run's bytes
-    // stop, which is where a write cursor resumes.
-    pub(crate) fn follows_restored_run(&self, segment_number: u32) -> bool {
-        let Some(previous) = segment_number.checked_sub(1) else {
-            return false;
-        };
-        !self.has_segment(segment_number)
-            && self
-                .restored_runs
-                .range(..=previous)
-                .next_back()
-                .is_some_and(|(_, run)| run.end_ordinal() == segment_number)
     }
 
     // A restored ordinal placed again leaves its run covering only the
@@ -451,123 +324,6 @@ impl FileAssembly {
                 },
             );
         }
-    }
-
-    // Every committed article whose decoded extent is known, in ordinal order:
-    // placed articles, rebuilt ones, and restored runs. Damaged ordinals are
-    // never committed, so they are never here. Nothing at or past the
-    // retained-damage floor is either: a part laid after damage may sit where
-    // the damaged part's extent put it, and no damaged state survives a
-    // restart to say whether that was right.
-    fn durable_extents(&self) -> Vec<CoverageRun> {
-        let single = |(ordinal, (offset, len)): (&u32, &(u64, u32))| CoverageRun {
-            first_ordinal: *ordinal,
-            ordinals: 1,
-            start: *offset,
-            end: offset.saturating_add(u64::from(*len)),
-        };
-        let mut extents: Vec<CoverageRun> = self
-            .placements
-            .iter()
-            .chain(
-                self.reconstructed_placements
-                    .iter()
-                    .filter(|(ordinal, _)| !self.placements.contains_key(ordinal)),
-            )
-            .filter(|(ordinal, _)| {
-                self.has_segment(**ordinal) && !self.segment_has_retained_damage(**ordinal)
-            })
-            .map(single)
-            .chain(self.restored_runs.values().copied())
-            .filter(|run| {
-                self.retained_damage_floor
-                    .is_none_or(|floor| run.end <= floor)
-            })
-            .collect();
-        extents.sort_by_key(|run| run.first_ordinal);
-        extents
-    }
-
-    // The received bytes a restart would keep, in the unit the job counts
-    // downloaded bytes in. Everything received, unless retained damage holds
-    // part of it back from the coverage.
-    pub(crate) fn durable_received_bytes(&self) -> u64 {
-        if self.retained_damage_floor.is_none() {
-            return self.received_bytes;
-        }
-        self.durable_coverage().covered_bytes()
-    }
-
-    // The file's durable coverage: what a restart may skip.
-    //
-    // Every committed article with a known extent counts, wherever it sits —
-    // a gap costs a restart the gap, nothing more. Retained damage is never
-    // coverage: a damaged ordinal is not committed, so a restart refetches it
-    // until verification or repair settles it.
-    pub(crate) fn durable_coverage(&self) -> FileCoverage {
-        FileCoverage::from_ordered_runs(self.durable_extents())
-    }
-
-    // The decoded bytes the file holds without a hole from offset zero.
-    pub(crate) fn committed_decoded_prefix(&self) -> u64 {
-        self.durable_coverage()
-            .runs()
-            .first()
-            .filter(|run| run.first_ordinal == 0 && run.start == 0)
-            .map_or(0, |run| run.end)
-    }
-
-    pub(crate) fn note_part_verification(&mut self, ordinal: u32, verified: bool) {
-        if ordinal.checked_add(1) == Some(self.total_segments) {
-            self.final_part_verified = verified;
-        }
-    }
-
-    pub(crate) fn final_part_verified(&self) -> bool {
-        self.final_part_verified
-    }
-
-    // Actual coverage, including the untouched restored prefix. NZB encoded
-    // sizes and progress totals are never used as decoded file lengths.
-    pub(crate) fn decoded_coverage_end(&self) -> Option<u64> {
-        if !self.is_complete() || self.has_retained_damage() {
-            return None;
-        }
-        let final_ordinal = self.total_segments.checked_sub(1)?;
-        if !self.placements.contains_key(&final_ordinal)
-            && !self.reconstructed_placements.contains_key(&final_ordinal)
-            && !self
-                .restored_runs
-                .values()
-                .next_back()
-                .is_some_and(|run| run.contains(final_ordinal))
-        {
-            return None;
-        }
-        let single = |(ordinal, (offset, len)): (&u32, &(u64, u32))| CoverageRun {
-            first_ordinal: *ordinal,
-            ordinals: 1,
-            start: *offset,
-            end: offset.saturating_add(u64::from(*len)),
-        };
-        // Every extent, a rebuilt copy of a placed ordinal included: two
-        // claims on one ordinal cannot tile, and the walk says so.
-        let mut extents: Vec<CoverageRun> = self
-            .placements
-            .iter()
-            .map(single)
-            .chain(self.reconstructed_placements.iter().map(single))
-            .chain(self.restored_runs.values().copied())
-            .collect();
-        extents.sort_by_key(|run| run.first_ordinal);
-        let mut cursor = 0u64;
-        for extent in extents {
-            if extent.start != cursor {
-                return None;
-            }
-            cursor = extent.end;
-        }
-        Some(cursor)
     }
 
     // Record that a segment has been received and decoded.
@@ -626,44 +382,6 @@ impl FileAssembly {
         self.geometry_requires_verification = false;
     }
 
-    // Declare the file fully received.
-    //
-    // UNITS: `received_bytes` normally accumulates DECODED bytes, one segment
-    // at a time, while `total_bytes` is the sum of the NZB's DECLARED segment
-    // sizes — which are encoded. The two are deliberately made equal here, so
-    // that a file completed by verification or repair reports 100% rather than
-    // the ~97% a yEnc file's decoded total would otherwise show against its
-    // declared total.
-    //
-    // That gap is far wider for uuencode: it encodes at roughly 1.38x, so a
-    // uuencode file's decoded total is about 72% of its declared total. The
-    // decision is to keep this behaviour unchanged for both encodings —
-    // completion is a statement about *segments*, and every ordinal has been
-    // accounted for. `received_bytes` after this call is a progress figure in
-    // declared units, not a measurement of the bytes on disk, and nothing may
-    // use it as one. The bytes actually written are the sum of the recorded
-    // placements; `contiguous_placements_proven` is what reasons about those.
-    pub fn mark_complete(&mut self) {
-        self.damaged_segments.clear();
-        self.truncation_only_damage.clear();
-        self.declared_damage_ends.clear();
-        self.retained_damage_floor = None;
-        self.geometry_requires_verification = false;
-        if let Some(ready) = &mut self.repair_output_ready {
-            *ready = true;
-        }
-        self.received.fill(true);
-        self.received_bytes = self.total_bytes;
-    }
-
-    // Complete an independently verified PAR3 image while preserving its
-    // authenticated decoded length for virtual source readers. The ordinary
-    // PAR2 completion/progress policy continues to use `mark_complete`.
-    pub(crate) fn mark_complete_decoded(&mut self, decoded_len: u64) {
-        self.mark_complete();
-        self.received_bytes = decoded_len;
-    }
-
     // Withdraw a segment the assembly already holds, because the bytes it
     // delivered are now known not to be trustworthy.
     //
@@ -711,11 +429,6 @@ impl FileAssembly {
             .is_some_and(|received| *received)
     }
 
-    // How many segments are still missing.
-    pub fn missing_count(&self) -> u32 {
-        self.total_segments - self.received.count_ones() as u32
-    }
-
     // Completion fraction (0.0 to 1.0).
     pub fn progress(&self) -> f64 {
         if let Some(ready) = self.repair_output_ready {
@@ -748,10 +461,6 @@ impl FileAssembly {
         self.declared_role.clone()
     }
 
-    pub fn archive_set_name(&self) -> Option<String> {
-        weaver_model::files::archive_base_name(&self.filename, &self.declared_role)
-    }
-
     // The filename.
     pub fn filename(&self) -> &str {
         &self.filename
@@ -760,12 +469,6 @@ impl FileAssembly {
     // The file id.
     pub fn file_id(&self) -> NzbFileId {
         self.file_id
-    }
-
-    // The byte offset within the target file where a given segment's data should be written.
-    // Segments are sequential: segment 0 starts at offset 0, segment 1 at segment_sizes[0], etc.
-    pub fn segment_offset(&self, segment_number: u32) -> u64 {
-        self.cumulative_offsets[segment_number as usize]
     }
 
     // The trusted zero-based byte range for a segment.
@@ -795,31 +498,6 @@ impl FileAssembly {
     // Whether the assembled file observed any duplicate article.
     pub fn has_duplicate_segments(&self) -> bool {
         self.has_duplicate_segments
-    }
-
-    // Whether the recorded placements prove a gap-free, overlap-free
-    // decoded tiling of `[0, received_bytes())`.
-    //
-    // Placements are recorded from each accepted article's own bounded
-    // header before its write, and `placement_conflict` refuses overlaps on
-    // the way in, so a complete file whose placements start at zero, abut
-    // exactly in ordinal order, and sum to the decoded total was assembled
-    // with no gap and no overlap. Files completed by verification or repair
-    // rather than by decode have no such observations and prove nothing
-    // here — deliberately: this proof licenses whole-file CRC evidence, and
-    // only the decode path measured what it wrote.
-    pub fn contiguous_placements_proven(&self) -> bool {
-        if !self.is_complete() || self.placements.len() != self.total_segments as usize {
-            return false;
-        }
-        let mut cursor = 0u64;
-        for (offset, len) in self.placements.values() {
-            if *offset != cursor {
-                return false;
-            }
-            cursor = cursor.saturating_add(u64::from(*len));
-        }
-        cursor == self.received_bytes
     }
 }
 

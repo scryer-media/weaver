@@ -13,8 +13,6 @@
 // read back. Below the root a namespace binds, claims, moves and gives back
 // as the root's does, a locked 7z ends as at the root, a repair survives a
 // crash, and an archive posted again under another name is that archive.
-// Classic runs no repair inside an archive and enforces no cap in
-// this harness, so each row names what it does beside the graph.
 
 use sevenz_turbo::encoder_options::Lzma2Options;
 use sevenz_turbo::{EncoderConfiguration, EncoderMethod};
@@ -24,8 +22,7 @@ use weaver_graph::recovery::RepairOutcome;
 use super::caps::{FLOOR, assert_refused, limits, zeros_zstd};
 use super::depth::stored as sevenz_stored;
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_fails_leaving, kinds, par2_set, par3_set,
-    payload, run, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, kinds, par2_set, par3_set, payload, run,
 };
 use super::rar::posts as rar_posts;
 use super::rar_rev::{body as rev_body, rar5_revs};
@@ -38,7 +35,6 @@ use super::streams::{tar, xz};
 use super::zip::{archive as zip_archive, members as zip_members, stored as zip_stored};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::scenarios::encrypted_store_set;
 use crate::pipeline::tests::direct_store::{
     multi_member_store_set, obfuscate_volumes, protected_store_set, single_member_store_set,
@@ -165,12 +161,9 @@ fn assert_broad_whole(graph: &Outcome) {
 
 // Both archives are repaired at depth by the set beside them, one slice
 // each, and opened on the job's password; nothing is asked for twice.
-// Classic fails unpacking the outer container: its repair does not reach a
-// set inside an archive.
 #[tokio::test]
-async fn an_enciphered_rar_and_an_aes_7z_two_deep_are_repaired_by_the_set_beside_them_under_graph_and_fail_under_classic()
- {
-    let (classic, graph) = run_both(&broad_two_deep()).await;
+async fn an_enciphered_rar_and_an_aes_7z_two_deep_are_repaired_by_the_set_beside_them() {
+    let graph = run(&broad_two_deep()).await;
     assert_broad_whole(&graph);
     assert_eq!(kinds(&graph), ["par2", "rar_store", "sevenz_store"]);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
@@ -179,8 +172,6 @@ async fn an_enciphered_rar_and_an_aes_7z_two_deep_are_repaired_by_the_set_beside
         vec![Some(RepairOutcome::Repaired { slices: 2 })]
     );
     assert_eq!(graph.graph().claims["lantern.7z"], Claim::Damaged);
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
 }
 
 #[tokio::test]
@@ -192,10 +183,9 @@ async fn the_broad_set_two_deep_restarted_after_every_article_is_repaired_with_n
 // articles damaged, `quill.bin` under two with one; an article two deep
 // spans two slices of its member. The short set's file is listed
 // unrepaired, the other is rebuilt, and the job is Partial for a Repair
-// failure. Classic fails unpacking the outer container.
+// failure.
 #[tokio::test]
-async fn two_sets_two_deep_one_short_of_blocks_end_partial_with_the_other_sets_file_whole_under_graph()
- {
+async fn two_sets_two_deep_one_short_of_blocks_end_partial_with_the_other_sets_file_whole() {
     let ember = payload(6 * ARTICLE + 5, 93);
     let quill = payload(5 * ARTICLE + 3, 94);
     let mut entries: Vec<(String, Vec<u8>)> = vec![("ember.bin".into(), ember.clone())];
@@ -221,7 +211,7 @@ async fn two_sets_two_deep_one_short_of_blocks_end_partial_with_the_other_sets_f
         .damaged(0, short[0])
         .damaged(0, short[2])
         .damaged(0, whole[1]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_eq!(
         graph.status,
         Some(JobStatus::Partial),
@@ -240,14 +230,12 @@ async fn two_sets_two_deep_one_short_of_blocks_end_partial_with_the_other_sets_f
     );
     assert_eq!(graph.graph().delivery.unrepaired, ["ember.bin"]);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
 }
 
 // A zstd of zeros two deep inflates past the ratio: the job fails at
 // extraction naming the ratio, as it does with the stream at the root.
 #[tokio::test]
-async fn a_member_two_deep_inflating_past_the_ratio_fails_the_job_naming_ratio_under_graph() {
+async fn a_member_two_deep_inflating_past_the_ratio_fails_the_job_naming_ratio() {
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.7z",
         two_deep(&[("ember.bin.zst", zeros_zstd(4))]),
@@ -256,27 +244,27 @@ async fn a_member_two_deep_inflating_past_the_ratio_fails_the_job_naming_ratio_u
         limits.max_ratio = 4;
         limits.ratio_floor_bytes = FLOOR;
     }));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "ratio");
 }
 
 // An xz two deep writes past the job's byte cap: one budget counts every
 // byte an object produces at any depth.
 #[tokio::test]
-async fn a_member_two_deep_writing_past_the_job_byte_cap_fails_naming_job_bytes_under_graph() {
+async fn a_member_two_deep_writing_past_the_job_byte_cap_fails_naming_job_bytes() {
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.7z",
         two_deep(&[("ember.bin.xz", xz(&payload(40 * ARTICLE, 95)))]),
     )])
     .limits(limits(|limits| limits.max_job_bytes = 1000));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "job_bytes");
 }
 
 // Three members beside a tar of three, two deep: no namespace holds more
 // than four, and the job's one count of entries passes five.
 #[tokio::test]
-async fn entries_counted_across_levels_fail_the_job_naming_entries_under_graph() {
+async fn entries_counted_across_levels_fail_the_job_naming_entries() {
     let leaves: Vec<(String, Vec<u8>)> = (0..3)
         .map(|index| (format!("ember{index}.bin"), payload(ARTICLE + index, 96)))
         .collect();
@@ -292,14 +280,13 @@ async fn entries_counted_across_levels_fail_the_job_naming_entries_under_graph()
     entries.push(("cinder.tar", tar(&borrowed)));
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", two_deep(&entries))])
         .limits(limits(|limits| limits.max_entries = 5));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "entries");
 }
 
 // An LZMA2 7z two deep beside a plain file: the store gives it up
 // compressed and the engine delivers its members, restarted after every
-// article, from what is on disk. Classic extracts it two deep and delivers
-// the same members.
+// article, from what is on disk.
 #[tokio::test]
 async fn an_lzma2_7z_two_deep_handed_to_the_engine_restarted_after_every_article_delivers_its_members()
  {
@@ -313,24 +300,13 @@ async fn an_lzma2_7z_two_deep_handed_to_the_engine_restarted_after_every_article
             ("candle.bin", candle()),
         ]),
     )]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(graph.files[&delivered("candle.bin")] == candle());
     for (name, bytes) in sevenz_members() {
         assert!(graph.files[&delivered(name)] == bytes, "{name}");
     }
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    let classic = run(&scenario, Engine::Classic).await;
-    assert!(
-        classic.completed(),
-        "{:?} {:?}",
-        classic.status,
-        classic.failure
-    );
-    assert!(
-        classic.files == graph.files,
-        "classic delivers what the graph does"
-    );
     restart_row(scenario).await;
 }
 
@@ -345,7 +321,7 @@ async fn an_uncovered_damaged_archive_two_deep_refused_to_a_leaf_restarted_after
     let outer = two_deep(&[("cinder.7z", inner)]);
     let ordinal = articles_inside(&outer, &members[0].1)[0];
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).damaged(0, ordinal);
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert_eq!(
         whole.status,
         Some(JobStatus::Partial),
@@ -366,14 +342,13 @@ async fn an_uncovered_damaged_archive_two_deep_refused_to_a_leaf_restarted_after
 // and the xz around it are a few hundred bytes each, under it. The cap
 // holds for what an object produces at any depth.
 #[tokio::test]
-async fn a_member_two_deep_writing_past_the_member_byte_cap_fails_naming_member_bytes_under_graph()
-{
+async fn a_member_two_deep_writing_past_the_member_byte_cap_fails_naming_member_bytes() {
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.7z",
         two_deep(&[("ember.bin.xz", xz(&[0x5a; 64 * 1024]))]),
     )])
     .limits(limits(|limits| limits.max_member_bytes = 16 * 1024));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "member_bytes");
     assert!(
         graph
@@ -387,9 +362,9 @@ async fn a_member_two_deep_writing_past_the_member_byte_cap_fails_naming_member_
 
 // A stored 7z two deep beside the PAR3 set over it, one article inside it
 // served damaged: the set repairs it at depth and nothing is asked for
-// twice. Classic fails unpacking the outer container.
+// twice.
 #[tokio::test]
-async fn a_damaged_7z_two_deep_is_repaired_by_the_par3_set_beside_it_under_graph() {
+async fn a_damaged_7z_two_deep_is_repaired_by_the_par3_set_beside_it() {
     let cinder = container(EncoderConfiguration::new(EncoderMethod::COPY), None);
     let set = par3_set("inner", &[("cinder.7z", cinder.as_slice())], 2);
     let mut entries: Vec<(&str, Vec<u8>)> = vec![("cinder.7z", cinder.clone())];
@@ -400,7 +375,7 @@ async fn a_damaged_7z_two_deep_is_repaired_by_the_par3_set_beside_it_under_graph
     let outer = two_deep(&entries);
     let damaged = articles_inside(&outer, &cinder)[0];
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).damaged(0, damaged);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     let mut names: Vec<String> = sevenz_members()
         .iter()
@@ -422,22 +397,19 @@ async fn a_damaged_7z_two_deep_is_repaired_by_the_par3_set_beside_it_under_graph
     );
     assert!(kinds(&graph).contains(&"par3"), "{:?}", kinds(&graph));
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
 }
 
 // A RAR5 volume carrying its recovery record, two deep, one article inside
 // its member served damaged: the record repairs the volume at depth, its
-// member is delivered whole and nothing is asked for twice. Classic fails
-// unpacking the outer container.
+// member is delivered whole and nothing is asked for twice.
 #[tokio::test]
-async fn a_rar5_volume_two_deep_is_repaired_from_its_own_recovery_record_under_graph() {
+async fn a_rar5_volume_two_deep_is_repaired_from_its_own_recovery_record() {
     let body = beacon();
     let volume = protected_store_set("beacon.bin", &body, 1, 1).remove(0).1;
     let outer = two_deep(&[("cinder.rar", volume)]);
     let damaged = articles_inside(&outer, &body)[0];
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]).damaged(0, damaged);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(graph.files.get(&delivered("beacon.bin")), Some(&body));
     assert_eq!(
@@ -448,21 +420,18 @@ async fn a_rar5_volume_two_deep_is_repaired_from_its_own_recovery_record_under_g
         )]
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
 }
 
 // An AES zip two deep, opened on the job's password by the engine's run.
-// Classic opens it on the same password and delivers the same members.
 #[tokio::test]
-async fn an_aes_zip_two_deep_delivers_its_members_under_graph() {
+async fn an_aes_zip_two_deep_delivers_its_members() {
     let enciphered = zip_stored().with_aes_encryption(::zip::AesMode::Aes256, SECRET);
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.7z",
         two_deep(&[("cinder.zip", zip_archive(enciphered))]),
     )])
     .password(SECRET);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -476,27 +445,14 @@ async fn an_aes_zip_two_deep_delivers_its_members_under_graph() {
         ["rar_store", "sevenz_store", "zip", "zip_engine"]
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    let classic = run(&scenario, Engine::Classic).await;
-    assert!(
-        classic.completed(),
-        "{:?} {:?}",
-        classic.status,
-        classic.failure
-    );
-    assert!(
-        classic.files == graph.files,
-        "classic delivers what the graph does"
-    );
 }
 
 // `quill.bin` one deep and two deep in stored RARs, served in order: the one
 // in `level.rar` is announced first and holds the name until the shallower
 // one is announced, which takes it; the holder moves to `quill (1).bin`
-// with its file, and nothing is written over. Classic completes delivering
-// one `quill.bin` holding the deeper file's bytes: the shallower file is
-// lost.
+// with its file, and nothing is written over.
 #[tokio::test]
-async fn one_name_one_and_two_deep_goes_to_the_shallower_and_the_deeper_holder_moves_under_graph() {
+async fn one_name_one_and_two_deep_goes_to_the_shallower_and_the_deeper_holder_moves() {
     let shallow = payload(3 * ARTICLE + 1, 102);
     let deeper = payload(2 * ARTICLE + 9, 103);
     let outer = rar(&[
@@ -504,8 +460,7 @@ async fn one_name_one_and_two_deep_goes_to_the_shallower_and_the_deeper_holder_m
         ("quill.bin", shallow.clone()),
     ]);
     let scenario = Scenario::new(vec![Post::plain("lantern.rar", outer)]);
-    let graph = run(&scenario, Engine::Graph).await;
-    let classic = run(&scenario, Engine::Classic).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -517,20 +472,6 @@ async fn one_name_one_and_two_deep_goes_to_the_shallower_and_the_deeper_holder_m
         "quill (1).bin"
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert!(
-        classic.completed(),
-        "{:?} {:?}",
-        classic.status,
-        classic.failure
-    );
-    assert_eq!(
-        classic.files.keys().cloned().collect::<Vec<_>>(),
-        [delivered("quill.bin")]
-    );
-    assert!(
-        classic.files[&delivered("quill.bin")] == deeper,
-        "classic: quill.bin holds the deeper file"
-    );
 }
 
 // Every article of `outer` holding a byte of `inner`.
@@ -573,7 +514,7 @@ async fn assert_lost_at_restart_repairs(
     let scenario = Scenario::new(vec![Post::plain("lantern.rar", outer)])
         .damaged(0, damaged)
         .first(&order);
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     assert!(whole.files[&delivered("ember.bin")] == ember);
     assert!(
@@ -660,10 +601,9 @@ async fn a_par2_index_two_deep_lost_before_its_packets_were_walked_comes_again_a
 // A stored RAR5 set of four volumes two deep, its second never posted,
 // beside the `.rev` that rebuilds it: the set is rebuilt at depth and the
 // member delivered whole. The `.rev` is delivered beside it, as recovery
-// files below the root are. Classic does not rebuild the set two deep: it
-// fails the job as Unpack on the absent volume, delivering nothing.
+// files below the root are.
 #[tokio::test]
-async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph() {
+async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev() {
     let body = rev_body();
     let volumes = single_member_store_set("beacon.bin", &body, 4);
     let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
@@ -679,7 +619,7 @@ async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph
             .map(|post| (post.name.as_str(), post.bytes.clone())),
     );
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", two_deep(&entries))]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.graph().outcomes,
@@ -696,12 +636,6 @@ async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph
         kinds(&graph)
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert_fails_leaving(
-        &run(&scenario, Engine::Classic).await,
-        HistoryFailureKind::Unpack,
-        "missing archive part 'silver.horizon.part02.rar'",
-        &[],
-    );
 }
 
 // A compressed, enciphered RAR, `cinder.rar`, two deep beside `beacon.bin`,
@@ -709,10 +643,8 @@ async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev_under_graph
 // engine, which asks, and nothing answers. The job ends as the locked RAR
 // at the root does, partial on its password with the archive withheld and
 // delivered as posted, and the members above it and beside it delivered.
-// Classic reads the enciphered RAR as damage: it fails the job as Repair on
-// a CRC failure, not on the password, delivering nothing.
 #[tokio::test]
-async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_the_members_above_it_delivered_under_graph()
+async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_the_members_above_it_delivered()
  {
     let locked = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -727,7 +659,7 @@ async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_
         ),
     ]);
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(
         matches!(graph.status, Some(JobStatus::Partial)),
         "{:?} {:?}",
@@ -756,12 +688,6 @@ async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_
         vec![("cinder.rar".to_owned(), Why::EncryptedHeader)]
     );
     assert!(kinds(&graph).contains(&"rar_engine"), "{:?}", kinds(&graph));
-    assert_fails_leaving(
-        &run(&scenario, Engine::Classic).await,
-        HistoryFailureKind::Repair,
-        "extraction CRC failures with no PAR2 data",
-        &[],
-    );
 }
 
 // The member of the four-volume stored RAR5 set the next rows move.
@@ -792,7 +718,7 @@ fn named_by_par2(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
 // whole at both, the repairs come out the same, and nothing is asked for
 // twice. Recovery files below the root are delivered beside the member.
 async fn assert_two_deep_as_at_the_root(posts: fn() -> Vec<Post>, shape: fn(Scenario) -> Scenario) {
-    let root = run(&shape(Scenario::new(posts())), Engine::Graph).await;
+    let root = run(&shape(Scenario::new(posts()))).await;
     assert!(
         root.completed(),
         "root: {:?} {:?}",
@@ -806,7 +732,7 @@ async fn assert_two_deep_as_at_the_root(posts: fn() -> Vec<Post>, shape: fn(Scen
         .map(|post| (post.name.as_str(), post.bytes.clone()))
         .collect();
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", two_deep(&entries))]);
-    let deep = run(&shape(scenario), Engine::Graph).await;
+    let deep = run(&shape(scenario)).await;
     assert!(
         deep.completed(),
         "two deep: {:?} {:?}",
@@ -831,8 +757,7 @@ async fn assert_two_deep_as_at_the_root(posts: fn() -> Vec<Post>, shape: fn(Scen
 // that names them, two deep: the set binds each by content and the namespace
 // puts the names back, as at the root.
 #[tokio::test]
-async fn a_rar_set_two_deep_with_two_volumes_posted_swapped_beside_par2_delivers_as_at_the_root_under_graph()
- {
+async fn a_rar_set_two_deep_with_two_volumes_posted_swapped_beside_par2_delivers_as_at_the_root() {
     assert_two_deep_as_at_the_root(
         || {
             let set = spread_set();
@@ -854,7 +779,7 @@ async fn a_rar_set_two_deep_with_two_volumes_posted_swapped_beside_par2_delivers
 // them, two deep: nothing says the first volume's place until the set does,
 // and the namespace moves each to its name as at the root.
 #[tokio::test]
-async fn a_nameless_rar_set_two_deep_whose_first_volume_comes_last_beside_par2_delivers_as_at_the_root_under_graph()
+async fn a_nameless_rar_set_two_deep_whose_first_volume_comes_last_beside_par2_delivers_as_at_the_root()
  {
     assert_two_deep_as_at_the_root(
         || {
@@ -871,7 +796,7 @@ async fn a_nameless_rar_set_two_deep_whose_first_volume_comes_last_beside_par2_d
 // first: claims made before the headers that bind them come are given back
 // and moved as at the root.
 #[tokio::test]
-async fn a_rar_set_two_deep_served_last_article_first_delivers_as_at_the_root_under_graph() {
+async fn a_rar_set_two_deep_served_last_article_first_delivers_as_at_the_root() {
     assert_two_deep_as_at_the_root(|| rar_posts(spread_set()), Scenario::backwards).await;
 }
 
@@ -880,20 +805,16 @@ async fn a_rar_set_two_deep_served_last_article_first_delivers_as_at_the_root_un
 // it withholds the archive, its folders shut. Two deep, inside `level.rar`
 // beside `beacon.bin` with `candle.bin` one deep, the job ends as it does at
 // the root: partial on the password, the archive withheld and delivered as
-// posted, and the members above it and beside it delivered. Classic fails
-// the job on the password, delivering nothing.
+// posted, and the members above it and beside it delivered.
 #[tokio::test]
-async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_root_with_the_members_above_it_delivered_under_graph()
+async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_root_with_the_members_above_it_delivered()
  {
     let locked = container(Lzma2Options::from_level(1).into(), Some(SECRET));
-    let root = run(
-        &Scenario::new(vec![
-            Post::plain("beacon.bin", beacon()),
-            Post::plain("candle.bin", candle()),
-            Post::plain("cinder.7z", locked.clone()),
-        ]),
-        Engine::Graph,
-    )
+    let root = run(&Scenario::new(vec![
+        Post::plain("beacon.bin", beacon()),
+        Post::plain("candle.bin", candle()),
+        Post::plain("cinder.7z", locked.clone()),
+    ]))
     .await;
     let outer = sevenz(&[
         ("candle.bin", candle()),
@@ -903,7 +824,7 @@ async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_
         ),
     ]);
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     for outcome in [&root, &graph] {
         assert!(
             matches!(outcome.status, Some(JobStatus::Partial)),
@@ -938,24 +859,10 @@ async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_
         "candle.bin"
     );
     assert!(graph.files[&delivered("cinder.7z")] == locked, "cinder.7z");
-    assert_fails_leaving(
-        &run(&scenario, Engine::Classic).await,
-        HistoryFailureKind::Password,
-        "WEAVER_PASSWORD_REQUIRED",
-        &[],
-    );
 }
 
 // `ember.bin` beside the PAR2 set over it in `level.rar` in `lantern.7z`,
 // one article of it damaged.
-// Classic repairs nothing inside an archive: the container stays short of
-// the damaged article and it fails unpacking, delivering nothing.
-async fn assert_classic_fails_unpacking(scenario: &Scenario) {
-    let classic = run(scenario, Engine::Classic).await;
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
-}
-
 fn repaired_two_deep() -> (Vec<u8>, Scenario) {
     let ember = payload(6 * ARTICLE + 5, 108);
     let set = par2_set("ember", &[("ember.bin", ember.as_slice())], 2);
@@ -974,12 +881,12 @@ fn repaired_two_deep() -> (Vec<u8>, Scenario) {
 // the checkpoint it goes down on holds `ember.bin` damaged and nothing of it
 // repaired. The restored job repairs it as the run that never went down
 // does and delivers the member whole; it asks again only for what it held
-// in memory. Classic fails unpacking the container.
+// in memory.
 #[tokio::test]
 async fn a_par2_set_two_deep_crashed_before_its_repair_landed_repairs_and_delivers_the_member_whole()
  {
     let (ember, scenario) = repaired_two_deep();
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     assert!(whole.files[&delivered("ember.bin")] == ember);
     assert!(
@@ -1018,7 +925,6 @@ async fn a_par2_set_two_deep_crashed_before_its_repair_landed_repairs_and_delive
         restarted.graph.blocks_reachable,
         whole.graph().blocks_reachable
     );
-    assert_classic_fails_unpacking(&scenario).await;
 }
 
 // A byte-identical archive posted again under another name is that
@@ -1026,7 +932,6 @@ async fn a_par2_set_two_deep_crashed_before_its_repair_landed_repairs_and_delive
 // side in `level.rar` in `lantern.7z`, once as stored 7zs and once as stored
 // RAR5 volumes: each job is Complete with the members once, the second
 // archive's bytes no file of their own, and nothing asked for twice.
-// Classic delivers the same members for each.
 #[tokio::test]
 async fn the_repost_rule_holds_two_deep_for_a_7z_and_a_rar5_posted_again_under_another_name() {
     let members = sevenz_members();
@@ -1038,7 +943,7 @@ async fn the_repost_rule_holds_two_deep_for_a_7z_and_a_rar5_posted_again_under_a
         let (first, again) = (format!("cinder.{ext}"), format!("ashen.{ext}"));
         let outer = two_deep(&[(&first, archive.clone()), (&again, archive)]);
         let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]);
-        let graph = run(&scenario, Engine::Graph).await;
+        let graph = run(&scenario).await;
         assert!(
             graph.completed(),
             "{ext}: {:?} {:?}",
@@ -1060,17 +965,6 @@ async fn the_repost_rule_holds_two_deep_for_a_7z_and_a_rar5_posted_again_under_a
             "{ext}: {:?}",
             graph.refetched()
         );
-        let classic = run(&scenario, Engine::Classic).await;
-        assert!(
-            classic.completed(),
-            "{ext}: {:?} {:?}",
-            classic.status,
-            classic.failure
-        );
-        assert!(
-            classic.files == graph.files,
-            "{ext}: classic delivers what the graph does"
-        );
     }
 }
 
@@ -1078,11 +972,11 @@ async fn the_repost_rule_holds_two_deep_for_a_7z_and_a_rar5_posted_again_under_a
 // deep is out on its thread: the drain hears it back, so the restored job
 // holds the repair, replays the damaged article of `lantern.7z` as the
 // damage the repair already answered, lends no second repair, and announces
-// the one once. Classic fails unpacking the container.
+// the one once.
 #[tokio::test]
 async fn a_par2_set_two_deep_restarted_while_its_repair_is_out_applies_the_repair_once() {
     let (ember, scenario) = repaired_two_deep();
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     let [Some(RepairOutcome::Repaired { slices })] = whole.graph().outcomes[..] else {
         panic!("{:?}", whole.graph().outcomes);
     };
@@ -1101,7 +995,6 @@ async fn a_par2_set_two_deep_restarted_while_its_repair_is_out_applies_the_repai
             "JobCompleted".to_owned()
         ]
     );
-    assert_classic_fails_unpacking(&scenario).await;
 }
 
 // The scenario of `assert_repaired_header_places_the_bytes_behind_it`, and
@@ -1109,10 +1002,10 @@ async fn a_par2_set_two_deep_restarted_while_its_repair_is_out_applies_the_repai
 type WrapMembers = fn(Vec<(&str, Vec<u8>)>) -> (String, Vec<u8>);
 
 async fn repaired_header(inner: Vec<u8>, first: &str, wrap: WrapMembers) -> (Outcome, Scenario) {
-    let alone = run(
-        &Scenario::new(vec![Post::plain("mixed.rar", inner.clone())]),
-        Engine::Graph,
-    )
+    let alone = run(&Scenario::new(vec![Post::plain(
+        "mixed.rar",
+        inner.clone(),
+    )]))
     .await;
     assert!(alone.completed(), "alone: {:?}", alone.failure);
     let first = alone.files[&delivered(first)].clone();
@@ -1169,14 +1062,14 @@ fn vint(bytes: &[u8]) -> (u64, usize) {
 // bytes behind it are and keeps them as its own; the repaired header names
 // the member they are. They go to that member as any bytes do once placed,
 // so every member `inner` holds is delivered byte-exact and whole, with
-// nothing fetched again. Classic fails unpacking the container.
+// nothing fetched again.
 async fn assert_repaired_header_places_the_bytes_behind_it(
     inner: Vec<u8>,
     first: &str,
     wrap: WrapMembers,
 ) -> Outcome {
     let (alone, scenario) = repaired_header(inner, first, wrap).await;
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(
         graph.completed(),
         "{:?} {:?} {:?}",
@@ -1206,7 +1099,6 @@ async fn assert_repaired_header_places_the_bytes_behind_it(
         "{delivery:?}"
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert_classic_fails_unpacking(&scenario).await;
     graph
 }
 
@@ -1269,7 +1161,7 @@ async fn a_stored_member_behind_a_repaired_header_is_delivered_whole_two_deep() 
 // The stored pair one deep, the pipeline crashed before the repair landed:
 // the bytes the store kept as its own behind the damaged header are still
 // its own after the restore, and the repaired header still sends them to
-// the member it names. Classic fails unpacking the container.
+// the member it names.
 #[tokio::test]
 async fn a_stored_member_behind_a_header_repaired_after_a_crash_is_delivered_whole() {
     let inner = rar(&[
@@ -1280,7 +1172,7 @@ async fn a_stored_member_behind_a_header_repaired_after_a_crash_is_delivered_who
         ("lantern.rar".into(), rar(&entries))
     })
     .await;
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let last = scenario.posts[0].bytes.len().div_ceil(4);
     let mut before_the_repair = false;
@@ -1306,7 +1198,6 @@ async fn a_stored_member_behind_a_header_repaired_after_a_crash_is_delivered_who
     assert_eq!(restarted.restarts, 1);
     assert_restarted(&restarted, &whole);
     assert_eq!(restarted.graph.outcomes, whole.graph().outcomes);
-    assert_classic_fails_unpacking(&scenario).await;
 }
 
 // An enciphered stored 7z one deep, its password only a candidate: the store
@@ -1314,15 +1205,14 @@ async fn a_stored_member_behind_a_header_repaired_after_a_crash_is_delivered_who
 // the password that opens it places them in their member with nothing more
 // delivered of the volume. Every member is delivered byte-exact.
 #[tokio::test]
-async fn a_locked_stored_7z_one_deep_opened_by_a_candidate_delivers_its_proof_member_whole_under_graph()
- {
+async fn a_locked_stored_7z_one_deep_opened_by_a_candidate_delivers_its_proof_member_whole() {
     let locked = container(EncoderConfiguration::new(EncoderMethod::COPY), Some(SECRET));
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.rar",
         rar(&[("cinder.7z", locked)]),
     )])
     .global_password(SECRET);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(
         graph.completed(),
         "{:?} {:?} {:?}",

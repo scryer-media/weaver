@@ -7,7 +7,6 @@
 // costs each step the same whatever the job's size.
 
 use super::harness::{ARTICLE, Post, Scenario, par2_set, payload, run};
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::checkpoint::Tally;
 
 // One plain file of `articles` articles under a PAR2 set sliced at an
@@ -20,7 +19,7 @@ fn covered(articles: usize) -> Scenario {
 }
 
 async fn tally(articles: usize) -> Tally {
-    let outcome = run(&covered(articles), Engine::Graph).await;
+    let outcome = run(&covered(articles)).await;
     assert!(outcome.completed(), "{:?}", outcome.failure);
     let tally = outcome.graph().checkpoints;
     eprintln!("{articles} articles: {tally:?}");

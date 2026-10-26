@@ -6,63 +6,6 @@ use super::*;
 use crate::ingest::{FullFileName, full_file_names};
 
 #[tokio::test]
-async fn a_par2_rename_past_the_name_limit_records_the_described_name_in_full() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(31101);
-    let posted_name = "c9d4e7a1.bin";
-    let described_name = format!("{} - 07.mkv", vec!["Harbor"; 50].join(" "));
-    let payload: Vec<u8> = (0..20_480)
-        .map(|index| (index as u8).wrapping_mul(37).wrapping_add(5))
-        .collect();
-    let working_dir = insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec(
-            "Harbor Rename",
-            &[(posted_name.to_string(), payload.len() as u32)],
-        ),
-    )
-    .await;
-    install_test_par2_runtime(
-        &mut pipeline,
-        job_id,
-        build_repairable_par2_set_for_files(
-            &[(described_name.as_str(), payload.as_slice())],
-            1024,
-            1,
-        ),
-        &[],
-    );
-    write_and_complete_file(&mut pipeline, job_id, 0, posted_name, &payload).await;
-    pipeline.try_deobfuscate_files_with_par2(job_id).await;
-
-    let disk_name = pipeline
-        .effective_file_identity(
-            job_id,
-            NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-        )
-        .unwrap()
-        .current_filename;
-    assert_ne!(disk_name, posted_name);
-    assert!(disk_name.len() < described_name.len());
-    assert_eq!(
-        std::fs::read(working_dir.join(&disk_name)).unwrap(),
-        payload
-    );
-    assert_eq!(
-        full_file_names(&pipeline.jobs[&job_id].spec.metadata),
-        vec![FullFileName {
-            name: disk_name,
-            full_name: described_name,
-        }]
-    );
-}
-
-#[tokio::test]
 async fn a_delivery_rename_reaches_the_finished_job_with_its_full_name() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;

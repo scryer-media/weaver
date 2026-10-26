@@ -5,16 +5,15 @@
 // them, and dropped once the sets proved the member whole.
 
 use super::harness::{ARTICLE, Post, Scenario, par2_set, payload, run};
-use crate::pipeline::graph::Engine;
 
 // A member whose article was lost keeps its checksums while its set waits
 // for recovery and repairs it, and has none once the set repaired it.
 #[tokio::test]
-async fn a_member_its_set_proved_whole_keeps_no_checksums_under_graph() {
+async fn a_member_its_set_proved_whole_keeps_no_checksums() {
     let data = payload(4 * ARTICLE, 47);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
     posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
-    let graph = run(&Scenario::new(posts).lost(0, 1), Engine::Graph).await;
+    let graph = run(&Scenario::new(posts).lost(0, 1)).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     let looks: Vec<(bool, bool)> = graph
         .graph()

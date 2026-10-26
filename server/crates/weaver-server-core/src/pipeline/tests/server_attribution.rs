@@ -29,7 +29,6 @@ async fn attribution_checkpoint_survives_repeated_active_job_restores() {
     }
     pipeline.db.flush_write_queue().await.unwrap();
     assert!(pipeline.dirty_server_attribution.is_empty());
-    assert!(pipeline.pending_file_progress.is_empty());
     retire_pipeline_database(pipeline).await;
 
     for round in 0..2 {
@@ -40,11 +39,8 @@ async fn attribution_checkpoint_survives_repeated_active_job_restores() {
                 job_id: id,
                 job_hash: [0; 32],
                 spec: spec.clone(),
-                complete_files: saved.complete_files,
-                file_progress: saved.file_progress,
                 detected_archives: saved.detected_archives,
                 file_identities: saved.file_identities,
-                extracted_members: saved.extracted_members,
                 status: JobStatus::Paused,
                 download_state: None,
                 post_state: None,

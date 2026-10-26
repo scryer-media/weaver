@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The engine switch, and the joined path under it: a graph job's articles go
-// from the decoder through the root, the tree and the namespace writer to
-// its files, and the classic assembly writes nothing.
+// The joined path: a job's articles go from the decoder through the root,
+// the tree and the namespace writer to its files, and the assembly writes
+// nothing.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,7 @@ use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::{Delivered, Delivery};
-use crate::pipeline::tests::{insert_active_job_on, new_direct_pipeline, retire_pipeline_database};
+use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
     YencLayoutAssertions,
@@ -167,14 +167,7 @@ async fn graph_job(
     posts: &[Post],
 ) -> (Pipeline, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
-    insert_active_job_on(
-        &mut pipeline,
-        job_id,
-        spec("lantern joined", posts),
-        Engine::Graph,
-    )
-    .await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
+    insert_active_job(&mut pipeline, job_id, spec("lantern joined", posts)).await;
     assert!(pipeline.graph_jobs.contains_key(&job_id));
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
     (pipeline, working_dir)
@@ -273,8 +266,8 @@ fn member_file(pipeline: &Pipeline, job_id: JobId, member: u32) -> Option<PathBu
         .map(|(_, path)| path)
 }
 
-// The classic assembly never saw a byte of the file.
-fn classic_wrote_nothing(pipeline: &Pipeline, job_id: JobId, index: u32) {
+// The assembly never saw a byte of the file.
+fn assembly_wrote_nothing(pipeline: &Pipeline, job_id: JobId, index: u32) {
     let file = pipeline.jobs[&job_id]
         .assembly
         .file(NzbFileId {
@@ -291,7 +284,7 @@ fn read(path: &Path) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn two_plain_files_are_written_at_their_names_and_classic_writes_nothing() {
+async fn two_plain_files_are_written_at_their_names_and_the_assembly_writes_nothing() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_001);
     let posts = [
@@ -313,7 +306,7 @@ async fn two_plain_files_are_written_at_their_names_and_classic_writes_nothing()
                 Provenance::Fresh
             )]
         );
-        classic_wrote_nothing(&pipeline, job_id, index as u32);
+        assembly_wrote_nothing(&pipeline, job_id, index as u32);
     }
     assert!(pipeline.graph_jobs[&job_id].namespace().is_clean());
     retire_pipeline_database(pipeline).await;
@@ -343,7 +336,7 @@ async fn a_damaged_article_is_written_as_damaged_and_its_range_reported() {
         vec![(MemberId(0), damaged)]
     );
     assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
-    classic_wrote_nothing(&pipeline, job_id, 0);
+    assembly_wrote_nothing(&pipeline, job_id, 0);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -452,7 +445,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         ]
     );
     assert_eq!(read(&working_dir.join("lantern.bin")), data);
-    classic_wrote_nothing(&pipeline, job_id, 0);
+    assembly_wrote_nothing(&pipeline, job_id, 0);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -635,7 +628,7 @@ async fn an_archive_handed_to_its_engine_writes_what_the_engine_read() {
     assert_eq!(job.tree().engines().len(), 1);
     for (index, body) in bodies.iter().enumerate() {
         assert_eq!(&read(&working_dir.join(format!("echo-{index}.bin"))), body);
-        classic_wrote_nothing(&pipeline, job_id, index as u32);
+        assembly_wrote_nothing(&pipeline, job_id, index as u32);
     }
     // The volumes are the engine's input, not files of the job.
     assert!(job.member_files().is_empty());
@@ -825,52 +818,6 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
     retire_pipeline_database(pipeline).await;
 }
 
-#[test]
-fn parse_defaults_to_graph_when_unset_or_blank() {
-    assert_eq!(Engine::parse(None), Engine::Graph);
-    assert_eq!(Engine::parse(Some("")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("  ")), Engine::Graph);
-    assert_eq!(Engine::default(), Engine::Graph);
-}
-
-#[test]
-fn parse_reads_both_engines() {
-    assert_eq!(Engine::parse(Some("classic")), Engine::Classic);
-    assert_eq!(Engine::parse(Some("graph")), Engine::Graph);
-}
-
-#[test]
-fn parse_ignores_case() {
-    assert_eq!(Engine::parse(Some("GRAPH")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("Graph")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("ClAsSiC")), Engine::Classic);
-    assert_eq!(Engine::parse(Some(" graph ")), Engine::Graph);
-}
-
-#[test]
-fn parse_falls_back_to_graph_on_an_unknown_value() {
-    assert_eq!(Engine::parse(Some("turbo")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("graph2")), Engine::Graph);
-}
-
-#[test]
-fn spelling_round_trips() {
-    for engine in [Engine::Classic, Engine::Graph] {
-        assert_eq!(engine.as_str().parse::<Engine>(), Ok(engine));
-        assert_eq!(engine.to_string(), engine.as_str());
-    }
-    assert_eq!(
-        "turbo".parse::<Engine>(),
-        Err(UnknownEngine("turbo".to_string()))
-    );
-}
-
-#[test]
-fn classic_switches_apply_only_to_classic() {
-    assert!(Engine::Classic.classic_switches_apply());
-    assert!(!Engine::Graph.classic_switches_apply());
-}
-
 mod refusals;
 
 // The articles of a recovery volume's head: enough for its first recovery
@@ -1017,7 +964,6 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
     let posts = three_volumes(32);
     let working_dir = {
         let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
-        root::tests::stamp_graph(&pipeline.db, job_id);
         decode_all(&mut pipeline, job_id, &posts, 1).await;
         decode_head(&mut pipeline, job_id, &posts, 2).await;
         for ordinal in after_head(&posts, 2) {
@@ -1034,11 +980,8 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
             job_id,
             job_hash: [0; 32],
             spec: spec("lantern joined", &posts),
-            complete_files: std::collections::HashSet::new(),
-            file_progress: Default::default(),
             detected_archives: Default::default(),
             file_identities: Default::default(),
-            extracted_members: std::collections::HashSet::new(),
             status: JobStatus::Downloading,
             download_state: None,
             post_state: None,

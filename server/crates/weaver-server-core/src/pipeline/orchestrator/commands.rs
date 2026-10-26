@@ -90,36 +90,9 @@ impl Pipeline {
                 .active_decodes_by_job
                 .get(&job_id)
                 .is_some_and(|n| *n > 0)
-            || self
-                .direct_barrier_flights
-                .keys()
-                .any(|(id, _)| *id == job_id)
-            || self
-                .direct_placement_lanes
-                .keys()
-                .any(|(id, _)| *id == job_id)
-            || self
-                .direct_rearm_in_flight
-                .iter()
-                .any(|(id, _)| *id == job_id)
-            || self.direct_post_repair_in_flight.contains_key(&job_id)
-            || self.direct_tolerated_in_flight.contains_key(&job_id)
-            || self.direct_demotion_in_flight.contains_key(&job_id)
-            || self.par2_analysis_in_flight.contains_key(&job_id)
-            || self.inflight_extractions.contains_key(&job_id)
-            || self.has_active_rar_workers(job_id)
             || self.inflight_terminal_post_processing.contains(&job_id)
             || self.added_script_holds.contains(&job_id)
             || self.inflight_moves.contains(&job_id)
-            || self.direct_unpack.has_job_work_in_flight(job_id)
-            || self
-                .par3_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.has_worker_in_flight(job_id))
-            || self
-                .rar_refresh_state
-                .iter()
-                .any(|((id, _), state)| *id == job_id && state.in_flight.is_some())
         {
             return false;
         }
@@ -139,7 +112,6 @@ impl Pipeline {
         if new_dir == old_dir {
             return true;
         }
-        crate::pipeline::close_cached_write_handles_under(&old_dir).await;
         let root = self.intermediate_dir.clone();
         let source = old_dir.clone();
         let result = self
@@ -156,17 +128,8 @@ impl Pipeline {
                 return false;
             }
         };
-        self.direct_store
-            .relocate_working_dir(job_id, &old_dir, &new_dir);
         if let Some(cache) = self.repeated_articles.get(&job_id) {
             cache.relocate_working_dir(&old_dir, &new_dir);
-        }
-        self.invalidate_par2_session_for_identity_rebind(job_id);
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            for set in runtime.sets.values_mut() {
-                set.scan_carry = None;
-                set.scan_carry_exclusions.clear();
-            }
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.working_dir = new_dir;
@@ -183,12 +146,6 @@ impl Pipeline {
         // Deletion scripts still need this cwd after archival. A cancelled
         // queue run must also leave its process group before files disappear.
         crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0).await?;
-        // A re-added job may reuse either path, so release cached handles before
-        // removing its previous working and direct-store staging directories.
-        crate::pipeline::close_cached_write_handles_under(working_dir).await;
-        if let Some(staging) = staging_dir {
-            crate::pipeline::close_cached_write_handles_under(staging).await;
-        }
         if let Err(error) = tokio::fs::remove_dir_all(working_dir).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -235,7 +192,6 @@ impl Pipeline {
 struct CancelledJobCleanup {
     job_id: JobId,
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
-    extraction_cleanup_wait: Option<Arc<JobExtractionBudget>>,
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
 }
@@ -418,20 +374,8 @@ impl Pipeline {
     }
 
     // The archive did not commit, so future work belongs to a live job again.
-    // Tokens already handed to workers stay cancelled. Discard their read-only
-    // analysis tickets and retained sessions so neither a late verdict nor a
-    // cached session can reintroduce the cancelled token into the next pass.
+    // Tokens already handed to workers stay cancelled.
     fn restore_after_failed_cancellation(&mut self, job_id: JobId) {
-        self.forget_par2_analysis_work(job_id);
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            runtime.scan_budget = None;
-            for set in runtime.sets.values_mut() {
-                set.session = None;
-                set.session_last_used = None;
-                set.session_evidence_file_ids.clear();
-            }
-        }
-        self.par2_cancellations.remove(&job_id);
         self.shared_state.clear_job_cancellations(job_id);
         self.schedule_job_completion_check(job_id);
     }
@@ -486,31 +430,10 @@ impl Pipeline {
             .get(&job_id)
             .is_some_and(|sender| sender.send(true).is_ok());
         let executor_cancelled = self.terminal_post_processing_executor.cancel_job(job_id.0);
-        let par2_cancelled = if let Some(cancellation) = self.par2_cancellations.get(&job_id) {
-            cancellation.cancel();
-            true
-        } else {
-            false
-        };
-        let extraction_cleanup_wait = self.extraction_budgets.get(&job_id).cloned();
-        let extraction_cancelled = if let Some(budget) = &extraction_cleanup_wait {
-            budget.cancel();
-            true
-        } else {
-            false
-        };
         if pipeline_cancelled || executor_cancelled {
             tracing::debug!(
                 job_id = job_id.0,
                 "requested cancellation of active post-processing"
-            );
-        }
-        if par2_cancelled || extraction_cancelled {
-            tracing::debug!(
-                job_id = job_id.0,
-                par2_cancelled,
-                extraction_cancelled,
-                "requested cancellation of active repair or extraction"
             );
         }
         // Ahead of the archive, which copies them from the active row: a job
@@ -563,7 +486,6 @@ impl Pipeline {
             CancelledJobCleanup {
                 job_id,
                 post_processing_done,
-                extraction_cleanup_wait,
                 working_dir: state.working_dir.clone(),
                 staging_dir: state.staging_dir.clone(),
             },
@@ -578,8 +500,6 @@ impl Pipeline {
         self.remove_pending_completion_check(job_id);
         self.update_queue_metrics();
 
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_extraction_runtime(job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
@@ -602,7 +522,6 @@ impl Pipeline {
         self.rate_limit_reservations
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.job_last_download_activity.remove(&job_id);
-        self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
         self.clear_job_phase_progress_runtime(job_id);
@@ -629,12 +548,6 @@ impl Pipeline {
         // completion handler once that run has ended.
         if let Some(mut post_processing_done) = cleanup.post_processing_done {
             while post_processing_done.changed().await.is_ok() {}
-        }
-        if let Some(extraction_budget) = cleanup.extraction_cleanup_wait {
-            let _ = tokio::task::spawn_blocking(move || {
-                extraction_budget.wait_for_idle();
-            })
-            .await;
         }
         if let Err(error) = Self::cleanup_cancelled_job_directories(
             &db,

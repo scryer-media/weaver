@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::direct_store::DirectStoreAdmission;
 use super::pressure::{CheckpointAdmission, CheckpointLease};
 use super::*;
 use crate::operations::metrics::SchedulerBlockClause;
@@ -49,8 +48,6 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     retention_excludes: Arc<Vec<usize>>,
     bootstrap_files: Option<&'a [u32]>,
     uu_cursor_ordinals: Option<&'a HashMap<NzbFileId, u32>>,
-    direct_admission: Vec<DirectStoreAdmission>,
-    sweep_held: Option<Vec<u32>>,
     checkpoint: CheckpointAdmission,
     // What the handout being built has taken, as the checkpoint weighs it.
     leased: CheckpointLease,
@@ -92,16 +89,6 @@ impl ServableWorkFilter<'_> {
     // admits.
     fn refusal(&self, work: &DownloadWork) -> Option<SchedulerBlockClause> {
         let file_index = work.segment_id.file_id.file_index;
-        if !self.direct_admission.iter().all(|set| set.allows(work)) {
-            return Some(SchedulerBlockClause::DirectStore);
-        }
-        if self
-            .sweep_held
-            .as_deref()
-            .is_some_and(|held| held.contains(&file_index))
-        {
-            return Some(SchedulerBlockClause::SweepHeld);
-        }
         if work.exclude_servers.contains(&self.server_idx)
             || (work.avoid_server == Some(self.server_idx) && self.hint_has_alternative(work))
         {
@@ -175,13 +162,9 @@ impl ServableWorkFilter<'_> {
     }
 
     // Charge an article the handout has just taken, so every later article
-    // of the same handout is admitted against the lease as it now stands:
-    // the per-set disk budgets and header probes, and the restart
-    // checkpoint's projected lead.
+    // of the same handout is admitted against the restart checkpoint's
+    // projected lead as it now stands.
     pub(in crate::pipeline::download) fn note_taken(&mut self, work: &DownloadWork) {
-        for set in &mut self.direct_admission {
-            set.note_leased(work);
-        }
         self.leased.add(work);
     }
 }
@@ -193,17 +176,10 @@ impl Pipeline {
         work: DownloadWork,
     ) -> Result<Option<DownloadWork>, DispatchAttempt> {
         if !self.primary_download_within_restart_durable_lead(job_id, &work) {
-            self.advance_durable_download_floor(
-                job_id,
-                "download.file_progress.flush.restart_durable_lead",
-            );
+            self.advance_durable_download_floor(job_id);
             if !self.primary_download_within_restart_durable_lead(job_id, &work) {
                 self.note_checkpoint_dispatch_block(job_id);
-                if let Some(work) = self.requeue_graph_work(work)
-                    && let Some(state) = self.jobs.get_mut(&job_id)
-                {
-                    state.download_queue.push(work);
-                }
+                self.enqueue_download_work(work);
                 self.update_queue_metrics();
                 return Ok(None);
             }
@@ -215,34 +191,11 @@ impl Pipeline {
     }
 
     // Whether work going back on the queue waits in the recovery queue
-    // until something asks for it. Classic parks the recovery nothing waits
-    // on, for its completion check to promote. A graph job parks what its
-    // root holds parked: an article an object deferred while it was on the
-    // wire goes back parked, whatever server failed it, and the root's
-    // moves are the one way out.
+    // until something asks for it: what the job's root holds parked. An
+    // article an object deferred while it was on the wire goes back parked,
+    // whatever server failed it, and the root's moves are the one way out.
     pub(in crate::pipeline) fn requeue_parks(&self, work: &DownloadWork) -> bool {
-        match self.graph_article_parked(work.segment_id) {
-            Some(parked) => parked,
-            None => {
-                work.is_recovery
-                    && !work.completion_critical
-                    && self
-                        .job_engine(work.segment_id.file_id.job_id)
-                        .classic_switches_apply()
-            }
-        }
-    }
-
-    // Whether the job has recovery work parked for its completion check to
-    // promote. A graph job's root raises the recovery articles it wants into
-    // the download queue itself, so what its recovery queue still holds is
-    // what nothing has asked for, and no completion check changes that.
-    pub(in crate::pipeline::download) fn parked_recovery(&self, job_id: JobId) -> bool {
-        self.job_engine(job_id).classic_switches_apply()
-            && self
-                .jobs
-                .get(&job_id)
-                .is_some_and(|state| !state.recovery_queue.is_empty())
+        self.graph_article_parked(work.segment_id).unwrap_or(false)
     }
 
     // Hold payload work only while declared recovery indexes are unresolved.
@@ -255,45 +208,9 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) -> Option<Vec<u32>> {
-        // The hold ends when the classic parse of the index publishes its
-        // grid. A graph job's root namespace holds its own payload for the
-        // indexes the post declares, as long as it says.
-        if !self.job_engine(job_id).classic_switches_apply() {
-            return self.graph_indexes_to_come(job_id);
-        }
-        if self.par2_bypassed.contains(&job_id)
-            || self
-                .jobs
-                .get(&job_id)
-                .is_none_or(|state| state.par2_bytes == 0)
-        {
-            return None;
-        }
-        if self
-            .par2_runtime(job_id)
-            .is_some_and(|runtime| runtime.explicit_index_bootstrap_closed)
-        {
-            return None;
-        }
-
-        let files = self
-            .par2_metadata_candidate_indices(job_id)
-            .into_iter()
-            .filter(|(_, is_index, _)| *is_index)
-            .filter_map(|(file_index, _, _)| {
-                (!self
-                    .par2_discovery_state_for_candidate(job_id, file_index)
-                    .candidate_probe_is_terminal())
-                .then_some(file_index)
-            })
-            .collect::<Vec<_>>();
-        if files.is_empty() {
-            self.ensure_par2_runtime(job_id)
-                .explicit_index_bootstrap_closed = true;
-            None
-        } else {
-            Some(files)
-        }
+        // The job's root namespace holds its own payload for the indexes the
+        // post declares, as long as it says.
+        self.graph_indexes_to_come(job_id)
     }
 
     // The recovery indexes the post declares that a graph job's root namespace
@@ -315,48 +232,6 @@ impl Pipeline {
             .map(|held| held.into_iter().map(|member| member.0).collect())
     }
 
-    // While bootstrap is active, lease only tracked explicit-index work.
-    pub(in crate::pipeline::download) fn recovery_metadata_bootstrap_claims_work(
-        &mut self,
-        job_id: JobId,
-        work: &DownloadWork,
-    ) {
-        // The discovery states are the classic parse's; a graph job's root
-        // tells its own hold from its articles.
-        if !self.job_engine(job_id).classic_switches_apply() {
-            return;
-        }
-        let file_index = work.segment_id.file_id.file_index;
-        if !matches!(
-            self.par2_discovery_state_for_candidate(job_id, file_index),
-            Par2DiscoveryState::Unseen
-        ) {
-            return;
-        }
-        let filename = self.jobs.get(&job_id).and_then(|state| {
-            let file = state.spec.files.get(file_index as usize)?;
-            matches!(
-                file.role,
-                weaver_model::files::FileRole::Par2 { is_index: true, .. }
-            )
-            .then(|| file.filename.clone())
-        });
-        let Some(filename) = filename else {
-            return;
-        };
-        let file = self
-            .ensure_par2_runtime(job_id)
-            .files
-            .entry(file_index)
-            .or_default();
-        file.filename = filename;
-        file.metadata_carrier_completion_critical = false;
-        file.discovery = Par2DiscoveryState::MetadataCarrierQueued {
-            target_set_id: None,
-            set_ids: Vec::new(),
-        };
-    }
-
     // The single definition of "this server may fetch this queued article
     // right now", for one job.
     //
@@ -365,24 +240,20 @@ impl Pipeline {
     // and the other decides whether a connection should be given work at
     // all, so a drift between them shows up as either an idle link or an
     // article handed to a server that cannot serve it. Everything the answer
-    // depends on — retention, per-set disk admission, a demotion sweep's
-    // held files, the restart checkpoint, the PAR2 index bootstrap, the UU
-    // spool cursor, the work's own exclusions and rotation hint — is sampled
-    // once here, so a whole handout costs one sample rather than one per
-    // article.
+    // depends on — retention, the restart checkpoint, the PAR2 index
+    // bootstrap, the UU spool cursor, the work's own exclusions and rotation
+    // hint — is sampled once here, so a whole handout costs one sample rather
+    // than one per article.
     //
     // Before the queue is scanned, the clauses that can refuse a whole file
     // are put to every queued file at once (see
     // [`Self::queued_file_may_pass`]); when none passes, the answer is
-    // [`ServableWork::NoQueuedFilePasses`] and no scan is owed. Only the
-    // per-set header-probe peeks run ahead of that answer, because a file
-    // holding a probe is never refused by its set's budget.
+    // [`ServableWork::NoQueuedFilePasses`] and no scan is owed.
     //
     // The filter starts from an empty lease. A caller cutting a batch passes
     // each article it takes to [`ServableWorkFilter::note_taken`], so the
-    // byte-budget clauses (per-set disk admission and the restart
-    // checkpoint's undurable lead) see the batch's own projection rather
-    // than only what the actor has already committed.
+    // restart checkpoint's undurable lead sees the batch's own projection
+    // rather than only what the actor has already committed.
     pub(in crate::pipeline::download) fn servable_work_filter<'a>(
         &mut self,
         job_id: JobId,
@@ -394,20 +265,7 @@ impl Pipeline {
         if retention_excludes.contains(&server_idx) {
             return ServableWork::RetentionExcluded;
         }
-        let sweep_held = self.demotion_sweep_held_file_indices(job_id);
-        let direct_admission = self.direct_store_admission(job_id);
-        if direct_admission
-            .iter()
-            .any(DirectStoreAdmission::unplaceable)
-        {
-            self.direct_store.unplaceable_verdicts.insert(job_id);
-        }
-        if let Err(blocked) = self.queued_file_may_pass(
-            job_id,
-            &direct_admission,
-            sweep_held.as_deref(),
-            bootstrap_files,
-        ) {
+        if let Err(blocked) = self.queued_file_may_pass(job_id, bootstrap_files) {
             return ServableWork::NoQueuedFilePasses(blocked);
         }
         ServableWork::Scan(ServableWorkFilter {
@@ -420,8 +278,6 @@ impl Pipeline {
             retention_excludes,
             bootstrap_files,
             uu_cursor_ordinals,
-            direct_admission,
-            sweep_held,
             checkpoint: self.checkpoint_admission(job_id),
             leased: CheckpointLease::default(),
             checkpoint_blocked: std::cell::Cell::new(false),
@@ -431,17 +287,11 @@ impl Pipeline {
     }
 
     // Whether any queued file of the job could get an article past the
-    // clauses that refuse whole files — a direct-store set's disk budget, a
-    // demotion sweep's holds and the PAR2 index bootstrap — answered from
-    // the queue's per-file counts and smallest queued estimates in
-    // O(files · sets), without looking at an article.
+    // clause that refuses whole files, the PAR2 index bootstrap, answered
+    // from the queue's per-file counts without looking at an article.
     //
     // Only an `Err` is acted on, so this may answer `Ok` freely and must
-    // never answer `Err` while some article would pass. The `Err` names the
-    // clauses that refused the queued files. A set's budget refuses a file
-    // only when even the file's smallest queued article does not fit and no
-    // probe of the set lies in that file
-    // (see [`DirectStoreAdmission::may_admit_from_file`]). The other clauses
+    // never answer `Err` while some article would pass. The other clauses
     // cannot refuse a whole file this way: the UU cursor admits the article
     // at its ordinal; exclusions, rotation hints and the backfill gate are
     // per article; and the checkpoint's refusals must be observed article by
@@ -450,13 +300,11 @@ impl Pipeline {
     fn queued_file_may_pass(
         &self,
         job_id: JobId,
-        direct_admission: &[DirectStoreAdmission],
-        sweep_held: Option<&[u32]>,
         bootstrap_files: Option<&[u32]>,
     ) -> Result<(), BlockedBy> {
-        if direct_admission.is_empty() && sweep_held.is_none() && bootstrap_files.is_none() {
+        let Some(bootstrap_files) = bootstrap_files else {
             return Ok(());
-        }
+        };
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(());
         };
@@ -471,20 +319,10 @@ impl Pipeline {
                 continue;
             }
             counted += queued;
-            let smallest = queue.min_queued_byte_estimate_for_file(file_id);
-            if smallest.is_some_and(|smallest| {
-                !direct_admission
-                    .iter()
-                    .all(|set| set.may_admit_from_file(file_index, smallest))
-            }) {
-                blocked = blocked.with(SchedulerBlockClause::DirectStore);
-            } else if sweep_held.is_some_and(|held| held.contains(&file_index)) {
-                blocked = blocked.with(SchedulerBlockClause::SweepHeld);
-            } else if bootstrap_files.is_some_and(|files| !files.contains(&file_index)) {
-                blocked = blocked.with(SchedulerBlockClause::RecoveryMetadataBootstrap);
-            } else {
+            if bootstrap_files.contains(&file_index) {
                 return Ok(());
             }
+            blocked = blocked.with(SchedulerBlockClause::RecoveryMetadataBootstrap);
         }
         // Articles of a file the spec does not list were not looked at; let
         // the scan judge them.

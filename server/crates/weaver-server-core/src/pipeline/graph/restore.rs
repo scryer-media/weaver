@@ -2,9 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The restart seam of a graph job: its checkpoint read back, the job rebuilt
-// from it, and the articles it has in hand given to the classic restore as
-// the ones the queue does not fetch. A job stamped graph with no checkpoint
-// is refused rather than restored wrong: nothing says what its files hold.
+// from it, and the articles it has in hand given to the restore as the ones
+// the queue does not fetch. A job with no checkpoint is admitted afresh.
 
 use std::collections::HashSet;
 use std::path::Path;

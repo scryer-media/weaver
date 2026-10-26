@@ -282,17 +282,6 @@ impl Pipeline {
                 {
                     return None;
                 }
-                // A job whose own health probe asked every lane for a pickup
-                // and got none stands down for one handout. The probe rides
-                // the download lanes, so a job holding all of them starves the
-                // batch that is trying to decide whether its release exists at
-                // all — and the busier it is, the longer it holds them. No
-                // lane is reserved: the job is simply not offered work while
-                // the batch is waiting, so the next lane to come free takes
-                // the batch.
-                if self.owned_download_lane_pool.probe_is_starved_by(job_id.0) {
-                    return None;
-                }
                 Some((Self::job_dispatch_priority(state), index, *job_id))
             })
             .collect::<Vec<_>>();
@@ -401,9 +390,6 @@ impl Pipeline {
         if self.propagation_hold_until(job_id).is_some() {
             return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
         }
-        // An archive whose unlock order changed re-ranks its queue before
-        // anything is taken from it.
-        self.apply_rar_unlock_priorities_if_dirty(job_id);
         let bootstrap_files = self.recovery_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
 
@@ -447,9 +433,6 @@ impl Pipeline {
                 break;
             };
             filter.note_taken(&work);
-            if bootstrap_files.is_some() {
-                self.recovery_metadata_bootstrap_claims_work(job_id, &work);
-            }
             taken.push(work);
         }
 

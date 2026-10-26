@@ -5,19 +5,18 @@
 // the payload waits for it as for one the post declares.
 
 use super::harness::{ARTICLE, Post, Scenario, par2_set, par3_set, payload, run};
-use crate::pipeline::graph::Engine;
 
 // The data member and the index are both posted under unrelated names. Once
 // the index's first article says what it is, the data member's payload
 // waits until the index is in; the index then names the member and it is
 // delivered under that name.
 #[tokio::test]
-async fn an_index_with_an_unrelated_name_holds_the_payload_under_graph() {
+async fn an_index_with_an_unrelated_name_holds_the_payload() {
     unnamed_index(false).await;
 }
 
 #[tokio::test]
-async fn a_par3_index_with_an_unrelated_name_holds_the_payload_under_graph() {
+async fn a_par3_index_with_an_unrelated_name_holds_the_payload() {
     unnamed_index(true).await;
 }
 
@@ -37,7 +36,7 @@ async fn unnamed_index(par3: bool) {
     ];
     let index_articles = index.len().div_ceil(ARTICLE) as u32;
     assert!(index_articles > 2, "the index spans articles");
-    let graph = run(&Scenario::new(posts).leased(), Engine::Graph).await;
+    let graph = run(&Scenario::new(posts).leased()).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),

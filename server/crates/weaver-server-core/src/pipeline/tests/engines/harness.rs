@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The two-engine harness: the API is described in `mod.rs`. A run stands a
-// fresh pipeline up, admits the scenario's job under one engine, and plays
-// the server: every article the job's download queue hands out is answered
-// from the posts, damaged or lost as the scenario says, and whenever the
-// queue runs dry the completion gate runs the way the orchestrator runs it,
-// with every detached ticket settled before the next look. The run ends when
-// the job is complete or failed; a round that changes nothing ends it too,
-// with the job's state in the panic.
+// The harness: the API is described in `mod.rs`. A run stands a fresh
+// pipeline up, admits the scenario's job, and plays the server: every
+// article the job's download queue hands out is answered from the posts,
+// damaged or lost as the scenario says, and whenever the queue runs dry the
+// completion gate runs the way the orchestrator runs it, with every detached
+// ticket settled before the next look. The run ends when the job is complete
+// or failed; a round that changes nothing ends it too, with the job's state
+// in the panic.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -17,16 +17,14 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_model::files::FileRole;
 
 use super::super::{
-    debug_job_state, insert_active_job_on, job_status_for_assert, new_direct_pipeline_with_buffers,
+    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
     pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
-    settle_direct_demotion_work, settle_direct_verification_read,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::pipeline::download::DownloadWork;
 use crate::pipeline::extraction::ExtractionLimits;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, PipelineEvent, SegmentEncoding, SegmentSource,
@@ -396,8 +394,8 @@ impl Scenario {
         self
     }
 
-    // A password the settings carry, not the job: classic tries it once
-    // the volumes are in, graph offers it when an object asks.
+    // A password the settings carry, not the job: the graph engine offers it
+    // when an object asks.
     pub(super) fn global_password(mut self, password: &str) -> Self {
         self.global_passwords.push(password.to_string());
         self
@@ -502,7 +500,6 @@ pub(super) struct GraphView {
 
 #[derive(Debug)]
 pub(super) struct Outcome {
-    pub(super) engine: Engine,
     pub(super) status: Option<JobStatus>,
     pub(super) failure: Option<String>,
     pub(super) failure_kind: Option<HistoryFailureKind>,
@@ -515,11 +512,11 @@ pub(super) struct Outcome {
     // Every article in the order it was asked for.
     pub(super) order: Vec<(u32, u32)>,
     pub(super) reads: u64,
-    pub(super) graph: Option<GraphView>,
-    // The posts that are PAR2 or PAR3 recovery volumes, by file index.
-    pub(super) volumes: Vec<u32>,
+    pub(super) graph: GraphView,
     // Every pipeline event the job's run sent, in order.
     pub(super) events: Vec<PipelineEvent>,
+    // The extraction refusals the run counted, in the metric's reason order.
+    pub(super) rejections: [u64; 9],
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
@@ -540,20 +537,8 @@ impl Outcome {
         self.status == Some(JobStatus::Complete)
     }
 
-    // The first article of a recovery volume, asked for when `other` never
-    // asked for it: the graph samples each volume's head to learn what it
-    // holds, which classic never needs while nothing is damaged.
-    pub(super) fn volume_samples(&self, other: &Outcome) -> Vec<(u32, u32)> {
-        self.requests
-            .keys()
-            .filter(|(file, ordinal)| *ordinal == 0 && self.volumes.contains(file))
-            .filter(|article| !other.requests.contains_key(article))
-            .copied()
-            .collect()
-    }
-
     pub(super) fn graph(&self) -> &GraphView {
-        self.graph.as_ref().expect("a graph run keeps its view")
+        &self.graph
     }
 }
 
@@ -579,42 +564,12 @@ pub(super) fn repair_and_terminal_events(outcome: &Outcome) -> Vec<String> {
         .collect()
 }
 
-pub(super) async fn run_both(scenario: &Scenario) -> (Outcome, Outcome) {
-    (
-        run(scenario, Engine::Classic).await,
-        run(scenario, Engine::Graph).await,
-    )
-}
-
-pub(super) fn assert_same(classic: &Outcome, graph: &Outcome) {
-    for outcome in [classic, graph] {
-        assert!(
-            outcome.refetched().is_empty(),
-            "{} asked for an article twice: {:?}",
-            outcome.engine,
-            outcome.refetched()
-        );
-    }
-    assert_eq!(classic.status, graph.status, "status");
-    assert_eq!(classic.failure_kind, graph.failure_kind, "failure kind");
-    assert_eq!(
-        classic.files.keys().collect::<Vec<_>>(),
-        graph.files.keys().collect::<Vec<_>>(),
-        "delivered names"
-    );
-    for (name, bytes) in &classic.files {
-        assert!(
-            graph.files[name] == *bytes,
-            "{name}: delivered bytes differ"
-        );
-    }
-    assert_eq!(classic.claims, graph.claims, "claims");
-    let samples = graph.volume_samples(classic);
-    let mut asked = graph.requests.clone();
-    asked.retain(|article, _| !samples.contains(article));
-    assert_eq!(
-        classic.requests, asked,
-        "article requests, volume samples aside"
+// Every article was asked for once.
+pub(super) fn assert_fetched_once(outcome: &Outcome) {
+    assert!(
+        outcome.refetched().is_empty(),
+        "asked for an article twice: {:?}",
+        outcome.refetched()
     );
 }
 
@@ -622,55 +577,32 @@ pub(super) fn assert_same(classic: &Outcome, graph: &Outcome) {
 // finished: the status it sat at, and the pipeline's account of the job.
 #[derive(Debug)]
 pub(super) struct Stall {
-    pub(super) engine: Engine,
     pub(super) status: Option<JobStatus>,
     pub(super) state: String,
 }
 
-// A run that failed as `kind` with an error that starts `error`, leaving
-// exactly `left` under the complete folder.
-pub(super) fn assert_fails_leaving(
-    outcome: &Outcome,
-    kind: HistoryFailureKind,
-    error: &str,
-    left: &[&str],
-) {
-    match &outcome.status {
-        Some(JobStatus::Failed { error: said }) => assert!(
-            said.starts_with(error),
-            "{}: failed saying {said}",
-            outcome.engine
-        ),
-        other => panic!("{}: {other:?}, not a failure", outcome.engine),
-    }
-    assert_eq!(outcome.failure_kind, Some(kind), "{}: kind", outcome.engine);
-    assert_eq!(
-        outcome.files.keys().map(String::as_str).collect::<Vec<_>>(),
-        left,
-        "{}: left under the complete folder",
-        outcome.engine
-    );
+pub(super) async fn run(scenario: &Scenario) -> Outcome {
+    try_run(scenario)
+        .await
+        .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state))
 }
 
-pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
-    try_run(scenario, engine).await.unwrap_or_else(|stall| {
-        panic!(
-            "{} job stalled at {:?}: {}",
-            stall.engine, stall.status, stall.state
-        )
-    })
-}
-
-// A run that may stall, for a row that asserts an engine does.
-// A fresh pipeline with the scenario's job admitted under `engine`, nothing
-// asked yet.
+// A fresh pipeline with the scenario's job admitted, nothing asked yet.
 pub(super) async fn admit(
     scenario: &Scenario,
-    engine: Engine,
+) -> (tempfile::TempDir, Pipeline, std::path::PathBuf) {
+    admit_with(scenario, |_, _| {}).await
+}
+
+// [`admit`], with `setup` given the pipeline and its directory before the
+// job is admitted.
+pub(super) async fn admit_with(
+    scenario: &Scenario,
+    setup: impl FnOnce(&mut Pipeline, &Path),
 ) -> (tempfile::TempDir, Pipeline, std::path::PathBuf) {
     let temp_dir = tempfile::tempdir().unwrap();
     // One server: an article it serves damaged has nowhere else to come
-    // from, so both engines give it up for repair at once.
+    // from, so the job gives it up for repair at once.
     let buffers = crate::runtime::buffers::BufferPoolConfig {
         small_count: 8,
         medium_count: 4,
@@ -682,21 +614,21 @@ pub(super) async fn admit(
         pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
     }
     scenario.prepare(&mut pipeline);
-    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), engine).await;
-    pipeline.admit_graph_job(JOB, engine);
-    assert_eq!(pipeline.is_graph_job(JOB), engine == Engine::Graph);
+    setup(&mut pipeline, temp_dir.path());
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     (temp_dir, pipeline, complete_dir)
 }
 
-pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outcome, Stall> {
-    let (_temp_dir, mut pipeline, complete_dir) = admit(scenario, engine).await;
+// A run that may stall, for a row that asserts the job does.
+pub(super) async fn try_run(scenario: &Scenario) -> Result<Outcome, Stall> {
+    let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
     let (heard, kept) = hear(pipeline.event_tx.subscribe());
     let mut refused = BTreeSet::new();
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
-    let mut graph = (engine == Engine::Graph).then(GraphView::default);
+    let mut graph = GraphView::default();
     let mut reads = 0;
     let mut stalled = None;
     loop {
@@ -734,11 +666,6 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             break;
         }
         let before = fingerprint(&pipeline, &requests);
-        // The idle tick: bytes held out of order behind an article that
-        // will never commit are written out.
-        if pipeline.write_buffered_bytes > 0 {
-            pipeline.flush_quiescent_write_backlog().await;
-        }
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }
@@ -775,69 +702,15 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             pipeline.receive_retry_work(retry);
             continue;
         }
-        // Classic's extraction runs out on a task too, a whole set's or a
-        // RAR member worker's, and says it is done the same way.
-        if pipeline
-            .inflight_extractions
-            .get(&JOB)
-            .is_some_and(|sets| !sets.is_empty())
-            || pipeline.has_active_rar_workers(JOB)
-        {
-            let done = pipeline
-                .extract_done_rx
-                .recv()
-                .await
-                .expect("an extraction in flight reports");
-            pipeline.handle_extraction_done(done).await;
-            continue;
-        }
-        // Classic works out a RAR set's plan off the actor too, and the
-        // orchestrator hears it back on its own channel.
-        if pipeline
-            .rar_refresh_state
-            .iter()
-            .any(|((job, _), refresh)| *job == JOB && refresh.in_flight.is_some())
-        {
-            let done = pipeline
-                .rar_refresh_done_rx
-                .recv()
-                .await
-                .expect("a RAR refresh in flight reports");
-            pipeline.handle_rar_refresh_done(done).await;
-            continue;
-        }
-        // A RAR plan or extraction classic put off for want of capacity is
-        // tried again when its retry comes back, as the orchestrator hears it.
-        if pipeline
-            .pending_rar_capacity_retries
-            .iter()
-            .any(|(job, _, _)| *job == JOB)
-        {
-            let retry = pipeline
-                .rar_capacity_retry_rx
-                .recv()
-                .await
-                .expect("a scheduled RAR retry is sent");
-            pipeline.handle_rar_capacity_retry(retry).await;
-            continue;
-        }
         let after = fingerprint(&pipeline, &requests);
         if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
             let status = job_status_for_assert(&pipeline, JOB);
-            let state = format!("{after}: {}", debug_job_state(&pipeline, JOB));
+            let state = after;
             retire_pipeline_database(pipeline).await;
-            return Err(Stall {
-                engine,
-                status,
-                state,
-            });
+            return Err(Stall { status, state });
         }
     }
 
-    if engine == Engine::Classic {
-        reads = (pipeline.par2_authoritative_verify_calls + pipeline.par2_selective_verify_calls)
-            as u64;
-    }
     let status = job_status_for_assert(&pipeline, JOB);
     let failure = match &status {
         Some(JobStatus::Failed { error }) => Some(error.clone()),
@@ -862,9 +735,9 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         .collect();
     drop(heard);
     let events = kept.await.expect("every event the run sent is kept");
+    let rejections = pipeline.metrics.extraction_rejections();
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
-        engine,
         status,
         failure,
         failure_kind,
@@ -875,22 +748,8 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         order,
         reads,
         graph,
-        volumes: scenario
-            .posts
-            .iter()
-            .zip(0u32..)
-            .filter(|(post, _)| {
-                matches!(
-                    post.role,
-                    FileRole::Par2 {
-                        is_index: false,
-                        ..
-                    } | FileRole::Par3 { is_index: false }
-                )
-            })
-            .map(|(_, index)| index)
-            .collect(),
         events,
+        rejections,
     })
 }
 
@@ -946,7 +805,7 @@ pub(super) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOut
                 .collect();
         }
     }
-    let (_temp_dir, mut pipeline, _) = admit(scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, _) = admit(scenario).await;
     let mut outcomes = Vec::new();
     loop {
         while let Some(work) = pipeline
@@ -1132,7 +991,7 @@ async fn serve_from(
     // what the job knows now when it was handed out alone.
     let checkpoint_plan = leased
         .cloned()
-        .unwrap_or_else(|| pipeline.par2_checkpoint_plan(job));
+        .unwrap_or_else(|| checkpoint_plan(pipeline, job));
     let mut checksums = weaver_yenc::SegmentedCrc32::new(offset as u64, checkpoint_plan.clone());
     checksums.update(&body);
     let (_, segments) = checksums.finish_article();
@@ -1165,10 +1024,6 @@ async fn serve_from(
             },
         )
         .await;
-    // What the select loop would pick up after the article: the read-back a
-    // set's last article submits, and a demotion's handback.
-    settle_direct_verification_read(pipeline, job).await;
-    settle_direct_demotion_work(pipeline).await;
 }
 
 pub(in crate::pipeline::tests) fn finished(pipeline: &Pipeline) -> bool {
@@ -1197,12 +1052,8 @@ fn fingerprint(pipeline: &Pipeline, requests: &BTreeMap<(u32, u32), usize>) -> S
 
 // The graph job as it stands; a finished job has left the pipeline, so the
 // last look before that is what the outcome keeps.
-pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
-    let (Some(view), Some(job), Some(state)) = (
-        view.as_mut(),
-        pipeline.graph_jobs.get(&JOB),
-        pipeline.jobs.get(&JOB),
-    ) else {
+pub(super) fn observe(pipeline: &Pipeline, view: &mut GraphView, reads: &mut u64) {
+    let (Some(job), Some(state)) = (pipeline.graph_jobs.get(&JOB), pipeline.jobs.get(&JOB)) else {
         return;
     };
     let looked = std::time::Instant::now();
@@ -1324,8 +1175,7 @@ pub(super) fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<
 
 // The delivered directories that hold nothing, the marker aside. The working
 // directories a run keeps beside the output, named with a leading
-// `.weaver-`, are not delivered, and classic leaves them empty when it is
-// done with them.
+// `.weaver-`, are not delivered.
 fn collect_empty(root: &Path, dir: &Path, empty: &mut BTreeSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

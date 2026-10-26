@@ -528,8 +528,6 @@ impl Pipeline {
                 released_results_by_job = backlog.released_results,
                 released_result_bytes_by_job = backlog.released_result_bytes,
                 pending_decodes_by_job = backlog.pending_decodes,
-                buffered_write_segments_by_job = backlog.buffered_write_segments,
-                buffered_write_bytes_by_job = backlog.buffered_write_bytes,
                 "download dispatch liveness stall: queued work but no active downloads"
             );
         } else {

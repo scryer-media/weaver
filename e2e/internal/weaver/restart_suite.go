@@ -34,13 +34,6 @@ const (
 const (
 	restartExtractDelayEnv = "WEAVER_E2E_DELAY=extract.member_start=20000"
 	restartPar2AliasSet    = "a31f592e0b874d3ea8c44161b77f3049"
-	// restartClassicExtractEnv keeps the classic RAR extraction path in play for
-	// the cases whose restart points are seams inside it: the member-start delay
-	// hook, the per-volume checkpoint and the finalize-after-rename trip point.
-	// Direct unpack installs members straight out of the chase and never enters
-	// those seams, so with the gate at its default a case written against them
-	// simply watches the job complete and never reaches its restart point.
-	restartClassicExtractEnv = "WEAVER_DIRECT_UNPACK=0"
 )
 
 type restartClassification string
@@ -2231,7 +2224,7 @@ func classifyRestartResult(profile restartProfile, pass bool, passSummary string
 }
 
 func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2260,7 +2253,7 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 	}
 	preCompletedFiles := preDB.JobMetrics[jobID].Files
 
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
 	postFacade, err := ctx.waitForFacade(jobID, 2*time.Minute, func(snapshot facadeItemSnapshot) bool {
@@ -2474,7 +2467,7 @@ func runQueuedRepairSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseR
 }
 
 func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobIDs, err := ctx.submitSlugNTimes("rar5-multi-member", 2)
@@ -2493,7 +2486,7 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	postDB, err := ctx.waitForDB(2*time.Minute, func(snapshot restartDBSnapshot) bool {
@@ -2714,7 +2707,7 @@ func runRepairingRestartsCleanly(ctx *restartCaseContext) (restartCaseResult, er
 }
 
 func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2736,7 +2729,7 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, fmt.Errorf("staged partial member %s was empty before restart", partialPath)
 	}
 
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
@@ -2761,7 +2754,7 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 }
 
 func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("extract.after_finalize_rename_before_record", 8, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("extract.after_finalize_rename_before_record", 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2783,7 +2776,7 @@ func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseRe
 		return restartCaseResult{}, fmt.Errorf("staged finalized member %s was empty before restart", stagedPath)
 	}
 
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
@@ -2808,7 +2801,7 @@ func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseRe
 }
 
 func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2868,7 +2861,7 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
 
@@ -3176,7 +3169,7 @@ func readConventional7zRepairLog(logText string, jobID int) conventional7zRepair
 // extraction's block data error reopens the verdict, one repair rebuilds the
 // volume, and the job completes with the expected output, never failing.
 func runConventional7zDamagedBlockRepairsOnce(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(conventional7zRepairSlug)
