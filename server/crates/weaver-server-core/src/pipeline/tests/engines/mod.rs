@@ -84,6 +84,7 @@ mod lines;
 mod nesting;
 mod par3;
 mod partial;
+mod password;
 mod perf;
 mod plain_par2;
 mod rar;

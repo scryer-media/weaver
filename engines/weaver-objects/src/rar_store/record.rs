@@ -32,6 +32,15 @@ impl RarStore {
         out: &mut Vec<Emit>,
     ) {
         for (id, part, stream) in self.linked(volume, range) {
+            // A condemned file's part in this volume is posted again: it is
+            // placed afresh from here, and once every part is, nothing reads
+            // them through the cipher they stood under.
+            if let Some(condemned) = self.condemned.get_mut(&id) {
+                condemned.parts.remove(&volume);
+                if condemned.parts.is_empty() {
+                    self.condemned.remove(&id);
+                }
+            }
             // The layout cuts a member's runs at its parts, so one run lies
             // in one piece; a part the entry has not taken yet routes nothing.
             let Some(pieces) = self.entries.get(id).map(|entry| &entry.pieces) else {
@@ -169,6 +178,13 @@ impl RarStore {
         ) else {
             return;
         };
+        // The gate composes verified runs only, so a failure here is on
+        // verified bytes: under a key on trial it condemns the key, not the
+        // bytes.
+        if let Some(candidate) = entry.trial {
+            self.wrong_key = Some(candidate);
+            return;
+        }
         let parts: Vec<(VolumeIndex, ByteRange)> = entry
             .pieces
             .iter()

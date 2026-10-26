@@ -526,6 +526,47 @@ fn a_wrong_password_then_the_right_one() {
     posted_whole(&owner);
 }
 
+// A RAR4 file key has no check of its own, so a candidate that did not open
+// the headers keys the files on trial: a whole-file checksum that fails on
+// bytes as they were posted condemns it, the store asks for every part it
+// read again, and the next candidate opens the same bytes.
+#[test]
+fn a_wrong_rar4_key_on_verified_bytes_is_condemned_and_the_right_one_opens_the_same_bytes() {
+    let volumes = write(&items(), &encrypted(Version::Rar4, false));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 4096);
+    owner.offer("not-the-passphrase");
+    let asked_again = owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Again { .. }))
+        .count();
+    assert_eq!(asked_again, files().len(), "one part of each file, once");
+    assert!(owner.members.values().all(|got| !got.closed));
+    owner.offer(PASSWORD);
+    owner.close(0);
+    owner
+        .said
+        .retain(|emit| !matches!(emit, Emit::NeedsPassword | Emit::Again { .. }));
+    no_trouble(&owner);
+    streamed(&owner);
+    posted_whole(&owner);
+}
+
+#[test]
+fn every_rar4_candidate_wrong_on_verified_bytes_needs_a_password() {
+    let volumes = write(&items(), &encrypted(Version::Rar4, false));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 4096);
+    owner.offer("not-the-passphrase");
+    owner.offer("not-that-either");
+    owner.close(0);
+    assert!(owner.members.values().all(|got| !got.closed));
+    assert!(!owner.said.contains(&Emit::Refuse(Why::Encrypted)));
+    owner.quiet();
+    assert!(owner.said.contains(&Emit::Refuse(Why::Encrypted)));
+}
+
 // RAR5 proves a candidate by its password check; RAR4 lets it through to
 // the walk, whose first header refutes a wrong one by its CRC.
 #[test]

@@ -261,6 +261,7 @@ fn entry(facts: EntryFacts) -> Entry {
             (None, _) => Lock::Plain,
         },
         hash_key: None,
+        trial: None,
         out: Arc::new(Out {
             coverage: facts.coverage,
             closed: facts.closed,

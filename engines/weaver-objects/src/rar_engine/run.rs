@@ -197,9 +197,11 @@ impl Walk<'_, '_> {
 
 // What a RAR error means for the job, by its class. Damage is said on the
 // volumes the failing member spans, or the one whose headers failed, so a
-// repair can bring their bytes back. A wrong key decrypts to bytes whose
-// checksum fails, so on an encrypted member a checksum failure asks for
-// another password before it is called damage.
+// repair can bring their bytes back. A run reads verified bytes only, and a
+// read that failed ends it silently, so a failure that gets here is on bytes
+// as they were posted: on an encrypted member, a wrong key decrypts to bytes
+// the decoder or the checksum rejects, and the failure asks for another
+// password before it is called damage.
 fn verdict(
     error: &RarError,
     encrypted: bool,
@@ -208,15 +210,7 @@ fn verdict(
 ) -> Vec<Emit> {
     match rar_error_class(error) {
         Class::PasswordRequired => vec![Emit::NeedsPassword],
-        Class::Recoverable
-            if encrypted
-                && matches!(
-                    error,
-                    RarError::DataCrcMismatch { .. } | RarError::PackedDataCrcMismatch { .. }
-                ) =>
-        {
-            vec![Emit::NeedsPassword]
-        }
+        Class::Recoverable if encrypted => vec![Emit::NeedsPassword],
         Class::Recoverable => {
             let damaged: Vec<Emit> = spans
                 .filter_map(|position| {
@@ -239,7 +233,14 @@ fn verdict(
 
 fn terminal(error: &RarError, encrypted: bool) -> Emit {
     match error {
-        RarError::Blake2Mismatch { .. } if encrypted => Emit::NeedsPassword,
+        // A wrong key's bytes, as the decoder rejects them.
+        RarError::Blake2Mismatch { .. }
+        | RarError::CorruptArchive { .. }
+        | RarError::InvalidHuffmanTable
+            if encrypted =>
+        {
+            Emit::NeedsPassword
+        }
         RarError::UnsafeLinkTarget { .. } | RarError::UnsupportedLinkType { .. } => {
             Emit::Refuse(Why::NotAFile)
         }

@@ -242,6 +242,14 @@ pub enum Effect {
         old: String,
         new: String,
     },
+    // The object at `node` asked for these ranges of its volumes again, in
+    // one say. The owner answers them with `Tree::again` once every effect
+    // before it is applied: what the object reads back of its members is
+    // then written.
+    Again {
+        node: NodeId,
+        ranges: Vec<(VolumeIndex, ByteRange)>,
+    },
 }
 
 // How the tree constructs the object for a kind the sniffer named. Objects
@@ -2337,8 +2345,11 @@ impl Tree {
             emits.clear();
             return;
         }
-        // What one say gives back is taken back together, after the rest.
+        // What one say gives back is taken back together, after the rest,
+        // and what it asks for again is asked together: each range reads
+        // back as the object stood before any of them comes again.
         let mut given = Vec::new();
+        let mut again = Vec::new();
         for emit in emits.drain(..) {
             match emit {
                 Emit::Pending => {}
@@ -2407,9 +2418,7 @@ impl Tree {
                     envelope,
                     at,
                 } => self.unkept(node, (volume, range), (envelope, at), effects),
-                Emit::Again { volume, range } => {
-                    self.again(node, volume, range, builder, effects);
-                }
+                Emit::Again { volume, range } => again.push((volume, range)),
                 Emit::Damaged { volume, range } => self.damaged(node, volume, range, effects),
                 Emit::NeedsPassword => effects.push(Effect::NeedsPassword { node }),
                 Emit::NeedsEngine(why) => self.unbind(node, why, true, builder, effects),
@@ -2421,6 +2430,12 @@ impl Tree {
                 // not heard: the drain drops it.
                 return;
             }
+        }
+        if !again.is_empty() {
+            effects.push(Effect::Again {
+                node,
+                ranges: again,
+            });
         }
         if !given.is_empty() {
             self.give_back(node, &given, builder, effects);
@@ -2768,56 +2783,58 @@ impl Tree {
         );
     }
 
-    // An object asked for a range of its volume again. What of it was posted
-    // is read back as the object rebuilds it, while it still stands as it
-    // said it, then uncovered at every depth as a restart's lost range is,
-    // and delivered to the object again, each run with the provenance the
-    // parent's member keeps for it. A run that was never posted, or does
-    // not read back, is not said again: it comes when it arrives.
-    fn again(
+    // An object asked for ranges of its volumes again. What of each was
+    // posted is read back as the object rebuilds it, every range while the
+    // object still stands as it said them all, then uncovered at every depth
+    // as a restart's lost range is, and delivered to the object again, each
+    // run with the provenance the parent's member keeps for it. A run that
+    // was never posted, or does not read back, is not said again: it comes
+    // when it arrives. The owner calls it for `Effect::Again`, after
+    // applying the effects before it.
+    pub fn again(
         &mut self,
         node: NodeId,
-        volume: VolumeIndex,
-        range: ByteRange,
+        ranges: &[(VolumeIndex, ByteRange)],
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let Some((parent, member)) = self
-            .nodes
-            .get(&node)
-            .and_then(|found| found.binding.as_ref())
-            .and_then(|binding| Some((binding.parent, *binding.volumes.get(&volume)?)))
-        else {
-            return;
-        };
-        let Some(within) = self.in_member(node, range) else {
-            return;
-        };
-        let shift = within.start as i64 - range.start as i64;
-        let runs: Vec<(ByteRange, Provenance)> = self
-            .namespace(parent)
-            .and_then(|namespace| namespace.get(member))
-            .map(|record| {
-                record
-                    .coverage
-                    .overlapping(within)
-                    .filter_map(|run| {
-                        let piece = run.range.intersect(within)?;
-                        (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let length = self
-            .namespace(parent)
-            .and_then(|namespace| namespace.get(member))
-            .and_then(|record| record.length);
         let mut again = Vec::new();
-        if let Some(object) = self
-            .nodes
-            .get(&node)
-            .and_then(|found| found.object.as_ref())
-        {
+        for &(volume, range) in ranges {
+            let Some((parent, member)) = self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.binding.as_ref())
+                .and_then(|binding| Some((binding.parent, *binding.volumes.get(&volume)?)))
+            else {
+                continue;
+            };
+            let Some(within) = self.in_member(node, range) else {
+                continue;
+            };
+            let shift = within.start as i64 - range.start as i64;
+            let record = self
+                .namespace(parent)
+                .and_then(|namespace| namespace.get(member));
+            let runs: Vec<(ByteRange, Provenance)> = record
+                .map(|record| {
+                    record
+                        .coverage
+                        .overlapping(within)
+                        .filter_map(|run| {
+                            let piece = run.range.intersect(within)?;
+                            (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let length = record.and_then(|record| record.length);
+            let Some(object) = self
+                .nodes
+                .get(&node)
+                .and_then(|found| found.object.as_ref())
+            else {
+                return;
+            };
             let (tree, reader) = (&*self, &*builder);
             let mut read = |placement: &Placement, into: &mut Vec<u8>| {
                 reader.read(tree, node, volume, placement, into)
@@ -2825,14 +2842,33 @@ impl Tree {
             for (piece, provenance) in runs {
                 let mut bytes = Vec::new();
                 if object.posted(volume, piece, &mut read, &mut bytes) {
-                    again.push((piece, Bytes::from(bytes), provenance));
+                    again.push((
+                        parent,
+                        member,
+                        length,
+                        volume,
+                        piece,
+                        Bytes::from(bytes),
+                        provenance,
+                    ));
                 }
             }
         }
-        for (piece, _, _) in &again {
-            self.uncover(node, volume, *piece);
+        for (_, _, _, volume, piece, _, _) in &again {
+            self.uncover(node, *volume, *piece);
         }
-        for (piece, bytes, provenance) in again {
+        // Each run reaches the object as any delivery does: what it places
+        // nowhere yet, a file it cannot key, is the owner's to hold.
+        for (parent, member, length, volume, piece, bytes, provenance) in again {
+            effects.push(Effect::Reached {
+                node: parent,
+                member,
+                child: node,
+                volume,
+                offset: piece.start,
+                bytes: bytes.clone(),
+                provenance,
+            });
             let arrived = Arrived {
                 volume,
                 offset: piece.start,

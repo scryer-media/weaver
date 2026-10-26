@@ -149,6 +149,22 @@ fn deliver(
         builder,
         effects,
     );
+    answer(tree, builder, effects);
+}
+
+// The owner answers each request for bytes again once the effects before
+// it are applied, and what the answer raises the same way.
+fn answer(tree: &mut Tree, builder: &mut Trials, effects: &mut Vec<Effect>) {
+    let mut at = 0;
+    while at < effects.len() {
+        if let Effect::Again { node, ranges } = &effects[at] {
+            let (node, ranges) = (*node, ranges.clone());
+            let mut raised = Vec::new();
+            tree.again(node, &ranges, builder, &mut raised);
+            effects.splice(at + 1..at + 1, raised);
+        }
+        at += 1;
+    }
 }
 
 // The store's volume posted with a hole at 12..15 and its tail short of the
