@@ -34,8 +34,8 @@ use par3_rs::{HEADER_SIZE, MAGIC, Packet, PacketHeader, PacketType, Par3Set, Sca
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, Member, MemberId, Namespace, Object,
-    ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
+    ByteRange, Coverage, Delivery, Emit, Extent, Kind, Located, Member, MemberId, Namespace,
+    Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
 };
 
 use crate::par2::combine;
@@ -434,7 +434,9 @@ impl Object for Par3 {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None

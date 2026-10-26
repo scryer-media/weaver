@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use unrar_rs::{EncryptedStore, StoredLayoutBuilder};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Posting,
-    Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    ByteRange, Coverage, Delivery, Emit, Extent, Kind, Located, MemberId, Object, Placement,
+    Posting, Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
@@ -573,8 +573,8 @@ impl Object for RarStore {
         self.place(volume, range, out);
     }
 
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
-        self.member_extent(member, range, out);
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
+        self.member_extent(member, range, out)
     }
 
     fn posted(

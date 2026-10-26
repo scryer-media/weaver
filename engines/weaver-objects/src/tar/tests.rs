@@ -6,7 +6,8 @@ mod facts;
 use std::collections::BTreeMap;
 
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Object, Placement, Provenance, VolumeIndex, Why,
+    ByteRange, Coverage, Delivery, Emit, Extent, Located, MemberId, Object, Placement, Provenance,
+    VolumeIndex, Why,
 };
 
 use super::Tar;
@@ -608,4 +609,61 @@ fn a_members_bytes_lie_where_its_entry_put_them() {
         }]
     );
     assert!(owner.tar.reads_in_order());
+}
+
+// A member's bytes are raw runs of the archive, so a seek into a member the
+// walk has not reached is not located yet, the same seek once its header is
+// read lies where the entry put it, and only a range past the entry's data
+// is never located.
+#[test]
+fn a_seek_into_a_member_the_walk_has_not_reached_is_located_once_it_has() {
+    let writer = mixed();
+    let mut owner = Owner::new(writer.bytes.clone());
+    owner.deliver(ByteRange::new(0, writer.headers[2] as u64));
+    let beta = MemberId(2);
+    let mut extents = Vec::new();
+    assert_eq!(
+        owner
+            .tar
+            .extent(beta, ByteRange::new(100, 200), &mut extents),
+        Located::NotYet
+    );
+    assert!(extents.is_empty());
+    owner.whole(4096);
+    clean(&owner);
+    let data = writer.data[2] as u64;
+    assert_eq!(
+        owner
+            .tar
+            .extent(beta, ByteRange::new(100, 200), &mut extents),
+        Located::Whole
+    );
+    assert_eq!(
+        extents,
+        [Extent {
+            volume: VolumeIndex(0),
+            range: ByteRange::new(data + 100, data + 200)
+        }]
+    );
+    extents.clear();
+    assert_eq!(
+        owner
+            .tar
+            .extent(beta, ByteRange::new(5_000, 5_100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// An archive under a compressed stream is the stream's decoded member, and a
+// decoded member never lies in the volumes.
+#[test]
+fn a_seek_under_a_compressed_stream_is_unseekable() {
+    let stream = crate::stream::GzipStream::new();
+    let mut extents = Vec::new();
+    assert_eq!(
+        stream.extent(MemberId(0), ByteRange::new(0, 100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
 }

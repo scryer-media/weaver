@@ -28,9 +28,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Handed, Kind, MemberId,
-    Object, Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex, Weight, Why,
-    signed,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Handed, Kind, Located,
+    MemberId, Object, Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex, Weight,
+    Why, signed,
 };
 use zeroize::Zeroizing;
 
@@ -752,8 +752,8 @@ impl Object for SevenZipStore {
         self.place(volume, range, out);
     }
 
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
-        self.member_extent(member, range, out);
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
+        self.member_extent(member, range, out)
     }
 
     fn posted(

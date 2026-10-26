@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use weaver_graph::{
-    Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, MemberId, Object,
-    ObjectId, Placement, Provenance, Pull, Seek, Sink, VolumeIndex, Volumes, Weight, Why,
+    Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, Located, MemberId,
+    Object, ObjectId, Placement, Provenance, Pull, Seek, Sink, VolumeIndex, Volumes, Weight, Why,
 };
 
 pub(crate) const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
@@ -86,7 +86,9 @@ impl Object for Echo {
             range,
         });
     }
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }

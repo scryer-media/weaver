@@ -13,8 +13,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Namespace, Object,
-    ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, Take, VolumeIndex,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, Located, MemberId, Namespace,
+    Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, Take, VolumeIndex,
 };
 
 use crate::grid::{self, Grid, WHOLE};
@@ -260,7 +260,9 @@ impl Object for Sfv {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None

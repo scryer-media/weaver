@@ -8,7 +8,7 @@
 // the map can say whose it is. A volume with no place in the container yet
 // is held whole.
 
-use weaver_graph::{ByteRange, Extent, MemberId, Placement, VolumeIndex};
+use weaver_graph::{ByteRange, Extent, Located, MemberId, Placement, VolumeIndex};
 
 use super::map::Piece;
 use super::{ENVELOPE, Zip};
@@ -93,24 +93,39 @@ impl Zip {
         }
     }
 
-    pub(super) fn member_extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
-        let Some(span) = self
-            .map
-            .as_ref()
-            .and_then(|map| map.entry(member))
-            .and_then(|entry| entry.span())
-        else {
-            return;
+    // Every member is a stored entry's raw bytes, so every range of one lies
+    // somewhere: not located yet until the map is read and the entry's local
+    // header says where its data starts and the lengths of the volumes it
+    // reaches are known, and never for a range the map gives it no bytes at.
+    pub(super) fn member_extent(
+        &self,
+        member: MemberId,
+        range: ByteRange,
+        out: &mut Vec<Extent>,
+    ) -> Located {
+        let Some(map) = &self.map else {
+            return Located::NotYet;
+        };
+        let Some(entry) = map.entry(member).filter(|entry| entry.streams) else {
+            return Located::Never;
+        };
+        let Some(span) = entry.span() else {
+            return Located::NotYet;
         };
         let Some(part) = range.shift(span.start as i64).intersect(span) else {
-            return;
+            return Located::Never;
         };
         let mut pieces = Vec::new();
         self.to_volumes(part, &mut pieces);
+        let placed: u64 = pieces.iter().map(|(_, range)| range.len()).sum();
         out.extend(
             pieces
                 .into_iter()
                 .map(|(volume, range)| Extent { volume, range }),
         );
+        match placed == part.len() {
+            true => Located::Whole,
+            false => Located::NotYet,
+        }
     }
 }

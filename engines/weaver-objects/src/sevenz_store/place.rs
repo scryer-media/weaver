@@ -12,7 +12,9 @@
 
 use std::sync::Arc;
 
-use weaver_graph::{ByteRange, Extent, MemberId, Placement, Placements, Posting, VolumeIndex};
+use weaver_graph::{
+    ByteRange, Extent, Located, MemberId, Placement, Placements, Posting, VolumeIndex,
+};
 
 use super::header::SIGNATURE;
 use super::map::Map;
@@ -238,22 +240,32 @@ impl SevenZipStore {
         }
     }
 
-    pub(super) fn member_extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
-        if let Some(map) = &self.map {
-            self.extent_in(map, member, range, out);
+    // Every member is a run of a stored folder's raw bytes, so every range
+    // of one lies somewhere once the end header is read: until then it is
+    // not located yet.
+    pub(super) fn member_extent(
+        &self,
+        member: MemberId,
+        range: ByteRange,
+        out: &mut Vec<Extent>,
+    ) -> Located {
+        match &self.map {
+            Some(map) => self.extent_in(map, member, range, out),
+            None => Located::NotYet,
         }
     }
 
     // On a map in hand, for a caller that has taken it out to route by it.
+    // A range the map gives no folder bytes is never addressed.
     pub(super) fn extent_in(
         &self,
         map: &Map,
         member: MemberId,
         range: ByteRange,
         out: &mut Vec<Extent>,
-    ) {
+    ) -> Located {
         let Some((index, container)) = map.container(member, range) else {
-            return;
+            return Located::Never;
         };
         let folder = &map.folders[index];
         // A cipher block reads with the one before it as its seed.
@@ -273,6 +285,7 @@ impl SevenZipStore {
                 .into_iter()
                 .map(|(volume, range)| Extent { volume, range }),
         );
+        Located::Whole
     }
 
     // The posted bytes of these ranges of the store's volumes, as it stands

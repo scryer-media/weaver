@@ -31,8 +31,8 @@ use std::marker::PhantomData;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, MemberId, Object,
-    Placement, Pull, Seek, Sniff, Standing, VolumeIndex, Why, signed,
+    ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, Located, MemberId,
+    Object, Placement, Pull, Seek, Sniff, Standing, VolumeIndex, Why, signed,
 };
 
 pub use self::brotli::Brotli;
@@ -206,7 +206,9 @@ impl<D: Decoder> Object for Stream<D> {
     }
 
     // A decoded byte lies at no one place in the volume.
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None

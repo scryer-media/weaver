@@ -147,6 +147,39 @@ async fn a_stored_7z_crossing_both_volume_boundaries_of_a_three_volume_rar_deliv
     assert_eq!(kinds(&graph), ["rar_store", "sevenz_store"]);
 }
 
+// A stored RAR5 of `ember.bin` inside a stored 7z whose end header lies in
+// its last article: the RAR is the 7z's raw bytes, so seeks into it wait for
+// the end header instead of sending the 7z to an engine.
+#[tokio::test]
+async fn a_stored_rar_inside_a_stored_7z_whose_end_header_is_in_the_last_article_delivers_under_graph()
+ {
+    let ember = payload(4 * ARTICLE + 17, 75);
+    let outer = sevenz(
+        &[Entry::File(
+            "ember.rar",
+            &rar(&[("ember.bin", ember.clone())]),
+        )],
+        copy(),
+        None,
+        false,
+    );
+    // The end header is the 7z's tail and the last article holds nothing
+    // else.
+    let header = 32 + u64::from_le_bytes(outer[12..20].try_into().unwrap()) as usize;
+    let length = u64::from_le_bytes(outer[20..28].try_into().unwrap()) as usize;
+    assert_eq!(header + length, outer.len());
+    assert!(header <= (outer.len() - 1) / ARTICLE * ARTICLE);
+    assert!(outer.len() > 4 * ARTICLE, "the 7z spans several articles");
+    let graph = run(
+        &Scenario::new(vec![Post::plain("lantern.7z", outer)]),
+        Engine::Graph,
+    )
+    .await;
+    assert_whole(&graph, &[("ember.bin", &ember)]);
+    // The kinds are a set in name order: both stores, and no engine.
+    assert_eq!(kinds(&graph), ["rar_store", "sevenz_store"]);
+}
+
 // The spanning set with a PAR2 set over its volumes at the root, an article
 // of the middle volume, all of it the 7z's bytes, served damaged: the set
 // repairs the volume and the 7z read through it delivers its member whole.

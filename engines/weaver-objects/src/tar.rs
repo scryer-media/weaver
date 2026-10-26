@@ -24,8 +24,8 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
-    Provenance, Pull, Seek, Standing, VolumeIndex, Why,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, Located, MemberId, Object,
+    Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Why,
 };
 
 use crate::grid::crc32;
@@ -495,20 +495,25 @@ impl Object for Tar {
         }
     }
 
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
+    // Every member is an entry's raw data, so every range of one lies
+    // somewhere: not located yet until the walk reads the entry's header,
+    // and never for a range past the data that header says it has.
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
         let Some(said) = self.members.get(member.0 as usize) else {
-            return;
+            return Located::NotYet;
         };
         let wanted = ByteRange::new(
             said.data.start.saturating_add(range.start),
             said.data.start.saturating_add(range.end),
         );
-        if let Some(range) = said.data.intersect(wanted) {
-            out.push(Extent {
-                volume: VOLUME,
-                range,
-            });
-        }
+        let Some(range) = said.data.intersect(wanted) else {
+            return Located::Never;
+        };
+        out.push(Extent {
+            volume: VOLUME,
+            range,
+        });
+        Located::Whole
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, _out: &mut Vec<Emit>) {

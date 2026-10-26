@@ -7,7 +7,9 @@ use weaver_graph::holds::{HoldBudgets, ScratchHold};
 
 use crate::pipeline::graph::checkpoint::HoldRecord;
 use weaver_graph::recovery::{MemberAccess, Recovery, RepairOutcome, SliceVerdict};
-use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, RecoveryKind, Seek};
+use weaver_graph::{
+    Delivery, Emit, Extent, Kind, Located, Object, ObjectId, Pull, RecoveryKind, Seek,
+};
 
 use super::*;
 use crate::pipeline::graph::lines::Lines;
@@ -86,7 +88,9 @@ impl Object for Store {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -184,7 +188,9 @@ impl Object for Late {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -320,7 +326,9 @@ impl Object for Par {
         out.push(Placement::Envelope { envelope: 0, range });
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
