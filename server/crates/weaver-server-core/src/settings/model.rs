@@ -13,6 +13,10 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 use crate::watch_folder::WatchFolderConfig;
 
+// The NZB admission limit when none is saved, for new and upgraded installations.
+pub const DEFAULT_MAX_CONCURRENT_NZBS: std::num::NonZeroU32 =
+    std::num::NonZeroU32::new(10).unwrap();
+
 // Shared config handle for runtime reads and writes.
 pub type SharedConfig = Arc<RwLock<Config>>;
 
@@ -122,10 +126,10 @@ impl Config {
             .unwrap_or(false)
     }
 
-    // One default for new and upgraded installations.
     pub fn max_concurrent_nzbs(&self) -> u32 {
         self.max_concurrent_nzbs
-            .map_or(10, std::num::NonZeroU32::get)
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_NZBS)
+            .get()
     }
 
     // A saved setting takes precedence over the legacy environment override.

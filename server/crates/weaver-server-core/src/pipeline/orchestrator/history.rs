@@ -290,9 +290,7 @@ impl Pipeline {
             let row = if let Some(index) = inner.jobs.iter().position(|row| row.id == job_id) {
                 &mut inner.jobs[index]
             } else {
-                inner
-                    .jobs
-                    .push(crate::pipeline::queue::JobRow::new(finished.clone()));
+                inner.push_job(crate::pipeline::queue::JobRow::new(finished.clone()));
                 inner.jobs.last_mut().expect("retiring job")
             };
             row.report.job = finished.clone();
@@ -321,7 +319,7 @@ impl Pipeline {
                 return;
             }
             queue.write(|inner| {
-                inner.jobs.retain(|row| row.id != job_id);
+                inner.retain_jobs(|row| row.id != job_id);
                 if let Some(job) = finished {
                     let mut history: Vec<_> = queue
                         .history()

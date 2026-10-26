@@ -237,7 +237,7 @@ impl Queue {
                 self.replace_history(inner, history);
                 let mut row = super::JobRow::new(info);
                 row.admission = Some(prepared);
-                inner.jobs.push(row);
+                inner.push_job(row);
                 let _ = events.send(crate::events::model::PipelineEvent::JobResumed { job_id: id });
                 Change::changed(())
             });

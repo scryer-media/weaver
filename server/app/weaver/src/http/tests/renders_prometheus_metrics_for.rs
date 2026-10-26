@@ -619,6 +619,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "backfill",
             "recovery_metadata_bootstrap",
             "provider_priority",
+            "provider_policy_contended",
             "uu_cursor",
             "checkpoint",
         ],

@@ -66,7 +66,11 @@ impl<T> Change<T> {
 #[derive(Default)]
 pub struct QueueInner {
     pub globals: Globals,
+    // Rows are added, removed and reordered only through `push_job`,
+    // `retain_jobs` and `reindex_jobs`, which keep `job_positions` in step.
     pub jobs: Vec<JobRow>,
+    // Each row's position in `jobs`, so a lookup by id is one probe.
+    job_positions: HashMap<JobId, usize>,
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
@@ -286,15 +290,46 @@ impl QueueInner {
     pub fn visible_jobs(&self) -> impl Iterator<Item = JobInfo> + '_ {
         self.jobs.iter().map(|row| row.info(&self.globals))
     }
+
+    // The row for `id`, found through the position index.
+    pub(crate) fn job(&self, id: JobId) -> Option<&JobRow> {
+        let row = self.jobs.get(*self.job_positions.get(&id)?)?;
+        debug_assert_eq!(row.id, id, "the queue's position index is out of step");
+        (row.id == id).then_some(row)
+    }
+
+    pub(crate) fn push_job(&mut self, row: JobRow) {
+        self.job_positions.insert(row.id, self.jobs.len());
+        self.jobs.push(row);
+    }
+
+    pub(crate) fn retain_jobs(&mut self, keep: impl FnMut(&JobRow) -> bool) {
+        self.jobs.retain(keep);
+        self.reindex_jobs();
+    }
+
+    // Rebuilds the position index after `jobs` was replaced or reordered.
+    pub(crate) fn reindex_jobs(&mut self) {
+        self.job_positions = self
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(position, row)| (row.id, position))
+            .collect();
+    }
 }
 
 impl Queue {
     pub fn new(jobs: Vec<JobInfo>) -> Self {
         Self {
             history: std::sync::RwLock::default(),
-            inner: Mutex::new(QueueInner {
-                jobs: jobs.into_iter().map(JobRow::new).collect(),
-                ..QueueInner::default()
+            inner: Mutex::new({
+                let mut inner = QueueInner {
+                    jobs: jobs.into_iter().map(JobRow::new).collect(),
+                    ..QueueInner::default()
+                };
+                inner.reindex_jobs();
+                inner
             }),
             revision: watch::channel(0).0,
             intent_wake: tokio::sync::Notify::new(),
@@ -399,7 +434,7 @@ impl Queue {
             }
             for id in ids {
                 if let Some(job) = reports.remove(&id) {
-                    inner.jobs.push(JobRow::new(job));
+                    inner.push_job(JobRow::new(job));
                 }
             }
             Change::changed(())

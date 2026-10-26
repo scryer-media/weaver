@@ -216,11 +216,9 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
     let job_id = JobId(99);
 
     pipeline.shared_state.queue.write(|inner| {
-        inner
-            .jobs
-            .push(crate::pipeline::queue::JobRow::new(finished_job_info(
-                job_id,
-            )));
+        inner.push_job(crate::pipeline::queue::JobRow::new(finished_job_info(
+            job_id,
+        )));
         crate::pipeline::queue::Change::changed(())
     });
     let repairing = pipeline.phase_begin(job_id, JobPhase::Repairing, Some(100));

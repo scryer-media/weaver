@@ -108,7 +108,7 @@ pub async fn recover_server_state(
                 job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
             let (download_state, post_state, run_state) =
                 runtime_lanes_from_status_snapshot(&status);
-            archive_unfinished_terminal_job(db, job_id, &recovered, &name, &status)?;
+            archive_unfinished_terminal_job(db, job_id, &recovered, &name, &status);
             initial_history.push(JobInfo {
                 job_id,
                 job_hash: Some(recovered.nzb_hash),
@@ -226,9 +226,9 @@ pub async fn recover_server_state(
                 }
                 Err(error) => {
                     // A skipped owner would never enter the runtime queue and
-                    // could therefore never release its admission. Archive it
-                    // durably before starting dispatch; failures abort startup
-                    // with ownership intact for the next recovery attempt.
+                    // could therefore never release its admission, so archive
+                    // it before dispatch starts. An archive that fails leaves
+                    // the row active, and the next start tries it again.
                     let name = recovered
                         .nzb_path
                         .file_stem()
@@ -237,7 +237,7 @@ pub async fn recover_server_state(
                     let status = JobStatus::Failed {
                         error: format!("Cannot recover persisted NZB: {error}"),
                     };
-                    archive_unfinished_terminal_job(db, job_id, &recovered, name, &status)?;
+                    archive_unfinished_terminal_job(db, job_id, &recovered, name, &status);
                 }
             }
         }
@@ -383,7 +383,26 @@ pub async fn recover_server_state(
 // The active row is all that survives, and it carries no byte counters, so the
 // synthesized row states what is known and leaves the rest at the same zeros
 // the recovered runtime entry already reports rather than inventing figures.
+//
+// One row that cannot be written never stops start-up: the failure is logged,
+// the row stays active, and the next start tries it again.
 fn archive_unfinished_terminal_job(
+    db: &Database,
+    job_id: crate::jobs::ids::JobId,
+    recovered: &crate::jobs::record::RecoveredJob,
+    name: &str,
+    status: &JobStatus,
+) {
+    if let Err(error) = try_archive_unfinished_terminal_job(db, job_id, recovered, name, status) {
+        warn!(
+            job_id = job_id.0,
+            error = %error,
+            "failed to archive a job during startup recovery; its row stays active until the next start"
+        );
+    }
+}
+
+fn try_archive_unfinished_terminal_job(
     db: &Database,
     job_id: crate::jobs::ids::JobId,
     recovered: &crate::jobs::record::RecoveredJob,
@@ -579,7 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_archive_failure_preserves_ownership_and_can_retry() {
+    async fn recovery_archive_failure_keeps_starting_and_retries_next_start() {
         for terminal in [false, true] {
             let temp = TempDir::new().unwrap();
             let db = Database::open_in_memory().unwrap();
@@ -598,12 +617,11 @@ mod tests {
                  BEGIN SELECT RAISE(ABORT, 'injected archive failure'); END",
                 vec![],
             );
-            assert!(
-                recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
-                    .await
-                    .is_err()
-            );
+            recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+                .await
+                .unwrap();
             assert!(db.load_nzb_admissions().unwrap().contains(&JobId(1)));
+            assert!(db.load_active_jobs().unwrap().contains_key(&JobId(1)));
             assert!(db.get_job_history(1).unwrap().is_none());
             execute_sql(&db, "DROP TRIGGER reject_recovery_history", vec![]);
             recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))

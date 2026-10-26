@@ -78,7 +78,7 @@ impl Queue {
             let mut row = JobRow::new(info);
             row.report.restoring = true;
             row.intents.restore = Some(request);
-            inner.jobs.push(row);
+            inner.push_job(row);
             Change::changed(Ok(()))
         })
     }
@@ -139,7 +139,7 @@ impl Queue {
             self.write_intent(|inner| {
                 let mut row = JobRow::new(job);
                 row.admission = Some(prepared);
-                inner.jobs.push(row);
+                inner.push_job(row);
                 let _ = events.send(event);
                 Change::changed(())
             });
