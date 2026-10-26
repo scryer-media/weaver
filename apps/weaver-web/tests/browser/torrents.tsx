@@ -183,7 +183,11 @@ const policy = (rest: Partial<SeedingPolicyData>): SeedingPolicyData => ({
 const torrent = (id: number, source: SeedingSource, override: SeedingPolicyData | null): TorrentData => ({
   id, name: `torrent ${id}`, infohash: "00".repeat(20), infohashV2: null, state: "SEEDING", detail: null, category: "movies", private: false,
   forced: false, progress: 1, totalBytes: 2048, haveBytes: 2048, uploadedBytes: 0, downloadedBytes: 2048, ratio: 0.4,
-  downloadBps: 0, uploadBps: 0, peers: 9, seeds: 3, leechers: 6, seedingLeft: null, route: null,
+  downloadBps: 0, uploadBps: 0, uploadLimit: null, downloadLimit: null, etaSeconds: null,
+  peers: 9, seeds: 3, leechers: 6, maxPeers: 50, swarmSeeds: 12, swarmLeechers: 20, reannounceSeconds: null,
+  activeSeconds: 0, downloadAvgBps: 0, uploadAvgBps: 0, wastedBytes: 0, lastSeenCompleteMs: null,
+  pieceCount: null, pieceSize: null, piecesHave: null, createdBy: null, createdAtMs: null, comment: null,
+  addedAtMs: 0, completedAtMs: null, savePath: null, unpack: false, seedingLeft: null, route: null,
   seedingOverride: override,
   seedingPolicy: override ?? policy({ ratioGoal: source === "CATEGORY" ? 1.5 : 1 }),
   seedingSource: source,

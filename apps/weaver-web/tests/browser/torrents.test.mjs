@@ -72,7 +72,7 @@ test("the add dialog sends a torrent file and a magnet link through submit, read
 
   // The daemon's refusal is shown as it gave it, and the dialog stays open for it.
   await dialog.getByText("This torrent is already in the queue.", { exact: true }).waitFor();
-  const input = { upload: null, category: null, paused: true, password: null };
+  const input = { upload: null, category: null, paused: true, password: null, unpack: null };
   const submitted = (await sent(page)).filter((entry) => entry.name === "Submit").map((entry) => entry.variables);
   assert.deepEqual(submitted, [
     { input: { ...input, text: "magnet:?xt=urn:btih:duplicate" } },
@@ -189,9 +189,10 @@ test("a torrent's detail names where its seeding policy comes from, and its swar
   assert.equal(await seeding("TORRENT").getByText("2.50", { exact: true }).count(), 1);
   assert.equal(await seeding("CATEGORY").getByText("1.50", { exact: true }).count(), 1);
 
-  const swarm = page.getByLabel("GLOBAL", { exact: true }).getByRole("region", { name: "Torrent", exact: true });
-  assert.equal(await swarm.getByText("3 / 6", { exact: true }).count(), 1);
-  assert.equal(await swarm.getByText("9", { exact: true }).count(), 1);
+  const swarm = page.getByLabel("GLOBAL", { exact: true }).getByRole("region", { name: "Transfer", exact: true });
+  assert.equal(await swarm.getByText("3 (12 total)", { exact: true }).count(), 1);
+  assert.equal(await swarm.getByText("6 (20 total)", { exact: true }).count(), 1);
+  assert.equal(await swarm.getByText("9 (50 max)", { exact: true }).count(), 1);
   const files = page.getByLabel("GLOBAL", { exact: true }).getByRole("region", { name: "Files", exact: true });
   assert.equal(await files.getByText("25.0%", { exact: true }).count(), 1);
   assert.equal(errors.length, 0, errors.join("\n"));
