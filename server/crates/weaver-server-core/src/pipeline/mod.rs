@@ -746,6 +746,10 @@ impl DownloadFailure {
             // Never got a socket before the deadline: local lane capacity, not
             // a transport fault of the server.
             | NntpError::AcquireTimeout(_) => Some(DownloadFailureKind::CapacityUnavailable),
+            // The lease's own guard turned the work away before a command
+            // went out: nothing was requested, and nothing is known about the
+            // article or the server.
+            NntpError::WorkObsolete => Some(DownloadFailureKind::Unrequested),
             NntpError::AuthenticationFailed
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
@@ -3133,11 +3137,9 @@ pub struct Pipeline {
     // an article off its hinted server only while one of these could take it.
     pub(super) download_pass_fill_servers: Option<Vec<usize>>,
     // The provider policy sampled once at the top of the dispatch pass running
-    // now; `None` outside one. Inside a pass the inner `None` means the sample
-    // lost its race for the pool's health state, and every candidate of the
-    // pass reads that answer rather than sampling again.
+    // now, read by every candidate of the pass; `None` outside one.
     pub(super) download_pass_provider_policy:
-        Option<Option<Arc<weaver_nntp::provider_policy::ProviderPolicy>>>,
+        Option<Arc<weaver_nntp::provider_policy::ProviderPolicy>>,
     // Whether the stall watchdog escalates (kick, then release). Read once
     // from `WEAVER_DOWNLOAD_STALL_RECOVERY` at construction; on by default.
     pub(super) download_stall_recovery: bool,

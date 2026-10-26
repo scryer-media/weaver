@@ -1780,12 +1780,10 @@ async fn cooling_fill_server_keeps_backfill_locked_and_order_empty() {
     );
 }
 
-// A `Disabled` fill server never produces the 430 that would put it in
-// `exclude`, so backfill has to unlock on the health state instead.
-// Without this, an article the remaining fill servers do not have is
-// pinned out of backfill for as long as the auth failure lasts.
+// A fill server refusing this pool's credentials is not one that lacks the
+// article: backfill stays locked, and the article waits for the fill tier.
 #[tokio::test]
-async fn disabled_fill_server_unlocks_backfill() {
+async fn credentials_refusing_fill_server_keeps_backfill_locked() {
     let client = tiered_client(&[false, false, true]);
 
     // Server 0: auth failure => Disabled { AuthFailure }.
@@ -1794,12 +1792,8 @@ async fn disabled_fill_server_unlocks_backfill() {
     // Server 1: missed the article, so it is on the exclusion ladder.
     let order = client.build_server_order(&[1]).await;
     assert!(
-        order.contains(&2),
-        "an auth-disabled fill server must unlock backfill: {order:?}"
-    );
-    assert!(
-        !order.contains(&0),
-        "the disabled server itself must not be ordered: {order:?}"
+        order.is_empty(),
+        "a fill server refusing credentials must not unlock backfill: {order:?}"
     );
 }
 
@@ -1859,9 +1853,10 @@ async fn cooling_fill_server_keeps_backfill_locked_with_peers_excluded() {
     );
 }
 
-// The owned blocking lane runs the same tiering rule off a `try_lock`.
+// The owned blocking lane runs the same tiering rule: a fill server refusing
+// credentials or cooling down never opens the backfill tier.
 #[tokio::test]
-async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
+async fn blocking_selection_keeps_backfill_locked_for_an_unavailable_fill_server() {
     let client = tiered_client(&[false, false, true]);
 
     client.pool.health().lock().await.record_failure(0, true);
@@ -1869,10 +1864,10 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
     let selection = client
         .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
-    assert_eq!(
-        selection.eligible,
-        vec![ServerId(2)],
-        "owned lane must reach backfill when the fill tier is disabled"
+    assert!(
+        selection.eligible.is_empty(),
+        "owned lane must not spill a credentials refusal onto backfill: {:?}",
+        selection.eligible
     );
 
     let cooling = tiered_client(&[false, false, true]);

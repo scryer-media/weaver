@@ -36,9 +36,9 @@ impl BlockedBy {
 // charges each article the handout takes to the byte-budget clauses.
 pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     server_idx: usize,
-    // `None` when the policy could not be sampled; every article is then
-    // refused for this pass and the next pass samples again.
-    provider_policy: Option<Arc<weaver_nntp::provider_policy::ProviderPolicy>>,
+    // The pass's one sample of the pool's provider policy, shared by every
+    // filter built in that pass.
+    provider_policy: Arc<weaver_nntp::provider_policy::ProviderPolicy>,
     // The fill servers a hinted article could go to instead of its hinted
     // one: the dispatch attempt's available fill servers, or a fresh ranking
     // when the handout is not part of one. The rotation hint is a
@@ -108,10 +108,7 @@ impl ServableWorkFilter<'_> {
             return Some(SchedulerBlockClause::ServerExclusion);
         }
         use weaver_nntp::provider_policy::ArticleEligibility;
-        let Some(policy) = &self.provider_policy else {
-            return Some(SchedulerBlockClause::ProviderPolicyContended);
-        };
-        match policy.eligibility(
+        match self.provider_policy.eligibility(
             self.server_idx,
             &work.exclude_servers,
             &self.retention_excludes,
@@ -151,17 +148,15 @@ impl ServableWorkFilter<'_> {
             *server != self.server_idx
                 && !work.exclude_servers.contains(server)
                 && !self.retention_excludes.contains(server)
-                && self.provider_policy.as_ref().is_some_and(|policy| {
-                    matches!(
-                        policy.eligibility(
-                            *server,
-                            &work.exclude_servers,
-                            &self.retention_excludes,
-                            Pipeline::bandwidth_reservation_estimate(work.byte_estimate)
-                        ),
-                        weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
-                    )
-                })
+                && matches!(
+                    self.provider_policy.eligibility(
+                        *server,
+                        &work.exclude_servers,
+                        &self.retention_excludes,
+                        Pipeline::bandwidth_reservation_estimate(work.byte_estimate)
+                    ),
+                    weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+                )
         })
     }
 
@@ -419,7 +414,7 @@ impl Pipeline {
             server_idx,
             provider_policy: match &self.download_pass_provider_policy {
                 Some(pass) => pass.clone(),
-                None => self.sample_provider_policy(),
+                None => Arc::new(self.nntp.pool().provider_policy()),
             },
             hint_alternatives: self.rotation_hint_alternatives(job_id),
             retention_excludes,
@@ -497,14 +492,6 @@ impl Pipeline {
             return Ok(());
         }
         Err(blocked)
-    }
-
-    // One sample of the pool's provider policy, shared by every filter built
-    // from it. `None` when the pool's health state was busy.
-    pub(in crate::pipeline::download::worker) fn sample_provider_policy(
-        &self,
-    ) -> Option<Arc<weaver_nntp::provider_policy::ProviderPolicy>> {
-        self.nntp.pool().try_provider_policy().map(Arc::new)
     }
 
     // The fill servers a hinted article of `job_id` could be sent to instead

@@ -2162,7 +2162,7 @@ impl BlockingNntpConnection {
             // dropped and the next dial authenticates from the start, which is
             // also where a credential that has genuinely gone bad is booked.
             // Reporting this as an auth failure instead disabled the whole
-            // server for the auth backoff and unlocked backfill behind it.
+            // server for the auth backoff.
             self.fail_body_pipeline();
             return Err(NntpError::SessionExpired.into());
         }
@@ -3163,6 +3163,7 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::PoolShutdown => NntpError::PoolShutdown,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
         NntpError::AcquireTimeout(seconds) => NntpError::AcquireTimeout(*seconds),
+        NntpError::WorkObsolete => NntpError::WorkObsolete,
         NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),
         NntpError::BodyNotRequestedDueToQuota {
             preceding_rejection,

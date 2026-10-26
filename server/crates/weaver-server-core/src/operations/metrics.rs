@@ -81,13 +81,10 @@ pub enum SchedulerBlockClause {
     Checkpoint,
     // A higher-priority group can still supply this article.
     ProviderPriority,
-    // The provider policy could not be sampled this pass; the next pass
-    // samples it again.
-    ProviderPolicyContended,
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
@@ -99,7 +96,6 @@ impl SchedulerBlockClause {
         Self::UuCursor,
         Self::Checkpoint,
         Self::ProviderPriority,
-        Self::ProviderPolicyContended,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -114,7 +110,6 @@ impl SchedulerBlockClause {
             Self::UuCursor => "uu_cursor",
             Self::Checkpoint => "checkpoint",
             Self::ProviderPriority => "provider_priority",
-            Self::ProviderPolicyContended => "provider_policy_contended",
         }
     }
 
