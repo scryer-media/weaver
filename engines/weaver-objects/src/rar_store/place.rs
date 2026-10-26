@@ -324,8 +324,14 @@ impl RarStore {
             return push(out, Placement::Held { range: part });
         };
         let member = MemberId(id as u32);
+        // A condemned file is placed as it stood until its bytes are
+        // posted again: what came out of them is uncovered where it lies.
+        let stood = self
+            .condemned
+            .get(&id)
+            .is_some_and(|condemned| condemned.parts.contains(&volume));
         match &entry.lock {
-            Lock::Locked | Lock::Sealed(_) => push(out, Placement::Held { range: part }),
+            Lock::Locked | Lock::Sealed(_) if !stood => push(out, Placement::Held { range: part }),
             Lock::Plain => push(
                 out,
                 Placement::Member {
@@ -333,7 +339,7 @@ impl RarStore {
                     range: stream,
                 },
             ),
-            Lock::Open(_) => {
+            Lock::Open(_) | Lock::Locked | Lock::Sealed(_) => {
                 let length = entry.length.unwrap_or(0);
                 let payload = ByteRange::new(stream.start.min(length), stream.end.min(length));
                 push(
@@ -390,12 +396,19 @@ impl RarStore {
         let mut sealed = Vec::new();
         for &(volume, range) in ranges {
             for (id, part, stream) in self.linked(volume, range) {
-                if let Some(Entry {
-                    lock: Lock::Open(cbc),
-                    out,
-                    ..
-                }) = self.entries.get(id)
-                {
+                let stood = match (self.condemned.get(&id), self.entries.get(id)) {
+                    (Some(condemned), _) => Some((&condemned.cbc, &condemned.out)),
+                    (
+                        None,
+                        Some(Entry {
+                            lock: Lock::Open(cbc),
+                            out,
+                            ..
+                        }),
+                    ) => Some((cbc, out)),
+                    _ => None,
+                };
+                if let Some((cbc, out)) = stood {
                     sealed.push(Sealed {
                         volume,
                         part,

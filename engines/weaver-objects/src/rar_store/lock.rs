@@ -19,7 +19,7 @@ use unrar_rs::{
 use weaver_graph::{ByteRange, Emit, VolumeIndex, Why};
 use zeroize::Zeroizing;
 
-use super::{Candidate, Lock, RarStore};
+use super::{Candidate, Condemned, Lock, RarStore};
 use crate::crypt::Cbc;
 use crate::grid::crc32;
 use crate::kept::Kept;
@@ -127,6 +127,7 @@ impl RarStore {
             self.candidates.push(Candidate {
                 secret: Zeroizing::new(secret.to_owned()),
                 headers_wrong: false,
+                files_wrong: false,
             });
             self.candidates.len() - 1
         })
@@ -256,9 +257,17 @@ impl RarStore {
             let keying = store.keying();
             let mut opened = None;
             for candidate in &order {
+                if self.candidates[*candidate].files_wrong {
+                    continue;
+                }
                 match derive(&self.keys, &self.candidates[*candidate].secret, &keying) {
                     Derived::Key(key) => {
-                        opened = Some(key);
+                        // A RAR4 file key has no check of its own: unless
+                        // the candidate proved itself on the headers, it is
+                        // on trial.
+                        let unproven = matches!(keying, MemberKeying::Rar4 { .. })
+                            && self.headers_open != Some(*candidate);
+                        opened = Some((key, unproven.then_some(*candidate)));
                         break;
                     }
                     Derived::Wrong => {}
@@ -267,7 +276,7 @@ impl RarStore {
                     }
                 }
             }
-            let Some(key) = opened else {
+            let Some((key, trial)) = opened else {
                 asks = true;
                 continue;
             };
@@ -284,11 +293,47 @@ impl RarStore {
             };
             entry.lock = Lock::Open(Arc::new(cbc));
             entry.hash_key = key.hash_key;
+            entry.trial = trial;
             self.stale = true;
         }
         if asks {
             self.ask(out);
         }
+    }
+
+    // The candidate on trial is wrong: the next one is tried on the same
+    // bytes, which every file it keyed asks for again. Each such file is
+    // locked again at once, a fresh record beside it, and its parts read
+    // back through the cipher and record it stood under until each one has
+    // been posted again.
+    pub(super) fn condemn(&mut self, candidate: usize, out: &mut Vec<Emit>) {
+        self.candidates[candidate].files_wrong = true;
+        for (id, entry) in self.entries.iter_mut().enumerate() {
+            if entry.trial != Some(candidate) {
+                continue;
+            }
+            let Lock::Open(cbc) = std::mem::replace(&mut entry.lock, Lock::Locked) else {
+                continue;
+            };
+            let parts = entry.pieces.iter().map(|piece| piece.volume).collect();
+            let said = std::mem::take(&mut entry.out);
+            self.condemned.insert(
+                id,
+                Condemned {
+                    cbc,
+                    out: said,
+                    parts,
+                },
+            );
+            entry.trial = None;
+            entry.hash_key = None;
+            entry.plain_runs = Default::default();
+            out.extend(entry.pieces.iter().map(|piece| Emit::Again {
+                volume: piece.volume,
+                range: piece.data,
+            }));
+        }
+        self.stale = true;
     }
 
     // What the set is shut by while the store is still asking: its headers,

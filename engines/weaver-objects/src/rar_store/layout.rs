@@ -189,6 +189,7 @@ impl RarStore {
             pieces: Vec::new(),
             complete: dir,
             hash_key: None,
+            trial: None,
             out: Arc::default(),
             plain_runs: CrcRuns::default(),
             parts: Default::default(),

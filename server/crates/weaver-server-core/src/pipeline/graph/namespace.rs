@@ -874,6 +874,13 @@ impl NamespaceWriter {
             }
             Effect::Renamed { .. } => self.moved(std::slice::from_ref(&effect))?,
             Effect::NeedsPassword { .. } => {}
+            // Every effect before it is applied, so what the object reads
+            // back of its members is on disk.
+            Effect::Again { node, ranges } => {
+                let mut effects = Vec::new();
+                tree.again(*node, ranges, &mut self.placing(builder), &mut effects);
+                self.apply_each(tree, builder, segments, effects, out)?;
+            }
         }
         out.push(effect);
         Ok(())
