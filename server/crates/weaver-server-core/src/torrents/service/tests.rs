@@ -2425,6 +2425,90 @@ async fn the_checkpoint_follows_the_verified_pieces_between_ticks() {
     rig.service.stop().await;
 }
 
+// The checkpoint written as pieces reach the job, between ticks, carries the
+// ledger the service holds as it is written: a crash recovers the bytes and
+// the active seconds of the moment its pieces were taken, not those of the
+// last tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_checkpoint_between_ticks_carries_the_ledger_with_its_pieces() {
+    const PIECE: usize = 1024;
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    // Twice what one write takes, so the job is not complete, and its
+    // completion's own write of the ledger cannot stand in for this one.
+    let pieces = CHECKPOINT_PIECES;
+    let bytes: Vec<u8> = (0..2 * pieces as usize * PIECE)
+        .map(|at| (at % 251) as u8)
+        .collect();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set",
+            &[("set/a.bin", &bytes)],
+            PIECE,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let (intake, layout) = {
+        let mut live = rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&job_id).unwrap();
+        // What a session moved for it since the last tick.
+        torrent.counters.downloaded_bytes = 1_805_238_272;
+        torrent.counters.uploaded_bytes = 7;
+        torrent.counters.active_duration_s = 24;
+        (
+            torrent.intake.clone().unwrap(),
+            torrent.layout.clone().unwrap(),
+        )
+    };
+    let mut written = rig.service.written();
+    let base = written.borrow().checkpoints;
+    for piece in 0..pieces {
+        let range = layout.piece_range(piece);
+        let shares = layout
+            .spans(piece)
+            .into_iter()
+            .filter_map(|span| {
+                let at = (range.start + span.at) as usize;
+                Some(crate::pipeline::graph::root::pieces::Verified {
+                    volume: span.volume?,
+                    piece,
+                    offset: span.range.start,
+                    bytes: bytes::Bytes::copy_from_slice(
+                        &bytes[at..at + span.range.len() as usize],
+                    ),
+                })
+            })
+            .collect();
+        intake.verified(shares).unwrap();
+    }
+    written
+        .wait_for(|written| written.checkpoints > base)
+        .await
+        .unwrap();
+    let held = rig.service.inner.live.lock().await[&job_id].counters;
+    let on_disk = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    assert_eq!(
+        (
+            on_disk.downloaded_bytes,
+            on_disk.uploaded_bytes,
+            on_disk.active_duration_s
+        ),
+        (
+            held.downloaded_bytes,
+            held.uploaded_bytes,
+            held.active_duration_s
+        )
+    );
+    assert_eq!(on_disk.downloaded_bytes, 1_805_238_272);
+    assert_eq!(on_disk.active_duration_s, 24);
+    let root = rig.service.kept_root(job_id, &layout).unwrap();
+    assert_eq!(root.have().count_ones() as u32, pieces);
+    rig.service.stop().await;
+}
+
 // The holds the queue publishes reach the torrents: a pause stops
 // downloading and leaves what is complete seeding, pausing everything or
 // pausing the torrents stops seeding too, and a release lets both run again.
@@ -4798,10 +4882,10 @@ async fn a_second_checkpoint_writes_only_what_changed() {
         }
     };
     let first = job(&rig.service).await;
-    rig.service.save_checkpoint(job_id, &first).await;
+    rig.service.save_checkpoints([job_id].into()).await;
     let whole = first.with(|job| job.pending().tally());
     assert!(whole.rows > 0);
-    rig.service.save_checkpoint(job_id, &first).await;
+    rig.service.save_checkpoints([job_id].into()).await;
     let again = first.with(|job| job.pending().tally());
     assert_eq!(again.checkpoints, whole.checkpoints + 1);
     assert_eq!(again.rows, whole.rows);
@@ -4811,7 +4895,7 @@ async fn a_second_checkpoint_writes_only_what_changed() {
     let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&restarted).await;
     let restored = job(&restarted).await;
-    restarted.save_checkpoint(job_id, &restored).await;
+    restarted.save_checkpoints([job_id].into()).await;
     assert_eq!(restored.with(|job| job.pending().tally()).rows, 0);
     restarted.stop().await;
 }
@@ -5804,17 +5888,13 @@ async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
     // The process ends while its session checks every piece and has found
     // piece 4 of the three the job held.
     rig.service.inner.sessions.stop_all().await;
-    let (intake, job) = {
-        let live = rig.service.inner.live.lock().await;
-        let torrent = &live[&job_id];
-        (
-            torrent.intake.clone().unwrap(),
-            torrent.job.clone().unwrap(),
-        )
-    };
+    let intake = rig.service.inner.live.lock().await[&job_id]
+        .intake
+        .clone()
+        .unwrap();
     assert!(intake.checking().unwrap());
     assert!(intake.found(4).unwrap());
-    rig.service.save_checkpoint(job_id, &job).await;
+    rig.service.save_checkpoints([job_id].into()).await;
     rig.db.prune_orphan_active_state().unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());

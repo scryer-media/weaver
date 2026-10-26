@@ -558,7 +558,11 @@ pub(crate) async fn delete_orphans(tx: &mut SqlTx<'_>) -> Result<usize, StateErr
     Ok(removed)
 }
 
-async fn write_delta(tx: &mut SqlTx<'_>, job_id: JobId, delta: &Delta) -> Result<(), StateError> {
+pub(crate) async fn write_delta(
+    tx: &mut SqlTx<'_>,
+    job_id: JobId,
+    delta: &Delta,
+) -> Result<(), StateError> {
     lock_active_job_for_write_tx(tx, job_id).await?;
     let id = job_id.0 as i64;
     let live = tx

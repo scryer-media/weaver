@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::sync::Arc;
+
 use crate::StateError;
+use crate::jobs::graph_checkpoint::{Delta, write_delta};
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
@@ -23,6 +26,47 @@ const TRACKER_INSERT: &str =
 // private tracker's carries the operator's passkey.
 const TRACKER_HOST_INSERT: &str =
     "INSERT INTO tracker_hosts (host) VALUES ({}) ON CONFLICT (host) DO NOTHING";
+
+// The statement that writes a torrent's ledger and the peers and bans it
+// begins with, each only when given; none when neither is.
+fn resume_update(
+    job_id: JobId,
+    counters: Option<&TorrentCounters>,
+    peers: Option<&ResumePeers>,
+) -> Result<Option<(String, Vec<SqlArg>)>, StateError> {
+    let mut sets = Vec::new();
+    let mut args = Vec::new();
+    if let Some(counters) = counters {
+        sets.push(
+            "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
+             last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}",
+        );
+        args.extend([
+            SqlArg::I64(stored(counters.uploaded_bytes)?),
+            SqlArg::I64(stored(counters.downloaded_bytes)?),
+            SqlArg::I64(stored(counters.active_duration_s)?),
+            SqlArg::OptI64(counters.last_seen_complete_ms),
+            SqlArg::I64(stored(counters.finished_duration_s)?),
+            SqlArg::OptI64(counters.last_activity_ms),
+        ]);
+    }
+    if let Some(peers) = peers {
+        sets.push("peers = {}, banned_peers = {}");
+        args.extend([
+            SqlArg::OptText(stored_list(&peers.peers)?),
+            SqlArg::OptText(stored_list(&peers.banned)?),
+        ]);
+    }
+    if sets.is_empty() {
+        return Ok(None);
+    }
+    args.push(SqlArg::I64(stored(job_id.0)?));
+    let sql = format!(
+        "UPDATE torrent_counters SET {} WHERE job_id = {{}}",
+        sets.join(", ")
+    );
+    Ok(Some((sql, args)))
+}
 
 // The one place a torrent's tracker rows are written: each row, and the
 // host of each, recorded as `tracker_host` spells it.
@@ -210,41 +254,47 @@ impl Database {
         counters: Option<&TorrentCounters>,
         peers: Option<&ResumePeers>,
     ) -> Result<bool, StateError> {
-        let mut sets = Vec::new();
-        let mut args = Vec::new();
-        if let Some(counters) = counters {
-            sets.push(
-                "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
-                 last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}",
-            );
-            args.extend([
-                SqlArg::I64(stored(counters.uploaded_bytes)?),
-                SqlArg::I64(stored(counters.downloaded_bytes)?),
-                SqlArg::I64(stored(counters.active_duration_s)?),
-                SqlArg::OptI64(counters.last_seen_complete_ms),
-                SqlArg::I64(stored(counters.finished_duration_s)?),
-                SqlArg::OptI64(counters.last_activity_ms),
-            ]);
-        }
-        if let Some(peers) = peers {
-            sets.push("peers = {}, banned_peers = {}");
-            args.extend([
-                SqlArg::OptText(stored_list(&peers.peers)?),
-                SqlArg::OptText(stored_list(&peers.banned)?),
-            ]);
-        }
-        if sets.is_empty() {
+        let Some((sql, args)) = resume_update(job_id, counters, peers)? else {
             return Ok(false);
-        }
-        args.push(SqlArg::I64(stored(job_id.0)?));
-        let sql = format!(
-            "UPDATE torrent_counters SET {} WHERE job_id = {{}}",
-            sets.join(", ")
-        );
+        };
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
             Ok(changed > 0)
+        })
+    }
+
+    // What the torrent's checkpoint changed, and its ledger and the peers
+    // and bans it begins with as they stood with it, each written only when
+    // given, in one transaction: a crash recovers the pieces and the
+    // counters of one moment.
+    pub(crate) fn save_torrent_checkpoint(
+        &self,
+        job_id: JobId,
+        delta: Option<Arc<Delta>>,
+        counters: Option<&TorrentCounters>,
+        peers: Option<&ResumePeers>,
+    ) -> Result<(), StateError> {
+        let resume = resume_update(job_id, counters, peers)?;
+        if delta.is_none() && resume.is_none() {
+            return Ok(());
+        }
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "save_torrent_checkpoint", |tx| {
+                let delta = delta.clone();
+                let resume = resume.clone();
+                Box::pin(async move {
+                    if let Some(delta) = &delta {
+                        write_delta(tx, job_id, delta).await?;
+                    }
+                    if let Some((sql, args)) = &resume {
+                        tx.execute(sql, args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
         })
     }
 

@@ -1325,6 +1325,15 @@ struct Resume {
     lost: Arc<AtomicBool>,
 }
 
+// A write of a torrent's checkpoint, with its ledger and peers when they
+// changed, queued; `landed` is none when nothing changed.
+struct CheckpointSave {
+    job_id: JobId,
+    landed: Option<oneshot::Receiver<Result<(), StateError>>>,
+    pending: Option<checkpoint::Pending>,
+    lost: Option<Arc<AtomicBool>>,
+}
+
 // A write of a torrent's ledger and peers, queued.
 struct Landing {
     job_id: JobId,
@@ -1869,16 +1878,17 @@ impl TorrentService {
         self.publish().await;
     }
 
-    // Write the checkpoints of `jobs`.
+    // Write the checkpoints of `jobs`, each with its torrent's ledger.
     async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
-        let jobs: Vec<(JobId, Arc<TorrentJob>)> = {
-            let live = self.inner.live.lock().await;
+        let now = self.inner.clock.now_ms();
+        let saves: Vec<CheckpointSave> = {
+            let mut live = self.inner.live.lock().await;
             jobs.into_iter()
-                .filter_map(|job_id| Some((job_id, live.get(&job_id)?.job.clone()?)))
+                .filter_map(|job_id| self.queue_checkpoint(live.get_mut(&job_id)?, now))
                 .collect()
         };
-        for (job_id, job) in jobs {
-            self.save_checkpoint(job_id, &job).await;
+        for save in saves {
+            self.checkpoint_landed(save).await;
         }
     }
 
@@ -1956,34 +1966,88 @@ impl TorrentService {
         receiver
     }
 
-    // Write what the job's checkpoint changed since the database last held
-    // it: the rows that differ, as the pipeline writes its jobs'.
-    async fn save_checkpoint(&self, job_id: JobId, job: &TorrentJob) {
-        let pending = job.with(|job| {
+    // Queue a write of what the job's checkpoint changed since the database
+    // last held it, the rows that differ as the pipeline writes its jobs',
+    // with what changed in the torrent's ledger and peers as they stand now,
+    // in one transaction: what a crash recovers is the pieces and the
+    // counters of one moment. The ledger is taken in the step that queues
+    // it, as every write of it is. None when the torrent has no job.
+    fn queue_checkpoint(&self, torrent: &mut Live, now: i64) -> Option<CheckpointSave> {
+        let job_id = torrent.record.job_id;
+        let pending = torrent.job.as_ref()?.with(|job| {
             let pending = job.pending().clone();
             pending.put(job).then_some(pending)
         });
-        if let Some(pending) = pending {
-            let writer = pending.clone();
-            let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
-                let Some(delta) = writer.take() else {
-                    return Ok(());
-                };
-                let written = db.save_graph_checkpoint(job_id, Arc::new(delta));
-                if written.is_err() {
-                    writer.forget();
-                }
-                written
+        torrent.settle(now);
+        let resume = torrent.take_resume(now, false);
+        if pending.is_none() && resume.is_none() {
+            return Some(CheckpointSave {
+                job_id,
+                landed: None,
+                pending: None,
+                lost: None,
             });
-            match landed.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
-                }
+        }
+        let (counters, peers, lost) = resume.map_or((None, None, None), |resume| {
+            (resume.counters, resume.peers, Some(resume.lost))
+        });
+        let writer = pending.clone();
+        let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
+            let delta = writer.as_ref().and_then(checkpoint::Pending::take);
+            let written = db.save_torrent_checkpoint(
+                job_id,
+                delta.map(Arc::new),
+                counters.as_ref(),
+                peers.as_ref(),
+            );
+            if written.is_err()
+                && let Some(writer) = &writer
+            {
+                writer.forget();
+            }
+            written
+        });
+        Some(CheckpointSave {
+            job_id,
+            landed: Some(landed),
+            pending,
+            lost,
+        })
+    }
+
+    // Wait for a checkpoint's write to land. One that failed leaves what
+    // the database holds of the ledger unknown, so the next writes all of
+    // it.
+    async fn checkpoint_landed(&self, save: CheckpointSave) {
+        let CheckpointSave {
+            job_id,
+            landed,
+            pending,
+            lost,
+        } = save;
+        if let Some(landed) = landed {
+            let failed = match landed.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
                 Err(error) => {
-                    pending.forget();
-                    tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent job");
+                    if let Some(pending) = &pending {
+                        pending.forget();
+                    }
+                    Some(error.to_string())
                 }
+            };
+            match (failed, lost) {
+                (Some(error), lost) => {
+                    if let Some(lost) = lost {
+                        lost.store(true, Ordering::Release);
+                    }
+                    tracing::warn!(job_id = job_id.0, %error, "could not checkpoint a torrent job");
+                }
+                (None, Some(_)) => self
+                    .inner
+                    .written
+                    .send_modify(|written| written.ledgers += 1),
+                (None, None) => {}
             }
         }
         self.inner
@@ -3041,12 +3105,12 @@ impl TorrentService {
     // before the session lets it go.
     async fn detach(&self, torrent: &mut Live) {
         let job_id = torrent.record.job_id;
-        if let Some(job) = &torrent.job
-            && self.inner.signal.take_unsaved_one(job_id)
-        {
-            self.save_checkpoint(job_id, job).await;
-        }
         let now = self.inner.clock.now_ms();
+        if self.inner.signal.take_unsaved_one(job_id)
+            && let Some(save) = self.queue_checkpoint(torrent, now)
+        {
+            self.checkpoint_landed(save).await;
+        }
         torrent.settle(now);
         let landing = torrent
             .attached
@@ -3996,6 +4060,7 @@ impl TorrentService {
                     .or_default();
                 traffic.open += u64::from(torrent.peers.0);
                 if leg.own_sockets {
+                    traffic.opening += u64::from(torrent.peers.2);
                     traffic.bytes_per_second += torrent.speeds.0;
                 }
             }
