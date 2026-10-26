@@ -30,7 +30,7 @@ use tokio::{
     },
     time::Instant,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug_span, trace};
 
 const LSD_PORT: u16 = 6771;
@@ -264,6 +264,10 @@ pub struct LocalServiceDiscoveryOptions<'a> {
     pub cancel_token: CancellationToken,
     pub cookie: Option<u32>,
     pub bind_device: Option<&'a BindDevice>,
+    /// Track the LSD's tasks in this tracker. They own the socket's use, so
+    /// once the tracker is empty after cancellation, nothing is sent or
+    /// received on it again.
+    pub tasks: Option<TaskTracker>,
     /// A test's socket in place of the multicast one.
     #[cfg(test)]
     pub(crate) socket: Option<Box<dyn Socket>>,
@@ -271,12 +275,14 @@ pub struct LocalServiceDiscoveryOptions<'a> {
 
 impl LocalServiceDiscovery {
     pub async fn new(opts: LocalServiceDiscoveryOptions<'_>) -> anyhow::Result<Self> {
+        let tasks = opts.tasks.unwrap_or_default();
         #[cfg(test)]
         if let Some(socket) = opts.socket {
             return Ok(Self::with_socket(
                 socket,
                 opts.cookie.unwrap_or_else(rand::random),
                 opts.cancel_token,
+                tasks,
             ));
         }
         let socket = MulticastUdpSocket::new(
@@ -292,10 +298,16 @@ impl LocalServiceDiscovery {
             Box::new(socket),
             opts.cookie.unwrap_or_else(rand::random),
             opts.cancel_token,
+            tasks,
         ))
     }
 
-    fn with_socket(socket: Box<dyn Socket>, cookie: u32, cancel_token: CancellationToken) -> Self {
+    fn with_socket(
+        socket: Box<dyn Socket>,
+        cookie: u32,
+        cancel_token: CancellationToken,
+        tasks: TaskTracker,
+    ) -> Self {
         let lsd = Self {
             inner: Arc::new(LocalServiceDiscoveryInner {
                 socket,
@@ -309,13 +321,13 @@ impl LocalServiceDiscovery {
             debug_span!("lsd"),
             "lsd",
             cancel_token.clone(),
-            lsd.clone().task_monitor_recv(),
+            tasks.track_future(lsd.clone().task_monitor_recv()),
         );
         spawn_with_cancel(
             debug_span!("lsd-announce"),
             "lsd-announce",
             cancel_token,
-            lsd.clone().task_announce(),
+            tasks.track_future(lsd.clone().task_announce()),
         );
 
         lsd
@@ -503,6 +515,47 @@ impl Socket for RecordingSocket {
     }
 }
 
+/// A [`RecordingSocket`] that counts in `listening` the receives waiting on
+/// it: one while the LSD listens, none once it has stopped.
+#[cfg(test)]
+pub(crate) struct ListeningSocket {
+    pub(crate) sent: UnboundedSender<String>,
+    pub(crate) listening: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Socket for ListeningSocket {
+    fn recv_from<'a>(&'a self, _: &'a mut [u8]) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        use std::sync::atomic::Ordering;
+
+        struct Waiting(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Waiting {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        self.listening.fetch_add(1, Ordering::SeqCst);
+        let waiting = Waiting(self.listening.clone());
+        Box::pin(async move {
+            let _waiting = waiting;
+            std::future::pending().await
+        })
+    }
+
+    fn send_everywhere<'a>(
+        &'a self,
+        msg: &'a (dyn Fn(bool) -> String + Sync),
+    ) -> BoxFuture<'a, ()> {
+        let _ = self.sent.send(msg(false));
+        Box::pin(async {})
+    }
+
+    fn nics(&self) -> &[NetworkInterface] {
+        &[]
+    }
+}
+
 #[derive(Debug)]
 struct BtSearchAnnounceMessage {
     hash: Id20,
@@ -650,6 +703,7 @@ mod tests {
                     Box::new(socket),
                     1,
                     CancellationToken::new(),
+                    tokio_util::task::TaskTracker::new(),
                 ),
                 sent,
                 incoming,

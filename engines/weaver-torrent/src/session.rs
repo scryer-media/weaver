@@ -1465,6 +1465,7 @@ impl Session {
                     LocalServiceDiscovery::new(LocalServiceDiscoveryOptions {
                         cancel_token: swarm.clone(),
                         bind_device: bind_device.as_ref(),
+                        tasks: Some(swarm_tasks.clone()),
                         #[cfg(test)]
                         socket: opts.lsd_socket.take(),
                         ..Default::default()
@@ -5064,6 +5065,75 @@ mod tests {
         assert!(handle.is_paused());
         assert!(!lsd.registered(handle.info_hash()));
         session.stop().await;
+        Ok(())
+    }
+
+    // The local discovery is part of the swarm a stopping session leaves:
+    // once stop returns it listens no more and announces nothing again,
+    // however long the clock then runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_session_is_done_with_the_local_network() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::{
+            lsd::ListeningSocket,
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+        };
+        use anyhow::Context;
+
+        let t = TestTorrent::new("test_lsd_stop", 2 * 16384, 16384).await?;
+        let (sent_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let listening = Arc::new(AtomicUsize::new(0));
+        let out = TempDir::with_prefix("test_lsd_stop_out")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            SessionOptions {
+                disable_local_service_discovery: false,
+                lsd_socket: Some(Box::new(ListeningSocket {
+                    sent: sent_tx,
+                    listening: listening.clone(),
+                })),
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    announce_port: Some(6881),
+                    ..Default::default()
+                }),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        let announce = sent.recv().await.context("no announce")?;
+        assert!(
+            announce.contains(&handle.info_hash().as_string()),
+            "{announce}"
+        );
+        assert_eq!(listening.load(Ordering::SeqCst), 1);
+
+        session.stop().await;
+        assert_eq!(
+            listening.load(Ordering::SeqCst),
+            0,
+            "the local discovery still listens after stop returned"
+        );
+        while sent.try_recv().is_ok() {}
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert!(
+            sent.try_recv().is_err(),
+            "the local discovery announced after stop returned"
+        );
         Ok(())
     }
 
