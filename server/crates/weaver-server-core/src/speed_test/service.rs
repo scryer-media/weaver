@@ -425,8 +425,11 @@ impl SpeedTestService {
             },
             None => runtime.policy(consumer),
         };
-        runtime.network.validate_policy(&policy)?;
         let route = policy.route();
+        // A run goes over a route its consumer may take, as the consumer's
+        // own traffic would: a torrent route's one leg with one exit.
+        consumer.validate_route(&route)?;
+        runtime.network.validate_policy(&policy)?;
         let (egresses, profiles, pools) = runtime.network.configuration_snapshot();
         let egress_names: HashMap<u32, String> =
             egresses.iter().map(|e| (e.id, e.name.clone())).collect();
