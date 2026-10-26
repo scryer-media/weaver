@@ -601,9 +601,7 @@ impl Pipeline {
             .set(pipeline.admission_resources());
         let initial_history: Arc<[JobInfo]> = initial_history.into();
         pipeline.shared_state.queue.write(|inner| {
-            inner
-                .jobs
-                .retain(|row| !is_terminal_status(&row.report.job.status));
+            inner.retain_jobs(|row| !is_terminal_status(&row.report.job.status));
             pipeline
                 .shared_state
                 .queue

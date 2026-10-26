@@ -344,6 +344,7 @@ impl SharedPipelineState {
                 .into_iter()
                 .map(crate::pipeline::queue::JobRow::new)
                 .collect();
+            inner.reindex_jobs();
             self.queue.replace_history(inner, Arc::from(Vec::new()));
             crate::pipeline::queue::Change::changed(())
         });

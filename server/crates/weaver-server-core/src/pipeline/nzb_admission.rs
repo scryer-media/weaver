@@ -6,6 +6,19 @@ use crate::pipeline::queue::Change;
 
 pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
 
+// One queue row as the admission pass sees it, copied out under the read lock.
+struct AdmissionRow {
+    id: JobId,
+    position: usize,
+    priority: u8,
+    paused: bool,
+    // The row still carries an intake, a restore or a resume for the actor.
+    pending: bool,
+    cancelled_or_retiring: bool,
+    // The row carries a fresh intake the actor has not installed yet.
+    intake: bool,
+}
+
 impl Pipeline {
     // Ownership survives empty queues, retries and all downstream processing.
     // Intake remains in the shared queue until its durable admission commits.
@@ -68,33 +81,34 @@ impl Pipeline {
                                     1
                                 }
                             });
-                        (
-                            row.id,
+                        AdmissionRow {
+                            id: row.id,
                             position,
                             priority,
                             paused,
                             pending,
-                            row.intents.cancelled.is_some() || row.report.retiring,
-                            row.admission.is_some(),
-                        )
+                            cancelled_or_retiring: row.intents.cancelled.is_some()
+                                || row.report.retiring,
+                            intake: row.admission.is_some(),
+                        }
                     })
                     .collect::<Vec<_>>(),
             )
         });
-        self.nzb_seen.extend(rows.iter().map(|row| row.0));
+        self.nzb_seen.extend(rows.iter().map(|row| row.id));
         let releases: Vec<_> = self
             .nzb_admitted
             .iter()
             .copied()
             .filter(|id| {
-                let gone = self.nzb_seen.contains(id) && !rows.iter().any(|row| row.0 == *id);
+                let gone = self.nzb_seen.contains(id) && !rows.iter().any(|row| row.id == *id);
                 // History retry/reprocess can reuse an ID before this actor
                 // observes the old row's removal. The new run must compete
                 // for a slot and commit its own ownership flag.
-                let replaced =
-                    !self.jobs.contains_key(id) && rows.iter().any(|row| row.0 == *id && row.6);
+                let replaced = !self.jobs.contains_key(id)
+                    && rows.iter().any(|row| row.id == *id && row.intake);
                 let paused = self.nzb_pause_releases.contains(id)
-                    && rows.iter().any(|row| row.0 == *id && row.3);
+                    && rows.iter().any(|row| row.id == *id && row.paused);
                 (gone || replaced || paused) && !self.nzb_work_in_flight(*id)
             })
             .collect();
@@ -102,7 +116,7 @@ impl Pipeline {
             // A replacement's old record has already been durably archived.
             // Its new record starts unowned and must acquire independently.
             let replaced =
-                !self.jobs.contains_key(&id) && rows.iter().any(|row| row.0 == id && row.6);
+                !self.jobs.contains_key(&id) && rows.iter().any(|row| row.id == id && row.intake);
             if !replaced
                 && let Err(error) = self
                     .db_blocking(move |db| db.set_nzb_admitted(id, false))
@@ -120,7 +134,7 @@ impl Pipeline {
             .copied()
             .filter(|id| {
                 !self.nzb_admitted.contains(id)
-                    && !rows.iter().any(|row| row.0 == *id)
+                    && !rows.iter().any(|row| row.id == *id)
                     && !self.nzb_work_in_flight(*id)
             })
             .collect();
@@ -133,9 +147,9 @@ impl Pipeline {
         // A history retry can replace a canceled, unadmitted paused job
         // before this actor sees the old row disappear.
         for row in &rows {
-            if row.6 && !self.jobs.contains_key(&row.0) && !self.nzb_work_in_flight(row.0) {
-                self.nzb_added_scripts_pending.remove(&row.0);
-                self.nzb_reprocess_pending.remove(&row.0);
+            if row.intake && !self.jobs.contains_key(&row.id) && !self.nzb_work_in_flight(row.id) {
+                self.nzb_added_scripts_pending.remove(&row.id);
+                self.nzb_reprocess_pending.remove(&row.id);
             }
         }
         if stopped {
@@ -143,8 +157,13 @@ impl Pipeline {
         }
         let mut candidates: Vec<_> = rows
             .iter()
-            .filter(|row| row.4 && !row.3 && !row.5 && !self.nzb_admitted.contains(&row.0))
-            .map(|row| (row.2, row.1, row.0))
+            .filter(|row| {
+                row.pending
+                    && !row.paused
+                    && !row.cancelled_or_retiring
+                    && !self.nzb_admitted.contains(&row.id)
+            })
+            .map(|row| (row.priority, row.position, row.id))
             .collect();
         candidates.sort_unstable();
         let propagating: HashSet<_> = candidates
@@ -160,7 +179,8 @@ impl Pipeline {
                 self.nzb_admitted.len()
                     < globals
                         .max_concurrent_nzbs
-                        .map_or(10, std::num::NonZeroU32::get) as usize
+                        .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
+                        .get() as usize
                     && !globals.paused
                     && !globals.scheduled_pause
                     && !globals.speed_test_paused

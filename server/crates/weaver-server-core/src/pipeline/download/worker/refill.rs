@@ -366,6 +366,14 @@ impl Pipeline {
         if reserved.is_empty() {
             return None;
         }
+        // The handout was cut for `server_idx` alone, so the lease is pinned
+        // there and no article in it may have failed on that server.
+        debug_assert!(
+            reserved
+                .iter()
+                .all(|work| !work.exclude_servers.contains(&server_idx)),
+            "a lease holds an article already excluded from the server it is pinned to"
+        );
         let completion_critical = reserved.iter().any(|work| work.completion_critical);
         let dial_exclude_servers = (0..self.nntp.pool().server_count())
             .filter(|idx| *idx != server_idx)

@@ -165,7 +165,7 @@ function transportLabel(t: Translate, server: Server): string {
 
 function roleLabel(t: Translate, server: Server): string {
   if (server.backfill) {
-    return t("next.providers.blockAccount");
+    return t("next.providers.backfillServer");
   }
   return server.priority === 0
     ? t("next.providers.primary")
@@ -623,8 +623,8 @@ export function ProvidersPanel() {
             },
             {
               id: "backfill",
-              label: t("next.providers.blockAccount"),
-              help: t("next.providers.blockAccountHelp"),
+              label: t("next.providers.backfillServer"),
+              help: t("next.providers.backfillServerHelp"),
               control: {
                 kind: "toggle",
                 value: values.backfill,

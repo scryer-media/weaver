@@ -507,7 +507,7 @@ impl Pipeline {
     // One dispatch pass at `now`, the instant the pass's timers and the stall
     // watchdog measure against.
     pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
-        self.download_pass_provider_policy = self.nntp.pool().try_provider_policy();
+        self.download_pass_provider_policy = Some(self.sample_provider_policy());
         self.dispatch_download_pass(now);
         self.download_pass_provider_policy = None;
         self.report_changed_dispatch_holds();

@@ -362,7 +362,7 @@ impl Pipeline {
                 if !keep_files {
                     inner.pending_cleanup.insert(job_id);
                 }
-                inner.jobs.retain(|row| row.id != job_id);
+                inner.retain_jobs(|row| row.id != job_id);
                 let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
                 crate::pipeline::queue::Change::changed(delete_history)
             });

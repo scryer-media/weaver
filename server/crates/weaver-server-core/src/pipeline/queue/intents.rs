@@ -178,6 +178,7 @@ impl Queue {
                     .position(|id| *id == row.id)
                     .unwrap_or(usize::MAX)
             });
+            inner.reindex_jobs();
             Change::changed(Ok(()))
         })
     }

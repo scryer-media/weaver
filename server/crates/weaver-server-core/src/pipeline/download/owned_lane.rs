@@ -1219,9 +1219,8 @@ pub(super) fn job_work_is_current(
             && !globals.schedule_replay_paused
             && !globals.shutting_down
             && globals.nntp_generation == generation
-            && inner.jobs.iter().any(|row| {
-                row.id == job_id
-                    && row.report.nzb_admitted
+            && inner.job(job_id).is_some_and(|row| {
+                row.report.nzb_admitted
                     && !row.report.retiring
                     && !row.report.restoring
                     && row.admission.is_none()
@@ -1232,6 +1231,10 @@ pub(super) fn job_work_is_current(
     })
 }
 
+// A lease is cut for one server from works that server may serve, and pinned
+// to it by `dial_exclude_servers` (see `Pipeline::lease_for_handout`). The
+// lease is current while some undialled-out server may still serve every one
+// of its works, which for a lease cut by dispatch is its own server.
 fn lease_is_current(
     state: &crate::jobs::handle::SharedPipelineState,
     nntp: &weaver_nntp::NntpClient,
@@ -2780,6 +2783,40 @@ mod routing_tests {
             crate::pipeline::queue::Change::changed(())
         });
         assert!(!lease_is_current(&state, &nntp, &lease));
+    }
+
+    // A lease is cut for one server and pinned to it, so two works whose own
+    // exclusions differ stay current while that server may serve both.
+    #[test]
+    fn a_lease_of_works_with_differing_exclusions_stays_current_on_its_server() {
+        let server = |port| weaver_nntp::pool::ServerPoolConfig {
+            max_connections: 4,
+            ..weaver_nntp::pool::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls: false,
+                ..Default::default()
+            })
+        };
+        let nntp = Arc::new(weaver_nntp::client::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig {
+                servers: vec![server(1), server(2)],
+                ..weaver_nntp::client::NntpClientConfig::single(
+                    weaver_nntp::ServerConfig::default(),
+                    1,
+                )
+            },
+        ));
+        let state = test_admitted_state(JobId(42));
+        let mut not_found_on_zero = tail_work(1, 1);
+        not_found_on_zero.exclude_servers = vec![0];
+        let lease = test_lease(
+            JobId(42),
+            0,
+            vec![0],
+            vec![not_found_on_zero, tail_work(2, 0)],
+        );
+        assert!(lease_is_current(&state, &nntp, &lease));
     }
 
     fn test_run(
