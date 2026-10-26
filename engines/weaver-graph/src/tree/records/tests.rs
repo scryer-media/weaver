@@ -11,7 +11,7 @@ use crate::deliver::{Delivery, Emit, Posted, Provenance, Why};
 use crate::engine::{Engine, Extraction, Sink, Volumes};
 use crate::facts::{Durable, Facts, Restore, RestoreError};
 use crate::member::MemberId;
-use crate::object::{Extent, Kind, Object, ObjectId, Placement, Standing};
+use crate::object::{Extent, Kind, Located, Object, ObjectId, Placement, Standing};
 use crate::records::{NodeState, TreeRecord};
 use crate::seek::{Pull, Seek, Weight};
 use crate::tree::NodeId;
@@ -90,11 +90,12 @@ impl Object for Wrap {
             range: ByteRange::new(start, range.end.max(start)).shift(-(self.header() as i64)),
         });
     }
-    fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
+    fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
         out.push(Extent {
             volume: VolumeIndex(0),
             range: range.shift(self.header() as i64),
         });
+        Located::Whole
     }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None

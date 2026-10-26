@@ -12,7 +12,7 @@
 // its own:
 //
 //   ask up      `Seek`: "I want this range of this volume ahead of the normal
-//               order", answered `Moved`, `Lost` or `Unseekable`.
+//               order", answered `Moved`, `Lost`, `Unseekable` or `Unlocated`.
 //   receive     `Delivery`: bytes of a volume at an offset, with a provenance,
 //               answered with what they turned out to be (`Emit`).
 //
@@ -53,7 +53,8 @@ pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{
-    Beside, Carried, Extent, Kind, Object, ObjectId, Placement, Placements, Posting, Standing,
+    Beside, Carried, Extent, Kind, Located, Object, ObjectId, Placement, Placements, Posting,
+    Standing,
 };
 pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,

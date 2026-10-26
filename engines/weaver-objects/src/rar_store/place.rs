@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use unrar_rs::{MappedSlice, StoredLayoutBuilder};
 use weaver_graph::{
-    ByteRange, Emit, Extent, MemberId, Placement, Placements, Posting, VolumeIndex,
+    ByteRange, Emit, Extent, Located, MemberId, Placement, Placements, Posting, VolumeIndex,
 };
 
 use super::{Entry, Lock, Out, RarStore, Volume};
@@ -363,27 +363,47 @@ impl RarStore {
         }
     }
 
-    pub(super) fn member_extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
+    // Every byte of a stored file is a raw byte of some volume, so every
+    // range of it lies somewhere: in the parts the headers read so far
+    // place, or, until its last part is placed, in a volume whose headers
+    // the store has not read yet.
+    pub(super) fn member_extent(
+        &self,
+        member: MemberId,
+        range: ByteRange,
+        out: &mut Vec<Extent>,
+    ) -> Located {
         let Some(entry) = self.entries.get(member.0 as usize) else {
-            return;
+            return Located::Never;
         };
-        // A cipher block reads with the one before it as its seed.
+        // A cipher block reads with the one before it as its seed. The
+        // packed stream ends where its last part does, once that is placed.
         let stream = match entry.store {
             Some(_) => {
                 let start = (range.start - range.start % BLOCK).saturating_sub(BLOCK);
-                let end = (range.end.div_ceil(BLOCK) * BLOCK).min(entry.packed());
+                let end = range.end.div_ceil(BLOCK) * BLOCK;
+                let end = match entry.complete {
+                    true => end.min(entry.packed()),
+                    false => end,
+                };
                 ByteRange::new(start, end.max(start))
             }
             None => range,
         };
+        let mut placed = 0;
         for piece in &entry.pieces {
             let span = ByteRange::at(piece.at, piece.data.len());
             if let Some(part) = span.intersect(stream) {
+                placed += part.len();
                 out.push(Extent {
                     volume: piece.volume,
                     range: part.shift(piece.data.start as i64 - piece.at as i64),
                 });
             }
+        }
+        match entry.complete || placed == stream.len() {
+            true => Located::Whole,
+            false => Located::NotYet,
         }
     }
 

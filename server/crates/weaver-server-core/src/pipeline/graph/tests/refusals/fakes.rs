@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use weaver_graph::{
-    Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, MemberId, Object,
-    ObjectId, Placement, Pull, Seek, Sink, Standing, VolumeIndex, Volumes, Why,
+    Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, Located, MemberId,
+    Object, ObjectId, Placement, Pull, Seek, Sink, Standing, VolumeIndex, Volumes, Why,
 };
 
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER};
@@ -212,7 +212,9 @@ impl Object for Store {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
         self.offers.lock().unwrap().push(secret.to_string());
@@ -280,7 +282,9 @@ impl Object for LockedEngine {
             range,
         });
     }
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
     fn offer_password(&mut self, secret: &str, _: &mut Vec<Emit>) {
         self.offers.lock().unwrap().push(secret.to_string());
         self.password = Some(secret.to_string());

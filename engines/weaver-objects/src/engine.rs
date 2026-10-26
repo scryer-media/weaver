@@ -25,8 +25,8 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, MemberId, Object,
-    Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, Located, MemberId,
+    Object, Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 
 pub use crate::quiet::Placed;
@@ -255,7 +255,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn offer_password(&mut self, secret: &str, _out: &mut Vec<Emit>) {
         self.password = Some(secret.to_owned());

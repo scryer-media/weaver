@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{
-    Builder, ByteRange, Delivery, Emit, Extent, Kind, MemberId, NodeId, Object, ObjectId,
+    Builder, ByteRange, Delivery, Emit, Extent, Kind, Located, MemberId, NodeId, Object, ObjectId,
     Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use weaver_model::files::FileRole;
@@ -88,7 +88,9 @@ impl Object for Probe {
         self.answers.lock().unwrap().push(pull);
     }
     fn locate(&self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Placement>) {}
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }

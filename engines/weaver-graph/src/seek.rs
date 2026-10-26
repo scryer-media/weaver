@@ -88,6 +88,16 @@ impl Seek {
             When::Deferred => Pull::Moved(0),
         }
     }
+
+    // What an ask answers whose bytes a store above has not located yet: an
+    // asker that wants them now waits and asks again; one that deferred
+    // them parked nothing.
+    pub fn unlocated(self) -> Pull {
+        match self.when {
+            When::Now => Pull::Unlocated,
+            When::Deferred => Pull::Moved(0),
+        }
+    }
 }
 
 // The root's answer, carried back down unchanged.
@@ -102,16 +112,22 @@ pub enum Pull {
     // reaches them. For data the asker gives up streaming and asks for an
     // engine; for recovery it waits.
     Unseekable,
+    // A store above has not read the header that places the range yet. The
+    // asker waits: its standing want is lifted again every round, and is
+    // answered once the store has read that header.
+    Unlocated,
 }
 
 impl Pull {
     pub fn fold(self, other: Pull) -> Pull {
         // A seek that spans several parent ranges is as good as its worst
         // part: one lost range loses the seek, one unseekable range leaves
-        // the asker waiting for the normal order.
+        // the asker waiting for the normal order, and one not located yet
+        // leaves it asking again.
         match (self, other) {
             (Pull::Lost, _) | (_, Pull::Lost) => Pull::Lost,
             (Pull::Unseekable, _) | (_, Pull::Unseekable) => Pull::Unseekable,
+            (Pull::Unlocated, _) | (_, Pull::Unlocated) => Pull::Unlocated,
             (Pull::Moved(left), Pull::Moved(right)) => Pull::Moved(left + right),
         }
     }
@@ -133,5 +149,7 @@ mod tests {
         assert_eq!(Pull::Moved(2).fold(Pull::Moved(3)), Pull::Moved(5));
         assert_eq!(Pull::Moved(2).fold(Pull::Unseekable), Pull::Unseekable);
         assert_eq!(Pull::Unseekable.fold(Pull::Lost), Pull::Lost);
+        assert_eq!(Pull::Moved(2).fold(Pull::Unlocated), Pull::Unlocated);
+        assert_eq!(Pull::Unlocated.fold(Pull::Unseekable), Pull::Unseekable);
     }
 }

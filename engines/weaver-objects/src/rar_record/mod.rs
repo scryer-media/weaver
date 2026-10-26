@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 use unrar_rs::{ArchiveFormat, RarError, RecoveryRecordAssessment, RecoveryRecordLayout};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Handed, Kind, MemberId, Namespace,
-    Object, Placement, Provenance, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Handed, Kind, Located, MemberId,
+    Namespace, Object, Placement, Provenance, Pull, Recovery, Seek, Segment, SliceVerdict,
+    VolumeIndex,
 };
 use zeroize::Zeroizing;
 
@@ -257,7 +258,9 @@ impl Object for RarRecord {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None

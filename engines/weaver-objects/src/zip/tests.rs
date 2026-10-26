@@ -8,7 +8,9 @@ use std::io::{Cursor, Write};
 
 use ::zip::write::SimpleFileOptions;
 use ::zip::{CompressionMethod, ZipWriter};
-use weaver_graph::{ByteRange, Emit, Kind, ObjectId, Provenance, Pull, VolumeIndex, Why};
+use weaver_graph::{
+    ByteRange, Emit, Kind, Located, MemberId, Object, ObjectId, Provenance, Pull, VolumeIndex, Why,
+};
 
 use super::Zip;
 use super::records::{self, LOCAL_LEN};
@@ -425,4 +427,74 @@ fn the_store_is_built_for_its_kind() {
     let object = crate::build(Kind::Zip, ObjectId(1)).unwrap();
     assert_eq!(object.kind(), Kind::Zip);
     assert!(!object.reads_in_order());
+}
+
+fn member_id(owner: &Owner, name: &str) -> MemberId {
+    owner
+        .members
+        .iter()
+        .find(|(_, got)| got.name == name)
+        .map(|(id, _)| MemberId(*id))
+        .unwrap()
+}
+
+// A stored entry's bytes are raw runs of the container, so a seek before the
+// central directory and the local header are read is not located yet, the
+// same seek after them lies where the map puts it, and only a range the map
+// rules out is never located.
+#[test]
+fn a_seek_before_the_central_directory_is_read_is_located_once_it_is() {
+    let bytes = archive();
+    let mut owner = Owner::single(Zip::new(), bytes.clone());
+    let mut extents = Vec::new();
+    assert_eq!(
+        owner
+            .object
+            .extent(MemberId(0), ByteRange::new(100, 200), &mut extents),
+        Located::NotYet
+    );
+    assert!(extents.is_empty());
+    owner.whole(4096);
+    no_trouble(&owner);
+    let alpha = member_id(&owner, "alpha.bin");
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(100, 200), &mut extents),
+        Located::Whole
+    );
+    let read: Vec<u8> = extents
+        .iter()
+        .flat_map(|extent| bytes[extent.range.start as usize..extent.range.end as usize].to_vec())
+        .collect();
+    assert_eq!(read, payload(1, 10_000)[100..200]);
+    extents.clear();
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(10_000, 10_100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// A deflated entry sends the whole container to an engine, whose members
+// are decoded and never lie in the volumes.
+#[test]
+fn a_seek_under_a_deflated_entry_is_unseekable() {
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let beta = payload(6, 2_000).repeat(4);
+    let mut owner = Owner::single(
+        Zip::new(),
+        write(&[Entry::File("beta.bin", &beta, deflated)]),
+    );
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Compressed)]);
+    let engine = crate::zip_engine::ZipEngine::new();
+    let mut extents = Vec::new();
+    assert_eq!(
+        engine.extent(MemberId(0), ByteRange::new(0, 100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
 }

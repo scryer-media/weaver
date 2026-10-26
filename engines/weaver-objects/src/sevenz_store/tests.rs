@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
-use weaver_graph::{ByteRange, Emit, Object, Provenance, Pull, RecoveryKind, VolumeIndex, Why};
+use weaver_graph::{
+    ByteRange, Emit, Located, MemberId, Object, Provenance, Pull, RecoveryKind, VolumeIndex, Why,
+};
 
 use super::SevenZipStore;
 use crate::keys::Keys;
@@ -760,4 +762,68 @@ fn every_unproven_candidate_wrong_needs_a_password() {
     assert!(has(&owner, &Emit::NeedsPassword));
     owner.quiet();
     assert!(has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
+}
+
+fn member_id(owner: &Owner, name: &str) -> MemberId {
+    owner
+        .members
+        .iter()
+        .find(|(_, got)| got.name == name)
+        .map(|(id, _)| MemberId(*id))
+        .unwrap()
+}
+
+// A stored member's bytes are raw runs of the container, so a seek before the
+// end header is read is not located yet, the same seek after it lies where
+// the map puts it, and only a range the map rules out is never located.
+#[test]
+fn a_seek_before_the_end_header_is_read_is_located_once_it_is() {
+    let bytes = archive(copy(), false);
+    let mut owner = Owner::single(store(), bytes.clone());
+    let mut extents = Vec::new();
+    assert_eq!(
+        owner
+            .object
+            .extent(MemberId(0), ByteRange::new(100, 200), &mut extents),
+        Located::NotYet
+    );
+    assert!(extents.is_empty());
+    owner.whole(4096);
+    no_trouble(&owner);
+    let alpha = member_id(&owner, "alpha.bin");
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(100, 200), &mut extents),
+        Located::Whole
+    );
+    let read: Vec<u8> = extents
+        .iter()
+        .flat_map(|extent| bytes[extent.range.start as usize..extent.range.end as usize].to_vec())
+        .collect();
+    assert_eq!(read, payload(1, 10_000)[100..200]);
+    extents.clear();
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(10_000, 10_100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// A compressed folder sends the whole container to an engine, whose members
+// are decoded and never lie in the volumes.
+#[test]
+fn a_seek_under_a_compressed_folder_is_unseekable() {
+    let mut owner = Owner::single(store(), archive(lzma2(), false));
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Compressed)));
+    let engine = crate::sevenz_engine::SevenZipEngine::new();
+    let mut extents = Vec::new();
+    assert_eq!(
+        engine.extent(MemberId(0), ByteRange::new(0, 100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
 }

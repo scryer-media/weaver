@@ -10,7 +10,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use weaver_graph::{ByteRange, Emit, Object, Provenance, RecoveryKind, VolumeIndex, Weight, Why};
+use weaver_graph::{
+    ByteRange, Emit, Located, MemberId, Object, Provenance, RecoveryKind, VolumeIndex, Weight, Why,
+};
 
 use super::RarStore;
 use crate::keys::{CAPACITY, Keys};
@@ -460,6 +462,104 @@ fn a_compressed_file_among_stored_ones_asks_for_an_engine() {
                 .iter()
                 .any(|emit| matches!(emit, Emit::Retract(_)))
         );
+    }
+}
+
+// The member a file was announced as, by its name.
+fn member_id(owner: &Owner, name: &str) -> MemberId {
+    owner
+        .members
+        .iter()
+        .find(|(_, got)| got.name == name)
+        .map(|(id, _)| MemberId(*id))
+        .unwrap_or_else(|| panic!("no member {name}"))
+}
+
+// A stored file's bytes in a volume whose headers the store has not read
+// are not located yet, never unseekable: every byte of the file is a raw
+// byte of some volume. Once that volume's headers are read, the same range
+// answers where it lies.
+#[test]
+fn a_seek_into_a_volume_not_walked_yet_is_located_once_its_headers_are_read() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let mut owner = Owner::named(store(), volumes);
+        owner.frames(0, 1000);
+        owner.close(0);
+        let alpha = member_id(&owner, "alpha.bin");
+        let bytes = &files()[0].1;
+        let length = bytes.len() as u64;
+        let tail = ByteRange::new(length - 100, length);
+        let whole = ByteRange::new(0, length);
+
+        let mut extents = Vec::new();
+        assert_eq!(
+            owner.object.extent(alpha, tail, &mut extents),
+            Located::NotYet,
+            "{version:?}"
+        );
+        assert!(extents.is_empty(), "{version:?}");
+        // What the first volume places is located; the rest is not yet.
+        assert_eq!(
+            owner.object.extent(alpha, whole, &mut extents),
+            Located::NotYet,
+            "{version:?}"
+        );
+        assert!(!extents.is_empty(), "{version:?}");
+        assert!(
+            extents.iter().all(|extent| extent.volume == VolumeIndex(0)),
+            "{version:?}"
+        );
+
+        owner.frames(1, 1000);
+        extents.clear();
+        assert_eq!(
+            owner.object.extent(alpha, tail, &mut extents),
+            Located::Whole,
+            "{version:?}"
+        );
+        assert_eq!(extents.len(), 1, "{version:?}");
+        assert_eq!(extents[0].volume, VolumeIndex(1), "{version:?}");
+        let at = extents[0].range;
+        assert_eq!(
+            &owner.volumes[1].1[at.start as usize..at.end as usize],
+            &bytes[(length - 100) as usize..],
+            "{version:?}"
+        );
+        extents.clear();
+        assert_eq!(
+            owner.object.extent(alpha, whole, &mut extents),
+            Located::Whole,
+            "{version:?}"
+        );
+        assert_eq!(
+            extents.iter().map(|extent| extent.range.len()).sum::<u64>(),
+            length,
+            "{version:?}"
+        );
+    }
+}
+
+// Under a compressed set there is nothing to seek into: the store gives the
+// set to an engine, whose members are no run of the volumes' raw bytes, so
+// a seek into any of them is unseekable.
+#[test]
+fn a_seek_under_a_compressed_set_is_unseekable() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut options = Options::new(version);
+        options.solid = true;
+        let volumes = write(&items(), &options);
+        let mut owner = Owner::named(store(), volumes);
+        owner.whole(4096);
+        assert!(owner.said.contains(&Emit::NeedsEngine(Why::Compressed)));
+        let engine = crate::rar_engine::RarEngine::new();
+        let mut extents = Vec::new();
+        assert_eq!(
+            engine.extent(MemberId(0), ByteRange::new(0, 100), &mut extents),
+            Located::Never,
+            "{version:?}"
+        );
+        assert!(extents.is_empty(), "{version:?}");
     }
 }
 

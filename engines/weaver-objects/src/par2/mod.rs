@@ -26,8 +26,8 @@ use par2_rs::Par2FileSet;
 use par2_rs::packet::{HEADER_SIZE, MAGIC};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
-    ByteRange, Delivery, Emit, Extent, Kind, MemberId, Namespace, Object, ObjectId, Placement,
-    Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    ByteRange, Delivery, Emit, Extent, Kind, Located, MemberId, Namespace, Object, ObjectId,
+    Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
 };
 
 use self::bind::bind_sets;
@@ -313,7 +313,9 @@ impl Object for Par2 {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None

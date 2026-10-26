@@ -46,7 +46,9 @@ impl Object for Set {
             range,
         });
     }
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }

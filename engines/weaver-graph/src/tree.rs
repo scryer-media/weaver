@@ -19,7 +19,7 @@ use crate::deliver::{Emit, Handed, Provenance, Why};
 use crate::engine::{Engine, Extraction};
 use crate::member::{Member, MemberId, Namespace};
 use crate::names::{Moved, NameLedger, Position};
-use crate::object::{Carried, Extent, Kind, Object, ObjectId, Placement, Posting};
+use crate::object::{Carried, Extent, Kind, Located, Object, ObjectId, Placement, Posting};
 use crate::recovery::Recovery;
 use crate::seek::{Pull, Seek, SeekUp};
 use crate::sniff::{Sniff, signed, sniff};
@@ -2645,12 +2645,15 @@ impl Tree {
             };
             let mut extents = std::mem::take(&mut self.extents);
             extents.clear();
-            object.extent(member, ask.range, &mut extents);
-            if extents.is_empty() {
-                // The parent does not know the member's layout yet, so it
-                // cannot say where the bytes lie; the ask waits for the
-                // normal order to reach them.
-                pulled = pulled.fold(ask.unseekable());
+            match object.extent(member, ask.range, &mut extents) {
+                Located::Whole => {}
+                // The parent has not read the header that places the rest
+                // of the bytes; the ask is lifted again next round, when it
+                // may have.
+                Located::NotYet => pulled = pulled.fold(ask.unlocated()),
+                // Nothing above can bring the bytes forward; the ask waits
+                // for the normal order to reach them.
+                Located::Never => pulled = pulled.fold(ask.unseekable()),
             }
             for extent in extents.iter().rev() {
                 asks.push((
@@ -3026,6 +3029,7 @@ mod tests {
     use crate::deliver::{Delivery, RecoveryKind};
 
     mod again;
+    mod lift;
     mod reposted;
     mod sets;
     mod windows;
@@ -3106,7 +3110,7 @@ mod tests {
                 range: member,
             });
         }
-        fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
+        fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
             let mut at = range.start + HEADER;
             let end = range.end + HEADER;
             while at < end {
@@ -3118,6 +3122,7 @@ mod tests {
                 });
                 at = stop;
             }
+            Located::Whole
         }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
@@ -3169,7 +3174,9 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
@@ -3206,7 +3213,9 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
@@ -4427,7 +4436,9 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
@@ -4581,7 +4592,9 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }

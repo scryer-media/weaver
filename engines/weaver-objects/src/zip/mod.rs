@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Object, Placement,
-    Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, Located, MemberId, Object,
+    Placement, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
 };
 
 use crate::engine::{Format, SetName};
@@ -451,8 +451,10 @@ impl Object for Zip {
         }
     }
 
+    // A range brought forward, or one not located yet and asked for again
+    // next round, is waited for.
     fn pulled(&mut self, seek: Seek, pull: Pull, out: &mut Vec<Emit>) {
-        if self.gone || matches!(pull, Pull::Moved(_)) {
+        if self.gone || matches!(pull, Pull::Moved(_) | Pull::Unlocated) {
             return;
         }
         let Some(range) = self.global(seek.volume, seek.range) else {
@@ -479,8 +481,8 @@ impl Object for Zip {
         self.place(volume, range, out);
     }
 
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
-        self.member_extent(member, range, out);
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
+        self.member_extent(member, range, out)
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {

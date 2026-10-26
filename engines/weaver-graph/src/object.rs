@@ -218,6 +218,20 @@ pub struct Extent {
     pub range: ByteRange,
 }
 
+// What a store says of a member range it was asked where it lies, beside the
+// extents it gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Located {
+    // The extents given are all of the range.
+    Whole,
+    // The extents given are the part the store has placed; the rest lies in
+    // volumes whose headers it has not read yet, and is located once it has.
+    NotYet,
+    // The bytes can never be addressed: the member is no run of the
+    // volumes' raw bytes, so only the normal order reaches them.
+    Never,
+}
+
 // What an object parsed of one of its volumes, which travels with the member
 // when the object gives it back: the next owner adopts it in place of
 // reading the member's headers again. Only an object of the same kind can
@@ -306,8 +320,10 @@ pub trait Object: Send + Sync {
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);
 
     // The forward map: where does this range of my member lie in my volumes?
-    // Empty when the member's layout is not known yet.
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>);
+    // The extents go into `out`; the answer says whether they are all of the
+    // range, the part placed so far, or whether the range can never be
+    // addressed.
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located;
 
     // The bytes posted for this range of my volume, rebuilt through the
     // inverse map: `read` hands back what one placement holds. An object

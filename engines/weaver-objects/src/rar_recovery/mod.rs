@@ -24,8 +24,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Namespace, Object, ObjectId,
-    Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, Located, MemberId, Namespace, Object,
+    ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
 };
 
 use self::header::{Header, RAR3_FOOTER, Read};
@@ -325,7 +325,9 @@ impl Object for RarRecovery {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None
