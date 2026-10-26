@@ -168,6 +168,9 @@ async fn async_main() {
     if let Command::Nzb { command } = command {
         std::process::exit(commands::nzb::run(command).await);
     }
+    if let Command::Torrent { command } = command {
+        std::process::exit(commands::torrent::run(command));
+    }
 
     let log_ring_buffer =
         weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();
@@ -534,6 +537,7 @@ async fn async_main() {
         }
         Command::Par2 { .. } => unreachable!("par2 command handled before config startup"),
         Command::Nzb { .. } => unreachable!("nzb command handled before logging starts"),
+        Command::Torrent { .. } => unreachable!("torrent command handled before logging starts"),
     }
 }
 

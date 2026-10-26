@@ -150,6 +150,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: NzbCommand,
     },
+
+    /// Torrent inspection, offline.
+    Torrent {
+        #[command(subcommand)]
+        command: TorrentCommand,
+    },
 }
 
 impl Command {
@@ -166,7 +172,7 @@ impl Command {
     pub(crate) fn opens_database(&self) -> bool {
         match self {
             Self::Download { .. } | Self::Serve { .. } => true,
-            Self::Par2 { .. } | Self::Nzb { .. } => false,
+            Self::Par2 { .. } | Self::Nzb { .. } | Self::Torrent { .. } => false,
         }
     }
 }
@@ -235,6 +241,22 @@ pub(crate) enum NzbCommand {
     },
 }
 
+#[derive(Subcommand, Clone)]
+pub(crate) enum TorrentCommand {
+    /// Print a report on a .torrent file or a magnet link that is safe to
+    /// paste in public: its shape, layout, trackers and red flags, with no
+    /// names, paths, comments, infohashes or tracker passkeys.
+    Analyze {
+        /// The .torrent file, or a magnet link.
+        #[arg(value_name = "TORRENT_OR_MAGNET")]
+        source: String,
+
+        /// Print the report as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 // Where `weaver nzb report` looks when neither --url nor WEAVER_URL says.
 pub(crate) const DEFAULT_REPORT_URL: &str = "http://127.0.0.1:9090";
 
@@ -248,7 +270,7 @@ mod tests {
 
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Command, DEFAULT_CONFIG_FILE, NzbCommand};
+    use super::{Cli, Command, DEFAULT_CONFIG_FILE, NzbCommand, TorrentCommand};
 
     #[test]
     fn skipping_upgrade_backup_requires_an_explicit_flag() {
@@ -287,6 +309,7 @@ mod tests {
         assert!(command(&["weaver", "serve"]).opens_database());
         assert!(command(&["weaver", "download", "fixture.nzb"]).opens_database());
         assert!(!command(&["weaver", "nzb", "analyze", "set.nzb"]).opens_database());
+        assert!(!command(&["weaver", "torrent", "analyze", "set.torrent"]).opens_database());
         assert!(!command(&["weaver", "par2", "verify", "set.par2"]).opens_database());
 
         let cli = Cli::parse_from(["weaver", "--require-upgrade-backup", "download", "a.nzb"]);
@@ -454,6 +477,26 @@ mod tests {
         assert_eq!(file, PathBuf::from("set.nzb.gz"));
         assert!(json);
         assert!(Cli::try_parse_from(["weaver", "nzb", "analyze"]).is_err());
+    }
+
+    #[test]
+    fn torrent_analyze_takes_a_file_or_a_magnet_and_an_optional_json_flag() {
+        let Some(Command::Torrent {
+            command: TorrentCommand::Analyze { source, json },
+        }) = Cli::parse_from([
+            "weaver",
+            "torrent",
+            "analyze",
+            "magnet:?xt=urn:btih:00",
+            "--json",
+        ])
+        .command
+        else {
+            panic!("expected torrent analyze");
+        };
+        assert_eq!(source, "magnet:?xt=urn:btih:00");
+        assert!(json);
+        assert!(Cli::try_parse_from(["weaver", "torrent", "analyze"]).is_err());
     }
 
     #[test]
