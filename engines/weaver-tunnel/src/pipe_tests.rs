@@ -1783,3 +1783,46 @@ async fn a_ladder_carries_the_datagrams_of_the_rung_a_dial_would_try() {
     ladder.report_rung(0, Some(&DialError::Egress(io::Error::other("path down"))));
     assert!(ladder.datagrams().is_none());
 }
+
+// A WireGuard hop whose tunnel has every socket slot taken.
+struct Full(proxy_tunnels::SlotFreed);
+#[async_trait::async_trait]
+impl Dialer for Full {
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        Err(DialError::hop(
+            1,
+            TunnelError::AtCapacity {
+                open: 256,
+                freed: self.0.clone(),
+            },
+        ))
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "full".into()
+    }
+}
+
+#[tokio::test]
+async fn a_full_tunnel_waits_for_room_without_cooling_its_rung() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut target = target(listener.local_addr().unwrap());
+    target.purpose = Purpose::Nntp { server: 1, leg: 0 };
+    let freed = proxy_tunnels::SlotFreed::default();
+
+    // The ladder goes on to the next rung and leaves the full one standing.
+    let ladder = Fallback::new(vec![Arc::new(Full(freed.clone())), bottom()]);
+    let dialed = ladder.dial(&target).await.unwrap();
+    assert_eq!(dialed.path.rung, Some(1));
+    assert_eq!(ladder.rung_states()[0], "STANDBY");
+
+    // With nowhere else to go, the dial waits on the tunnel freeing a slot.
+    let ladder = Fallback::new(vec![Arc::new(Full(freed.clone()))]);
+    let Err(DialError::AtCapacity(waits)) = ladder.dial(&target).await else {
+        panic!("a full tunnel is at capacity");
+    };
+    assert!(Arc::ptr_eq(&waits[0], &freed.notify()));
+    assert_eq!(ladder.rung_states(), ["STANDBY"]);
+}
