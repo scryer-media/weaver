@@ -117,7 +117,9 @@ pub struct EngineObject<F: Format> {
 }
 
 impl<F: Format> Durable for EngineObject<F> {
-    const VERSION: u16 = 2;
+    // 3: a directory is a member, numbered in the walk with the files, so the
+    // members recorded under an older run carry other ids.
+    const VERSION: u16 = 3;
 
     fn impossible(&self) -> Option<&'static str> {
         let known = self

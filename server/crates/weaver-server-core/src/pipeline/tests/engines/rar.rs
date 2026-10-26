@@ -1417,3 +1417,92 @@ async fn a_damaged_rar_store_under_par2_rules_and_delivers_without_an_idle_look(
     assert_eq!(outcomes, vec![Some(RepairOutcome::Repaired { slices: 1 })]);
     assert!(moved, "the delivery waited for an idle look");
 }
+
+// A one-volume stored RAR5 holding an empty directory beside a member.
+fn rar5_with_empty_directory(member: &[u8]) -> Vec<u8> {
+    use crate::pipeline::tests::{
+        TEST_RAR5_SIG, build_test_rar_directory_header, build_test_rar_end_header,
+        build_test_rar_file_header, build_test_rar_main_header,
+    };
+    let mut bytes = TEST_RAR5_SIG.to_vec();
+    bytes.extend(build_test_rar_main_header(0, None));
+    bytes.extend(build_test_rar_directory_header(
+        "hollow",
+        0o755,
+        1_600_000_000,
+    ));
+    bytes.extend(build_test_rar_file_header(
+        MEMBER,
+        0,
+        member.len() as u64,
+        member.len() as u64,
+        Some(par2_rs::checksum::crc32(member)),
+    ));
+    bytes.extend_from_slice(member);
+    bytes.extend(build_test_rar_end_header(false));
+    bytes
+}
+
+// A one-volume stored RAR4 holding an empty directory beside a member: a
+// file header whose dictionary bits are all set, with no data.
+fn rar4_with_empty_directory(member: &[u8]) -> Vec<u8> {
+    use crate::pipeline::tests::{
+        TEST_RAR4_SIG, build_test_rar4_block, build_test_rar4_end_header,
+        build_test_rar4_file_header,
+    };
+    const NAME: &str = "hollow";
+    let mut directory = Vec::new();
+    directory.extend(0u32.to_le_bytes());
+    directory.extend(0u32.to_le_bytes());
+    directory.push(3);
+    directory.extend(0u32.to_le_bytes());
+    directory.extend(0u32.to_le_bytes());
+    directory.push(20);
+    directory.push(0x30);
+    directory.extend((NAME.len() as u16).to_le_bytes());
+    directory.extend(0o040_755u32.to_le_bytes());
+    directory.extend(NAME.as_bytes());
+    let mut bytes = TEST_RAR4_SIG.to_vec();
+    // An archive header with no flags: one volume, not a set.
+    bytes.extend(build_test_rar4_block(0x73, 0, &[0; 6]));
+    bytes.extend(build_test_rar4_block(0x74, 0x8000 | 0x00e0, &directory));
+    bytes.extend(build_test_rar4_file_header(
+        MEMBER,
+        0,
+        member.len() as u32,
+        member.len() as u32,
+        par2_rs::checksum::crc32(member),
+    ));
+    bytes.extend_from_slice(member);
+    bytes.extend(build_test_rar4_end_header(false));
+    bytes
+}
+
+// The empty directory is delivered as a directory by both engines.
+#[tokio::test]
+async fn a_rar_holding_an_empty_directory_delivers_it_under_both_engines() {
+    let member = body();
+    for (format, bytes) in [
+        ("rar5", rar5_with_empty_directory(&member)),
+        ("rar4", rar4_with_empty_directory(&member)),
+    ] {
+        let scenario = Scenario::new(vec![Post::plain("lantern.rar", bytes)]);
+        let (classic, graph) = run_both(&scenario).await;
+        assert!(
+            classic.completed(),
+            "{format} classic: {:?}",
+            classic.failure
+        );
+        assert!(classic.files[&delivered(MEMBER)] == member, "{format}");
+        let hollow = [delivered("hollow/")];
+        assert_eq!(
+            (
+                classic.empty.iter().collect::<Vec<_>>(),
+                graph.empty.iter().collect::<Vec<_>>()
+            ),
+            (hollow.iter().collect(), hollow.iter().collect()),
+            "{format}: (classic, graph) empty directories"
+        );
+        assert_same(&classic, &graph);
+    }
+}

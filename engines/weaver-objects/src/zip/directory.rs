@@ -180,10 +180,7 @@ impl Zip {
         out: &mut Vec<Emit>,
     ) -> u64 {
         let directory = header.shape == Shape::Directory;
-        let mut name = header.name.clone();
-        if directory && !name.ends_with(['/', '\\']) {
-            name.push('/');
-        }
+        let name = records::member_name(header.name.clone(), header.shape);
         let length = if directory { 0 } else { header.length };
         out.push(Emit::Member {
             member,

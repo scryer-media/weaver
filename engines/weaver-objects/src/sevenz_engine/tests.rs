@@ -64,6 +64,8 @@ fn store_said() -> Vec<Said> {
         Said::Member(1, "deep/second.bin".into(), Some(64)),
         Said::Bytes(1, second()),
         Said::Closed(1),
+        Said::Member(2, "deep/".into(), Some(0)),
+        Said::Closed(2),
     ]
 }
 
@@ -258,6 +260,8 @@ fn an_lzma2_archive_extracts_its_members() {
             Said::Member(1, "second.bin".into(), Some(5_000)),
             Said::Bytes(1, second),
             Said::Closed(1),
+            Said::Member(2, "deep/".into(), Some(0)),
+            Said::Closed(2),
         ]
     );
 }
@@ -339,6 +343,8 @@ fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
             Said::Member(0, "notes.txt".into(), Some(NOTES.len() as u64)),
             Said::Bytes(0, NOTES.to_vec()),
             Said::Closed(0),
+            Said::Member(1, "deep/".into(), Some(0)),
+            Said::Closed(1),
         ]
     );
 }

@@ -133,11 +133,26 @@ impl Walk<'_, '_> {
                 len: archive.len(),
             }));
         };
-        // The namespace has no directories, and no links: a directory is
-        // implied by the paths of the members inside it, and a link is not a
-        // file body, so neither is a member and the files around them stand.
-        if info.is_directory || info.is_symlink || info.is_hardlink || info.is_file_copy {
+        // A link is not a file body, so it is no member and the files around
+        // it stand.
+        if info.is_symlink || info.is_hardlink || info.is_file_copy {
             return Ok(());
+        }
+        // A directory is a member with nothing in it, named with a trailing
+        // slash as the store names it.
+        if info.is_directory {
+            let mut name = unrar_rs::sanitize_path(&info.raw_name);
+            if !name.ends_with('/') {
+                name.push('/');
+            }
+            let member = MemberId(self.next);
+            self.next += 1;
+            self.say(Emit::Member {
+                member,
+                name,
+                length: Some(0),
+            })?;
+            return self.say(Emit::MemberClosed(member));
         }
         if info.is_encrypted && !has_password {
             return Err(Stop::Say(vec![Emit::NeedsPassword]));
