@@ -291,6 +291,36 @@ async fn a_run_takes_a_slot_and_the_next_queues_behind_the_limit() {
     assert!(!runs.live());
 }
 
+// A run stopped as the job goes down keeps the generation it ran under, so
+// no run starts on its node under that generation again: what its thread
+// says once stopped, its end included, is not heard as any run's. It gives
+// back its slot, and the job is not quiet, since it never finished reading.
+#[tokio::test]
+async fn a_stopped_run_keeps_its_generation_and_what_it_says_after_is_not_heard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), unbounded());
+    let (first, second) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(first, 1), vec![first]);
+    let shelf = envelopes.shelf(first);
+    runs.start(first, Box::new(Quiet), Arc::clone(&shelf));
+    let generation = runs.generation(first).expect("the run started");
+
+    runs.stop(1);
+    assert!(runs.has(first), "the stopped run stays");
+    assert_eq!(runs.generation(first), Some(generation));
+    assert_eq!(shelf.generation(), generation, "no step retracts it");
+    assert!(!runs.in_flight(), "nothing of it is awaited");
+    assert!(runs.live(), "it never finished reading");
+    assert_eq!(runs.ask(second, 1), vec![second], "its slot is free");
+
+    let said = mail.recv().await.unwrap();
+    assert_eq!((said.node, said.generation), (first, generation));
+    assert!(matches!(said.heard, Heard::Ended));
+    assert!(!runs.current(first, said.generation));
+}
+
 // Three runs hold the three slots and a fourth waits. The limit falls to
 // one: no holder is stopped, the first two to end admit no one, and the
 // third to end admits the waiter, so the job is never left holding fewer
