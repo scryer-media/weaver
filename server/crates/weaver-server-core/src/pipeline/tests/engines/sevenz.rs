@@ -854,3 +854,38 @@ async fn a_damaged_six_volume_lzma2_7z_under_five_par2_volumes_rules_and_deliver
  {
     damaged_split_rules_unprompted(6, ARTICLE as u64 / 4, 16, 5).await;
 }
+
+// An AES-stored 7z whose one file is larger than any a password is proved
+// against, offered a wrong candidate before the right one: the graph's store
+// opens the wrong one on trial, its checksum fails on verified bytes, the
+// folder's bytes come again and open under the right one, and the file is
+// delivered whole with nothing fetched twice.
+#[tokio::test]
+async fn a_large_aes_stored_7z_offered_a_wrong_password_first_delivers_under_graph() {
+    let file = payload(4 * 1024 * 1024 + 1, 61);
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![
+        AesEncoderOptions::new(Password::new(SECRET))
+            .with_num_cycles_power(4)
+            .into(),
+        EncoderConfiguration::new(EncoderMethod::COPY),
+    ]);
+    let mut entry = ArchiveEntry::new_file("lantern.bin");
+    entry.size = file.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(Cursor::new(file.clone())))
+        .unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)])
+        .framed(256 << 10)
+        .global_password("not-the-secret")
+        .global_password(SECRET);
+    let graph = run(&scenario, Engine::Graph).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered("lantern.bin")]
+    );
+    assert!(graph.files[&delivered("lantern.bin")] == file, "bytes");
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
