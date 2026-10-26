@@ -189,6 +189,21 @@ pub struct SevenZipStore {
     // The candidate that opened the header or the folders.
     #[serde(skip)]
     opened: Option<usize>,
+    // Whether a proof file proved it. A candidate opened unproven is on
+    // trial: a checksum it fails on verified bytes condemns it. Not kept: a
+    // restart offers the candidate again and admits it unproven, and a
+    // candidate it condemns then costs one more reading of its bytes.
+    #[serde(skip)]
+    proven: bool,
+    // A checksum failed on verified bytes under the candidate on trial.
+    #[serde(skip)]
+    wrong_key: bool,
+    // Open folders keyed by a condemned candidate, until their bytes are
+    // said again; then, until the next look, folders to lock again.
+    #[serde(skip)]
+    condemned: BTreeSet<usize>,
+    #[serde(skip)]
+    relock: BTreeSet<usize>,
     proof: Option<open::Proof>,
     asked: bool,
     // Container ranges wanted ahead of the normal order.
@@ -268,6 +283,10 @@ impl SevenZipStore {
             grid: Grid::default(),
             candidates: Vec::new(),
             opened: None,
+            proven: false,
+            wrong_key: false,
+            condemned: BTreeSet::new(),
+            relock: BTreeSet::new(),
             proof: None,
             asked: false,
             bids: Vec::new(),
@@ -401,6 +420,9 @@ impl SevenZipStore {
         self.check_recovery(start, out);
         if self.map.is_none() {
             self.read_header(start, out);
+        }
+        for folder in std::mem::take(&mut self.relock) {
+            self.folders[folder] = Lock::Locked;
         }
         if self.map.is_some() && !self.gone {
             self.open_folders(out);
@@ -592,6 +614,8 @@ impl SevenZipStore {
         self.members = Arc::default();
         self.grid = Grid::default();
         self.proof = None;
+        self.condemned.clear();
+        self.relock.clear();
     }
 }
 
@@ -631,6 +655,9 @@ impl Object for SevenZipStore {
             }
         }
         self.route(range, bytes, delivery.provenance, read, out);
+        if std::mem::take(&mut self.wrong_key) {
+            self.condemn(out);
+        }
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {

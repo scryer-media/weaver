@@ -256,6 +256,14 @@ pub enum Emit {
         envelope: u32,
         at: u64,
     },
+    // "Give me the bytes of my volume at `range` again, as they were
+    // posted": what I said of them was read under a key I now know is
+    // wrong. Every member they reached is open again, and what of the range
+    // was posted comes again with the provenance it came with.
+    Again {
+        volume: VolumeIndex,
+        range: ByteRange,
+    },
     // "My volume is bad at this range": a header checksum failed.
     Damaged {
         volume: VolumeIndex,

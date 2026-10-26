@@ -35,6 +35,8 @@ pub(super) struct Owner {
     pub pull: Pull,
     // Held pieces, with the bytes they arrived with.
     held: Vec<(VolumeIndex, ByteRange, Provenance, Vec<u8>)>,
+    // What each volume was delivered, by provenance, as its member keeps it.
+    delivered: BTreeMap<u32, Coverage>,
     bound: Vec<bool>,
     next: u32,
 }
@@ -50,6 +52,7 @@ impl Owner {
             seeks: Vec::new(),
             pull: Pull::Moved(1),
             held: Vec::new(),
+            delivered: BTreeMap::new(),
             bound: vec![false; count],
             next: 0,
         };
@@ -117,6 +120,10 @@ impl Owner {
         }
         let real = &self.volumes[volume.0 as usize].1[range.start as usize..range.end as usize];
         let bytes = bytes.unwrap_or(real).to_vec();
+        self.delivered
+            .entry(volume.0)
+            .or_default()
+            .write(range, provenance);
         let mut out = Vec::new();
         let members = &self.members;
         let mut read =
@@ -250,8 +257,13 @@ impl Owner {
     }
 
     fn apply(&mut self, out: Vec<Emit>) {
+        let mut again = Vec::new();
         for emit in out {
             match emit {
+                Emit::Again { volume, range } => {
+                    self.said.push(Emit::Again { volume, range });
+                    again.push((volume, range));
+                }
                 Emit::Member {
                     member,
                     name,
@@ -295,6 +307,51 @@ impl Owner {
                 }
                 other => self.said.push(other),
             }
+        }
+        for (volume, range) in again {
+            self.again(volume, range);
+        }
+    }
+
+    // A range asked for again, as the tree answers it: what of it was
+    // delivered is read back as the store rebuilds it, every member it
+    // reached is open again, and the bytes come again as they came.
+    fn again(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let runs: Vec<(ByteRange, Provenance)> = self
+            .delivered
+            .get(&volume.0)
+            .map(|coverage| {
+                coverage
+                    .overlapping(range)
+                    .filter_map(|run| Some((run.range.intersect(range)?, run.provenance)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut read_back = Vec::new();
+        for (piece, provenance) in runs {
+            let members = &self.members;
+            let mut read =
+                |placement: &Placement, into: &mut Vec<u8>| read_member(members, placement, into);
+            let mut bytes = Vec::new();
+            if self.object.posted(volume, piece, &mut read, &mut bytes) {
+                read_back.push((piece, provenance, bytes));
+            }
+        }
+        for (piece, _, _) in &read_back {
+            let mut placements = Vec::new();
+            self.object.locate(volume, *piece, &mut placements);
+            for placement in placements {
+                if let Placement::Member { member, range } = placement
+                    && let Some(got) = self.members.get_mut(&member.0)
+                {
+                    got.coverage.erase(range);
+                    got.closed = false;
+                }
+            }
+            self.object.unposted(volume, *piece);
+        }
+        for (piece, provenance, bytes) in read_back {
+            self.push(volume, piece, provenance, Some(&bytes));
         }
     }
 

@@ -680,3 +680,84 @@ fn a_repaired_cipher_stretch_gives_the_members_whole() {
     }
     assert!(failed.is_empty(), "{failed:?}");
 }
+
+// One file past the largest a password is proved against: the store has
+// nothing to prove a candidate by, so the first one left opens on trial.
+fn unprovable() -> (Vec<u8>, Vec<u8>) {
+    let file = payload(51, (super::open::PROOF_CAP + 1) as usize);
+    let bytes = write(aes(), false, &[(None, Entry::File("large.bin", &file))]);
+    (bytes, file)
+}
+
+fn condemned(owner: &Owner) -> usize {
+    owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Again { .. }))
+        .count()
+}
+
+// Verified bytes that fail their checksum under a candidate nothing proved
+// condemn it: its folder's bytes come again and open under the next one.
+#[test]
+fn a_wrong_unproven_candidate_on_verified_bytes_gives_way_to_the_next() {
+    let (bytes, file) = unprovable();
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.offer("not-the-passphrase");
+    owner.offer(PASSWORD);
+    owner.frames(0, 256 << 10);
+    owner.close(0);
+    no_trouble(&owner);
+    assert_eq!(condemned(&owner), 1);
+    let got = owner.member("large.bin");
+    assert!(got.closed);
+    assert_eq!(got.bytes, file);
+    assert!(got.coverage.verified(ByteRange::new(0, file.len() as u64)));
+    assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
+}
+
+// The same failure on bytes not verified is damage: nothing is condemned
+// until a repair verifies them, and then the next candidate opens them.
+#[test]
+fn a_wrong_unproven_candidate_on_unverified_bytes_is_damage_until_repaired() {
+    let (bytes, file) = unprovable();
+    let length = bytes.len() as u64;
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.offer("not-the-passphrase");
+    owner.offer(PASSWORD);
+    let frame = 256 << 10;
+    for start in (0..length).step_by(frame) {
+        let range = ByteRange::new(start, (start + frame as u64).min(length));
+        owner.deliver_as(0, range, Provenance::Damaged, None);
+    }
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Damaged { .. }))
+    );
+    assert_eq!(condemned(&owner), 0);
+    owner.deliver_as(0, ByteRange::new(0, length), Provenance::Repaired, None);
+    owner.close(0);
+    assert_eq!(condemned(&owner), 1);
+    let got = owner.member("large.bin");
+    assert!(got.closed);
+    assert_eq!(got.bytes, file);
+    assert!(got.coverage.verified(ByteRange::new(0, file.len() as u64)));
+}
+
+// Every candidate condemned leaves the store asking, and quiet refuses it
+// as one that needs a password.
+#[test]
+fn every_unproven_candidate_wrong_needs_a_password() {
+    let (bytes, _) = unprovable();
+    let mut owner = Owner::single(store(), bytes);
+    owner.offer("not-the-passphrase");
+    owner.offer("nor-this-one");
+    owner.frames(0, 256 << 10);
+    owner.close(0);
+    assert_eq!(condemned(&owner), 2);
+    assert!(has(&owner, &Emit::NeedsPassword));
+    owner.quiet();
+    assert!(has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
+}

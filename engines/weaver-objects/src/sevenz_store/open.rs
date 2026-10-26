@@ -7,8 +7,12 @@
 // one with a checksum, so the proof costs the fewest bytes; its cipher
 // blocks are kept, with the block before them as their seed, until a
 // candidate deciphers them into the checksum the header wrote. With no such
-// file the first candidate is admitted unproven, and a checksum that fails
-// later is damage like any other.
+// file the first candidate left is admitted unproven, on trial: a file whose
+// checksum fails on bytes the tree verified condemns it, every folder it
+// keyed asks for its bytes again, and they open under the next candidate as
+// they come back. A checksum that fails on bytes not verified is damage, as
+// under a proved candidate: repair runs first, and the trial goes on over
+// the repaired bytes. Every candidate condemned leaves the store asking.
 
 use std::sync::Arc;
 
@@ -25,7 +29,7 @@ use crate::keys::{Derived, Tuple};
 
 // The largest file a password is proved against. Its cipher bytes are kept
 // until a candidate is proved, on top of whatever the owner holds.
-const PROOF_CAP: u64 = 4 * 1024 * 1024;
+pub(super) const PROOF_CAP: u64 = 4 * 1024 * 1024;
 
 const FOLDER_TAG: &str = "7z-aes";
 const HEADER_TAG: &str = "7z-header";
@@ -123,6 +127,7 @@ impl SevenZipStore {
                 }
                 header::Parsed::Archive { archive, read } => {
                     self.opened = Some(index);
+                    self.proven = true;
                     return self.build(&archive, &read, out);
                 }
             }
@@ -155,8 +160,9 @@ impl SevenZipStore {
             }
             match self.prove(index) {
                 Verdict::Waiting => return,
-                Verdict::Right | Verdict::Unproven => {
+                verdict @ (Verdict::Right | Verdict::Unproven) => {
                     self.opened = Some(index);
+                    self.proven = matches!(verdict, Verdict::Right);
                     return self.open_all(index, out);
                 }
                 Verdict::Wrong => self.candidates[index].folder_wrong = true,
@@ -164,6 +170,38 @@ impl SevenZipStore {
             }
         }
         self.ask(out);
+    }
+
+    // Whether the folders are open under a candidate nothing proved.
+    pub(super) fn on_trial(&self) -> bool {
+        self.opened.is_some() && !self.proven
+    }
+
+    // The candidate on trial is wrong: the next one is tried on the same
+    // bytes, which every folder it opened asks for again. The folders stay
+    // as they are until those bytes are said again, so what was posted reads
+    // back as it was posted.
+    pub(super) fn condemn(&mut self, out: &mut Vec<Emit>) {
+        let Some(index) = self.opened.take() else {
+            return;
+        };
+        self.candidates[index].folder_wrong = true;
+        let Some(map) = self.map.clone() else {
+            return;
+        };
+        let mut pieces = Vec::new();
+        for (at, folder) in map.folders.iter().enumerate() {
+            if !matches!(self.folders[at], Lock::Open(..)) {
+                continue;
+            }
+            self.condemned.insert(at);
+            self.to_volumes(folder.pack, &mut pieces);
+        }
+        out.extend(
+            pieces
+                .into_iter()
+                .map(|(volume, range)| Emit::Again { volume, range }),
+        );
     }
 
     fn folder_tuple<'a>(
