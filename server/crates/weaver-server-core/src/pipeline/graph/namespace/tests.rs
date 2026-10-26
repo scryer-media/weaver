@@ -552,7 +552,9 @@ impl Job {
         due: &[NodeId],
     ) -> Vec<(NodeId, RepairOutcome)> {
         let mut lent = Inline::default();
-        self.writer.repair(&mut self.tree, node, due, &mut lent);
+        self.writer
+            .repair(&mut self.tree, node, due, &mut lent)
+            .expect("lent");
         self.run_lent(build, lent)
     }
 }

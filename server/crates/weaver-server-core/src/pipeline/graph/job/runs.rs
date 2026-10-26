@@ -73,7 +73,7 @@ impl GraphJob {
         limit: usize,
     ) -> Result<(), GraphError> {
         if !self.loans.returned(set, serial) {
-            return Ok(());
+            return Ok(returned.repaired.remove().map_err(WriteError::from)?);
         }
         let mut out = Vec::new();
         self.writer.returned(

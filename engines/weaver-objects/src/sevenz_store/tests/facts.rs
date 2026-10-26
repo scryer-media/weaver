@@ -70,3 +70,40 @@ fn an_encrypted_7z_restored_mid_folder_opens_again_and_its_facts_hold_no_key() {
     assert!(!contains(&facts.bytes, key.as_bytes()));
     assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
 }
+
+// Opened under a password its proof file proved, then restored: the
+// password offered anew stands proved, so a file whose checksum fails on
+// verified bytes after the restart is damage, as it is to the live store,
+// and nothing is asked for again.
+#[test]
+fn a_proved_password_stays_proved_across_a_restore() {
+    let mut bytes = archive(aes(), false);
+    // A byte of the first file, which the proof file is not.
+    bytes[6500] ^= 0x5a;
+    let volumes = vec![("alpha.7z".to_owned(), bytes)];
+    let mut steps = steps(&volumes, 1000);
+    steps[3..].rotate_right(2);
+    steps.insert(5, Step::Password(PASSWORD));
+    let cut = steps.len() / 2;
+    let damaged = steps
+        .iter()
+        .position(|step| matches!(step, Step::Bytes(0, 6000, _)))
+        .expect("the frame with the bad byte");
+    assert!(damaged >= cut, "the bad byte arrives after the restart");
+    let (facts, _, restored) =
+        restores_alike(Box::new(store()), &steps, cut, &[Step::Password(PASSWORD)]);
+    let kept: SevenZipStore = facts.read(Kind::SevenZipStore).expect("decodes");
+    assert!(kept.proven);
+    let after: SevenZipStore = restored.facts().read(Kind::SevenZipStore).expect("decodes");
+    assert!(after.proven);
+    assert!(
+        after.members.iter().any(|said| said.damaged),
+        "the failure is damage"
+    );
+    assert!(
+        after
+            .folders
+            .iter()
+            .all(|lock| matches!(lock, Lock::Open(..) | Lock::Sealed(..)))
+    );
+}

@@ -4,7 +4,9 @@
 mod facts;
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ByteRange, Delivery, MemberId, Object, ObjectId, Provenance, Recovery, Seek};
+use weaver_graph::{
+    ByteRange, Delivery, MemberId, Object, ObjectId, Provenance, Recovery, Seek, VolumeIndex,
+};
 
 use super::Par3;
 use crate::testing::{Job, par3_set, payload};
@@ -362,4 +364,148 @@ fn a_hidden_member_still_arriving_holds_the_set_without_asking_for_recovery() {
     let (outcome, renamed) = identify(&mut job);
     assert_eq!(outcome, RepairOutcome::Clean);
     assert_eq!(renamed, vec![hidden]);
+}
+
+// Where each matrix packet lies in a volume: its type is the last eight
+// bytes of its 48-byte header, and its length sits 24 bytes in.
+fn matrix_packets(volume: &[u8]) -> Vec<ByteRange> {
+    volume
+        .windows(8)
+        .enumerate()
+        .filter(|(_, window)| *window == b"PAR CAU\x00")
+        .map(|(found, _)| {
+            let start = found - 40;
+            let length = u64::from_le_bytes(volume[start + 24..start + 32].try_into().unwrap());
+            ByteRange::at(start as u64, length)
+        })
+        .collect()
+}
+
+// Deliver the volume's bytes outside `holes`, which are ascending.
+fn deliver_around(job: &mut Job<Par3>, volume: VolumeIndex, bytes: &[u8], holes: &[ByteRange]) {
+    let mut at = 0;
+    let mut spans = Vec::new();
+    for hole in holes {
+        spans.push(ByteRange::new(at, hole.start));
+        at = hole.end;
+    }
+    spans.push(ByteRange::new(at, bytes.len() as u64));
+    for span in spans.into_iter().filter(|span| !span.is_empty()) {
+        deliver(job, volume, bytes, span);
+    }
+}
+
+fn deliver(job: &mut Job<Par3>, volume: VolumeIndex, bytes: &[u8], range: ByteRange) {
+    job.object.deliver(
+        Delivery {
+            volume,
+            offset: range.start,
+            bytes: &bytes[range.start as usize..range.end as usize],
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+}
+
+// Every volume repeats the matrix packet. The copies are one packet, so the
+// set has one matrix, and the blocks of every volume are computed with it:
+// all of them are spent.
+#[test]
+fn a_matrix_packet_repeated_across_volumes_is_one_matrix_and_every_block_is_usable() {
+    let one = payload(51, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+    let carrying = files
+        .iter()
+        .filter(|(_, bytes)| !matrix_packets(bytes).is_empty())
+        .count();
+    assert!(carrying >= 2, "{carrying} volumes carry the matrix");
+    let mut packets = Vec::new();
+    for (_, bytes) in &files {
+        super::scan(bytes, &mut packets);
+    }
+    let sets = super::sets(packets);
+    assert_eq!(sets.len(), 1);
+    assert_eq!(sets[0].matrix_packets().len(), 1);
+    let mut job = job(&files);
+    let mut wrong = one.clone();
+    for at in [100, 3000, 7000] {
+        wrong[at] ^= 0x42;
+    }
+    let member = job.member("one.bin", &wrong);
+    bind(&mut job);
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 3 }
+    );
+    assert_eq!(reachable(&job.object), 3);
+    assert!(job.store.members[&member] == one);
+}
+
+// The recovery blocks are in while every copy of the matrix they were
+// computed with is still to come: the set waits for it, and rules only once
+// it arrives, or once every copy is lost.
+#[test]
+fn recovery_blocks_ahead_of_their_matrix_wait_until_it_arrives_or_is_lost() {
+    let one = payload(52, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+    let mut wrong = one.clone();
+    wrong[5000] ^= 0x42;
+    let start = |job: &mut Job<Par3>| {
+        let volumes: Vec<(VolumeIndex, Vec<ByteRange>)> = files
+            .iter()
+            .map(|(name, bytes)| {
+                let volume = job.name(name, bytes);
+                let holes = matrix_packets(bytes);
+                deliver_around(job, volume, bytes, &holes);
+                (volume, holes)
+            })
+            .collect();
+        let member = job.member("one.bin", &wrong);
+        bind(job);
+        (volumes, member)
+    };
+
+    let mut job = job(&[]);
+    let (volumes, member) = start(&mut job);
+    let sets = job.object.front_sets();
+    assert!(sets[0].matrix_packets().is_empty() && !sets[0].recovery_blocks().is_empty());
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    // Every volume but the last closes over its lost copy; the last copy
+    // is still to come.
+    let (last, before) = volumes.split_last().unwrap();
+    for (volume, holes) in before {
+        for hole in holes {
+            job.object.volume_lost(*volume, *hole, &mut Vec::new());
+        }
+        job.object.volume_closed(*volume, &mut Vec::new());
+    }
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    let (volume, holes) = last;
+    let bytes = &files.last().unwrap().1;
+    for hole in holes {
+        deliver(&mut job, *volume, bytes, *hole);
+    }
+    job.object.volume_closed(*volume, &mut Vec::new());
+    assert_eq!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&member] == one);
+
+    let mut job = self::job(&[]);
+    let (volumes, _) = start(&mut job);
+    for (volume, holes) in &volumes {
+        for hole in holes {
+            job.object.volume_lost(*volume, *hole, &mut Vec::new());
+        }
+        job.object.volume_closed(*volume, &mut Vec::new());
+    }
+    assert!(matches!(
+        job.object.repair(&mut job.store),
+        RepairOutcome::Impossible {
+            damaged: 1,
+            reachable: 0
+        }
+    ));
 }
