@@ -158,8 +158,9 @@ struct Candidate {
 
 // Its facts are all of it but what keys it: no password, no candidate and
 // no key. The owner offers the winning password again, and the folders open
-// from the AES properties in the map. Bids are not kept either; a restart
-// makes them again.
+// from the AES properties in the map; whether it had proved itself is kept,
+// so it is proved still. Bids are not kept either; a restart makes them
+// again.
 #[derive(Serialize, Deserialize)]
 pub struct SevenZipStore {
     #[serde(skip, default = "Keys::global")]
@@ -189,11 +190,10 @@ pub struct SevenZipStore {
     // The candidate that opened the header or the folders.
     #[serde(skip)]
     opened: Option<usize>,
-    // Whether a proof file proved it. A candidate opened unproven is on
-    // trial: a checksum it fails on verified bytes condemns it. Not kept: a
-    // restart offers the candidate again and admits it unproven, and a
-    // candidate it condemns then costs one more reading of its bytes.
-    #[serde(skip)]
+    // Whether the header or a proof file proved it. A candidate opened
+    // unproven is on trial: a checksum it fails on verified bytes condemns
+    // it. Kept: the candidate a restart offers again is the one that proved
+    // itself, and a checksum it fails after is damage, as before.
     proven: bool,
     // A checksum failed on verified bytes under the candidate on trial.
     #[serde(skip)]
@@ -221,7 +221,8 @@ impl Durable for SevenZipStore {
     // 3: the grid shelved by chunk of blocks, kept apart from the bytes.
     // 4: a sealed value encodes as nothing, numbered by its owner's walk.
     // 5: the container's length as the first piece's front states it.
-    const VERSION: u16 = 5;
+    // 6: whether the candidate that opened it had proved itself.
+    const VERSION: u16 = 6;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)

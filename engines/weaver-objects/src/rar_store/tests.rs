@@ -10,7 +10,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use weaver_graph::{ByteRange, Emit, Object, Provenance, RecoveryKind, VolumeIndex, Weight, Why};
+use weaver_graph::{
+    ByteRange, Emit, Object, Placement, Provenance, RecoveryKind, VolumeIndex, Weight, Why,
+};
 
 use super::RarStore;
 use crate::keys::{CAPACITY, Keys};
@@ -545,6 +547,69 @@ fn a_wrong_rar4_key_on_verified_bytes_is_condemned_and_the_right_one_opens_the_s
     assert!(owner.members.values().all(|got| !got.closed));
     owner.offer(PASSWORD);
     owner.close(0);
+    owner
+        .said
+        .retain(|emit| !matches!(emit, Emit::NeedsPassword | Emit::Again { .. }));
+    no_trouble(&owner);
+    streamed(&owner);
+    posted_whole(&owner);
+}
+
+// The same failure on bytes not verified is damage: nothing is condemned
+// while the files' bytes stand as they came, and once a repair verifies
+// them and they fail again, the candidate is condemned and the next opens
+// them. Only file data comes damaged; where it lies is what the store
+// places at members once it has walked the volume.
+#[test]
+fn a_wrong_rar4_key_on_unverified_bytes_is_damage_until_repaired() {
+    let volumes = write(&items(), &encrypted(Version::Rar4, false));
+    let length = volumes[0].len() as u64;
+    let whole = ByteRange::new(0, length);
+    let mut walked = Owner::named(store(), volumes.clone());
+    walked.offer(PASSWORD);
+    walked.deliver(0, whole);
+    let mut placements = Vec::new();
+    walked.object.locate(VolumeIndex(0), whole, &mut placements);
+    let mut at = 0;
+    let mut data = Vec::new();
+    for placement in &placements {
+        let range = ByteRange::at(at, placement.len());
+        data.push((range, matches!(placement, Placement::Member { .. })));
+        at = range.end;
+    }
+    assert!(data.iter().filter(|(_, member)| *member).count() >= files().len());
+
+    let mut owner = Owner::named(store(), volumes);
+    owner.offer("not-the-passphrase");
+    owner.offer(PASSWORD);
+    for (range, member) in &data {
+        let provenance = match member {
+            true => Provenance::Damaged,
+            false => Provenance::Fresh,
+        };
+        owner.deliver_as(0, *range, provenance, None);
+    }
+    let asked_again = |owner: &Owner| {
+        owner
+            .said
+            .iter()
+            .filter(|emit| matches!(emit, Emit::Again { .. }))
+            .count()
+    };
+    assert_eq!(asked_again(&owner), 0, "{:?}", owner.said);
+    assert_eq!(owner.members.len(), files().len());
+    assert!(owner.members.values().all(|got| {
+        got.coverage
+            .runs()
+            .all(|run| run.provenance == Provenance::Damaged)
+    }));
+    for (range, member) in &data {
+        if *member {
+            owner.deliver_as(0, *range, Provenance::Repaired, None);
+        }
+    }
+    owner.close(0);
+    assert_eq!(asked_again(&owner), files().len(), "one part of each file");
     owner
         .said
         .retain(|emit| !matches!(emit, Emit::NeedsPassword | Emit::Again { .. }));

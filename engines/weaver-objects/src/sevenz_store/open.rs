@@ -246,7 +246,13 @@ impl SevenZipStore {
         Ok(Some(key))
     }
 
+    // A store that proved a candidate before a restart is offered that one
+    // again, and it stands proved: the proof's bytes are gone to their
+    // members, and nothing else would prove it.
     fn prove(&self, index: usize) -> Verdict {
+        if self.proven {
+            return Verdict::Right;
+        }
         let Some(proof) = self.proof else {
             return Verdict::Unproven;
         };

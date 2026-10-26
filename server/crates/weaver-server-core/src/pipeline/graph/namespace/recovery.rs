@@ -229,8 +229,7 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         self.announce_absent(tree, builder, segments, (node, reading), out)?;
         let due = self.due(tree, node, reading(node));
-        self.repair(tree, node, &due, lender);
-        Ok(())
+        self.repair(tree, node, &due, lender)
     }
 
     // Ranges of `node`'s volumes that will never arrive. The tree marks them
@@ -397,15 +396,16 @@ impl NamespaceWriter {
         node: NodeId,
         due: &[NodeId],
         lender: &mut dyn Lender,
-    ) {
+    ) -> Result<(), WriteError> {
         for &set in due {
             if !lender.admit() {
-                return;
+                break;
             }
-            if let Some(loan) = self.lend(tree, node, set) {
+            if let Some(loan) = self.lend(tree, node, set)? {
                 lender.lend(loan);
             }
         }
+        Ok(())
     }
 
     // A lent repair came back. The object takes its node again and hears
@@ -414,8 +414,9 @@ impl NamespaceWriter {
     // object is rebuilt as it left, from the facts its node kept and its
     // volumes' files, and the set is due again. Otherwise what it came to
     // is applied: the ranges it repaired come back through the one write
-    // path as repaired bytes, so a leaf is overwritten and a bound member's
-    // object takes them as any delivery. A member whose bytes it rewrote or
+    // path as repaired bytes, read from the repair's output a slice at a
+    // time, so a leaf is overwritten and a bound member's object takes them
+    // as any delivery. A member whose bytes it rewrote or
     // proved is offered again once applied, so whatever refused it on the
     // bytes it held before reads it as it is now. An object that keeps no
     // facts cannot be rebuilt as it left, so its ruling is applied as it
@@ -426,12 +427,19 @@ impl NamespaceWriter {
         builder: &mut dyn Builder,
         segments: &dyn Segments,
         restore: &dyn Restore,
-        returned: Returned,
+        mut returned: Returned,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // A repair whose output refused a write failed with it, and nothing
+        // it came to is applied. The refusal is the error, whatever removing
+        // the output then says.
+        if let Some(error) = returned.repaired.failed() {
+            let _ = returned.repaired.remove();
+            return Err(error.into());
+        }
         // A set retracted while it was out has nowhere to rule.
         if !tree.lent(returned.set) {
-            return Ok(());
+            return Ok(returned.repaired.remove()?);
         }
         let rebuilt = if self.moved_since(&returned) {
             tree.lent_facts(returned.set)
@@ -463,13 +471,14 @@ impl NamespaceWriter {
             for (parent, member) in volumes {
                 self.replay_file(tree, builder, segments, parent, member, out)?;
             }
-            return Ok(());
+            return Ok(repaired.remove()?);
         }
         tree.take_back(set, object, &mut self.placing(builder), &mut effects);
         self.apply_all(tree, builder, segments, effects, out)?;
         self.read_backs += reads;
         let mut rewritten = std::collections::BTreeSet::new();
-        for (member, offset, bytes) in repaired {
+        for (member, offset, bytes) in repaired.slices() {
+            let bytes = bytes?;
             rewritten.insert(member);
             let arrival = Arrival {
                 node,
@@ -480,6 +489,7 @@ impl NamespaceWriter {
             };
             self.arrive(tree, builder, segments, arrival, out)?;
         }
+        repaired.remove()?;
         for (member, range) in found {
             let marked = (node, member, range, Provenance::Damaged);
             self.redeliver(tree, builder, segments, marked, out)?;

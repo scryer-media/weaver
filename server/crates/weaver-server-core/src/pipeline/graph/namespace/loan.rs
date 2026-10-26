@@ -10,7 +10,8 @@
 // changes after the loan reaches it, and what the loop moved that it read is
 // known on its return: a shelf whose generation moved, or a file no longer
 // where it was. The repaired ranges, the ranges found bad and the object come
-// back together, and the namespace applies them as one repair.
+// back together, and the namespace applies them as one repair. What the
+// repair rebuilt waits on disk until then, never in memory.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,8 +27,10 @@ use weaver_graph::{
 };
 
 use super::super::envelope::Shelf;
-use super::super::leaf::read_exact_at;
-use super::{ALL, NamespaceWriter, SetState, Source, held_volume, index, read_member, read_pieces};
+use super::super::leaf::{Leaf, LeafError, read_exact_at};
+use super::{
+    ALL, NamespaceWriter, READ_BACK, SetState, Source, held_volume, index, read_member, read_pieces,
+};
 
 // A set's repair, ready to run anywhere.
 pub(crate) struct Loan {
@@ -47,7 +50,7 @@ pub(crate) struct Returned {
     pub(crate) object: Box<dyn Object>,
     pub(crate) outcome: Option<RepairOutcome>,
     pub(crate) reads: u64,
-    pub(crate) repaired: Vec<(MemberId, u64, Bytes)>,
+    pub(crate) repaired: Repaired,
     // Ranges the object proved bad and could not rebuild.
     pub(crate) found: Vec<(MemberId, ByteRange)>,
     read: Read,
@@ -60,7 +63,7 @@ impl std::fmt::Debug for Returned {
             .field("namespace", &self.namespace)
             .field("outcome", &self.outcome)
             .field("reads", &self.reads)
-            .field("repaired", &self.repaired.len())
+            .field("repaired", &self.repaired.runs.len())
             .field("found", &self.found)
             .finish_non_exhaustive()
     }
@@ -131,15 +134,103 @@ struct Lent {
     // slice.
     open: RefCell<Option<((NodeId, MemberId), File)>>,
     reads: u64,
-    repaired: Vec<(MemberId, u64, Bytes)>,
+    repaired: Repaired,
     found: Vec<(MemberId, ByteRange)>,
     scratch: Option<PathBuf>,
+}
+
+// What a repair rewrote: runs of members in the order written, each one's
+// bytes on the repair's output file, so a repair never holds what it
+// rebuilt in memory however much that is. The file lies beside the
+// repair's scratch directory, whose names are the object's own, and goes
+// once the namespace has applied the runs, or turned them away. A write
+// the file refuses fails the repair: nothing it rebuilt is applied.
+pub(crate) struct Repaired {
+    // The member, where in it the run goes, and where on the output it is.
+    runs: Vec<(MemberId, u64, ByteRange)>,
+    output: Leaf,
+    // How far the output file reaches: the next run is written there.
+    written: u64,
+    // The first write the output refused. Nothing is written after it.
+    failed: Option<LeafError>,
+}
+
+impl Repaired {
+    fn new(
+        working_dir: &std::path::Path,
+        namespace: NodeId,
+        set: NodeId,
+    ) -> Result<Self, LeafError> {
+        let name = format!(
+            "{}/graph-recovery-{}-{}.repaired",
+            weaver_graph::names::INTERNAL_DIR,
+            namespace.0,
+            set.0
+        );
+        Ok(Self {
+            runs: Vec::new(),
+            output: Leaf::at(working_dir, &name)?,
+            written: 0,
+            failed: None,
+        })
+    }
+
+    fn write(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+        if self.failed.is_some() {
+            return;
+        }
+        let at = ByteRange {
+            start: self.written,
+            end: self.written + bytes.len() as u64,
+        };
+        match self.output.write(at.start, bytes, None) {
+            Ok(()) => {
+                self.written = at.end;
+                self.runs.push((member, offset, at));
+            }
+            Err(error) => self.failed = Some(error),
+        }
+    }
+
+    // The write the output refused, if one did: the repair failed with it.
+    pub(crate) fn failed(&mut self) -> Option<LeafError> {
+        self.failed.take()
+    }
+
+    // Every run in the order written, a slice at a time, so no more than a
+    // slice of it is in memory at once.
+    pub(crate) fn slices(
+        &self,
+    ) -> impl Iterator<Item = (MemberId, u64, Result<Bytes, LeafError>)> + '_ {
+        self.runs.iter().flat_map(move |(member, offset, at)| {
+            (0..at.len().div_ceil(READ_BACK)).map(move |slice| {
+                let from = slice * READ_BACK;
+                let to = at.len().min(from + READ_BACK);
+                let mut bytes = Vec::new();
+                let read = self
+                    .output
+                    .read(at.start + from, index(to - from), &mut bytes)
+                    .map(|()| Bytes::from(bytes));
+                (*member, offset + from, read)
+            })
+        })
+    }
+
+    // The output goes with the runs.
+    pub(crate) fn remove(self) -> Result<(), LeafError> {
+        self.output.remove()
+    }
 }
 
 impl NamespaceWriter {
     // Lend the set's object out of the tree with everything its repair
     // reads. `None` when the node holds no recovery object.
-    pub(crate) fn lend(&self, tree: &mut Tree, namespace: NodeId, set: NodeId) -> Option<Loan> {
+    pub(crate) fn lend(
+        &self,
+        tree: &mut Tree,
+        namespace: NodeId,
+        set: NodeId,
+    ) -> Result<Option<Loan>, LeafError> {
         let mut access = Lent {
             namespace,
             set,
@@ -151,7 +242,7 @@ impl NamespaceWriter {
             window: tree.window(set),
             open: RefCell::new(None),
             reads: 0,
-            repaired: Vec::new(),
+            repaired: Repaired::new(&self.working_dir, namespace, set)?,
             found: Vec::new(),
             scratch: None,
         };
@@ -168,14 +259,16 @@ impl NamespaceWriter {
             }
         }
         let state = self.state(tree, namespace, set);
-        let object = tree.lend(set)?;
-        Some(Loan {
+        let Some(object) = tree.lend(set) else {
+            return Ok(None);
+        };
+        Ok(Some(Loan {
             set,
             namespace,
             state,
             object,
             access,
-        })
+        }))
     }
 
     // Whether the loop moved anything the repair read: a shelf whose
@@ -390,8 +483,7 @@ impl MemberAccess for Lent {
     }
 
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
-        self.repaired
-            .push((member, offset, Bytes::copy_from_slice(bytes)));
+        self.repaired.write(member, offset, bytes);
     }
 
     fn found_damaged(&mut self, member: MemberId, range: ByteRange) {
