@@ -185,10 +185,12 @@ async fn test_a_paused_torrent_asks_nothing_of_its_tracker_or_peers() -> anyhow:
 
     session.pause(&paused).await?;
     assert_eq!(next(&mut heard).await?, announce(Some("stopped")));
-    // The peer is let go: its connection ends, and the torrent counts no
-    // peer.
+    // The peer is let go: its connection ends, and neither the torrent nor
+    // the session counts it live, nor does the torrent's view.
     assert_eq!(peer.next_request().await, None);
     assert_eq!(run.stats_snapshot().peer_stats.live, 0);
+    assert_eq!(session.stats_snapshot().peers.live, 0);
+    assert!(paused.stats().live.is_none());
 
     for _ in 0..2 {
         tokio::time::advance(Duration::from_secs(3600)).await;
