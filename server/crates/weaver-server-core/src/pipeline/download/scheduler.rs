@@ -404,7 +404,7 @@ impl Pipeline {
         // An archive whose unlock order changed re-ranks its queue before
         // anything is taken from it.
         self.apply_rar_unlock_priorities_if_dirty(job_id);
-        let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
+        let bootstrap_files = self.recovery_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
 
         // Sampled once for the whole handout. Each article taken is charged
@@ -448,7 +448,7 @@ impl Pipeline {
             };
             filter.note_taken(&work);
             if bootstrap_files.is_some() {
-                self.par2_metadata_bootstrap_claims_work(job_id, &work);
+                self.recovery_metadata_bootstrap_claims_work(job_id, &work);
             }
             taken.push(work);
         }
@@ -577,7 +577,7 @@ impl Pipeline {
         if self.propagation_hold_until(job_id).is_some() {
             return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
         }
-        let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
+        let bootstrap_files = self.recovery_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
         let filter = match self.servable_work_filter(
             job_id,

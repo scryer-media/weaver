@@ -69,6 +69,7 @@ mod par3_recovery;
 #[cfg(unix)]
 mod post_processing_completion;
 mod post_processing_pause;
+mod provider_scheduling;
 mod queue;
 mod rar_extraction;
 mod restart_resume_floor;
@@ -468,6 +469,9 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
             .expect("lane event channel should stay open")
         {
             OwnedDownloadLaneEvent::AcquireFailed { .. } => {}
+            OwnedDownloadLaneEvent::LeaseObsolete { lease } => {
+                panic!("lane {} became obsolete before dialing", lease.lane_id)
+            }
             OwnedDownloadLaneEvent::BatchComplete { lane_id, .. } => {
                 panic!("lane {lane_id} fetched from a server that refuses every session")
             }
@@ -648,6 +652,23 @@ async fn new_direct_pipeline_on_machine(
     .unwrap();
 
     (pipeline, intermediate_dir, complete_dir)
+}
+
+async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+    let (mut pipeline, intermediate, complete) = new_direct_pipeline(temp_dir).await;
+    // Scheduler-only callers name two real policy entries without dialing.
+    pipeline.nntp = Arc::new(NntpClient::new(NntpClientConfig {
+        servers: (0..2)
+            .map(|_| weaver_nntp::pool::ServerPoolConfig {
+                max_connections: 100,
+                ..Default::default()
+            })
+            .collect(),
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    }));
+    (pipeline, intermediate, complete)
 }
 
 pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {

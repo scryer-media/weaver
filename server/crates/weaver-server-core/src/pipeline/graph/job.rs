@@ -294,22 +294,59 @@ impl GraphJob {
         self.writer.block_sizes(&self.tree, NodeId::ROOT)
     }
 
-    // Seam for the download scheduler: of the root members the post
-    // declares as indexes, and those whose fronts say they are one whatever
-    // their names, the ones the root namespace holds its payload for.
-    // `None` once it holds for none.
+    // Both recovery formats report progress to the same bootstrap gate.
+    // Missing or invalid indexes settle once no article remains outstanding.
     pub(crate) fn indexes_to_come(
         &self,
-        declared: impl IntoIterator<Item = MemberId>,
+        declared: impl IntoIterator<Item = (MemberId, super::metadata::RecoveryFormat)>,
     ) -> Option<Vec<MemberId>> {
-        let mut indexes: Vec<MemberId> = declared.into_iter().collect();
-        indexes.extend(self.tree.signed_indexes(NodeId::ROOT));
-        indexes.sort_unstable();
-        indexes.dedup();
-        let held = self
-            .writer
-            .holding_for(indexes, |member| self.to_come(VolumeIndex(member.0)));
-        (!held.is_empty()).then_some(held)
+        use super::metadata::{MetadataState, RecoveryFormat, RecoveryMetadata};
+        let mut metadata = RecoveryMetadata::default();
+        let declared: Vec<_> = declared.into_iter().collect();
+        let mut sampled: Vec<_> = declared.iter().map(|(_, format)| *format).collect();
+        let discovered = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .into_iter()
+            .flat_map(|namespace| {
+                namespace.members().filter_map(|member| {
+                    // Named recovery volumes remain optional. Obfuscated indexes
+                    // discovered from their fronts use the same coordinator.
+                    if weaver_graph::sniff::names_recovery(&member.name) {
+                        return None;
+                    }
+                    let (child, _) = self.tree.child_of(NodeId::ROOT, member.id)?;
+                    let format = RecoveryFormat::signed_index(
+                        self.tree.kind(child)?,
+                        namespace.first_bytes(member.id),
+                    )?;
+                    Some((member.id, format))
+                })
+            })
+            .filter(|(_, format)| {
+                // At most one unnamed candidate per format, even when every
+                // optional recovery volume repeats metadata at its front.
+                if sampled.contains(format) {
+                    return false;
+                }
+                sampled.push(*format);
+                true
+            });
+        for (member, format) in declared.into_iter().chain(discovered) {
+            let state = if self.to_come(VolumeIndex(member.0)) {
+                MetadataState::Unresolved
+            } else if self
+                .tree
+                .child_of(NodeId::ROOT, member)
+                .is_some_and(|(child, _)| self.tree.kind(child) == Some(format.kind()))
+            {
+                MetadataState::Ready
+            } else {
+                MetadataState::Unavailable
+            };
+            metadata.observe(member, format, state);
+        }
+        metadata.bootstrap_files()
     }
 
     // Every root member written to a file of its own, leaves and recovery

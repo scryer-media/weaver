@@ -164,17 +164,30 @@ fn a_namespace_without_sets_has_ruled_and_one_with_an_unruled_set_has_not() {
 }
 
 #[test]
-fn the_namespace_holds_only_for_declared_indexes_still_to_come() {
-    let job = Job::new(PLENTY);
+fn the_coordinator_holds_only_for_declared_indexes_still_to_come() {
+    use crate::pipeline::graph::metadata::{MetadataState, RecoveryFormat, RecoveryMetadata};
     let arrived = MemberId(1);
-    let held = job
-        .writer
-        .holding_for([MemberId(0), arrived, MemberId(2)], |member| {
-            member != arrived
-        });
-    assert_eq!(held, vec![MemberId(0), MemberId(2)]);
-    assert!(
-        job.writer.holding_for([arrived], |_| false).is_empty(),
+    let mut metadata = RecoveryMetadata::default();
+    for member in [MemberId(0), arrived, MemberId(2)] {
+        metadata.observe(
+            member,
+            RecoveryFormat::Par2,
+            if member == arrived {
+                MetadataState::Ready
+            } else {
+                MetadataState::Unresolved
+            },
+        );
+    }
+    assert_eq!(
+        metadata.bootstrap_files(),
+        Some(vec![MemberId(0), MemberId(2)])
+    );
+    let mut settled = RecoveryMetadata::default();
+    settled.observe(arrived, RecoveryFormat::Par2, MetadataState::Ready);
+    assert_eq!(
+        settled.bootstrap_files(),
+        None,
         "nothing is held once every index is in"
     );
 }

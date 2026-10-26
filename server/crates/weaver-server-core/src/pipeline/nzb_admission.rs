@@ -189,6 +189,11 @@ impl Pipeline {
         self.shared_state.queue.write(|inner| {
             let mut changed = false;
             for row in &mut inner.jobs {
+                let admitted = self.nzb_admitted.contains(&row.id);
+                if row.report.nzb_admitted != admitted {
+                    row.report.nzb_admitted = admitted;
+                    changed = true;
+                }
                 if propagating.contains(&row.id) {
                     row.report.job.download_wait_reason = None;
                     row.report.job.download_state = crate::DownloadState::Queued;

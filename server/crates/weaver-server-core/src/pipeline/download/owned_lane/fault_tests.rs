@@ -56,6 +56,7 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
             &mut cached,
             OwnedLaneRun {
                 nntp: client,
+                state: test_admitted_state(JobId(42)),
                 event_tx,
                 refill_tx,
                 parked_tx,
@@ -168,6 +169,7 @@ async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
             &mut cached,
             OwnedLaneRun {
                 nntp: client,
+                state: test_admitted_state(JobId(42)),
                 event_tx,
                 refill_tx,
                 parked_tx,
@@ -317,6 +319,7 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
             &mut cached,
             OwnedLaneRun {
                 nntp: client,
+                state: test_admitted_state(JobId(42)),
                 event_tx,
                 refill_tx,
                 parked_tx,
@@ -474,6 +477,7 @@ async fn a_parking_lane_releases_its_idle_thread_memory_once() {
             &mut cached,
             OwnedLaneRun {
                 nntp: client,
+                state: test_admitted_state(JobId(42)),
                 event_tx,
                 refill_tx,
                 parked_tx,

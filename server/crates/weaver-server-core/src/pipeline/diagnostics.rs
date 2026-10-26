@@ -85,6 +85,14 @@ pub struct PressureDiagnostics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPipelineDiagnostics {
     pub job_id: u64,
+    #[serde(default)]
+    pub next_article_eligible_priority: Option<u32>,
+    #[serde(default)]
+    pub next_article_eligible_backfill: Option<bool>,
+    #[serde(default)]
+    pub reserved_article_demand: usize,
+    #[serde(default)]
+    pub provider_selection_reason: Option<String>,
     pub status: JobStatus,
     pub download_queue_len: usize,
     pub recovery_queue_len: usize,
@@ -247,6 +255,7 @@ impl Pipeline {
             }
         }
 
+        let provider_policy = self.nntp.pool().try_provider_policy();
         let mut jobs: Vec<JobPipelineDiagnostics> = self
             .jobs
             .iter()
@@ -258,8 +267,35 @@ impl Pipeline {
                     .peek_first_matching(|work| !work.is_recovery);
                 let (timed, indefinite, deadline) =
                     retries.get(job_id).copied().unwrap_or_default();
+                let group = next.and_then(|work| {
+                    provider_policy.as_ref()?.eligible_group(
+                        &work.exclude_servers,
+                        &self.compute_job_retention_excludes(*job_id),
+                        Self::bandwidth_reservation_estimate(work.byte_estimate),
+                    )
+                });
                 JobPipelineDiagnostics {
                     job_id: job_id.0,
+                    next_article_eligible_priority: group.map(|group| group.priority),
+                    next_article_eligible_backfill: group.map(|group| group.backfill),
+                    reserved_article_demand: self
+                        .download_lane_owners
+                        .values()
+                        .flat_map(|lane| lane.outstanding.keys())
+                        .filter(|segment| segment.file_id.job_id == *job_id)
+                        .count(),
+                    provider_selection_reason: next.map(|work| {
+                        if provider_policy.is_none() {
+                            "selection_contended"
+                        } else if group.is_none() {
+                            "no_eligible_provider"
+                        } else if !work.exclude_servers.is_empty() {
+                            "article_fallback"
+                        } else {
+                            "highest_available_priority"
+                        }
+                        .to_string()
+                    }),
                     status: state.status.clone(),
                     download_queue_len: state.download_queue.len(),
                     recovery_queue_len: state.recovery_queue.len(),

@@ -1206,7 +1206,7 @@ export const nextJa: LocaleDictionary = {
   "next.providers.enabledHelp": "無効にしたプロバイダーは残りますが、接続されることはありません。",
   "next.providers.killSwitchHelp": "このプロバイダーを無効のまま、接続テストなしで、外に出る経路のない状態で保存します。ネットワークでルートを設定してから、ここで有効にしてください。",
   "next.providers.priority": "優先度",
-  "next.providers.priorityHelp": "小さい値から先に試します。同じ値のプロバイダーは一緒に使われます。",
+  "next.providers.priorityHelp": "小さい数値が優先され、同じ数値のプロバイダーは帯域を共有します。上位グループがその記事を提供できない場合にのみ下位グループを使用します。接続が使用中でも下位には切り替わりません。",
   "next.providers.blockAccountHelp": "他のプロバイダーが提供できなかった記事の補完にのみ使われます。",
   "next.providers.retention": "保持期間",
   "next.providers.retentionHelp": "これより古い記事ではこのプロバイダーを使いません。0 は無制限です。",

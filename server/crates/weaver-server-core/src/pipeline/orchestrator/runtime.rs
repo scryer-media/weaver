@@ -468,6 +468,7 @@ impl Pipeline {
             download_dispatch_stall: None,
             download_stall_recovery,
             download_pass_fill_servers: None,
+            download_pass_provider_policy: None,
             download_retry_storm_window: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),

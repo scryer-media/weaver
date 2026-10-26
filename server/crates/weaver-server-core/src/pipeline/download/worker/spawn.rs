@@ -395,6 +395,7 @@ impl Pipeline {
         // reset returns the leases it reclaims.
         if let Err(lease) = self.owned_download_lane_pool.submit(
             Arc::clone(&self.nntp),
+            self.shared_state.clone(),
             self.owned_download_lane_event_tx.clone(),
             self.download_refill_tx.clone(),
             self.download_lane_parked_tx.clone(),

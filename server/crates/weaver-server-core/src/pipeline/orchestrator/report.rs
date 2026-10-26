@@ -34,6 +34,7 @@ impl Pipeline {
                     return Change::unchanged(());
                 };
                 row.report.moving = moving;
+                row.report.nzb_admitted = self.nzb_admitted.contains(&job_id);
                 if !self.nzb_admitted.contains(&job_id)
                     && row.intents.paused == Some(false)
                     && row.intents.cancelled.is_none()

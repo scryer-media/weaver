@@ -843,6 +843,9 @@ impl Pipeline {
     ) {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
+            OwnedDownloadLaneEvent::LeaseObsolete { lease } => {
+                self.restore_stopped_owned_lane_lease(lease);
+            }
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
                 if !self.download_lane_is_live(lease.lane_id) {
                     return;

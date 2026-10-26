@@ -1213,7 +1213,7 @@ export const nextEn: LocaleDictionary = {
   "next.providers.enabledHelp": "A disabled provider is kept but never dialled.",
   "next.providers.killSwitchHelp": "Save this provider switched off, untested, with nothing allowed out. Set its route under Networking, then enable it here.",
   "next.providers.priority": "Priority",
-  "next.providers.priorityHelp": "Lower is tried first. Providers sharing a number are used together.",
+  "next.providers.priorityHelp": "Lower numbers have priority. Providers with the same number share bandwidth. Higher numbers are used only when the earlier groups cannot supply that article; busy connections do not trigger fallback.",
   "next.providers.blockAccountHelp": "Only used to fill articles the other providers could not supply.",
   "next.providers.retention": "Retention",
   "next.providers.retentionHelp": "Skip this provider for articles older than this. Zero means no limit.",

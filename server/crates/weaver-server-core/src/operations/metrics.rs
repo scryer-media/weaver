@@ -73,16 +73,18 @@ pub enum SchedulerBlockClause {
     ServerExclusion,
     // A backfill server waits for the fill servers to give the article up.
     Backfill,
-    // The PAR2 index bootstrap claims the queue for its index files.
-    Par2Bootstrap,
+    // The recovery metadata bootstrap claims the queue for its index files.
+    RecoveryMetadataBootstrap,
     // The UU spool cursor has not reached the article.
     UuCursor,
     // The restart checkpoint holds the job's undurable lead.
     Checkpoint,
+    // A higher-priority group can still supply this article.
+    ProviderPriority,
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
@@ -90,9 +92,10 @@ impl SchedulerBlockClause {
         Self::SweepHeld,
         Self::ServerExclusion,
         Self::Backfill,
-        Self::Par2Bootstrap,
+        Self::RecoveryMetadataBootstrap,
         Self::UuCursor,
         Self::Checkpoint,
+        Self::ProviderPriority,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -103,9 +106,10 @@ impl SchedulerBlockClause {
             Self::SweepHeld => "sweep_held",
             Self::ServerExclusion => "server_exclusion",
             Self::Backfill => "backfill",
-            Self::Par2Bootstrap => "par2_bootstrap",
+            Self::RecoveryMetadataBootstrap => "recovery_metadata_bootstrap",
             Self::UuCursor => "uu_cursor",
             Self::Checkpoint => "checkpoint",
+            Self::ProviderPriority => "provider_priority",
         }
     }
 

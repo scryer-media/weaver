@@ -130,7 +130,7 @@ impl Pipeline {
         excludes
     }
 
-    fn compute_job_retention_excludes(&self, job_id: JobId) -> Vec<usize> {
+    pub(in crate::pipeline) fn compute_job_retention_excludes(&self, job_id: JobId) -> Vec<usize> {
         let retention_days = self.nntp.pool().server_retention_days();
         if retention_days.iter().all(|days| *days == 0) {
             return Vec::new();

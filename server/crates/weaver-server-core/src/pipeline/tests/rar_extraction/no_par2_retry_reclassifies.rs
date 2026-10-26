@@ -2643,7 +2643,7 @@ async fn rar_unlock_ranked_window_uses_logical_volume_order() {
 #[tokio::test]
 async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_scheduler_pipeline(&temp_dir).await;
     let job_id = JobId(40108);
     let files = (0..5)
         .map(|volume| {

@@ -1206,7 +1206,7 @@ export const nextKo: LocaleDictionary = {
   "next.providers.enabledHelp": "사용하지 않는 공급자는 유지되지만 연결하지 않습니다.",
   "next.providers.killSwitchHelp": "이 공급자를 사용하지 않는 상태로, 연결 테스트 없이, 나가는 경로 없이 저장합니다. 네트워크에서 경로를 설정한 다음 여기에서 사용하도록 설정하세요.",
   "next.providers.priority": "우선순위",
-  "next.providers.priorityHelp": "낮은 값을 먼저 시도합니다. 같은 값의 공급자는 함께 사용합니다.",
+  "next.providers.priorityHelp": "낮은 숫자가 우선이며 같은 숫자의 공급자는 대역폭을 공유합니다. 앞선 그룹이 해당 기사를 제공할 수 없을 때만 다음 그룹을 사용합니다. 연결이 사용 중이라는 이유로 전환하지 않습니다.",
   "next.providers.blockAccountHelp": "다른 공급자가 제공하지 못한 기사를 채우는 데만 사용합니다.",
   "next.providers.retention": "보존 기간",
   "next.providers.retentionHelp": "이보다 오래된 기사에는 이 공급자를 건너뜁니다. 0은 제한 없음입니다.",

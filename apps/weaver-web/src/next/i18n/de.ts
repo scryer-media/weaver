@@ -1206,7 +1206,7 @@ export const nextDe: LocaleDictionary = {
   "next.providers.enabledHelp": "Ein deaktivierter Anbieter bleibt erhalten, wird aber nie angewählt.",
   "next.providers.killSwitchHelp": "Speichert diesen Anbieter deaktiviert und ungetestet, ohne Weg nach draußen. Route unter Netzwerk festlegen, dann hier aktivieren.",
   "next.providers.priority": "Priorität",
-  "next.providers.priorityHelp": "Niedrigere Werte werden zuerst versucht. Anbieter mit gleicher Zahl werden gemeinsam genutzt.",
+  "next.providers.priorityHelp": "Niedrigere Zahlen haben Vorrang. Anbieter mit gleicher Zahl teilen die Bandbreite. Höhere Zahlen werden nur genutzt, wenn die vorherigen Gruppen den Artikel nicht liefern können. Belegte Verbindungen lösen keinen Wechsel aus.",
   "next.providers.blockAccountHelp": "Wird nur genutzt, um Artikel zu ergänzen, die die anderen Anbieter nicht liefern konnten.",
   "next.providers.retention": "Vorhaltezeit",
   "next.providers.retentionHelp": "Diesen Anbieter für ältere Artikel überspringen. Null bedeutet keine Grenze.",

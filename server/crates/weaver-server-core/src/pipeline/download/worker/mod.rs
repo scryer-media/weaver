@@ -411,7 +411,6 @@ impl Pipeline {
             else {
                 return DispatchAttempt::NoWork;
             };
-            let job_id = lease.job_id;
             let activation_items = Self::activation_items(&lease);
             self.activate_download_batch_lease(&lease, &activation_items, true);
             if let Some(owner) = self.download_lane_owners.get_mut(&lane_id) {
@@ -419,64 +418,9 @@ impl Pipeline {
             }
             self.spawn_download_batch(lease);
             *sent_this_pass.entry(server_idx).or_default() += 1;
-            self.warm_idle_download_lanes_for_barrier(job_id);
             return DispatchAttempt::Dispatched;
         }
         DispatchAttempt::NoWork
-    }
-
-    // Open the connections a barred job is about to need, while it is barred.
-    //
-    // A job whose first wave is held behind a barrier — the PAR2 index
-    // bootstrap is the standing case — may only lease the barrier's own work,
-    // so dispatch cuts one batch and stops. Nothing in the barrier requires
-    // the *connections* to wait: without this, the moment the grid publishes
-    // and payload leases go out, each lane pays a TCP, TLS, greeting and
-    // authentication exchange before its first BODY, one after another, on a
-    // job that has been waiting on exactly those bytes.
-    //
-    // A warm lane is idle, not active: it is counted in no connection gauge,
-    // and if the barrier never lifts it parks with the rest of the pool. The
-    // dial is asked for after the lease has been handed to a worker, and each
-    // warm runs on its own worker thread, so nothing already leased waits on
-    // one.
-    fn warm_idle_download_lanes_for_barrier(&mut self, job_id: JobId) {
-        let capacity = self
-            .effective_download_connection_capacity(self.tuner.params().max_concurrent_downloads);
-        let free = capacity.saturating_sub(self.active_download_connections);
-        if free == 0 {
-            return;
-        }
-        // Only while the job is actually holding work back. Ordinary dispatch
-        // needs no help: it leases into every free connection itself.
-        if self.par2_metadata_bootstrap_files(job_id).is_none() {
-            return;
-        }
-        // Sized for a payload article, falling back to the barrier's own
-        // class when the payload queue has not been built yet.
-        let Some(byte_estimate) = self.jobs.get(&job_id).and_then(|state| {
-            state
-                .download_queue
-                .peek_in_class(false)
-                .or_else(|| state.download_queue.peek_in_class(true))
-                .map(|work| work.byte_estimate)
-        }) else {
-            return;
-        };
-        let exclude_servers: Arc<[usize]> = Arc::from(self.effective_exclude_servers(job_id, &[]));
-        let warmed = self.owned_download_lane_pool.warm(
-            &self.nntp,
-            exclude_servers,
-            Self::bandwidth_reservation_estimate(byte_estimate),
-            free,
-        );
-        if warmed > 0 {
-            debug!(
-                job_id = job_id.0,
-                lanes = warmed,
-                "warming idle download lanes behind a job barrier"
-            );
-        }
     }
 
     fn mark_download_pass_started(&mut self, job_id: JobId) {
@@ -563,7 +507,9 @@ impl Pipeline {
     // One dispatch pass at `now`, the instant the pass's timers and the stall
     // watchdog measure against.
     pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
+        self.download_pass_provider_policy = self.nntp.pool().try_provider_policy();
         self.dispatch_download_pass(now);
+        self.download_pass_provider_policy = None;
         self.report_changed_dispatch_holds();
         #[cfg(test)]
         self.audit_lane_holdings();

@@ -15,6 +15,8 @@ use crate::pipeline::download::scheduler::{Handout, LaneShare, SaturationWake, Y
 const SERVER_A: usize = 0;
 const SERVER_B: usize = 1;
 
+use crate::pipeline::tests::new_scheduler_pipeline as new_direct_pipeline;
+
 // Ask the scheduler for work, taking the pressure sample a caller would.
 fn ask(
     pipeline: &mut Pipeline,

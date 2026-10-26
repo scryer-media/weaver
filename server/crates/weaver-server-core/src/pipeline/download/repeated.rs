@@ -312,6 +312,7 @@ impl RepeatedArticles {
         self.root.relocate(old, new);
     }
 
+    #[cfg(test)]
     async fn fetch(
         self: &Arc<Self>,
         work: &DownloadWork,
@@ -319,10 +320,37 @@ impl RepeatedArticles {
         nntp: &NntpClient,
         generation: u64,
     ) -> Reply {
+        self.fetch_guarded(work, excludes, nntp, generation, || true)
+            .await
+    }
+
+    async fn fetch_guarded(
+        self: &Arc<Self>,
+        work: &DownloadWork,
+        excludes: &[usize],
+        nntp: &NntpClient,
+        generation: u64,
+        ready: impl Fn() -> bool,
+    ) -> Reply {
+        let obsolete = || Reply {
+            data: Err(DownloadError::Fetch(DownloadFailure::new(
+                DownloadFailureKind::Unrequested,
+                "duplicate article reservation became obsolete",
+            ))),
+            attempts: Vec::new(),
+            source: None,
+            excludes: work.exclude_servers.clone(),
+        };
+        if !ready() {
+            return obsolete();
+        }
         let Some(entry) = self.entries.get(&work.message_id) else {
             return Self::fetch_uncached(work, excludes, nntp).await;
         };
         let mut state = entry.clone().lock_owned().await;
+        if !ready() {
+            return obsolete();
+        }
         match state.as_mut() {
             Some(Entry::Body(body))
                 if body.generation == generation
@@ -515,6 +543,7 @@ impl Pipeline {
         cache: Arc<RepeatedArticles>,
     ) {
         let nntp = self.nntp.clone();
+        let state = self.shared_state.clone();
         let tx = self.download_done_tx.clone();
         let parked = self.download_lane_parked_tx.clone();
         tokio::spawn(async move {
@@ -525,12 +554,52 @@ impl Pipeline {
                 // from the work: fetching on the lease's set alone re-asks a
                 // server this article has already been refused by, and the
                 // result then reports a set that never grows.
-                let excludes = Pipeline::union_exclude_servers(
+                let article_excludes = Pipeline::union_exclude_servers(
                     &work.exclude_servers,
                     &lease.effective_exclude_servers,
                 );
+                let excludes =
+                    Pipeline::union_exclude_servers(&article_excludes, &lease.dial_exclude_servers);
+                let guard_state = state.clone();
+                let guard_pool = Arc::clone(nntp.pool());
+                let guard_excludes = article_excludes.clone();
+                let job_id = lease.job_id;
+                let generation = lease.runtime_generation;
+                let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
+                let guarded = nntp.with_work_guard(move |server| {
+                    super::owned_lane::job_work_is_current(&guard_state, job_id, generation)
+                        && guard_pool.try_provider_policy().is_some_and(|policy| {
+                            matches!(
+                                policy.eligibility(server.0, &guard_excludes, &[], estimate),
+                                weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+                            )
+                        })
+                });
                 let reply = cache
-                    .fetch(&work, &excludes, &nntp, lease.runtime_generation)
+                    .fetch_guarded(&work, &excludes, &guarded, lease.runtime_generation, || {
+                        super::owned_lane::job_work_is_current(
+                            &state,
+                            lease.job_id,
+                            lease.runtime_generation,
+                        ) && nntp.pool().try_provider_policy().is_some_and(|policy| {
+                            (0..nntp.pool().server_count()).any(|server| {
+                                !lease.dial_exclude_servers.contains(&server)
+                                    && matches!(
+                                        policy.eligibility(
+                                            server,
+                                            &article_excludes,
+                                            &[],
+                                            Pipeline::bandwidth_reservation_estimate(
+                                                work.byte_estimate
+                                            )
+                                        ),
+                                        weaver_nntp::provider_policy::ArticleEligibility::Eligible(
+                                            _
+                                        )
+                                    )
+                            })
+                        })
+                    })
                     .await;
                 let _ = tx
                     .send(DownloadResult {

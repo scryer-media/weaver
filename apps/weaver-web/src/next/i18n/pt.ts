@@ -1206,7 +1206,7 @@ export const nextPt: LocaleDictionary = {
   "next.providers.enabledHelp": "Um provedor desativado é mantido, mas nunca é contatado.",
   "next.providers.killSwitchHelp": "Salva este provedor desativado e sem teste, sem nenhuma saída. Defina a rota em Rede e depois ative-o aqui.",
   "next.providers.priority": "Prioridade",
-  "next.providers.priorityHelp": "Valores menores são tentados primeiro. Provedores com o mesmo número são usados juntos.",
+  "next.providers.priorityHelp": "Números menores têm prioridade. Provedores com o mesmo número compartilham a largura de banda. Números maiores só são usados quando os grupos anteriores não podem fornecer aquele artigo; conexões ocupadas não acionam a alternativa.",
   "next.providers.blockAccountHelp": "Usado apenas para completar artigos que os outros provedores não conseguiram fornecer.",
   "next.providers.retention": "Retenção",
   "next.providers.retentionHelp": "Ignora este provedor para artigos mais antigos que isso. Zero significa sem limite.",

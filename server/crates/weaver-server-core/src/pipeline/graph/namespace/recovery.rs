@@ -213,21 +213,6 @@ impl NamespaceWriter {
         sizes
     }
 
-    // The members the namespace holds its payload for: each index its
-    // source declared that still has bytes to come. Evidence cut before an
-    // index gives its block sizes is cut at none, so its slices are read
-    // back rather than proven as they pass.
-    pub(crate) fn holding_for(
-        &self,
-        declared: impl IntoIterator<Item = MemberId>,
-        to_come: impl Fn(MemberId) -> bool,
-    ) -> Vec<MemberId> {
-        declared
-            .into_iter()
-            .filter(|member| to_come(*member))
-            .collect()
-    }
-
     // Rule the namespace's sets that are due. A file a set describes and
     // no member carries is announced first, once the namespace has every
     // member it will get, so the repair has a member to write it into.

@@ -384,8 +384,12 @@ impl ServerHealth {
     // back to Degraded. A separate gate admits one fresh demanded connection;
     // cached stragglers cannot decide the recovery outcome.
     pub fn check_reenable(&mut self) {
+        self.check_reenable_at(Instant::now());
+    }
+
+    fn check_reenable_at(&mut self, now: Instant) {
         match self.state {
-            ServerState::Disabled { until, .. } if Instant::now() >= until => {
+            ServerState::Disabled { until, .. } if now >= until => {
                 let probe_failures = 0;
                 self.consecutive_failures = probe_failures;
                 self.state = ServerState::Degraded {
@@ -396,7 +400,7 @@ impl ServerHealth {
                 until,
                 resume_degraded,
                 ..
-            } if Instant::now() >= until => {
+            } if now >= until => {
                 self.state = match resume_degraded {
                     Some(consecutive_failures) => ServerState::Degraded {
                         consecutive_failures,
@@ -519,6 +523,8 @@ impl ServerHealth {
 #[derive(Debug)]
 pub struct HealthTracker {
     servers: Vec<ServerHealth>,
+    #[cfg(test)]
+    reenable_clock: Option<Instant>,
     // Backfill flag per server, parallel to `servers`. Failure-ratio trips
     // only fire when another FILL server can absorb the shifted load;
     // backfill servers never count (health never unlocks backfill, so
@@ -603,7 +609,12 @@ impl HealthTracker {
         let servers = (0..server_count)
             .map(|_| ServerHealth::new(config.clone()))
             .collect();
-        Self { servers, backfill }
+        Self {
+            servers,
+            backfill,
+            #[cfg(test)]
+            reenable_clock: None,
+        }
     }
 
     // Whether a failure-ratio trip on `server_idx` has somewhere to shift
@@ -640,15 +651,30 @@ impl HealthTracker {
 
     // Whether the given server is available for work.
     pub fn is_available(&mut self, server_idx: usize) -> bool {
-        self.servers[server_idx].check_reenable();
+        let now = self.reenable_now();
+        self.servers[server_idx].check_reenable_at(now);
         self.servers[server_idx].is_available()
     }
 
     // Check all disabled servers and re-enable any whose backoff has expired.
     pub fn check_reenable_all(&mut self) {
+        let now = self.reenable_now();
         for server in &mut self.servers {
-            server.check_reenable();
+            server.check_reenable_at(now);
         }
+    }
+
+    fn reenable_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.reenable_clock {
+            return now;
+        }
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reenable_clock(&mut self, now: Instant) {
+        self.reenable_clock = Some(now);
     }
 
     // Return server indices ordered by health: Healthy first, Degraded second,

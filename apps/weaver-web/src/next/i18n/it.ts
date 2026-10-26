@@ -1206,7 +1206,7 @@ export const nextIt: LocaleDictionary = {
   "next.providers.enabledHelp": "Un provider disattivato viene conservato ma mai contattato.",
   "next.providers.killSwitchHelp": "Salva questo provider disattivato e non testato, senza alcuna uscita. Imposta il percorso in Rete, poi attivalo qui.",
   "next.providers.priority": "Priorità",
-  "next.providers.priorityHelp": "I valori più bassi vengono provati per primi. I provider con lo stesso numero vengono usati insieme.",
+  "next.providers.priorityHelp": "I numeri più bassi hanno priorità. I provider con lo stesso numero condividono la banda. I numeri più alti vengono usati solo se i gruppi precedenti non possono fornire quell’articolo; le connessioni occupate non attivano il ripiego.",
   "next.providers.blockAccountHelp": "Usato solo per completare gli articoli che gli altri provider non hanno potuto fornire.",
   "next.providers.retention": "Ritenzione",
   "next.providers.retentionHelp": "Salta questo provider per articoli più vecchi di così. Zero significa nessun limite.",

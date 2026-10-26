@@ -1723,6 +1723,8 @@ impl Pipeline {
         // lane and then pay a full cold dial for it. Asking the lane to run
         // the STAT batch on the socket it is already holding costs neither.
         let owned_lane_probe = self.owned_download_lane_pool.probe_handle(job_id.0);
+        let probe_state = self.shared_state.clone();
+        let probe_generation = self.pool_generation;
 
         info!(
             job_id = job_id.0,
@@ -1753,7 +1755,7 @@ impl Pipeline {
                 // async client is the fallback for whatever they cannot settle
                 // — a server with no lane of its own, or a lane that faulted.
                 let results = owned_lane_probe
-                    .confirm_exists_for_probe(&nntp, batch)
+                    .confirm_exists_for_probe(&nntp, batch, &probe_state, probe_generation)
                     .await;
                 if results.inconclusive {
                     // One batch that could not settle is a hole in the sample,

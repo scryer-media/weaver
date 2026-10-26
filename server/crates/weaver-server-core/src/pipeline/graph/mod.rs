@@ -14,6 +14,7 @@ pub(crate) mod leaf;
 pub(crate) mod limits;
 #[cfg(test)]
 pub(crate) mod lines;
+pub(crate) mod metadata;
 pub(crate) mod namespace;
 pub(crate) mod restore;
 pub(crate) mod root;

@@ -136,6 +136,8 @@ pub struct Intents {
 
 pub struct Report {
     pub job: JobInfo,
+    // Published only from the actor's durable admission ledger.
+    pub nzb_admitted: bool,
     pub seen_intent_seq: u64,
     pub retiring: bool,
     pub restoring: bool,
@@ -182,6 +184,7 @@ impl JobRow {
             id: job.job_id,
             intents: Intents::default(),
             report: Report {
+                nzb_admitted: false,
                 download_active: job.download_state == crate::DownloadState::Downloading,
                 download_work_pending: false,
                 job,

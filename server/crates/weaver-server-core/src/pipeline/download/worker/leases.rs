@@ -36,12 +36,7 @@ impl BlockedBy {
 // charges each article the handout takes to the byte-budget clauses.
 pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     server_idx: usize,
-    // Set when `server_idx` is a backfill server: the fill servers that are
-    // available right now. A backfill server only takes an article every one
-    // of those cannot fetch — by the job's retention, the article's own
-    // exclusions, or its rotation hint — which is what keeps backfill traffic
-    // to what the fill tier has already given up on.
-    fill_servers: Option<Vec<usize>>,
+    provider_policy: Option<weaver_nntp::provider_policy::ProviderPolicy>,
     // The fill servers a hinted article could go to instead of its hinted
     // one: the dispatch attempt's available fill servers, or a fresh ranking
     // when the handout is not part of one. The rotation hint is a
@@ -110,20 +105,25 @@ impl ServableWorkFilter<'_> {
         {
             return Some(SchedulerBlockClause::ServerExclusion);
         }
-        if !self.fill_servers.as_deref().is_none_or(|fill| {
-            fill.iter().all(|server| {
-                self.retention_excludes.contains(server)
-                    || work.exclude_servers.contains(server)
-                    || work.avoid_server == Some(*server)
-            })
-        }) {
-            return Some(SchedulerBlockClause::Backfill);
+        use weaver_nntp::provider_policy::ArticleEligibility;
+        let Some(policy) = &self.provider_policy else {
+            return Some(SchedulerBlockClause::ProviderPriority);
+        };
+        match policy.eligibility(
+            self.server_idx,
+            &work.exclude_servers,
+            &self.retention_excludes,
+            Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
+        ) {
+            ArticleEligibility::Eligible(_) => {}
+            ArticleEligibility::BackfillProtected => return Some(SchedulerBlockClause::Backfill),
+            _ => return Some(SchedulerBlockClause::ProviderPriority),
         }
         if self
             .bootstrap_files
             .is_some_and(|files| !files.contains(&file_index))
         {
-            return Some(SchedulerBlockClause::Par2Bootstrap);
+            return Some(SchedulerBlockClause::RecoveryMetadataBootstrap);
         }
         if self
             .uu_cursor_ordinals
@@ -149,6 +149,17 @@ impl ServableWorkFilter<'_> {
             *server != self.server_idx
                 && !work.exclude_servers.contains(server)
                 && !self.retention_excludes.contains(server)
+                && self.provider_policy.as_ref().is_some_and(|policy| {
+                    matches!(
+                        policy.eligibility(
+                            *server,
+                            &work.exclude_servers,
+                            &self.retention_excludes,
+                            Pipeline::bandwidth_reservation_estimate(work.byte_estimate)
+                        ),
+                        weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+                    )
+                })
         })
     }
 
@@ -237,13 +248,13 @@ impl Pipeline {
                 .is_some_and(|state| !state.recovery_queue.is_empty())
     }
 
-    // Hold payload work only while declared PAR2 indexes are unresolved.
+    // Hold payload work only while declared recovery indexes are unresolved.
     //
     // Checkpoint cuts are fixed when a batch is leased, so an index already
     // present in the primary queue must publish its grid first. Indexless
     // recovery discovery stays completion-bounded instead of turning every
     // optional volume into a pre-download barrier.
-    pub(in crate::pipeline::download) fn par2_metadata_bootstrap_files(
+    pub(in crate::pipeline::download) fn recovery_metadata_bootstrap_files(
         &mut self,
         job_id: JobId,
     ) -> Option<Vec<u32>> {
@@ -288,7 +299,7 @@ impl Pipeline {
         }
     }
 
-    // The PAR2 indexes the post declares that a graph job's root namespace
+    // The recovery indexes the post declares that a graph job's root namespace
     // holds its payload for. Root members are numbered as the posted files
     // they are.
     fn graph_indexes_to_come(&self, job_id: JobId) -> Option<Vec<u32>> {
@@ -298,20 +309,17 @@ impl Pipeline {
             .files
             .iter()
             .zip(0u32..)
-            .filter(|(file, _)| {
-                matches!(
-                    file.role,
-                    weaver_model::files::FileRole::Par2 { is_index: true, .. }
-                )
-            })
-            .map(|(_, index)| weaver_graph::MemberId(index));
+            .filter_map(|(file, index)| {
+                crate::pipeline::graph::metadata::RecoveryFormat::declared_index(&file.role)
+                    .map(|format| (weaver_graph::MemberId(index), format))
+            });
         graph
             .indexes_to_come(declared)
             .map(|held| held.into_iter().map(|member| member.0).collect())
     }
 
     // While bootstrap is active, lease only tracked explicit-index work.
-    pub(in crate::pipeline::download) fn par2_metadata_bootstrap_claims_work(
+    pub(in crate::pipeline::download) fn recovery_metadata_bootstrap_claims_work(
         &mut self,
         job_id: JobId,
         work: &DownloadWork,
@@ -407,7 +415,10 @@ impl Pipeline {
         }
         ServableWork::Scan(ServableWorkFilter {
             server_idx,
-            fill_servers: self.backfill_fill_gate(server_idx),
+            provider_policy: self
+                .download_pass_provider_policy
+                .clone()
+                .or_else(|| self.nntp.pool().try_provider_policy()),
             hint_alternatives: self.rotation_hint_alternatives(job_id),
             retention_excludes,
             bootstrap_files,
@@ -473,7 +484,7 @@ impl Pipeline {
             } else if sweep_held.is_some_and(|held| held.contains(&file_index)) {
                 blocked = blocked.with(SchedulerBlockClause::SweepHeld);
             } else if bootstrap_files.is_some_and(|files| !files.contains(&file_index)) {
-                blocked = blocked.with(SchedulerBlockClause::Par2Bootstrap);
+                blocked = blocked.with(SchedulerBlockClause::RecoveryMetadataBootstrap);
             } else {
                 return Ok(());
             }
@@ -512,29 +523,6 @@ impl Pipeline {
                 .filter(is_fill)
                 .collect(),
             None => (0..flags.len()).filter(is_fill).collect(),
-        }
-    }
-
-    // The fill servers a backfill server must see exhausted before it takes
-    // an article; `None` for a fill server, and for a backfill server once
-    // the pool has already unlocked the backfill tier for everyone.
-    fn backfill_fill_gate(&self, server_idx: usize) -> Option<Vec<usize>> {
-        let flags = self.nntp.pool().server_backfill_flags();
-        if !flags.get(server_idx).copied().unwrap_or(false) {
-            return None;
-        }
-        match self.nntp.blocking_body_server_order(&[]) {
-            Some(order) => {
-                if order.iter().any(|server| flags[server.0]) {
-                    // The fill tier is exhausted or auth-disabled for the
-                    // whole pool; backfill serves everything.
-                    return None;
-                }
-                Some(order.into_iter().map(|server| server.0).collect())
-            }
-            // The ranking is contended: gate on every fill server, which is
-            // the strict answer and costs at most one pass.
-            None => Some((0..flags.len()).filter(|idx| !flags[*idx]).collect()),
         }
     }
 

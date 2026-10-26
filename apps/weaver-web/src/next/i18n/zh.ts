@@ -1206,7 +1206,7 @@ export const nextZh: LocaleDictionary = {
   "next.providers.enabledHelp": "停用的服务商会保留，但不会被连接。",
   "next.providers.killSwitchHelp": "以停用状态保存此服务商，不做连接测试，且不允许任何流量外出。在“网络”中设置路由后，再在此处启用。",
   "next.providers.priority": "优先级",
-  "next.providers.priorityHelp": "数值小的先尝试。数值相同的服务商会一起使用。",
+  "next.providers.priorityHelp": "数值越小优先级越高，相同数值的服务商共同提供带宽。仅当前面的组无法提供该文章时才使用后面的组；连接繁忙不会触发回退。",
   "next.providers.blockAccountHelp": "仅用于补全其他服务商无法提供的文章。",
   "next.providers.retention": "保留期",
   "next.providers.retentionHelp": "对于早于此期限的文章跳过此服务商。0 表示不限制。",
