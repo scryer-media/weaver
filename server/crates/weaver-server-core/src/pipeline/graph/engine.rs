@@ -8,14 +8,15 @@
 // beside its other work, and is applied to the tree as if the object had said
 // it in `deliver`.
 //
-// A run has one life: queued for a slot, running, ended. Before it starts it
-// reserves the resident bytes it will hold, against the limit every job
-// shares; one that does not fit gives its slot back and waits for memory
-// instead. A repair behind what
+// A run has one life: queued for a slot, running, ended, or stopped where it
+// stands when the job goes down. Before it starts it reserves the resident
+// bytes it will hold, against the limit every job shares; one that does not
+// fit gives its slot back and waits for memory instead. A repair behind what
 // it read moves its shelf's generation on, which stops it where it stands;
 // its owner then retracts what it built and starts it again, under the slot
 // it already holds. Whatever a stopped run still says carries the old
-// generation, and is not heard.
+// generation, and is not heard: a run stopped as the job goes down keeps its
+// generation, so no run starts under it again.
 
 mod volumes;
 
@@ -116,6 +117,12 @@ enum Life {
     Starved { resident: u64 },
     Running { generation: u64 },
     Ended { generation: u64 },
+    // Stopped where it stood because the job is going down, under the
+    // generation it ran under, if it started. Its thread may still be out
+    // and speak under that generation, so the run keeps it: no other run
+    // starts on the node, and what the stopped one says is not heard. It did
+    // not finish reading, so the job is not quiet while it stands.
+    Stopped { generation: Option<u64> },
 }
 
 #[derive(Debug)]
@@ -175,7 +182,8 @@ impl Runs {
         self.mail.clone()
     }
 
-    // A run is waiting for a slot, waiting for memory, or running.
+    // A run is waiting for a slot, waiting for memory, running, or stopped
+    // before it finished.
     pub(crate) fn live(&self) -> bool {
         self.runs
             .values()
@@ -192,8 +200,9 @@ impl Runs {
         self.runs.contains_key(&node)
     }
 
-    // Whether the node's run is waiting for a slot, waiting for memory, or
-    // running: it may still announce members, or close them.
+    // Whether the node's run is waiting for a slot, waiting for memory,
+    // running, or stopped before it finished: it may still announce members,
+    // or close them.
     pub(crate) fn reading(&self, node: NodeId) -> bool {
         self.runs
             .get(&node)
@@ -221,6 +230,7 @@ impl Runs {
         match self.runs.get(&node)?.life {
             Life::Queued | Life::Starved { .. } => None,
             Life::Running { generation } | Life::Ended { generation } => Some(generation),
+            Life::Stopped { generation } => generation,
         }
     }
 
@@ -350,12 +360,32 @@ impl Runs {
         self.forget(gone, limit)
     }
 
-    // Stop every run where it stands and forget it: the job is going down.
-    // What a run read is on its shelf, for the restored job to read again.
+    // Stop every run where it stands: the job is going down. What a run read
+    // is on its shelf, for the restored job to read again. Its slot and its
+    // memory are given back, but the run stays, stopped under its generation:
+    // its thread may still speak under it, and a run started in its place
+    // would read under the same generation and hear it as its own.
     pub(crate) fn stop(&mut self, limit: usize) {
         self.request_stop();
-        let all = self.runs.keys().copied().collect();
-        self.forget(all, limit);
+        self.follow(limit);
+        let all: Vec<NodeId> = self.runs.keys().copied().collect();
+        // Out of the queue first, so a slot one of them frees cannot go to
+        // another of them.
+        for node in &all {
+            self.slots.withdraw(asker(*node));
+        }
+        for node in all {
+            self.free(node);
+            if let Some(run) = self.runs.get_mut(&node) {
+                run.life = match run.life {
+                    Life::Queued | Life::Starved { .. } => Life::Stopped { generation: None },
+                    Life::Running { generation } => Life::Stopped {
+                        generation: Some(generation),
+                    },
+                    life @ (Life::Ended { .. } | Life::Stopped { .. }) => life,
+                };
+            }
+        }
     }
 
     pub(crate) fn request_stop(&self) {

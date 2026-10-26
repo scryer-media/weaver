@@ -209,9 +209,10 @@ impl GraphJob {
         self.runs.request_stop();
     }
 
-    // The pipeline is going down. Every run stops where it stands and is
-    // forgotten: what it read is on its shelf, and the restored job reads it
-    // again. A repair out on its thread still comes back through the mail.
+    // The pipeline is going down. Every run stops where it stands and keeps
+    // its generation, so no run starts under it again: what it read is on
+    // its shelf, and the restored job reads it again. A repair out on its
+    // thread still comes back through the mail.
     pub(in crate::pipeline) fn stop_runs(&mut self, limit: usize) {
         self.runs.stop(limit);
     }
