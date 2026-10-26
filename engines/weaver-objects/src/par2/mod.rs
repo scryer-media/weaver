@@ -274,12 +274,34 @@ impl Object for Par2 {
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
     // What arrived there is to come again, and the blocks it carried; a
-    // volume closed over them is open until they do.
+    // volume closed over them is open until they do. The walk reads the
+    // range again as it comes, so a recovery packet wholly inside it is
+    // forgotten and found again from the bytes that come, and counted once.
+    // The range is no longer lost: its bytes are coming.
     fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
-        if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
-            found.arrived.erase(range);
-            found.closed = false;
+        let mut found = Vec::new();
+        let Some(state) = self.volumes.get_mut(volume.0 as usize) else {
+            return;
+        };
+        state.arrived.erase(range);
+        state.closed = false;
+        state.lost = state
+            .lost
+            .iter()
+            .flat_map(|lost| walker::minus(*lost, range))
+            .collect();
+        state.walker.unposted(range, &mut found);
+        let mut forgotten = 0;
+        for set in self.sets.values_mut() {
+            set.recovery.retain(|_, at| {
+                let inside = at.volume == volume && range.covers(at.range);
+                forgotten += u64::from(inside);
+                !inside
+            });
         }
+        let state = self.volume(volume);
+        state.walked_blocks = state.walked_blocks.saturating_sub(forgotten);
+        self.take(volume, found);
     }
 
     // The volume's bytes are all envelope: they stay in the volume's own

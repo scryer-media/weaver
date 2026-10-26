@@ -962,3 +962,249 @@ fn the_article_that_closes_the_gap_is_walked_with_the_hold_full() {
     );
     assert_eq!(walker.front(), length);
 }
+
+// Every packet of a PAR2 file, by where it lies and whether it carries a
+// recovery block.
+fn packets_of(bytes: &[u8]) -> Vec<(ByteRange, bool)> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 64 <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().expect("8 bytes"));
+        let recovery = &bytes[at + 48..at + 64] == b"PAR 2.0\0RecvSlic";
+        out.push((ByteRange::at(at as u64, length), recovery));
+        at += length as usize;
+    }
+    out
+}
+
+// The articles of a volume, delivered in order, those inside `damaged`
+// with every byte wrong.
+fn deliver_articles(
+    object: &mut Par2,
+    volume: weaver_graph::VolumeIndex,
+    bytes: &[u8],
+    damaged: Option<ByteRange>,
+) {
+    for (index, piece) in bytes.chunks(ARTICLE as usize).enumerate() {
+        let offset = index as u64 * ARTICLE;
+        let mut piece = piece.to_vec();
+        let range = ByteRange::at(offset, piece.len() as u64);
+        let provenance = match damaged.and_then(|damaged| damaged.intersect(range)) {
+            Some(_) => {
+                piece.iter_mut().for_each(|byte| *byte ^= 0x5A);
+                Provenance::Damaged
+            }
+            None => Provenance::Fresh,
+        };
+        object.deliver(
+            weaver_graph::Delivery {
+                volume,
+                offset,
+                bytes: &piece,
+                provenance,
+            },
+            &mut |_, _| false,
+            &mut Vec::new(),
+        );
+    }
+}
+
+// The articles covering the first recovery packet whose articles end before
+// the volume does, so the walk goes on past them.
+fn passed_articles(bytes: &[u8]) -> ByteRange {
+    packets_of(bytes)
+        .into_iter()
+        .filter(|(_, recovery)| *recovery)
+        .map(|(packet, _)| {
+            ByteRange::new(
+                packet.start / ARTICLE * ARTICLE,
+                packet.end.div_ceil(ARTICLE) * ARTICLE,
+            )
+        })
+        .find(|articles| articles.end < bytes.len() as u64)
+        .expect("a recovery packet clear of the last article")
+}
+
+// Recovery packets the walk can find once `range` came again: every one
+// that does not straddle its edges, whose bytes before or after it do not
+// come again.
+fn findable(bytes: &[u8], range: ByteRange) -> u64 {
+    packets_of(bytes)
+        .into_iter()
+        .filter(|(packet, recovery)| {
+            *recovery && (range.covers(*packet) || packet.intersect(range).is_none())
+        })
+        .count() as u64
+}
+
+fn redeliver(object: &mut Par2, volume: weaver_graph::VolumeIndex, bytes: &[u8], range: ByteRange) {
+    object.deliver(
+        weaver_graph::Delivery {
+            volume,
+            offset: range.start,
+            bytes: &bytes[range.start as usize..range.end as usize],
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+}
+
+// A recovery volume's articles arrive damaged and the walk goes on past
+// them; their bytes come again correct, and every packet wholly inside them
+// is found from what came, each counted once.
+#[test]
+fn articles_the_walk_read_damaged_are_walked_again_when_they_come_again() {
+    let data = payload(50, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 1);
+    assert_eq!(files.len(), 2);
+    let mut job = job(&files[..1]);
+    job.member("payload.bin", &data);
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    let range = passed_articles(bytes);
+    deliver_articles(&mut job.object, volume, bytes, Some(range));
+    bind(&mut job);
+    let in_hand = |object: &Par2| {
+        object
+            .sets
+            .values()
+            .map(|state| state.recovery.len() as u64)
+            .sum::<u64>()
+    };
+    let missed = in_hand(&job.object);
+    job.object.unposted(volume, range);
+    redeliver(&mut job.object, volume, bytes, range);
+    let named = job.object.volumes[volume.0 as usize].named_blocks;
+    let walked = job.object.volumes[volume.0 as usize].walked_blocks;
+    job.object.volume_closed(volume, &mut Vec::new());
+    bind(&mut job);
+    let expected = findable(bytes, range);
+    assert_eq!(reachable(&job.object), expected);
+    assert!(expected > missed, "the damaged articles held a packet");
+    assert_eq!(walked, expected, "every block found is counted once");
+    assert_eq!(named, Some(4));
+}
+
+// The same, the bytes coming again before and after a checkpoint taken
+// between: the checkpoint resumes at the start of the range, steps over
+// what the walk read past it, and the replay of every byte finds each
+// packet once.
+#[test]
+fn a_walk_checkpointed_after_its_range_is_unposted_resumes_at_the_range() {
+    let data = payload(51, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 1);
+    let mut job = job(&files[..1]);
+    job.member("payload.bin", &data);
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    let range = passed_articles(bytes);
+    deliver_articles(&mut job.object, volume, bytes, Some(range));
+    job.object.unposted(volume, range);
+    let walk = &job.object.volumes[volume.0 as usize].walker;
+    assert_eq!(walk.front(), range.start, "the checkpoint's front");
+    assert!(
+        walk.lost()
+            .contains(&ByteRange::new(range.end, bytes.len() as u64)),
+        "{:?}",
+        walk.lost()
+    );
+    let mut restored = super::facts::par2(&job.object.facts()).expect("restores");
+    deliver_articles(&mut restored, volume, bytes, None);
+    let walked = restored.volumes[volume.0 as usize].walked_blocks;
+    restored.volume_closed(volume, &mut Vec::new());
+    job.object = restored;
+    bind(&mut job);
+    assert_eq!(reachable(&job.object), findable(bytes, range));
+    assert_eq!(walked, findable(bytes, range));
+}
+
+// A recovery packet built by hand: header, exponent and payload, its hash
+// over everything past the hash.
+fn recovery_packet(exponent: u32, payload: &[u8]) -> Vec<u8> {
+    use par2_rs::FileHashState;
+    use par2_rs::packet::{HEADER_SIZE, MAGIC};
+
+    let length = (HEADER_SIZE + 4 + payload.len()) as u64;
+    let mut packet = Vec::with_capacity(length as usize);
+    packet.extend_from_slice(MAGIC);
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.extend_from_slice(&[0; 16]);
+    packet.extend_from_slice(&[7; 16]);
+    packet.extend_from_slice(b"PAR 2.0\0RecvSlic");
+    packet.extend_from_slice(&exponent.to_le_bytes());
+    packet.extend_from_slice(payload);
+    let mut hasher = FileHashState::new();
+    hasher.update(&packet[32..]);
+    let hash = hasher.finalize();
+    packet[16..32].copy_from_slice(&hash);
+    packet
+}
+
+fn recovered(found: &[super::walker::Found]) -> Vec<(u32, ByteRange)> {
+    found
+        .iter()
+        .filter_map(|found| match found {
+            super::walker::Found::Recovery {
+                exponent, range, ..
+            } => Some((*exponent, *range)),
+            _ => None,
+        })
+        .collect()
+}
+
+// A recovery packet streamed when the range it is read from is unposted is
+// dropped, its hash having read the bytes that were there, and found again
+// from the bytes that come. One streamed past a range behind the front is
+// not touched: the walk past the range goes on.
+#[test]
+fn a_streamed_packet_in_an_unposted_range_is_dropped_and_found_again() {
+    use super::walker::Walker;
+
+    let first = recovery_packet(1, &payload(52, 4000));
+    let second = recovery_packet(2, &payload(53, 4000));
+    let mut volume = first.clone();
+    volume.extend_from_slice(&second);
+    let one = ByteRange::at(0, first.len() as u64);
+    let two = ByteRange::at(one.end, second.len() as u64);
+
+    // Inside the range: the front stands in it, and starts again from it.
+    let mut walker = Walker::default();
+    let mut found = Vec::new();
+    let mut wrong = volume[..2000].to_vec();
+    wrong[1000] ^= 0x01;
+    walker.deliver(0, &wrong, &mut found);
+    assert!(walker.reading_recovery());
+    walker.unposted(ByteRange::new(0, 2000), &mut found);
+    assert_eq!(walker.front(), 0);
+    walker.deliver(0, &volume[..2000], &mut found);
+    walker.deliver(2000, &volume[2000..], &mut found);
+    assert_eq!(recovered(&found), vec![(1, one), (2, two)]);
+
+    // Behind the front: the first packet is walked again on its own while
+    // the second streams on.
+    let mut walker = Walker::default();
+    let mut found = Vec::new();
+    let mut wrong = volume[..one.end as usize].to_vec();
+    wrong[1000] ^= 0x01;
+    walker.deliver(0, &wrong, &mut found);
+    walker.deliver(
+        one.end,
+        &volume[one.end as usize..two.start as usize + 2000],
+        &mut found,
+    );
+    assert!(recovered(&found).is_empty(), "the first failed its hash");
+    walker.unposted(one, &mut found);
+    assert_eq!(walker.front(), 0, "a checkpoint resumes at the range");
+    assert!(walker.lost().is_empty(), "the second starts where it ends");
+    walker.deliver(0, &volume[..one.end as usize], &mut found);
+    assert_eq!(recovered(&found), vec![(1, one)]);
+    assert_eq!(walker.front(), two.start, "the second still streams");
+    walker.deliver(
+        two.start + 2000,
+        &volume[two.start as usize + 2000..],
+        &mut found,
+    );
+    assert_eq!(recovered(&found), vec![(1, one), (2, two)]);
+    assert_eq!(walker.front(), two.end);
+}

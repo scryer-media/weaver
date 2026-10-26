@@ -10,6 +10,11 @@
 // passes and only its exponent kept; the payload stays in the volume's file
 // and is read back when a repair spends it. Bytes that arrive ahead of the
 // front are held until the front reaches them, within a bound.
+//
+// What the walk has read past it has read as it was then. A range whose
+// bytes come again is walked again: from its start, when the front stands
+// in it, or by a walk of its own bounded by it, when the front is past it,
+// so the walk past the range goes on as it was.
 
 use std::collections::BTreeMap;
 
@@ -67,12 +72,17 @@ pub(super) struct Walker {
     // Ranges no server has; the front steps over them and resyncs, or every
     // packet past a lost article would stay unfound.
     lost: Vec<ByteRange>,
+    // Ranges behind the front whose bytes come again, in offset order and
+    // apart, each walked again by a walk of its own that ends where the
+    // range does.
+    again: Vec<(ByteRange, Walker)>,
 }
 
 impl Walker {
-    // A walk resumed at a packet boundary: a packet streamed when the
-    // checkpoint was taken is hashed again from its header, and what was
-    // held past the front is delivered again by the replay.
+    // A walk resumed where a checkpoint left it, a packet boundary or the
+    // start of a range walked again: a packet streamed when the checkpoint
+    // was taken is hashed again from its header, and what was held past the
+    // front is delivered again by the replay.
     pub(super) fn resumed(front: u64, lost: Vec<ByteRange>) -> Self {
         Self {
             next: front,
@@ -81,9 +91,37 @@ impl Walker {
         }
     }
 
-    // The packet boundary the walk has reached.
+    // A walk of a range that comes again: it ends at the range's end, as at
+    // a loss, and a packet the end cuts is dropped.
+    fn bounded(range: ByteRange) -> Self {
+        Self::resumed(range.start, vec![ByteRange::new(range.end, u64::MAX)])
+    }
+
+    // The packet boundary the walk has reached, or the earliest a range
+    // walked again has: what a resumed walk starts from.
     pub(super) fn front(&self) -> u64 {
-        self.streamed.as_ref().map_or(self.next, |open| open.at)
+        self.resume().0
+    }
+
+    // The front a resumed walk starts from and the ranges it steps over:
+    // the losses, and what lies between a range walked again and the next
+    // place a walk stands, which the walk already read.
+    fn resume(&self) -> (u64, Vec<ByteRange>) {
+        let mut ahead = self.streamed.as_ref().map_or(self.next, |open| open.at);
+        let mut lost = self.lost.clone();
+        for (range, walk) in self.again.iter().rev() {
+            let (front, inside) = walk.resume();
+            lost.extend(
+                inside
+                    .iter()
+                    .filter_map(|piece| piece.intersect(ByteRange::new(0, range.end))),
+            );
+            if range.end < ahead {
+                lost.push(ByteRange::new(range.end, ahead));
+            }
+            ahead = front;
+        }
+        (ahead, lost)
     }
 
     // Whether the packet at the front is a recovery packet: the one being
@@ -102,11 +140,24 @@ impl Walker {
         matches!(header, Some(PacketType::RecoverySlice))
     }
 
-    pub(super) fn lost(&self) -> &[ByteRange] {
-        &self.lost
+    // What a resumed walk steps over.
+    pub(super) fn lost(&self) -> Vec<ByteRange> {
+        self.resume().1
     }
 
     pub(super) fn deliver(&mut self, offset: u64, bytes: &[u8], found: &mut Vec<Found>) {
+        let arrived = ByteRange::at(offset, bytes.len() as u64);
+        for (range, walk) in &mut self.again {
+            if let Some(piece) = arrived.intersect(*range) {
+                let from = (piece.start - offset) as usize;
+                walk.deliver(
+                    piece.start,
+                    &bytes[from..from + piece.len() as usize],
+                    found,
+                );
+            }
+        }
+        self.again.retain(|(range, walk)| walk.next < range.end);
         if offset + bytes.len() as u64 <= self.next {
             return;
         }
@@ -123,9 +174,99 @@ impl Walker {
     }
 
     pub(super) fn lose(&mut self, range: ByteRange, found: &mut Vec<Found>) {
+        for (bound, walk) in &mut self.again {
+            if let Some(piece) = range.intersect(*bound) {
+                walk.lose(piece, found);
+            }
+        }
+        self.again.retain(|(range, walk)| walk.next < range.end);
         if range.end > self.next {
             self.lost.push(range);
             self.walk(found);
+        }
+    }
+
+    // The bytes of the range come again, and what was read of them is not
+    // behind the walk: no longer lost, not held, and walked again as they
+    // come. When the front stands in the range it starts again from the
+    // range's start; a packet the range cuts into is dropped, as its hash
+    // read the bytes that were there. When the front is past the range, the
+    // range is walked on its own and the walk past it goes on.
+    pub(super) fn unposted(&mut self, range: ByteRange, found: &mut Vec<Found>) {
+        if range.is_empty() {
+            return;
+        }
+        self.lost = self
+            .lost
+            .iter()
+            .flat_map(|lost| minus(*lost, range))
+            .collect();
+        self.unhold(range);
+        for (bound, walk) in &mut self.again {
+            if let Some(piece) = range.intersect(*bound) {
+                walk.unposted(piece, found);
+            }
+        }
+        if range.start >= self.next {
+            return;
+        }
+        if range.end >= self.next {
+            self.streamed = None;
+            self.next = range.start;
+            // What the walks of their own were to read from the range's
+            // start on is read again by this one: they end there.
+            for (bound, walk) in &mut self.again {
+                if bound.end > range.start {
+                    bound.end = range.start.max(bound.start);
+                    walk.end_at(bound.end, found);
+                }
+            }
+            self.again.retain(|(bound, walk)| walk.next < bound.end);
+            return;
+        }
+        if self
+            .streamed
+            .as_ref()
+            .is_some_and(|open| open.at < range.end)
+        {
+            self.streamed = None;
+        }
+        let mut parts = vec![range];
+        for (bound, _) in &self.again {
+            parts = parts.iter().flat_map(|part| minus(*part, *bound)).collect();
+        }
+        self.again
+            .extend(parts.into_iter().map(|part| (part, Self::bounded(part))));
+        self.again.sort_by_key(|(bound, _)| bound.start);
+    }
+
+    // A walk of a range walked again ends sooner.
+    fn end_at(&mut self, end: u64, found: &mut Vec<Found>) {
+        self.lost.retain(|lost| lost.end != u64::MAX);
+        self.lost.push(ByteRange::new(end, u64::MAX));
+        self.walk(found);
+    }
+
+    // Drop the held bytes inside the range.
+    fn unhold(&mut self, range: ByteRange) {
+        let touching: Vec<u64> = self
+            .held
+            .range(..range.end)
+            .filter(|(at, island)| **at + island.len() as u64 > range.start)
+            .map(|(at, _)| *at)
+            .collect();
+        for at in touching {
+            let Some(island) = self.held.remove(&at) else {
+                continue;
+            };
+            self.held_bytes -= island.len();
+            let whole = ByteRange::at(at, island.len() as u64);
+            for keep in minus(whole, range) {
+                let from = (keep.start - at) as usize;
+                let kept = island[from..from + keep.len() as usize].to_vec();
+                self.held_bytes += kept.len();
+                self.held.insert(keep.start, kept);
+            }
         }
     }
 
@@ -287,6 +428,17 @@ impl Walker {
             }
         }
     }
+}
+
+// What of `range` lies outside `cut`.
+pub(super) fn minus(range: ByteRange, cut: ByteRange) -> impl Iterator<Item = ByteRange> {
+    [
+        (range.start, range.end.min(cut.start)),
+        (range.start.max(cut.end), range.end),
+    ]
+    .into_iter()
+    .filter(|(start, end)| start < end)
+    .map(|(start, end)| ByteRange::new(start, end))
 }
 
 fn body_cap(packet_type: PacketType) -> Option<u64> {

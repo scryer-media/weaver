@@ -239,7 +239,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
         .iter()
         .map(|volume| VolumeFacts {
             front: volume.walker.front(),
-            walk_lost: volume.walker.lost().to_vec(),
+            walk_lost: volume.walker.lost(),
             arrived: volume.arrived.clone(),
             lost: volume.lost.clone(),
             closed: volume.closed,
