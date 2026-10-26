@@ -425,6 +425,9 @@ pub struct AddRequest {
     pub unpack: Option<bool>,
     // The attributes its job carries.
     pub metadata: Vec<(String, String)>,
+    // Its own rate limits in bytes a second, none being no limit.
+    pub upload_limit: Option<u64>,
+    pub download_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -2476,8 +2479,8 @@ impl TorrentService {
             policy_override: request.policy_override.clone(),
             unpack: request.unpack,
             metadata: request.metadata.clone(),
-            upload_limit: None,
-            download_limit: None,
+            upload_limit: request.upload_limit,
+            download_limit: request.download_limit,
             sequential: false,
             first_last_piece_first: false,
         }
@@ -2791,6 +2794,7 @@ impl TorrentService {
             ssl,
             picking,
             saved,
+            listed,
         ) = {
             let live = self.inner.live.lock().await;
             let Some(torrent) = live.get(&job_id) else {
@@ -2839,7 +2843,19 @@ impl TorrentService {
                 // libtorrent `torrent::read_resume_data`: the saved peers
                 // are known from the start and the saved bans hold.
                 torrent.resume.clone(),
+                // The trackers it lists, read under the lock a tracker edit
+                // writes under.
+                self.inner.db.list_torrent_trackers(job_id),
             )
+        };
+        // The trackers the torrent lists now, each with who named it, stand
+        // in for its metainfo's.
+        let listed = match listed {
+            Ok(listed) => listed,
+            Err(error) => {
+                self.fail(job_id, state_error(error)).await;
+                return;
+            }
         };
         let plan = match self.inner.sessions.routes().plan(scope) {
             Ok(plan) => plan,
@@ -2863,15 +2879,6 @@ impl TorrentService {
                 return;
             }
         };
-        // The trackers the torrent lists now, each with who named it, stand
-        // in for its metainfo's.
-        let trackers = match self.inner.db.list_torrent_trackers(job_id) {
-            Ok(trackers) => tracker_tiers(&trackers),
-            Err(error) => {
-                self.fail(job_id, state_error(error)).await;
-                return;
-            }
-        };
         let (identity, tracker_handover) = match fetched {
             Some(fetched)
                 if !paused
@@ -2892,7 +2899,7 @@ impl TorrentService {
             ratelimits,
             identity: Some(identity),
             totals,
-            tracker_tiers: Some(trackers),
+            tracker_tiers: Some(tracker_tiers(&listed)),
             initial_peers: (!saved.peers.is_empty()).then(|| saved.peers.clone()),
             banned_peers: saved.banned.clone(),
             file_priorities: Some(picking.0),
@@ -2933,6 +2940,17 @@ impl TorrentService {
                     .collect();
                 if !since.is_empty() {
                     handle.ban_peers(&since);
+                }
+                // A tracker edit made while the session took the torrent,
+                // which found it in no session, reaches it too.
+                match self.inner.db.list_torrent_trackers(job_id) {
+                    Ok(trackers) if trackers != listed => {
+                        handle.replace_trackers(tracker_tiers(&trackers));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's trackers");
+                    }
                 }
                 torrent.settle(self.inner.clock.now_ms());
                 torrent.attached = Some(Attached {
@@ -3280,8 +3298,8 @@ impl TorrentService {
 
     // Write the trackers `edit` makes of the torrent's list and hand them
     // to its session. A tracker the list already held keeps who named it;
-    // the operator names any other. The rule they match is picked again in
-    // memory only: the stored rule is not this path's to write.
+    // the operator names any other. The rule they match is picked again; no
+    // rule is stored, a restart picks it from the trackers written here.
     async fn edit_trackers(
         &self,
         job_id: JobId,
