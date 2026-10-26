@@ -41,7 +41,7 @@ func scriptedCappedProvider(t *testing.T, refusals int32) (host, port string, se
 				}
 				reader := bufio.NewReader(conn)
 				_, _ = conn.Write([]byte("200 scripted ready\r\n"))
-				for _, reply := range []string{"381 password\r\n", "281 authenticated\r\n"} {
+				for _, reply := range []string{"200 control\r\n", "381 password\r\n", "281 authenticated\r\n"} {
 					if _, err := reader.ReadString('\n'); err != nil {
 						return
 					}

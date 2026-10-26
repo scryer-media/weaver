@@ -1473,6 +1473,8 @@ var canonicalFixtureSlugs = []string{
 	"zip-corrupted",
 	"zip-encrypted",
 	"zip-unencrypted",
+	"zip-deflate-lost-article",
+	"zip-cp437-empty-dirs",
 	"xz-text",
 	"xz-video",
 	"zstd-single",

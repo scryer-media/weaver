@@ -154,7 +154,7 @@ func assertTerminalFixtureStateSweeping(dbPath string, jobID int, expectedStatus
 	}
 
 	if sweepOrphans {
-		if err := assertNoOrphanActiveState(db); err != nil {
+		if err := assertNoOrphanActiveState(db, datastore); err != nil {
 			return err
 		}
 	}
@@ -165,14 +165,18 @@ func assertTerminalFixtureStateSweeping(dbPath string, jobID int, expectedStatus
 // lingeringJobActiveState counts the job's rows in every active-state table in
 // one statement, and names each table that still holds any.
 func lingeringJobActiveState(db *sql.DB, datastore weaverDatastore, jobID int) ([]string, error) {
-	counts := make([]string, 0, len(weaverActiveStateTables))
-	args := make([]any, 0, len(weaverActiveStateTables))
-	for _, table := range weaverActiveStateTables {
+	tables, err := presentActiveStateTables(db, datastore)
+	if err != nil {
+		return nil, err
+	}
+	counts := make([]string, 0, len(tables))
+	args := make([]any, 0, len(tables))
+	for _, table := range tables {
 		counts = append(counts, fmt.Sprintf(`(SELECT COUNT(*) FROM %s WHERE job_id = ?)`, table.Name))
 		args = append(args, jobID)
 	}
 	query := rebindWeaverSQL(datastore, `SELECT `+strings.Join(counts, ", "))
-	values := make([]int, len(weaverActiveStateTables))
+	values := make([]int, len(tables))
 	dest := make([]any, len(values))
 	for i := range values {
 		dest[i] = &values[i]
@@ -181,7 +185,7 @@ func lingeringJobActiveState(db *sql.DB, datastore weaverDatastore, jobID int) (
 		return nil, fmt.Errorf("count active state rows for job %d: %w", jobID, err)
 	}
 	var lingering []string
-	for i, table := range weaverActiveStateTables {
+	for i, table := range tables {
 		if values[i] > 0 {
 			lingering = append(lingering, fmt.Sprintf("%s=%d", table.Name, values[i]))
 		}
@@ -196,8 +200,12 @@ func assertNoLingeringWeaverActiveState(dbPath string) error {
 	}
 	defer closeWeaverStateDB(db, datastore)
 
+	tables, err := presentActiveStateTables(db, datastore)
+	if err != nil {
+		return err
+	}
 	var lingering []string
-	for _, table := range weaverActiveStateTables {
+	for _, table := range tables {
 		count, err := countTableRows(db, table.Name)
 		if err != nil {
 			return err
@@ -220,7 +228,7 @@ func assertNoOrphanActiveStatePath(dbPath string) error {
 	}
 	defer closeWeaverStateDB(db, datastore)
 
-	return assertNoOrphanActiveState(db)
+	return assertNoOrphanActiveState(db, datastore)
 }
 
 func loadJobHistoryStatus(db *sql.DB, datastore weaverDatastore, jobID int) (string, bool, error) {
@@ -289,9 +297,32 @@ func orphanActiveStateJobIDs(db *sql.DB, table string) (string, error) {
 	return strings.Join(jobIDs, ","), nil
 }
 
-func assertNoOrphanActiveState(db *sql.DB) error {
+// presentActiveStateTables is the active-state tables this database has. A
+// database a migration has dropped tables from sweeps the ones it still holds.
+func presentActiveStateTables(db *sql.DB, datastore weaverDatastore) ([]weaverActiveStateTable, error) {
+	present := make([]weaverActiveStateTable, 0, len(weaverActiveStateTables))
+	for _, table := range weaverActiveStateTables {
+		exists, err := weaverStateTableExists(db, datastore, table.Name)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			present = append(present, table)
+		}
+	}
+	return present, nil
+}
+
+func assertNoOrphanActiveState(db *sql.DB, datastore weaverDatastore) error {
+	tables, err := presentActiveStateTables(db, datastore)
+	if err != nil {
+		return err
+	}
 	var orphaned []string
-	for _, table := range weaverActiveStateTables[1:] {
+	for _, table := range tables {
+		if table.Name == "active_jobs" {
+			continue
+		}
 		var count int
 		query := fmt.Sprintf(
 			`SELECT COUNT(*) FROM %s WHERE NOT EXISTS (

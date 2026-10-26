@@ -12102,6 +12102,34 @@
       }
     },
     {
+      "path": "testdata/zip-cp437-empty-dirs/archive.zip",
+      "size": 3146786,
+      "blake3": "bbff9bbb4c61903e7ec58ca4cc8d496456db5ad172a393b18d1a811ed7f166bb",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/zip-deflate-lost-article/archive.zip",
+      "size": 6292184,
+      "blake3": "20f41d06904378da2dfbb4102e859e0f76ee01619f115482cf3baa78d636c9d9",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
       "path": "testdata/zip-encrypted/archive.zip",
       "size": 85923231,
       "blake3": "1c1c0226fc14df27a510ac67f7a0990a4167db5dab71d8b1516efd301b188591",

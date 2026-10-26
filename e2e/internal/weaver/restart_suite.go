@@ -5,6 +5,7 @@ package weaver
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -180,7 +181,7 @@ func cmdRestartTest(args []string) {
 }
 
 func restartCases() []restartCase {
-	return []restartCase{
+	return append([]restartCase{
 		{
 			Name:        "download_completed_file_survives_restart",
 			Description: "Completed archive files should survive a crash/restart without redownloading",
@@ -334,7 +335,7 @@ func restartCases() []restartCase {
 			Timeout:     10 * time.Minute,
 			Run:         runRepairDataWaitReadsFetchingRepairData,
 		},
-	}
+	}, graphRestartCases()...)
 }
 
 func selectRestartCases(requested []string) []restartCase {
@@ -1164,6 +1165,7 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 	}
 
 	type aggregateSpec struct {
+		table string
 		query string
 		apply func(*restartJobMetrics, int64, int64)
 	}
@@ -1185,24 +1187,28 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 
 	aggregates := []aggregateSpec{
 		{
+			table: "active_files",
 			query: `SELECT job_id, COUNT(*), 0 FROM active_files GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {
 				m.Files = int(count)
 			},
 		},
 		{
+			table: "active_par2_files",
 			query: `SELECT job_id, COUNT(*), 0 FROM active_par2_files GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {
 				m.Par2Files = int(count)
 			},
 		},
 		{
+			table: "active_extraction_chunks",
 			query: `SELECT job_id, COUNT(*), 0 FROM active_extraction_chunks GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {
 				m.ExtractionChunks = int(count)
 			},
 		},
 		{
+			table: "active_extracted",
 			query: `SELECT job_id, COUNT(*), 0 FROM active_extracted GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {
 				m.Extracted = int(count)
@@ -1210,6 +1216,12 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 		},
 	}
 	for _, aggregate := range aggregates {
+		// A table the graph-engine migration dropped reads as empty.
+		if present, err := weaverStateTableExists(db, datastore, aggregate.table); err != nil {
+			return snapshot, err
+		} else if !present {
+			continue
+		}
 		rows, err := db.Query(rebindWeaverSQL(datastore, aggregate.query))
 		if err != nil {
 			return snapshot, err
@@ -1235,6 +1247,12 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 		rows.Close()
 	}
 
+	if present, err := weaverStateTableExists(db, datastore, "active_extraction_chunks"); err != nil || !present {
+		if err != nil {
+			return snapshot, err
+		}
+		return readRestartExtractedMembers(db, datastore, snapshot)
+	}
 	rows, err = db.Query(rebindWeaverSQL(datastore, `
 		SELECT job_id, set_name, member_name, volume_index, bytes_written, temp_path, start_offset, end_offset, verified, appended
 		FROM active_extraction_chunks
@@ -1265,8 +1283,11 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 	if err := rows.Err(); err != nil {
 		return snapshot, err
 	}
+	return readRestartExtractedMembers(db, datastore, snapshot)
+}
 
-	rows, err = db.Query(rebindWeaverSQL(datastore, `SELECT job_id, member_name, output_path FROM active_extracted ORDER BY job_id, member_name`))
+func readRestartExtractedMembers(db *sql.DB, datastore weaverDatastore, snapshot restartDBSnapshot) (restartDBSnapshot, error) {
+	rows, err := db.Query(rebindWeaverSQL(datastore, `SELECT job_id, member_name, output_path FROM active_extracted ORDER BY job_id, member_name`))
 	if err != nil {
 		return snapshot, err
 	}
@@ -1518,13 +1539,17 @@ func capturePar2AliasState(dbPath string, jobID int) (restartPar2AliasState, err
 	}
 	sort.Strings(state.ClassificationSets)
 
-	factRows, err := db.Query(rebindWeaverSQL(datastore, `
-		SELECT set_name, COUNT(*)
-		FROM active_rar_volume_facts
-		WHERE job_id = ?
-		GROUP BY set_name
-		ORDER BY set_name
-	`), jobID)
+	// The graph-engine migration drops the facts and chunk tables; a
+	// database without them holds none.
+	factsPresent, err := weaverStateTableExists(db, datastore, "active_rar_volume_facts")
+	if err != nil {
+		return state, err
+	}
+	factQuery := `SELECT set_name, COUNT(*) FROM active_rar_volume_facts WHERE job_id = ? GROUP BY set_name ORDER BY set_name`
+	if !factsPresent {
+		factQuery = `SELECT '', 0 WHERE ? IS NULL`
+	}
+	factRows, err := db.Query(rebindWeaverSQL(datastore, factQuery), jobID)
 	if err != nil {
 		return state, err
 	}
@@ -1548,6 +1573,11 @@ func capturePar2AliasState(dbPath string, jobID int) (restartPar2AliasState, err
 		"active_extracted":         &state.ActiveExtracted,
 		"active_extraction_chunks": &state.ExtractionChunks,
 	} {
+		if present, err := weaverStateTableExists(db, datastore, table); err != nil {
+			return state, err
+		} else if !present {
+			continue
+		}
 		query := rebindWeaverSQL(datastore, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE job_id = ?", table))
 		if err := db.QueryRow(query, jobID).Scan(destination); err != nil {
 			return state, err
