@@ -362,11 +362,6 @@ pub(crate) enum DemotionReason {
     // writes the same bytes to a different file, so this is a demotion rather
     // than a job failure.
     DestinationWriteFailed,
-    // One of the set's destinations could not be marked sparse. Raised
-    // **before** the file holds a hole, so demoting here is what keeps a
-    // Windows filesystem from allocating a whole volume's worth of zeros
-    // behind a member partial whose first routed byte lands near its end.
-    SparseMarkFailed,
     // Committing a verified set to its destinations failed. The bytes are
     // good; the filesystem refused the rename, so the set is rebuilt the
     // ordinary way rather than left half-committed.
@@ -580,10 +575,9 @@ impl DemotionReason {
             // conventional extractor applies the same path validator and the
             // same collision rule, and it can apply them reading the overlay.
             Self::UnsafeDestination | Self::CollidingDestinations => VolumeDemand::Virtual,
-            // A destination write failed, or a destination could not be marked
-            // sparse. The overlay's member half is exactly those files, and the
-            // path to them is the thing that is failing.
-            Self::DestinationWriteFailed | Self::SparseMarkFailed => VolumeDemand::Real,
+            // A destination write failed. The overlay's member half is those
+            // files, and the path to them is the thing that is failing.
+            Self::DestinationWriteFailed => VolumeDemand::Real,
             // Finalization got part way: some members are renamed to their
             // destinations and the overlay's partial map points at paths that
             // are no longer there.
@@ -670,7 +664,6 @@ impl DemotionReason {
             Self::CollidingDestinations => "colliding_destinations",
             Self::VolumeCrcMismatch => "volume_crc_mismatch",
             Self::DestinationWriteFailed => "destination_write_failed",
-            Self::SparseMarkFailed => "sparse_mark_failed",
             Self::FinalizationFailed => "finalization_failed",
             Self::IdentityRosterUnfillable => "identity_roster_unfillable",
             Self::IdentityVolumeMismatch => "identity_volume_mismatch",
@@ -1155,8 +1148,7 @@ pub(crate) struct HoldsScratch {
     ceiling: u64,
     // The sparse marker. The scratch is append-only so it holds no hole of its
     // own, but it is a direct-store-created file in the working directory and
-    // it inherits the same rule: marked at creation, before a byte is written,
-    // and a marking failure demotes rather than proceeding.
+    // it uses the same best-effort marking at creation, before a byte is written.
     sparse: SparseMarking,
     // Live pins over the **current** image. Replaced, not reset, whenever the
     // image is: the pins of a relocated-away image keep decrementing their own
@@ -1261,8 +1253,8 @@ fn take_over_scratch_path(
     Ok(())
 }
 
-// Creates (or truncates) a scratch file, read/write, marked sparse before a
-// byte is written. On Windows it is opened share-delete: `discard` unlinks
+// Creates (or truncates) a scratch file, read/write, with best-effort sparse
+// marking before a byte is written. On Windows it is opened share-delete: `discard` unlinks
 // the scratch under live pins, and a pinned compaction renames its packed copy
 // over the path, and neither is allowed against a handle opened without it.
 fn open_scratch_file(
@@ -1278,11 +1270,7 @@ fn open_scratch_file(
         options.share_mode(0x1 | 0x2 | 0x4);
     }
     let file = options.open(path)?;
-    if let Err(error) = super::sparse::SparseMarker::mark_sparse(sparse, &file) {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(error);
-    }
+    super::sparse::mark_sparse_best_effort(&file, sparse);
     Ok(file)
 }
 

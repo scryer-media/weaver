@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
-use crate::pipeline::direct_store::sparse::{SparseMarker, SparseMarking};
+use crate::pipeline::direct_store::sparse::{SparseMarking, mark_sparse_best_effort};
 
 // An exclusively created provisional destination. Its logical output is charged
 // once; repair overwrites do not allocate a second file. The run journal owns
@@ -91,7 +91,7 @@ impl ExtractionRoot {
             let file = self.dir.open_with(&safe, &options)?;
             created = true;
             let file = file.into_std();
-            marker.mark_sparse(&file)?;
+            mark_sparse_best_effort(&file, &marker);
             file.set_len(len)?;
             Ok(file)
         })();
@@ -279,7 +279,41 @@ mod tests {
     }
 
     #[test]
-    fn positional_partial_collisions_and_sparse_failure_preserve_existing_files() {
+    fn positional_partial_remains_budgeted_and_writable_when_sparse_marking_fails() {
+        let (temp, root, budget) = root_and_budget();
+        let output = root
+            .create_positional_partial_with_marker(
+                Path::new("fallback.partial"),
+                8,
+                &budget,
+                SparseMarking::AlwaysFail,
+            )
+            .unwrap();
+        assert_eq!(budget.total_written(), 8);
+        assert_eq!(output.write_at(4, b"tail").unwrap(), 4);
+        assert_eq!(
+            std::fs::read(temp.path().join("fallback.partial")).unwrap(),
+            b"\0\0\0\0tail"
+        );
+        assert_eq!(output.write_at(0, b"head").unwrap(), 4);
+        assert!(output.write_at(8, b"x").is_err());
+        output.sync_data().unwrap();
+        root.publish_positional_partial(
+            &root,
+            Path::new("fallback.partial"),
+            Path::new("member"),
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join("member")).unwrap(),
+            b"headtail"
+        );
+        assert_eq!(budget.total_written(), 8);
+    }
+
+    #[test]
+    fn positional_partial_collisions_preserve_existing_files() {
         let (temp, root, budget) = root_and_budget();
         std::fs::write(temp.path().join("existing.partial"), b"keep").unwrap();
         assert!(
@@ -290,17 +324,6 @@ mod tests {
             std::fs::read(temp.path().join("existing.partial")).unwrap(),
             b"keep"
         );
-        assert_eq!(budget.total_written(), 0);
-        assert!(
-            root.create_positional_partial_with_marker(
-                Path::new("failed.partial"),
-                8,
-                &budget,
-                SparseMarking::AlwaysFail
-            )
-            .is_err()
-        );
-        assert!(!temp.path().join("failed.partial").exists());
         assert_eq!(budget.total_written(), 0);
         let _output = root
             .create_positional_partial(Path::new("owned.partial"), 8, &budget)

@@ -562,11 +562,11 @@ pub(crate) fn repair_damaged_volumes(
 // `ENOENT` at offset 0 and the set demotes *after* the targeted recovery has
 // already been downloaded, which is the most expensive moment to give up.
 //
-// So the target is created here, at the **PAR2-described** length, sparse and
-// wholly holes, and the repair fills it slice by slice. Only volumes the sweep
-// left no file for are touched, so a volume that really was reconstructed is
-// never re-marked after its bytes were written — the ordering rule
-// [`super::sparse`] states.
+// So the target is created here, at the **PAR2-described** length, with sparse
+// marking attempted before sizing, and the repair fills it slice by slice.
+// Only volumes the sweep left no file for are touched, so a volume that really
+// was reconstructed is never re-marked after its bytes were written — the
+// ordering rule [`super::sparse`] states.
 fn create_absent_repair_targets(
     damaged: &[DamagedDirectVolume],
     sparse: super::sparse::SparseMarking,
@@ -575,21 +575,12 @@ fn create_absent_repair_targets(
         if volume.len == 0 || volume.path.exists() {
             continue;
         }
-        let file =
-            super::sparse::create_sparse(&volume.path, &sparse).map_err(|error| match error {
-                super::sparse::SparseCreateError::Open(error) => {
-                    ReconstructionFailure::WriteFailed {
-                        volume_index: volume.volume_index,
-                        error: error.to_string(),
-                    }
-                }
-                super::sparse::SparseCreateError::Mark(error) => {
-                    ReconstructionFailure::SparseMarkFailed {
-                        volume_index: volume.volume_index,
-                        error: error.to_string(),
-                    }
-                }
-            })?;
+        let file = super::sparse::create_sparse(&volume.path, &sparse).map_err(|error| {
+            ReconstructionFailure::WriteFailed {
+                volume_index: volume.volume_index,
+                error: error.to_string(),
+            }
+        })?;
         // After the marking and never before it: on Windows the length is what
         // makes NTFS allocate, so an unmarked file sized here would cost the
         // whole volume in zeros.

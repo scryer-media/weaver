@@ -342,7 +342,6 @@ macro_rules! direct_demotions {
             colliding_destinations Forced::Direct(DemotionReason::CollidingDestinations),
             volume_crc_mismatch Forced::Direct(DemotionReason::VolumeCrcMismatch),
             destination_write_failed Forced::Direct(DemotionReason::DestinationWriteFailed),
-            sparse_mark_failed Forced::Direct(DemotionReason::SparseMarkFailed),
             finalization_failed Forced::Direct(DemotionReason::FinalizationFailed),
             identity_roster_unfillable Forced::Direct(DemotionReason::IdentityRosterUnfillable),
             identity_volume_mismatch Forced::Direct(DemotionReason::IdentityVolumeMismatch),
@@ -376,7 +375,7 @@ macro_rules! forced_list {
     };
 }
 
-const DIRECT_DEMOTIONS: [Forced; 35] = direct_demotions!(forced_list!());
+const DIRECT_DEMOTIONS: [Forced; 34] = direct_demotions!(forced_list!());
 const CHASE_DEMOTIONS: [Forced; 10] = chase_demotions!(forced_list!());
 
 // Each direct-store reason's variant, in declaration order. Exhaustive, so
@@ -414,12 +413,11 @@ fn direct_variant(reason: DemotionReason) -> usize {
         R::CollidingDestinations => 27,
         R::VolumeCrcMismatch => 28,
         R::DestinationWriteFailed => 29,
-        R::SparseMarkFailed => 30,
-        R::FinalizationFailed => 31,
-        R::IdentityRosterUnfillable => 32,
-        R::IdentityVolumeMismatch => 33,
-        R::SevenZip(_) => 34,
-        R::SevenZipAesChecksumMismatch => 35,
+        R::FinalizationFailed => 30,
+        R::IdentityRosterUnfillable => 31,
+        R::IdentityVolumeMismatch => 32,
+        R::SevenZip(_) => 33,
+        R::SevenZipAesChecksumMismatch => 34,
     }
 }
 
@@ -446,7 +444,7 @@ fn every_demotion_reason_is_forced() {
             Forced::Chase(..) => unreachable!(),
         })
         .collect();
-    assert_eq!(direct, (0..35).collect());
+    assert_eq!(direct, (0..34).collect());
     let chase: BTreeSet<_> = CHASE_DEMOTIONS
         .iter()
         .map(|forced| match forced {

@@ -339,8 +339,8 @@ impl Pipeline {
     }
 
     // What a placement whose writes did not all return does to its set: a
-    // destination that could not be made sparse, or a write the destination
-    // did not refuse outright, demotes the set; a refusal fails the job.
+    // write the destination did not refuse outright demotes the set; a
+    // refusal fails the job.
     //
     // `handoffs` are the routed articles the failed writes carried. They go
     // back to the conventional path, which the demotion is told about before
@@ -353,24 +353,6 @@ impl Pipeline {
         failure: DirectPlacementError,
     ) {
         match failure {
-            DirectPlacementError::Sparse { path, error } => {
-                // A destination that could not be marked sparse is refused *before*
-                // it holds a hole, so nothing has been allocated for it yet. Demote
-                // and let the conventional path own the bytes.
-                warn!(
-                    job_id = job_id.0,
-                    path = %path.display(),
-                    error = %error,
-                    "could not mark a direct-store destination sparse; demoting the set"
-                );
-                self.demote_direct_set_with_handoffs(
-                    job_id,
-                    set_index,
-                    DemotionReason::SparseMarkFailed,
-                    handoffs,
-                )
-                .await;
-            }
             DirectPlacementError::Write(error) if destination_refused(&error) => {
                 // A refusal the destination itself makes — no space, no
                 // permission, a read-only filesystem, a path component that is
@@ -2797,7 +2779,7 @@ pub(super) async fn prepare_direct_destination_paths(
         };
         match created {
             Ok(Ok(())) => {}
-            Ok(Err(super::super::sparse::SparseCreateError::Open(error))) => {
+            Ok(Err(error)) => {
                 // An ordinary filesystem failure, and exactly the one the
                 // first routed write would have hit. Left unprepared so the
                 // write path reports it as `destination_write_failed`,
@@ -2810,34 +2792,16 @@ pub(super) async fn prepare_direct_destination_paths(
                 );
                 continue;
             }
-            Ok(Err(super::super::sparse::SparseCreateError::Mark(error))) => {
-                warn!(
-                    job_id = job_id.0,
-                    path = %path.display(),
-                    error = %error,
-                    "a direct-store destination could not be marked sparse"
-                );
-                return (
-                    prepared,
-                    Err(DirectPlacementError::Sparse {
-                        path: path.clone(),
-                        error,
-                    }),
-                );
-            }
             Err(error) => {
                 warn!(
                     job_id = job_id.0,
                     path = %path.display(),
                     error = %error,
-                    "the sparse-marking task did not complete"
+                    "the destination-creation task did not complete"
                 );
                 return (
                     prepared,
-                    Err(DirectPlacementError::Sparse {
-                        path: path.clone(),
-                        error: std::io::Error::other(error),
-                    }),
+                    Err(DirectPlacementError::Write(std::io::Error::other(error))),
                 );
             }
         }
