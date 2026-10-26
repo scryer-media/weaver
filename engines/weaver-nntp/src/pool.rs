@@ -607,7 +607,7 @@ impl NntpPool {
                             pool.retire_quarantined_idle(idx);
                         }
                         if !matches!(error, NntpError::Route(route) if !route.is_evidence()) {
-                            *pool.last_connect_failure[idx].lock().await = Some(Instant::now());
+                            pool.note_connect_failure(idx, error).await;
                         }
                     }
                     if let Ok(mut connection) = result {
@@ -987,9 +987,7 @@ impl NntpPool {
                                 );
                                 self.retire_quarantined_idle(idx);
                             }
-                            // Record the failure timestamp.
-                            let mut last_failure = self.last_connect_failure[idx].lock().await;
-                            *last_failure = Some(Instant::now());
+                            self.note_connect_failure(idx, &e).await;
                             return Err(e);
                         }
                     }
@@ -1063,8 +1061,7 @@ impl NntpPool {
                 conn
             }
             Err(error) => {
-                let mut last_failure = self.last_connect_failure[idx].lock().await;
-                *last_failure = Some(Instant::now());
+                self.note_connect_failure(idx, &error).await;
                 return Err(error);
             }
         };
@@ -1698,6 +1695,17 @@ impl NntpPool {
             let sockets = self.socket_budgets[idx].snapshot();
             sockets.physical
                 > sockets.dialing + sockets.closing + sockets.async_idle + sockets.owned_idle
+        }
+    }
+
+    // Start the reconnect delay after a fresh dial failed for the server's
+    // own reasons. A dial the provider declined, or one the holdoff turned
+    // away before it dialled, is paced by the over-limit holdoff alone:
+    // stamping the delay for it as well would answer the next caller with
+    // `ServerRecovering` instead of the holdoff, as if the server were down.
+    async fn note_connect_failure(&self, idx: usize, error: &NntpError) {
+        if !self.dial_declined_over_limit(idx, error) {
+            *self.last_connect_failure[idx].lock().await = Some(Instant::now());
         }
     }
 
