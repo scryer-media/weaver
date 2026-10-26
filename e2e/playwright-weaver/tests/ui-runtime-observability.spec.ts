@@ -215,9 +215,10 @@ test("subscription loss polls and reconnects without losing the visible applicat
   await expect(page.getByRole("main")).toBeVisible();
 });
 
-test("the NZB analyzer renders and downloads a redacted report without queueing", async ({ cleanPage: page }) => {
+test("the analyzer renders and downloads a redacted report without queueing", async ({ cleanPage: page }) => {
+  // The NZB-only path still opens the analyzer.
   await page.goto(weaverRoute("/tools/nzb-analyzer"));
-  await expect(page.getByRole("heading", { name: "NZB analyzer", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Analyzer", exact: true })).toBeVisible();
   const sentinel = "e2e-analyzer-private";
   const nzb = `<?xml version="1.0" encoding="UTF-8"?>
     <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -228,7 +229,7 @@ test("the NZB analyzer renders and downloads a redacted report without queueing"
       </file>
     </nzb>`;
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("button", { name: "Drop an .nzb or .nzb.gz here, or click to choose one", exact: true }).click();
+  await page.getByRole("button", { name: "Drop an .nzb, .nzb.gz or .torrent here, or click to choose one", exact: true }).click();
   await (await chooser).setFiles({ name: "analysis-probe.nzb", mimeType: "application/x-nzb", buffer: Buffer.from(nzb) });
   const report = page.getByRole("region", { name: "Report", exact: true });
   await expect(report).toContainText("fingerprint ");
@@ -245,6 +246,13 @@ test("the NZB analyzer renders and downloads a redacted report without queueing"
   const parsed = JSON.parse(json);
   expect(parsed.nzb.shape.file_count).toBe(1);
   expect(parsed.job).toBeNull();
+
+  const infohash = "0123456789abcdef0123456789abcdef01234567";
+  await page.getByRole("textbox", { name: "Magnet link", exact: true }).fill(`magnet:?xt=urn:btih:${infohash}&dn=${sentinel}`);
+  await page.getByRole("button", { name: "Analyze", exact: true }).click();
+  await expect(report).toContainText("source magnet");
+  await expect(report).not.toContainText(sentinel);
+  await expect(report).not.toContainText(infohash);
   await page.goto(weaverRoute("/"));
   await expect(page.getByRole("main")).toContainText("No active downloads");
 });

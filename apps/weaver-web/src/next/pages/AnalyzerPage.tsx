@@ -2,26 +2,22 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useRef, useState } from "react";
-import { useMutation, type UseMutationExecute } from "urql";
-import { ANALYZE_NZB_MUTATION } from "@/graphql/queries";
+import { useMutation } from "urql";
+import { ANALYZE_NZB_MUTATION, ANALYZE_TORRENT_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { DetailBlock, EmptyState } from "../components/chrome";
-import { SecondaryButton } from "../components/controls";
+import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
+import { ANALYZER_ACCEPT, fileKind, isMagnet, maxBytes } from "../data/analyzer";
 import { formatSize } from "../data/format";
 import {
   copySupportReport,
   downloadSupportReportJson,
   type AnalyzeNzbResponse,
+  type AnalyzeTorrentResponse,
   type SupportReport,
 } from "../data/support-report";
 import { NextShell } from "../shell/NextShell";
-
-/** What the picker offers. The daemon reads compression from the bytes, not the name. */
-const ANALYZER_ACCEPT = ".nzb,.gz,.zst,.xz";
-
-// The daemon's default inline NZB limit; a larger file is refused before it is read.
-const ANALYZER_MAX_BYTES = 268_435_456;
 
 /** Base64 in slices, since one `String.fromCharCode` call cannot take a whole NZB. */
 function toBase64(bytes: Uint8Array): string {
@@ -33,57 +29,49 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-/** The report for one NZB, or the message to show in its place. */
-async function analyzeFile(
-  file: File,
-  analyzeNzb: UseMutationExecute<AnalyzeNzbResponse>,
-  failed: () => string,
-): Promise<{ report: SupportReport } | { error: string }> {
-  try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    const result = await analyzeNzb({ input: { nzbBase64: toBase64(bytes) } });
-    if (result.error || !result.data?.analyzeNzb) {
-      return { error: result.error?.graphQLErrors[0]?.message ?? failed() };
-    }
-    return { report: result.data.analyzeNzb };
-  } catch {
-    return { error: failed() };
+type Outcome = { report: SupportReport } | { error: string };
+
+/** The report, or the message to show in its place. */
+function outcomeOf(
+  result: { error?: { graphQLErrors: { message: string }[] }; data?: SupportReport },
+  failed: string,
+): Outcome {
+  if (result.error || !result.data) {
+    return { error: result.error?.graphQLErrors[0]?.message ?? failed };
   }
+  return { report: result.data };
 }
 
 /**
- * Tools → NZB analyzer.
+ * Tools → Analyzer.
  *
- * Reads an NZB without submitting it and shows the same redacted report a
- * job's "Copy support report" produces, minus the job. Nothing is queued and
- * nothing is stored.
+ * Reads an NZB, a .torrent file or a magnet link without adding it and shows
+ * the same redacted report a job's "Copy support report" produces, minus the
+ * job. Nothing is queued and nothing is stored.
  */
-export function NzbAnalyzerPage() {
+export function AnalyzerPage() {
   const t = useTranslate();
   const [, analyzeNzb] = useMutation<AnalyzeNzbResponse>(ANALYZE_NZB_MUTATION);
+  const [, analyzeTorrent] = useMutation<AnalyzeTorrentResponse>(ANALYZE_TORRENT_MUTATION);
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [source, setSource] = useState<{ name: string; size: number } | null>(null);
+  const [magnet, setMagnet] = useState("");
   const [report, setReport] = useState<SupportReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const analyze = async (file: File | undefined) => {
-    if (!file) {
-      return;
-    }
+  const run = async (work: () => Promise<Outcome>, failed: string) => {
     setBusy(true);
     setError(null);
     setNotice(null);
-    setSource({ name: file.name, size: file.size });
-    if (file.size > ANALYZER_MAX_BYTES) {
-      setReport(null);
-      setError(t("next.analyzer.tooLarge", { size: formatSize(ANALYZER_MAX_BYTES) }));
-      setBusy(false);
-      return;
+    let outcome: Outcome;
+    try {
+      outcome = await work();
+    } catch {
+      outcome = { error: failed };
     }
-    const outcome = await analyzeFile(file, analyzeNzb, () => t("next.analyzer.failed"));
     if ("report" in outcome) {
       setReport(outcome.report);
     } else {
@@ -93,9 +81,39 @@ export function NzbAnalyzerPage() {
     setBusy(false);
   };
 
+  const analyzeFile = async (file: File | undefined) => {
+    if (!file) {
+      return;
+    }
+    setSource({ name: file.name, size: file.size });
+    const failed = t("next.analyzer.failed");
+    await run(async () => {
+      const kind = fileKind(new Uint8Array(await file.slice(0, 2).arrayBuffer()));
+      if (file.size > maxBytes(kind)) {
+        return { error: t("next.analyzer.tooLarge", { size: formatSize(maxBytes(kind)) }) };
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (kind === "torrent") {
+        const result = await analyzeTorrent({ input: { torrentBase64: toBase64(bytes) } });
+        return outcomeOf({ error: result.error, data: result.data?.analyzeTorrent }, failed);
+      }
+      const result = await analyzeNzb({ input: { nzbBase64: toBase64(bytes) } });
+      return outcomeOf({ error: result.error, data: result.data?.analyzeNzb }, failed);
+    }, failed);
+  };
+
+  const analyzeMagnet = async (link: string) => {
+    setSource(null);
+    const failed = t("next.analyzer.magnetFailed");
+    await run(async () => {
+      const result = await analyzeTorrent({ input: { magnet: link.trim() } });
+      return outcomeOf({ error: result.error, data: result.data?.analyzeTorrent }, failed);
+    }, failed);
+  };
+
   return (
     <NextShell
-      title={t("next.nav.nzbAnalyzer")}
+      title={t("next.nav.analyzer")}
       note={t("next.analyzer.note")}
       controls={
         report === null ? undefined : (
@@ -137,7 +155,14 @@ export function NzbAnalyzerPage() {
             onDrop={(event) => {
               event.preventDefault();
               setDragging(false);
-              void analyze(event.dataTransfer.files[0]);
+              const file = event.dataTransfer.files[0];
+              const text = event.dataTransfer.getData("text/plain");
+              if (file === undefined && isMagnet(text)) {
+                setMagnet(text.trim());
+                void analyzeMagnet(text);
+              } else {
+                void analyzeFile(file);
+              }
             }}
             className={cn(
               "flex h-[104px] cursor-pointer flex-col items-center justify-center gap-2 border border-dashed text-[13px]",
@@ -152,7 +177,7 @@ export function NzbAnalyzerPage() {
               accept={ANALYZER_ACCEPT}
               className="hidden"
               onChange={(event) => {
-                void analyze(event.target.files?.[0]);
+                void analyzeFile(event.target.files?.[0]);
                 event.target.value = "";
               }}
             />
@@ -165,6 +190,25 @@ export function NzbAnalyzerPage() {
               </span>
             )}
           </button>
+          <form
+            className="mt-3 flex gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void analyzeMagnet(magnet);
+            }}
+          >
+            <TextField
+              value={magnet}
+              onChange={setMagnet}
+              label={t("next.analyzer.magnet")}
+              placeholder="magnet:?xt=urn:btih:"
+              className="min-w-0 flex-1"
+              autoComplete="off"
+            />
+            <PrimaryButton type="submit" disabled={busy || !isMagnet(magnet)}>
+              {t("next.analyzer.analyze")}
+            </PrimaryButton>
+          </form>
           {error === null ? null : (
             <div className="mt-4 border border-wv-danger-border bg-wv-button px-4 py-3 text-[12.5px] text-wv-error-text">
               {error}

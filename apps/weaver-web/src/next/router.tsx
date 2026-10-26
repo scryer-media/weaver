@@ -47,9 +47,10 @@ export const nextRouter = createBrowserRouter(
         },
         { path: "logs", ...lazyRoute(() => import("./pages/LogsPage"), "LogsPage") },
         {
-          path: "tools/nzb-analyzer",
-          ...lazyRoute(() => import("./pages/NzbAnalyzerPage"), "NzbAnalyzerPage"),
+          path: "tools/analyzer",
+          ...lazyRoute(() => import("./pages/AnalyzerPage"), "AnalyzerPage"),
         },
+        { path: "tools/nzb-analyzer", element: <Navigate to="/tools/analyzer" replace /> },
         {
           path: "settings",
           children: [

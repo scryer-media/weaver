@@ -27,7 +27,7 @@
       "oracle": "browser"
     },
     {
-      "path": "/tools/nzb-analyzer",
+      "path": "/tools/analyzer",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
     },
@@ -135,6 +135,11 @@
   "mutations": [
     {
       "name": "analyzeNzb",
+      "owner": "ui-runtime-observability",
+      "oracle": "browser"
+    },
+    {
+      "name": "analyzeTorrent",
       "owner": "ui-runtime-observability",
       "oracle": "browser"
     },

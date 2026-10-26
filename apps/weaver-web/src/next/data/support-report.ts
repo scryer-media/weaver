@@ -7,8 +7,8 @@ import { JOB_SUPPORT_REPORT_QUERY } from "@/graphql/queries";
 import { saveBlobAsDownload } from "@/lib/download";
 
 /**
- * A report the daemon writes about an NZB, and about the job that downloaded
- * it when there is one. The daemon leaves out every name, path, host and
+ * A report the daemon writes about an NZB or a torrent, and about the job
+ * that downloaded it when there is one. The daemon leaves out every name, path, host and
  * password, so both forms are safe to paste where support happens.
  */
 export interface SupportReport {
@@ -24,6 +24,10 @@ export interface JobSupportReportResponse {
 
 export interface AnalyzeNzbResponse {
   analyzeNzb: SupportReport;
+}
+
+export interface AnalyzeTorrentResponse {
+  analyzeTorrent: SupportReport;
 }
 
 /** The text wrapped in a fence, so a paste into an issue or chat keeps its columns. */
@@ -49,8 +53,9 @@ function reportFingerprint(report: SupportReport): string | null {
   try {
     const parsed = JSON.parse(report.json) as {
       nzb?: { identity?: { fingerprint?: unknown } };
+      torrent?: { identity?: { fingerprint?: unknown } };
     };
-    const fingerprint = parsed.nzb?.identity?.fingerprint;
+    const fingerprint = (parsed.nzb ?? parsed.torrent)?.identity?.fingerprint;
     return typeof fingerprint === "string" && /^[0-9a-f]+$/.test(fingerprint)
       ? fingerprint.slice(0, 12)
       : null;
@@ -61,7 +66,7 @@ function reportFingerprint(report: SupportReport): string | null {
 
 /** Save the JSON form under a name that carries no title. */
 export function downloadSupportReportJson(report: SupportReport, jobId?: number) {
-  const stem = jobId === undefined ? reportFingerprint(report) ?? "nzb" : `job-${jobId}`;
+  const stem = jobId === undefined ? reportFingerprint(report) ?? "report" : `job-${jobId}`;
   saveBlobAsDownload(
     new Blob([report.json], { type: "application/json" }),
     `weaver-support-${stem}.json`,

@@ -2711,6 +2711,15 @@ export const ANALYZE_NZB_MUTATION = gql`
   }
 `;
 
+export const ANALYZE_TORRENT_MUTATION = gql`
+  mutation AnalyzeTorrent($input: AnalyzeTorrentInput!) {
+    analyzeTorrent(input: $input) {
+      text
+      json
+    }
+  }
+`;
+
 export const ARCHIVE_PASSWORD_SETTINGS_QUERY = gql`
   query ArchivePasswordSettings {
     archivePasswordSettings {
