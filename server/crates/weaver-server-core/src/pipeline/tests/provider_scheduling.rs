@@ -16,6 +16,8 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
         let mut configs = Vec::new();
         let accepted = Arc::new((0..24).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
         let (commands, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let (release, held) = tokio::sync::watch::channel(false);
+        let (closed, mut closures) = tokio::sync::mpsc::unbounded_channel();
         for server in 0..24 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut config = weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
@@ -30,17 +32,31 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
             configs.push(config);
             let accepted = Arc::clone(&accepted);
             let commands = commands.clone();
+            let held = held.clone();
+            let closed = closed.clone();
             servers.spawn(async move {
                 let mut connections = tokio::task::JoinSet::new();
                 loop {
                     let (socket, _) = listener.accept().await.unwrap();
                     accepted[server].fetch_add(1, Ordering::SeqCst);
                     let commands = commands.clone();
+                    let mut held = held.clone();
+                    let closed = closed.clone();
                     connections.spawn(async move {
                         let (read, mut write) = socket.into_split();
                         write.write_all(b"200 fixture ready\r\n").await.unwrap();
                         let mut lines = BufReader::new(read).lines();
-                        while let Some(command) = lines.next_line().await.unwrap() {
+                        loop {
+                            let command = match lines.next_line().await {
+                                Ok(Some(command)) => command,
+                                Ok(None) => break,
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::ConnectionReset =>
+                                {
+                                    break;
+                                }
+                                Err(error) => panic!("fixture command read failed: {error}"),
+                            };
                             if command == "CAPABILITIES" {
                                 write
                                     .write_all(b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
@@ -53,11 +69,15 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
                                     .unwrap();
                             } else if command.starts_with("BODY ") {
                                 commands.send((server, command)).unwrap();
-                                std::future::pending::<()>().await;
+                                held.wait_for(|released| *released).await.unwrap();
+                                write.write_all(b"430 fixture absent\r\n").await.unwrap();
+                            } else if command == "QUIT" {
+                                break;
                             } else {
                                 write.write_all(b"500 unsupported\r\n").await.unwrap();
                             }
                         }
+                        closed.send(server).unwrap();
                     });
                 }
             });
@@ -188,6 +208,38 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
                 "{format}: provider {server}"
             );
         }
+        // Stop admission before releasing the held replies. Drain every
+        // lease and close its cached socket while these listeners still own
+        // their ports; a later format must never inherit a recycled endpoint
+        // that an earlier fixture's workers can still contact.
+        pipeline.shared_state.queue.write(|inner| {
+            inner.globals.paused = true;
+            crate::pipeline::queue::Change::changed(())
+        });
+        release.send(true).unwrap();
+        let mut parked = 0;
+        while parked < 4 {
+            tokio::select! {
+                Some(request) = pipeline.download_refill_rx.recv() => {
+                    assert!(request.response_tx.send(DownloadLaneRefillResponse {
+                        lease: None,
+                        park_reason: LaneParkReason::NoWork,
+                    }).is_ok());
+                }
+                Some(event) = pipeline.owned_download_lane_event_rx.recv() => {
+                    let OwnedDownloadLaneEvent::BatchComplete { ack, .. } = event else {
+                        panic!("only issued leases remain during fixture teardown");
+                    };
+                    if let Some(ack) = ack { ack.send(()).unwrap(); }
+                }
+                Some(_) = pipeline.download_lane_parked_rx.recv() => parked += 1,
+            }
+        }
+        assert!(pipeline.owned_download_lane_pool.reset().is_empty());
+        for _ in 0..4 {
+            assert!(closures.recv().await.unwrap() < 2);
+        }
+        pipeline.nntp.shutdown().await;
         servers.abort_all();
         while servers.join_next().await.is_some() {}
     }
