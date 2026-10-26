@@ -4974,9 +4974,14 @@ type Torrent {
 	version: TorrentVersion
 	state: TorrentState!
 	"""
-	Why the torrent is in its state, when there is a reason to give.
+	Why the torrent is in its state, when there is a reason to give and
+	its route does not hold it.
 	"""
 	detail: String
+	"""
+	Why its route holds it, while its state comes from that hold.
+	"""
+	routeReason: TorrentRouteReason
 	category: String
 	private: Boolean!
 	forced: Boolean!
@@ -5300,6 +5305,7 @@ enum TorrentRouteReason {
 	SESSION_STATE_UNREADABLE
 	SESSION_BUILD_FAILED
 	BLOCKLIST_FAILED
+	SESSION_LIMIT
 }
 
 """

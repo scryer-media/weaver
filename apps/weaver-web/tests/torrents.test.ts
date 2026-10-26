@@ -13,7 +13,7 @@ import {
   type TorrentData,
 } from "../src/lib/torrents.ts";
 import { EM_DASH, formatRate, formatSize } from "../src/next/data/format.ts";
-import { informationFields, transferFields } from "../src/next/features/torrents/general.ts";
+import { informationFields, transferFields, transferNote } from "../src/next/features/torrents/general.ts";
 import { nextDe } from "../src/next/i18n/de.ts";
 import { nextEn } from "../src/next/i18n/en.ts";
 import { nextEs } from "../src/next/i18n/es.ts";
@@ -63,6 +63,7 @@ const torrent = (overrides: Partial<TorrentData> = {}): TorrentData => ({
   infohash: "ab".repeat(20),
   infohashV2: null,
   detail: null,
+  routeReason: null,
   category: null,
   private: true,
   progress: 0.5,
@@ -222,4 +223,21 @@ test("every locale renders route reasons and reuses its route refusal wording", 
   assert.equal(routeReasonText(t, "LEG_OPEN_FAILED"), "Leg failed to open");
   assert.equal(routeReasonText(t, "STATE_DIRECTORY_FAILED"), "State directory unavailable");
   assert.equal(routeReasonText(t, "LISTEN_PORT_UNAVAILABLE"), "Listen port unavailable");
+});
+
+test("the transfer section notes its route's reason in each locale, else the server's words", () => {
+  for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
+    const translate = (key: string) => {
+      const value = dictionary[key];
+      assert.ok(value?.trim(), `${locale}: missing ${key}`);
+      return value;
+    };
+    for (const reason of TORRENT_ROUTE_REASONS) {
+      const key = reason.startsWith("TORRENT_ROUTE_") ? `next.refusal.${reason}` : `next.torrents.routeReason.${reason}`;
+      assert.equal(transferNote(translate, torrent({ state: "STALLED", routeReason: reason })), dictionary[key], `${locale}: ${reason}`);
+    }
+  }
+  assert.equal(transferNote(t, torrent({ state: "STALLED", routeReason: "SESSION_LIMIT" })), "Session limit reached");
+  assert.equal(transferNote(t, torrent({ state: "STOPPED", detail: "disk gone" })), "disk gone");
+  assert.equal(transferNote(t, torrent()), undefined);
 });

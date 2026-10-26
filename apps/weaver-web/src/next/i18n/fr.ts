@@ -1840,6 +1840,7 @@ export const nextFr: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_STATE_UNREADABLE": "État de la session illisible",
   "next.torrents.routeReason.SESSION_BUILD_FAILED": "Échec de l’ouverture de la session",
   "next.torrents.routeReason.BLOCKLIST_FAILED": "Échec du chargement de la liste de blocage",
+  "next.torrents.routeReason.SESSION_LIMIT": "Limite de sessions atteinte",
   "next.torrents.routesEmpty": "Aucune route.",
   "next.seeding.ratioGoal": "Objectif de ratio",
   "next.seeding.seedTimeGoal": "Objectif de durée",

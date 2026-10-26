@@ -118,6 +118,8 @@ export interface TorrentData extends TorrentSummaryData {
   infohash: string;
   infohashV2: string | null;
   detail: string | null;
+  /** Why its route holds it, while its state comes from that hold. */
+  routeReason: TorrentRouteReason | null;
   category: string | null;
   private: boolean;
   progress: number;
@@ -263,6 +265,7 @@ export const TORRENT_ROUTE_REASONS = [
   "SESSION_STATE_UNREADABLE",
   "SESSION_BUILD_FAILED",
   "BLOCKLIST_FAILED",
+  "SESSION_LIMIT",
 ] as const;
 
 export type TorrentRouteReason = (typeof TORRENT_ROUTE_REASONS)[number];

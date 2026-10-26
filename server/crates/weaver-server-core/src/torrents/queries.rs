@@ -33,6 +33,16 @@ fn count(row: &SqlRow, column: &str) -> Result<u64, StateError> {
     u64::try_from(value).map_err(|_| corrupt(column, value))
 }
 
+fn tracker_entry(row: &SqlRow) -> Result<TrackerEntry, StateError> {
+    let tier = row.i64("tier")?;
+    let named_by = row.text("named_by")?;
+    Ok(TrackerEntry {
+        tier: u32::try_from(tier).map_err(|_| corrupt("tracker tier", tier))?,
+        url: row.text("url")?,
+        named_by: parse_named_by(&named_by).ok_or_else(|| corrupt("tracker naming", &named_by))?,
+    })
+}
+
 fn opt_u64(row: &SqlRow, column: &str) -> Result<Option<u64>, StateError> {
     row.opt_i64(column)?
         .map(|value| u64::try_from(value).map_err(|_| corrupt(column, value)))
@@ -229,18 +239,32 @@ impl Database {
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?;
-            rows.iter()
-                .map(|row| {
-                    let tier = row.i64("tier")?;
-                    let named_by = row.text("named_by")?;
-                    Ok(TrackerEntry {
-                        tier: u32::try_from(tier).map_err(|_| corrupt("tracker tier", tier))?,
-                        url: row.text("url")?,
-                        named_by: parse_named_by(&named_by)
-                            .ok_or_else(|| corrupt("tracker naming", &named_by))?,
-                    })
-                })
-                .collect()
+            rows.iter().map(tracker_entry).collect()
+        })
+    }
+
+    /// Every torrent's trackers, by torrent, each in the order
+    /// [`Self::list_torrent_trackers`] gives.
+    pub fn torrent_trackers_by_job(
+        &self,
+    ) -> Result<std::collections::BTreeMap<JobId, Vec<TrackerEntry>>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, tier, url, named_by FROM torrent_trackers ORDER BY job_id, tier, url",
+                &[],
+            )
+            .await?;
+            let mut trackers = std::collections::BTreeMap::<JobId, Vec<TrackerEntry>>::new();
+            for row in &rows {
+                let job_id = count(row, "job_id")?;
+                trackers
+                    .entry(JobId(job_id))
+                    .or_default()
+                    .push(tracker_entry(row)?);
+            }
+            Ok(trackers)
         })
     }
 

@@ -376,6 +376,7 @@ fn view(state: TorrentState) -> TorrentView {
         source: TorrentSource::Metainfo,
         state,
         detail: None,
+        route_reason: None,
         paused_by: None,
         category: None,
         scope: TorrentScope::Default,

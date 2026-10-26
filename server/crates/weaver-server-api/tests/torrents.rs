@@ -1566,3 +1566,36 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
         );
     }
 }
+
+// A torrent its route holds says why as the route's reason code, not in
+// words, in the list and in its own view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_torrent_carries_its_routes_reason_code() {
+    let offline = rig().await;
+    let response = offline
+        .execute(&format!(
+            r#"mutation {{ submitTorrent(input: {{ metainfoBase64: "{}" }}) {{
+                id state detail routeReason
+            }} }}"#,
+            metainfo("offline.mkv", 3000, false)
+        ))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let submitted = response.data.into_json().unwrap()["submitTorrent"].clone();
+    let id = submitted["id"].as_u64().unwrap();
+    let held = serde_json::json!({
+        "id": id, "state": "STALLED", "detail": null, "routeReason": "LEG_DOWN"
+    });
+    assert_eq!(submitted, held);
+    let response = offline
+        .execute(&format!(
+            "{{ torrents {{ id state detail routeReason }} \
+               torrent(id: {id}) {{ id state detail routeReason }} }}"
+        ))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert_eq!(
+        response.data.into_json().unwrap(),
+        serde_json::json!({ "torrents": [held.clone()], "torrent": held })
+    );
+}

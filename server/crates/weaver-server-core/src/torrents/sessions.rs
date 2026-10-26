@@ -67,6 +67,8 @@ pub enum TorrentRouteReason {
     SessionStateUnreadable,
     SessionBuildFailed,
     BlocklistFailed,
+    /// Every session there can be is in use by other routes.
+    SessionLimit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +126,7 @@ impl RouteFailure {
             }
             TorrentRouteReason::SessionBuildFailed => "the session could not be opened",
             TorrentRouteReason::BlocklistFailed => "the blocklist could not be loaded",
+            TorrentRouteReason::SessionLimit => "every session is in use by other routes",
         }
         .to_owned()
     }

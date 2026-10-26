@@ -17,7 +17,6 @@ use crate::torrents::sessions::Routes;
 use crate::torrents::sessions::tests::{
     FakeRoutes, env, loopback_proxy, on_network, save_again, unbound_leg,
 };
-use crate::torrents::status::ROUTE_DOWN_FETCHING;
 use crate::torrents::storage::PieceStorage;
 
 const EPOCH_MS: i64 = 1_700_000_000_000;
@@ -437,6 +436,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         source: TorrentSource::Metainfo,
         state: TorrentState::Downloading,
         detail: None,
+        route_reason: None,
         paused_by: None,
         category: None,
         scope: TorrentScope::Default,
@@ -735,8 +735,8 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(
-        view.detail.as_deref(),
-        Some(format!("{ROUTE_DOWN_FETCHING} (tunnel gone)").as_str())
+        (view.detail.as_deref(), view.route_reason),
+        (None, Some(TorrentRouteReason::LegDown))
     );
     let held = rig.service.inner.sessions.views().await;
     assert_eq!(held.len(), 1);
@@ -751,12 +751,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
     rig.routes.set_down(None);
     rig.service.tick().await;
     let view = rig.service.torrent(job_id).await.unwrap();
-    assert_ne!(
-        view.detail
-            .as_deref()
-            .map(|detail| detail.starts_with(ROUTE_DOWN_FETCHING)),
-        Some(true)
-    );
+    assert_eq!(view.route_reason, None);
     assert_eq!(view.route.as_deref(), Some(first.as_str()));
     assert!(
         rig.service.inner.live.lock().await[&job_id]
@@ -1304,9 +1299,10 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
             .into()
         ))
     );
+    let view = service.torrent(job_id).await.unwrap();
     assert_eq!(
-        service.torrent(job_id).await.unwrap().detail.as_deref(),
-        Some("Not downloading: route down (a torrent route has one leg)"),
+        (view.detail.as_deref(), view.route_reason),
+        (None, Some(refusal))
     );
     let listed = service.routes().await;
     let held = listed
@@ -1531,7 +1527,6 @@ async fn a_torrent_whose_leg_is_revoked_moves_to_a_session_on_the_new_leg() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_past_the_session_limit_says_so() {
     use crate::torrents::sessions::MAX_SESSIONS;
-    use crate::torrents::status::SESSION_LIMIT_FETCHING;
 
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
@@ -1552,7 +1547,10 @@ async fn a_torrent_past_the_session_limit_says_so() {
         .unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
-    assert_eq!(view.detail.as_deref(), Some(SESSION_LIMIT_FETCHING));
+    assert_eq!(
+        (view.detail.as_deref(), view.route_reason),
+        (None, Some(TorrentRouteReason::SessionLimit))
+    );
     rig.service.stop().await;
 }
 
@@ -1569,9 +1567,59 @@ async fn a_session_that_cannot_be_built_says_why() {
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(
-        view.detail.as_deref(),
-        Some("Not downloading: no listening port")
+        (view.detail.as_deref(), view.route_reason),
+        (None, Some(TorrentRouteReason::LegOpenFailed))
     );
+}
+
+// The list of torrents carries each torrent's trackers, the same rows its
+// own view does, and no other torrent's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_list_carries_each_torrents_trackers() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let add = |name: &'static str, seed| {
+        rig.service.add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain(name, seed)))
+        })
+    };
+    let tracked = add("tracked", 1).await.unwrap();
+    let bare = add("bare", 2).await.unwrap();
+    rig.service
+        .add_trackers(
+            tracked,
+            vec![
+                vec!["http://127.0.0.1:1/announce".to_owned()],
+                vec!["http://127.0.0.1:2/announce".to_owned()],
+            ],
+        )
+        .await
+        .unwrap();
+
+    let own = rig.service.torrent(tracked).await.unwrap().trackers;
+    assert_eq!(
+        own.iter()
+            .map(|tracker| (tracker.tier, tracker.url.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (0, "http://127.0.0.1:1/announce"),
+            (1, "http://127.0.0.1:2/announce")
+        ]
+    );
+    let listed: Vec<(JobId, Vec<TorrentTracker>)> = rig
+        .service
+        .torrents(None)
+        .await
+        .into_iter()
+        .map(|view| (view.job_id, view.trackers))
+        .collect();
+    assert_eq!(listed, [(tracked, own), (bare, Vec::new())]);
+    assert_eq!(
+        rig.service.torrent(bare).await.unwrap().trackers,
+        Vec::new()
+    );
+    rig.service.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2117,7 +2165,10 @@ async fn torrents_turn_off_and_on_while_running() {
     rig.service.set_settings(settings.clone()).await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.state, TorrentState::Stopped);
-    assert_eq!(view.detail.as_deref(), Some(status::OFF));
+    assert_eq!(
+        (view.detail.as_deref(), view.route_reason),
+        (None, Some(TorrentRouteReason::TorrentsDisabled))
+    );
     assert!(rig.service.inner.sessions.views().await.is_empty());
     assert_eq!(
         rig.service
@@ -2134,7 +2185,7 @@ async fn torrents_turn_off_and_on_while_running() {
     ticks.wait_for(|ticks| *ticks > base).await.unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_ne!(view.state, TorrentState::Stopped);
-    assert_ne!(view.detail.as_deref(), Some(status::OFF));
+    assert_eq!(view.route_reason, None);
     assert!(view.route.is_some());
     rig.service.stop().await;
 }
@@ -2619,8 +2670,9 @@ impl Seeded {
     }
 }
 
-// A torrent's averages run over the part of a second it has been active:
-// its first second reads a rate, not 0.
+// A torrent's averages run over the seconds it reads as active, a second
+// begun counting whole: its first second reads its bytes as its rate, not
+// 0, and past it the bytes over the seconds is the average.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrents_first_second_reads_a_rate() {
     let seeded = seeded().await;
@@ -2629,7 +2681,13 @@ async fn a_torrents_first_second_reads_a_rate() {
     assert!(view.downloaded_bytes > 0);
     assert_eq!(
         (view.active_seconds, view.download_avg_bps),
-        (0, view.downloaded_bytes * 2)
+        (1, view.downloaded_bytes)
+    );
+    seeded.advance(3_443);
+    let view = seeded.view().await;
+    assert_eq!(
+        (view.active_seconds, view.download_avg_bps),
+        (4, view.downloaded_bytes / 4)
     );
     seeded.stop().await;
 }

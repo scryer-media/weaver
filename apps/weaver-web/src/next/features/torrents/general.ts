@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import type { Translate } from "@/lib/context/translate-context";
-import type { TorrentData } from "@/lib/torrents";
+import { routeReasonText, type TorrentData } from "../../../lib/torrents.ts";
 import { EM_DASH, formatDate, formatDuration, formatRate, formatSize } from "../../data/format.ts";
 
 /** One row of a torrent's general sections; a wide one spans the whole row. */
@@ -14,6 +14,12 @@ export interface TorrentField {
 
 const seconds = (value: number | null) => (value === null ? EM_DASH : formatDuration(value));
 const text = (value: string | null) => (value === null || value === "" ? EM_DASH : value);
+
+/** Why the torrent is in its state: its route's reason while the route holds it, else the server's words. */
+export function transferNote(t: Translate, torrent: TorrentData): string | undefined {
+  if (torrent.routeReason !== null) return routeReasonText(t, torrent.routeReason);
+  return torrent.detail ?? undefined;
+}
 
 /** The Transfer section, in qBittorrent's order. */
 export function transferFields(t: Translate, torrent: TorrentData): TorrentField[] {
