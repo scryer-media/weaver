@@ -1011,6 +1011,70 @@ async fn all_async_fetch_families_keep_capacity_rejections_out_of_health() {
     server.abort();
 }
 
+// A dial the provider declined is paced by the holdoff alone. A lane asked
+// for on that server inside the window learns it is over its limit, not
+// that it is recovering, and nothing dials it again.
+#[tokio::test]
+async fn declined_dial_holds_blocking_lanes_on_the_holdoff() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted_by_server = Arc::clone(&accepted);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            accepted_by_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = socket.write_all(b"502 Too Many Connections\r\n").await;
+            });
+        }
+    });
+    let client = NntpClient::new(NntpClientConfig::single(
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        4,
+    ));
+
+    assert!(matches!(
+        client.pool().acquire(ServerId(0)).await,
+        Err(NntpError::TooManyConnections)
+    ));
+    assert!(client.pool().is_over_limit(ServerId(0)));
+    assert!(matches!(
+        client.pool().acquire(ServerId(0)).await,
+        Err(NntpError::ServerOverLimit { .. })
+    ));
+    let client = tokio::task::spawn_blocking(move || {
+        for _ in 0..4 {
+            let Err(error) = client.try_acquire_blocking_body_lane(&[], &[]) else {
+                panic!("a held-off server must not open a lane");
+            };
+            assert!(
+                matches!(
+                    error,
+                    BlockingBodyLaneAcquireError::ProviderCapacity(
+                        NntpError::ServerOverLimit { .. }
+                    )
+                ),
+                "{error:?}"
+            );
+        }
+        client
+    })
+    .await
+    .unwrap();
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        client.pool().health().lock().await.server(0).failure_count,
+        0
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn blocking_tls_capacity_rejection_parks_connects_without_health_poisoning() {
     let client = NntpClient::new(NntpClientConfig {

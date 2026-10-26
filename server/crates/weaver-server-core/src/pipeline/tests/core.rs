@@ -597,7 +597,16 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
     .unwrap();
     let harness = TestHarness::new_with_nntp(client, CONNECTIONS).await;
     let job_id = JobId(80_021);
-    let spec = segmented_job_spec("held off provider", "held-off.bin", &vec![1024_u32; 64]);
+    const SEGMENTS: usize = 64;
+    let spec = segmented_job_spec(
+        "held off provider",
+        "held-off.bin",
+        &vec![1024_u32; SEGMENTS],
+    );
+    let leased_before = harness
+        .handle
+        .get_live_metrics()
+        .download_lane_lease_items_total;
 
     harness
         .handle
@@ -606,7 +615,17 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
         .unwrap();
 
     // The scheduler also keeps the queued workload off the held-off provider.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Leasing more articles than the job holds means at least one lease came
+    // back unserved and its articles were leased again, so a lane has asked
+    // the held-off server and been answered.
+    wait_until(|| {
+        harness
+            .handle
+            .get_live_metrics()
+            .download_lane_lease_items_total
+            > leased_before + SEGMENTS as u64
+    })
+    .await;
     assert_eq!(
         accepted.load(Ordering::SeqCst),
         1,
