@@ -83,6 +83,15 @@ pub const TICK: Duration = Duration::from_secs(10);
 /// is written at every tick it changed, as its checkpoint is.
 pub const PEERS_EVERY_MS: i64 = 60_000;
 
+/// The most pieces a torrent's checkpoint goes without between ticks: once
+/// this many pieces reached its job, or left it, since the checkpoint was
+/// last written, it is written at once, so a crash fetches again at most
+/// these and those that verified while that write was on its way. A
+/// download is never more than a few pieces a write behind, at any rate:
+/// a faster one only waits on the write in flight, and its next write
+/// takes everything verified meanwhile.
+pub const CHECKPOINT_PIECES: u32 = 16;
+
 /// The time torrents are stamped with.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
@@ -1330,12 +1339,12 @@ fn same_peers(a: &ResumePeers, b: &ResumePeers) -> bool {
 }
 
 // What the job side asks the service to look at: the jobs that changed,
-// the ones whose checkpoint is behind them, and the writes a job's intake
-// could not make.
+// the ones whose checkpoint is behind them with how many pieces came or
+// went since it was written, and the writes a job's intake could not make.
 #[derive(Default)]
 pub(super) struct Signal {
     dirty: Mutex<BTreeSet<JobId>>,
-    unsaved: Mutex<BTreeSet<JobId>>,
+    unsaved: Mutex<BTreeMap<JobId, u32>>,
     refused: Mutex<BTreeMap<JobId, String>>,
     wake: Notify,
 }
@@ -1346,16 +1355,23 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Signal {
     pub(super) fn mark(&self, job_id: JobId) {
+        self.marked(job_id, 0);
+    }
+
+    fn marked(&self, job_id: JobId, pieces: u32) {
         locked(&self.dirty).insert(job_id);
-        locked(&self.unsaved).insert(job_id);
+        *locked(&self.unsaved).entry(job_id).or_default() += pieces;
         self.wake.notify_one();
     }
 
     fn heard(&self, job_id: JobId, heard: IntakeHeard) {
-        if let IntakeHeard::Refused(error) = heard {
-            locked(&self.refused).entry(job_id).or_insert(error);
+        match heard {
+            IntakeHeard::Changed => self.marked(job_id, 1),
+            IntakeHeard::Refused(error) => {
+                locked(&self.refused).entry(job_id).or_insert(error);
+                self.mark(job_id);
+            }
         }
-        self.mark(job_id);
     }
 
     fn take(&self) -> BTreeSet<JobId> {
@@ -1368,10 +1384,24 @@ impl Signal {
 
     fn take_unsaved(&self) -> BTreeSet<JobId> {
         std::mem::take(&mut *locked(&self.unsaved))
+            .into_keys()
+            .collect()
     }
 
     fn take_unsaved_one(&self, job_id: JobId) -> bool {
-        locked(&self.unsaved).remove(&job_id)
+        locked(&self.unsaved).remove(&job_id).is_some()
+    }
+
+    // The jobs whose checkpoint is [`CHECKPOINT_PIECES`] pieces behind.
+    fn take_due(&self) -> BTreeSet<JobId> {
+        let mut unsaved = locked(&self.unsaved);
+        let due: BTreeSet<JobId> = unsaved
+            .iter()
+            .filter(|(_, pieces)| **pieces >= CHECKPOINT_PIECES)
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        unsaved.retain(|job_id, _| !due.contains(job_id));
+        due
     }
 }
 
@@ -1797,7 +1827,8 @@ impl TorrentService {
 
     // What the jobs that spoke did: a write the job could not take fails
     // its torrent, a refusal found while unpacking stops it, and a job that
-    // is done completes it.
+    // is done completes it. A job whose checkpoint fell
+    // [`CHECKPOINT_PIECES`] behind has it written.
     async fn settle(&self) {
         let dirty = self.inner.signal.take();
         for job_id in dirty {
@@ -1828,6 +1859,7 @@ impl TorrentService {
                 self.completed(job_id).await;
             }
         }
+        self.save_checkpoints(self.inner.signal.take_due()).await;
         self.apply_picking().await;
         self.publish().await;
     }
@@ -2081,11 +2113,17 @@ impl TorrentService {
         checkpoint: FromCheckpoint,
     ) -> GraphJob<PieceRoot> {
         match checkpoint {
+            // What the checkpoint held, and what of it was not on disk. A
+            // piece that verified after the checkpoint was written is fetched
+            // again too, but nothing short of a check of the files can say
+            // which those are: every file has its full length from its first
+            // piece on.
             FromCheckpoint::Restored(restored) => {
                 tracing::debug!(
                     job_id = job_id.0,
                     read_bytes = restored.read,
-                    refetched = restored.refetched.len(),
+                    in_hand = restored.job.have().count_ones(),
+                    missing = restored.refetched.len(),
                     "a torrent's job is restored from its checkpoint"
                 );
                 return restored.job;

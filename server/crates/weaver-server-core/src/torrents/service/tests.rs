@@ -2279,8 +2279,8 @@ async fn torrents_with_one_name_get_their_own_directories() {
     assert_ne!(dirs[0], dirs[1]);
 }
 
-// However many pieces a job verifies between ticks, its checkpoint is
-// written once.
+// However often a job is marked between ticks with no piece reaching it,
+// its checkpoint is written once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_checkpoint_is_written_once_a_tick() {
     let rig = rig(set_clock());
@@ -2302,6 +2302,76 @@ async fn the_checkpoint_is_written_once_a_tick() {
     assert_eq!(written.borrow().checkpoints, base + 1);
     rig.service.tick().await;
     assert_eq!(written.borrow().checkpoints, base + 1);
+}
+
+// A downloading torrent's checkpoint follows its pieces with no tick: it is
+// written each time [`CHECKPOINT_PIECES`] more pieces reach the job, so the
+// checkpoint on disk is never that many pieces behind what verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_checkpoint_follows_the_verified_pieces_between_ticks() {
+    const PIECE: usize = 1024;
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let pieces = 3 * CHECKPOINT_PIECES + CHECKPOINT_PIECES / 2;
+    let bytes: Vec<u8> = (0..pieces as usize * PIECE)
+        .map(|at| (at % 251) as u8)
+        .collect();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set",
+            &[("set/a.bin", &bytes)],
+            PIECE,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let (intake, layout) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.intake.clone().unwrap(),
+            torrent.layout.clone().unwrap(),
+        )
+    };
+    let on_disk = || {
+        rig.service
+            .kept_root(job_id, &layout)
+            .map_or(0, |root| root.have().count_ones() as u32)
+    };
+    let mut written = rig.service.written();
+    let base = written.borrow().checkpoints;
+    for piece in 0..pieces {
+        let range = layout.piece_range(piece);
+        let shares = layout
+            .spans(piece)
+            .into_iter()
+            .filter_map(|span| {
+                let at = (range.start + span.at) as usize;
+                Some(crate::pipeline::graph::root::pieces::Verified {
+                    volume: span.volume?,
+                    piece,
+                    offset: span.range.start,
+                    bytes: bytes::Bytes::copy_from_slice(
+                        &bytes[at..at + span.range.len() as usize],
+                    ),
+                })
+            })
+            .collect();
+        intake.verified(shares).unwrap();
+        let verified = piece + 1;
+        if verified % CHECKPOINT_PIECES == 0 {
+            let saves = base + u64::from(verified / CHECKPOINT_PIECES);
+            written
+                .wait_for(|written| written.checkpoints >= saves)
+                .await
+                .unwrap();
+            assert_eq!(on_disk(), verified);
+        }
+        assert!(verified - on_disk() < CHECKPOINT_PIECES, "piece {piece}");
+    }
+    rig.service.stop().await;
 }
 
 // The holds the queue publishes reach the torrents: a pause stops
