@@ -74,7 +74,9 @@ struct Walk<'s, 'a> {
 
 impl Walk<'_, '_> {
     fn all(&mut self, image: Image, password: Option<&str>) -> Result<(), Option<Emit>> {
-        let mut archive = ZipArchive::new(image).map_err(|error| Some(verdict::zip(&error)))?;
+        let mut archive = image
+            .archive()
+            .map_err(|error| Some(verdict::zip(&error)))?;
         for index in 0..archive.len() {
             let file = match password {
                 Some(password) => archive.by_index_decrypt(index, password.as_bytes()),

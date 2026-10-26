@@ -72,8 +72,15 @@ pub(crate) struct End {
 // exactly to the end, so a signature inside a comment or inside stored data
 // is not taken for it.
 pub(crate) fn find_end(tail: &[u8]) -> Option<End> {
+    end_among(tail, 0..tail.len())
+}
+
+// The end record among the signatures that start at `starts` in the tail,
+// for a search that reads the tail backward and looks only at what it has
+// just read.
+pub(crate) fn end_among(tail: &[u8], starts: std::ops::Range<usize>) -> Option<End> {
     let last = tail.len().checked_sub(END_LEN as usize)?;
-    (0..=last).rev().find_map(|at| {
+    starts.filter(|at| *at <= last).rev().find_map(|at| {
         let comment = u16_at(tail, at + 20)? as usize;
         (u32_at(tail, at)? == END && at + END_LEN as usize + comment == tail.len())
             .then(|| end_at(tail, at))

@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The set as the zip library reads it: one seekable file. A zip in one
-// volume is that volume. A spanned set is its volumes end to end, but its
-// directory gives every entry a disk and an offset within that disk, and
-// the library reads only single-disk archives, so the directory is
-// rewritten for the joined bytes: every entry on disk zero at its place in
-// the whole, then a fresh end record, with zip64 records where a field no
-// longer fits. The entries' own bytes are read where they lie.
+// The set as the zip library reads it: one seekable file, the volumes end
+// to end. The run reads the archive's records itself, each exactly where the
+// end record puts it, and holds them: its directory, rewritten for the joined
+// bytes, and a fresh end record after it, with zip64 records where a field no
+// longer fits. A spanned set's directory gives every entry a disk and an
+// offset within that disk, and the library reads only single-disk archives,
+// so every entry is put on disk zero at its place in the whole. The library
+// learns the archive from those records alone and reads only the entries'
+// own bytes from the set, each when the walk reaches it: a byte lost in one
+// entry fails that entry, not the opening of the archive.
 
 use std::io::{self, Read, Seek, SeekFrom};
 
+use ::zip::ZipArchive;
+use ::zip::read::{ArchiveOffset, Config};
+use ::zip::result::ZipResult;
 use weaver_graph::Why;
 
 use crate::engine::Joined;
-use crate::zip::records::{self, END, END64, END64_LEN, End, LOCATOR, LOCATOR_LEN, TAIL};
+use crate::zip::records::{self, END, END_LEN, END64, END64_LEN, End, LOCATOR, LOCATOR_LEN, TAIL};
 
 // Why the set is not an image: the owner failed a read, which it already
 // knows, or the shape is one no image is made of.
@@ -49,11 +55,8 @@ impl Image {
             rest: Vec::new(),
             position: 0,
         };
-        let start = total.saturating_sub(TAIL);
-        let mut tail = vec![0u8; (total - start) as usize];
-        joined.read_exact(start, &mut tail)?;
         // With no end record the library says what is wrong.
-        let Some(found) = records::find_end(&tail) else {
+        let Some((start, found)) = find_end(&joined, total)? else {
             return Ok(whole(joined));
         };
         let base = |disk: u32| -> Option<u64> {
@@ -88,9 +91,6 @@ impl Image {
         if end.this_disk as usize + 1 != lengths.len() {
             return Err(Unopened::Refused(Why::Unsupported));
         }
-        if end.this_disk == 0 {
-            return Ok(whole(joined));
-        }
         // A directory runs no further than the records after it.
         let directory = base(end.directory_disk)
             .and_then(|base| base.checked_add(end.offset))
@@ -98,23 +98,122 @@ impl Image {
                 directory
                     .checked_add(end.size)
                     .is_some_and(|end| end <= after)
-            })
-            .ok_or(Unopened::Refused(Why::Unsupported))?;
-        let mut bytes = vec![0u8; end.size as usize];
-        joined.read_exact(directory, &mut bytes)?;
-        let rest = rewrite(&mut bytes, &end, directory, &base)
-            .ok_or(Unopened::Refused(Why::Unsupported))?;
-        Ok(Image {
-            joined,
-            prefix: directory,
-            rest,
+            });
+        let rest = match directory {
+            Some(directory) => {
+                let mut bytes = vec![0u8; end.size as usize];
+                joined.read_exact(directory, &mut bytes)?;
+                rewrite(&mut bytes, &end, directory, &base).map(|rest| (directory, rest))
+            }
+            None => None,
+        };
+        match rest {
+            Some((prefix, rest)) => Ok(Image {
+                joined,
+                prefix,
+                rest,
+                position: 0,
+            }),
+            // A volume whose directory is not where its end record puts it
+            // has bytes in front of the archive: the library finds it there.
+            None if lengths.len() == 1 => Ok(whole(joined)),
+            None => Err(Unopened::Refused(Why::Unsupported)),
+        }
+    }
+
+    // The archive, as the library reads it. Where the run holds the records,
+    // the library learns the archive from them alone, at their places in
+    // the whole and with nothing in front of them, so it reads no entry's
+    // bytes to open it; it then reads each entry from the set. Otherwise it
+    // reads the set, finds the archive in it, or says what is wrong.
+    pub(super) fn archive(self) -> ZipResult<ZipArchive<Image>> {
+        if self.rest.is_empty() {
+            return ZipArchive::new(self);
+        }
+        let records = Records {
+            prefix: self.prefix,
+            rest: &self.rest,
             position: 0,
-        })
+        };
+        let at_zero = Config {
+            archive_offset: ArchiveOffset::Known(0),
+        };
+        let metadata = ZipArchive::with_config(at_zero, records)?.metadata();
+        // SAFETY: the metadata is the image's. The records it was read from
+        // are the image's own bytes at the same places, its whole length,
+        // and only the bytes in front of the directory, which the library
+        // did not read the archive from, stand as zeros there.
+        Ok(unsafe { ZipArchive::unsafe_new_with_metadata(self, metadata) })
     }
 
     fn len(&self) -> u64 {
         self.prefix + self.rest.len() as u64
     }
+}
+
+// The end record, searched for from the set's end backward as far as the
+// longest comment it can carry, a record's length read at a time: the search
+// reads no further back than a record's length past the record it finds,
+// into the directory or the zip64 locator ahead of it, which the open reads
+// next. Its place in the set and the record, or `None` when there is none.
+fn find_end(joined: &Joined, total: u64) -> Result<Option<(u64, End)>, Unopened> {
+    let floor = total.saturating_sub(TAIL);
+    let mut tail = vec![0u8; (total - floor) as usize];
+    let mut start = total;
+    while start > floor {
+        let from = start.saturating_sub(END_LEN).max(floor);
+        let read = (from - floor) as usize..(start - floor) as usize;
+        joined.read_exact(from, &mut tail[read.clone()])?;
+        start = from;
+        let held = &tail[read.start..];
+        if let Some(found) = records::end_among(held, 0..read.len()) {
+            return Ok(Some((start, found)));
+        }
+    }
+    Ok(None)
+}
+
+// The image as the library opens it: the records the run holds, at their
+// places, and zeros in front of them.
+struct Records<'a> {
+    prefix: u64,
+    rest: &'a [u8],
+    position: u64,
+}
+
+impl Read for Records<'_> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let len = self.prefix + self.rest.len() as u64;
+        let wanted = usize::try_from(len.saturating_sub(self.position))
+            .map_or(into.len(), |rest| rest.min(into.len()));
+        let into = &mut into[..wanted];
+        for (at, byte) in (self.position..).zip(into.iter_mut()) {
+            *byte = at
+                .checked_sub(self.prefix)
+                .and_then(|at| usize::try_from(at).ok())
+                .map_or(0, |at| self.rest[at]);
+        }
+        self.position += wanted as u64;
+        Ok(wanted)
+    }
+}
+
+impl Seek for Records<'_> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let len = self.prefix + self.rest.len() as u64;
+        self.position = seek(self.position, len, to)?;
+        Ok(self.position)
+    }
+}
+
+// Where a seek from `position` in `len` bytes lands.
+fn seek(position: u64, len: u64, to: SeekFrom) -> io::Result<u64> {
+    match to {
+        SeekFrom::Start(at) => Some(at),
+        SeekFrom::End(by) => len.checked_add_signed(by),
+        SeekFrom::Current(by) => position.checked_add_signed(by),
+    }
+    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
 // The directory on disk zero at its place in the whole, followed by the
@@ -210,12 +309,7 @@ impl Read for Image {
 
 impl Seek for Image {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
-        let position = match to {
-            SeekFrom::Start(at) => Some(at),
-            SeekFrom::End(by) => self.len().checked_add_signed(by),
-            SeekFrom::Current(by) => self.position.checked_add_signed(by),
-        };
-        self.position = position.ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        self.position = seek(self.position, self.len(), to)?;
         Ok(self.position)
     }
 }
