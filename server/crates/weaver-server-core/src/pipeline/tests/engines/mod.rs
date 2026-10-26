@@ -82,6 +82,7 @@ mod encrypted_hex;
 pub(in crate::pipeline::tests) mod harness;
 mod lines;
 mod nesting;
+mod pairings;
 mod par3;
 mod partial;
 mod password;
