@@ -277,6 +277,9 @@ async fn the_queue_orders_torrents_and_jobs_by_when_they_were_added() {
     let order: Vec<JobId> = state.list_jobs().iter().map(|job| job.job_id).collect();
     assert_eq!(order, [earlier.job_id, job_id, later.job_id]);
     assert_eq!(state.get_job(job_id).unwrap().protocol, Protocol::Torrent);
+    // The two NZB jobs go away again, so the finished torrent is all the
+    // queue holds below.
+    state.publish_jobs(Vec::new());
 
     let mut changes = state.subscribe_job_changes();
     changes.borrow_and_update();
@@ -295,8 +298,6 @@ async fn the_queue_orders_torrents_and_jobs_by_when_they_were_added() {
         }
     );
     assert_eq!(finished.0.protocol, Protocol::Torrent);
-    // The stub pipeline publishes no live jobs of its own, so the finished
-    // torrent is all the queue holds.
     assert_eq!(finished.1, 1);
 }
 
