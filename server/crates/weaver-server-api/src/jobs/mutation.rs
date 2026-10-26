@@ -58,6 +58,17 @@ impl JobsMutation {
         crate::jobs::support_report::resolve_analyze_nzb(ctx, input).await
     }
 
+    /// Analyze a torrent without adding it: a .torrent file or a magnet
+    /// link. Reads nothing and changes nothing, as `analyzeNzb`.
+    #[graphql(guard = "ReadGuard")]
+    async fn analyze_torrent(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::jobs::support_report::AnalyzeTorrentInput,
+    ) -> Result<crate::jobs::support_report::SupportReport> {
+        crate::jobs::support_report::resolve_analyze_torrent(ctx, input).await
+    }
+
     /// Submit an NZB for download through the public integration facade.
     #[graphql(guard = "ControlGuard")]
     async fn submit_nzb(

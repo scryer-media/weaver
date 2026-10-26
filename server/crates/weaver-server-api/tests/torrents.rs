@@ -1599,3 +1599,36 @@ async fn a_held_torrent_carries_its_routes_reason_code() {
         serde_json::json!({ "torrents": [held.clone()], "torrent": held })
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_torrent_has_a_support_report_without_its_name() {
+    let rig = rig().await;
+    let response = rig
+        .execute(&submit(&metainfo("zqxsentinel.mkv", 3000, true), ""))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let id = response.data.into_json().unwrap()["submitTorrent"]["id"]
+        .as_u64()
+        .unwrap();
+    let response = rig
+        .execute_as_key(
+            &format!("{{ jobSupportReport(jobId: {id}) {{ text json }} }}"),
+            CallerScope::Read,
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let data = response.data.into_json().unwrap();
+    let text = data["jobSupportReport"]["text"].as_str().unwrap();
+    let json = data["jobSupportReport"]["json"].as_str().unwrap();
+    assert!(!text.contains("zqxsentinel"), "{text}");
+    assert!(!json.contains("zqxsentinel"), "{json}");
+    assert!(text.contains("job (queue, torrent)"), "{text}");
+    let json: Value = serde_json::from_str(json).unwrap();
+    assert_eq!(json["torrent"]["identity"]["source"], "metainfo");
+    assert_eq!(json["torrent"]["trackers"]["private"], true);
+    assert_eq!(json["job"]["source"], "queue");
+    assert_eq!(json["job"]["state"], "stalled");
+    assert_eq!(json["job"]["route_reason"], "leg_down");
+    assert_eq!(json["job"]["private"], true);
+    assert_eq!(json["job"]["pieces"]["total"], 3);
+}

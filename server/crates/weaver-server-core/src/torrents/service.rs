@@ -568,6 +568,76 @@ pub struct TorrentView {
     pub metadata: Vec<(String, String)>,
 }
 
+/// What a support report reads of a torrent beyond its view.
+#[derive(Debug, Clone)]
+pub struct TorrentSupport {
+    pub view: TorrentView,
+    /// The one copy of its metainfo, once it is in hand.
+    pub metainfo: Option<Bytes>,
+    /// The ledger as of this reading.
+    pub counters: TorrentCounters,
+    /// Of the bytes wasted this run, those of pieces that failed their
+    /// check, and those of blocks that arrived when already in hand.
+    pub failed_bytes: u64,
+    pub redundant_bytes: u64,
+    /// Its established peers, the seeders among them, and the peers still
+    /// in their handshake.
+    pub peers: (u32, u32, u32),
+    pub peer_kinds: PeerKinds,
+    /// Where its metadata fetch asks for peers, while one runs.
+    pub fetch: Option<weaver_torrent::FetchPhase>,
+    pub in_session: bool,
+    pub leg: Option<TorrentLeg>,
+    /// Whether its job is built; until it is, the pieces its checkpoint
+    /// has in hand.
+    pub has_job: bool,
+    pub kept_pieces: u32,
+    /// The bytes of the files it wants, and those of them in hand.
+    pub wanted_bytes: u64,
+    pub wanted_have_bytes: u64,
+    /// The snapshot the exporter renders, as last published.
+    pub metrics: TorrentMetrics,
+}
+
+/// The leg of its route a torrent's session runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TorrentLeg {
+    pub position: usize,
+    pub egress_id: u32,
+    pub own_sockets: bool,
+}
+
+/// A torrent's connections to peers, counted by how they were made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerKinds {
+    pub tcp: u32,
+    pub utp: u32,
+    pub outgoing: u32,
+    pub incoming: u32,
+    pub encrypted: u32,
+}
+
+impl PeerKinds {
+    pub fn of(peers: &[weaver_torrent::PeerInfo]) -> Self {
+        let mut kinds = Self::default();
+        for peer in peers {
+            match peer.connection {
+                weaver_torrent::ConnectionKind::Tcp => kinds.tcp += 1,
+                weaver_torrent::ConnectionKind::Utp => kinds.utp += 1,
+            }
+            if peer.outgoing {
+                kinds.outgoing += 1;
+            } else {
+                kinds.incoming += 1;
+            }
+            if peer.encryption != weaver_torrent::Encryption::None {
+                kinds.encrypted += 1;
+            }
+        }
+        kinds
+    }
+}
+
 /// A torrent's pieces: how many, how long each is, and how many verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TorrentPieces {
@@ -806,6 +876,8 @@ struct Attached {
 struct OnLeg {
     network: Arc<NetworkRuntime>,
     egress_id: u32,
+    // Whether the session dials from the leg's own sockets, past any route.
+    own_sockets: bool,
     // The torrent's place on the leg, which counts what it holds there
     // until the torrent leaves its session.
     tenancy: Arc<LegTenancy>,
@@ -3186,6 +3258,7 @@ impl TorrentService {
                     .map(|proxies| OnLeg {
                         network: proxies.network.clone(),
                         egress_id: plan.egress_id,
+                        own_sockets: plan.kind.own_sockets(),
                         tenancy: proxies.network.tenant_torrent(
                             Consumer::Torrent(scope),
                             crate::torrents::sessions::TORRENT_LEG,
@@ -4609,6 +4682,65 @@ impl TorrentService {
         };
         self.track(&mut view, listed, &announces, &mut HashMap::new());
         Some(view)
+    }
+
+    /// What a support report reads of one torrent: its view, its metainfo,
+    /// and the held figures the view folds together. One pass over the
+    /// torrent under the lock its view takes; its peers are read after,
+    /// from its session.
+    pub async fn support(&self, job_id: JobId) -> Option<TorrentSupport> {
+        let settings = self.settings();
+        let now = self.inner.clock.now_ms();
+        let listed = self
+            .inner
+            .db
+            .list_torrent_trackers(job_id)
+            .unwrap_or_default();
+        let (mut support, announces, handle) = {
+            let live = self.inner.live.lock().await;
+            let torrent = live.get(&job_id)?;
+            let reading = torrent.reading(now);
+            let (wanted_bytes, wanted_have_bytes) = wanted(
+                torrent.layout.as_deref(),
+                &torrent.levels,
+                &reading.file_have,
+            );
+            let attached = torrent.attached.as_ref();
+            let support = TorrentSupport {
+                view: self.view(&settings, torrent, now),
+                metainfo: torrent.record.metainfo.clone(),
+                counters: reading.counters,
+                failed_bytes: reading.seen.failed_bytes,
+                redundant_bytes: reading.seen.redundant_bytes,
+                peers: reading.peers,
+                peer_kinds: PeerKinds::default(),
+                fetch: torrent.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
+                in_session: attached.is_some(),
+                leg: attached
+                    .and_then(|attached| attached.leg.as_ref())
+                    .map(|leg| TorrentLeg {
+                        position: leg.tenancy.leg().1,
+                        egress_id: leg.egress_id,
+                        own_sockets: leg.own_sockets,
+                    }),
+                has_job: torrent.job.is_some(),
+                kept_pieces: torrent.kept_pieces,
+                wanted_bytes,
+                wanted_have_bytes,
+                metrics: TorrentMetrics::default(),
+            };
+            (
+                support,
+                torrent.announces(),
+                attached.map(|attached| Arc::clone(&attached.handle)),
+            )
+        };
+        self.track(&mut support.view, listed, &announces, &mut HashMap::new());
+        if let Some(handle) = handle {
+            support.peer_kinds = PeerKinds::of(&handle.peers());
+        }
+        support.metrics = self.metrics();
+        Some(support)
     }
 
     /// Every torrent, or a category's, in the order they were added, each

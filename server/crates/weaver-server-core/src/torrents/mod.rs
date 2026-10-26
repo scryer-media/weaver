@@ -19,6 +19,7 @@ pub use model::{
     FilePriority, Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent,
     TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry, TrackerStatus,
 };
+pub use weaver_torrent::analysis;
 pub use weaver_torrent::tracker::redacted_tracker_url;
 pub use weaver_torrent::{
     ConnectionKind, Encryption, FetchPhase, NamedBy, PeerFlags, PeerInfo, PeerSourceFlag,

@@ -66,6 +66,16 @@ input AnalyzeNzbInput {
 	nzbBase64: String
 }
 
+"""
+A torrent to analyze without adding it: a .torrent file, uploaded or
+as base64, or a magnet link. Exactly one source is required.
+"""
+input AnalyzeTorrentInput {
+	torrentUpload: Upload
+	torrentBase64: String
+	magnet: String
+}
+
 type ApiKey {
 	id: Int!
 	name: String!
@@ -1762,6 +1772,11 @@ type MutationRoot {
 	uploads travel as mutations.
 	"""
 	analyzeNzb(input: AnalyzeNzbInput!): SupportReport!
+	"""
+	Analyze a torrent without adding it: a .torrent file or a magnet
+	link. Reads nothing and changes nothing, as `analyzeNzb`.
+	"""
+	analyzeTorrent(input: AnalyzeTorrentInput!): SupportReport!
 	"""
 	Submit an NZB for download through the public integration facade.
 	"""

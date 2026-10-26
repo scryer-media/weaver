@@ -9,8 +9,10 @@ use std::io::Read;
 use async_graphql::{Context, InputObject, Result, SimpleObject, Upload};
 use base64::Engine;
 use weaver_server_core::support::{
-    ReportEnvironment, SupportReportError, analyze_nzb_bytes, job_support_report, now_epoch_secs,
+    ReportEnvironment, SupportReportError, analyze_magnet, analyze_nzb_bytes,
+    analyze_torrent_bytes, job_support_report, now_epoch_secs,
 };
+use weaver_server_core::torrents::service::TorrentService;
 use weaver_server_core::{Database, SchedulerHandle};
 
 use crate::auth::graphql_error;
@@ -44,11 +46,26 @@ pub struct AnalyzeNzbInput {
     pub nzb_base64: Option<String>,
 }
 
+/// A torrent to analyze without adding it: a .torrent file, uploaded or
+/// as base64, or a magnet link. Exactly one source is required.
+#[derive(Debug, InputObject)]
+pub struct AnalyzeTorrentInput {
+    pub torrent_upload: Option<Upload>,
+    pub torrent_base64: Option<String>,
+    pub magnet: Option<String>,
+}
+
+// The largest .torrent file the analyzer reads.
+const MAX_TORRENT_BYTES: u64 = 64 * 1024 * 1024;
+
 fn report_error(error: SupportReportError) -> async_graphql::Error {
     match error {
         SupportReportError::NotFound(_) => graphql_error("NOT_FOUND", error.to_string()),
         SupportReportError::NzbUnavailable(_) => graphql_error("NOT_FOUND", error.to_string()),
-        SupportReportError::Parse(_) => graphql_error("INVALID_INPUT", error.to_string()),
+        SupportReportError::TorrentUnavailable(_) => graphql_error("NOT_FOUND", error.to_string()),
+        SupportReportError::Parse(_) | SupportReportError::TorrentParse(_) => {
+            graphql_error("INVALID_INPUT", error.to_string())
+        }
         SupportReportError::State(_) | SupportReportError::Task(_) => {
             graphql_error("INTERNAL", error.to_string())
         }
@@ -61,7 +78,7 @@ pub(crate) async fn resolve_job_support_report(
 ) -> Result<SupportReport> {
     let db = ctx.data::<Database>()?;
     let handle = ctx.data::<SchedulerHandle>()?;
-    job_support_report(db, handle, job_id)
+    job_support_report(db, handle, ctx.data_opt::<TorrentService>(), job_id)
         .await
         .map(SupportReport::from)
         .map_err(report_error)
@@ -118,6 +135,70 @@ pub(crate) async fn resolve_analyze_nzb(
     })
     .await
     .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+}
+
+pub(crate) async fn resolve_analyze_torrent(
+    ctx: &Context<'_>,
+    input: AnalyzeTorrentInput,
+) -> Result<SupportReport> {
+    let environment =
+        ReportEnvironment::current(ctx.data::<Database>()?, ctx.data::<SchedulerHandle>()?);
+    let source = match (input.torrent_upload, input.torrent_base64, input.magnet) {
+        (Some(upload), None, None) => {
+            let upload = upload
+                .value(ctx)
+                .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
+            TorrentSource::Upload(upload)
+        }
+        (None, Some(encoded), None) => {
+            let encoded = encoded.trim();
+            if encoded.len() as u64 > MAX_TORRENT_BYTES.div_ceil(3) * 4 {
+                return Err(graphql_error("INVALID_INPUT", "the torrent is too large"));
+            }
+            TorrentSource::Bytes(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid base64: {e}")))?,
+            )
+        }
+        (None, None, Some(link)) => TorrentSource::Magnet(link),
+        _ => {
+            return Err(graphql_error(
+                "INVALID_INPUT",
+                "analyzeTorrent requires exactly one of torrentUpload, torrentBase64 or magnet",
+            ));
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let report = match source {
+            TorrentSource::Magnet(link) => analyze_magnet(&link, &environment, now_epoch_secs()),
+            TorrentSource::Bytes(bytes) => {
+                analyze_torrent_bytes(&bytes, &environment, now_epoch_secs())
+            }
+            TorrentSource::Upload(upload) => {
+                let mut bytes = Vec::new();
+                upload
+                    .content
+                    .take(MAX_TORRENT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| graphql_error("INVALID_INPUT", format!("invalid upload: {e}")))?;
+                if bytes.len() as u64 > MAX_TORRENT_BYTES {
+                    return Err(graphql_error("INVALID_INPUT", "the torrent is too large"));
+                }
+                analyze_torrent_bytes(&bytes, &environment, now_epoch_secs())
+            }
+        };
+        report.map(SupportReport::from).map_err(report_error)
+    })
+    .await
+    .map_err(|e| graphql_error("INTERNAL", e.to_string()))?
+}
+
+enum TorrentSource {
+    Upload(async_graphql::UploadValue),
+    Bytes(Vec<u8>),
+    Magnet(String),
 }
 
 enum Source {

@@ -144,7 +144,7 @@ fn history_report_carries_the_outcome_and_no_names() {
     )
     .unwrap();
 
-    let report = build_job_support_report(&db, None, 7, &ENVIRONMENT, NOW).unwrap();
+    let report = build_job_support_report(&db, None, None, 7, &ENVIRONMENT, NOW).unwrap();
     assert_redacted(&report);
 
     let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
@@ -225,7 +225,7 @@ fn live_report_reads_queue_state() {
     );
     let info = live_info(3);
 
-    let report = build_job_support_report(&db, Some(info), 3, &ENVIRONMENT, NOW).unwrap();
+    let report = build_job_support_report(&db, Some(info), None, 3, &ENVIRONMENT, NOW).unwrap();
     assert_redacted(&report);
     let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
     let job = &json["job"];
@@ -244,7 +244,7 @@ fn live_report_reads_queue_state() {
 fn missing_job_and_missing_nzb_are_distinct_errors() {
     let db = Database::open_in_memory().unwrap();
     assert!(matches!(
-        build_job_support_report(&db, None, 99, &ENVIRONMENT, NOW),
+        build_job_support_report(&db, None, None, 99, &ENVIRONMENT, NOW),
         Err(SupportReportError::NotFound(99))
     ));
 }
@@ -326,7 +326,8 @@ fn demotion_and_gaps_reach_the_report_and_survive_the_archive() {
         .unwrap();
 
     // Live: read from the active row.
-    let live = build_job_support_report(&db, Some(live_info(11)), 11, &ENVIRONMENT, NOW).unwrap();
+    let live =
+        build_job_support_report(&db, Some(live_info(11)), None, 11, &ENVIRONMENT, NOW).unwrap();
     assert_redacted(&live);
     assert!(
         live.text
@@ -338,7 +339,7 @@ fn demotion_and_gaps_reach_the_report_and_survive_the_archive() {
     // Finished: the archive copies the column onto the history row.
     db.archive_job(JobId(11), &history_row(11, "failed"))
         .unwrap();
-    let report = build_job_support_report(&db, None, 11, &ENVIRONMENT, NOW).unwrap();
+    let report = build_job_support_report(&db, None, None, 11, &ENVIRONMENT, NOW).unwrap();
     assert_redacted(&report);
     let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
     let job = &json["job"];
@@ -377,7 +378,7 @@ fn a_job_without_facts_reports_no_demotion_or_gap_lines() {
     db.create_active_job(&active_job(12)).unwrap();
     db.archive_job(JobId(12), &history_row(12, "completed"))
         .unwrap();
-    let report = build_job_support_report(&db, None, 12, &ENVIRONMENT, NOW).unwrap();
+    let report = build_job_support_report(&db, None, None, 12, &ENVIRONMENT, NOW).unwrap();
     let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
     assert!(json["job"]["demotion"].is_null());
     assert!(json["job"]["gaps"].is_null());
@@ -392,7 +393,8 @@ fn a_hand_edited_row_cannot_carry_names_into_the_report() {
     let raw = format!(r#"{{"d":{{"r":"{SENTINEL}.part01.rar","s":"{SENTINEL}","t":1}}}}"#);
     db.save_active_support_facts(vec![(JobId(13), Some(raw))])
         .unwrap();
-    let report = build_job_support_report(&db, Some(live_info(13)), 13, &ENVIRONMENT, NOW).unwrap();
+    let report =
+        build_job_support_report(&db, Some(live_info(13)), None, 13, &ENVIRONMENT, NOW).unwrap();
     assert_redacted(&report);
     assert!(
         report.text.contains("demoted unknown  in other"),
@@ -409,9 +411,494 @@ fn a_cached_finished_job_reports_from_history() {
     db.create_active_job(&active_job(14)).unwrap();
     db.archive_job(JobId(14), &history_row(14, "failed"))
         .unwrap();
-    let report = build_job_support_report(&db, Some(live_info(14)), 14, &ENVIRONMENT, NOW).unwrap();
+    let report =
+        build_job_support_report(&db, Some(live_info(14)), None, 14, &ENVIRONMENT, NOW).unwrap();
     assert_redacted(&report);
     let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
     assert_eq!(json["job"]["source"], "history");
     assert_eq!(json["job"]["status"], "failed");
+}
+
+// Torrents.
+
+fn bstr(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(format!("{}:", bytes.len()).as_bytes());
+    out.extend_from_slice(bytes);
+}
+
+const TRACKER: &str = "udp://tracker.example:6969/qvzsentinel/announce?passkey=qvzsentinel";
+
+// The info dictionary of a private one-file torrent named after the
+// sentinel, and the whole metainfo around it.
+fn sentinel_torrent() -> (Vec<u8>, [u8; 20]) {
+    let mut info = b"d".to_vec();
+    bstr(&mut info, b"length");
+    info.extend_from_slice(b"i3000e");
+    bstr(&mut info, b"name");
+    bstr(&mut info, format!("{SENTINEL}.part1.rar").as_bytes());
+    bstr(&mut info, b"piece length");
+    info.extend_from_slice(b"i1024e");
+    bstr(&mut info, b"pieces");
+    bstr(&mut info, &[7u8; 60]);
+    bstr(&mut info, b"private");
+    info.extend_from_slice(b"i1e");
+    info.push(b'e');
+    let hash: [u8; 20] = {
+        use sha1::{Digest, Sha1};
+        Sha1::digest(&info).into()
+    };
+    let mut out = b"d".to_vec();
+    bstr(&mut out, b"announce");
+    bstr(&mut out, TRACKER.as_bytes());
+    bstr(&mut out, b"comment");
+    bstr(&mut out, format!("{SENTINEL} comment").as_bytes());
+    bstr(&mut out, b"created by");
+    bstr(&mut out, SENTINEL.as_bytes());
+    bstr(&mut out, b"creation date");
+    out.extend_from_slice(format!("i{}e", NOW - 86_400).as_bytes());
+    bstr(&mut out, b"info");
+    out.extend_from_slice(&info);
+    out.push(b'e');
+    (out, hash)
+}
+
+fn sentinel_magnet(hash: [u8; 20]) -> String {
+    format!(
+        "magnet:?xt=urn:btih:{}&dn={SENTINEL}&tr=udp%3A%2F%2Ftracker.example%3A6969%2F{SENTINEL}%2Fannounce",
+        hex::encode(hash)
+    )
+}
+
+fn assert_torrent_redacted(report: &SupportReport, hash: [u8; 20]) {
+    assert_redacted(report);
+    for (form, body) in [("text", &report.text), ("json", &report.json)] {
+        assert!(
+            !body.to_ascii_lowercase().contains(&hex::encode(hash)),
+            "{form} leaks the infohash:\n{body}"
+        );
+        assert!(!body.contains("passkey"), "{form} leaks a passkey:\n{body}");
+    }
+}
+
+#[test]
+fn a_torrent_file_and_its_magnet_report_without_names() {
+    let (metainfo, hash) = sentinel_torrent();
+    let file = analyze_torrent_bytes(&metainfo, &ENVIRONMENT, NOW).unwrap();
+    assert_torrent_redacted(&file, hash);
+    let json: serde_json::Value = serde_json::from_str(&file.json).unwrap();
+    assert!(json["job"].is_null());
+    assert_eq!(json["torrent"]["identity"]["weaver_version"], "9.9.9");
+    assert_eq!(json["torrent"]["trackers"]["private"], true);
+    assert_eq!(
+        json["torrent"]["trackers"]["trackers"][0]["host"],
+        "tracker.example"
+    );
+    assert_eq!(json["environment"]["datastore"], "sqlite");
+    assert!(file.text.contains("tracker.example"), "{}", file.text);
+    assert!(!file.text.contains("job ("));
+
+    let magnet = analyze_magnet(&sentinel_magnet(hash), &ENVIRONMENT, NOW).unwrap();
+    assert_torrent_redacted(&magnet, hash);
+    let magnet_json: serde_json::Value = serde_json::from_str(&magnet.json).unwrap();
+    assert_eq!(
+        magnet_json["torrent"]["identity"]["fingerprint"],
+        json["torrent"]["identity"]["fingerprint"],
+    );
+    assert_eq!(magnet_json["torrent"]["identity"]["source"], "magnet");
+
+    assert!(matches!(
+        analyze_torrent_bytes(b"not bencode", &ENVIRONMENT, NOW),
+        Err(SupportReportError::TorrentParse(_))
+    ));
+    assert!(matches!(
+        analyze_magnet("magnet:?dn=nothing", &ENVIRONMENT, NOW),
+        Err(SupportReportError::TorrentParse(_))
+    ));
+}
+
+fn torrent_history_row(
+    id: u64,
+    hash: [u8; 20],
+    status: &str,
+    error: Option<&str>,
+) -> JobHistoryRow {
+    JobHistoryRow {
+        protocol: crate::jobs::Protocol::Torrent,
+        job_hash: Some(hash.to_vec()),
+        error_message: error.map(str::to_owned),
+        output_dir: Some(format!("/srv/{SENTINEL}/out")),
+        category: Some(SENTINEL.to_string()),
+        status: status.to_string(),
+        ..history_row(id, status)
+    }
+}
+
+#[test]
+fn a_retired_torrent_reports_from_its_history_row() {
+    let (metainfo, hash) = sentinel_torrent();
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&active_job(21)).unwrap();
+    record_events(&db, 21, &["JobCreated", "JobFailed"]);
+    db.archive_job(
+        JobId(21),
+        &torrent_history_row(
+            21,
+            hash,
+            "failed",
+            Some(&format!("tracker {SENTINEL} refused the announce")),
+        ),
+    )
+    .unwrap();
+
+    let report = build_job_support_report(&db, None, None, 21, &ENVIRONMENT, NOW).unwrap();
+    assert_torrent_redacted(&report, hash);
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    let job = &json["job"];
+    assert_eq!(job["source"], "history");
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["failure"], "tracker");
+    assert_eq!(job["output"]["kind"], "absolute");
+    assert_eq!(job["category_set"], true);
+    assert_eq!(job["checkpoint_in_hand"], false);
+    assert_eq!(job["events"][1]["kind"], "JobFailed");
+    assert_eq!(json["torrent"]["identity"]["source"], "magnet");
+    // The hash it went by is what ties the report to the file's.
+    let file = analyze_torrent_bytes(&metainfo, &ENVIRONMENT, NOW).unwrap();
+    let file_json: serde_json::Value = serde_json::from_str(&file.json).unwrap();
+    assert_eq!(
+        json["torrent"]["identity"]["fingerprint"],
+        file_json["torrent"]["identity"]["fingerprint"],
+    );
+    assert!(
+        report.text.contains("job (history, torrent)"),
+        "{}",
+        report.text
+    );
+    assert!(report.text.contains("verdict tracker"), "{}", report.text);
+
+    // A torrent row without its hash has nothing left to report.
+    db.create_active_job(&active_job(22)).unwrap();
+    db.archive_job(
+        JobId(22),
+        &JobHistoryRow {
+            job_hash: None,
+            ..torrent_history_row(22, hash, "completed", None)
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        build_job_support_report(&db, None, None, 22, &ENVIRONMENT, NOW),
+        Err(SupportReportError::TorrentUnavailable(22))
+    ));
+}
+
+fn held_torrent(
+    metainfo: Option<Vec<u8>>,
+    hash: [u8; 20],
+) -> crate::torrents::service::TorrentSupport {
+    use crate::proxies::TorrentScope;
+    use crate::settings::SeedingPolicy;
+    use crate::torrents::service::{
+        PeerKinds, SeedingSource, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
+    };
+    use crate::torrents::sessions::TorrentRouteReason;
+    use crate::torrents::{
+        NamedBy, TorrentCounters, TorrentSource, TorrentState, TorrentTracker, TrackerStatus,
+    };
+
+    let now_ms = NOW as i64 * 1000;
+    let view = TorrentView {
+        job_id: JobId(31),
+        name: SENTINEL.into(),
+        infohash: hex::encode(hash),
+        infohash_v1: Some(hex::encode(hash)),
+        infohash_v2: None,
+        version: metainfo
+            .as_ref()
+            .map(|_| weaver_torrent::TorrentVersion::V1),
+        magnet: sentinel_magnet(hash),
+        source: TorrentSource::Metainfo,
+        state: TorrentState::Downloading,
+        detail: None,
+        route_reason: Some(TorrentRouteReason::LegDown),
+        paused_by: None,
+        category: Some(SENTINEL.into()),
+        scope: TorrentScope::Category(4),
+        private: true,
+        forced: false,
+        progress: 0.25,
+        total_bytes: 3000,
+        have_bytes: 1024,
+        uploaded_bytes: 512,
+        downloaded_bytes: 2048,
+        ratio: 0.5,
+        download_bps: 500,
+        upload_bps: 0,
+        upload_limit: None,
+        download_limit: None,
+        eta_seconds: None,
+        peers: 3,
+        seeds: 1,
+        leechers: 2,
+        max_peers: 100,
+        swarm_seeds: None,
+        swarm_leechers: None,
+        reannounce_seconds: None,
+        active_seconds: 120,
+        download_avg_bps: 0,
+        upload_avg_bps: 0,
+        wasted_bytes: 2048,
+        last_seen_complete_ms: None,
+        pieces: Some(TorrentPieces {
+            count: 3,
+            size: 1024,
+            have: 1,
+        }),
+        created_by: Some(SENTINEL.into()),
+        created_at_ms: None,
+        comment: Some(SENTINEL.into()),
+        added_at_ms: now_ms - 600_000,
+        completed_at_ms: None,
+        storage_dir: Some(format!("/srv/{SENTINEL}")),
+        seeding_left: None,
+        route: Some("0123456789abcdef".into()),
+        files: Vec::new(),
+        sequential: false,
+        first_last_piece_first: false,
+        trackers: vec![TorrentTracker {
+            tier: 0,
+            url: TRACKER.into(),
+            named_by: NamedBy::Torrent,
+            status: TrackerStatus::TrackerError,
+            updating: false,
+            last_announce_ms: Some(now_ms - 30_000),
+            next_announce_ms: Some(now_ms + 60_000),
+            min_announce_ms: None,
+            message: Some(format!("passkey {SENTINEL} not authorized")),
+            seeders: Some(4),
+            leechers: Some(2),
+            downloaded: Some(9),
+            peers: Some(6),
+            fails: 2,
+            resolved_by: None,
+        }],
+        file_have: Vec::new(),
+        metadata: Vec::new(),
+        seeding_override: None,
+        seeding_inherited: None,
+        seeding_policy: SeedingPolicy {
+            ratio_goal: Some(2.0),
+            ..SeedingPolicy::default()
+        },
+        seeding_source: SeedingSource::Category,
+        unpack: true,
+    };
+    TorrentSupport {
+        view,
+        metainfo: metainfo.map(Into::into),
+        counters: TorrentCounters {
+            uploaded_bytes: 512,
+            downloaded_bytes: 2048,
+            active_duration_s: 120,
+            ..TorrentCounters::default()
+        },
+        failed_bytes: 1024,
+        redundant_bytes: 1024,
+        peers: (3, 1, 2),
+        peer_kinds: PeerKinds {
+            tcp: 2,
+            utp: 1,
+            outgoing: 3,
+            incoming: 0,
+            encrypted: 1,
+        },
+        fetch: None,
+        in_session: true,
+        leg: Some(TorrentLeg {
+            position: 1,
+            egress_id: 3,
+            own_sockets: false,
+        }),
+        has_job: true,
+        kept_pieces: 0,
+        wanted_bytes: 3000,
+        wanted_have_bytes: 1024,
+        metrics: published_metrics(),
+    }
+}
+
+// The exporter's snapshot with job 31, its route's session and another
+// torrent's figures beside it.
+fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
+    use crate::torrents::metrics::{
+        FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
+        TorrentMetrics, TorrentSeries, TrackerSeries,
+    };
+    use crate::torrents::service::TorrentPieces;
+    use crate::torrents::{TorrentState, TrackerStatus};
+
+    let now_ms = NOW as i64 * 1000;
+    let series = |job: u64| TorrentSeries {
+        job_id: JobId(job),
+        category: SENTINEL.into(),
+        route: "0123456789abcdef".into(),
+        state: TorrentState::Downloading,
+        have_bytes: 1024,
+        total_bytes: 3000,
+        wanted_bytes: 3000,
+        pieces: Some(TorrentPieces {
+            count: 3,
+            size: 1024,
+            have: 1,
+        }),
+        downloaded_bytes: 2048,
+        uploaded_bytes: 512,
+        hash_failed_bytes: 1024,
+        redundant_bytes: 1024,
+        active_seconds: 120,
+        seeding_seconds: 0,
+        download_bps: 500,
+        upload_bps: 0,
+        ratio: 0.5,
+        peers_established: 3,
+        peers_connecting: 2,
+        peer_seeders: 1,
+        leg: Some(("torrent:category:4".into(), 1)),
+        fetch: None,
+        seeding: SeedingSeries {
+            goals: vec![(SeedingGoal::Ratio, 2.0, 1.5)],
+            met: false,
+        },
+        trackers: vec![TrackerSeries {
+            host: "tracker.example".into(),
+            status: TrackerStatus::TrackerError,
+            last_announce_ms: Some(now_ms - 30_000),
+            next_announce_ms: Some(now_ms + 60_000),
+            interval_seconds: Some(1800),
+            seeders: Some(4),
+            leechers: Some(2),
+            completed: Some(9),
+            fails: 2,
+        }],
+    };
+    let mut other = series(32);
+    other.state = TorrentState::Seeding;
+    TorrentMetrics {
+        published: std::sync::Arc::new(Published {
+            torrents: vec![other, series(31)],
+            sessions: vec![SessionSeries {
+                route: "0123456789abcdef".into(),
+                open: true,
+                listen_port: Some(6881),
+                external_addresses: 1,
+                uptime_seconds: 600,
+                received_payload_bytes: 2048,
+                received_protocol_bytes: 100,
+                sent_payload_bytes: 512,
+                sent_protocol_bytes: 80,
+                blocked_incoming: 1,
+                blocked_outgoing: 0,
+                peers: vec![("established", 3), ("connecting", 2)],
+                connects: vec![("tcp", "v4", [5, 3, 2])],
+                dht: None,
+            }],
+        }),
+        events: vec![(TorrentEvent::Added, 2), (TorrentEvent::Failed, 0)],
+        fetches: vec![(FetchOutcome::Resolved, 0)],
+    }
+}
+
+#[test]
+fn a_held_torrent_reports_what_the_service_holds() {
+    let (metainfo, hash) = sentinel_torrent();
+    let db = Database::open_in_memory().unwrap();
+    record_events(&db, 31, &["JobCreated"]);
+    let held = held_torrent(Some(metainfo), hash);
+
+    let report = build_job_support_report(&db, None, Some(held), 31, &ENVIRONMENT, NOW).unwrap();
+    assert_torrent_redacted(&report, hash);
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    let job = &json["job"];
+    assert_eq!(json["torrent"]["identity"]["source"], "metainfo");
+    assert_eq!(job["source"], "queue");
+    assert_eq!(job["state"], "downloading");
+    assert_eq!(job["route_reason"], "leg_down");
+    assert_eq!(job["scope"], "category c4");
+    assert_eq!(job["leg"]["egress"], "e3");
+    assert_eq!(job["private"], true);
+    assert_eq!(job["counts"]["ratio_milli"], 500);
+    assert_eq!(job["counts"]["hash_failed_bytes"], 1024);
+    assert_eq!(job["pieces"]["hash_failures"], 1);
+    assert_eq!(job["pieces"]["have"], 1);
+    assert_eq!(job["peers"]["utp"], 1);
+    assert_eq!(job["trackers"][0]["status"], "tracker_error");
+    assert_eq!(job["trackers"][0]["message"], "authorization");
+    assert_eq!(job["trackers"][0]["last_answer_age_secs"], 30);
+    assert_eq!(job["trackers"][0]["next_announce_in_secs"], 60);
+    assert_eq!(job["seeding"]["source"], "category");
+    assert_eq!(job["seeding"]["ratio_left_milli"], 1500);
+    assert_eq!(job["output"]["kind"], "absolute");
+    assert!(
+        report.text.contains("job (queue, torrent)"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report
+            .text
+            .contains("  tracker 0 udp tracker.example  tracker_error x2 (authorization)"),
+        "{}",
+        report.text
+    );
+
+    // The exporter's figures for this job, not its neighbour's.
+    let metrics = &job["metrics"];
+    assert_eq!(metrics["torrent"]["state"], "downloading");
+    assert_eq!(metrics["torrent"]["category_set"], true);
+    assert_eq!(metrics["torrent"]["leg"][0], "torrent:category:4");
+    assert_eq!(metrics["torrent"]["seeding_goals"][0][0], "ratio");
+    assert_eq!(metrics["torrent"]["trackers"][0]["interval_secs"], 1800);
+    assert_eq!(metrics["session"]["listening"], true);
+    assert_eq!(metrics["session"]["connects"][0][2][1], 3);
+    assert_eq!(metrics["events"][0][0], "added");
+    assert_eq!(metrics["events"][0][1], 2);
+    assert!(
+        report.text.contains("metrics (as exported)"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains("    connects tcp/v4 3/5 x2"),
+        "{}",
+        report.text
+    );
+    assert!(!report.json.contains("6881"), "{}", report.json);
+
+    // Before its metadata arrives, the link it was added by stands in.
+    let report = build_job_support_report(
+        &db,
+        None,
+        Some(held_torrent(None, hash)),
+        31,
+        &ENVIRONMENT,
+        NOW,
+    )
+    .unwrap();
+    assert_torrent_redacted(&report, hash);
+    let json: serde_json::Value = serde_json::from_str(&report.json).unwrap();
+    assert_eq!(json["torrent"]["identity"]["source"], "magnet");
+    assert!(json["job"]["private"].is_null());
+}
+
+#[test]
+fn torrent_failures_reduce_to_a_cause() {
+    for (message, verdict) in [
+        ("certificate verify failed", FailureVerdict::Certificate),
+        ("metadata never arrived", FailureVerdict::Metadata),
+        ("tracker refused the announce", FailureVerdict::Tracker),
+        ("no route: egress down", FailureVerdict::Route),
+        ("listen port unavailable", FailureVerdict::Session),
+    ] {
+        assert_eq!(FailureVerdict::classify(message), verdict, "{message}");
+    }
 }

@@ -236,3 +236,182 @@ async fn analyze_accepts_an_upload_and_refuses_two_sources() {
         .await;
     assert_has_errors(&response);
 }
+
+fn bstr(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(format!("{}:", bytes.len()).as_bytes());
+    out.extend_from_slice(bytes);
+}
+
+// A private one-file torrent named after the sentinel.
+fn sentinel_torrent() -> Vec<u8> {
+    let mut info = b"d".to_vec();
+    bstr(&mut info, b"length");
+    info.extend_from_slice(b"i40000e");
+    bstr(&mut info, b"name");
+    bstr(&mut info, format!("{SENTINEL}.mkv").as_bytes());
+    bstr(&mut info, b"piece length");
+    info.extend_from_slice(b"i16384e");
+    bstr(&mut info, b"pieces");
+    bstr(&mut info, &[3u8; 60]);
+    bstr(&mut info, b"private");
+    info.extend_from_slice(b"i1e");
+    info.push(b'e');
+    let mut out = b"d".to_vec();
+    bstr(&mut out, b"announce");
+    bstr(
+        &mut out,
+        format!("https://tracker.example/{SENTINEL}/announce").as_bytes(),
+    );
+    bstr(&mut out, b"info");
+    out.extend_from_slice(&info);
+    out.push(b'e');
+    out
+}
+
+// The hash a magnet in these tests goes by: the server tests tie it to a
+// file's.
+const HASH: [u8; 20] = [0x5a; 20];
+
+#[tokio::test]
+async fn read_scope_can_analyze_a_torrent_and_its_magnet() {
+    let h = TestHarness::new().await;
+    let metainfo = sentinel_torrent();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&metainfo);
+    let response = h
+        .execute_as(
+            &format!(
+                r#"mutation {{ analyzeTorrent(input: {{ torrentBase64: "{encoded}" }}) {{ text json }} }}"#
+            ),
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let file = &data["analyzeTorrent"];
+    assert_redacted(file);
+    let file_json: serde_json::Value =
+        serde_json::from_str(file["json"].as_str().unwrap()).unwrap();
+    assert!(file_json["job"].is_null());
+    assert_eq!(file_json["torrent"]["identity"]["source"], "metainfo");
+    assert_eq!(file_json["torrent"]["trackers"]["private"], true);
+
+    let magnet = format!("magnet:?xt=urn:btih:{}&dn={SENTINEL}", hex::encode(HASH));
+    let response = h
+        .execute_as(
+            &format!(
+                r#"mutation {{ analyzeTorrent(input: {{ magnet: "{magnet}" }}) {{ text json }} }}"#
+            ),
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    assert_redacted(&data["analyzeTorrent"]);
+    let json: serde_json::Value =
+        serde_json::from_str(data["analyzeTorrent"]["json"].as_str().unwrap()).unwrap();
+    assert_eq!(json["torrent"]["identity"]["source"], "magnet");
+    assert!(
+        !data["analyzeTorrent"]["json"]
+            .as_str()
+            .unwrap()
+            .contains(&hex::encode(HASH))
+    );
+}
+
+#[tokio::test]
+async fn analyze_torrent_accepts_an_upload_and_refuses_two_sources() {
+    let h = TestHarness::new().await;
+    let metainfo = sentinel_torrent();
+    let mut request = Request::new(
+        "mutation Analyze($input: AnalyzeTorrentInput!) { analyzeTorrent(input: $input) { text json } }",
+    )
+    .data(CallerScope::Read)
+    .data(CallerIdentity::Local([9; 32]))
+    .variables(Variables::from_json(
+        json!({ "input": { "torrentUpload": null } }),
+    ));
+    request.set_upload(
+        "variables.input.torrentUpload",
+        UploadValue {
+            filename: format!("{SENTINEL}.torrent"),
+            content_type: Some("application/x-bittorrent".to_string()),
+            content: metainfo.into(),
+        },
+    );
+    let response = h.schema.execute(request).await;
+    assert_no_errors(&response);
+    assert_redacted(&response_data(&response)["analyzeTorrent"]);
+
+    let response = h
+        .execute_as(
+            r#"mutation { analyzeTorrent(input: {}) { text } }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&response);
+
+    let magnet = format!("magnet:?xt=urn:btih:{}", hex::encode(HASH));
+    let response = h
+        .execute_as(
+            &format!(
+                r#"mutation {{ analyzeTorrent(input: {{ torrentBase64: "ZGU=", magnet: "{magnet}" }}) {{ text }} }}"#
+            ),
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&response);
+
+    let response = h
+        .execute_as(
+            r#"mutation { analyzeTorrent(input: { torrentBase64: "bm90IGEgdG9ycmVudA==" }) { text } }"#,
+            CallerScope::Read,
+        )
+        .await;
+    assert_has_errors(&response);
+}
+
+#[tokio::test]
+async fn a_retired_torrent_job_reports_from_its_hash() {
+    let h = TestHarness::new().await;
+    // Torrents are archived with the hash they went by and no NZB.
+    h.db.archive_job(
+        JobId(44),
+        &JobHistoryRow {
+            protocol: weaver_server_core::Protocol::Torrent,
+            job_id: 44,
+            job_hash: Some(HASH.to_vec()),
+            name: SENTINEL.to_string(),
+            status: "failed".to_string(),
+            error_message: Some(format!("metadata for {SENTINEL} never arrived")),
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1_767_000_000,
+            completed_at: 1_767_000_600,
+            metadata: None,
+            server_attribution: None,
+        },
+    )
+    .unwrap();
+    let response = h
+        .execute_as(
+            "{ jobSupportReport(jobId: 44) { text json } }",
+            CallerScope::Read,
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let report = &data["jobSupportReport"];
+    assert_redacted(report);
+    let json: serde_json::Value = serde_json::from_str(report["json"].as_str().unwrap()).unwrap();
+    assert_eq!(json["job"]["source"], "history");
+    assert_eq!(json["job"]["failure"], "metadata");
+    assert_eq!(json["torrent"]["identity"]["source"], "magnet");
+    assert!(json["nzb"].is_null());
+}
