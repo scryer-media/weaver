@@ -2182,6 +2182,58 @@ impl Database {
         })
     }
 
+    pub(crate) fn set_nzb_pause_release(
+        &self,
+        job_id: JobId,
+        pending: bool,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_nzb_pause_release", |tx| {
+                Box::pin(async move {
+                    lock_active_job_for_write_tx(tx, job_id).await?;
+                    tx.execute(
+                        "UPDATE active_jobs SET nzb_release_pending = {} WHERE job_id = {}",
+                        &[
+                            SqlArg::I64(i64::from(pending)),
+                            SqlArg::I64(job_id.0 as i64),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    pub(crate) fn set_nzb_admitted(&self, job_id: JobId, admitted: bool) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "set_nzb_admitted", |tx| {
+                Box::pin(async move {
+                    lock_active_job_for_write_tx(tx, job_id).await?;
+                    if admitted && !active_job_exists_tx(tx, job_id).await? {
+                        return Err(StateError::Database(format!(
+                            "cannot admit missing active NZB {}",
+                            job_id.0
+                        )));
+                    }
+                    tx.execute(
+                        "UPDATE active_jobs SET nzb_admitted = {} WHERE job_id = {}",
+                        &[
+                            SqlArg::I64(i64::from(admitted)),
+                            SqlArg::I64(job_id.0 as i64),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
     pub fn set_active_job_normalization_retried(
         &self,
         job_id: JobId,

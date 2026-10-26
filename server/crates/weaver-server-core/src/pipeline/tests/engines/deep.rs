@@ -729,7 +729,7 @@ async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]);
     let graph = run(&scenario, Engine::Graph).await;
     assert!(
-        matches!(graph.status, Some(JobStatus::Partial { .. })),
+        matches!(graph.status, Some(JobStatus::Partial)),
         "{:?} {:?}",
         graph.status,
         graph.failure
@@ -906,7 +906,7 @@ async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_
     let graph = run(&scenario, Engine::Graph).await;
     for outcome in [&root, &graph] {
         assert!(
-            matches!(outcome.status, Some(JobStatus::Partial { .. })),
+            matches!(outcome.status, Some(JobStatus::Partial)),
             "{:?} {:?}",
             outcome.status,
             outcome.failure
@@ -1106,11 +1106,9 @@ async fn a_par2_set_two_deep_restarted_while_its_repair_is_out_applies_the_repai
 
 // The scenario of `assert_repaired_header_places_the_bytes_behind_it`, and
 // `inner` run alone: what it delivers.
-async fn repaired_header(
-    inner: Vec<u8>,
-    first: &str,
-    wrap: fn(Vec<(&str, Vec<u8>)>) -> (String, Vec<u8>),
-) -> (Outcome, Scenario) {
+type WrapMembers = fn(Vec<(&str, Vec<u8>)>) -> (String, Vec<u8>);
+
+async fn repaired_header(inner: Vec<u8>, first: &str, wrap: WrapMembers) -> (Outcome, Scenario) {
     let alone = run(
         &Scenario::new(vec![Post::plain("mixed.rar", inner.clone())]),
         Engine::Graph,
@@ -1175,7 +1173,7 @@ fn vint(bytes: &[u8]) -> (u64, usize) {
 async fn assert_repaired_header_places_the_bytes_behind_it(
     inner: Vec<u8>,
     first: &str,
-    wrap: fn(Vec<(&str, Vec<u8>)>) -> (String, Vec<u8>),
+    wrap: WrapMembers,
 ) -> Outcome {
     let (alone, scenario) = repaired_header(inner, first, wrap).await;
     let graph = run(&scenario, Engine::Graph).await;
@@ -1215,9 +1213,7 @@ async fn assert_repaired_header_places_the_bytes_behind_it(
 // The compressed fixture: the member the repaired header names is
 // compressed, so the store gives `mixed.rar` up to the RAR engine, which
 // reads the bytes back where they went.
-async fn assert_repaired_bytes_read_back_after_refusal(
-    wrap: fn(Vec<(&str, Vec<u8>)>) -> (String, Vec<u8>),
-) {
+async fn assert_repaired_bytes_read_back_after_refusal(wrap: WrapMembers) {
     let mixed = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
     let graph = assert_repaired_header_places_the_bytes_behind_it(mixed, "hello.txt", wrap).await;
     assert!(kinds(&graph).contains(&"rar_engine"), "{:?}", kinds(&graph));
@@ -1225,9 +1221,7 @@ async fn assert_repaired_bytes_read_back_after_refusal(
 
 // A stored RAR of two members: the member the repaired header names is
 // stored, and the store delivers it itself.
-async fn assert_repaired_header_delivers_the_stored_member_behind_it(
-    wrap: fn(Vec<(&str, Vec<u8>)>) -> (String, Vec<u8>),
-) {
+async fn assert_repaired_header_delivers_the_stored_member_behind_it(wrap: WrapMembers) {
     let inner = rar(&[
         ("cinder.txt", payload(40, 3)),
         ("ember.bin", payload(60, 5)),

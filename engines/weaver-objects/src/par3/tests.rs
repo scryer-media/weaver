@@ -349,7 +349,7 @@ fn a_hidden_member_still_arriving_holds_the_set_without_asking_for_recovery() {
     bind(&mut job);
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
     let mut wants = Vec::new();
-    Recovery::wants(&mut job.object, &mut wants);
+    Recovery::wants(&job.object, &mut wants);
     assert!(wants.is_empty(), "{wants:?}");
     job.arrive(hidden, 4000, &one[4000..], Provenance::Fresh);
     job.store.members.insert(hidden, one.clone());

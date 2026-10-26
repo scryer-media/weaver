@@ -59,6 +59,7 @@ mod full_file_names;
 mod hardware_profile;
 mod health_probe;
 mod idle;
+mod nzb_admission;
 mod par2_completion;
 mod par2_multiset_binding;
 mod par2_multiset_gate;
@@ -89,6 +90,30 @@ impl Pipeline {
         let id = request.job_id;
         if self.jobs.contains_key(&id) {
             return Err(SchedulerError::JobExists(id));
+        }
+        // Synthetic restore requests still need the active record that real
+        // startup recovery reads, so admission can commit before work starts.
+        if !self.db.load_active_jobs()?.contains_key(&id) {
+            self.db.create_active_job(&crate::ActiveJob {
+                job_id: id,
+                engine: crate::pipeline::graph::Engine::Classic,
+                nzb_hash: request.job_hash,
+                nzb_path: request.working_dir.join("restore-fixture.nzb"),
+                nzb_zstd: sample_nzb_zstd(),
+                output_dir: request.working_dir.clone(),
+                created_at: 0,
+                category: request.spec.category.clone(),
+                metadata: request.spec.metadata.clone(),
+                status: "queued",
+                download_state: "queued",
+                post_state: "idle",
+                run_state: "active",
+                paused_resume_status: None,
+                paused_resume_download_state: None,
+                paused_resume_post_state: None,
+                password_override: None,
+                supplied_password_candidates: Vec::new(),
+            })?;
         }
         // Some crash fixtures reuse the stopped runtime's shared queue.
         self.shared_state.queue.write(|inner| {
@@ -141,6 +166,7 @@ impl TestHarness {
             retry: None,
             max_download_speed: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
@@ -558,6 +584,7 @@ async fn new_direct_pipeline_on_machine(
         retry: None,
         max_download_speed: None,
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -2056,6 +2083,10 @@ async fn insert_on(
         .unwrap();
     let (assembly, download_queue, recovery_queue) =
         Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), engine);
+    // This fixture represents work already admitted, not queued intake.
+    pipeline.db.set_nzb_admitted(job_id, true).unwrap();
+    pipeline.nzb_admitted.insert(job_id);
+    pipeline.nzb_seen.insert(job_id);
     // Mirror admission: `add_job` registers a job's bare `.7z` files as
     // direct-unpack arming candidates, and this harness hand-builds the state
     // `add_job` would otherwise have produced.

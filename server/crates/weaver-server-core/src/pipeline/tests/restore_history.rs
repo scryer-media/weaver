@@ -220,6 +220,18 @@ async fn blocked_placement_restore_stays_visible_across_restart_and_resume() {
             assert_eq!(restored.active_downloads, 0);
             assert_eq!(restored.jobs[&job_id].status, JobStatus::Paused);
             assert!(restored.resume_restored_job(job_id).await.is_err());
+            handle.resume_job(job_id).await.unwrap();
+            restored.apply_queue_intents().await;
+            restored.apply_queue_intents().await;
+            assert!(!restored.nzb_admitted.contains(&job_id), "{fault}");
+            assert!(!restored.db.load_nzb_admissions().unwrap().contains(&job_id));
+            assert!(
+                restored
+                    .db
+                    .load_nzb_pause_releases()
+                    .unwrap()
+                    .contains(&job_id)
+            );
             assert!(journal_dir.exists());
             let row = restored
                 .db

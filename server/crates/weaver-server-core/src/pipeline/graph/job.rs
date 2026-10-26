@@ -201,7 +201,12 @@ impl GraphJob {
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
     pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
-        self.runs.live() || self.loans.out()
+        self.runs.in_flight() || self.loans.out()
+    }
+
+    // Keep ownership until stopped workers report that they ended.
+    pub(in crate::pipeline) fn request_stop(&self) {
+        self.runs.request_stop();
     }
 
     // The pipeline is going down. Every run stops where it stands and is
@@ -358,6 +363,15 @@ impl GraphJob {
     pub(crate) fn sample(&mut self) -> Vec<Move> {
         self.root.map.sample();
         self.root.map.take_moves()
+    }
+
+    pub(crate) fn resume_runs(
+        &mut self,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        self.step_runs(Vec::new(), limit)?;
+        self.lend(slots, limit)
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step

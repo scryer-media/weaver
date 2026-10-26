@@ -137,6 +137,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: crate::jobs::DuplicatePolicy::default(),
             direct_store: None,

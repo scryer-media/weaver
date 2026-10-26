@@ -274,7 +274,8 @@ impl Pipeline {
             .enumerate()
             .filter_map(|(index, job_id)| {
                 let state = self.jobs.get(job_id)?;
-                if held.contains(job_id)
+                if !self.nzb_admitted.contains(job_id)
+                    || held.contains(job_id)
                     || state.download_queue.is_empty()
                     || !Self::status_allows_download_dispatch(&state.status)
                     || self.held_for_added_scripts(*job_id)

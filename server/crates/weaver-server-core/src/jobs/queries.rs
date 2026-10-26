@@ -306,6 +306,36 @@ impl Database {
         })
     }
 
+    pub(crate) fn load_nzb_pause_releases(&self) -> Result<HashSet<JobId>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id FROM active_jobs WHERE nzb_release_pending = 1",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.i64("job_id").map(|id| JobId(id as u64)))
+            .collect()
+        })
+    }
+
+    pub(crate) fn load_nzb_admissions(&self) -> Result<HashSet<JobId>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id FROM active_jobs WHERE nzb_admitted = 1",
+                &[],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.i64("job_id").map(|id| JobId(id as u64)))
+            .collect()
+        })
+    }
+
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();

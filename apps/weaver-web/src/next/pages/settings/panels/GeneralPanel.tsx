@@ -54,6 +54,7 @@ interface GeneralSettings {
   cleanupAfterExtract: boolean;
   maxRetries: number;
   propagationDelaySecs: number;
+  maxConcurrentNzbs: number;
   enableSrrdbLookup: boolean;
   duplicatePolicy: DuplicatePolicy;
 }
@@ -70,6 +71,7 @@ interface Form extends DuplicatePolicy {
   cleanupAfterExtract: boolean;
   maxRetries: number;
   propagationDelaySecs: number;
+  maxConcurrentNzbs: number;
   enableSrrdbLookup: boolean;
   /** A replacement list as typed. The stored list never comes back, so it starts blank. */
   archivePasswords: string;
@@ -227,6 +229,7 @@ export function GeneralPanel() {
             cleanupAfterExtract: settings.cleanupAfterExtract,
             maxRetries: settings.maxRetries,
             propagationDelaySecs: settings.propagationDelaySecs,
+            maxConcurrentNzbs: settings.maxConcurrentNzbs,
             enableSrrdbLookup: settings.enableSrrdbLookup,
             archivePasswords: "",
             archivePasswordFile: archive.passwordFile ?? "",
@@ -414,6 +417,20 @@ export function GeneralPanel() {
                 max: 20,
                 onChange: (next) => commit("maxRetries", next),
                 suffix: t("next.general.attempts"),
+              },
+            },
+            {
+              id: "maxConcurrentNzbs",
+              label: t("next.general.maxConcurrentNzbs"),
+              help: t("next.general.maxConcurrentNzbsHelp"),
+              keywords: "usenet concurrent nzb limit",
+              control: {
+                kind: "number",
+                value: values.maxConcurrentNzbs,
+                min: 1,
+                max: 2147483647,
+                step: 1,
+                onChange: (next) => commit("maxConcurrentNzbs", next),
               },
             },
             {

@@ -35,6 +35,7 @@ impl SettingsQuery {
                 cleanup_after_extract: cfg.cleanup_after_extract(),
                 max_download_speed: cfg.max_download_speed.unwrap_or(0),
                 propagation_delay_secs: cfg.propagation_delay_secs(),
+                max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
                 max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),
                 enable_srrdb_lookup: cfg.enable_srrdb_lookup(),
                 watch_folder: (&cfg.watch_folder).into(),

@@ -182,6 +182,12 @@ impl Runs {
             .any(|run| !matches!(run.life, Life::Ended { .. }))
     }
 
+    pub(crate) fn in_flight(&self) -> bool {
+        self.runs
+            .values()
+            .any(|run| matches!(run.life, Life::Running { .. }))
+    }
+
     pub(crate) fn has(&self, node: NodeId) -> bool {
         self.runs.contains_key(&node)
     }
@@ -347,13 +353,17 @@ impl Runs {
     // Stop every run where it stands and forget it: the job is going down.
     // What a run read is on its shelf, for the restored job to read again.
     pub(crate) fn stop(&mut self, limit: usize) {
+        self.request_stop();
+        let all = self.runs.keys().copied().collect();
+        self.forget(all, limit);
+    }
+
+    pub(crate) fn request_stop(&self) {
         for run in self.runs.values() {
             if let Some(volumes) = &run.volumes {
                 volumes.stop();
             }
         }
-        let all = self.runs.keys().copied().collect();
-        self.forget(all, limit);
     }
 
     // Forget the runs of `gone`, whose threads may still be out: what they

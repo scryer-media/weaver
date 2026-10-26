@@ -129,7 +129,7 @@ impl Pipeline {
         segments: &[weaver_yenc::Segment],
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let limit = self.graph_slot_limit();
+        let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return false;
         };
@@ -213,7 +213,7 @@ impl Pipeline {
     // arithmetic is not asked.
     pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
-        let limit = self.graph_slot_limit();
+        let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return false;
         };
@@ -232,12 +232,18 @@ impl Pipeline {
     // waited on, so the completion gate looks again.
     pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
-        let limit = self.graph_slot_limit();
+        let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return;
         };
         let ended = matches!(said.heard, Heard::Ended | Heard::Repaired(_));
         let result = graph.run_said(said, &mut self.graph_status.repairs, limit);
+        if !self.jobs.contains_key(&job_id) {
+            if !graph.awaits_mail() {
+                self.graph_jobs.remove(&job_id);
+            }
+            return;
+        }
         self.after_graph_result(job_id, result);
         if ended {
             self.schedule_job_completion_check(job_id);
@@ -262,6 +268,32 @@ impl Pipeline {
         limits::budgets(&self.direct_store.settings(), &self.tuner).1
     }
 
+    fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
+        if self.nzb_admitted.contains(&job_id)
+            && self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.run_state != crate::jobs::model::RunState::Paused)
+        {
+            self.graph_slot_limit()
+        } else {
+            0
+        }
+    }
+
+    pub(in crate::pipeline) fn resume_graph_work(&mut self, job_id: JobId) {
+        let limit = self.graph_job_slot_limit(job_id);
+        if limit == 0 {
+            return;
+        }
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            return;
+        };
+        let result = graph.resume_runs(&mut self.graph_status.repairs, limit);
+        self.after_graph_result(job_id, result);
+        self.schedule_job_completion_check(job_id);
+    }
+
     fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {
         // A step the job's extraction budget refused ends the job here, so
         // nothing more is fetched or decoded for it.
@@ -284,6 +316,14 @@ impl Pipeline {
     // Lend the job's due repairs under the repair slots every graph job
     // shares.
     pub(in crate::pipeline::graph) fn lend_graph_repairs(&mut self, job_id: JobId) {
+        if !self.nzb_admitted.contains(&job_id)
+            || self
+                .jobs
+                .get(&job_id)
+                .is_none_or(|state| state.run_state == crate::jobs::model::RunState::Paused)
+        {
+            return;
+        }
         let limit = self.graph_slot_limit();
         if let Some(graph) = self.graph_jobs.get_mut(&job_id)
             && let Err(error) = graph.lend(&mut self.graph_status.repairs, limit)

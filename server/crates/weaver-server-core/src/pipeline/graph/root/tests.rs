@@ -945,7 +945,8 @@ fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
     let mut held = Held::new();
     let a = VolumeIndex(0);
     encodes_whole(&root, &mut encoded, &mut held, 0);
-    let steps: Vec<Box<dyn Fn(&mut ArticleRoot)>> = vec![
+    type Step<'a> = Box<dyn Fn(&mut ArticleRoot) + 'a>;
+    let steps: Vec<Step<'_>> = vec![
         Box::new(|root| {
             root.receive(with_segments(
                 decoded(0, 5, 300, &[1; 60], None),

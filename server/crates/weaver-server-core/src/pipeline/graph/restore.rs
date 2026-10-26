@@ -69,7 +69,13 @@ impl Pipeline {
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
-            slots: self.graph_slot_limit(),
+            // An explicitly paused restore owns no NZB slot. Rebuild its
+            // checkpoint, but leave engine runs queued until admission.
+            slots: if self.nzb_admitted.contains(&job_id) {
+                self.graph_slot_limit()
+            } else {
+                0
+            },
             mail: self.graph_runs.sender(),
             passwords: self.restore_passwords(job_id, spec),
             caps: self.graph_caps(&files),

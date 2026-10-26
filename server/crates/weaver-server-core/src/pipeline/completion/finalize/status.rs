@@ -701,6 +701,7 @@ impl Pipeline {
             crate::jobs::model::RunState::Active,
             Some(persist_status),
         );
+        self.resume_graph_work(job_id);
         if matches!(
             resume_download_state,
             crate::jobs::model::DownloadState::Downloading

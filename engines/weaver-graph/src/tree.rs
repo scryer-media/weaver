@@ -2538,10 +2538,10 @@ impl Tree {
         let holder = match engine {
             Some(engine) => engine,
             None => {
-                if let Some(found) = self.nodes.refuse(&node, why) {
-                    if let Some(object) = found.object.as_mut() {
-                        object.refused();
-                    }
+                if let Some(found) = self.nodes.refuse(&node, why)
+                    && let Some(object) = found.object.as_mut()
+                {
+                    object.refused();
                 }
                 node
             }

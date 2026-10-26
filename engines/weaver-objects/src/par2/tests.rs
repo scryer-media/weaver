@@ -332,7 +332,7 @@ fn wants_asks_for_recovery_while_short() {
     let wrong = job.store.members[&member].clone();
     feed(&mut job, member, &wrong, Some(bad));
     let mut seeks = Vec::new();
-    Recovery::wants(&mut job.object, &mut seeks);
+    Recovery::wants(&job.object, &mut seeks);
     assert!(!seeks.is_empty());
     assert!(
         seeks
@@ -488,7 +488,7 @@ fn named_volume(job: &mut Job<Par2>, file: &(String, Vec<u8>)) -> weaver_graph::
 
 fn wanted(job: &mut Job<Par2>) -> Vec<weaver_graph::VolumeIndex> {
     let mut seeks = Vec::new();
-    Recovery::wants(&mut job.object, &mut seeks);
+    Recovery::wants(&job.object, &mut seeks);
     let mut volumes: Vec<_> = seeks.iter().map(|seek| seek.volume).collect();
     volumes.dedup();
     volumes

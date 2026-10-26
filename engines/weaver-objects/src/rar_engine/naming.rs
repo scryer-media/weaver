@@ -73,7 +73,7 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
         return Some(0);
     }
     if lower.len() >= 4 {
-        let ext = lower[lower.len() - 4..].as_bytes();
+        let ext = &lower.as_bytes()[lower.len() - 4..];
         if ext[0] == b'.'
             && OLD_LETTERS.contains(&ext[1])
             && let Ok(n) = lower[lower.len() - 2..].parse::<u32>()

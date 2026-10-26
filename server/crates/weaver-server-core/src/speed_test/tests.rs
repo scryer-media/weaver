@@ -37,6 +37,7 @@ async fn rig() -> Rig {
         retry: None,
         max_download_speed: None,
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),

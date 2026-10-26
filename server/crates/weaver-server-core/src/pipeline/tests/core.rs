@@ -745,6 +745,7 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
     let job_name = "Silver Horizon Broken Final Move";
     let missing_working_dir = intermediate_dir.join("missing");
 
+    pipeline.nzb_admitted.insert(job_id);
     pipeline.jobs.insert(
         job_id,
         minimal_job_state(job_id, job_name, missing_working_dir),

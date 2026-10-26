@@ -607,6 +607,9 @@ impl Pipeline {
     //   critical = (total - 2 × par2_bytes) / (total - par2_bytes) × 1000
     // If no PAR2 data, defaults to 850 (85%).
     pub(super) fn check_health(&mut self, job_id: JobId) {
+        if !self.nzb_admitted.contains(&job_id) {
+            return;
+        }
         if self.jobs.get(&job_id).is_none_or(|state| {
             matches!(
                 state.status,
@@ -1655,6 +1658,9 @@ impl Pipeline {
     // job is downloading, and saying so kept it out of dispatch decisions,
     // completion scheduling and the capacity budget that all read the status.
     pub(super) fn activate_health_probes(&mut self, job_id: JobId) -> bool {
+        if !self.nzb_admitted.contains(&job_id) {
+            return false;
+        }
         // The failing-file count this round was armed on: another file failing
         // is what re-arms the next one, and a second dead article in a file
         // already known to be missing is not that.

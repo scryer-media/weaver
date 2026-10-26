@@ -46,7 +46,7 @@ enum Ended {
 
 impl<D: Decoder> Extraction for Run<D> {
     fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
-        let input = Front::new(Arc::clone(&volumes));
+        let mut input = Front::new(Arc::clone(&volumes));
         let failed = input.failure();
         let announced = sink(Emit::Member {
             member: MEMBER,
@@ -57,9 +57,9 @@ impl<D: Decoder> Extraction for Run<D> {
             return;
         }
         let pumped = if D::IDENTITY {
-            pump(Box::new(input), sink, Front::bridge)
+            pump(&mut input, sink, Front::bridge)
         } else {
-            D::open(input, self.window).and_then(|reader| pump(reader, sink, |_, _| None))
+            D::open(input, self.window).and_then(|mut reader| pump(&mut *reader, sink, |_, _| None))
         };
         let error = match pumped {
             Ok(Ended::Whole) => {
@@ -101,7 +101,7 @@ impl<D: Decoder> Extraction for Run<D> {
 // short. What decoded before a failure is said before it. A failure `bridge`
 // reads on past is a gap of the length it gives, said as damaged bytes.
 fn pump<R: Read + ?Sized>(
-    mut reader: Box<R>,
+    reader: &mut R,
     sink: &mut Sink<'_>,
     bridge: impl Fn(&mut R, &io::Error) -> Option<u64>,
 ) -> io::Result<Ended> {

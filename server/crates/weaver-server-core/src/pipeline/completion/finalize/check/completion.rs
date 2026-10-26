@@ -417,6 +417,9 @@ impl Pipeline {
     // CRC failures occur, recovery files are promoted for download and repair
     // runs from disk using `verify_all` + `plan_repair` + `execute_repair`.
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        if !self.nzb_admitted.contains(&job_id) {
+            return;
+        }
         // A retiring job does not advance: its archive's done event either
         // removes it or hands it back live, and a handed-back job is checked
         // again then.

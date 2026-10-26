@@ -101,6 +101,17 @@ impl Pipeline {
                 Duration::from_secs(u64::from(cfg.propagation_delay_secs())),
             )
         };
+        let nzb_limit = config.read().await.max_concurrent_nzbs();
+        shared_state.queue.write(|inner| {
+            inner.globals.max_concurrent_nzbs = std::num::NonZeroU32::new(nzb_limit);
+            queue::Change::changed(())
+        });
+        let admission_db = db.clone();
+        let nzb_admitted =
+            tokio::task::spawn_blocking(move || admission_db.load_nzb_admissions()).await??;
+        let admission_db = db.clone();
+        let nzb_pause_releases =
+            tokio::task::spawn_blocking(move || admission_db.load_nzb_pause_releases()).await??;
         let download_stall_recovery = download::download_stall_recovery_from_env_value(
             std::env::var(download::DOWNLOAD_STALL_RECOVERY_ENV).ok(),
         );
@@ -265,6 +276,11 @@ impl Pipeline {
             graph_status: Default::default(),
             graph_holds,
             graph_runs: Default::default(),
+            nzb_admitted,
+            nzb_seen: HashSet::new(),
+            nzb_pause_releases,
+            nzb_added_scripts_pending: HashSet::new(),
+            nzb_reprocess_pending: HashSet::new(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             archive_password_winners: HashMap::new(),

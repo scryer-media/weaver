@@ -846,7 +846,9 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
     let admission = pipeline.checkpoint_admission(JOB);
     assert_eq!(admission.decision(&work, &[]).as_str(), "within_limit");
     assert_eq!(
-        admission.decision(&work, &[work.clone()]).as_str(),
+        admission
+            .decision(&work, std::slice::from_ref(&work))
+            .as_str(),
         "within_limit",
         "a restored graph job must not drop to one article at a time"
     );

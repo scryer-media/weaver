@@ -17,6 +17,7 @@ pub mod graph;
 mod health;
 mod infrastructure_retry;
 pub(crate) mod integrity;
+mod nzb_admission;
 mod orchestrator;
 mod progress;
 pub mod queue;
@@ -2613,6 +2614,11 @@ pub struct Pipeline {
     pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
     // Where the engines graph jobs run say what they found.
     pub(super) graph_runs: graph::engine::RunMail,
+    pub(crate) nzb_admitted: HashSet<JobId>,
+    pub(crate) nzb_seen: HashSet<JobId>,
+    pub(crate) nzb_pause_releases: HashSet<JobId>,
+    pub(crate) nzb_added_scripts_pending: HashSet<JobId>,
+    pub(crate) nzb_reprocess_pending: HashSet<JobId>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
