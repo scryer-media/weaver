@@ -20,8 +20,6 @@ pub(crate) enum Step<'a> {
     Bytes(u32, u64, &'a [u8]),
     Closed(u32),
     Password(&'a str),
-    // How far the object's run read, as its owner tells it.
-    Reached(u32, u64),
     // Bytes the object placed before the checkpoint, delivered again as a
     // restart replays its partials: what it holds now the owner already
     // holds, so nothing here is held again.
@@ -78,11 +76,6 @@ impl Owner {
                 &mut |placement, into| read(&self.written, placement, into),
                 out,
             ),
-            Step::Reached(volume, offset) => {
-                if let Some(engine) = object.engine_mut() {
-                    engine.reached(VolumeIndex(volume), offset);
-                }
-            }
         }
         self.release(object, out);
         for emit in out.iter() {

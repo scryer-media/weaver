@@ -208,6 +208,38 @@ fn sealing_re_enciphers_from_any_kept_seed() {
     }
 }
 
+// Blocks staged behind a gap post as they came: no seed is needed for
+// them, so the gap never comes into it. Across the gap nothing seals.
+#[test]
+fn staged_blocks_behind_a_gap_seal_without_it() {
+    let (plain, cipher) = posted(300);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    for range in [
+        ByteRange::new(0, 64),
+        ByteRange::new(160, cipher.len() as u64),
+    ] {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+    }
+    let cipher_len = cipher.len() as u64;
+    for range in [
+        ByteRange::new(0, 64),
+        ByteRange::new(160, cipher_len),
+        ByteRange::new(170, 200),
+    ] {
+        let mut into = Vec::new();
+        assert!(out.seal(&stream, range, &plain, &mut into), "{range}");
+        assert_eq!(
+            into,
+            cipher[range.start as usize..range.end as usize],
+            "{range}"
+        );
+    }
+    let mut into = Vec::new();
+    assert!(!out.seal(&stream, ByteRange::new(48, 176), &plain, &mut into));
+}
+
 // A cipher opened again with nothing kept, over its owner's record of what
 // it placed, seals each range before the replay delivers it, says nothing
 // new, and keeps the seeds the first one kept.

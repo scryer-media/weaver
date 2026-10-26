@@ -20,9 +20,9 @@ use par3_rs::creation::{CreationCodec, CreationOptions};
 
 use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, par3_set, par3_set_with,
-    payload, repair_and_terminal_events, run, run_both, try_run,
+    payload, repair_and_terminal_events, run, run_both,
 };
-use super::rar::{assert_classic_stalls, delivered, posts};
+use super::rar::{delivered, posts};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::Engine;
@@ -344,9 +344,9 @@ async fn a_damaged_obfuscated_member_under_par3_is_repaired_and_renamed_under_bo
     assert!(claims_all(&view.claims, Claim::Complete));
 }
 
-// Divergence, as beside PAR2: classic waits at Downloading on the damaged
-// set and never settles; the graph repairs the volume in the stream and
-// delivers the member.
+// As beside PAR2: classic repairs the damaged volume from PAR3 and
+// delivers the member; the graph repairs the volume in the stream and
+// delivers it.
 #[tokio::test]
 async fn a_two_volume_rar5_set_beside_par3_with_a_damaged_article_is_repaired_in_the_stream_under_graph()
  {
@@ -360,7 +360,10 @@ async fn a_two_volume_rar5_set_beside_par3_with_a_damaged_article_is_repaired_in
     let mut all = posts(volumes.clone());
     all.extend(set);
     let scenario = Scenario::new(all).damaged(0, 2);
-    assert_classic_stalls(try_run(&scenario, Engine::Classic).await);
+    assert_delivers(
+        &run(&scenario, Engine::Classic).await,
+        &[("beacon.bin", &body)],
+    );
     let graph = run(&scenario, Engine::Graph).await;
     assert_delivers(&graph, &[("beacon.bin", &body)]);
     assert_repaired_once(&graph, 1);

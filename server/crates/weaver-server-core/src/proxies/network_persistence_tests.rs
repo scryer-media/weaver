@@ -687,7 +687,10 @@ fn a_torrent_route_is_one_leg_with_one_exit() {
             "TORRENT_ROUTE_RUNGS",
         ),
         (
-            policy(vec![leg(0, ladder(vec![Rung::Pool { id: pool.id }], false))]),
+            policy(vec![leg(
+                0,
+                ladder(vec![Rung::Pool { id: pool.id }], false),
+            )]),
             "TORRENT_ROUTE_POOL",
         ),
     ];
@@ -719,7 +722,14 @@ fn a_torrent_route_is_one_leg_with_one_exit() {
         }
         for policy in &saved {
             db.save_proxy_routing_policy(consumer, policy).unwrap();
-            assert_eq!(db.proxy_routing_policy(consumer).unwrap().route().legs.len(), 1);
+            assert_eq!(
+                db.proxy_routing_policy(consumer)
+                    .unwrap()
+                    .route()
+                    .legs
+                    .len(),
+                1
+            );
         }
     }
     for (policy, _) in &refusals {

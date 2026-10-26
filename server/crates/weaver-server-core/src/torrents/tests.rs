@@ -5,8 +5,8 @@ use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
-    FilePriority, Infohash, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent,
-    TorrentRecord, TorrentSource, TrackerEntry,
+    FilePriority, Infohash, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
+    TorrentSource, TrackerEntry,
 };
 
 fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {

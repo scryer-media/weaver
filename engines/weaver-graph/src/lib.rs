@@ -43,8 +43,8 @@ pub mod tree;
 pub mod volume;
 mod wire;
 
-pub use deliver::{Delivery, Emit, Posted, Provenance, RecoveryKind, Why};
-pub use engine::{Engine, Extraction, Sink, Volumes};
+pub use deliver::{Delivery, Emit, Handed, Posted, Provenance, RecoveryKind, Why};
+pub use engine::{Engine, Extraction, Lost, Sink, Volumes};
 pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
     decode_parts, encode_parts, encode_since,
@@ -59,7 +59,7 @@ pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
 };
 pub use recovery::{Recovery, Segment, SliceVerdict};
-pub use seek::{Pull, Purpose, Seek, SeekUp, Weight};
-pub use sniff::{Sniff, VERDICT_BYTES, signed, sniff};
+pub use seek::{Pull, Purpose, Seek, SeekUp, Weight, When};
+pub use sniff::{Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, sniff};
 pub use tree::{Builder, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};

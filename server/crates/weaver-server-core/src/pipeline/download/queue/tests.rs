@@ -7,6 +7,7 @@ use super::*;
 
 fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadWork {
     DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: JobId(job_id),
@@ -86,6 +87,23 @@ fn clear_exclude_servers_drops_stale_indices_and_counter() {
     assert_eq!(q.len(), 2);
     while let Some(work) = q.pop() {
         assert!(work.exclude_servers.is_empty());
+    }
+}
+
+#[test]
+fn clear_exclude_servers_drops_hints_on_hint_only_work() {
+    let mut q = DownloadQueue::new();
+    let mut hinted = make_work(1, 0, 0, 10);
+    hinted.avoid_server = Some(3);
+    q.push(hinted);
+    q.push(make_work(1, 0, 1, 20));
+    assert_eq!(q.excluded_work_count(), 1);
+
+    q.clear_exclude_servers();
+    assert_eq!(q.excluded_work_count(), 0);
+    assert_eq!(q.len(), 2);
+    while let Some(work) = q.pop() {
+        assert_eq!(work.avoid_server, None);
     }
 }
 
@@ -483,6 +501,7 @@ fn min_queued_byte_estimate_tracks_every_add_and_removal_path() {
         file_index,
     };
     let sized = |file_index, seg, bytes| DownloadWork {
+        counters: None,
         byte_estimate: bytes,
         ..make_work(7, file_index, seg, 10)
     };

@@ -56,7 +56,9 @@ pub(super) fn param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The next HTTP request to the tracker, unanswered, and its query string.
-pub(super) async fn read_announce_query(listener: &TcpListener) -> anyhow::Result<(TcpStream, String)> {
+pub(super) async fn read_announce_query(
+    listener: &TcpListener,
+) -> anyhow::Result<(TcpStream, String)> {
     let (mut conn, _) = listener.accept().await?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];

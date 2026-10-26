@@ -73,16 +73,18 @@ pub enum SchedulerBlockClause {
     ServerExclusion,
     // A backfill server waits for the fill servers to give the article up.
     Backfill,
-    // The PAR2 index bootstrap claims the queue for its index files.
-    Par2Bootstrap,
+    // The recovery metadata bootstrap claims the queue for its index files.
+    RecoveryMetadataBootstrap,
     // The UU spool cursor has not reached the article.
     UuCursor,
     // The restart checkpoint holds the job's undurable lead.
     Checkpoint,
+    // A higher-priority group can still supply this article.
+    ProviderPriority,
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 10;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
@@ -90,9 +92,10 @@ impl SchedulerBlockClause {
         Self::SweepHeld,
         Self::ServerExclusion,
         Self::Backfill,
-        Self::Par2Bootstrap,
+        Self::RecoveryMetadataBootstrap,
         Self::UuCursor,
         Self::Checkpoint,
+        Self::ProviderPriority,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -103,9 +106,10 @@ impl SchedulerBlockClause {
             Self::SweepHeld => "sweep_held",
             Self::ServerExclusion => "server_exclusion",
             Self::Backfill => "backfill",
-            Self::Par2Bootstrap => "par2_bootstrap",
+            Self::RecoveryMetadataBootstrap => "recovery_metadata_bootstrap",
             Self::UuCursor => "uu_cursor",
             Self::Checkpoint => "checkpoint",
+            Self::ProviderPriority => "provider_priority",
         }
     }
 
@@ -175,7 +179,7 @@ impl DownloadPressureReason {
 // it is advanced once per 100 ms metrics tick under the tracker mutex, and
 // once per active job phase on that same tick, so a job's displayed rate and
 // the global gauge are one estimator over one window and can be compared.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RateSeries {
     // Ring buffer of (timestamp, cumulative value) samples.
     samples: Vec<(Instant, u64)>,
@@ -197,10 +201,23 @@ impl RateSeries {
         }
     }
 
-    // Whether any sample has been recorded since construction.
-    #[cfg(test)]
-    pub(crate) fn has_samples(&self) -> bool {
-        !self.samples.is_empty()
+    // A series on this one's sample instants that has counted nothing yet:
+    // every past sample holds `cumulative` and the smoothed rate is zero.
+    //
+    // A counter that starts contributing to a total mid-window gets one of
+    // these from the total's series. Both are then the same linear estimator
+    // over the same instants, so the parts' rates sum to the total's rate.
+    pub(crate) fn aligned_from(&self, cumulative: u64) -> Self {
+        Self {
+            samples: self
+                .samples
+                .iter()
+                .map(|&(at, _)| (at, cumulative))
+                .collect(),
+            pos: self.pos,
+            rate: 0.0,
+            last_ema_at: self.last_ema_at,
+        }
     }
 
     // Record a sample and recompute the smoothed rate.
@@ -469,6 +486,11 @@ pub struct PipelineMetrics {
     pub segments_failed_permanent: AtomicU64,
     pub parked_infrastructure_work: AtomicUsize,
     pub nntp_generation_recovery_requeues: AtomicU64,
+    // Download dispatch stall recoveries, by escalation: a kick clears the
+    // dispatch-side holds of a stall nothing explains; a release books the
+    // stalled jobs' queued articles missing when the kick moved no bytes.
+    pub download_dispatch_stall_kicks: AtomicU64,
+    pub download_dispatch_stall_releases: AtomicU64,
     pub download_failures_article_not_found: AtomicU64,
     pub download_failures_capacity_unavailable: AtomicU64,
     pub download_failures_transient: AtomicU64,
@@ -613,6 +635,8 @@ impl PipelineMetrics {
             segments_failed_permanent: AtomicU64::new(0),
             parked_infrastructure_work: AtomicUsize::new(0),
             nntp_generation_recovery_requeues: AtomicU64::new(0),
+            download_dispatch_stall_kicks: AtomicU64::new(0),
+            download_dispatch_stall_releases: AtomicU64::new(0),
             download_failures_article_not_found: AtomicU64::new(0),
             download_failures_capacity_unavailable: AtomicU64::new(0),
             download_failures_transient: AtomicU64::new(0),
@@ -868,6 +892,12 @@ impl PipelineMetrics {
             nntp_generation_recovery_requeues: self
                 .nntp_generation_recovery_requeues
                 .load(Ordering::Relaxed),
+            download_dispatch_stall_kicks: self
+                .download_dispatch_stall_kicks
+                .load(Ordering::Relaxed),
+            download_dispatch_stall_releases: self
+                .download_dispatch_stall_releases
+                .load(Ordering::Relaxed),
             download_failures_article_not_found: self
                 .download_failures_article_not_found
                 .load(Ordering::Relaxed),
@@ -887,19 +917,49 @@ impl PipelineMetrics {
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
-        let segments_downloaded = self.segments_downloaded.load(Ordering::Relaxed);
-        let bytes_decoded = self.bytes_decoded.load(Ordering::Relaxed);
-        // One mutex acquisition per 100 ms tick, on the metrics publisher — not
-        // a per-segment path. All three published rates advance together so they
-        // describe the same window.
-        let rates = self.speed_tracker.lock().unwrap().update(
+        self.sample_totals(
             Instant::now(),
-            bytes_downloaded,
+            self.bytes_downloaded.load(Ordering::Relaxed),
+            0,
+            0,
+        )
+    }
+
+    // The global download series as it stands before this tick, holding
+    // nothing: what a job's download rate starts from, so the job's rate and
+    // the gauge share every sample instant.
+    pub(crate) fn download_rate_seed(&self) -> RateSeries {
+        self.speed_tracker
+            .lock()
+            .unwrap()
+            .bytes_downloaded
+            .aligned_from(0)
+    }
+
+    // `downloaded` is the wire-byte counter the download gauge integrates. The
+    // queue hands it the transfer total every job's own counter is credited
+    // beside, so the jobs' download rates sum to the gauge.
+    pub(crate) fn sample_totals(
+        &self,
+        now: Instant,
+        downloaded: u64,
+        decoded: u64,
+        articles: u64,
+    ) -> MetricsSnapshot {
+        let bytes_downloaded = downloaded.max(self.bytes_downloaded.load(Ordering::Relaxed));
+        let segments_downloaded = articles.max(self.segments_downloaded.load(Ordering::Relaxed));
+        let bytes_decoded = decoded.max(self.bytes_decoded.load(Ordering::Relaxed));
+        // One independent sampling tick advances every rate on the same clock.
+        let rates = self.speed_tracker.lock().unwrap().update(
+            now,
+            downloaded,
             segments_downloaded,
             bytes_decoded,
         );
-        self.snapshot_with_speed(bytes_downloaded, rates)
+        let mut snapshot = self.snapshot_with_speed(bytes_downloaded, rates);
+        snapshot.bytes_decoded = bytes_decoded;
+        snapshot.segments_downloaded = segments_downloaded;
+        snapshot
     }
 
     // Return a fresh atomics-based metrics snapshot without advancing the
@@ -916,13 +976,6 @@ impl PipelineMetrics {
     // tick: only the intervals in which bytes arrived.
     pub fn download_time(&self) -> Duration {
         self.speed_tracker.lock().unwrap().download_time
-    }
-
-    // Forget every rate sample, so a test can start the global window at a
-    // known tick instead of at whatever moment the metrics were constructed.
-    #[cfg(test)]
-    pub(crate) fn reset_speed_tracker(&self) {
-        *self.speed_tracker.lock().unwrap() = SpeedTracker::new();
     }
 }
 
@@ -1017,6 +1070,10 @@ pub struct MetricsSnapshot {
     pub parked_infrastructure_work: usize,
     #[serde(default)]
     pub nntp_generation_recovery_requeues: u64,
+    #[serde(default)]
+    pub download_dispatch_stall_kicks: u64,
+    #[serde(default)]
+    pub download_dispatch_stall_releases: u64,
     pub download_failures_article_not_found: u64,
     pub download_failures_capacity_unavailable: u64,
     pub download_failures_transient: u64,

@@ -68,8 +68,8 @@ use crate::torrents::sessions::{
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
-    FilePriority, Infohash, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent,
-    NamedBy, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
+    FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert,
+    TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
 };
 
 #[cfg(test)]

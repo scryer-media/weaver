@@ -220,6 +220,18 @@ impl NntpError {
         )
     }
 
+    // Whether this is the server refusing the account's credentials (480,
+    // 481, 482, or a 502 that is not a connection limit).
+    pub fn is_credentials_refusal(&self) -> bool {
+        matches!(
+            self,
+            NntpError::AuthenticationFailed
+                | NntpError::AuthenticationRejected
+                | NntpError::AuthenticationRequired
+                | NntpError::AccessDenied
+        )
+    }
+
     // Create an `UnexpectedResponse` from a status code and message.
     pub fn unexpected(code: StatusCode, message: impl Into<String>) -> Self {
         NntpError::UnexpectedResponse {

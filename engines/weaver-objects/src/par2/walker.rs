@@ -86,6 +86,22 @@ impl Walker {
         self.streamed.as_ref().map_or(self.next, |open| open.at)
     }
 
+    // Whether the packet at the front is a recovery packet: the one being
+    // read past it, or one whose header alone has arrived. A volume's first
+    // article may hold no more than that header, and it says as much.
+    pub(super) fn reading_recovery(&self) -> bool {
+        let header = match &self.streamed {
+            Some(open) => Some(open.header.packet_type),
+            None => self
+                .held
+                .get(&self.next)
+                .filter(|front| front.len() >= HEADER_SIZE && &front[..8] == MAGIC)
+                .and_then(|front| PacketHeader::parse(front, self.next).ok())
+                .map(|header| header.packet_type),
+        };
+        matches!(header, Some(PacketType::RecoverySlice))
+    }
+
     pub(super) fn lost(&self) -> &[ByteRange] {
         &self.lost
     }
@@ -97,7 +113,9 @@ impl Walker {
         let skip = self.next.saturating_sub(offset) as usize;
         let start = offset.max(self.next);
         let bytes = &bytes[skip..];
-        if self.held_bytes + bytes.len() > HOLD_CAP {
+        // Bytes at the front are walked whatever is held: they are what
+        // lets the held bytes drain. Only bytes that go on hold count.
+        if start > self.next && self.held_bytes + bytes.len() > HOLD_CAP {
             return;
         }
         self.hold(start, bytes);

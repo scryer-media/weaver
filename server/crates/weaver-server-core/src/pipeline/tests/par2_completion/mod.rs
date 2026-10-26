@@ -2338,6 +2338,7 @@ async fn install_parked_recovery_par2_job(
         // The volume is in the parked pool, which is exactly where a promotion
         // has to find it.
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: recovery_file_id,
                 segment_number: 0,

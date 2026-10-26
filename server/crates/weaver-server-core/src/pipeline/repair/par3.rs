@@ -1276,17 +1276,7 @@ impl Pipeline {
                 .get(&file_id)
                 .into_iter()
                 .flat_map(|buffer| buffer.persisted_ranges());
-            let floor = self
-                .pending_file_progress
-                .get(&file_id)
-                .copied()
-                .unwrap_or(0)
-                .max(
-                    self.persisted_file_progress
-                        .get(&file_id)
-                        .copied()
-                        .unwrap_or(0),
-                );
+            let floor = file.committed_decoded_prefix();
             for range in materialized
                 .iter()
                 .cloned()
@@ -1568,12 +1558,6 @@ impl Pipeline {
                     .write_buffers
                     .get(&file_id)
                     .is_some_and(|buffer| buffer.buffered_len() != 0)
-                // A batch out to the disk owner is marked persisted before it
-                // lands, so its bytes are not on disk yet.
-                || self
-                    .segment_writes
-                    .get(&file_id)
-                    .is_some_and(|tickets| !tickets.is_empty())
             {
                 continue;
             }

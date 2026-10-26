@@ -1040,7 +1040,14 @@ impl Default for JobStatusCounts {
 
 impl JobStatusCounts {
     pub fn from_statuses<'a>(statuses: impl IntoIterator<Item = &'a JobStatus>) -> Self {
-        let mut counts = [0.0; NUM_JOB_STATUS_METRICS];
+        Self::default().with_statuses(statuses)
+    }
+
+    pub(crate) fn with_statuses<'a>(
+        self,
+        statuses: impl IntoIterator<Item = &'a JobStatus>,
+    ) -> Self {
+        let mut counts = self.0;
         for status in statuses {
             if let Some(index) = job_status_index(status) {
                 counts[index] += 1.0;

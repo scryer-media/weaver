@@ -250,10 +250,8 @@ async fn a_gzipped_tar_delivers_alike_in_every_frame_size_under_both_engines() {
 
 // The compressed subtitle holds a different file of the plain one's name.
 // Neither is written over the other. Classic writes the inner file over the
-// plain one; so does graph for now, since each namespace allocates its own
-// members' names while every namespace's leaves share the job's folder.
+// plain one.
 #[tokio::test]
-#[ignore = "graph allocates output names per namespace, not across the tree"]
 async fn subs_srt_beside_subs_srt_gz_delivers_both_and_overwrites_nothing() {
     let plain = payload(2 * ARTICLE + 5, 63);
     let inner = payload(3 * ARTICLE + 9, 64);

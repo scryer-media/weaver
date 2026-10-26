@@ -222,6 +222,12 @@ impl Runs {
             .any(|run| !matches!(run.life, Life::Ended { .. }))
     }
 
+    pub(crate) fn in_flight(&self) -> bool {
+        self.runs
+            .values()
+            .any(|run| matches!(run.life, Life::Running { .. }))
+    }
+
     pub(crate) fn has(&self, node: NodeId) -> bool {
         self.runs.contains_key(&node)
     }
@@ -346,9 +352,10 @@ impl Runs {
             let mut sink =
                 |emit| volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok();
             extraction.run(reader, &mut sink);
-            // A run that read bytes nothing will bring built on less than its
-            // volumes hold, and ends silent on the failed read: what it said
-            // is refused as damage nothing repairs.
+            // A run that read bytes nothing will bring, and did not read on
+            // past them, built on less than its volumes hold and ends silent
+            // on the failed read: what it said is refused as damage nothing
+            // repairs.
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
@@ -370,14 +377,14 @@ impl Runs {
         admitted
     }
 
-    // Forget the runs of nodes no longer among `engines`: refused, retracted
-    // or unbound. Their slots and their memory go to whoever waits; returns
-    // the nodes that may start now.
+    // Forget the runs of nodes no longer among `engines`, which are in node
+    // order: refused, retracted or unbound. Their slots and their memory go
+    // to whoever waits; returns the nodes that may start now.
     pub(crate) fn forget_gone(&mut self, engines: &[NodeId], limit: usize) -> Vec<NodeId> {
         let gone = self
             .runs
             .keys()
-            .filter(|node| !engines.contains(node))
+            .filter(|node| engines.binary_search(node).is_err())
             .copied()
             .collect();
         self.forget(gone, limit)
@@ -386,13 +393,17 @@ impl Runs {
     // Stop every run where it stands and forget it: the job is going down.
     // What a run read is on its shelf, for the restored job to read again.
     pub(crate) fn stop(&mut self, limit: usize) {
+        self.request_stop();
+        let all = self.runs.keys().copied().collect();
+        self.forget(all, limit);
+    }
+
+    pub(crate) fn request_stop(&self) {
         for run in self.runs.values() {
             if let Some(volumes) = &run.volumes {
                 volumes.stop();
             }
         }
-        let all = self.runs.keys().copied().collect();
-        self.forget(all, limit);
     }
 
     // Forget the runs of `gone`, whose threads may still be out: what they

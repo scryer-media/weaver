@@ -15,7 +15,7 @@ use crate::jobs::duplicate::{
 };
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
 use crate::settings::persistence::reserve_next_job_id_tx;
 
 const RESERVATION_TTL_SECONDS: i64 = 5 * 60;
@@ -2058,39 +2058,46 @@ async fn cleanup_stale_admissions_tx(tx: &mut SqlTx<'_>, now: i64) -> Result<usi
             ],
         )
         .await?;
-    let count = rows.len();
-    for row in rows {
-        forget_duplicate_identity_tx(tx, JobId(row.i64("job_id")? as u64)).await?;
-    }
-    Ok(count)
+    let job_ids = rows
+        .iter()
+        .map(|row| row.i64("job_id").map(|id| JobId(id as u64)))
+        .collect::<Result<Vec<_>, _>>()?;
+    forget_duplicate_identities_tx(tx, &job_ids).await?;
+    Ok(job_ids.len())
 }
 
 async fn forget_duplicate_identity_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Result<(), StateError> {
-    tx.execute(
-        "DELETE FROM semantic_duplicate_candidates WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM duplicate_admission_claims WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM job_fingerprints WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM submission_idempotency WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM duplicate_job_snapshots WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
+    forget_duplicate_identities_tx(tx, &[job_id]).await
+}
+
+// Removes every id's durable duplicate identity with one `IN (...)` delete
+// per table and chunk, then sweeps the semantic groups left without a
+// candidate once for the whole set.
+async fn forget_duplicate_identities_tx(
+    tx: &mut SqlTx<'_>,
+    job_ids: &[JobId],
+) -> Result<(), StateError> {
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+    for chunk in ids.chunks(max_rows_for_tx(tx, 1)) {
+        let placeholders = vec!["{}"; chunk.len()].join(", ");
+        let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+        for table in [
+            "semantic_duplicate_candidates",
+            "duplicate_admission_claims",
+            "job_fingerprints",
+            "submission_idempotency",
+            "duplicate_job_snapshots",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE job_id IN ({placeholders})"),
+                &args,
+            )
+            .await?;
+        }
+    }
     tx.execute(
         "DELETE FROM semantic_duplicate_groups
          WHERE NOT EXISTS (
@@ -2105,18 +2112,31 @@ async fn forget_duplicate_identity_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Resu
 
 // Records a permanent user-requested deletion before removing the durable
 // identity, so duplicate backfill cannot recreate it from stale source data.
-pub(crate) async fn forget_duplicate_identity_for_history_delete_tx(
+pub(crate) async fn forget_duplicate_identities_for_history_delete_tx(
     tx: &mut SqlTx<'_>,
-    job_id: JobId,
+    job_ids: &[JobId],
 ) -> Result<(), StateError> {
-    tx.execute(
-        "INSERT INTO forgotten_duplicate_identities (job_id, forgotten_at)
-         VALUES ({}, {})
-         ON CONFLICT(job_id) DO UPDATE SET forgotten_at = excluded.forgotten_at",
-        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(epoch_seconds())],
-    )
-    .await?;
-    forget_duplicate_identity_tx(tx, job_id).await
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let forgotten_at = epoch_seconds();
+    for chunk in job_ids.chunks(max_rows_for_tx(tx, 2)) {
+        let values = vec!["({}, {})"; chunk.len()].join(", ");
+        let args = chunk
+            .iter()
+            .flat_map(|id| [SqlArg::I64(id.0 as i64), SqlArg::I64(forgotten_at)])
+            .collect::<Vec<_>>();
+        tx.execute(
+            &format!(
+                "INSERT INTO forgotten_duplicate_identities (job_id, forgotten_at)
+                 VALUES {values}
+                 ON CONFLICT(job_id) DO UPDATE SET forgotten_at = excluded.forgotten_at"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    forget_duplicate_identities_tx(tx, job_ids).await
 }
 
 fn snapshot_from_row(

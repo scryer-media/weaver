@@ -19,7 +19,7 @@ use unrar_rs::{
 use weaver_graph::{ByteRange, Emit, VolumeIndex, Why};
 use zeroize::Zeroizing;
 
-use super::{Candidate, Lock, RarStore};
+use super::{Candidate, Condemned, Lock, RarStore};
 use crate::crypt::Cbc;
 use crate::grid::crc32;
 use crate::kept::Kept;
@@ -127,6 +127,7 @@ impl RarStore {
             self.candidates.push(Candidate {
                 secret: Zeroizing::new(secret.to_owned()),
                 headers_wrong: false,
+                files_wrong: false,
             });
             self.candidates.len() - 1
         })
@@ -188,9 +189,12 @@ impl RarStore {
         self.ask(out);
     }
 
-    // Every walk reads the headers again under the candidate at `index`.
+    // Every walk reads the headers again under the candidate at `index`,
+    // and every recovery record is said again, handed it: after a restore
+    // too, when the record built before holds no candidate.
     fn open_on(&mut self, index: usize) {
         self.headers_open = Some(index);
+        self.recovery_said.clear();
         for volume in self.volumes.values_mut() {
             volume.walk.touch();
         }
@@ -216,30 +220,17 @@ impl RarStore {
     }
 
     // Whether the first enciphered header of `volume` unseals under
-    // `password` with its CRC whole. Each RAR4 header is its salt, then the
-    // header ciphered to a whole block; under a wrong key the header is
-    // noise, so whichever of its size or CRC fails first refutes it. `None`
-    // while its bytes are not here whole, which wants them.
+    // `password`, read from what the volume kept; `None` while its bytes are
+    // not here whole, which wants them.
     fn rar4_unseals(&mut self, volume: VolumeIndex, password: &str) -> Option<bool> {
         let found = self.volumes.get_mut(&volume)?;
         let length = found.length;
         let kept = &mut found.kept;
-        let main = whole(kept, ByteRange::at(RAR4_SIGNATURE, RAR4_BASE))?;
-        let at = RAR4_SIGNATURE + u64::from(u16::from_le_bytes([main[5], main[6]]));
-        let front = whole(kept, ByteRange::at(at, RAR4_SALT + AES_BLOCK as u64))?;
-        let salt: [u8; 8] = front[..8].try_into().ok()?;
-        let mut block: [u8; AES_BLOCK] = front[8..].try_into().ok()?;
-        let (key, iv) = rar4_derive_key(password, Some(&salt));
-        decrypt_cipher_range_rar4(&key, &iv, &mut block).ok()?;
-        let size = usize::from(u16::from_le_bytes([block[5], block[6]]));
-        let sealed = ByteRange::at(at + RAR4_SALT, size.next_multiple_of(AES_BLOCK) as u64);
-        if (size as u64) < RAR4_BASE || length.is_some_and(|length| sealed.end > length) {
-            return Some(false);
-        }
-        let mut header = whole(kept, sealed)?.to_vec();
-        decrypt_cipher_range_rar4(&key, &iv, &mut header).ok()?;
-        let crc = crc32(&header[2..size]) & 0xffff;
-        Some(crc == u32::from(u16::from_le_bytes([header[0], header[1]])))
+        rar4_unseals(
+            &mut |range| whole(kept, range).map(<[u8]>::to_vec),
+            length,
+            password,
+        )
     }
 
     // The candidates in the order to try them: the one that opened the
@@ -266,9 +257,17 @@ impl RarStore {
             let keying = store.keying();
             let mut opened = None;
             for candidate in &order {
+                if self.candidates[*candidate].files_wrong {
+                    continue;
+                }
                 match derive(&self.keys, &self.candidates[*candidate].secret, &keying) {
                     Derived::Key(key) => {
-                        opened = Some(key);
+                        // A RAR4 file key has no check of its own: unless
+                        // the candidate proved itself on the headers, it is
+                        // on trial.
+                        let unproven = matches!(keying, MemberKeying::Rar4 { .. })
+                            && self.headers_open != Some(*candidate);
+                        opened = Some((key, unproven.then_some(*candidate)));
                         break;
                     }
                     Derived::Wrong => {}
@@ -277,7 +276,7 @@ impl RarStore {
                     }
                 }
             }
-            let Some(key) = opened else {
+            let Some((key, trial)) = opened else {
                 asks = true;
                 continue;
             };
@@ -294,11 +293,47 @@ impl RarStore {
             };
             entry.lock = Lock::Open(Arc::new(cbc));
             entry.hash_key = key.hash_key;
+            entry.trial = trial;
             self.stale = true;
         }
         if asks {
             self.ask(out);
         }
+    }
+
+    // The candidate on trial is wrong: the next one is tried on the same
+    // bytes, which every file it keyed asks for again. Each such file is
+    // locked again at once, a fresh record beside it, and its parts read
+    // back through the cipher and record it stood under until each one has
+    // been posted again.
+    pub(super) fn condemn(&mut self, candidate: usize, out: &mut Vec<Emit>) {
+        self.candidates[candidate].files_wrong = true;
+        for (id, entry) in self.entries.iter_mut().enumerate() {
+            if entry.trial != Some(candidate) {
+                continue;
+            }
+            let Lock::Open(cbc) = std::mem::replace(&mut entry.lock, Lock::Locked) else {
+                continue;
+            };
+            let parts = entry.pieces.iter().map(|piece| piece.volume).collect();
+            let said = std::mem::take(&mut entry.out);
+            self.condemned.insert(
+                id,
+                Condemned {
+                    cbc,
+                    out: said,
+                    parts,
+                },
+            );
+            entry.trial = None;
+            entry.hash_key = None;
+            entry.plain_runs = Default::default();
+            out.extend(entry.pieces.iter().map(|piece| Emit::Again {
+                volume: piece.volume,
+                range: piece.data,
+            }));
+        }
+        self.stale = true;
     }
 
     // What the set is shut by while the store is still asking: its headers,
@@ -332,6 +367,36 @@ const RAR4_SIGNATURE: u64 = 7;
 const RAR4_BASE: u64 = 7;
 const RAR4_SALT: u64 = 8;
 const AES_BLOCK: usize = 16;
+
+// Whether the first enciphered header of a RAR4 volume `length` long
+// unseals under `password` with its CRC whole: the one proof a RAR4
+// candidate has, as unrar takes it. Each RAR4 header is its salt, then the
+// header ciphered to a whole block; under a wrong key the header is noise,
+// so whichever of its size or CRC fails first refutes it. `read` gives the
+// volume's bytes over a range when they are here whole; `None` while one
+// the proof needs is not.
+fn rar4_unseals(
+    read: &mut dyn FnMut(ByteRange) -> Option<Vec<u8>>,
+    length: Option<u64>,
+    password: &str,
+) -> Option<bool> {
+    let main = read(ByteRange::at(RAR4_SIGNATURE, RAR4_BASE))?;
+    let at = RAR4_SIGNATURE + u64::from(u16::from_le_bytes([main[5], main[6]]));
+    let front = read(ByteRange::at(at, RAR4_SALT + AES_BLOCK as u64))?;
+    let salt: [u8; 8] = front[..8].try_into().ok()?;
+    let mut block: [u8; AES_BLOCK] = front[8..].try_into().ok()?;
+    let (key, iv) = rar4_derive_key(password, Some(&salt));
+    decrypt_cipher_range_rar4(&key, &iv, &mut block).ok()?;
+    let size = usize::from(u16::from_le_bytes([block[5], block[6]]));
+    let sealed = ByteRange::at(at + RAR4_SALT, size.next_multiple_of(AES_BLOCK) as u64);
+    if (size as u64) < RAR4_BASE || length.is_some_and(|length| sealed.end > length) {
+        return Some(false);
+    }
+    let mut header = read(sealed)?;
+    decrypt_cipher_range_rar4(&key, &iv, &mut header).ok()?;
+    let crc = crc32(&header[2..size]) & 0xffff;
+    Some(crc == u32::from(u16::from_le_bytes([header[0], header[1]])))
+}
 
 // The bytes of `range` when they are here whole; otherwise they are wanted.
 fn whole(kept: &mut Kept, range: ByteRange) -> Option<&[u8]> {

@@ -4,8 +4,8 @@
 mod common;
 
 use common::{
-    BlockingDbOperation, TestHarness, assert_has_errors, assert_no_errors, local_request,
-    response_data,
+    BlockingDbOperation, FailingDbOperation, TestHarness, assert_has_errors, assert_no_errors,
+    local_request, response_data,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -79,6 +79,77 @@ async fn list_servers_empty() {
     let data = response_data(&resp);
     let servers = data["servers"].as_array().unwrap();
     assert!(servers.is_empty());
+}
+
+#[tokio::test]
+async fn list_servers_survives_tls_diagnostics_load_failure() {
+    let h = TestHarness::new().await;
+    let mut ids = Vec::new();
+    for index in 0..40 {
+        let resp = h
+            .execute(&format!(
+                r#"mutation {{
+                    addServer(input: {{
+                        host: "news{index}.example.com",
+                        port: 119,
+                        tls: false,
+                        connections: 5,
+                        active: false
+                    }}) {{ id }}
+                }}"#
+            ))
+            .await;
+        assert_no_errors(&resp);
+        ids.push(response_data(&resp)["addServer"]["id"].as_u64().unwrap());
+    }
+
+    let _failing = FailingDbOperation::new("servers.query.tls_diagnostics");
+    let resp = h.execute("{ servers { id host tlsCipherSuite } }").await;
+    assert_no_errors(&resp);
+    let servers = response_data(&resp)["servers"].as_array().unwrap().clone();
+    let listed: Vec<u64> = servers
+        .iter()
+        .map(|server| server["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(listed, ids);
+    for (index, server) in servers.iter().enumerate() {
+        assert_eq!(
+            server["host"].as_str().unwrap(),
+            format!("news{index}.example.com")
+        );
+        assert!(server["tlsCipherSuite"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn server_survives_tls_diagnostics_load_failure() {
+    let h = TestHarness::new().await;
+    let resp = h
+        .execute(
+            r#"mutation {
+                addServer(input: {
+                    host: "news.example.com",
+                    port: 119,
+                    tls: false,
+                    connections: 5,
+                    active: false
+                }) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let id = response_data(&resp)["addServer"]["id"].as_u64().unwrap();
+
+    let _failing = FailingDbOperation::new("servers.query.server.tls_diagnostics");
+    let resp = h
+        .execute(&format!(
+            "{{ server(id: {id}) {{ id host tlsCipherSuite }} }}"
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let server = &response_data(&resp)["server"];
+    assert_eq!(server["host"].as_str().unwrap(), "news.example.com");
+    assert!(server["tlsCipherSuite"].is_null());
 }
 
 #[tokio::test]

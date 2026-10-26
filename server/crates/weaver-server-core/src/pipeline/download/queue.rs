@@ -8,6 +8,8 @@ use crate::jobs::ids::{MessageId, NzbFileId, SegmentId};
 // A work item representing a segment to download.
 #[derive(Clone)]
 pub struct DownloadWork {
+    // Attached at dispatch; queued articles do not allocate counters.
+    pub counters: Option<std::sync::Arc<crate::pipeline::queue::JobCounters>>,
     pub segment_id: SegmentId,
     pub message_id: MessageId,
     // The file's newsgroups, shared by every segment of the file rather than
@@ -35,6 +37,14 @@ pub struct DownloadWork {
     // accumulated) on each transport failure; advisory only, so an index left
     // stale by a pool rebuild merely skips one server for one attempt.
     pub avoid_server: Option<usize>,
+}
+
+impl DownloadWork {
+    // Whether the work is steered off a server: excluded from one or hinted
+    // away from one.
+    fn is_steered(&self) -> bool {
+        !self.exclude_servers.is_empty() || self.avoid_server.is_some()
+    }
 }
 
 // Dispatch classes, in the order the queue serves them:
@@ -125,9 +135,9 @@ pub struct DownloadQueue {
     completion_critical_work: ClassMap,
     ordinary_work: ClassMap,
     next_sequence: u64,
-    // Queued items carrying failure exclusions — escalated work that may
-    // need a backfill lane. Maintained on push/pop; recounted on the rare
-    // bulk-removal paths.
+    // Queued items steered off a server: failure exclusions (escalated work
+    // that may need a backfill lane) or a rotation hint. Maintained on
+    // push/pop; recounted on the rare bulk-removal paths.
     excluded_work: usize,
     // Queued recovery items. Kept explicitly so scheduler admission checks
     // stay O(1) even for jobs with very large article queues.
@@ -211,7 +221,7 @@ impl DownloadQueue {
         let priority = work.priority;
         let sequence = self.next_sequence;
         self.next_sequence += 1;
-        if !work.exclude_servers.is_empty() {
+        if work.is_steered() {
             self.excluded_work += 1;
         }
         if work.is_recovery {
@@ -257,7 +267,7 @@ impl DownloadQueue {
         work
     }
 
-    // Number of queued items with failure exclusions.
+    // Number of queued items with failure exclusions or a rotation hint.
     pub fn excluded_work_count(&self) -> usize {
         self.excluded_work
     }
@@ -281,11 +291,32 @@ impl DownloadQueue {
         self.excluded_work = 0;
     }
 
+    // Drop the rotation hint from all queued work, keeping exclusions: a 430
+    // is a fact about the article, a hint only about one failed attempt.
+    // Returns how many hints were dropped.
+    pub fn clear_rotation_hints(&mut self) -> usize {
+        if self.excluded_work == 0 {
+            return 0;
+        }
+        let mut cleared = 0;
+        // Not part of the key, so the entries are edited in place.
+        for work in self
+            .completion_critical_work
+            .values_mut()
+            .chain(self.ordinary_work.values_mut())
+        {
+            if work.avoid_server.take().is_some() {
+                cleared += 1;
+                if work.exclude_servers.is_empty() {
+                    self.excluded_work = self.excluded_work.saturating_sub(1);
+                }
+            }
+        }
+        cleared
+    }
+
     fn recount_derived_counts(&mut self) {
-        self.excluded_work = self
-            .iter()
-            .filter(|work| !work.exclude_servers.is_empty())
-            .count();
+        self.excluded_work = self.iter().filter(|work| work.is_steered()).count();
         self.recovery_work = self.iter().filter(|work| work.is_recovery).count();
         let mut queued_by_file = HashMap::new();
         let mut queued_estimates_by_file: HashMap<NzbFileId, BTreeMap<u32, u32>> = HashMap::new();
@@ -392,7 +423,7 @@ impl DownloadQueue {
     }
 
     fn note_removed(&mut self, work: &DownloadWork) {
-        if !work.exclude_servers.is_empty() {
+        if work.is_steered() {
             self.excluded_work = self.excluded_work.saturating_sub(1);
         }
         if work.is_recovery {

@@ -12,21 +12,23 @@ async fn post_processing_resume_arms_deferred_direct_unpack() {
     let set = "generated_split_store_plain.7z";
     let files = sevenz_fixture_bytes(set);
     insert_active_job(&mut pipeline, job, rar_job_spec("Deferred Chase", &files)).await;
-    let (reply, received) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PausePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     for (index, (name, bytes)) in files.iter().enumerate() {
         write_and_complete_file(&mut pipeline, job, index as u32, name, bytes).await;
     }
     assert!(!pipeline.direct_unpack.is_armed(job, set));
     assert!(pipeline.deferred_post_processing.contains(&job));
-    let (reply, received) = tokio::sync::oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.direct_unpack.is_armed(job, set));
     assert!(!pipeline.deferred_post_processing.contains(&job));
     pipeline

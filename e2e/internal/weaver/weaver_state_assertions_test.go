@@ -307,6 +307,7 @@ func TestObserveActiveFileIdentityRewritePassesWhenCanonicalRowsObserved(t *test
 }
 
 func TestFileIdentityRewriteObserverReusesOpenDatabase(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	dbPath := newTestWeaverStateDB(t)
 	db := openTestWeaverStateDB(t, dbPath)
 	defer db.Close()
@@ -394,6 +395,7 @@ func TestObserveActiveFileIdentityRewriteFailsWhenPar2ClassificationIsMissing(t 
 }
 
 func TestObserveActiveFileIdentityRewriteUsesObserverRowsAfterActiveCleanup(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	dbPath := newTestWeaverStateDB(t)
 	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
 		t.Fatalf("install file identity rewrite observer: %v", err)
@@ -435,6 +437,7 @@ func TestObserveActiveFileIdentityRewriteUsesObserverRowsAfterActiveCleanup(t *t
 }
 
 func TestObserveActiveFileIdentityRewriteUsesLatestObserverRowsAfterSupersededObfuscatedRows(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	dbPath := newTestWeaverStateDB(t)
 	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
 		t.Fatalf("install file identity rewrite observer: %v", err)
@@ -480,6 +483,7 @@ func TestObserveActiveFileIdentityRewriteUsesLatestObserverRowsAfterSupersededOb
 }
 
 func TestObserveActiveFileIdentityRewriteFailsWhenLatestObserverRowRemainsForbidden(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	dbPath := newTestWeaverStateDB(t)
 	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
 		t.Fatalf("install file identity rewrite observer: %v", err)
@@ -508,6 +512,7 @@ func TestObserveActiveFileIdentityRewriteFailsWhenLatestObserverRowRemainsForbid
 }
 
 func TestObserveActiveFileIdentityRewriteFailsWhenLatestObserverRowMissesPar2Classification(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	dbPath := newTestWeaverStateDB(t)
 	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
 		t.Fatalf("install file identity rewrite observer: %v", err)
@@ -562,6 +567,7 @@ func TestObserveActiveFileIdentityRewriteUsesLiveRowsBeforeObserverHistory(t *te
 }
 
 func TestObserveActiveFileIdentityRewriteFailsWhenObserverRowsMissPar2Classification(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	dbPath := newTestWeaverStateDB(t)
 	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
 		t.Fatalf("install file identity rewrite observer: %v", err)
@@ -619,6 +625,7 @@ func TestApplyRuntimeFileIdentityRewriteTerminalCheckFailsWhenJobCompletesBefore
 }
 
 func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -650,6 +657,7 @@ func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testi
 // either the older rendered-line shape or the field-per-part shape, and must
 // not count as a second observation of the event.
 func TestAssertPar2CleanSettlementIgnoresDebugRingReplays(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -709,6 +717,7 @@ func TestUnexpectedDirectDemotionsIgnoresDebugRingReplays(t *testing.T) {
 }
 
 func TestAssertPar2CleanSettlementRejectsModeOutsideSingletonPin(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -734,6 +743,7 @@ func TestAssertPar2CleanSettlementRejectsModeOutsideSingletonPin(t *testing.T) {
 }
 
 func TestAssertPar2CleanSettlementAcceptsAllowedNonGridModes(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -760,6 +770,7 @@ func TestAssertPar2CleanSettlementAcceptsAllowedNonGridModes(t *testing.T) {
 }
 
 func TestAssertPar2CleanSettlementConditionsGridEvidenceOnObservedMode(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -802,6 +813,7 @@ func TestAssertPar2CleanSettlementConditionsGridEvidenceOnObservedMode(t *testin
 }
 
 func TestAssertPar2CleanSettlementRejectsGridEvidenceForNonGridMode(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -826,6 +838,7 @@ func TestAssertPar2CleanSettlementRejectsGridEvidenceForNonGridMode(t *testing.T
 }
 
 func TestAssertPar2CleanSettlementRejectsMissingGridEvidence(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -850,6 +863,7 @@ func TestAssertPar2CleanSettlementRejectsMissingGridEvidence(t *testing.T) {
 }
 
 func TestAssertPar2CleanSettlementRejectsDuplicateAndUnknownRecords(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
@@ -916,6 +930,7 @@ func TestAssertPar2CleanSettlementRejectsUnknownVerificationMode(t *testing.T) {
 }
 
 func TestWaitForActiveFileCompleteMatchesExactJobAndFilename(t *testing.T) {
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	dbPath := newTestWeaverStateDB(t)
 	db := openTestWeaverStateDB(t, dbPath)
 	defer db.Close()
@@ -1222,7 +1237,7 @@ func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t 
 		t.Fatal(err)
 	}
 	t.Setenv("WEAVER_RAR_DIRECT_STORE", "1")
-	t.Setenv(weaverEngineEnv, "")
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	assertion := &ScenarioDirectStoreAssertion{
 		ExpectedDemotionReason:           "member_malformed_chain",
 		RequireRoutedByteMaterialization: true,

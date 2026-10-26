@@ -621,6 +621,7 @@ async fn missing_middle_rar_volume_enters_authoritative_par2_repair() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -729,6 +730,7 @@ async fn rar_waiting_for_missing_volumes_without_par2_fails_after_download_compl
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30077);
     let working_dir = intermediate_dir.join("rar-missing-tail");
+    pipeline.nzb_admitted.insert(job_id);
     let mut state = minimal_job_state(job_id, "RAR Missing Tail", working_dir);
     state.download_queue = DownloadQueue::new();
     state.recovery_queue = DownloadQueue::new();
@@ -2034,6 +2036,7 @@ async fn incomplete_download_with_active_extraction_defers_instead_of_failing() 
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.download_queue = DownloadQueue::new();
         state.download_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -2640,7 +2643,7 @@ async fn rar_unlock_ranked_window_uses_logical_volume_order() {
 #[tokio::test]
 async fn rar_unlock_dirty_priorities_apply_before_lane_refill() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_scheduler_pipeline(&temp_dir).await;
     let job_id = JobId(40108);
     let files = (0..5)
         .map(|volume| {
@@ -2722,6 +2725,7 @@ async fn rar_unlock_retry_requeue_marks_rar_volume_dirty_only() {
     pipeline.rar_unlock_priority_dirty_jobs.clear();
 
     pipeline.enqueue_download_work(DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId {
                 job_id: standalone_job_id,
@@ -2752,6 +2756,7 @@ async fn impossible_rar_state_fails_loudly_after_forced_recompute() {
     let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30076);
     let working_dir = intermediate_dir.join("impossible-rar-state");
+    pipeline.nzb_admitted.insert(job_id);
     let mut state = minimal_job_state(job_id, "Impossible RAR State", working_dir);
     let topology = crate::jobs::assembly::ArchiveTopology {
         archive_type: crate::jobs::assembly::ArchiveType::Rar,

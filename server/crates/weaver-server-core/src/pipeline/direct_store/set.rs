@@ -486,6 +486,20 @@ impl DirectSet {
         self.router.plan()
     }
 
+    pub(crate) fn relocate_working_dir(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        self.router.relocate_working_dir(old, new);
+        for volume in self.retained.iter_mut().flatten() {
+            if let Ok(relative) = volume.envelope.strip_prefix(old) {
+                volume.envelope = new.join(relative);
+            }
+            for path in std::sync::Arc::make_mut(&mut volume.partials).values_mut() {
+                if let Ok(relative) = path.strip_prefix(old) {
+                    *path = new.join(relative);
+                }
+            }
+        }
+    }
+
     // Records one identity binding on the plan. See
     // [`DirectSetPlan::bind_identity_volume`] for the refusal semantics.
     pub(crate) fn bind_identity_volume(&mut self, volume_index: u32, file_index: u32) -> bool {

@@ -107,20 +107,68 @@ fn file_assembly_role_and_set_name_follow_declared_role_only() {
 }
 
 #[test]
-fn resumed_coverage_uses_actual_end_and_does_not_hide_replacement_gaps() {
-    for second_len in [2, 4] {
-        let mut asm = make_assembly(vec![14, 8, 8]);
-        asm.commit_segment(0, 14).unwrap();
-        asm.note_restored_prefix(14);
-        // The encoded checkpoint overlaps the next actual article by four
-        // bytes. Rewriting from ten withdraws that old suffix as evidence.
-        asm.record_placement(1, 10, second_len);
-        asm.commit_segment(1, second_len).unwrap();
-        asm.record_placement(2, 14, 4);
-        asm.commit_segment(2, 4).unwrap();
-        assert_eq!(asm.decoded_coverage_end(), (second_len == 4).then_some(18));
-        assert_ne!(asm.received_bytes(), 18);
+fn restored_coverage_runs_stand_in_for_placements_around_a_gap() {
+    use crate::jobs::assembly::{CoverageRun, FileCoverage};
+    // Ordinal 1 never arrived before the restart; 0 and 2..4 did.
+    let mut asm = make_assembly(vec![14, 14, 14, 14]);
+    for ordinal in [0, 2, 3] {
+        asm.commit_segment(ordinal, 14).unwrap();
     }
+    let restored = FileCoverage::from_ordered_runs([
+        CoverageRun {
+            first_ordinal: 0,
+            ordinals: 1,
+            start: 0,
+            end: 10,
+        },
+        CoverageRun {
+            first_ordinal: 2,
+            ordinals: 2,
+            start: 20,
+            end: 40,
+        },
+    ]);
+    asm.note_restored_coverage(&restored);
+    assert_eq!(asm.durable_coverage(), restored);
+    assert_eq!(asm.committed_decoded_prefix(), 10);
+    assert!(asm.follows_restored_run(1));
+    assert!(!asm.follows_restored_run(2));
+    assert_eq!(asm.anchor_end_after(0, false), Some(10));
+    // The gap's article may only fill the gap the runs leave it.
+    assert_eq!(asm.placement_conflict(1, 9, 10), Some(0));
+    assert_eq!(asm.placement_conflict(1, 10, 11), Some(2));
+    assert_eq!(asm.placement_conflict(1, 10, 10), None);
+    assert_eq!(asm.decoded_coverage_end(), None, "the gap is still open");
+    asm.record_placement(1, 10, 10);
+    asm.commit_segment(1, 10).unwrap();
+    assert_eq!(asm.decoded_coverage_end(), Some(40));
+    assert_eq!(
+        asm.durable_coverage().runs(),
+        &[CoverageRun {
+            first_ordinal: 0,
+            ordinals: 4,
+            start: 0,
+            end: 40,
+        }]
+    );
+    // Rewriting a restored ordinal clips its run where the new copy starts,
+    // and the two still tile.
+    asm.record_placement(3, 32, 8);
+    assert_eq!(
+        asm.durable_coverage().runs(),
+        &[CoverageRun {
+            first_ordinal: 0,
+            ordinals: 4,
+            start: 0,
+            end: 40,
+        }]
+    );
+    // A withdrawn restored ordinal takes its whole run out of coverage.
+    assert!(asm.retract_segment(2));
+    assert_eq!(
+        asm.durable_coverage().ordinals().collect::<Vec<_>>(),
+        vec![0, 1, 3]
+    );
 }
 
 #[test]
@@ -131,9 +179,9 @@ fn damaged_checkpoint_stops_before_actual_bytes_and_stays_conservative() {
     asm.note_retained_damage(1, 10, 5, false, None);
     assert_eq!(asm.placement_of(1), None);
     assert_eq!(asm.placement_conflict(2, 14, 4), None);
-    assert_eq!(asm.retained_damage_floor(), Some(10));
+    assert_eq!(asm.retained_damage_floor, Some(10));
     assert!(asm.clear_retained_damage(1));
-    assert_eq!(asm.retained_damage_floor(), Some(10));
+    assert_eq!(asm.retained_damage_floor, Some(10));
     asm.record_placement(1, 10, 4);
     asm.commit_segment(1, 4).unwrap();
     assert_eq!(asm.decoded_coverage_end(), Some(14));

@@ -1162,3 +1162,54 @@ kind = "sql"
 file = "migrations/0089_forget_saved_mapped_ports/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 90
+description = "a file's restart checkpoint is its written coverage"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_file_coverage_checkpoint/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_file_coverage_checkpoint/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 91
+description = "a graph checkpoint records where each hold paged to scratch lies in its scratch file"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_graph_holds_scratch_offset/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_graph_holds_scratch_offset/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 92
+description = "durable NZB concurrency admission"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0092_nzb_admission/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0092_nzb_admission/postgres.sql"
+engine = "postgres"
+scope = "all"

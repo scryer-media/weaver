@@ -78,24 +78,21 @@ async fn seated(temp_dir: &tempfile::TempDir) -> (Pipeline, Arc<Torrents>) {
     (pipeline, torrents)
 }
 
+fn handle(pipeline: &Pipeline) -> SchedulerHandle {
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+}
+
 async fn set_bandwidth(pipeline: &mut Pipeline, bandwidth: crate::proxies::Bandwidth) {
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetBandwidth {
-            bandwidth,
-            replaces_schedule: true,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    handle(pipeline).set_bandwidth(bandwidth).await.unwrap();
+    pipeline.apply_queue_intents().await;
 }
 
 async fn schedule(pipeline: &mut Pipeline, action: ScheduleAction) {
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction { action, reply })
-        .await;
-    received.await.unwrap();
+    handle(pipeline)
+        .apply_schedule_action(action)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
 }
 
 fn rates(pipeline: &Pipeline, torrents: &Torrents) -> (Option<u64>, Option<u64>) {
@@ -324,24 +321,17 @@ async fn pauses_publish_what_they_stop_to_the_torrents() {
         assert_eq!(stopped(&holds.borrow_and_update()), expected, "{action:?}");
     }
 
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::Pause {
-            hold: crate::jobs::Hold::manual(HoldOwner::All),
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    handle(&pipeline)
+        .pause(crate::jobs::Hold::manual(HoldOwner::All))
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(holds.has_changed().unwrap());
     assert_eq!(stopped(&holds.borrow_and_update()), (true, true, false));
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::Resume {
-            origin: crate::jobs::HoldOrigin::Manual,
-            owner: HoldOwner::All,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    handle(&pipeline)
+        .resume(crate::jobs::HoldOrigin::Manual, HoldOwner::All)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(stopped(&holds.borrow_and_update()), (false, false, false));
 }

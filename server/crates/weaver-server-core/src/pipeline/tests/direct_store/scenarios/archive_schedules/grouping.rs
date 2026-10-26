@@ -21,6 +21,7 @@ use super::super::sevenz_store::schedules::{LOSES, map_slots, unrepeated_payload
 use super::super::sevenz_store::{Entry, build_7z_shaped, sevenz_job_spec, split_volumes};
 use super::*;
 use crate::pipeline::direct_store::plan::{AdmissionRefusal, DirectSetPlan};
+use crate::pipeline::tests::rar_extraction::single_member_rar4_old_numbering_set;
 
 // What the volumes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,9 +63,9 @@ pub(in crate::pipeline::tests) enum Naming {
     Single,
     // The first volume's stem in a different case from the second's.
     MixedCase,
-    // `.rar` then `.s00`: the second old-style series, which an archiver
-    // starts after `.r99`.
-    OldStyleS,
+    // Old-style numbering, `silver.horizon.rar` then `silver.horizon.r00`:
+    // the first two volumes of a set written that way.
+    OldStyle,
     // 32-hex extensionless names with no shared stem.
     HexBare,
     // One volume under a bare 32-hex name.
@@ -168,7 +169,7 @@ macro_rules! any_naming {
             | Naming::ConventionalFour
             | Naming::Single
             | Naming::MixedCase
-            | Naming::OldStyleS
+            | Naming::OldStyle
             | Naming::HexBare
             | Naming::HexSingle
             | Naming::HexMisnumbered
@@ -229,6 +230,17 @@ const fn fallback(admission: Admission, direct_store: Expect) -> Expectation {
 impl Container {
     pub(super) fn is_sevenz(self) -> bool {
         matches!(self, Self::SevenZip | Self::SevenZipSolid)
+    }
+
+    fn is_rar5(self) -> bool {
+        matches!(
+            self,
+            Self::Rar5
+                | Self::Rar5Encrypted
+                | Self::Rar5EncryptedHeaders
+                | Self::Rar5Solid
+                | Self::Rar5SolidEncrypted
+        )
     }
 
     fn is_solid_rar(self) -> bool {
@@ -381,8 +393,11 @@ fn crossed(cell: Cell) -> Ruling {
         )
     };
     match (naming, binding) {
-        (Naming::OldStyleS | Naming::HexSwappedRar, any_binding!()) if sevenz => {
+        (Naming::OldStyle | Naming::HexSwappedRar, any_binding!()) if sevenz => {
             Ruling::Impossible("a RAR naming")
+        }
+        (Naming::OldStyle, any_binding!()) if container.is_rar5() => {
+            Ruling::Impossible("rar writes old-style volume names only for RAR4")
         }
         (Naming::HexNumberedGap, any_binding!()) if container.is_solid_rar() => {
             Ruling::Impossible("no solid set was written as three volumes")
@@ -393,7 +408,7 @@ fn crossed(cell: Cell) -> Ruling {
             | Naming::ConventionalFour
             | Naming::Single
             | Naming::MixedCase
-            | Naming::OldStyleS,
+            | Naming::OldStyle,
             Binding::Par2Posted | Binding::LegacyReal,
         ) => Ruling::Impossible(
             "the posted names are the real ones, so describing them is the Par2Real binding",
@@ -407,7 +422,7 @@ fn crossed(cell: Cell) -> Ruling {
             | Naming::ConventionalFour
             | Naming::Single
             | Naming::MixedCase
-            | Naming::OldStyleS,
+            | Naming::OldStyle,
             Binding::Par2RealFirst
             | Binding::Par2RealLast
             | Binding::Sfv
@@ -557,7 +572,7 @@ impl Naming {
             Self::Reposted | Self::HexReposted => (2, &[0, 1, 0, 1]),
             Self::Conventional
             | Self::MixedCase
-            | Self::OldStyleS
+            | Self::OldStyle
             | Self::HexBare
             | Self::HexMisnumbered
             | Self::HexSwappedRar
@@ -575,7 +590,7 @@ impl Naming {
                 | Self::ConventionalFour
                 | Self::Single
                 | Self::MixedCase
-                | Self::OldStyleS
+                | Self::OldStyle
                 | Self::HexSwappedRar
         )
     }
@@ -596,13 +611,14 @@ impl Naming {
         const STEM: &str = "5f0c9e2ab1d74c6e8a3f1b0d9c2e7a41";
         let hex = |index: usize| format!("{:032x}", 0xd1c7_0000_u128 + index as u128);
         match self {
-            Self::Conventional | Self::ConventionalFour | Self::Single => real.to_vec(),
+            Self::Conventional | Self::ConventionalFour | Self::Single | Self::OldStyle => {
+                real.to_vec()
+            }
             Self::MixedCase => {
                 let mut names = real.to_vec();
                 names[0] = names[0].replacen("silver.horizon", "Silver.Horizon", 1);
                 names
             }
-            Self::OldStyleS => vec!["silver.horizon.rar".into(), "silver.horizon.s00".into()],
             Self::HexBare | Self::HexReposted => (0..real.len()).map(hex).collect(),
             Self::HexSingle => vec![STEM.to_string()],
             Self::HexMisnumbered => vec![format!("{STEM}.002"), format!("{STEM}.001")],
@@ -653,7 +669,7 @@ impl Fixture {
     pub(super) fn build(cell: Cell) -> Self {
         let (count, posted) = cell.naming.layout();
         let payload = unrepeated_payload(13, 70_001);
-        let (written, expected, unmapped) = if cell.container.is_sevenz() {
+        let (mut written, expected, unmapped) = if cell.container.is_sevenz() {
             let (archive, expected) = if cell.container == Container::SevenZipSolid {
                 let archive = include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
@@ -716,6 +732,11 @@ impl Fixture {
         } else {
             let name = "nested/feature.mkv";
             let mut written = match cell.container {
+                // Written with the new-numbering flag clear, as an old-style
+                // set's main header is.
+                Container::Rar4 if cell.naming == Naming::OldStyle => {
+                    single_member_rar4_old_numbering_set("silver.horizon", name, &payload, count)
+                }
                 Container::Rar4 if count == 4 => {
                     single_member_rar4_store_set_numbered(name, &payload, count)
                 }
@@ -738,6 +759,15 @@ impl Fixture {
             }
             (written, vec![(name, payload)], LOSES[0])
         };
+        // An old-style set's real names are `.rar`, then `.r00` onwards.
+        if cell.naming == Naming::OldStyle {
+            for (index, (name, _)) in written.iter_mut().enumerate() {
+                *name = match index.checked_sub(1) {
+                    None => "silver.horizon.rar".to_string(),
+                    Some(next) => format!("silver.horizon.r{next:02}"),
+                };
+            }
+        }
         let real: Vec<String> = posted.iter().map(|&at| written[at].0.clone()).collect();
         let names = cell.naming.posted(&real);
         let volumes: Vec<_> = posted
@@ -1182,13 +1212,12 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                             | Naming::ConventionalFour
                             | Naming::Single
                             | Naming::MixedCase
+                            | Naming::OldStyle
                     )
                 {
                     // Recognizable posted names retain their direct identity even
                     // with every payload article absent. Obfuscated, reordered or
-                    // reposted names need content evidence and rebuild on disk, and
-                    // so do old-style names, which differ from the real PAR2 names
-                    // and bind only through a content prefix the loss took.
+                    // reposted names need content evidence and rebuild on disk.
                     route.direct = false;
                 }
                 if matches!(
@@ -1255,31 +1284,6 @@ async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Sch
                                     MemberIneligibility::MalformedChain
                                 )
                         )
-                    };
-                }
-                if cell.naming == Naming::OldStyleS
-                    && interruption
-                        .loss()
-                        .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
-                {
-                    // These posted names admit a RAR set but differ from the real
-                    // PAR2 names. Without its content prefix a volume cannot be
-                    // bound safely; repair must use materialized source files.
-                    // Solid members may already have refused direct admission.
-                    route.shape_demotion = if cell.container.is_solid_rar() {
-                        |reason| {
-                            matches!(
-                                reason,
-                                DemotionReason::Par2Unbindable
-                                    | DemotionReason::MemberIneligible(
-                                        MemberIneligibility::Compressed
-                                            | MemberIneligibility::Solid
-                                            | MemberIneligibility::Encrypted
-                                    )
-                            )
-                        }
-                    } else {
-                        |reason| reason == DemotionReason::Par2Unbindable
                     };
                 }
                 // A volume the post never carried is held to the route of the
@@ -1610,7 +1614,7 @@ async fn repaired_old_style_rar_retains_direct_ownership() {
     run_cell(
         Cell {
             container: Container::Rar4,
-            naming: Naming::OldStyleS,
+            naming: Naming::OldStyle,
             binding: Binding::Par2RealFirst,
         },
         ExtractionProfile::DirectStore,
@@ -1620,11 +1624,11 @@ async fn repaired_old_style_rar_retains_direct_ownership() {
 }
 
 #[tokio::test]
-async fn all_lost_old_style_rar_can_recover_conventionally() {
+async fn all_lost_old_style_rar_retains_direct_ownership() {
     run_cell(
         Cell {
             container: Container::Rar4,
-            naming: Naming::OldStyleS,
+            naming: Naming::OldStyle,
             binding: Binding::Par2RealFirst,
         },
         ExtractionProfile::DirectStore,
@@ -1780,7 +1784,7 @@ async fn retained_index_can_admit_misnumbered_rar_after_restart() {
 #[tokio::test]
 async fn renamed_par2_sources_repair_missing_identity_prefixes() {
     for (container, naming, binding, mask) in [
-        (Container::Rar4, Naming::OldStyleS, Binding::Par2RealLast, 1),
+        (Container::Rar4, Naming::HexBare, Binding::Par2RealLast, 1),
         (
             Container::SevenZipSolid,
             Naming::HexBare,
@@ -1852,7 +1856,7 @@ pub(super) const NAMINGS: [Naming; 15] = [
     Naming::ConventionalFour,
     Naming::Single,
     Naming::MixedCase,
-    Naming::OldStyleS,
+    Naming::OldStyle,
     Naming::HexBare,
     Naming::HexSingle,
     Naming::HexMisnumbered,

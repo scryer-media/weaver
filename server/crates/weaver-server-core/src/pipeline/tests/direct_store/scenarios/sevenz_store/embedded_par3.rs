@@ -157,7 +157,6 @@ async fn run_embedded(
         // A demoted partial volume can leave a short write behind once the
         // queue drains; the actor's quiescent flush is what lands it.
         pipeline.flush_quiescent_write_backlog().await;
-        pipeline.settle_all_segment_writes().await;
         pipeline.check_job_completion(job_id).await;
         settle_par3_work(&mut pipeline, job_id).await;
         observe(&pipeline, &mut sets);

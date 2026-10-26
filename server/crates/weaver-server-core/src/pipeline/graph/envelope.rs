@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use weaver_graph::{ByteRange, Coverage, NodeId, Placement, Provenance, VolumeIndex};
+use weaver_graph::{ByteRange, Coverage, Marks, NodeId, Placement, Provenance, VolumeIndex};
 
 use super::leaf::{Leaf, LeafError};
 
@@ -29,6 +29,10 @@ use super::leaf::{Leaf, LeafError};
 pub(crate) struct Envelopes {
     working_dir: PathBuf,
     shelves: BTreeMap<NodeId, Arc<Shelf>>,
+    // The nodes whose kept envelopes changed, under the generation of the
+    // latest change: every way to change what a checkpoint says of them
+    // marks the node.
+    marks: Marks<NodeId>,
 }
 
 // One node's envelopes, shared with the run that reads them.
@@ -80,6 +84,7 @@ impl Envelopes {
         Self {
             working_dir,
             shelves: BTreeMap::new(),
+            marks: Marks::default(),
         }
     }
 
@@ -145,6 +150,7 @@ impl Envelopes {
         }
         let shelf = self.shelf(node);
         let range = ByteRange::at(offset, bytes.len() as u64);
+        self.marks.mark(node);
         shelf.update(|state| {
             let kept = shelf.kept(state, envelope)?;
             let mends = provenance.is_verified() && kept.coverage.damaged(range);
@@ -182,9 +188,29 @@ impl Envelopes {
     // the object kept of the volume. Nothing is read or copied.
     pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Leaf> {
         let shelf = self.shelves.get(&node)?;
-        shelf
-            .update(|state| state.kept.remove(&envelope))
-            .map(|kept| kept.leaf)
+        let kept = shelf.update(|state| state.kept.remove(&envelope))?;
+        self.marks.mark(node);
+        Some(kept.leaf)
+    }
+
+    // Change the node's shelf as `change` says it did, which marks the node
+    // when it did and wakes whoever waits on it.
+    pub(crate) fn update_if<E>(
+        &mut self,
+        node: NodeId,
+        change: impl FnOnce(&Shelf, &mut Shelved) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let shelf = self.shelf(node);
+        let mut changed = false;
+        let result = shelf.update_if(|state| {
+            let result = change(&shelf, state);
+            changed = !matches!(result, Ok(false));
+            result
+        });
+        if changed {
+            self.marks.mark(node);
+        }
+        result
     }
 
     // The node is gone, and its envelopes with it. A run still reading them
@@ -193,6 +219,7 @@ impl Envelopes {
         let Some(shelf) = self.shelves.remove(&node) else {
             return Ok(());
         };
+        self.marks.mark(node);
         let kept = shelf.update(|state| {
             state.generation += 1;
             std::mem::take(&mut state.kept)
@@ -248,6 +275,20 @@ impl Shelf {
         result
     }
 
+    // Change the shelf as `change` says it did, and wake whoever waits on
+    // it only when it did: a waiter woken to an unchanged shelf only waits
+    // again. One that failed part way may have changed it, and wakes them.
+    pub(crate) fn update_if<E>(
+        &self,
+        change: impl FnOnce(&mut Shelved) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let result = change(&mut self.lock());
+        if !matches!(result, Ok(false)) {
+            self.changed.notify_all();
+        }
+        result.map(|_| ())
+    }
+
     // Wait for the shelf to change; the guard is given back once it did.
     pub(crate) fn wait<'a>(&self, state: MutexGuard<'a, Shelved>) -> MutexGuard<'a, Shelved> {
         self.changed
@@ -264,7 +305,11 @@ impl Shelf {
         match state.kept.entry(envelope) {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
-                let name = format!(".weaver-chunks/graph-envelope-{}-{envelope}", self.node.0);
+                let name = format!(
+                    "{}/graph-envelope-{}-{envelope}",
+                    weaver_graph::names::INTERNAL_DIR,
+                    self.node.0
+                );
                 let mut leaf = Leaf::at(&state.dir, &name)?;
                 leaf.truncate()?;
                 Ok(free.insert(Kept {

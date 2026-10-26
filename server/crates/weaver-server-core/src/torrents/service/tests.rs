@@ -204,25 +204,12 @@ fn request(source: AddSource) -> AddRequest {
     }
 }
 
-// A queue whose pipeline holds no live jobs and keeps the finished jobs
-// handed to it, newest first.
+// A queue whose pipeline holds no live jobs. A retired job goes to its
+// finished jobs, newest first.
 fn queue() -> SchedulerHandle {
-    use crate::jobs::handle::SchedulerCommand;
-
     let state = crate::jobs::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]);
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
     let (event_tx, _) = tokio::sync::broadcast::channel(16);
-    let handle = SchedulerHandle::new(cmd_tx, event_tx, state.clone());
-    tokio::spawn(async move {
-        let mut finished: Vec<JobInfo> = Vec::new();
-        while let Some(command) = cmd_rx.recv().await {
-            if let SchedulerCommand::RetireJob { info } = command {
-                finished.insert(0, *info);
-                state.publish_live_jobs(Vec::new(), Arc::from(finished.clone()));
-            }
-        }
-    });
-    handle
+    SchedulerHandle::new(event_tx, state)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -286,7 +273,7 @@ async fn the_queue_orders_torrents_and_jobs_by_when_they_were_added() {
     let mut later = earlier.clone();
     later.job_id = JobId(job_id.0 + 1001);
     later.created_at_epoch_ms = added + 1.0;
-    state.publish_live_jobs(vec![earlier.clone(), later.clone()], Arc::from(Vec::new()));
+    state.publish_jobs(vec![earlier.clone(), later.clone()]);
     let order: Vec<JobId> = state.list_jobs().iter().map(|job| job.job_id).collect();
     assert_eq!(order, [earlier.job_id, job_id, later.job_id]);
     assert_eq!(state.get_job(job_id).unwrap().protocol, Protocol::Torrent);
@@ -5838,9 +5825,12 @@ async fn heard_tracker(
 // owed `stopped` only once it accepted `started`.
 async fn started_accepted(service: &TorrentService, job_id: JobId) {
     trackers_once(service, job_id, |announces| {
-        announces
-            .iter()
-            .any(|announce| announce.last.as_ref().is_some_and(|last| last.result.is_ok()))
+        announces.iter().any(|announce| {
+            announce
+                .last
+                .as_ref()
+                .is_some_and(|last| last.result.is_ok())
+        })
     })
     .await;
 }

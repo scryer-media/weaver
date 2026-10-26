@@ -99,6 +99,8 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
         nntp_generation_recovery_requeues: 0,
+        download_dispatch_stall_kicks: 0,
+        download_dispatch_stall_releases: 0,
         download_failures_article_not_found: 0,
         download_failures_capacity_unavailable: 0,
         download_failures_transient: 0,

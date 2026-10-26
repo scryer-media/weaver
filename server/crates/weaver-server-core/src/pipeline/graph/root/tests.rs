@@ -30,7 +30,8 @@ use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd,
+    insert_active_job, insert_active_job_on, new_direct_pipeline, retire_pipeline_database,
+    sample_nzb_zstd,
 };
 use crate::pipeline::{
     DecodeResult, DecodedChunk, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -261,7 +262,7 @@ fn segment_id(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId 
 
 // Stamp a row graph behind the switch's back, the way a row written by a
 // process with the switch on reads after a restart with it off.
-fn stamp_graph(db: &crate::Database, job_id: JobId) {
+pub(in crate::pipeline::graph) fn stamp_graph(db: &crate::Database, job_id: JobId) {
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
@@ -280,7 +281,12 @@ fn stamp_graph(db: &crate::Database, job_id: JobId) {
 
 #[test]
 fn the_phase_is_the_first_state_that_holds() {
-    for activity in [Activity::Idle, Activity::Verifying, Activity::Repairing] {
+    for activity in [
+        Activity::Idle,
+        Activity::Verifying,
+        Activity::Fetching,
+        Activity::Repairing,
+    ] {
         for extracting in [false, true] {
             assert_eq!(
                 RootPhase::derive(true, activity, extracting),
@@ -297,6 +303,10 @@ fn the_phase_is_the_first_state_that_holds() {
             RootPhase::derive(false, Activity::Verifying, extracting),
             RootPhase::Verifying
         );
+        assert_eq!(
+            RootPhase::derive(false, Activity::Fetching, extracting),
+            RootPhase::Downloading
+        );
     }
     assert_eq!(
         RootPhase::derive(false, Activity::Idle, true),
@@ -306,13 +316,17 @@ fn the_phase_is_the_first_state_that_holds() {
         RootPhase::derive(false, Activity::Idle, false),
         RootPhase::Done
     );
-    assert_eq!(phase::activity([]), Activity::Idle);
+    assert_eq!(phase::activity([], false), Activity::Idle);
     assert_eq!(
-        phase::activity([Some(RepairOutcome::Clean), None]),
+        phase::activity([Some(RepairOutcome::Clean), None], false),
         Activity::Verifying
     );
     assert_eq!(
-        phase::activity([None, Some(RepairOutcome::Waiting)]),
+        phase::activity([None, Some(RepairOutcome::Waiting)], false),
+        Activity::Fetching
+    );
+    assert_eq!(
+        phase::activity([None, Some(RepairOutcome::Waiting)], true),
         Activity::Repairing
     );
     assert_eq!(RootPhase::Done.job_status(), None);
@@ -487,7 +501,12 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
         Weight(1),
     )];
     let (mut job, _dir, answers) = job_with(
-        &[file("inner.zip", &[64, 64]), file("blocks.par2", &[64])],
+        // A recovery volume by its name, not an index the root asks for
+        // first.
+        &[
+            file("inner.zip", &[64, 64]),
+            file("blocks.vol0+1.par2", &[64]),
+        ],
         wants,
     );
     job.intake(
@@ -586,7 +605,13 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
         .collect();
     files.push(("lantern.vol0+4.par2".to_string(), recovery_role(), 3));
     let members = files.len();
-    insert_active_job(&mut pipeline, job_id, spec("lantern sample", files)).await;
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec("lantern sample", files),
+        Engine::Graph,
+    )
+    .await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
@@ -605,6 +630,104 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
             .segment_number,
         0
     );
+}
+
+// Every file role the classic engine ranks or parks, in an order no role
+// ranking would keep.
+fn ranked_roles() -> Vec<(String, FileRole, u32)> {
+    vec![
+        ("lantern.vol0+4.par2".to_string(), recovery_role(), 2),
+        ("lantern.bin".to_string(), FileRole::Unknown, 2),
+        (
+            "lantern.part2.rar".to_string(),
+            FileRole::RarVolume { volume_number: 1 },
+            2,
+        ),
+        (
+            "lantern.part1.rar".to_string(),
+            FileRole::RarVolume { volume_number: 0 },
+            3,
+        ),
+        ("lantern.7z".to_string(), FileRole::SevenZipArchive, 2),
+        (
+            "lantern.par2".to_string(),
+            FileRole::Par2 {
+                is_index: true,
+                recovery_block_count: 0,
+            },
+            1,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_graph_job_is_queued_in_posted_order_at_one_neutral_priority() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_010);
+    let files = ranked_roles();
+    let posted: Vec<SegmentId> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (_, _, segments))| {
+            (0..*segments).map(move |ordinal| segment_id(job_id, index as u32, ordinal))
+        })
+        .collect();
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec("lantern posted", files),
+        Engine::Graph,
+    )
+    .await;
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    // Nothing is parked by its name: the recovery volume waits in the
+    // download queue with everything else, and nothing marks it recovery.
+    assert_eq!(state.recovery_queue.count_matching(|_| true), 0);
+    let mut queued = Vec::new();
+    while let Some(work) = state.download_queue.pop() {
+        assert_eq!(work.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
+        assert!(!work.is_recovery);
+        assert!(!work.completion_critical);
+        queued.push(work.segment_id);
+    }
+    assert_eq!(queued, posted);
+}
+
+#[tokio::test]
+async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_011);
+    insert_active_job_on(
+        &mut pipeline,
+        job_id,
+        spec("lantern requeued", ranked_roles()),
+        Engine::Graph,
+    )
+    .await;
+    pipeline.admit_graph_job(job_id, Engine::Graph);
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    while state.download_queue.pop().is_some() {}
+
+    // The first RAR volume's role ranks it ahead of everything, and a
+    // retry rebuilt from the post says so; the root holds it ordinary.
+    let first_volume = segment_id(job_id, 3, 1);
+    let retry = pipeline
+        .download_retry_work(first_volume, 1, Vec::new())
+        .unwrap();
+    assert_eq!(
+        retry.priority,
+        FileRole::RarVolume { volume_number: 0 }.download_priority()
+    );
+    pipeline.enqueue_download_work(retry);
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let requeued = state.download_queue.pop().unwrap();
+    assert_eq!(requeued.segment_id, first_volume);
+    assert_eq!(requeued.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
+    assert!(state.download_queue.pop().is_none());
 }
 
 #[tokio::test]
@@ -665,7 +788,7 @@ async fn a_lost_article_marks_its_range_damaged() {
             ("lantern.dat".to_string(), FileRole::Standalone, 19),
         ],
     );
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
     pipeline.book_terminal_segment(segment_id(job_id, 0, 0), SegmentTerminalState::Missing);
     assert_eq!(
@@ -695,7 +818,7 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
         "lantern damaged",
         vec![("lantern.bin".to_string(), FileRole::Standalone, 1)],
     );
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
     let body = vec![3u8; 64];
     pipeline
@@ -819,7 +942,8 @@ fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
     let mut held = Held::new();
     let a = VolumeIndex(0);
     encodes_whole(&root, &mut encoded, &mut held, 0);
-    let steps: Vec<Box<dyn Fn(&mut ArticleRoot)>> = vec![
+    type Step<'a> = Box<dyn Fn(&mut ArticleRoot) + 'a>;
+    let steps: Vec<Step<'_>> = vec![
         Box::new(|root| {
             root.receive(with_segments(
                 decoded(0, 5, 300, &[1; 60], None),
@@ -876,7 +1000,8 @@ fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
         }),
         Box::new(|root| {
             root.map.sample();
-            root.map.parked(|_, ordinal| ordinal % 3 == 0);
+            root.map
+                .seek(a, ByteRange::new(2_000, u64::MAX), Some(Class::Parked));
             root.map.queue(a, ByteRange::new(0, 2_000));
         }),
         Box::new(|root| root.map.arrived_before(|_, ordinal| ordinal % 2 == 0)),
@@ -909,6 +1034,47 @@ fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
     let small = changed(40);
     assert!(!small.is_empty() && small.len() <= 3, "{small:?}");
     assert_eq!(changed(400), small);
+}
+
+// With the switch unset a new job is a graph job, row and runtime both; a
+// switch naming classic opts it into the classic pipeline. The decision is
+// driven through `Engine::parse`, never the process variable.
+#[tokio::test]
+async fn admission_with_the_switch_unset_stamps_graph_and_classic_is_the_opt_in() {
+    for (switch, engine, job_id) in [
+        (None, Engine::Graph, JobId(91_008)),
+        (Some("classic"), Engine::Classic, JobId(91_009)),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let mut resources = pipeline.admission_resources();
+        resources.engine = Engine::parse(switch);
+        let prepared = crate::pipeline::Pipeline::prepare_add(
+            &resources,
+            job_id,
+            spec(
+                "lantern default",
+                vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
+            ),
+            PathBuf::from("lantern-default.nzb"),
+            sample_nzb_zstd(),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+        pipeline.install_prepared_add(job_id, prepared);
+        assert_eq!(
+            pipeline.db.load_active_job_engine(job_id).unwrap(),
+            Some(engine),
+            "{switch:?}"
+        );
+        assert_eq!(
+            pipeline.graph_jobs.contains_key(&job_id),
+            engine == Engine::Graph,
+            "{switch:?}"
+        );
+        retire_pipeline_database(pipeline).await;
+    }
 }
 
 #[tokio::test]
@@ -1074,5 +1240,48 @@ fn an_article_jobs_restore_reads_its_articles_back_and_checks_them() {
     assert_eq!(
         damaged_ranges(&restored.job, 0),
         vec![ByteRange::new(0, 90)]
+    );
+}
+
+// A deferral lowers only articles still in the normal order: one already
+// raised keeps its class, a later raise takes a parked one, and a deferral
+// over a lost article or a missing volume is never Lost to the asker.
+#[test]
+fn a_deferral_never_lowers_a_raised_article_and_is_never_lost() {
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100, 100])]);
+    let volume = VolumeIndex(0);
+    // The first article gives the positions of the rest.
+    root.receive(decoded(0, 0, 0, &[7; 100], Some(400)));
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(100, 200), Some(Class::Recovery)),
+        Pull::Moved(1)
+    );
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(0, u64::MAX), Some(Class::Parked)),
+        Pull::Moved(2)
+    );
+    assert_eq!(root.map.class(volume, 1), Some(Class::Recovery));
+    for ordinal in 2..4 {
+        assert_eq!(root.map.class(volume, ordinal), Some(Class::Parked));
+    }
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(200, 300), Some(Class::Recovery)),
+        Pull::Moved(1)
+    );
+    assert_eq!(root.map.class(volume, 2), Some(Class::Recovery));
+
+    root.map.lost(volume, 3);
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(0, u64::MAX), Some(Class::Parked)),
+        Pull::Moved(0)
+    );
+    assert_eq!(
+        root.map
+            .seek(VolumeIndex(9), ByteRange::new(0, 100), Some(Class::Parked)),
+        Pull::Moved(0)
     );
 }

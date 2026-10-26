@@ -8,8 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use tokio::time::Instant;
 use tracing::warn;
 use weaver_graph::holds::HoldBudgets;
 use weaver_graph::{MemberId, NodeId, Tree};
@@ -61,9 +62,10 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   entries            members of the live namespaces objects produced
 //   resident           what those namespaces keep in memory for their
 //                      members, against the memory limit
-//   deadline           the job's wall clock since an object first produced
-//                      output: extraction's own time, however long the
-//                      posts or pieces took to arrive
+//   deadline           the wall clock since the first member an object
+//                      produced reached its namespace, as classic's runs
+//                      from the job's first extraction; the posts' own
+//                      writes are not under it
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
 //   content policy     the operator's unacceptable extensions, on every
@@ -73,7 +75,8 @@ pub(crate) struct Caps {
     policy: Result<Arc<PostProcessingSettings>, String>,
     // The bytes posted for each root member, by member id.
     declared: Vec<u64>,
-    // When an object first produced output.
+    // When extraction began: the first time an object's namespace was
+    // charged. A job queued or paused before then has spent none of it.
     started: Option<Instant>,
     debits: CapacityDebits,
     // How far each member an object produced is written.
@@ -131,15 +134,23 @@ impl Caps {
         self.refusal.as_ref()
     }
 
-    // The breach, if one stands, or the deadline's once it has passed.
-    pub(crate) fn check(&mut self) -> Result<(), ExtractionFailure> {
-        if let Some(refusal) = &self.refusal {
-            return Err(refusal.clone());
+    // The breach, if one stands.
+    pub(crate) fn check(&self) -> Result<(), ExtractionFailure> {
+        match &self.refusal {
+            Some(refusal) => Err(refusal.clone()),
+            None => Ok(()),
         }
-        if self
-            .started
-            .is_some_and(|started| started.elapsed() > Duration::from_secs(self.limits.max_seconds))
-        {
+    }
+
+    // A member of `node` changed. What an object produced is extraction:
+    // the first such change starts the clock, and every one after it is
+    // refused once the deadline has passed. The posts are not under it.
+    fn extracting(&mut self, tree: &Tree, node: NodeId) -> Result<(), ExtractionFailure> {
+        if !produced(tree, node) {
+            return Ok(());
+        }
+        let started = *self.started.get_or_insert_with(Instant::now);
+        if started.elapsed() > Duration::from_secs(self.limits.max_seconds) {
             let detail = format!(
                 "extraction exceeded the {} second deadline",
                 self.limits.max_seconds
@@ -147,11 +158,6 @@ impl Caps {
             return Err(self.breach(ExtractionRejectionReason::Deadline, detail));
         }
         Ok(())
-    }
-
-    // An object produced output: extraction's clock runs from the first time.
-    fn start(&mut self) {
-        self.started.get_or_insert_with(Instant::now);
     }
 
     // A namespace places `name`. A directory carries no extension.
@@ -183,6 +189,7 @@ impl Caps {
         member: MemberId,
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
+        self.extracting(tree, node)?;
         self.charge(tree, node, member);
         if self.entries > self.limits.max_entries {
             let detail = format!(
@@ -208,7 +215,6 @@ impl Caps {
         if !produced(tree, node) {
             return;
         }
-        self.start();
         let Some(namespace) = tree.namespace(node).filter(|_| tree.is_live(node)) else {
             self.release(node);
             return;
@@ -256,10 +262,10 @@ impl Caps {
         capacity: Capacity,
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
+        self.extracting(tree, node)?;
         if !produced(tree, node) {
             return Ok(());
         }
-        self.start();
         let extent = self.extents.get(&(node, member)).copied().unwrap_or(0);
         let Some(grown) = end.checked_sub(extent).filter(|grown| *grown > 0) else {
             return Ok(());
@@ -325,7 +331,6 @@ impl Caps {
             .unwrap_or(0);
         self.unwrite(node, member);
         if extent > 0 {
-            self.start();
             self.extents.insert((node, member), extent);
             self.written = self.written.saturating_add(extent);
         }
@@ -425,41 +430,4 @@ pub(crate) struct GraphBudget {
     // Where the job's runs speak, and where it joins to hear them.
     pub(crate) mail: tokio::sync::mpsc::Sender<super::engine::Said>,
     pub(crate) outside: Arc<super::engine::Outside>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // The deadline counts from extraction's start, not from the job's: a
-    // job whose input took past the deadline to arrive is not refused, and
-    // the clock, once running, keeps its first start.
-    #[test]
-    fn the_deadline_runs_from_the_first_output_not_the_job() {
-        let mut limits = ExtractionLimits::unbounded();
-        limits.max_seconds = 0;
-        let mut caps = Caps::new(
-            Arc::new(limits),
-            Ok(Arc::new(PostProcessingSettings::default())),
-            Vec::new(),
-        );
-        let long_ago = Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("a second before now");
-
-        // The input arriving, however long it takes, starts nothing.
-        caps.admit_member(&Tree::new(), NodeId::ROOT, MemberId(0))
-            .unwrap();
-        assert_eq!(caps.started, None);
-        caps.check().unwrap();
-
-        caps.start();
-        let first = caps.started.expect("started");
-        caps.start();
-        assert_eq!(caps.started, Some(first));
-
-        caps.started = Some(long_ago);
-        let refused = caps.check().unwrap_err();
-        assert_eq!(refused.reason(), ExtractionRejectionReason::Deadline);
-    }
 }

@@ -607,6 +607,9 @@ impl Pipeline {
     //   critical = (total - 2 × par2_bytes) / (total - par2_bytes) × 1000
     // If no PAR2 data, defaults to 850 (85%).
     pub(super) fn check_health(&mut self, job_id: JobId) {
+        if !self.nzb_admitted.contains(&job_id) {
+            return;
+        }
         if self.jobs.get(&job_id).is_none_or(|state| {
             matches!(
                 state.status,
@@ -905,18 +908,25 @@ impl Pipeline {
             health as f64 / 10.0,
             critical as f64 / 10.0
         );
+        self.attributed_dead_post_error(job_id, health_error)
+    }
+
+    // The error a health detector fails a job with: the first-article
+    // sample's diagnosis when the sample has ruled, the detector's own
+    // `error` otherwise.
+    fn attributed_dead_post_error(&self, job_id: JobId, error: String) -> String {
         match self.first_article_verdict(job_id) {
             Some((missing, total)) => {
                 warn!(
                     job_id = job_id.0,
                     missing,
                     total,
-                    health = %health_error,
+                    health = %error,
                     "health abort attributed to the first-article sample"
                 );
                 Self::first_article_verdict_error(missing, total)
             }
-            None => health_error,
+            None => error,
         }
     }
 
@@ -984,10 +994,23 @@ impl Pipeline {
             .get(&job_id)
             .is_some_and(|state| state.par2_bytes > 0);
 
-        if done && !inconclusive && missed == total && total > 0 && !par2_recovery_potential {
-            let error = format!(
-                "health probe: all {} samples missing — release is unavailable",
-                total
+        // A dead post has one verdict whichever detector reaches it first.
+        // While the first-article sample can still rule, the round falls
+        // through to the ordinary projection below, and the health arithmetic
+        // holds its abort on that sample exactly as it holds a byte-count
+        // abort; the sample's diagnosis is then the one the job fails with.
+        // The probe's own wording is left for a post the sample cannot speak
+        // for.
+        if done
+            && !inconclusive
+            && missed == total
+            && total > 0
+            && !par2_recovery_potential
+            && !self.first_article_sample_can_still_decide(job_id)
+        {
+            let error = self.attributed_dead_post_error(
+                job_id,
+                format!("health probe: all {total} samples missing — release is unavailable"),
             );
             warn!(job_id = job_id.0, "{error}");
             self.raise_queue_script_event(
@@ -1567,12 +1590,9 @@ impl Pipeline {
         self.pending_concat.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
-        self.active_downloads_by_job.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
         self.active_completion_critical_connections_by_job
             .remove(&job_id);
-        self.active_downloads_by_file
-            .retain(|file_id, _| file_id.job_id != job_id);
         self.active_decodes_by_job.remove(&job_id);
         self.active_decodes_by_file
             .retain(|file_id, _| file_id.job_id != job_id);
@@ -1619,7 +1639,7 @@ impl Pipeline {
         if released_extract {
             self.promote_queued_extractions();
         }
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     // Spawn a dedicated STAT probe task to quickly estimate job health.
@@ -1638,6 +1658,9 @@ impl Pipeline {
     // job is downloading, and saying so kept it out of dispatch decisions,
     // completion scheduling and the capacity budget that all read the status.
     pub(super) fn activate_health_probes(&mut self, job_id: JobId) -> bool {
+        if !self.nzb_admitted.contains(&job_id) {
+            return false;
+        }
         // The failing-file count this round was armed on: another file failing
         // is what re-arms the next one, and a second dead article in a file
         // already known to be missing is not that.
@@ -1691,6 +1714,7 @@ impl Pipeline {
             .collect();
 
         let probe_count = probes.len();
+        let retention_excludes = self.job_retention_excludes(job_id);
         let nntp = Arc::clone(&self.nntp);
         let probe_tx = self.probe_result_tx.clone();
         // The probe rides the download lanes rather than competing with them.
@@ -1700,6 +1724,8 @@ impl Pipeline {
         // lane and then pay a full cold dial for it. Asking the lane to run
         // the STAT batch on the socket it is already holding costs neither.
         let owned_lane_probe = self.owned_download_lane_pool.probe_handle(job_id.0);
+        let probe_state = self.shared_state.clone();
+        let probe_generation = self.pool_generation;
 
         info!(
             job_id = job_id.0,
@@ -1730,7 +1756,13 @@ impl Pipeline {
                 // async client is the fallback for whatever they cannot settle
                 // — a server with no lane of its own, or a lane that faulted.
                 let results = owned_lane_probe
-                    .confirm_exists_for_probe(&nntp, batch)
+                    .confirm_exists_for_probe(
+                        &nntp,
+                        batch,
+                        &retention_excludes,
+                        &probe_state,
+                        probe_generation,
+                    )
                     .await;
                 if results.inconclusive {
                     // One batch that could not settle is a hole in the sample,

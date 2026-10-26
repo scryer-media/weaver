@@ -10,6 +10,43 @@ use common::{
 use weaver_server_core::auth::CallerScope;
 
 #[tokio::test]
+async fn nzb_limit_defaults_to_ten_and_accepts_only_positive_integers() {
+    let h = TestHarness::new().await;
+    let response = h.execute("{ settings { maxConcurrentNzbs } }").await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["settings"]["maxConcurrentNzbs"],
+        10
+    );
+    for value in ["0", "-1", "1.5", "2147483648"] {
+        let response = h.execute(&format!(
+            "mutation {{ updateSettings(input: {{ maxConcurrentNzbs: {value} }}) {{ maxConcurrentNzbs }} }}"
+        )).await;
+        assert!(!response.errors.is_empty(), "{value} must be rejected");
+        assert_eq!(h.db.load_config().unwrap().max_concurrent_nzbs(), 10);
+    }
+    let response = h
+        .execute(
+            "mutation { updateSettings(input: { maxConcurrentNzbs: 3 }) { maxConcurrentNzbs } }",
+        )
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateSettings"]["maxConcurrentNzbs"],
+        3
+    );
+    assert_eq!(h.db.load_config().unwrap().max_concurrent_nzbs(), 3);
+    let response = h
+        .execute("mutation { updateSettings(input: { maxRetries: 4 }) { maxConcurrentNzbs } }")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateSettings"]["maxConcurrentNzbs"],
+        3
+    );
+}
+
+#[tokio::test]
 async fn create_schedule_refuses_a_client_supplied_id_and_generates_one() {
     let h = TestHarness::new().await;
     let data_dir = std::path::PathBuf::from(&h.config.read().await.data_dir);
@@ -791,6 +828,21 @@ async fn the_profile_in_force_is_reported_beside_the_choice() {
     assert_no_errors(&resp);
     let profile = &response_data(&resp)["setHardwareProfile"];
     assert_eq!(profile["selected"], "EFFICIENT");
+    let mut revisions = h.handle.subscribe_job_changes();
+    loop {
+        revisions.mark_unchanged();
+        if h.handle.hardware_profile_in_force().is_some_and(|profile| {
+            profile.active == weaver_server_core::runtime::HardwareProfile::Efficient
+        }) {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
+    let resp = h
+        .execute("{ hardwareProfile { selected active scheduled } }")
+        .await;
+    assert_no_errors(&resp);
+    let profile = &response_data(&resp)["hardwareProfile"];
     assert_eq!(profile["active"], "EFFICIENT");
     assert!(profile["scheduled"].is_null());
 }

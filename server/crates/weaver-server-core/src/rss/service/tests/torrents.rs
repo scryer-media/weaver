@@ -14,7 +14,6 @@ const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 struct Rig {
     service: RssService,
     db: Database,
-    submissions: Arc<StdMutex<Vec<CapturedSubmission>>>,
     server: tokio::task::JoinHandle<()>,
     _dir: TempDir,
 }
@@ -113,19 +112,28 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
     );
     torrents.open().await.unwrap();
 
-    let submissions = Arc::new(StdMutex::new(Vec::new()));
-    let service = build_service(dir.path(), db.clone(), submissions.clone());
+    let service = build_service(dir.path(), db.clone());
     service.use_torrents(torrents);
     Rig {
         service,
         db,
-        submissions,
         server,
         _dir: dir,
     }
 }
 
 impl Rig {
+    // The NZB jobs the feed submitted to the queue.
+    fn nzb_jobs(&self) -> Vec<crate::jobs::JobInfo> {
+        self.service
+            .inner
+            .handle
+            .list_jobs()
+            .into_iter()
+            .filter(|job| job.protocol == crate::jobs::Protocol::Nzb)
+            .collect()
+    }
+
     // The feed's seen rows, oldest first, as (item, decision, job, error).
     fn seen(&self) -> Vec<(String, String, Option<u64>, Option<String>)> {
         let mut rows = self.db.list_rss_seen_items(Some(1), None).unwrap();
@@ -200,7 +208,7 @@ async fn an_enclosed_torrent_file_is_added_to_the_torrent_client() {
     let stored = rig.db.list_torrents().unwrap();
     assert_eq!(stored[0].name, "set.bin");
     assert_eq!(stored[0].category_id, Some(1));
-    assert!(rig.submissions.lock().unwrap().is_empty());
+    assert!(rig.nzb_jobs().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -296,9 +304,9 @@ async fn an_nzb_beside_a_torrent_client_is_submitted_as_before() {
 
     assert_eq!(report.items_submitted, 1, "{report:?}");
     assert!(rig.torrent_jobs().is_empty());
-    let submissions = rig.submissions.lock().unwrap().clone();
+    let submissions = rig.nzb_jobs();
     assert_eq!(submissions.len(), 1);
-    assert_eq!(submissions[0].spec.category.as_deref(), Some("tv"));
+    assert_eq!(submissions[0].category.as_deref(), Some("tv"));
     let seen = rig.seen();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].1, "submitted");

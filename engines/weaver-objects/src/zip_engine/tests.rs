@@ -13,7 +13,7 @@ use weaver_graph::{
 };
 
 use super::ZipEngine;
-use crate::testing::payload;
+use crate::testing::{payload, zip64_end};
 use crate::zip::records;
 
 const NOTES: &[u8] = b"the first member, stored";
@@ -342,6 +342,50 @@ fn a_set_the_names_disagree_with_is_refused_as_unsupported() {
             vec![volumes[0].clone(), volumes[2].clone()]
         ),
         vec![Said::Refuse(Why::Unsupported)]
+    );
+}
+
+// The spanned set ended by zip64 records saying what `edit` makes them say.
+fn spanned64(edit: impl FnOnce(&mut crate::testing::Zip64)) -> Vec<Vec<u8>> {
+    let mut volumes = spanned(&plain(), 3);
+    zip64_end(&mut volumes[2], 3, edit);
+    volumes
+}
+
+fn run_spanned(volumes: Vec<Vec<u8>>) -> Vec<Said> {
+    run(
+        &mut named(&["alpha.z01", "alpha.z02", "alpha.zip"]),
+        volumes,
+    )
+}
+
+#[test]
+fn a_spanned_set_ended_by_zip64_records_extracts_as_one() {
+    assert_eq!(run_spanned(spanned64(|_| {})), plain_said());
+}
+
+#[test]
+fn zip64_places_past_the_end_of_the_bytes_are_refused_as_unsupported() {
+    let refused = vec![Said::Refuse(Why::Unsupported)];
+    assert_eq!(
+        run_spanned(spanned64(|said| said.record = u64::MAX - 8)),
+        refused,
+        "a zip64 record past the last byte"
+    );
+    assert_eq!(
+        run_spanned(spanned64(|said| said.offset = u64::MAX - 8)),
+        refused,
+        "a directory past the last byte"
+    );
+    assert_eq!(
+        run_spanned(spanned64(|said| said.size = 1 << 62)),
+        refused,
+        "a directory longer than the bytes before its end records"
+    );
+    assert_eq!(
+        run_spanned(spanned64(|said| said.size += 1)),
+        refused,
+        "a directory that runs into its end records"
     );
 }
 

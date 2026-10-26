@@ -13,7 +13,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use weaver_graph::{VolumeIndex, Volumes};
+use weaver_graph::{Lost, VolumeIndex, Volumes};
 
 pub(crate) struct Joined {
     volumes: Arc<dyn Volumes>,
@@ -38,6 +38,16 @@ impl Joined {
         self.volumes
             .read_at(volume, offset, into)
             .inspect_err(|_| self.failed.store(true, Ordering::Release))
+    }
+
+    // The run reads on past the span `error` says is lost, when that is why
+    // a read failed: the owner hears it, the failure is not remembered, and
+    // the span's length is how far the read moves on.
+    pub(crate) fn bridge(&self, error: &io::Error) -> Option<u64> {
+        let lost = Lost::of(error)?;
+        self.volumes.bridged(lost);
+        self.failed.store(false, Ordering::Release);
+        Some(lost.range.len())
     }
 
     // The volume after `after` in the set's order, as the owner says.

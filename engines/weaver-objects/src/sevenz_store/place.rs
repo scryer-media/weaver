@@ -202,6 +202,16 @@ impl SevenZipStore {
             };
             let local = part.shift(-(folder.pack.start as i64));
             let lock = &mut self.folders[index];
+            // A folder a condemned key opened said nothing true of any of
+            // its bytes: all of it is said again, under the next key.
+            let local = match self.condemned.remove(&index) {
+                true => {
+                    self.relock.insert(index);
+                    self.stale = true;
+                    ByteRange::new(0, folder.pack.len())
+                }
+                false => local,
+            };
             let said = match lock {
                 Lock::Locked => continue,
                 Lock::Plain => local,
@@ -223,6 +233,7 @@ impl SevenZipStore {
             {
                 said.coverage.erase(range);
                 said.closed = false;
+                said.damaged = false;
             }
         }
     }

@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use unrar_rs::{MappedSlice, StoredLayoutBuilder};
-use weaver_graph::{ByteRange, Extent, MemberId, Placement, Placements, Posting, VolumeIndex};
+use weaver_graph::{
+    ByteRange, Emit, Extent, MemberId, Placement, Placements, Posting, VolumeIndex,
+};
 
 use super::{Entry, Lock, Out, RarStore, Volume};
 use crate::crypt::{BLOCK, Cbc};
@@ -126,6 +128,13 @@ fn place_unlinked(found: &Volume, envelope: u32, range: ByteRange, out: &mut Vec
     }
 }
 
+// The parts of `range` outside `cut`, in order.
+fn outside(range: ByteRange, cut: ByteRange) -> impl Iterator<Item = ByteRange> {
+    let before = ByteRange::new(range.start, range.end.min(cut.start).max(range.start));
+    let after = ByteRange::new(range.start.max(cut.end).min(range.end), range.end);
+    [before, after].into_iter().filter(|part| !part.is_empty())
+}
+
 // One run of a volume range as the layout maps it.
 enum Run {
     Member { id: usize, stream: ByteRange },
@@ -191,6 +200,60 @@ impl RarStore {
         if range.end > reach {
             let above = ByteRange::new(range.start.max(reach), range.end);
             held_or_kept(found, envelope, above, out);
+        }
+    }
+
+    // Of the bytes a volume the store still holds keeps from `from`, where
+    // its headers reached before they moved, to where they reach now, what
+    // the map places anywhere but the volume's own envelope, past `fresh`.
+    // Every byte past the reach is kept in the envelope as itself, and the
+    // map keeps what it placed below it, so no other kept byte leaves.
+    pub(super) fn unkept(
+        &self,
+        volume: VolumeIndex,
+        from: u64,
+        fresh: Option<(VolumeIndex, ByteRange)>,
+        out: &mut Vec<Emit>,
+    ) {
+        let Some(found) = self.volumes.get(&volume) else {
+            return;
+        };
+        let reach = found.walk.reach().unwrap_or(0);
+        if reach <= from {
+            return;
+        }
+        let window = ByteRange::new(from, reach);
+        let mut placements = Vec::new();
+        for (range, _, _) in found.kept.runs() {
+            let Some(range) = range.intersect(window) else {
+                continue;
+            };
+            placements.clear();
+            self.place(volume, range, &mut placements);
+            let mut cursor = range.start;
+            for placement in &placements {
+                let piece = ByteRange::at(cursor, placement.len());
+                cursor = piece.end;
+                if *placement
+                    == (Placement::Envelope {
+                        envelope: volume.0,
+                        range: piece,
+                    })
+                {
+                    continue;
+                }
+                let cut = fresh
+                    .filter(|(delivered, _)| *delivered == volume)
+                    .map_or(ByteRange::new(piece.end, piece.end), |(_, cut)| cut);
+                for part in outside(piece, cut) {
+                    out.push(Emit::Unkept {
+                        volume,
+                        range: part,
+                        envelope: volume.0,
+                        at: part.start,
+                    });
+                }
+            }
         }
     }
 
@@ -261,8 +324,14 @@ impl RarStore {
             return push(out, Placement::Held { range: part });
         };
         let member = MemberId(id as u32);
+        // A condemned file is placed as it stood until its bytes are
+        // posted again: what came out of them is uncovered where it lies.
+        let stood = self
+            .condemned
+            .get(&id)
+            .is_some_and(|condemned| condemned.parts.contains(&volume));
         match &entry.lock {
-            Lock::Locked | Lock::Sealed(_) => push(out, Placement::Held { range: part }),
+            Lock::Locked | Lock::Sealed(_) if !stood => push(out, Placement::Held { range: part }),
             Lock::Plain => push(
                 out,
                 Placement::Member {
@@ -270,7 +339,7 @@ impl RarStore {
                     range: stream,
                 },
             ),
-            Lock::Open(_) => {
+            Lock::Open(_) | Lock::Locked | Lock::Sealed(_) => {
                 let length = entry.length.unwrap_or(0);
                 let payload = ByteRange::new(stream.start.min(length), stream.end.min(length));
                 push(
@@ -327,12 +396,19 @@ impl RarStore {
         let mut sealed = Vec::new();
         for &(volume, range) in ranges {
             for (id, part, stream) in self.linked(volume, range) {
-                if let Some(Entry {
-                    lock: Lock::Open(cbc),
-                    out,
-                    ..
-                }) = self.entries.get(id)
-                {
+                let stood = match (self.condemned.get(&id), self.entries.get(id)) {
+                    (Some(condemned), _) => Some((&condemned.cbc, &condemned.out)),
+                    (
+                        None,
+                        Some(Entry {
+                            lock: Lock::Open(cbc),
+                            out,
+                            ..
+                        }),
+                    ) => Some((cbc, out)),
+                    _ => None,
+                };
+                if let Some((cbc, out)) = stood {
                     sealed.push(Sealed {
                         volume,
                         part,

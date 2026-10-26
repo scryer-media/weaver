@@ -3,7 +3,6 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_graphql::Request;
@@ -138,6 +137,9 @@ async fn queue_snapshots_reflect_paused_job_item_state() {
         .await;
     assert!(pause.errors.is_empty());
 
+    h.wait_for_job_status(job_id, weaver_server_core::JobStatus::Paused)
+        .await;
+
     let request = Request::new("subscription { queueSnapshots { items { id state } } }")
         .data(CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
@@ -153,19 +155,24 @@ async fn queue_snapshots_reflect_paused_job_item_state() {
     assert_eq!(paused_item["state"].as_str().unwrap(), "PAUSED");
 }
 
-#[tokio::test]
-async fn queue_snapshots_keep_cached_speed_on_unrelated_events() {
+#[tokio::test(start_paused = true)]
+async fn queue_snapshots_use_published_speed_on_unrelated_events() {
     let h = TestHarness::new().await;
     let job_id = h.submit_test_nzb("speed-cache-snapshot").await;
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    h.metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    h.shared_state.refresh_metrics_snapshot();
-    let expected_speed = h.handle.get_metrics().current_download_speed;
-    assert!(expected_speed > 0);
+    // Establish the independent ticker's baseline with the controlled clock.
+    tokio::time::advance(Duration::from_millis(250)).await;
+    tokio::task::yield_now().await;
+    h.shared_state.record_wire_bytes(256 * 1024);
+    let mut revisions = h.handle.subscribe_job_changes();
+    tokio::time::advance(Duration::from_millis(250)).await;
+    loop {
+        revisions.mark_unchanged();
+        if h.handle.get_metrics().current_download_speed > 0 {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
 
     let request = Request::new(
         "subscription { queueSnapshots { items { id state } summary { currentDownloadSpeed } } }",
@@ -180,13 +187,15 @@ async fn queue_snapshots_keep_cached_speed_on_unrelated_events() {
         first_data["queueSnapshots"]["summary"]["currentDownloadSpeed"]
             .as_u64()
             .unwrap(),
-        expected_speed
+        h.handle.get_metrics().current_download_speed
     );
 
     let pause = h
         .execute(&format!("mutation {{ pauseJob(id: {job_id}) }}"))
         .await;
     assert!(pause.errors.is_empty());
+    h.wait_for_job_status(job_id, weaver_server_core::JobStatus::Paused)
+        .await;
 
     let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
@@ -195,7 +204,7 @@ async fn queue_snapshots_keep_cached_speed_on_unrelated_events() {
         second_data["queueSnapshots"]["summary"]["currentDownloadSpeed"]
             .as_u64()
             .unwrap(),
-        expected_speed
+        h.handle.get_metrics().current_download_speed
     );
     let items = second_data["queueSnapshots"]["items"].as_array().unwrap();
     let paused_item = items
@@ -309,7 +318,7 @@ async fn latest_queue_cursor_query_returns_encoded_cursor() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn system_metrics_updates_emit_metrics_and_global_state() {
     let h = TestHarness::new().await;
 
@@ -342,11 +351,10 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         "no pool means no servers to count"
     );
 
-    h.metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    h.shared_state.refresh_metrics_snapshot();
+    h.shared_state.record_wire_bytes(256 * 1024);
+    tokio::time::advance(Duration::from_millis(250)).await;
+    h.shared_state
+        .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
 
     let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
@@ -376,7 +384,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn system_metrics_updates_share_metrics_snapshot_speed() {
     let h = TestHarness::new().await;
     let query = "subscription { systemMetricsUpdates { metrics { currentDownloadSpeed } } }";
@@ -398,11 +406,10 @@ async fn system_metrics_updates_share_metrics_snapshot_speed() {
         .expect("second stream should stay open");
     assert!(first_b.errors.is_empty());
 
-    h.metrics
-        .bytes_downloaded
-        .fetch_add(256 * 1024, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    h.shared_state.refresh_metrics_snapshot();
+    h.shared_state.record_wire_bytes(256 * 1024);
+    tokio::time::advance(Duration::from_millis(250)).await;
+    h.shared_state
+        .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
 
     async fn next_nonzero_speed<S>(stream: &mut S, label: &str) -> u64
     where

@@ -56,13 +56,22 @@ pub trait Decoder: Send + Sync + 'static {
     // opens the signature, whatever its number.
     const FIRST_PIECE: Option<u32> = None;
 
+    // Whether the decoded bytes are the input's own, at the same offsets:
+    // a span of the input nothing will bring is then that span of the
+    // member, and the run reads on past it, leaving it a gap marked damaged
+    // that a recovery set over the member rebuilds. Such a decoder is
+    // never opened: the run reads its input itself.
+    const IDENTITY: bool = false;
+
     // The bytes a run of this stream holds resident, as the stream's first
     // bytes declare them, or the format's largest while they do not say.
     fn window(first: &[u8]) -> u64;
 
     // The decoded bytes of the stream read from `input`, holding no more
-    // than `window` resident.
-    fn open(input: Front, window: u64) -> io::Result<Box<dyn Read + Send>>;
+    // than `window` resident. Nothing to do for an identity decoder.
+    fn open(input: Front, _window: u64) -> io::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(input))
+    }
 
     // The range of the volume a failed decode proves bad, when the format
     // can say: read through `input`, a fresh view of the volume.
@@ -221,7 +230,9 @@ impl<D: Decoder> Object for Stream<D> {
     // known by names alone and else the first volume's own, whether that
     // place is held or not: a piece posted again is that piece. A name is all
     // that places a piece here, so it never outvotes a front a format
-    // names: that piece is the format's, wherever its name numbers it.
+    // names: that piece is the format's, wherever its name numbers it. A
+    // stream with a name counts from its own set's first piece, so only a
+    // piece of that set is claimed.
     fn claim(
         &mut self,
         name: &str,
@@ -233,7 +244,8 @@ impl<D: Decoder> Object for Stream<D> {
         }
         let piece = split::parse(name)?;
         let first = match D::FIRST_PIECE {
-            Some(number) => piece.numbered(number),
+            Some(number) if self.name.is_empty() => piece.numbered(number),
+            Some(number) => split::parse(&self.name)?.numbered(number),
             None => split::parse(&self.name)?,
         };
         piece.index_from(&first).map(VolumeIndex)

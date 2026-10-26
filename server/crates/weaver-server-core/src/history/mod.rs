@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod attributes;
+pub(crate) mod delete_files;
 pub mod delete_queue;
 pub mod failure_kind;
 pub mod model;

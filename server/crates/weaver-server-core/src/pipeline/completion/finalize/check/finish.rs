@@ -317,7 +317,7 @@ impl Pipeline {
             crate::operations::instrumentation::StageOutcomeKind::Complete,
             u64::from(slices_repaired),
         );
-        let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+        self.emit_job_event(PipelineEvent::RepairComplete {
             job_id,
             slices_repaired,
         });
@@ -477,6 +477,20 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn fail_par2_repair(&mut self, job_id: JobId, error: String) {
+        // A run shutdown cut short is no verdict: its token fired under it,
+        // nothing is recorded, and a restart runs the pass again.
+        if self
+            .shared_state
+            .queue
+            .read(|inner| inner.globals.shutting_down)
+            && self
+                .par2_cancellations
+                .get(&job_id)
+                .is_some_and(par2_rs::CancellationToken::is_cancelled)
+        {
+            info!(job_id = job_id.0, error = %error, "PAR2 repair stopped for shutdown");
+            return;
+        }
         // Dropped unread: the artefacts stay on disk for diagnosis, and the
         // snapshot must not survive into the next attempt.
         self.par2_pre_repair_dir_entries.remove(&job_id);
@@ -488,7 +502,7 @@ impl Pipeline {
             crate::operations::instrumentation::StageOutcomeKind::Failed,
             0,
         );
-        let _ = self.event_tx.send(PipelineEvent::RepairFailed {
+        self.emit_job_event(PipelineEvent::RepairFailed {
             job_id,
             error: error.clone(),
         });

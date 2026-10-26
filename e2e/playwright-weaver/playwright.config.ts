@@ -32,11 +32,16 @@ const iterationTestTimeoutMs = Number(process.env.E2E_WEAVER_PLAYWRIGHT_TEST_TIM
 // npm scripts repeat this in --grep-invert, which replaces this setting.
 const extended = process.env.E2E_WEAVER_EXTENDED === "1";
 
+// A test's own bound is a hang detector, never a deadline: an hour is far
+// above any real run of any test here on a loaded runner, the same order as
+// the Rust suite's one-hour end. Tests set no timeout of their own.
+const testHangMs = 60 * 60 * 1000;
+
 export default defineConfig({
   testDir: "./tests",
   grepInvert: extended ? undefined : /@extended/,
   outputDir: `${runArtifactsDir}/test-results`,
-  timeout: iterationTestTimeoutMs || 5 * 60 * 1000,
+  timeout: iterationTestTimeoutMs || testHangMs,
   globalTimeout: deadlineMs > 0 ? Math.max(1, deadlineMs - Date.now()) : 0,
   expect: { timeout: 20 * 1000 },
   fullyParallel: false,

@@ -15,9 +15,7 @@ mod durable;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use weaver_graph::{ByteRange, Pull, VolumeIndex};
-
-use weaver_graph::Marks;
+use weaver_graph::{ByteRange, Marks, Pull, VolumeIndex};
 
 use super::facts::{Chunk, of_boundary, of_ordinal};
 
@@ -79,9 +77,22 @@ struct Volume {
     // In ordinal order.
     articles: Vec<Article>,
     encoded_len: u64,
+    // The post's encoded bytes of the articles no longer waited on: in hand,
+    // or lost for good. Kept by the one path that changes a state.
+    settled_bytes: u64,
     // Decoded offsets known exactly, by boundary index: boundary `k` is
     // where article `k` starts, and boundary `articles.len()` is the end.
     known: BTreeMap<usize, u64>,
+    // How many pairs of neighbouring known boundaries fall: the later
+    // offset below the earlier. None while the post's placements agree,
+    // and then every boundary's bounds rise with its index.
+    disorder: usize,
+    // The articles a deferral can still park: waiting, in the normal
+    // order. Filed on the two paths that change a state or a class.
+    parkable: BTreeSet<usize>,
+    // The articles a queueing can bring back: waiting, and parked. Filed
+    // beside `parkable`.
+    parked: BTreeSet<usize>,
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
@@ -113,7 +124,11 @@ impl Volume {
         Self {
             articles,
             encoded_len: encoded,
+            settled_bytes: 0,
             known: BTreeMap::from([(0, 0)]),
+            disorder: 0,
+            parkable: (0..sizes.len()).collect(),
+            parked: BTreeSet::new(),
             ordered_only: false,
             starts: BTreeMap::new(),
             marks: Marks::default(),
@@ -132,7 +147,15 @@ impl Volume {
         if was == state {
             return;
         }
+        if (was == State::Waiting) != (state == State::Waiting) {
+            let size = self.encoded_at(index + 1) - self.encoded_at(index);
+            self.settled_bytes = match state {
+                State::Waiting => self.settled_bytes - size,
+                _ => self.settled_bytes + size,
+            };
+        }
         self.articles[index].state = state;
+        self.file_parkable(index);
         self.marks.mark(Chunk::Articles(of_ordinal(ordinal)));
         let (from, to) = (start_of(was), start_of(state));
         if from == to {
@@ -180,18 +203,54 @@ impl Volume {
         }
         article.class = class;
         let chunk = of_ordinal(article.ordinal);
+        self.file_parkable(index);
         self.marks.mark(Chunk::Articles(chunk));
     }
 
+    fn file_parkable(&mut self, index: usize) {
+        let article = self.articles[index];
+        let waiting = article.state == State::Waiting;
+        if waiting && article.class == Class::Ordinary {
+            self.parkable.insert(index);
+        } else {
+            self.parkable.remove(&index);
+        }
+        if waiting && article.class == Class::Parked {
+            self.parked.insert(index);
+        } else {
+            self.parked.remove(&index);
+        }
+    }
+
     fn know(&mut self, boundary: usize, offset: u64) {
-        if self.known.insert(boundary, offset) != Some(offset) {
+        self.disorder -= self.falls_around(boundary);
+        let was = self.known.insert(boundary, offset);
+        self.disorder += self.falls_around(boundary);
+        if was != Some(offset) {
             self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
         }
     }
 
     fn unknow(&mut self, boundary: usize) {
-        if self.known.remove(&boundary).is_some() {
+        self.disorder -= self.falls_around(boundary);
+        let was = self.known.remove(&boundary);
+        self.disorder += self.falls_around(boundary);
+        if was.is_some() {
             self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
+        }
+    }
+
+    // The falling pairs among the known boundaries next to `boundary`'s
+    // place: the two it makes when known, the one across it when not.
+    fn falls_around(&self, boundary: usize) -> usize {
+        let below = self.known.range(..boundary).next_back().map(|(_, at)| *at);
+        let above = self.known.range(boundary + 1..).next().map(|(_, at)| *at);
+        let falls = |low: Option<u64>, high: Option<u64>| {
+            usize::from(matches!((low, high), (Some(low), Some(high)) if low > high))
+        };
+        match self.known.get(&boundary) {
+            Some(at) => falls(below, Some(*at)) + falls(Some(*at), above),
+            None => falls(below, above),
         }
     }
 
@@ -226,11 +285,47 @@ impl Volume {
         (low, high.max(low))
     }
 
+    // The covering articles a queueing can bring back. With none parked
+    // there is no run to find.
+    fn parked_covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
+        (!self.parked.is_empty())
+            .then(|| self.run(range))
+            .into_iter()
+            .flat_map(move |run| self.parked.range(run).copied())
+            .filter(move |index| self.may_carry(*index, range))
+    }
+
     // The articles whose bytes may fall in the range.
     fn covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
-        (0..self.articles.len()).filter(move |index| {
-            self.bounds(*index).0 < range.end && self.bounds(index + 1).1 > range.start
-        })
+        self.run(range)
+            .filter(move |index| self.may_carry(*index, range))
+    }
+
+    // The covering articles a deferral can still park.
+    fn parkable_covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
+        self.parkable
+            .range(self.run(range))
+            .copied()
+            .filter(move |index| self.may_carry(*index, range))
+    }
+
+    // The articles that may carry the range lie in this run. While no
+    // known boundaries fall, an article's bounds rise with its index, so
+    // they are one run, found by halving.
+    fn run(&self, range: ByteRange) -> std::ops::Range<usize> {
+        let all = self.articles.len();
+        match self.disorder {
+            0 => {
+                let start = first_of(all, |index| self.bounds(index + 1).1 > range.start);
+                let end = first_of(all, |index| self.bounds(index).0 >= range.end);
+                start..end.max(start)
+            }
+            _ => 0..all,
+        }
+    }
+
+    fn may_carry(&self, index: usize, range: ByteRange) -> bool {
+        self.bounds(index).0 < range.end && self.bounds(index + 1).1 > range.start
     }
 
     // Whether the article's bytes certainly include some of the range.
@@ -405,23 +500,6 @@ impl ArticleMap {
             .is_some_and(Volume::to_come)
     }
 
-    // The articles still waiting that the queue holds parked. One already
-    // raised keeps its class.
-    pub(crate) fn parked(&mut self, mut held: impl FnMut(VolumeIndex, u32) -> bool) {
-        for (index, found) in self.volumes.iter_mut().enumerate() {
-            let volume = VolumeIndex(index as u32);
-            for at in 0..found.articles.len() {
-                let article = found.articles[at];
-                if article.state == State::Waiting
-                    && article.class == Class::Ordinary
-                    && held(volume, article.ordinal)
-                {
-                    found.set_class(at, Class::Parked);
-                }
-            }
-        }
-    }
-
     // The ranges of lost articles that can now be marked damaged.
     pub(crate) fn take_damage(&mut self, out: &mut Vec<(VolumeIndex, ByteRange)>) {
         let mut ranges = Vec::new();
@@ -436,21 +514,27 @@ impl ArticleMap {
         }
     }
 
-    // Answer a seek, and raise the articles that carry it to `class` when
+    // Answer a seek, and move the articles that carry it to `class` when
     // one is given. A seek with no class is only answered: a bid the window
     // did not draw keeps its articles where they are. A lost article loses
     // the seek, but every article of the range that can still come is
     // raised all the same: one lost article does not leave the rest of the
     // range where the normal order would never reach it, and the lost range
     // itself reaches every object it lands in at its exact bounds as damage.
+    //
+    // `Parked` is the one class that lowers: it takes only articles still
+    // in the normal order, so one already raised keeps its class, and a
+    // later raise takes a parked one as it takes any. A deferral is never
+    // lost or unseekable to the asker: its answer is how many it parked.
     pub(crate) fn seek(
         &mut self,
         volume: VolumeIndex,
         range: ByteRange,
         class: Option<Class>,
     ) -> Pull {
+        let parks = class == Some(Class::Parked);
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
-            return Pull::Lost;
+            return if parks { Pull::Moved(0) } else { Pull::Lost };
         };
         // The clamp for open-ended seeks: a recovery object does not know how
         // long its volume is and asks to the end of the address space, so the
@@ -460,21 +544,31 @@ impl ArticleMap {
         if found.ordered_only {
             // Without positions only the front can be told apart, and it is
             // already here.
-            return if range.end <= found.front() {
+            return if parks || range.end <= found.front() {
                 Pull::Moved(0)
             } else {
                 Pull::Unseekable
             };
         }
-        let covering: Vec<usize> = found.covering(range).collect();
-        let lost = covering.iter().any(|index| {
-            matches!(found.articles[*index].state, State::Lost { .. })
-                && found.surely_in(*index, range)
-        });
+        // A deferral moves only what it can park, and is never lost.
+        let covering: Vec<usize> = if parks {
+            found.parkable_covering(range).collect()
+        } else {
+            found.covering(range).collect()
+        };
+        let lost = !parks
+            && covering.iter().any(|index| {
+                matches!(found.articles[*index].state, State::Lost { .. })
+                    && found.surely_in(*index, range)
+            });
         let mut moved = 0;
         for index in covering {
             let article = found.articles[index];
-            if let Some(class) = class.filter(|class| *class < article.class)
+            let moves = |class: &Class| match class {
+                Class::Parked => article.class == Class::Ordinary,
+                _ => *class < article.class,
+            };
+            if let Some(class) = class.filter(moves)
                 && article.state == State::Waiting
             {
                 found.set_class(index, class);
@@ -486,20 +580,26 @@ impl ArticleMap {
                 moved += 1;
             }
         }
-        if lost { Pull::Lost } else { Pull::Moved(moved) }
+        if lost && !parks {
+            Pull::Lost
+        } else {
+            Pull::Moved(moved)
+        }
     }
 
     // Queue the articles that may carry `range` without raising them: they
     // are wanted, but ahead of nothing, so queued work keeps its order and
-    // only parked work joins it. An article already raised keeps its class.
+    // only parked work joins it, which is the one move this makes. An
+    // article already raised keeps its class, and one already queued is
+    // left as it is.
     pub(crate) fn queue(&mut self, volume: VolumeIndex, range: ByteRange) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return;
         };
-        let covering: Vec<usize> = found.covering(range).collect();
-        for index in covering {
+        let parked: Vec<usize> = found.parked_covering(range).collect();
+        for index in parked {
             let article = found.articles[index];
-            if article.state == State::Waiting && article.class >= Class::Ordinary {
+            if article.state == State::Waiting && article.class > Class::Ordinary {
                 found.set_class(index, Class::Ordinary);
                 self.moves.push(Move {
                     volume,
@@ -542,6 +642,21 @@ impl ArticleMap {
         moves.dedup();
         moves
     }
+}
+
+// The first index below `len` at which `rises` holds, which then holds at
+// every index after it; `len` when it holds at none.
+fn first_of(len: usize, rises: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if rises(middle) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    low
 }
 
 fn start_of(state: State) -> Option<u64> {

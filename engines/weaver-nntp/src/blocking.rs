@@ -438,7 +438,7 @@ impl BlockingBodyLane {
             .lock()
             .expect("lane idle clock poisoned")
             .map_or(Duration::ZERO, |since| since.elapsed());
-        if idle >= Duration::from_mins(5) {
+        if idle >= self._permit.max_idle_age {
             return true;
         }
         if self.conn.transport.tcp().is_none() {

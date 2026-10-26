@@ -272,11 +272,13 @@ async fn announced(
 }
 
 #[tokio::test]
-async fn stop_closes_the_listener_and_dht_before_the_tracker_hears_stopped() -> anyhow::Result<()>
-{
+async fn stop_closes_the_listener_and_dht_before_the_tracker_hears_stopped() -> anyhow::Result<()> {
     let (_dir, factory, session, tracker) = announced("stop_swarm_first").await?;
     let listen = session.listen_addr().expect("the session listens");
-    let dht = session.get_dht().expect("the session runs a DHT").listen_addr();
+    let dht = session
+        .get_dht()
+        .expect("the session runs a DHT")
+        .listen_addr();
     assert!(!factory.dropped(listen) && !factory.dropped(dht));
 
     let tracker_side = async {

@@ -392,11 +392,15 @@ impl Root for PieceRoot {
             .iter()
             .zip(classes)
             .map(|(ask, asked)| {
-                let class = asked.map(|asked| match asked {
-                    Asked::Critical => Class::Critical,
-                    Asked::Recovery => Class::Recovery,
-                    Asked::Window(rank) => Class::Window(rank),
-                });
+                let class = match asked {
+                    // A deferral is never lost: pieces have no recovery
+                    // queue to park in, so it parks nothing.
+                    Some(Asked::Parked) => return Pull::Moved(0),
+                    Some(Asked::Critical) => Some(Class::Critical),
+                    Some(Asked::Recovery) => Some(Class::Recovery),
+                    Some(Asked::Window(rank)) => Some(Class::Window(rank)),
+                    None => None,
+                };
                 self.seek(ask.seek.volume, ask.seek.range, class)
             })
             .collect();
@@ -461,6 +465,18 @@ impl Root for PieceRoot {
             .map(|(volume, piece, _)| (volume, piece))
             .collect()
     }
+
+    fn settled_bytes(&self) -> u64 {
+        self.each()
+            .filter(|(_, _, unit)| *unit != Unit::Waiting)
+            .filter_map(|(volume, piece, _)| self.layout.span(volume, piece))
+            .map(|span| span.end - span.start)
+            .sum()
+    }
+
+    // A piece is checked against its hash as it lands; nothing is kept to
+    // check it again.
+    fn seal(&mut self, _volume: VolumeIndex) {}
 
     // A checkpoint is trusted: what it says verified is taken as read.
     // Checking every piece again is the session's recheck, when one is

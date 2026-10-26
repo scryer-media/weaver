@@ -1014,7 +1014,7 @@ impl Pipeline {
             crate::post_processing::model::QueueEvent::FileDownloaded,
             None,
         );
-        let _ = self.event_tx.send(PipelineEvent::FileComplete {
+        self.emit_job_event(PipelineEvent::FileComplete {
             file_id,
             filename,
             total_bytes,

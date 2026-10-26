@@ -8,14 +8,14 @@
 // recovery seek, and a recovery seek standing across a restart. Where the
 // engines part, the row names how.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, JOB, Outcome, Post, Scenario, Stall, finished, one_block_article, par2_set,
-    par2_volumes, payload, recovery_blocks, run, serve, try_run,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, assert_fails_leaving, finished,
+    one_block_article, par2_set, par2_volumes, payload, recovery_blocks, run, serve,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
@@ -23,7 +23,7 @@ use crate::pipeline::Pipeline;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::{multi_member_store_set, obfuscate_volumes};
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues,
+    insert_active_job_on, new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues,
     retire_pipeline_database,
 };
 
@@ -86,6 +86,17 @@ fn find(haystack: &[u8], needle: &[u8]) -> usize {
 // Every member delivered at its name with its bytes, and no article asked
 // for twice.
 fn assert_members(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
+    assert_members_delivered(outcome, members);
+    assert_eq!(
+        outcome.refetched(),
+        Vec::new(),
+        "{}: refetched",
+        outcome.engine
+    );
+}
+
+// Every member delivered at its name with its bytes, and nothing else.
+fn assert_members_delivered(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
     assert!(
         outcome.completed(),
         "{}: {:?} {:?}",
@@ -110,26 +121,6 @@ fn assert_members(outcome: &Outcome, members: &[(String, Vec<u8>)]) {
             "{}: {name} bytes",
             outcome.engine
         );
-    }
-    assert_eq!(
-        outcome.refetched(),
-        Vec::new(),
-        "{}: refetched",
-        outcome.engine
-    );
-}
-
-// A run that sat at `status` with nothing left to do.
-fn assert_stalled(result: Result<Outcome, Stall>, engine: Engine, status: JobStatus) {
-    match result {
-        Err(stall) => {
-            assert_eq!(stall.engine, engine);
-            assert_eq!(stall.status, Some(status), "{engine}: {}", stall.state);
-        }
-        Ok(outcome) => panic!(
-            "{engine} finished {:?} {:?}, expected a stall at {status:?}",
-            outcome.status, outcome.failure
-        ),
     }
 }
 
@@ -180,8 +171,10 @@ fn last(outcome: &Outcome, file: u32) -> usize {
 }
 
 // Row 1. A store posted out of volume order, reversed and shuffled, a plain
-// file between its volumes: the store's bids bring each next volume forward
-// as far as the window lets them, and both engines ask in one order.
+// file between its volumes. The graph's root samples every member's head
+// first, in posted order, and the store's bids bring its volumes ahead of
+// the plain file's payload. Both engines deliver every member, asking for
+// nothing twice.
 async fn out_of_order(order: &[usize]) {
     let members = members(4, 11);
     let volumes = store_set(&members, 12);
@@ -198,16 +191,32 @@ async fn out_of_order(order: &[usize]) {
     all.push(("ember.bin".to_string(), plain));
     assert_members(&classic, &all);
     assert_members(&graph, &all);
-    assert_eq!(graph.order, classic.order, "one order of asks");
+    for outcome in [&classic, &graph] {
+        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
+    }
+    let heads: Vec<(u32, u32)> = (0..posted(order)).map(|file| (file, 0)).collect();
+    assert_eq!(graph.order[..heads.len()], heads, "the heads lead");
+    let plain = graph.order.iter().position(|article| *article == (6, 1));
+    let plain = plain.expect("the plain file's payload is asked for");
+    assert!(
+        graph.order[plain..].iter().all(|(file, _)| *file == 6),
+        "the store's volumes come ahead of the plain payload: {:?}",
+        graph.order
+    );
+}
+
+// The posts of an `out_of_order` row: its volumes and the plain file.
+fn posted(order: &[usize]) -> u32 {
+    order.len() as u32 + 1
 }
 
 #[tokio::test]
-async fn a_store_posted_in_reverse_is_asked_for_in_one_order_by_both_engines() {
+async fn a_store_posted_in_reverse_is_fetched_heads_first_and_delivered_by_both_engines() {
     out_of_order(&(0..12).rev().collect::<Vec<_>>()).await;
 }
 
 #[tokio::test]
-async fn a_store_posted_shuffled_is_asked_for_in_one_order_by_both_engines() {
+async fn a_store_posted_shuffled_is_fetched_heads_first_and_delivered_by_both_engines() {
     out_of_order(&[5, 0, 9, 3, 11, 1, 7, 10, 2, 8, 4, 6]).await;
 }
 
@@ -268,9 +277,9 @@ async fn two_stores_share_the_window_volume_by_volume() {
 // Row 3. A damaged article in the second volume: the PAR2 object's recovery
 // seek is promoted over every store bid, so the recovery volume that holds
 // enough blocks comes whole before the store's remaining volumes, and the
-// others are only sampled. Classic leaves the job at Downloading: it holds
-// the store's damage for an unpack that a store fed in order never asks
-// for, where the graph repairs as soon as the blocks are in.
+// others are only sampled. Classic repairs from PAR2 once the download is
+// in and delivers every member, asking for some articles twice; the graph
+// repairs as soon as the blocks are in.
 #[tokio::test]
 async fn a_recovery_seek_is_promoted_over_every_store_bid() {
     let members = members(3, 61);
@@ -295,17 +304,13 @@ async fn a_recovery_seek_is_promoted_over_every_store_bid() {
         last(&graph, 7) < last(&graph, 5),
         "the recovery volume comes whole before the store's last volume"
     );
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Downloading,
-    );
+    assert_members_delivered(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 4a. A recovery article lost in the first recovery volume: the seek is
 // lost there, but the blocks beyond the lost article still come, and the
-// next volume makes up the shortfall. Classic stalls at Downloading, as in
-// row 3.
+// next volume makes up the shortfall. Classic repairs and delivers every
+// member, as in row 3.
 #[tokio::test]
 async fn a_lost_recovery_article_is_made_up_from_the_next_volume() {
     let members = members(3, 71);
@@ -321,18 +326,13 @@ async fn a_lost_recovery_article_is_made_up_from_the_next_volume() {
         vec![Some(RepairOutcome::Repaired { slices: 1 })]
     );
     assert_eq!(graph.graph().blocks_reachable, 2);
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Downloading,
-    );
+    assert_members_delivered(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 4b. The only recovery block lost: nothing can make it up, so the
 // graph rules the repair impossible at once and asks for nothing again.
-// Classic leaves the job at Downloading: its RAR set never takes in the
-// damaged second volume, holding it for a repair that cannot come, where
-// the graph delivers what the repair did not need.
+// Classic fails the whole job as Repair with nothing delivered, where the
+// graph delivers what the repair did not need.
 #[tokio::test]
 async fn a_lost_recovery_article_nothing_makes_up_fails_the_repair() {
     let members = members(3, 81);
@@ -359,15 +359,17 @@ async fn a_lost_recovery_article_nothing_makes_up_fails_the_repair() {
             reachable: 0
         })]
     );
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Downloading,
+    assert_fails_leaving(
+        &run(&scenario, Engine::Classic).await,
+        HistoryFailureKind::Repair,
+        "PAR2 recovery failed for 1 set(s): silver.horizon.par2",
+        &[],
     );
 }
 
 // Row 4c. A recovery article lost in the one volume that holds the blocks:
 // the block it carried is gone, and the volume's next block repairs.
+// Classic repairs too and delivers every member.
 #[tokio::test]
 async fn a_lost_recovery_article_is_made_up_from_the_same_volume() {
     let members = members(3, 75);
@@ -382,8 +384,7 @@ async fn a_lost_recovery_article_is_made_up_from_the_same_volume() {
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 1 })]
     );
-    let classic = try_run(&scenario, Engine::Classic).await;
-    assert_stalled(classic, Engine::Classic, JobStatus::Downloading);
+    assert_members_delivered(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 5. A data article lost with no recovery: the loss reaches the store
@@ -434,8 +435,8 @@ async fn a_lost_data_article_without_recovery_delivers_the_volumes_as_posted() {
 
 // Row 6a. A store posted inside an xz stream: the stream cannot seek, so
 // every bid is answered Unseekable and the store reads in stream order.
-// Classic leaves the job at Extracting: it has no reader for a store inside
-// a stream.
+// Classic decodes the stream, extracts the volume, and delivers every
+// member with no article asked for twice.
 #[tokio::test]
 async fn a_store_read_out_of_a_stream_reads_in_stream_order() {
     let members = members(3, 101);
@@ -443,11 +444,7 @@ async fn a_store_read_out_of_a_stream_reads_in_stream_order() {
     let scenario = Scenario::new(vec![Post::plain("silver.horizon.rar.xz", xz(&volume.1))]);
     let graph = run(&scenario, Engine::Graph).await;
     assert_members(&graph, &members);
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Extracting,
-    );
+    assert_members(&run(&scenario, Engine::Classic).await, &members);
 }
 
 // Row 6b. A PAR2 set stored beside a damaged member in one RAR volume: the
@@ -503,17 +500,23 @@ async fn a_par2_set_in_a_plain_store_repairs_the_member_beside_it() {
 
 // The same volume inside an xz stream: the store reads it as the stream
 // decodes it, and the set repairs exactly as in the plain twin. Classic
-// leaves the job at Extracting, as in row 6a.
+// decodes the stream and extracts the volume as in the plain twin: ember.bin
+// as stored, damaged, beside the two PAR2 files, and completes.
 #[tokio::test]
 async fn a_par2_set_in_a_store_in_a_stream_repairs_the_member_beside_it() {
-    let (scenario, body, _) =
+    let (scenario, body, bad) =
         par2_in_a_store(|bytes| Post::plain("silver.horizon.rar.xz", xz(&bytes))).await;
     let graph = run(&scenario, Engine::Graph).await;
     assert_repaired_in_store(&graph, &body, 11);
-    assert_stalled(
-        try_run(&scenario, Engine::Classic).await,
-        Engine::Classic,
-        JobStatus::Extracting,
+    let classic = run(&scenario, Engine::Classic).await;
+    assert!(classic.completed(), "{:?}", classic.failure);
+    assert_eq!(
+        classic.files.keys().cloned().collect::<Vec<_>>(),
+        ["ember.bin", "ember.par2", "ember.vol0+2.par2"].map(|name| format!("{FOLDER}/{name}"))
+    );
+    assert!(
+        classic.files[&format!("{FOLDER}/ember.bin")] == bad,
+        "classic: ember.bin as stored"
     );
 }
 
@@ -616,18 +619,13 @@ async fn an_open_ended_recovery_seek_fetches_the_volume_after_the_damage() {
 }
 
 // Row 10. A graph run restarted once, the moment the recovery seek was
-// answered: the restored objects restate their wants, and the run finishes
-// in the order the whole run took, asking for nothing twice.
+// answered: the pipeline drains, so the volume heads it held go to scratch
+// and are read back; the restored objects restate their wants, and the run
+// finishes in the order the whole run took, asking for nothing twice.
 #[tokio::test]
 async fn a_recovery_seek_stands_across_a_restart() {
-    let members = members(3, 151);
-    let volumes = store_set(&members, 4);
-    let mut posts = posts(&volumes);
-    posts.extend(par2_set("silver.horizon", &named(&volumes), 2));
-    let scenario = Scenario::new(posts).damaged(1, 2);
-    let whole = run(&scenario, Engine::Graph).await;
-    assert_members(&whole, &members);
-    let (status, order, requests) = run_restarting_once(&scenario).await;
+    let (scenario, whole) = recovery_seek().await;
+    let (status, order, requests) = run_restarting_once(&scenario, recovering, Stop::Drained).await;
     assert_eq!(status, Some(JobStatus::Complete));
     assert_eq!(order, whole.order, "the restarted run's order");
     assert!(
@@ -636,10 +634,97 @@ async fn a_recovery_seek_stands_across_a_restart() {
     );
 }
 
-// A graph run restarted once, the moment the recovery seek was answered:
-// recovery work sits queued and none of it was handed out yet.
+// Row 10 with the pipeline dropped instead of drained: the volume heads held
+// in RAM are lost with it and fetched again, and nothing that had a place on
+// disk is.
+#[tokio::test]
+async fn a_recovery_seek_across_a_crash_fetches_only_the_held_heads_again() {
+    let (scenario, whole) = recovery_seek().await;
+    let (status, _, requests) = run_restarting_once(&scenario, recovering, Stop::Crashed).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    let twice: Vec<(u32, u32)> = requests
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(article, _)| *article)
+        .collect();
+    assert!(!twice.is_empty(), "a crash loses the held heads");
+    assert!(
+        twice.iter().all(|(_, ordinal)| *ordinal == 0),
+        "only volume heads are fetched again: {twice:?}"
+    );
+    assert!(
+        requests.values().all(|count| *count <= 2),
+        "nothing is fetched more than once again: {requests:?}"
+    );
+    assert_eq!(
+        requests.keys().copied().collect::<BTreeSet<_>>(),
+        whole.order.iter().copied().collect::<BTreeSet<_>>(),
+        "the crashed run fetches what the whole run fetched"
+    );
+}
+
+// The store and set of row 10, and the run of it with no restart.
+async fn recovery_seek() -> (Scenario, Outcome) {
+    let members = members(3, 151);
+    let volumes = store_set(&members, 4);
+    let mut posts = posts(&volumes);
+    posts.extend(par2_set("silver.horizon", &named(&volumes), 2));
+    let scenario = Scenario::new(posts).damaged(1, 2);
+    let whole = run(&scenario, Engine::Graph).await;
+    assert_members(&whole, &members);
+    (scenario, whole)
+}
+
+fn recovering(pipeline: &Pipeline) -> bool {
+    pipeline
+        .jobs
+        .get(&JOB)
+        .is_some_and(|state| state.download_queue.has_recovery_work())
+}
+
+// How a restart takes the pipeline down: drained, as a graceful stop does,
+// or dropped where it stands, as a crash does.
+#[derive(Clone, Copy)]
+enum Stop {
+    Drained,
+    Crashed,
+}
+
+// A file the set describes and no post carries is a root member the root
+// announced itself, past the post's files. A run restarted once that member
+// is in the checkpoint restores it beside the posted ones and rebuilds it.
+#[tokio::test]
+async fn a_root_member_the_set_announced_restores_across_a_restart() {
+    let lantern = payload(4 * ARTICLE, 75);
+    let quill = payload(3 * ARTICLE - 3, 76);
+    let mut posts = vec![Post::plain("lantern.bin", lantern.clone())];
+    posts.extend(par2_set(
+        "lantern",
+        &[
+            ("lantern.bin", lantern.as_slice()),
+            ("quill.bin", quill.as_slice()),
+        ],
+        4,
+    ));
+    let posted = posts.len() as u32;
+    let scenario = Scenario::new(posts);
+    let announced = |pipeline: &Pipeline| {
+        pipeline.graph_jobs.get(&JOB).is_some_and(|job| {
+            job.tree()
+                .namespace(weaver_graph::NodeId::ROOT)
+                .is_some_and(|root| root.records().any(|member| member.id.0 >= posted))
+        })
+    };
+    let (status, _, _) = run_restarting_once(&scenario, announced, Stop::Drained).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+}
+
+// A graph run restarted once, after the first article that leaves `due`
+// true.
 async fn run_restarting_once(
     scenario: &Scenario,
+    due: impl Fn(&Pipeline) -> bool,
+    stop: Stop,
 ) -> (
     Option<JobStatus>,
     Vec<(u32, u32)>,
@@ -647,8 +732,9 @@ async fn run_restarting_once(
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
-    stamp_graph(&pipeline.db);
+    // Admitted as the whole run's job is: its queues built as admission
+    // builds a graph job's.
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     pipeline.admit_graph_job(JOB, Engine::Graph);
     let mut order = Vec::new();
     let mut requests = BTreeMap::new();
@@ -666,13 +752,9 @@ async fn run_restarting_once(
             *requests.entry(article).or_insert(0usize) += 1;
             order.push(article);
             serve(&mut pipeline, scenario, article).await;
-            let promoted = pipeline
-                .jobs
-                .get(&JOB)
-                .is_some_and(|state| state.download_queue.has_recovery_work());
-            if !restarted && promoted {
+            if !restarted && due(&pipeline) {
                 restarted = true;
-                pipeline = restart(&temp_dir, pipeline, scenario).await;
+                pipeline = restart(&temp_dir, pipeline, scenario, stop).await;
             }
         }
         if finished(&pipeline) {
@@ -717,14 +799,19 @@ fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
     }
 }
 
-// The pipeline goes down and a new one restores the job from what reached
-// the database, as `restart.rs` does after every article.
+// The pipeline goes down as `stop` says and a new one restores the job from
+// what reached the database, as `restart.rs` does after every article.
 async fn restart(
     temp_dir: &tempfile::TempDir,
-    pipeline: Pipeline,
+    mut pipeline: Pipeline,
     scenario: &Scenario,
+    stop: Stop,
 ) -> Pipeline {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    match stop {
+        Stop::Drained => pipeline.drain().await,
+        Stop::Crashed => {}
+    }
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;
     drop(db);
@@ -754,23 +841,4 @@ async fn restart(
         .unwrap();
     assert!(pipeline.graph_jobs.contains_key(&JOB), "the job restored");
     pipeline
-}
-
-// The row stamped graph as an admission stamps it.
-fn stamp_graph(db: &crate::Database) {
-    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-    let datastore = db.datastore();
-    db.run_sql_blocking(async move {
-        SqlRuntime::execute(
-            datastore.read_exec(),
-            "UPDATE active_jobs SET engine = {} WHERE job_id = {}",
-            &[
-                SqlArg::Text(Engine::Graph.as_str().to_string()),
-                SqlArg::I64(JOB.0 as i64),
-            ],
-        )
-        .await?;
-        Ok(())
-    })
-    .unwrap();
 }

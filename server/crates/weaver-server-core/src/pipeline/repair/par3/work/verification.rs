@@ -95,7 +95,7 @@ impl Pipeline {
                 .job_lifecycle
                 .note_stage_duration(JobStageKind::Verify, receipt.elapsed);
         }
-        let _ = self.event_tx.send(
+        self.emit_job_event(
             crate::events::model::PipelineEvent::Par3VerificationComplete {
                 job_id,
                 passed: receipt.stamp.outcome == VerificationOutcomeKind::Intact,

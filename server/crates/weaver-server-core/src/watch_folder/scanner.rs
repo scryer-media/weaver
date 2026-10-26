@@ -1360,10 +1360,9 @@ mod tests {
                 Arc::new(SystemClock),
             );
             torrents.open().await.unwrap();
-            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(16);
             let (event_tx, _) = tokio::sync::broadcast::channel(16);
             let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-            let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
+            let handle = SchedulerHandle::new(event_tx, state);
             let config = Arc::new(tokio::sync::RwLock::new(Config {
                 seeding: None,
                 torrent: Default::default(),
@@ -1378,6 +1377,7 @@ mod tests {
                 bandwidth: Default::default(),
                 cleanup_after_extract: None,
                 propagation_delay_secs: None,
+                max_concurrent_nzbs: None,
                 watch_folder: WatchFolderConfig::default(),
                 duplicate_policy: Default::default(),
                 direct_store: None,

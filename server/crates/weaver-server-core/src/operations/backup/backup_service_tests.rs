@@ -4,20 +4,27 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc as StdArc, Mutex as StdMutex};
+use std::sync::Arc as StdArc;
 
 use crate::JobHistoryRow;
 use crate::categories::CategoryConfig;
 use crate::operations::backup::manifest::BackupInstanceSecrets;
 use crate::persistence::sql_runtime::StoreDatastore;
 use crate::settings::Config;
-use crate::{PipelineMetrics, SchedulerCommand, SharedPipelineState};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use crate::{PipelineMetrics, SharedPipelineState};
+use tokio::sync::{RwLock, broadcast};
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct RuntimeCapture {
-    updated_paths: StdArc<StdMutex<Option<(PathBuf, PathBuf, PathBuf)>>>,
-    speed_limits: StdArc<StdMutex<Vec<crate::proxies::Bandwidth>>>,
+    state: SharedPipelineState,
+}
+
+impl Default for RuntimeCapture {
+    fn default() -> Self {
+        Self {
+            state: SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+        }
+    }
 }
 
 fn open_temp_db() -> Database {
@@ -105,52 +112,8 @@ fn build_service(
 }
 
 fn test_scheduler_handle(capture: RuntimeCapture) -> SchedulerHandle {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
-    let (event_tx, _) = broadcast::channel(16);
-    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-    let task_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(command) = cmd_rx.recv().await {
-            match command {
-                SchedulerCommand::SetBandwidth {
-                    bandwidth, reply, ..
-                } => {
-                    capture.speed_limits.lock().unwrap().push(bandwidth);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::RebuildNntp { reply, .. } => {
-                    let _ = reply.send(Ok(crate::NntpRuntimeActivation {
-                        generation: 1,
-                        configured_connections: 0,
-                    }));
-                }
-                SchedulerCommand::UpdateRuntimePaths {
-                    data_dir,
-                    intermediate_dir,
-                    complete_dir,
-                    reply,
-                } => {
-                    *capture.updated_paths.lock().unwrap() =
-                        Some((data_dir, intermediate_dir, complete_dir));
-                    let _ = reply.send(Ok(()));
-                }
-                SchedulerCommand::Pause { hold, reply } => {
-                    task_state.hold(hold);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::Resume {
-                    origin,
-                    owner,
-                    reply,
-                } => {
-                    task_state.release(origin, owner);
-                    let _ = reply.send(());
-                }
-                _ => {}
-            }
-        }
-    });
-    SchedulerHandle::new(cmd_tx, event_tx, state)
+    let (events, _) = broadcast::channel(16);
+    SchedulerHandle::new(events, capture.state)
 }
 
 fn sample_server(id: u32) -> crate::servers::ServerConfig {
@@ -212,6 +175,7 @@ fn sample_config() -> Config {
             split: None,
         },
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -1237,6 +1201,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             retry: None,
             bandwidth: Default::default(),
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
@@ -1263,6 +1228,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             retry: None,
             bandwidth: Default::default(),
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
@@ -1440,8 +1406,13 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
         target_db.load_config().unwrap().data_dir,
         target_root.path().to_string_lossy()
     );
-    assert!(capture.updated_paths.lock().unwrap().is_none());
-    assert!(capture.speed_limits.lock().unwrap().is_empty());
+    assert!(
+        capture
+            .state
+            .queue
+            .read(|inner| inner.globals.runtime_paths.is_none())
+    );
+    assert_eq!(capture.state.queue.revision(), 0);
     assert_eq!(target_policy.snapshot(7).unwrap().lifetime_bytes, 50_000);
 
     let (restored_target_db, outcome) =

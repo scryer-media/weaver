@@ -8,6 +8,8 @@ use crate::test_support::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+mod strict_priority;
+
 struct ScriptStep {
     expect_prefix: Option<&'static str>,
     response: &'static [u8],
@@ -1070,7 +1072,7 @@ async fn blocking_capacity_holdoff_never_cools_healthy_server() {
 #[test]
 fn blocking_lane_preserves_provider_capacity_rejection() {
     let error = NntpError::from_status(crate::types::StatusCode::new(502), "Too many connections");
-    let error = BlockingBodyLaneAcquireError::from_connect_error(error);
+    let error = BlockingBodyLaneAcquireError::from_connect_error(ServerId(0), error);
 
     assert!(
         matches!(
@@ -1215,6 +1217,7 @@ fn multi_server_client(server_count: usize) -> NntpClient {
 
     NntpClient {
         pool: Arc::new(pool),
+        work_guard: None,
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     }
@@ -2246,7 +2249,7 @@ async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
 }
 
 #[tokio::test]
-async fn remote_trickle_consumes_active_budget_and_fails_over() {
+async fn remote_trickle_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
     let primary_port = spawn_trickling_body_server(Duration::from_millis(20)).await;
     let mut backup_response =
         b"222 1 <trickle@example.com>\r\n=ybegin line=128 size=128 name=x\r\n".to_vec();
@@ -2282,9 +2285,11 @@ async fn remote_trickle_consumes_active_budget_and_fails_over() {
     let trace = client
         .fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[])
         .await;
-    let decoded = trace.result.expect("backup should satisfy the BODY fetch");
-    assert_eq!(decoded.decoded.concat(), vec![b'A'; 128]);
-    assert_eq!(trace.attempts.len(), 2);
+    assert!(matches!(
+        trace.result,
+        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
+    ));
+    assert_eq!(trace.attempts.len(), 1);
     assert_eq!(
         trace.attempts[0].outcome,
         FetchAttemptOutcome::TransientFailure
@@ -2295,7 +2300,6 @@ async fn remote_trickle_consumes_active_budget_and_fails_over() {
             .as_deref()
             .is_some_and(|error| error.contains("soft timeout"))
     );
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
     let health = client.pool.health().lock().await;
     let primary = health.server(0);
     assert!(matches!(
@@ -2307,7 +2311,7 @@ async fn remote_trickle_consumes_active_budget_and_fails_over() {
 }
 
 #[tokio::test]
-async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
+async fn delayed_body_initial_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
     let primary_port = spawn_delayed_body_initial_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
@@ -2338,19 +2342,21 @@ async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
         .fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[])
         .await;
 
-    assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
-    assert_eq!(trace.attempts.len(), 2);
+    assert!(matches!(
+        trace.result,
+        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
+    ));
+    assert_eq!(trace.attempts.len(), 1);
     assert!(
         trace.attempts[0]
             .error
             .as_deref()
             .is_some_and(|error| error.contains("soft timeout"))
     );
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
 }
 
 #[tokio::test]
-async fn delayed_reauth_consumes_active_budget_and_fails_over() {
+async fn delayed_reauth_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
     let primary_port = spawn_delayed_reauth_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
@@ -2381,15 +2387,17 @@ async fn delayed_reauth_consumes_active_budget_and_fails_over() {
         .fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[])
         .await;
 
-    assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
-    assert_eq!(trace.attempts.len(), 2);
+    assert!(matches!(
+        trace.result,
+        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
+    ));
+    assert_eq!(trace.attempts.len(), 1);
     assert!(
         trace.attempts[0]
             .error
             .as_deref()
             .is_some_and(|error| error.contains("soft timeout"))
     );
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
 }
 
 #[tokio::test]
@@ -2441,8 +2449,8 @@ async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
         )
         .await;
 
-    assert_eq!(trace.result.unwrap().as_ref(), b"backup\r\n");
-    assert_eq!(trace.attempts.len(), 2);
+    assert!(matches!(trace.result, Err(NntpError::SoftTimeout(_))));
+    assert_eq!(trace.attempts.len(), 1);
     assert!(
         trace.attempts[0]
             .error
@@ -2829,6 +2837,7 @@ async fn build_server_order_keeps_backfill_after_primary_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
+        work_guard: None,
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };
@@ -2866,6 +2875,7 @@ async fn build_server_order_prefers_ready_servers_within_same_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
+        work_guard: None,
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };

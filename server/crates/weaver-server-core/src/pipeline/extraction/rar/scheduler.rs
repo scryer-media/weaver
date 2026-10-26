@@ -404,14 +404,12 @@ impl Pipeline {
                 Some(volume_index) => {
                     let previous = self.rar_waiting_members.insert(key.clone(), volume_index);
                     if previous != Some(volume_index) {
-                        let _ = self
-                            .event_tx
-                            .send(PipelineEvent::ExtractionMemberWaitingStarted {
-                                job_id,
-                                set_name: set_name.to_string(),
-                                member: member.clone(),
-                                volume_index,
-                            });
+                        self.emit_job_event(PipelineEvent::ExtractionMemberWaitingStarted {
+                            job_id,
+                            set_name: set_name.to_string(),
+                            member: member.clone(),
+                            volume_index,
+                        });
                     }
                 }
                 None => {
@@ -724,14 +722,12 @@ impl Pipeline {
                     set_name.clone(),
                     member_name.clone(),
                 )) {
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::ExtractionMemberWaitingFinished {
-                            job_id,
-                            set_name: set_name.clone(),
-                            member: member_name.clone(),
-                            volume_index,
-                        });
+                    self.emit_job_event(PipelineEvent::ExtractionMemberWaitingFinished {
+                        job_id,
+                        set_name: set_name.clone(),
+                        member: member_name.clone(),
+                        volume_index,
+                    });
                 }
                 scheduled_slots += 1;
 
@@ -1422,7 +1418,7 @@ impl Pipeline {
                             self.metrics.job_lifecycle.note_extraction(
                                 crate::operations::instrumentation::StageOutcomeKind::Failed,
                             );
-                            let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
+                            self.emit_job_event(PipelineEvent::ExtractionFailed {
                                 job_id,
                                 error: error.message().to_string(),
                             });
@@ -1797,7 +1793,7 @@ impl Pipeline {
                     self.metrics.job_lifecycle.note_extraction(
                         crate::operations::instrumentation::StageOutcomeKind::Failed,
                     );
-                    let _ = self.event_tx.send(PipelineEvent::ExtractionFailed {
+                    self.emit_job_event(PipelineEvent::ExtractionFailed {
                         job_id,
                         error: e.message().to_string(),
                     });

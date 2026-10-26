@@ -784,26 +784,46 @@ impl Database {
         state: AsyncOperationTargetState,
         error_message: Option<&str>,
     ) -> Result<(), StateError> {
+        self.mark_history_delete_targets_state(operation_id, &[target_id], state, error_message)
+    }
+
+    // Moves every listed target of one operation to `state` with one
+    // `UPDATE ... IN (...)` per bind-sized chunk.
+    pub fn mark_history_delete_targets_state(
+        &self,
+        operation_id: u64,
+        target_ids: &[u64],
+        state: AsyncOperationTargetState,
+        error_message: Option<&str>,
+    ) -> Result<(), StateError> {
+        let target_ids = dedupe_ids(target_ids);
+        if target_ids.is_empty() {
+            return Ok(());
+        }
         let datastore = self.datastore();
         let error_message = error_message.map(str::to_string);
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
-                "UPDATE async_operation_targets
-                 SET state = {},
-                     error_message = {}
-                 WHERE operation_id = {}
-                   AND target_kind = {}
-                   AND target_id = {}",
-                &[
+            // Four fixed binds: state, error_message, operation_id, target_kind.
+            let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 4);
+            for chunk in target_ids.chunks(chunk_size) {
+                let sql = format!(
+                    "UPDATE async_operation_targets
+                     SET state = {{}},
+                         error_message = {{}}
+                     WHERE operation_id = {{}}
+                       AND target_kind = {{}}
+                       AND target_id IN ({})",
+                    placeholders(chunk.len())
+                );
+                let mut args = vec![
                     SqlArg::Text(state.as_str().to_string()),
-                    SqlArg::OptText(error_message),
+                    SqlArg::OptText(error_message.clone()),
                     SqlArg::I64(operation_id as i64),
                     SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
-                    SqlArg::I64(target_id as i64),
-                ],
-            )
-            .await?;
+                ];
+                args.extend(id_args(chunk));
+                SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+            }
             Ok(())
         })
     }

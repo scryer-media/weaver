@@ -4,10 +4,10 @@
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Result, SimpleObject};
 use weaver_server_core::auth::CallerScope;
 use weaver_server_core::proxies::{TorrentRouteFault, TorrentScope};
+use weaver_server_core::torrents::net::Exposure;
 use weaver_server_core::torrents::service::{
     ScheduleSeeding, SeedingSource, TorrentRoute, TorrentView,
 };
-use weaver_server_core::torrents::net::Exposure;
 use weaver_server_core::torrents::sessions::TorrentRouteReason;
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_server_core::torrents::{

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::RwLock;
 
 use super::fixture::{
     FixtureArticle, HttpFixture, NntpFixture, SilentFixture, librespeed_list, loopback_tls, nzb,
@@ -14,7 +14,7 @@ use super::*;
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 use crate::proxies::{Consumer, Failover, LegPath, ProxyRuntime, Route, RouteLeg};
 use crate::settings::Config;
-use crate::{Database, PipelineMetrics, SchedulerCommand, SchedulerHandle, SharedPipelineState};
+use crate::{Database, PipelineMetrics, SchedulerHandle, SharedPipelineState};
 
 struct Rig {
     service: SpeedTestService,
@@ -50,6 +50,7 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
         retry: None,
         bandwidth: Default::default(),
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -59,31 +60,10 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
         metrics: Default::default(),
         config_path: None,
     }));
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let (event_tx, _) = tokio::sync::broadcast::channel(8);
     let metrics = PipelineMetrics::new();
     let state = SharedPipelineState::new(metrics.clone(), vec![]);
-    let scheduler_state = state.clone();
-    tokio::spawn(async move {
-        while let Some(command) = cmd_rx.recv().await {
-            match command {
-                SchedulerCommand::Pause { hold, reply } => {
-                    scheduler_state.hold(hold);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::Resume {
-                    origin,
-                    owner,
-                    reply,
-                } => {
-                    scheduler_state.release(origin, owner);
-                    let _ = reply.send(());
-                }
-                _ => {}
-            }
-        }
-    });
-    let handle = SchedulerHandle::new(cmd_tx, event_tx, state);
+    let handle = SchedulerHandle::new(event_tx, state);
     let loopback = db
         .create_egress_interface(&crate::proxies::EgressInterface {
             name: "loopback".into(),
@@ -1486,7 +1466,10 @@ async fn a_torrent_run_needs_a_torrent_route_and_torrents_on() {
         SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentNeedsTorrentRoute)
     );
     assert_eq!(
-        rig.service.start(torrent_request(rig.loopback)).await.unwrap_err(),
+        rig.service
+            .start(torrent_request(rig.loopback))
+            .await
+            .unwrap_err(),
         SpeedTestError::Refused(crate::proxies::NetworkRefusal::SpeedTestTorrentsOff)
     );
     rig.config.write().await.torrent.enabled = true;
@@ -1521,7 +1504,11 @@ async fn a_torrent_run_pulls_from_the_swarm_and_serves_what_it_held() {
     let rig = torrent_rig(&fixture).await;
     rig.service
         .peer_upload_budget_for_tests(u64::from(PIECE_LEN));
-    let started = rig.service.start(torrent_request(rig.loopback)).await.unwrap();
+    let started = rig
+        .service
+        .start(torrent_request(rig.loopback))
+        .await
+        .unwrap();
     assert_eq!(started.kind, SpeedTestKindLabel::Torrent);
     assert_eq!(
         started
@@ -1571,7 +1558,11 @@ async fn a_torrent_run_whose_tracker_fails_says_so() {
         ..Answer::default()
     });
     let rig = torrent_rig(&fixture).await;
-    let started = rig.service.start(torrent_request(rig.loopback)).await.unwrap();
+    let started = rig
+        .service
+        .start(torrent_request(rig.loopback))
+        .await
+        .unwrap();
     let run = finished(&rig, started.id).await;
 
     assert_eq!(run.status, SpeedTestStatus::Failed);
@@ -1595,7 +1586,11 @@ async fn a_torrent_run_without_leechers_has_no_demand() {
         ..Answer::default()
     });
     let rig = torrent_rig(&fixture).await;
-    let started = rig.service.start(torrent_request(rig.loopback)).await.unwrap();
+    let started = rig
+        .service
+        .start(torrent_request(rig.loopback))
+        .await
+        .unwrap();
     let run = finished(&rig, started.id).await;
 
     assert_eq!(run.status, SpeedTestStatus::Completed, "{:?}", run.error);

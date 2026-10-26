@@ -1207,7 +1207,8 @@ impl TrackerStatus {
         ignore_min_interval: bool,
     ) -> bool {
         // A tracker is its URL, whoever named it.
-        let tracker = match tracker.map(|url| SupportedTracker::new(Tracker::torrent(url.clone()))) {
+        let tracker = match tracker.map(|url| SupportedTracker::new(Tracker::torrent(url.clone())))
+        {
             Some(None) => return false,
             Some(Some(t)) => Some(t),
             None => None,
@@ -2186,12 +2187,18 @@ mod tests {
     #[test]
     fn a_tracker_shows_only_its_scheme_host_and_port() {
         let url = Url::parse(PRIVATE).unwrap();
-        let shown = format!("{:?}", SupportedTracker::new(Tracker::operator(url.clone())).unwrap());
+        let shown = format!(
+            "{:?}",
+            SupportedTracker::new(Tracker::operator(url.clone())).unwrap()
+        );
         assert_eq!(shown, "https://tracker.example:8443/…");
         assert!(!leaks(&shown, &url), "{shown}");
         let udp = Url::parse("udp://tracker.example:6969/0123passkey/announce").unwrap();
         assert_eq!(
-            format!("{:?}", SupportedTracker::new(Tracker::operator(udp)).unwrap()),
+            format!(
+                "{:?}",
+                SupportedTracker::new(Tracker::operator(udp)).unwrap()
+            ),
             "udp://tracker.example:6969/…"
         );
         assert_eq!(
@@ -3457,7 +3464,9 @@ mod tests {
         let peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
-            op(vec![vec![Url::parse("http://tracker.invalid/announce").unwrap()]]),
+            op(vec![vec![
+                Url::parse("http://tracker.invalid/announce").unwrap(),
+            ]]),
             Box::new(()),
             None,
             tokio::sync::watch::channel(Some(6881)).1,
@@ -4214,10 +4223,7 @@ mod tests {
     impl Wired {
         fn new(at: &Url) -> Arc<Self> {
             Arc::new(Self {
-                at: SocketAddr::new(
-                    at.host_str().unwrap().parse().unwrap(),
-                    at.port().unwrap(),
-                ),
+                at: SocketAddr::new(at.host_str().unwrap().parse().unwrap(), at.port().unwrap()),
                 built: Mutex::default(),
             })
         }
@@ -4369,13 +4375,24 @@ mod tests {
                 url::Host::Ipv4(Ipv4Addr::new(192, 168, 1, 1)),
                 Ipv4Addr::new(192, 168, 1, 1),
             ),
-            (url::Host::Domain("192.168.1.1"), Ipv4Addr::new(192, 168, 1, 1)),
+            (
+                url::Host::Domain("192.168.1.1"),
+                Ipv4Addr::new(192, 168, 1, 1),
+            ),
         ] {
-            let refused =
-                udp_tracker_to_socket_addrs(host.clone(), 6969, &names, &reach_all(), NamedBy::Torrent)
-                    .await
-                    .unwrap_err();
-            assert!(refused.downcast_ref::<super::NotPublic>().is_some(), "{refused:#}");
+            let refused = udp_tracker_to_socket_addrs(
+                host.clone(),
+                6969,
+                &names,
+                &reach_all(),
+                NamedBy::Torrent,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                refused.downcast_ref::<super::NotPublic>().is_some(),
+                "{refused:#}"
+            );
             let asked =
                 udp_tracker_to_socket_addrs(host, 6969, &names, &reach_all(), NamedBy::Operator)
                     .await
@@ -4416,11 +4433,7 @@ mod tests {
             );
             let serve = async {
                 let (conn, q) = read_announce(&tracker).await;
-                redirect(
-                    conn,
-                    &format!("http://private.invalid:{port}/announce?{q}"),
-                )
-                .await;
+                redirect(conn, &format!("http://private.invalid:{port}/announce?{q}")).await;
                 std::future::pending::<()>().await
             };
             let e = tokio::select! {
@@ -4799,9 +4812,15 @@ mod tests {
         let v6 = (Ipv6Addr::LOCALHOST, 6969).into();
 
         let ipv4_only = reach_but(vec![blocked], true);
-        let found = udp_tracker_to_socket_addrs(host.clone(), 6969, &resolver, &ipv4_only, NamedBy::Operator)
-            .await
-            .unwrap();
+        let found = udp_tracker_to_socket_addrs(
+            host.clone(),
+            6969,
+            &resolver,
+            &ipv4_only,
+            NamedBy::Operator,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(found, UdpTrackerResolveResult::One(a) if a == v4),
             "{found:?}"

@@ -22,8 +22,8 @@ use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::root::phase::{self, RootPhase};
 use crate::pipeline::tests::{
-    hear_graph_mail, insert_active_job, job_status_for_assert, new_direct_pipeline,
-    rar5_fixture_bytes, standalone_job_spec, submit_decoded_segment,
+    hear_graph_mail, insert_active_job, insert_active_job_on, job_status_for_assert,
+    new_direct_pipeline, rar5_fixture_bytes, standalone_job_spec, submit_decoded_segment,
 };
 
 // A graph job's reads, prepared by the test: a namespace, a summary, and the
@@ -64,6 +64,7 @@ impl RootJob for Prepared {
                 .iter()
                 .enumerate()
                 .map(|(at, set)| self.ruled.get(at).copied().or(set.outcome)),
+            false,
         );
         RootPhase::derive(false, activity, self.extracting)
     }
@@ -89,6 +90,10 @@ impl RootJob for Prepared {
 
     fn refusal(&self) -> Option<&ExtractionFailure> {
         None
+    }
+
+    fn repair_out(&self) -> bool {
+        false
     }
 }
 
@@ -159,7 +164,7 @@ async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engi
             ("ember.field.sfv".to_string(), listing.len() as u32),
         ],
     );
-    insert_active_job(pipeline, job_id, spec).await;
+    insert_active_job_on(pipeline, job_id, spec, engine).await;
     pipeline.admit_graph_job(job_id, engine);
     let file = |file_index| NzbFileId { job_id, file_index };
     submit_decoded_segment(
@@ -259,10 +264,11 @@ fn the_drive_walks_the_phases_the_root_reports() {
     assert_eq!(drive(&mut job, &mut slots, AskerId(1), 1), Step::Deliver);
     assert_eq!((job.repairs, job.phase()), (1, RootPhase::Done));
 
-    // Waiting on recovery bytes: the root repairs until they come.
+    // Waiting on recovery bytes: the root fetches them, and no repair is
+    // out until they come.
     let mut job = Prepared::new(names(), damaged()).repairing_to(vec![RepairOutcome::Waiting]);
     assert_eq!(drive(&mut job, &mut slots, AskerId(2), 1), Step::Wait);
-    assert_eq!(job.phase(), RootPhase::Repairing);
+    assert_eq!(job.phase(), RootPhase::Downloading);
 
     // Not ruled yet: the root verifies.
     let job = Prepared::new(names(), damaged());
@@ -335,6 +341,14 @@ fn claims_read_complete_damaged_and_missing_off_the_namespace() {
     row.lost_bytes = 64;
     assert_eq!(row.failed_bytes(), 64);
     assert!(row.evidence, "thirty of a hundred bytes is a delivery");
+    // A damaged one owes its damage, retained with nothing lost or beside
+    // a smaller loss, and a larger loss as it stands.
+    let mut row = ClaimedMember::read(member(&names, 2), false);
+    assert_eq!(row.failed_bytes(), 40);
+    row.lost_bytes = 10;
+    assert_eq!(row.failed_bytes(), 40);
+    row.lost_bytes = 64;
+    assert_eq!(row.failed_bytes(), 64);
 }
 
 #[test]
@@ -670,7 +684,7 @@ async fn a_graph_job_never_rescans_its_output_for_nested_archives() {
         let temp_dir = tempfile::tempdir().unwrap();
         let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
         let spec = standalone_job_spec("Ember Nested", &[("outer.bin".to_string(), 8)]);
-        insert_active_job(&mut pipeline, job_id, spec).await;
+        insert_active_job_on(&mut pipeline, job_id, spec, engine).await;
         pipeline.admit_graph_job(job_id, engine);
         let staging = temp_dir.path().join("ember-nested");
         tokio::fs::create_dir_all(&staging).await.unwrap();
@@ -697,7 +711,7 @@ async fn a_graph_census_keeps_a_damaged_member_and_refuses_an_empty_delivery() {
     // Nothing of the payload ever arrived: refused with the classic words.
     let job_id = JobId(91_206);
     let spec = standalone_job_spec("Ember Empty", &[("ember.bin".to_string(), 64)]);
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
     pipeline.admit_graph_job(job_id, Engine::Graph);
     let Some(Err(error)) = pipeline.reconcile_graph_delivery(job_id) else {
         panic!("an empty graph delivery is refused");

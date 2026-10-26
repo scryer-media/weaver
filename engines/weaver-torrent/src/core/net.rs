@@ -126,7 +126,10 @@ impl NamedBy {
 /// outside the documentation ranges.
 pub(crate) fn is_public(ip: IpAddr) -> bool {
     let documentation = match ip.to_canonical() {
-        IpAddr::V4(a) => matches!(a.octets(), [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]),
+        IpAddr::V4(a) => matches!(
+            a.octets(),
+            [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+        ),
         IpAddr::V6(a) => {
             let s = a.segments();
             (s[0], s[1]) == (0x2001, 0xdb8) || (s[0] & 0xfff0) == 0x3ff0

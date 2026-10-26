@@ -17,8 +17,10 @@
 //   4. each unit read is delivered down the tree before the next is
 //      read, as it first came, so every object is where it was and a stream
 //      replays from its start
-//   5. the engines' runs are asked again for their slots; holds were in
-//      memory and are fetched again
+//   5. the engines' runs are asked again for their slots; holds the
+//      checkpoint recorded on scratch were adopted before step 3, so they
+//      read back as bytes on disk do, and holds that were in memory are
+//      fetched again
 //   6. what the root still waits on is what the queue fetches
 //
 // Step 1, refusing a graph job with no checkpoint, is the caller's.
@@ -122,6 +124,7 @@ impl<R: Root> GraphJob<R> {
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
         }
+        writer.restore_holds(&tree, &snapshot.holds)?;
         let mut job = Self {
             tree,
             root,
@@ -177,9 +180,10 @@ impl<R: Root> GraphJob<R> {
     // it holds of the member's front goes back into the namespace. What is
     // not there is the root's to fetch again: the unit waits, and the bytes
     // it covered are no longer covered, or said at any depth they reached.
-    // A restore starts with no holds, so any it reads through are bytes an
-    // earlier unit's delivery moved there from disk, as a member bound by
-    // its bytes moves its file. Also returns how many bytes it read.
+    // A restore starts with the holds the checkpoint recorded on scratch,
+    // read through as any bytes on disk are; any others it reads through are
+    // bytes an earlier unit's delivery moved there from disk, as a member
+    // bound by its bytes moves its file. Also returns how many bytes it read.
     fn read_back(&mut self) -> Result<(Vec<(VolumeIndex, u32)>, u64), GraphError> {
         let mut missing = Vec::new();
         let mut bytes = Vec::new();
@@ -347,17 +351,19 @@ impl<R: Root> GraphJob<R> {
     }
 }
 
-// A root member is the root's volume of its number: its identity is that
-// index, never its name, which a recovery set's rename changes. That the
-// volumes are the ones checkpointed, by their names, is the root's facts'
-// check.
+// A root member the root carries is the root's volume of its number: its
+// identity is that index, never its name, which a recovery set's rename
+// changes. That the volumes are the ones checkpointed, by their names, is
+// the root's facts' check. The members past the root's volumes are files a
+// recovery set describes, which the root announced itself after them; a
+// further posting is the post's, so none of them is one.
 fn same_volumes(tree: &Tree, volumes: usize) -> Result<(), RestoreFailure> {
     let Some(namespace) = tree.namespace(NodeId::ROOT) else {
         return Err(RestoreFailure::Post(0));
     };
     match namespace
         .records()
-        .find(|member| member.id.0 as usize >= volumes)
+        .find(|member| member.id.0 as usize >= volumes && namespace.resolve(member.id) != member.id)
     {
         Some(member) => Err(RestoreFailure::Post(member.id.0)),
         None => Ok(()),

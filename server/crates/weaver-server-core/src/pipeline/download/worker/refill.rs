@@ -104,6 +104,8 @@ impl Pipeline {
         request: DownloadLaneRefillRequest,
     ) {
         self.answer_download_lane_refill(request, Instant::now(), None);
+        #[cfg(test)]
+        self.audit_lane_holdings();
     }
 
     // Re-run every held refill against the queues. Called at the top of a
@@ -285,7 +287,6 @@ impl Pipeline {
         let completion_critical = lease.completion_critical;
         let activation_items = Self::activation_items(&lease);
         let progress_article = self.checkpoint_progress_article_for_lease(&lease);
-        let recovery_count = lease.works.iter().filter(|work| work.is_recovery).count();
         let booked_works = lease.works.clone();
         match response_tx.send(DownloadLaneRefillResponse {
             lease: Some(lease),
@@ -309,7 +310,6 @@ impl Pipeline {
                     .fetch_add(1, Ordering::Relaxed);
                 self.activate_download_batch(
                     job_id,
-                    recovery_count,
                     completion_critical,
                     lane_mode,
                     &activation_items,
@@ -350,8 +350,12 @@ impl Pipeline {
             }
         }
         let mut returned = 0;
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            for work in works {
+        for work in works {
+            let Some(work) = self.requeue_graph_work(work) else {
+                returned += 1;
+                continue;
+            };
+            if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.download_queue.push(work);
                 returned += 1;
             }

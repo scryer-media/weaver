@@ -9,7 +9,8 @@ use weaver_graph::recovery::RepairOutcome;
 
 use crate::jobs::model::JobStatus;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run_both};
+use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run, run_both};
+use crate::pipeline::graph::Engine;
 
 const NAME: &str = "lantern.bin";
 const PIECE: usize = 6 * ARTICLE;
@@ -166,5 +167,22 @@ async fn a_plain_split_whose_par2_over_the_joined_file_is_short_fails_without_it
             damaged: 3,
             reachable: 2
         })]
+    );
+}
+
+// One piece's article lost: the set posted over the joined file repairs the
+// joined file where the join writes it, and that file is what is handed
+// over, whole, with none of the pieces beside it.
+#[tokio::test]
+async fn a_plain_split_with_a_lost_article_under_par2_over_the_joined_file_is_repaired_under_graph()
+{
+    let original = joined();
+    let mut posts = pieces(&original);
+    posts.extend(par2_set("lantern", &[(NAME, &original)], 2));
+    let graph = run(&Scenario::new(posts).lost(1, 2), Engine::Graph).await;
+    assert_joined(&graph);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
     );
 }

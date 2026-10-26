@@ -237,8 +237,9 @@ impl SocketFactory for KernelSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
         Box::pin(async move {
-            let listener = librqbit_dualstack_sockets::TcpListener::bind_tcp(addr, self.bind_opts())
-                .map_err(io::Error::other)?;
+            let listener =
+                librqbit_dualstack_sockets::TcpListener::bind_tcp(addr, self.bind_opts())
+                    .map_err(io::Error::other)?;
             Ok(Box::new(KernelListener(listener)) as Box<dyn StreamListener>)
         })
     }

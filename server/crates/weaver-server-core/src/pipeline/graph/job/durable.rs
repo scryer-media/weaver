@@ -3,17 +3,20 @@
 
 // The job as a checkpoint takes it: the tree's records, the root's facts,
 // the job's count of repair reads and the phase it last reported, the
-// writer's files and kept envelopes, and which candidate each node was
-// offered last. A node is read on its own, so a checkpoint reads only the
-// nodes the tree or the writer marked since the generations it read at.
+// writer's files, kept envelopes and holds on scratch, and which candidate
+// each node was offered last. A node is read on its own, so a checkpoint
+// reads only the nodes the tree, the writer, its envelopes or an offer
+// marked since the generations it read at.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use weaver_graph::holds::ScratchHold;
 use weaver_graph::{MemberId, NodeId, NodeRecord};
 
 use super::GraphJob;
-use crate::pipeline::graph::checkpoint::{FileState, Generations, Snapshot};
+use crate::pipeline::graph::checkpoint::{FileState, Generations, HoldRecord, Snapshot};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
+use crate::pipeline::graph::namespace::WriteError;
 use crate::pipeline::graph::root::Root;
 use crate::pipeline::graph::root::facts::{JobFacts, Parts, RootBlob, RootRow};
 
@@ -22,6 +25,9 @@ impl<R: Root> GraphJob<R> {
     pub(crate) fn snapshot(&self) -> Snapshot {
         let tree = self.tree.records();
         let mut files = BTreeMap::new();
+        let mut kept = Vec::new();
+        let mut holds = Vec::new();
+        let mut passwords = BTreeMap::new();
         for node in &tree.nodes {
             for member in &node.members {
                 let state = self.writer.file_state(node.node, member.member);
@@ -29,14 +35,27 @@ impl<R: Root> GraphJob<R> {
                     files.insert((node.node, member.member), state);
                 }
             }
+            kept.extend(self.kept_records(node.node));
+            holds.extend(
+                self.hold_records(node.node)
+                    .into_iter()
+                    .map(|held| HoldRecord {
+                        node: node.node,
+                        held,
+                    }),
+            );
+            if let Some(index) = self.last_offered(node.node) {
+                passwords.insert(node.node, index);
+            }
         }
         Snapshot {
             job: self.job_facts(),
             root: RootBlob::of(&self.root),
             tree,
             files,
-            kept: self.writer.kept_records(),
-            passwords: self.passwords.last_offered().collect(),
+            kept,
+            holds,
+            passwords,
         }
     }
 
@@ -48,15 +67,23 @@ impl<R: Root> GraphJob<R> {
     }
 
     pub(crate) fn generations(&self) -> Generations {
-        (self.tree.generation(), self.writer.files_generation())
+        Generations {
+            tree: self.tree.generation(),
+            files: self.writer.files_generation(),
+            kept: self.writer.kept_generation(),
+            offered: self.passwords.generation(),
+        }
     }
 
-    // The nodes the tree or the writer changed since `at`: with `at` the
-    // generations nothing was read at, every node the job ever had.
-    pub(crate) fn changed_since(&self, (tree, files): Generations) -> BTreeSet<NodeId> {
+    // The nodes the tree, the writer, its envelopes or an offer changed
+    // since `at`: with `at` the generations nothing was read at, every node
+    // the job ever had.
+    pub(crate) fn changed_since(&self, at: Generations) -> BTreeSet<NodeId> {
         self.tree
-            .changed_since(tree)
-            .chain(self.writer.files_changed_since(files))
+            .changed_since(at.tree)
+            .chain(self.writer.files_changed_since(at.files))
+            .chain(self.writer.kept_changed_since(at.kept))
+            .chain(self.passwords.changed_since(at.offered))
             .collect()
     }
 
@@ -73,12 +100,25 @@ impl<R: Root> GraphJob<R> {
         Some((record, files))
     }
 
-    pub(crate) fn kept_records(&self) -> Vec<KeptRecord> {
-        self.writer.kept_records()
+    // The node's kept envelopes.
+    pub(crate) fn kept_records(&self, node: NodeId) -> Vec<KeptRecord> {
+        self.writer.kept_records(node)
     }
 
-    pub(crate) fn last_offered(&self) -> BTreeMap<NodeId, usize> {
-        self.passwords.last_offered().collect()
+    // The holds the node's namespace has on scratch.
+    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<ScratchHold> {
+        self.writer.hold_records(node)
+    }
+
+    // A graceful stop: what the job holds in RAM goes to scratch, so the
+    // checkpoint after it spares a restart fetching it again.
+    pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
+        self.writer.page_out_holds()
+    }
+
+    // The candidate the node was offered last, by index.
+    pub(crate) fn last_offered(&self, node: NodeId) -> Option<usize> {
+        self.passwords.last_offered(node)
     }
 
     // The root row, its root's facts encoded again only where they changed
@@ -96,5 +136,11 @@ impl<R: Root> GraphJob<R> {
             root,
         };
         (row, parts)
+    }
+
+    // The bytes of the units the root's facts say this run does not fetch
+    // again: what the facts encoded now spare a restore.
+    pub(crate) fn settled_bytes(&self) -> u64 {
+        self.root.settled_bytes()
     }
 }

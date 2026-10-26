@@ -14,8 +14,8 @@
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
 use weaver_graph::{
-    Builder, ByteRange, Effect, Kind, MemberId, NodeId, Provenance, RecoveryKind, Restore, Segment,
-    Tree, VolumeIndex,
+    Builder, ByteRange, Effect, Handed, Kind, MemberId, NodeId, Provenance, RecoveryKind, Restore,
+    Segment, Tree, VolumeIndex,
 };
 
 use super::{
@@ -99,6 +99,49 @@ impl NamespaceWriter {
         })
     }
 
+    // Some member of a namespace holds damage a set of that namespace
+    // covers: a repair of it has something to rebuild.
+    pub(crate) fn damage_covered(&self, tree: &Tree) -> bool {
+        tree.live().into_iter().any(|node| {
+            let sets = tree.recovery_nodes(node);
+            tree.namespace(node).is_some_and(|namespace| {
+                namespace.members().any(|member| {
+                    member
+                        .coverage
+                        .runs()
+                        .any(|run| run.provenance == Provenance::Damaged)
+                        && self.covering(tree, &sets, member.id).next().is_some()
+                })
+            })
+        })
+    }
+
+    // The member is closed whole and the sets proved it: one covers it, and
+    // every one that does ruled it clean or repaired it and is not out on
+    // loan. No set reads the source's checksums of its bytes again.
+    pub(crate) fn proven_whole(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+        let whole = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .is_some_and(|record| record.is_whole());
+        let sets = tree.recovery_nodes(node);
+        let mut covering = self.covering(tree, &sets, member).peekable();
+        whole
+            && covering.peek().is_some()
+            && covering.all(|set| {
+                !tree.lent(set)
+                    && tree
+                        .recovery(set)
+                        .and_then(|recovery| recovery.outcome())
+                        .is_some_and(|outcome| {
+                            matches!(
+                                outcome,
+                                RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+                            )
+                        })
+            })
+    }
+
     // Every set of every namespace has ruled on something other than
     // waiting.
     pub(crate) fn all_ruled(&self, tree: &Tree) -> bool {
@@ -115,7 +158,8 @@ impl NamespaceWriter {
 
     // Each set of every namespace, parents first, with what it last ruled.
     // A set whose repair is out is one whose ruling is pending; what it said
-    // when it left is its lender's to tell.
+    // when it left is its lender's to tell. A set that read nothing ruled on
+    // nothing, so it is not among them.
     pub(crate) fn states(&self, tree: &Tree) -> Vec<SetState> {
         self.sets(tree)
             .into_iter()
@@ -133,11 +177,12 @@ impl NamespaceWriter {
                 outcome: None,
             });
         };
-        Some(SetState {
+        let outcome = recovery.outcome();
+        (outcome != Some(RepairOutcome::Unread)).then_some(SetState {
             node,
             namespace,
             kind,
-            outcome: recovery.outcome(),
+            outcome,
         })
     }
 
@@ -166,21 +211,6 @@ impl NamespaceWriter {
             }
         }
         sizes
-    }
-
-    // The members the namespace holds its payload for: each index its
-    // source declared that still has bytes to come. Evidence cut before an
-    // index gives its block sizes is cut at none, so its slices are read
-    // back rather than proven as they pass.
-    pub(crate) fn holding_for(
-        &self,
-        declared: impl IntoIterator<Item = MemberId>,
-        to_come: impl Fn(MemberId) -> bool,
-    ) -> Vec<MemberId> {
-        declared
-            .into_iter()
-            .filter(|member| to_come(*member))
-            .collect()
     }
 
     // Rule the namespace's sets that are due. A file a set describes and
@@ -322,13 +352,16 @@ impl NamespaceWriter {
         (node, reading): (NodeId, &dyn Fn(NodeId) -> bool),
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // Only a set describes files: a namespace with none announces
+        // nothing, whatever its members.
+        let sets = tree.recovery_nodes(node);
         let known = |namespace: NodeId| members_known(tree, namespace, reading(namespace));
-        if !known(node) || !self.members_in(tree, node) {
+        if sets.is_empty() || !known(node) || !self.members_in(tree, node) {
             return Ok(());
         }
         let below_known = tree.namespaces_below(node).into_iter().all(known);
         let mut absent = Vec::new();
-        for set in tree.recovery_nodes(node) {
+        for set in sets {
             let Some(recovery) = tree.recovery(set) else {
                 continue;
             };
@@ -492,9 +525,10 @@ impl NamespaceWriter {
                             .any(|covering| covering == set)
                     })
                     .filter_map(|(member, range)| {
-                        let length = namespace.get(member)?.length.unwrap_or(range.end);
-                        let proves = tree.recovery(set)?.proves(member, length);
-                        Some((member, range.intersect(proves)?))
+                        Some((
+                            member,
+                            namespace.proven(member, range, tree.recovery(set)?)?,
+                        ))
                     })
                     .collect()
             })
@@ -777,13 +811,19 @@ impl NamespaceWriter {
                 .namespace(node)
                 .and_then(|namespace| namespace.get(*member))
                 .and_then(|record| record.length.filter(|_| record.is_complete()));
-            if let Some(length) = length
-                && let Some(leaf) = self
+            let has_file = self
+                .files
+                .get(&node)
+                .is_some_and(|files| files.leaves.contains_key(member));
+            if let Some(length) = length.filter(|_| has_file) {
+                self.admit_file(tree, node, *member, length)?;
+                if let Some(leaf) = self
                     .files
                     .get_mut(&node)
                     .and_then(|files| files.leaves.get_mut(member))
-            {
-                leaf.close(length)?;
+                {
+                    leaf.close(length)?;
+                }
             }
         }
         self.renamed = renamed;
@@ -793,15 +833,16 @@ impl NamespaceWriter {
     // An object found its own recovery data at a range of its volume. The
     // set for it is built over that range of the member the volume is, as a
     // window beside the object, so it lives in the namespace of the members
-    // it covers. What of the range has passed is read back through the
-    // inverse map and handed to it; the rest reaches it as it passes.
+    // it covers, and takes what the object handed it. What of the range
+    // has passed is read back through the inverse map and handed to it;
+    // the rest reaches it as it passes.
     pub(super) fn recovery_at(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,
         segments: &dyn Segments,
         (node, volume, range): (NodeId, VolumeIndex, ByteRange),
-        kind: RecoveryKind,
+        (kind, handed): (RecoveryKind, &Handed),
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let Some((parent, member)) = tree
@@ -834,7 +875,7 @@ impl NamespaceWriter {
         let window = tree.attach_window(
             parent,
             (member, range),
-            object,
+            (object, handed),
             passed,
             &mut self.placing(builder),
             &mut effects,

@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 89;
+const CURRENT_SCHEMA_VERSION: i64 = 92;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -2032,12 +2032,11 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        let keys: Vec<String> = sqlx::query_scalar(
-            "SELECT key FROM settings WHERE key LIKE 'torrent.%' ORDER BY key",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let keys: Vec<String> =
+            sqlx::query_scalar("SELECT key FROM settings WHERE key LIKE 'torrent.%' ORDER BY key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(keys, vec!["torrent.session_slots".to_string()]);
         pool.close().await;
     }

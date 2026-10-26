@@ -188,12 +188,7 @@ impl P2pPath {
             )?),
             _ => None,
         };
-        match OpenLeg::on(
-            leg.kind,
-            Arc::clone(&leg.stage),
-            bridge.clone(),
-            None,
-        ) {
+        match OpenLeg::on(leg.kind, Arc::clone(&leg.stage), bridge.clone(), None) {
             Ok(open) => Ok(Self {
                 stage: leg.stage,
                 leg: open,
@@ -379,7 +374,11 @@ impl TestTorrent {
                 let tiers = if torrent.announce_list.iter().flatten().next().is_some() {
                     torrent.announce_list.clone()
                 } else {
-                    torrent.announce.iter().map(|url| vec![url.clone()]).collect()
+                    torrent
+                        .announce
+                        .iter()
+                        .map(|url| vec![url.clone()])
+                        .collect()
                 };
                 let trackers = tiers
                     .iter()

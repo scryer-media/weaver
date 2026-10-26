@@ -173,6 +173,7 @@ fn config_roundtrip() {
             split: Some(crate::bandwidth::BandwidthSplit { usenet_pct: 70 }),
         },
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(false),
         watch_folder: crate::watch_folder::WatchFolderConfig {
             mode: crate::watch_folder::WatchFolderMode::Polling,

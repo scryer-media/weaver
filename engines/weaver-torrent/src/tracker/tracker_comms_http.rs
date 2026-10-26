@@ -667,7 +667,13 @@ mod tests {
             answer: Resolved::Addresses(vec![SocketAddr::new(ip.parse().unwrap(), 80)]),
             asked: Default::default(),
         };
-        for ip in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.1.1", "fd00::1"] {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "fd00::1",
+        ] {
             for (path, ask) in [
                 ("/announce", Ask::Announce),
                 ("/scrape", Ask::Scrape),
@@ -675,17 +681,10 @@ mod tests {
             ] {
                 let url = url::Url::parse(&format!("http://tracker.test{path}")).unwrap();
                 let clients = Targets::default();
-                let refused = reach(
-                    &clients,
-                    &url,
-                    NamedBy::Torrent,
-                    ask,
-                    &at(ip),
-                    &reachable,
-                )
-                .await
-                .err()
-                .unwrap_or_else(|| panic!("{ip} {path} was asked"));
+                let refused = reach(&clients, &url, NamedBy::Torrent, ask, &at(ip), &reachable)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{ip} {path} was asked"));
                 assert!(
                     refused
                         .downcast_ref::<crate::tracker::tracker_comms::NotPublic>()

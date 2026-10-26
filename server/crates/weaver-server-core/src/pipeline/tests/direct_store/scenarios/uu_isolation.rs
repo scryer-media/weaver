@@ -191,9 +191,7 @@ async fn download_archives(uu: bool, mixed: bool, low_space: bool) {
         u64::MAX
     }));
     let shared = pipeline.shared_state.clone();
-    let (commands, receiver) = mpsc::channel(64);
-    pipeline.cmd_rx = receiver;
-    let handle = SchedulerHandle::new(commands, pipeline.event_tx.clone(), shared.clone());
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), shared.clone());
     let task = tokio::spawn(async move {
         pipeline.run().await;
         pipeline

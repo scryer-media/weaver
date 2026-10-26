@@ -110,6 +110,33 @@ async fn a_member_past_its_byte_cap_fails_naming_member_bytes_under_graph() {
     assert_refused(&graph, "member_bytes");
 }
 
+// A stored member whose header declares more than the cap, of which only
+// the first article arrives: its file takes the declared length when it
+// opens, so the cap is breached there, whatever the bytes reach.
+#[tokio::test]
+async fn a_member_declaring_past_its_byte_cap_fails_naming_member_bytes_under_graph() {
+    let body = payload(3 * ARTICLE + 5, 79);
+    let (name, bytes) = single_member_store_set("beacon.bin", &body, 1).remove(0);
+    let articles = bytes.len().div_ceil(ARTICLE) as u32;
+    let mut scenario = Scenario::new(vec![Post::plain(&name, bytes)]).limits(limits(|limits| {
+        limits.max_member_bytes = 2 * ARTICLE as u64
+    }));
+    for ordinal in 1..articles {
+        scenario = scenario.lost(0, ordinal);
+    }
+    let graph = run(&scenario, Engine::Graph).await;
+    assert_refused(&graph, "member_bytes");
+    let declared = format!("member output would reach {} bytes", body.len());
+    assert!(
+        graph
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains(&declared)),
+        "{:?}",
+        graph.failure
+    );
+}
+
 #[tokio::test]
 async fn an_archive_past_the_entry_cap_fails_naming_entries_under_graph() {
     let members: Vec<(String, Vec<u8>)> = (0..5)

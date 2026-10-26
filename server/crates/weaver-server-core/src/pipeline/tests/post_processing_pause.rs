@@ -19,32 +19,35 @@ async fn post_processing_pause_holds_admission_and_resume_rechecks_jobs() {
         .await;
     }
     pipeline.pending_completion_checks.clear();
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PausePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.shared_state.is_post_processing_paused());
     assert!(!pipeline.maybe_start_repair(repair).await);
     assert!(!pipeline.maybe_start_extraction(extract).await);
     assert_eq!(pipeline.active_repair_jobs(), 0);
     assert_eq!(pipeline.active_extract_jobs(), 0);
 
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(!pipeline.shared_state.is_post_processing_paused());
     assert!(pipeline.pending_completion_checks.contains(&repair));
     assert!(pipeline.pending_completion_checks.contains(&extract));
     assert!(!pipeline.pending_completion_checks.contains(&untouched));
     pipeline.pending_completion_checks.clear();
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(
         pipeline.pending_completion_checks.is_empty(),
         "an already running post-processor must not rescan the queue"
@@ -64,25 +67,24 @@ async fn post_processing_resume_preserves_manual_pause_on_deferred_move() {
         standalone_job_spec("manually held move", &[("payload.bin".to_owned(), 512)]),
     )
     .await;
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PausePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     pipeline.start_move_to_complete(id).await.unwrap();
     assert!(pipeline.deferred_moves.contains(&id));
-    pipeline.pause_job_runtime(id).unwrap();
-
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.pause_job(id).await.unwrap();
+    handle.resume_post_processing().await.unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(matches!(pipeline.jobs[&id].status, JobStatus::Paused));
     assert!(!pipeline.inflight_moves.contains(&id));
     assert!(!pipeline.pending_completion_checks.contains(&id));
 
-    pipeline.resume_restored_job(id).await.unwrap();
+    handle.resume_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.pending_completion_checks.contains(&id));
 }
 
@@ -98,11 +100,12 @@ async fn post_processing_pause_defers_moves_without_cancelling_running_stages() 
     )
     .await;
     assert!(pipeline.maybe_start_extraction(id).await);
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PausePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(matches!(pipeline.jobs[&id].status, JobStatus::Extracting));
     pipeline.start_move_to_complete(id).await.unwrap();
     assert!(pipeline.deferred_moves.contains(&id));
@@ -124,21 +127,23 @@ async fn post_processing_resume_requeues_deferred_completion_and_rar_gates() {
         .await;
     }
     pipeline.pending_completion_checks.clear();
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::PausePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .pause_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     pipeline.check_job_completion(completion).await;
     pipeline.try_rar_extraction(rar).await;
     assert!(pipeline.deferred_post_processing.contains(&completion));
     assert!(pipeline.deferred_post_processing.contains(&rar));
     assert!(pipeline.pending_completion_checks.is_empty());
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ResumePostProcessing { reply })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .resume_post_processing()
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.pending_completion_checks.contains(&completion));
     assert!(pipeline.pending_completion_checks.contains(&rar));
     assert!(pipeline.deferred_post_processing.is_empty());

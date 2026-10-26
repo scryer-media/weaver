@@ -9,7 +9,9 @@ use weaver_graph::{
     NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
 };
 
-use super::{CheckpointError, FileState, Pending, Snapshot, rows, snapshot};
+use weaver_graph::holds::ScratchHold;
+
+use super::{CheckpointError, FileState, HoldRecord, Pending, Snapshot, rows, snapshot};
 use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint, PartRow};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
 use crate::pipeline::graph::job::{GraphJob, RootFile};
@@ -209,6 +211,32 @@ fn full() -> Snapshot {
                 settled: false,
             },
         ],
+        holds: vec![
+            HoldRecord {
+                node: NodeId(0),
+                held: ScratchHold {
+                    volume: VolumeIndex(1),
+                    range: ByteRange::new(0, 64),
+                    scratch_offset: 128,
+                },
+            },
+            HoldRecord {
+                node: NodeId(1),
+                held: ScratchHold {
+                    volume: VolumeIndex(0),
+                    range: ByteRange::new(20, 300),
+                    scratch_offset: 0,
+                },
+            },
+            HoldRecord {
+                node: NodeId(1),
+                held: ScratchHold {
+                    volume: VolumeIndex(0),
+                    range: ByteRange::new(400, 410),
+                    scratch_offset: 280,
+                },
+            },
+        ],
         passwords: BTreeMap::from([(NodeId(1), 2)]),
     }
 }
@@ -217,6 +245,28 @@ fn full() -> Snapshot {
 fn a_snapshot_comes_back_from_its_rows() {
     let taken = full();
     assert_eq!(snapshot(&rows(&taken)), Ok(taken));
+}
+
+#[test]
+fn hold_rows_come_back_as_the_holds_a_restore_adopts() {
+    let taken = full();
+    let rows = rows(&taken);
+    assert_eq!(rows.holds.len(), 3);
+    assert_eq!(rows.holds[2].scratch_offset, 280);
+    assert_eq!(snapshot(&rows).map(|back| back.holds), Ok(taken.holds));
+    // A change to one hold rewrites that row alone.
+    let mut moved = rows.clone();
+    moved.holds[1].scratch_offset = 64;
+    let delta = Delta::between(Some(&rows), &moved);
+    assert_eq!(delta.rows(), 1, "{delta:?}");
+    assert_eq!(delta.holds.len(), 1);
+    // A negative offset is no row a build could have written.
+    let mut bad = rows;
+    bad.holds[0].scratch_offset = -1;
+    assert!(matches!(
+        snapshot(&bad),
+        Err(CheckpointError::Row { node: 0, .. })
+    ));
 }
 
 #[test]
@@ -315,6 +365,7 @@ fn held(delta: &Delta) -> GraphCheckpoint {
         envelopes: of(&delta.envelopes),
         crypt: of(&delta.crypt),
         parts: of(&delta.parts),
+        holds: of(&delta.holds),
     }
 }
 

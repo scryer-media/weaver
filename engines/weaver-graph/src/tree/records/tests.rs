@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::super::{Builder, Tree};
 use crate::deliver::{Delivery, Emit, Posted, Provenance, Why};
+use crate::engine::{Engine, Extraction, Sink, Volumes};
 use crate::facts::{Durable, Facts, Restore, RestoreError};
 use crate::member::MemberId;
-use crate::object::{Extent, Kind, Object, ObjectId, Placement};
+use crate::object::{Extent, Kind, Object, ObjectId, Placement, Standing};
 use crate::records::{NodeState, TreeRecord};
-use crate::seek::{Pull, Seek};
+use crate::seek::{Pull, Seek, Weight};
 use crate::tree::NodeId;
 use crate::volume::{ByteRange, VolumeIndex};
 
@@ -18,7 +21,8 @@ const XZ: &[u8] = b"\xfd7zXZ\x00";
 const GZIP: &[u8] = b"\x1f\x8b";
 
 // A pretend wrapper: its own magic, then one member that is everything
-// after it, under a fixed name.
+// after it, under a fixed name. As an engine it bids for the volume after
+// the one its run reached, and refuses itself, quiet, while its run asks.
 #[derive(Serialize, Deserialize)]
 struct Wrap {
     kind: Kind,
@@ -72,6 +76,11 @@ impl Object for Wrap {
     }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if standing.asking() {
+            out.push(Emit::Refuse(Why::EncryptedHeader));
+        }
+    }
     fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
@@ -90,9 +99,31 @@ impl Object for Wrap {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
+    fn engine(&self) -> Option<&dyn Engine> {
+        Some(self)
+    }
+    fn engine_mut(&mut self) -> Option<&mut dyn Engine> {
+        Some(self)
+    }
     fn facts(&self) -> Facts {
         Facts::of(self.kind, self)
     }
+}
+
+impl Engine for Wrap {
+    fn start(&mut self) -> Box<dyn Extraction> {
+        Box::new(Idle)
+    }
+    fn bid(&self, reached: VolumeIndex, out: &mut Vec<Seek>) {
+        let next = VolumeIndex(reached.0 + 1);
+        out.push(Seek::data(next, ByteRange::new(0, u64::MAX), Weight(1)));
+    }
+}
+
+struct Idle;
+
+impl Extraction for Idle {
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>) {}
 }
 
 struct Objects;
@@ -313,4 +344,44 @@ fn a_member_a_buried_refusal_left_open_comes_back_buried() {
         assert!(rebuilt.buried_member(*node, *member), "{node:?} {member:?}");
     }
     assert_eq!(rebuilt.records(), record);
+}
+
+// A run's progress is the tree's, never its node's: reporting how far a
+// run read and that it asked marks no node and changes no record, the
+// object's facts among them. Rebuilt from those records, the tree bids and
+// rules from progress of its own, which starts empty, and a run it starts
+// answers what an earlier one asked.
+#[test]
+fn a_run_reports_progress_without_marking_its_node_or_its_facts() {
+    let bids = |tree: &Tree| {
+        let mut out = Vec::new();
+        tree.collect_wants(&mut out);
+        out.into_iter()
+            .map(|(node, seek)| (node, seek.volume))
+            .collect::<Vec<_>>()
+    };
+    let refused = |tree: &mut Tree, node| {
+        tree.quiet(node, &mut Objects, &mut Vec::new());
+        tree.record(node).and_then(|record| record.reason)
+    };
+    let (mut tree, _) = three_levels();
+    let engine = NodeId(1);
+    let record = tree.records();
+    let at = tree.generation();
+    tree.run_reached(engine, VolumeIndex(0));
+    tree.run_asked(engine);
+    assert_eq!(tree.generation(), at);
+    assert_eq!(tree.changed_since(at).count(), 0, "progress marks no node");
+    assert_eq!(tree.records(), record, "no record carries progress");
+    assert_eq!(bids(&tree), vec![(engine, VolumeIndex(1))]);
+
+    let mut rebuilt = Tree::rebuild(&record, &Objects).expect("rebuilds");
+    assert!(bids(&rebuilt).is_empty(), "a rebuilt tree knows no run yet");
+    rebuilt.run_reached(engine, VolumeIndex(0));
+    assert_eq!(bids(&rebuilt), bids(&tree));
+    rebuilt.run_asked(engine);
+    assert!(rebuilt.start(engine).is_some());
+    assert_eq!(refused(&mut rebuilt, engine), None, "the new run asks anew");
+
+    assert_eq!(refused(&mut tree, engine), Some(Why::EncryptedHeader));
 }

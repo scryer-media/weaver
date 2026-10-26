@@ -83,6 +83,22 @@ fn sfv_verifies_fed_members_without_reading_them() {
     assert_eq!(job.store.reads, 0);
 }
 
+// The text's pieces arrive last first: each waits for the text to reach
+// it, and every entry binds.
+#[test]
+fn sfv_text_delivered_out_of_order_binds_every_entry() {
+    let one = payload(7, 2000);
+    let two = payload(8, 3000);
+    let text = sfv_text(&[("one.bin", crc32(&one)), ("two.bin", crc32(&two))]);
+    let mut job = Job::new(Sfv::new(OWN), OWN);
+    job.volume("check.sfv", &text, 7, true);
+    let first = job.member("one.bin", &one);
+    let second = job.member("two.bin", &two);
+    bind(&mut job);
+    assert!(job.object.covers(first) && job.object.covers(second));
+    assert!(job.object.text == text);
+}
+
 #[test]
 fn sfv_reads_back_what_the_feed_missed() {
     let one = payload(3, 9000);

@@ -992,6 +992,8 @@ jobs:
       AWS_LC_SYS_CMAKE_BUILDER: "0"
       CFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
       CXXFLAGS_x86_64_apple_darwin: "-DNDEBUG -ffunction-sections -fdata-sections -fvisibility=hidden"
+      # Fat LTO on the Intel runner is the slowest link in the release.
+      CARGO_PROFILE_RELEASE_LTO: thin
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: ${{ github.workspace }}
       SCCACHE_CACHE_SIZE: 10G

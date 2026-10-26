@@ -274,6 +274,27 @@ impl<T: BufferedChunk> WriteReorderBuffer<T> {
         }
     }
 
+    // Withdraw what the buffer holds at `offset` for an article whose
+    // placement was ruled wrong after it was accepted: its bytes while `owns`
+    // says they are still waiting here, or the marker that would let the drain
+    // step over the range as written. Returned bytes are still charged to the
+    // caller's write backlog.
+    pub(crate) fn withdraw_at(&mut self, offset: u64, owns: impl FnOnce(&T) -> bool) -> Option<T> {
+        match self.pending.get(&offset)? {
+            PendingChunk::Buffered(buf) if owns(buf) => {}
+            PendingChunk::Buffered(_) => return None,
+            PendingChunk::Persisted { .. } => {
+                self.pending.remove(&offset);
+                return None;
+            }
+        }
+        let Some(PendingChunk::Buffered(buf)) = self.pending.remove(&offset) else {
+            unreachable!("checked a buffered entry");
+        };
+        self.forget_buffered(buf.len_bytes());
+        Some(buf)
+    }
+
     pub fn buffered_len(&self) -> usize {
         self.buffered_segments
     }

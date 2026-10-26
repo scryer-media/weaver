@@ -35,17 +35,10 @@ fn every_stream_restored_from_its_facts_runs_as_the_live_one() {
     restored::<Deflate>("alpha.bin", "alpha.bin", deflate);
 }
 
-// The steps of an xz volume of two concatenated streams, the run's frontier
-// told after every frame as an owner tells it.
+// The steps of an xz volume of two concatenated streams.
 fn xz_steps(bytes: &[u8], frame: usize) -> Vec<Step<'_>> {
     let mut steps = vec![Step::Bound(0, "alpha.tar.xz")];
-    for step in frames(0, bytes, frame) {
-        let Step::Bytes(_, offset, chunk) = step else {
-            continue;
-        };
-        steps.push(step);
-        steps.push(Step::Reached(0, offset + chunk.len() as u64));
-    }
+    steps.extend(frames(0, bytes, frame));
     steps.push(Step::Closed(0));
     steps
 }
@@ -64,13 +57,13 @@ fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
     let header = xz_steps(&bytes, 12);
     let block = xz_steps(&bytes, 4);
     let wide = xz_steps(&bytes, 256);
-    // A cut after k frames and their frontiers is step 1 + 2k.
-    let (middle, past) = (wide.len() / 4, boundary.div_ceil(256));
+    // A cut after k frames is step 1 + k.
+    let (middle, past) = ((wide.len() - 1) / 2, boundary.div_ceil(256));
     let cuts: [(&[Step<'_>], usize, u64); 4] = [
-        (&header, 3, 12),
-        (&block, 1 + 2 * 4, 16),
-        (&wide, 1 + 2 * middle, 256 * middle as u64),
-        (&wide, 1 + 2 * past, 256 * past as u64),
+        (&header, 2, 12),
+        (&block, 1 + 4, 16),
+        (&wide, 1 + middle, 256 * middle as u64),
+        (&wide, 1 + past, 256 * past as u64),
     ];
     for (steps, cut, frontier) in cuts {
         let (facts, live, again) = restores_alike(Box::new(XzStream::new()), steps, cut, &[]);
@@ -85,8 +78,8 @@ fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
     }
     // Restored before its front is in, the stream reserves nothing yet;
     // once it is, the first block's dictionary.
-    let early = header_facts(&header, 3);
-    let late = header_facts(&block, 1 + 2 * (FIRST / 4));
+    let early = header_facts(&header, 2);
+    let late = header_facts(&block, 1 + FIRST / 4);
     assert_eq!(early.reserve(), None);
     assert_eq!(late.reserve(), Some(Xz::window(&bytes)));
 }

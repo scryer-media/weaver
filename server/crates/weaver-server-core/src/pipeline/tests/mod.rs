@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::SchedulerError;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -47,6 +48,8 @@ macro_rules! segment_spec {
 
 mod archive_topology;
 mod bandwidth_split;
+mod cancel_batch;
+mod control_lifecycle;
 mod core;
 mod decode_and_files;
 mod direct_store;
@@ -57,6 +60,7 @@ mod full_file_names;
 mod hardware_profile;
 mod health_probe;
 mod idle;
+mod nzb_admission;
 mod par2_completion;
 mod par2_multiset_binding;
 mod par2_multiset_gate;
@@ -66,6 +70,8 @@ mod par3_recovery;
 #[cfg(unix)]
 mod post_processing_completion;
 mod post_processing_pause;
+mod provider_scheduling;
+mod queue;
 mod rar_extraction;
 mod restart_resume_floor;
 mod restore_history;
@@ -77,6 +83,50 @@ mod support_facts;
 mod terminal_settlement;
 mod yenc_compatibility;
 mod zip64;
+
+impl Pipeline {
+    pub(in crate::pipeline) async fn restore_job(
+        &mut self,
+        request: RestoreJobRequest,
+    ) -> Result<(), SchedulerError> {
+        let id = request.job_id;
+        if self.jobs.contains_key(&id) {
+            return Err(SchedulerError::JobExists(id));
+        }
+        // Synthetic restore requests still need the active record that real
+        // startup recovery reads, so admission can commit before work starts.
+        if !self.db.load_active_jobs()?.contains_key(&id) {
+            self.db.create_active_job(&crate::ActiveJob {
+                job_id: id,
+                engine: crate::pipeline::graph::Engine::Classic,
+                nzb_hash: request.job_hash,
+                nzb_path: request.working_dir.join("restore-fixture.nzb"),
+                nzb_zstd: sample_nzb_zstd(),
+                output_dir: request.working_dir.clone(),
+                created_at: 0,
+                category: request.spec.category.clone(),
+                metadata: request.spec.metadata.clone(),
+                status: "queued",
+                download_state: "queued",
+                post_state: "idle",
+                run_state: "active",
+                paused_resume_status: None,
+                paused_resume_download_state: None,
+                paused_resume_post_state: None,
+                password_override: None,
+                supplied_password_candidates: Vec::new(),
+            })?;
+        }
+        // Some crash fixtures reuse the stopped runtime's shared queue.
+        self.shared_state.queue.write(|inner| {
+            inner.jobs.retain(|row| row.id != id);
+            crate::pipeline::queue::Change::changed(())
+        });
+        self.shared_state.queue.restore(request)?;
+        self.apply_queue_intents().await;
+        Ok(())
+    }
+}
 
 struct TestHarness {
     _temp_dir: TempDir,
@@ -120,6 +170,7 @@ impl TestHarness {
             retry: None,
             bandwidth: Default::default(),
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
@@ -138,10 +189,9 @@ impl TestHarness {
             config_path: None,
         }));
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
         let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
         let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-        let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), shared_state.clone());
+        let handle = SchedulerHandle::new(event_tx.clone(), shared_state.clone());
 
         let profile = SystemProfile {
             cpu: CpuProfile {
@@ -170,7 +220,6 @@ impl TestHarness {
         });
 
         let mut pipeline = Pipeline::new(
-            cmd_rx,
             event_tx,
             nntp,
             buffers,
@@ -188,7 +237,6 @@ impl TestHarness {
         )
         .await
         .unwrap();
-        // This rig drives the classic engine.
         let pipeline_task = tokio::spawn(async move {
             pipeline.run().await;
         });
@@ -426,6 +474,9 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
             .expect("lane event channel should stay open")
         {
             OwnedDownloadLaneEvent::AcquireFailed { .. } => {}
+            OwnedDownloadLaneEvent::LeaseObsolete { lease } => {
+                panic!("lane {} became obsolete before dialing", lease.lane_id)
+            }
             OwnedDownloadLaneEvent::BatchComplete { lane_id, .. } => {
                 panic!("lane {lane_id} fetched from a server that refuses every session")
             }
@@ -544,6 +595,7 @@ async fn new_direct_pipeline_on_machine(
         retry: None,
         bandwidth: Default::default(),
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
@@ -559,7 +611,6 @@ async fn new_direct_pipeline_on_machine(
         config_path: None,
     }));
 
-    let (_cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
     let (event_tx, _) = broadcast::channel::<PipelineEvent>(1024);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
     // Dispatch asks the pool which server a new lane should try, so a harness
@@ -589,7 +640,6 @@ async fn new_direct_pipeline_on_machine(
     let buffers = BufferPool::new(buffer_config);
 
     let pipeline = Pipeline::new(
-        cmd_rx,
         event_tx,
         nntp,
         buffers,
@@ -607,15 +657,28 @@ async fn new_direct_pipeline_on_machine(
     )
     .await
     .unwrap();
-    // This rig drives the classic engine by hand; a graph test says so when
-    // it admits through the switch.
 
     (pipeline, intermediate_dir, complete_dir)
 }
 
-pub(in crate::pipeline) async fn new_direct_pipeline(
-    temp_dir: &TempDir,
-) -> (Pipeline, PathBuf, PathBuf) {
+async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+    let (mut pipeline, intermediate, complete) = new_direct_pipeline(temp_dir).await;
+    // Scheduler-only callers name two real policy entries without dialing.
+    pipeline.nntp = Arc::new(NntpClient::new(NntpClientConfig {
+        servers: (0..2)
+            .map(|_| weaver_nntp::pool::ServerPoolConfig {
+                max_connections: 100,
+                ..Default::default()
+            })
+            .collect(),
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    }));
+    (pipeline, intermediate, complete)
+}
+
+pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
     new_direct_pipeline_with_buffers(
         temp_dir,
         BufferPoolConfig {
@@ -1906,6 +1969,43 @@ fn with_priority(mut spec: JobSpec, priority: &str) -> JobSpec {
     spec
 }
 
+// Record cancellation, drive its boundary, then observe the durable archive.
+async fn cancel_one_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    origin: crate::jobs::handle::CancellationOrigin,
+) -> Result<(), crate::SchedulerError> {
+    pipeline.report_all_for_test();
+    let mut events = pipeline.event_tx.subscribe();
+    pipeline
+        .shared_state
+        .queue
+        .cancel_jobs(BTreeSet::from([job_id]), origin)
+        .remove(&job_id)
+        .unwrap()?;
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(pipeline).await;
+    loop {
+        if matches!(events.recv().await.unwrap(), PipelineEvent::JobCancelled { job_id: id } if id == job_id)
+        {
+            return Ok(());
+        }
+    }
+}
+
+// Hands the actor the archive outcome of the one cancel batch in flight.
+async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
+    match pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    {
+        TerminalPostProcessingEvent::CancelJobsDone(done) => pipeline.handle_cancel_jobs_done(done),
+        _ => panic!("expected the cancel's archive done event"),
+    }
+}
+
 pub(in crate::pipeline) async fn insert_active_job(
     pipeline: &mut Pipeline,
     job_id: JobId,
@@ -1937,6 +2037,36 @@ async fn insert_active_job_with_persisted_nzb_named(
     nzb_zstd: Vec<u8>,
     nzb_file_name: Option<&str>,
 ) -> PathBuf {
+    insert_on(
+        pipeline,
+        job_id,
+        spec,
+        nzb_zstd,
+        nzb_file_name,
+        crate::pipeline::graph::Engine::Classic,
+    )
+    .await
+}
+
+// [`insert_active_job`] for a job admitted under `engine`: its row is
+// stamped with it and its queues are built as admission builds them for it.
+pub(in crate::pipeline) async fn insert_active_job_on(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    engine: crate::pipeline::graph::Engine,
+) -> PathBuf {
+    insert_on(pipeline, job_id, spec, sample_nzb_zstd(), None, engine).await
+}
+
+async fn insert_on(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+    nzb_zstd: Vec<u8>,
+    nzb_file_name: Option<&str>,
+    engine: crate::pipeline::graph::Engine,
+) -> PathBuf {
     let nzb_file_name = nzb_file_name
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}.nzb", job_id.0));
@@ -1959,7 +2089,7 @@ async fn insert_active_job_with_persisted_nzb_named(
     pipeline
         .db
         .create_active_job(&crate::ActiveJob {
-            engine: crate::pipeline::graph::Engine::Classic,
+            engine,
             job_id,
             nzb_hash: [0; 32],
             nzb_path: working_dir.join(&nzb_file_name),
@@ -1980,7 +2110,11 @@ async fn insert_active_job_with_persisted_nzb_named(
         })
         .unwrap();
     let (assembly, download_queue, recovery_queue) =
-        Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), engine);
+    // This fixture represents work already admitted, not queued intake.
+    pipeline.db.set_nzb_admitted(job_id, true).unwrap();
+    pipeline.nzb_admitted.insert(job_id);
+    pipeline.nzb_seen.insert(job_id);
     // Mirror admission: `add_job` registers a job's bare `.7z` files as
     // direct-unpack arming candidates, and this harness hand-builds the state
     // `add_job` would otherwise have produced.
@@ -2035,6 +2169,7 @@ async fn insert_active_job_with_persisted_nzb_named(
         },
     );
     pipeline.job_order.push(job_id);
+    pipeline.report_all_for_test();
     working_dir
 }
 
@@ -2438,10 +2573,6 @@ async fn submit_decoded_segment_declaring(
     // used to find already reached lands on the check the ticket re-arms —
     // settled first, because that verdict can be the demotion the sweep below
     // then hands back.
-    //
-    // A conventional article's write is a ticket of its own, landed here the
-    // same way.
-    settle_segment_write_work(pipeline).await;
     settle_direct_verification_read(pipeline, file_id.job_id).await;
     settle_direct_demotion_work(pipeline).await;
 }
@@ -2510,7 +2641,6 @@ async fn settle_queued_decode(
             },
         })
         .await;
-    settle_segment_write_work(pipeline).await;
     settle_direct_demotion_work(pipeline).await;
 }
 
@@ -2545,26 +2675,6 @@ async fn settle_direct_placement_work(pipeline: &mut Pipeline) {
     }
 }
 
-// Drives every decoded batch out to the disk owner to its commit, the way
-// the orchestrator's select loop would: the write runs on an owner thread,
-// and the commit waits for the done message.
-//
-// It waits on the messages themselves, with no deadline.
-async fn settle_segment_write_work(pipeline: &mut Pipeline) {
-    while pipeline
-        .segment_writes
-        .values()
-        .any(|tickets| !tickets.is_empty())
-    {
-        let done = pipeline
-            .segment_write_done_rx
-            .recv()
-            .await
-            .expect("the segment write channel should stay open");
-        pipeline.handle_segment_write_done(done).await;
-    }
-}
-
 // Drives every outstanding demotion reconstruction ticket to its handler, the
 // way the orchestrator's select loop would.
 //
@@ -2580,9 +2690,6 @@ async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
             .await
             .expect("the demotion completion channel should stay open");
         pipeline.handle_direct_demotion_done(done).await;
-        // A handback writes the articles the sweep unblocked: a ticket of
-        // its own, landed here the same way.
-        settle_segment_write_work(pipeline).await;
     }
 }
 
@@ -2644,7 +2751,6 @@ async fn submit_decoded_segment_from_server(
             },
         )
         .await;
-    settle_segment_write_work(pipeline).await;
     settle_direct_placement_work(pipeline).await;
 }
 
@@ -2721,13 +2827,7 @@ pub(in crate::pipeline) fn job_status_for_assert(
         .jobs
         .get(&job_id)
         .map(|state| state.status.clone())
-        .or_else(|| {
-            pipeline
-                .finished_jobs
-                .iter()
-                .find(|job| job.job_id == job_id)
-                .map(|job| job.status.clone())
-        })
+        .or_else(|| pipeline.shared_state.get_job(job_id).map(|job| job.status))
 }
 
 fn drain_job_verification_started(
@@ -3104,7 +3204,6 @@ async fn park_direct_verification_verdict(pipeline: &mut Pipeline, job_id: JobId
 }
 
 async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
-    settle_segment_write_work(pipeline).await;
     settle_direct_post_repair_work(pipeline).await;
 
     settle_inflight_moves(pipeline).await;
@@ -3174,7 +3273,6 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
             )
         });
         pipeline.handle_decode_done(done).await;
-        settle_segment_write_work(pipeline).await;
         settle_direct_placement_work(pipeline).await;
         settle_inflight_moves(pipeline).await;
     }
@@ -3262,6 +3360,7 @@ async fn setup_extracting_rar_full_set(
 
 fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWork {
     DownloadWork {
+        counters: None,
         segment_id: SegmentId {
             file_id: NzbFileId { job_id, file_index },
             segment_number: 0,

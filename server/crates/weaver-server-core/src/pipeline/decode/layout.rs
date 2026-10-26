@@ -174,6 +174,21 @@ pub(super) fn validate_yenc_layout(
     Ok(file_offset)
 }
 
+// Whether a placement fits the envelope the NZB's own segment sizes prove.
+//
+// Not a rejection criterion on its own (see [`validate_yenc_layout`]), but
+// when two accepted claims contradict each other one of them is wrong, and
+// the one the NZB can vouch for is the one to keep.
+#[inline]
+pub(super) fn placement_within_nzb_envelope(
+    expected: ExpectedSegmentLayout,
+    offset: u64,
+    len: u32,
+) -> bool {
+    offset <= expected.max_file_offset
+        && offset.saturating_add(u64::from(len)) <= expected.max_file_size
+}
+
 // The layout boundary this article declares for itself, when it declares a
 // usable one that fits the same envelopes a placement is bounded by.
 //

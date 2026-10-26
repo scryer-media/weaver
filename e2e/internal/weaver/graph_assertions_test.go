@@ -815,7 +815,7 @@ func TestAssertDirectStoreEngagementReadsTheGraphLog(t *testing.T) {
 	wantVerdict(t, assertDirectStoreEngagement(noWeaver, jobs), "no job of the phase bound a store object")
 
 	// Classic with its gate off stays a no-op, whatever the log holds.
-	t.Setenv(weaverEngineEnv, "")
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	wantVerdict(t, assertDirectStoreEngagement(noWeaver, jobs), "")
 }
 
@@ -826,7 +826,7 @@ func TestFileIdentityRewriteFailureNamesItsEvidence(t *testing.T) {
 		ObservedCurrentFilenames: []string{"archive.part1.rar (par2)"},
 	}
 
-	t.Setenv(weaverEngineEnv, "")
+	t.Setenv(weaverEngineEnv, string(engineClassic))
 	if got := empty.terminalFailureMessage("failed", ""); !strings.Contains(got, "no matching active_file_identities rows were observed") {
 		t.Fatalf("classic message = %q", got)
 	}

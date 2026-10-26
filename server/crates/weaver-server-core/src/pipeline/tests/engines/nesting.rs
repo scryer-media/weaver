@@ -524,6 +524,7 @@ async fn three_decoders_deep_xz_in_gzip_in_zstd_delivers_under_both_engines() {
 
 // The compressed RAR5 fixture (two stored members, one compressed) as a
 // member of a stored RAR: the store hands it to the engine one deep.
+// Classic delivers the same three members.
 #[tokio::test]
 async fn a_nested_stored_rar_with_one_compressed_member_among_stored_ones_delivers_under_graph() {
     let mixed = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
@@ -568,12 +569,14 @@ async fn a_nested_stored_rar_with_one_compressed_member_among_stored_ones_delive
         "{delivery:?}"
     );
     assert!(delivery.withheld.is_empty(), "{delivery:?}");
-    // Classic stops at Extracting on this job and settles there.
-    let classic = super::harness::try_run(&scenario, Engine::Classic).await;
-    match classic {
-        Err(stall) => assert_eq!(stall.status, Some(JobStatus::Extracting), "{}", stall.state),
-        Ok(outcome) => panic!("classic finished: {}", summary(&outcome)),
-    }
+    // Classic extracts the inner RAR and delivers what the graph does.
+    let classic = run(&scenario, Engine::Classic).await;
+    assert!(classic.completed(), "classic: {}", summary(&classic));
+    assert!(
+        classic.files == graph.files,
+        "classic delivers what the graph does: {}",
+        summary(&classic)
+    );
 }
 
 // Small files, each in its own xz, stored in one 7z, run at the graph's
@@ -724,10 +727,6 @@ async fn a_sized_by_descriptor_zip_entry_under_an_xz_parent_is_refused_unbounded
     assert!(delivery.withheld.is_empty(), "{delivery:?}");
     assert_eq!(delivery.whole, [FILE], "{delivery:?}");
     assert_eq!(delivery.files[0].depth, 2, "{delivery:?}");
-    let classic = super::harness::try_run(&scenario, Engine::Classic).await;
-    let classic = match classic {
-        Ok(outcome) => summary(&outcome),
-        Err(stall) => format!("stalled at {:?}", stall.status),
-    };
-    assert_eq!(classic, "Some(Complete) [ember.bin]", "classic");
+    let classic = run(&scenario, Engine::Classic).await;
+    assert_eq!(summary(&classic), "Some(Complete) [ember.bin]", "classic");
 }

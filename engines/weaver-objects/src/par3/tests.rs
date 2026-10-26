@@ -4,7 +4,7 @@
 mod facts;
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ByteRange, Delivery, MemberId, Object, ObjectId, Provenance, Recovery};
+use weaver_graph::{ByteRange, Delivery, MemberId, Object, ObjectId, Provenance, Recovery, Seek};
 
 use super::Par3;
 use crate::testing::{Job, par3_set, payload};
@@ -107,6 +107,44 @@ fn par3_short_of_blocks_waits_until_a_volume_is_in_hand() {
     );
     assert_eq!(job.object.outcome(), Some(outcome));
     assert!(job.store.members[&member] == one);
+}
+
+// The head of each file of a set arrives before any damage: a volume named
+// for recovery blocks, whose head holds only the index it repeats, defers
+// the rest of itself; the index, which carries none, defers nothing.
+#[test]
+fn a_recovery_volume_whose_head_holds_only_the_index_is_deferred() {
+    const HEAD: u64 = 64;
+    let one = payload(41, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 2);
+    let mut job = Job::new(Par3::new(OWN), OWN);
+    let mut volumes = Vec::new();
+    for (name, bytes) in &files {
+        let volume = job.name(name, bytes);
+        job.object.deliver(
+            Delivery {
+                volume,
+                offset: 0,
+                bytes: &bytes[..HEAD as usize],
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut Vec::new(),
+        );
+        volumes.push(volume);
+    }
+    job.member("one.bin", &one);
+    bind(&mut job);
+    let mut out = Vec::new();
+    Recovery::wants(&job.object, &mut out);
+    let expected: Vec<Seek> = files
+        .iter()
+        .zip(&volumes)
+        .filter(|((name, _), _)| name.contains(".vol"))
+        .map(|(_, volume)| Seek::deferred(*volume, ByteRange::new(HEAD, u64::MAX)))
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(out, expected);
 }
 
 #[test]
@@ -311,7 +349,7 @@ fn a_hidden_member_still_arriving_holds_the_set_without_asking_for_recovery() {
     bind(&mut job);
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
     let mut wants = Vec::new();
-    Recovery::wants(&mut job.object, &mut wants);
+    Recovery::wants(&job.object, &mut wants);
     assert!(wants.is_empty(), "{wants:?}");
     job.arrive(hidden, 4000, &one[4000..], Provenance::Fresh);
     job.store.members.insert(hidden, one.clone());

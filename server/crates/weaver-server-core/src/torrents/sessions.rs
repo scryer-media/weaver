@@ -17,8 +17,6 @@ use sha1::{Digest, Sha1};
 pub use weaver_torrent::IpRanges;
 use weaver_torrent::dht::DhtPersistenceConfig;
 use weaver_torrent::network::{KernelSockets, Resolver};
-use weaver_tunnel::bridge::Bridge;
-use weaver_tunnel::pipe::Dialer;
 use weaver_torrent::upnp::PortMapEvents;
 pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
@@ -26,6 +24,8 @@ use weaver_torrent::{
     ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions,
     SocketFactory,
 };
+use weaver_tunnel::bridge::Bridge;
+use weaver_tunnel::pipe::Dialer;
 
 use crate::StateError;
 use crate::persistence::Database;
@@ -154,9 +154,8 @@ fn leg_egress(network: &NetworkRuntime, egress_id: u32) -> Option<EgressInterfac
 
 /// How a session rides a leg through `egress_id` and `path`.
 pub fn leg_kind(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> LegKind {
-    leg_egress(network, egress_id).map_or(LegKind::System, |egress| {
-        LegKind::of(&egress.binding, path)
-    })
+    leg_egress(network, egress_id)
+        .map_or(LegKind::System, |egress| LegKind::of(&egress.binding, path))
 }
 
 /// Why a leg on egress `egress_id` may carry nothing now, when it may not:

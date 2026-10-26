@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::member::FIRST_BYTES;
-use weaver_graph::{ByteRange, MemberId, NodeId, Pull, Purpose, Seek, VolumeIndex, Weight};
+use weaver_graph::{ByteRange, MemberId, NodeId, Pull, Purpose, Seek, VolumeIndex, Weight, When};
 
 use super::layout::Span;
 use super::{Class, Move, PieceFile, PieceLayout, PieceRoot, Unit, Verified};
@@ -87,6 +87,7 @@ fn critical(volume: u32, range: ByteRange) -> Ask {
             range,
             purpose: Purpose::Data,
             weight: Weight::FIRST,
+            when: When::Now,
         },
         bidder: NodeId(1),
         in_order: false,
@@ -100,6 +101,7 @@ fn recovery(volume: u32, range: ByteRange) -> Ask {
             range,
             purpose: Purpose::Recovery,
             weight: Weight::FIRST,
+            when: When::Now,
         },
         bidder: NodeId(1),
         in_order: false,

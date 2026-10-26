@@ -37,3 +37,11 @@ test("pause, terminal states, and unrelated retry reasons are not propagation ho
   assert.equal(job("COMPLETED", "propagation_delay").status, "COMPLETE");
   assert.equal(job("DOWNLOADING", "network_error").status, "DOWNLOADING");
 });
+
+test("an NZB waiting for admission stays queued and exposes its reason", () => {
+  const held = job("QUEUED", "nzb_slot");
+  assert.equal(held.status, "QUEUED");
+  assert.equal(isActiveStatus(held.status), false);
+  assert.equal(held.downloadWaitReason, "nzb_slot");
+  assert.equal(progressDisplayKind(held.status, held.progress), "empty");
+});

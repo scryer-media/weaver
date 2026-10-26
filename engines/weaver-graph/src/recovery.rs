@@ -41,6 +41,10 @@ pub enum RepairOutcome {
     Impossible { damaged: u64, reachable: u64 },
     // Recovery blocks are still on their way.
     Waiting,
+    // The object read no recovery data it could check anything against, so
+    // it rules on nothing: no member is clean or short by it. It has nothing
+    // more to wait for either.
+    Unread,
 }
 
 // One recovery set an object holds, as its last repair left it.

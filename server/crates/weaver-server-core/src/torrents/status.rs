@@ -1324,14 +1324,31 @@ mod tests {
         ];
         let ran: Vec<_> = trackers(listed, &run, None)
             .into_iter()
-            .map(|tracker| (tracker.tier, tracker.url, tracker.updating, tracker.named_by))
+            .map(|tracker| {
+                (
+                    tracker.tier,
+                    tracker.url,
+                    tracker.updating,
+                    tracker.named_by,
+                )
+            })
             .collect();
         assert_eq!(
             ran,
             [
-                (0, "http://magnet.invalid/announce".into(), false, NamedBy::Torrent),
+                (
+                    0,
+                    "http://magnet.invalid/announce".into(),
+                    false,
+                    NamedBy::Torrent
+                ),
                 (0, "http://tracker.invalid/".into(), true, NamedBy::Torrent),
-                (1, "udp://backup.invalid:80".into(), false, NamedBy::Operator),
+                (
+                    1,
+                    "udp://backup.invalid:80".into(),
+                    false,
+                    NamedBy::Operator
+                ),
             ]
         );
     }

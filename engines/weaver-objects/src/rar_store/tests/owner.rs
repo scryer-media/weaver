@@ -4,7 +4,8 @@
 // The store's owner, in miniature: it binds volumes, delivers their bytes,
 // holds what the store cannot place yet and hands it back once the store
 // places it, keeps envelope bytes as they pass the way a namespace's shelf
-// does, answers seeks, and writes members the way a namespace does.
+// does and holds them again when the store says they are no longer its own,
+// answers seeks, and writes members the way a namespace does.
 
 use std::collections::BTreeMap;
 
@@ -45,6 +46,9 @@ pub(super) struct Owner {
     pub pull: Pull,
     held: Vec<(VolumeIndex, ByteRange, Provenance, Vec<u8>)>,
     shelves: BTreeMap<u32, Shelf>,
+    // What each volume was delivered, as the parent's member record keeps
+    // it: what a range asked for again is read back from.
+    delivered: BTreeMap<u32, Coverage>,
     bound: Vec<bool>,
     next: u32,
 }
@@ -68,6 +72,7 @@ impl Owner {
             pull: Pull::Moved(0),
             held: Vec::new(),
             shelves: BTreeMap::new(),
+            delivered: BTreeMap::new(),
             bound: vec![false; count],
             next: 0,
         };
@@ -160,6 +165,10 @@ impl Owner {
         }
         let real = &self.volumes[volume.0 as usize].1[range.start as usize..range.end as usize];
         let bytes = bytes.unwrap_or(real).to_vec();
+        self.delivered
+            .entry(volume.0)
+            .or_default()
+            .write(range, provenance);
         let mut out = Vec::new();
         let members = &self.members;
         let mut read =
@@ -288,6 +297,9 @@ impl Owner {
             fn lost(&self) -> bool {
                 false
             }
+            fn asking(&self) -> bool {
+                false
+            }
             fn beside(&self) -> Vec<weaver_graph::Beside<'_>> {
                 Vec::new()
             }
@@ -309,8 +321,13 @@ impl Owner {
     }
 
     fn apply(&mut self, out: Vec<Emit>) {
+        let mut again = Vec::new();
         for emit in out {
             match emit {
+                Emit::Again { volume, range } => {
+                    self.said.push(Emit::Again { volume, range });
+                    again.push((volume, range));
+                }
                 Emit::Member {
                     member,
                     name,
@@ -352,8 +369,92 @@ impl Owner {
                     self.next = self.next.min(member.0);
                     self.said.push(Emit::Retract(member));
                 }
+                Emit::Unkept {
+                    volume,
+                    range,
+                    envelope,
+                    at,
+                } => {
+                    // Read back from the shelf they were kept on, and held
+                    // until the store places them again.
+                    let shelf = &self.shelves[&envelope];
+                    let kept = ByteRange::at(at, range.len());
+                    for run in shelf.coverage.overlapping(kept) {
+                        let piece = run.range.intersect(kept).expect("overlapping");
+                        let bytes = shelf.bytes[piece.start as usize..piece.end as usize].to_vec();
+                        let start = range.start + (piece.start - at);
+                        self.held.push((
+                            volume,
+                            ByteRange::at(start, piece.len()),
+                            run.provenance,
+                            bytes,
+                        ));
+                    }
+                    self.said.push(emit);
+                }
                 other => self.said.push(other),
             }
+        }
+        for (volume, range) in again {
+            self.again(volume, range);
+        }
+    }
+
+    // A range asked for again, as the tree answers it once the batch is
+    // applied: what of it was delivered is read back as the store rebuilds
+    // it, every member it reached is open again, and the bytes come again
+    // as they came.
+    fn again(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let runs: Vec<(ByteRange, Provenance)> = self
+            .delivered
+            .get(&volume.0)
+            .map(|coverage| {
+                coverage
+                    .overlapping(range)
+                    .filter_map(|run| Some((run.range.intersect(range)?, run.provenance)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut read_back = Vec::new();
+        for (piece, provenance) in runs {
+            let (members, shelves) = (&self.members, &self.shelves);
+            let mut read = |placement: &Placement, into: &mut Vec<u8>| -> bool {
+                match placement {
+                    Placement::Member { .. } => read_member(members, placement, into),
+                    Placement::Envelope { envelope, range } => {
+                        let Some(shelf) = shelves.get(envelope) else {
+                            return false;
+                        };
+                        shelf.coverage.covered(*range) && {
+                            into.extend_from_slice(
+                                &shelf.bytes[range.start as usize..range.end as usize],
+                            );
+                            true
+                        }
+                    }
+                    Placement::Held { .. } => false,
+                }
+            };
+            let mut bytes = Vec::new();
+            if self.object.posted(volume, piece, &mut read, &mut bytes) {
+                read_back.push((piece, provenance, bytes));
+            }
+        }
+        for (piece, _, _) in &read_back {
+            let mut placements = Vec::new();
+            self.object.locate(volume, *piece, &mut placements);
+            for placement in placements {
+                if let Placement::Member { member, range } = placement
+                    && let Some(got) = self.members.get_mut(&member.0)
+                {
+                    got.coverage.erase(range);
+                    got.closed = false;
+                }
+            }
+            self.object.unposted(volume, *piece);
+        }
+        for (piece, provenance, bytes) in read_back {
+            self.push(volume, piece, provenance, Some(&bytes));
         }
     }
 

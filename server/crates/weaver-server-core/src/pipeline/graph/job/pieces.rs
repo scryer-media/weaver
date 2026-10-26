@@ -168,13 +168,14 @@ impl GraphJob<PieceRoot> {
     #[cfg(test)]
     pub(crate) fn raise(&mut self, file: u32) {
         use crate::pipeline::graph::root::{Ask, Root};
-        use weaver_graph::{NodeId, Purpose, Seek, Weight};
+        use weaver_graph::{NodeId, Purpose, Seek, Weight, When};
         let ask = Ask {
             seek: Seek {
                 volume: VolumeIndex(file),
                 range: ByteRange::new(0, u64::MAX),
                 purpose: Purpose::Data,
                 weight: Weight::FIRST,
+                when: When::Now,
             },
             bidder: NodeId(1),
             in_order: false,

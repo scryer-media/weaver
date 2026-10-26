@@ -223,8 +223,10 @@ async fn submit_keeps_password_candidates_on_the_job() {
     let data = response_data(&resp);
     assert!(data["submitNzb"]["accepted"].as_bool().unwrap());
     let id = data["submitNzb"]["item"]["id"].as_u64().unwrap();
-    let supplied =
-        h.supplied_passwords.lock().unwrap()[&weaver_server_core::jobs::ids::JobId(id)].clone();
+    let (_, supplied) =
+        h.db.load_active_job_password_sources(weaver_server_core::jobs::ids::JobId(id))
+            .unwrap()
+            .unwrap();
     assert_eq!(
         supplied
             .iter()
@@ -1049,6 +1051,8 @@ async fn pause_queued_job() {
     let data = response_data(&resp);
     assert!(data["pauseQueueItem"]["success"].as_bool().unwrap());
 
+    h.wait_for_job_status(id, weaver_server_core::JobStatus::Paused)
+        .await;
     let resp = h.execute("{ queueItems { id state } }").await;
     assert_no_errors(&resp);
     let data = response_data(&resp);
@@ -1071,6 +1075,8 @@ async fn resume_paused_job() {
     ))
     .await;
 
+    h.wait_for_job_status(id, weaver_server_core::JobStatus::Paused)
+        .await;
     let resp = h
         .execute(&format!(
             r#"mutation {{ resumeQueueItem(id: {id}) {{ success item {{ id state }} }} }}"#
@@ -1080,6 +1086,8 @@ async fn resume_paused_job() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["resumeQueueItem"]["success"].as_bool().unwrap());
+    h.wait_for_job_status(id, weaver_server_core::JobStatus::Queued)
+        .await;
 
     let resp = h.execute("{ queueItems { id state } }").await;
     assert_no_errors(&resp);
@@ -1090,7 +1098,7 @@ async fn resume_paused_job() {
         .iter()
         .find(|j| j["id"].as_u64().unwrap() == id)
         .expect("job not found");
-    assert_eq!(job["state"].as_str().unwrap(), "DOWNLOADING");
+    assert_eq!(job["state"].as_str().unwrap(), "QUEUED");
 }
 
 #[tokio::test]
@@ -1137,13 +1145,14 @@ async fn resume_idempotent() {
         .iter()
         .find(|j| j["id"].as_u64().unwrap() == id)
         .expect("job not found");
-    assert_eq!(job["state"].as_str().unwrap(), "DOWNLOADING");
+    assert_eq!(job["state"].as_str().unwrap(), "QUEUED");
 }
 
 #[tokio::test]
 async fn cancel_queued_job() {
     let h = TestHarness::new().await;
     let id = h.submit_test_nzb("cancel-test").await;
+    let mut events = h.handle.subscribe_events();
 
     let resp = h
         .execute(&format!(
@@ -1153,6 +1162,11 @@ async fn cancel_queued_job() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["cancelQueueItem"]["success"].as_bool().unwrap());
+    // The job leaves the queue once its history row commits.
+    while !matches!(
+        events.recv().await.unwrap(),
+        weaver_server_core::events::model::PipelineEvent::JobCancelled { job_id } if job_id.0 == id
+    ) {}
 
     let resp = h.execute("{ queueItems { id } }").await;
     assert_no_errors(&resp);
@@ -1171,6 +1185,7 @@ async fn cancel_paused_job() {
         r#"mutation {{ pauseQueueItem(id: {id}) {{ success }} }}"#
     ))
     .await;
+    let mut events = h.handle.subscribe_events();
 
     let resp = h
         .execute(&format!(
@@ -1180,6 +1195,11 @@ async fn cancel_paused_job() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["cancelQueueItem"]["success"].as_bool().unwrap());
+    // The job leaves the queue once its history row commits.
+    while !matches!(
+        events.recv().await.unwrap(),
+        weaver_server_core::events::model::PipelineEvent::JobCancelled { job_id } if job_id.0 == id
+    ) {}
 
     let resp = h.execute("{ queueItems { id } }").await;
     assert_no_errors(&resp);

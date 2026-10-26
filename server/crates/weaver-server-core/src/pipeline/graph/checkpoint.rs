@@ -2,11 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A graph job's checkpoint: the tree's records, the job's and the root's
-// facts, which members have files, the kept envelopes and which candidate
-// each node was offered last, as the rows the database keeps. It is taken after every
-// step that reached the tree, when the step's bytes are written, so it only
-// ever describes bytes on disk; holds in memory are left out and fetched
-// again.
+// facts, which members have files, the kept envelopes, the holds paged to
+// scratch and which candidate each node was offered last, as the rows the
+// database keeps. It is taken after every step that reached the tree, when
+// the step's bytes are written, so it only ever describes bytes on disk;
+// holds in memory are left out and fetched again. A graceful stop pages
+// every hold it can to scratch first, so its last checkpoint leaves out only
+// what scratch could not take.
 //
 // Each checkpoint is written as what it changed of the one before: a step
 // costs the database the rows it changed, not the job's. One writer per job:
@@ -22,6 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use tracing::{debug, warn};
+use weaver_graph::holds::ScratchHold;
 use weaver_graph::{
     ByteRange, CoverageRecord, CryptRecord, Facts, Kind, MemberId, MemberRecord, NodeId,
     NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
@@ -32,8 +35,8 @@ use super::job::GraphJob;
 use super::root::Root;
 use super::root::facts::{self, JobFacts, Parts, RootBlob, RootFactsError, RootRow};
 use crate::jobs::graph_checkpoint::{
-    Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, MemberRow, NodeRow,
-    PartRow, Row,
+    Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, HoldRow, MemberRow,
+    NodeRow, PartRow, Row,
 };
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
@@ -42,7 +45,7 @@ use crate::pipeline::Pipeline;
 // builder makes.
 const ROOT_KIND: &str = "root";
 
-// A job's checkpoint, as the graph layer reads and writes it.
+// A job's checkpoint, as a restore reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) tree: TreeRecord,
@@ -51,13 +54,28 @@ pub(crate) struct Snapshot {
     // What the writer holds of each member it holds anything of.
     pub(crate) files: BTreeMap<(NodeId, MemberId), FileState>,
     pub(crate) kept: Vec<KeptRecord>,
+    // The holds each namespace had paged to scratch.
+    pub(crate) holds: Vec<HoldRecord>,
     // The candidate each node was offered last, by index.
     pub(crate) passwords: BTreeMap<NodeId, usize>,
 }
 
-// The generations of the tree and of the writer a checkpoint read the job
-// at.
-pub(crate) type Generations = (u64, u64);
+// A hold of the namespace at `node` paged to its scratch file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HoldRecord {
+    pub(crate) node: NodeId,
+    pub(crate) held: ScratchHold,
+}
+
+// The generations a checkpoint read the job at: of the tree, of the
+// writer's files, of its kept envelopes, and of the offers of candidates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Generations {
+    pub(crate) tree: u64,
+    pub(crate) files: u64,
+    pub(crate) kept: u64,
+    pub(crate) offered: u64,
+}
 
 // What the writer holds of one member.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -103,19 +121,21 @@ struct Slot {
 }
 
 // Every row the database holds of the job but the root's facts parts, the
-// rows of each node apart, by the node's id as the rows have it, and the
-// generations of the job they were read at: a step reads and compares
-// again only the nodes marked since.
+// rows of each node apart, its kept envelopes with them, by the node's id as
+// the rows have it, and the generations of the job they were read at: a
+// step reads and compares again only the nodes marked since.
 #[derive(Default)]
 struct Held {
     root: Option<NodeRow>,
     nodes: BTreeMap<i64, GraphCheckpoint>,
-    // The candidate each node was offered last, as its row has it.
-    passwords: BTreeMap<i64, i64>,
-    envelopes: GraphCheckpoint,
     // `None` for rows a restore read, not ones taken from the job: the next
     // step reads every node.
     read: Option<Generations>,
+    // The post's encoded bytes of the articles the rows' root facts settle,
+    // as the last checkpoint taken from the job encoded them: the job's
+    // durable download floor. 0 for rows a restore read; the restore's own
+    // floor stands for them until the job's first checkpoint.
+    settled_bytes: u64,
 }
 
 // What a job's checkpoints asked the database to write, counted as each is
@@ -145,6 +165,7 @@ impl Pending {
         let held = slot.held.get_or_insert_with(Held::default);
         let (row, parts) = job.encode_root(!slot.root_read);
         slot.root_read = true;
+        held.settled_bytes = job.settled_bytes();
         let root = root_row(RootRow::VERSION, facts::encode(&row));
         if held.root.as_ref() != Some(&root) {
             delta.nodes.insert(root.key(), Some(root.clone()));
@@ -158,44 +179,18 @@ impl Pending {
         if held.read.is_none() {
             nodes.extend(held.nodes.keys());
         }
-        let passwords: BTreeMap<i64, i64> = job
-            .last_offered()
-            .into_iter()
-            .map(|(node, index)| (i64::from(node.0), index as i64))
-            .collect();
-        nodes.extend(
-            passwords
-                .iter()
-                .chain(&held.passwords)
-                .filter(|(node, _)| passwords.get(node) != held.passwords.get(node))
-                .map(|(node, _)| *node),
-        );
         held.read = Some(job.generations());
         for node in nodes {
             // An id no tree could have names a node the job does not have.
             let now = u32::try_from(node)
-                .ok()
-                .and_then(|id| job.node(NodeId(id)))
-                .map_or_else(GraphCheckpoint::default, |(record, files)| {
-                    node_rows(
-                        &record,
-                        |member| files.get(&member).copied().unwrap_or_default(),
-                        passwords.get(&node).copied(),
-                    )
-                });
+                .map(NodeId)
+                .map_or_else(|_| GraphCheckpoint::default(), |node| job_rows(job, node));
             let was = held.nodes.remove(&node).unwrap_or_default();
             delta.compare(&was, &now);
             if now != GraphCheckpoint::default() {
                 held.nodes.insert(node, now);
             }
         }
-        held.passwords = passwords;
-        let envelopes = GraphCheckpoint {
-            envelopes: envelope_rows(&job.kept_records()),
-            ..GraphCheckpoint::default()
-        };
-        delta.compare(&held.envelopes, &envelopes);
-        held.envelopes = envelopes;
         let changed = root_parts(&mut slot.root_parts, parts);
         if delta.whole {
             let root = i64::from(NodeId::ROOT.0);
@@ -254,9 +249,6 @@ impl Pending {
                 held.root = Some(row);
                 continue;
             }
-            if let Some(index) = row.winning_password {
-                held.passwords.insert(row.node, index);
-            }
             held.nodes.entry(row.node).or_default().nodes.push(row);
         }
         for row in rows.members {
@@ -277,8 +269,23 @@ impl Pending {
                 held.nodes.entry(row.node).or_default().parts.push(row);
             }
         }
-        held.envelopes.envelopes = rows.envelopes;
+        for row in rows.envelopes {
+            held.nodes.entry(row.node).or_default().envelopes.push(row);
+        }
+        for row in rows.holds {
+            held.nodes.entry(row.node).or_default().holds.push(row);
+        }
         slot.held = Some(held);
+    }
+
+    // The bytes the rows the database holds, once what is queued is
+    // written, spare a restore fetching again; 0 while what it holds is not
+    // known.
+    pub(crate) fn settled_bytes(&self) -> u64 {
+        self.slot()
+            .held
+            .as_ref()
+            .map_or(0, |held| held.settled_bytes)
     }
 
     #[cfg(test)]
@@ -288,6 +295,15 @@ impl Pending {
 }
 
 impl Pipeline {
+    // A graph job's durable download floor: the bytes its last checkpoint
+    // spares a restore. `None` for a classic job, whose floor is its file
+    // coverage barrier's.
+    pub(in crate::pipeline) fn graph_checkpointed_bytes(&self, job_id: JobId) -> Option<u64> {
+        self.graph_jobs
+            .get(&job_id)
+            .map(|graph| graph.pending().settled_bytes())
+    }
+
     // Checkpoint the job's tree as it stands now.
     pub(crate) fn checkpoint_graph_job(&mut self, job_id: JobId) {
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
@@ -424,6 +440,13 @@ pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
         out.coverage.extend(rows.coverage);
         out.crypt.extend(rows.crypt);
         out.parts.extend(rows.parts);
+        let holds: Vec<ScratchHold> = snapshot
+            .holds
+            .iter()
+            .filter(|record| record.node == node.node)
+            .map(|record| record.held)
+            .collect();
+        out.holds.extend(hold_rows(node.node, &holds));
     }
     out.nodes.sort_by_key(Row::key);
     out.members.sort_by_key(Row::key);
@@ -449,6 +472,40 @@ fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
     }
 }
 
+// The rows the job has now of one node: its own, as `node_rows` takes
+// them, its kept envelopes' and its holds on scratch.
+fn job_rows<R: Root>(job: &GraphJob<R>, node: NodeId) -> GraphCheckpoint {
+    let mut out = job
+        .node(node)
+        .map_or_else(GraphCheckpoint::default, |(record, files)| {
+            node_rows(
+                &record,
+                |member| files.get(&member).copied().unwrap_or_default(),
+                job.last_offered(node).map(|index| index as i64),
+            )
+        });
+    out.envelopes = envelope_rows(&job.kept_records(node));
+    out.holds = hold_rows(node, &job.hold_records(node));
+    out
+}
+
+// A namespace's holds on scratch, in key order, as the ledger lists them.
+fn hold_rows(node: NodeId, holds: &[ScratchHold]) -> Vec<HoldRow> {
+    let node = i64::from(node.0);
+    let mut out: Vec<HoldRow> = holds
+        .iter()
+        .map(|held| HoldRow {
+            node,
+            volume: i64::from(held.volume.0),
+            start: held.range.start as i64,
+            end: held.range.end as i64,
+            scratch_offset: held.scratch_offset as i64,
+        })
+        .collect();
+    out.sort_by_key(Row::key);
+    out
+}
+
 // One node's rows, each table in key order: its own row and facts parts
 // when it holds an object, and its members, coverage and seeds. `files`
 // says what the writer holds of each member, `password` the candidate the
@@ -459,66 +516,64 @@ fn node_rows(
     password: Option<i64>,
 ) -> GraphCheckpoint {
     let mut out = GraphCheckpoint::default();
-    {
-        let id = i64::from(node.node.0);
-        if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
-            let volumes: Vec<(u32, u32)> = node
-                .volumes
-                .iter()
-                .map(|(volume, member)| (volume.0, member.0))
-                .collect();
-            out.nodes.push(NodeRow {
-                node: id,
-                parent: node.parent.map(|parent| i64::from(parent.0)),
-                parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
-                volumes: rmp_serde::to_vec(&volumes).ok(),
-                window: node
-                    .window
-                    .map(|window| (window.start as i64, window.end as i64)),
-                kind: kind.to_string(),
-                state: state_name(node.state).to_owned(),
-                reason: node.reason.map(|why| why_name(why).to_owned()),
-                facts_version: i64::from(facts.version),
-                facts: facts.bytes.clone(),
-                winning_password: password,
-            });
-            out.parts.extend(part_rows(id, &facts.parts));
-        }
-        for member in &node.members {
-            let state = files(member.member);
-            out.members.push(MemberRow {
-                node: id,
-                member: i64::from(member.member.0),
-                name: member.name.clone(),
-                output_name: member.output_name.clone(),
-                length: member.length.map(|length| length as i64),
-                closed: member.closed,
-                bound: member.bound_to.map(|object| i64::from(object.0)),
-                owner: member.owner.map(pair),
-                given_up: member.given_up.map(pair),
-                buried: member.buried,
-                undecided: member.undecided,
-                has_file: state.has_file,
-                refused: state.refused.map(|why| why_name(why).to_owned()),
-                copy_of: member.copy_of.map(|into| i64::from(into.0)),
-            });
-        }
-        out.coverage
-            .extend(node.coverage.iter().map(|run| CoverageRow {
-                node: id,
-                member: i64::from(run.member.0),
-                start: run.start as i64,
-                end: run.end as i64,
-                provenance: provenance_name(run.provenance).to_owned(),
-                verified: false,
-            }));
-        out.crypt.extend(node.crypt.iter().map(|crypt| CryptRow {
+    let id = i64::from(node.node.0);
+    if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
+        let volumes: Vec<(u32, u32)> = node
+            .volumes
+            .iter()
+            .map(|(volume, member)| (volume.0, member.0))
+            .collect();
+        out.nodes.push(NodeRow {
             node: id,
-            member: i64::from(crypt.member.0),
-            run_start: crypt.run_start,
-            seed: crypt.seed.to_vec(),
-        }));
+            parent: node.parent.map(|parent| i64::from(parent.0)),
+            parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
+            volumes: rmp_serde::to_vec(&volumes).ok(),
+            window: node
+                .window
+                .map(|window| (window.start as i64, window.end as i64)),
+            kind: kind.to_string(),
+            state: state_name(node.state).to_owned(),
+            reason: node.reason.map(|why| why_name(why).to_owned()),
+            facts_version: i64::from(facts.version),
+            facts: facts.bytes.clone(),
+            winning_password: password,
+        });
+        out.parts.extend(part_rows(id, &facts.parts));
     }
+    for member in &node.members {
+        let state = files(member.member);
+        out.members.push(MemberRow {
+            node: id,
+            member: i64::from(member.member.0),
+            name: member.name.clone(),
+            output_name: member.output_name.clone(),
+            length: member.length.map(|length| length as i64),
+            closed: member.closed,
+            bound: member.bound_to.map(|object| i64::from(object.0)),
+            owner: member.owner.map(pair),
+            given_up: member.given_up.map(pair),
+            buried: member.buried,
+            undecided: member.undecided,
+            has_file: state.has_file,
+            refused: state.refused.map(|why| why_name(why).to_owned()),
+            copy_of: member.copy_of.map(|into| i64::from(into.0)),
+        });
+    }
+    out.coverage
+        .extend(node.coverage.iter().map(|run| CoverageRow {
+            node: id,
+            member: i64::from(run.member.0),
+            start: run.start as i64,
+            end: run.end as i64,
+            provenance: provenance_name(run.provenance).to_owned(),
+            verified: false,
+        }));
+    out.crypt.extend(node.crypt.iter().map(|crypt| CryptRow {
+        node: id,
+        member: i64::from(crypt.member.0),
+        run_start: crypt.run_start,
+        seed: crypt.seed.to_vec(),
+    }));
     out.nodes.sort_by_key(Row::key);
     out.members.sort_by_key(Row::key);
     out.coverage.sort_by_key(Row::key);
@@ -782,6 +837,24 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             });
         }
     }
+    let mut holds = Vec::with_capacity(rows.holds.len());
+    for row in &rows.holds {
+        let node = node_id(row.node, row.node)?;
+        let refuse = |reason| CheckpointError::Row {
+            node: row.node,
+            reason,
+        };
+        let scratch_offset =
+            u64::try_from(row.scratch_offset).map_err(|_| refuse("a scratch offset"))?;
+        holds.push(HoldRecord {
+            node,
+            held: ScratchHold {
+                volume: VolumeIndex(u32::try_from(row.volume).map_err(|_| refuse("a volume"))?),
+                range: range(row.node, row.start, row.end)?,
+                scratch_offset,
+            },
+        });
+    }
     Ok(Snapshot {
         tree: TreeRecord {
             nodes: nodes.into_values().collect(),
@@ -791,6 +864,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
         root: root.root,
         files,
         kept: kept.into_values().collect(),
+        holds,
         passwords,
     })
 }

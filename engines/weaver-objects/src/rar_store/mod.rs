@@ -118,6 +118,9 @@ struct Entry {
     complete: bool,
     lock: Lock,
     hash_key: Option<Zeroizing<[u8; 32]>>,
+    // The candidate that keyed the file when nothing proved it: on trial,
+    // a whole-file checksum that fails on verified bytes condemns it.
+    trial: Option<usize>,
     out: Arc<Out>,
     // The plaintext's runs for the whole-file CRC, and every part's packed
     // runs, by piece, for its own.
@@ -137,10 +140,22 @@ impl Entry {
     }
 }
 
+// A file a condemned candidate keyed, as it stood: what reads its parts
+// back as they were posted, and the parts not yet posted again.
+struct Condemned {
+    cbc: Arc<Cbc>,
+    out: Arc<Out>,
+    parts: BTreeSet<VolumeIndex>,
+}
+
 // A password offered.
 struct Candidate {
     secret: Zeroizing<String>,
     headers_wrong: bool,
+    // A file it keyed on trial failed its checksum on verified bytes. Not
+    // kept: a restart offers the candidate again and keys it on trial, and
+    // condemning it once more costs one more reading of its bytes.
+    files_wrong: bool,
 }
 
 pub struct RarStore {
@@ -155,6 +170,12 @@ pub struct RarStore {
     // The candidate that opened the headers.
     headers_open: Option<usize>,
     asked: bool,
+    // The candidate on trial a checksum condemned during this delivery.
+    wrong_key: Option<usize>,
+    // Files a condemned candidate keyed, with the cipher and record they
+    // stood under, until every part of them has been posted again: their
+    // bytes read back as they were posted.
+    condemned: BTreeMap<usize, Condemned>,
     damage_said: HashSet<(VolumeIndex, u64, u64, u32)>,
     recovery_said: BTreeSet<(VolumeIndex, u64)>,
     gaps_said: BTreeSet<VolumeIndex>,
@@ -185,6 +206,8 @@ impl RarStore {
             candidates: Vec::new(),
             headers_open: None,
             asked: false,
+            wrong_key: None,
+            condemned: BTreeMap::new(),
             damage_said: HashSet::new(),
             recovery_said: BTreeSet::new(),
             gaps_said: BTreeSet::new(),
@@ -219,29 +242,44 @@ impl RarStore {
         }
     }
 
-    // Look again at everything, after anything changed.
-    fn settle(&mut self, out: &mut Vec<Emit>) {
-        while !self.gone && std::mem::take(&mut self.stale) {
-            self.walk_all(out);
-            if self.gone {
-                return;
-            }
-            self.sync(out);
-            if self.gone {
-                return;
-            }
-            self.open_files(out);
+    // Look again at everything, after anything changed. What the store kept
+    // in its envelope and its map places elsewhere now is no longer its own,
+    // and is said so ahead of any giving up, past `fresh`, a volume range
+    // being delivered, which is placed afresh. Only a volume whose headers
+    // moved can say so, of the bytes they newly reach.
+    fn settle(&mut self, fresh: Option<(VolumeIndex, ByteRange)>, out: &mut Vec<Emit>) {
+        if self.gone || !self.stale {
+            return;
         }
+        let mut reached = BTreeMap::new();
+        while !self.gone && std::mem::take(&mut self.stale) {
+            self.walk_all(&mut reached, out);
+            if !self.gone {
+                self.sync(out);
+            }
+            if !self.gone {
+                self.open_files(out);
+            }
+        }
+        let mut unkept = Vec::new();
+        for (volume, from) in reached {
+            self.unkept(volume, from, fresh, &mut unkept);
+        }
+        let last = self.gone.then(|| out.pop()).flatten();
+        out.extend(unkept);
+        out.extend(last);
     }
 
-    // Walk every volume's headers as far as its bytes go.
-    fn walk_all(&mut self, out: &mut Vec<Emit>) {
+    // Walk every volume's headers as far as its bytes go, noting for each
+    // volume whose headers moved how far they reached before.
+    fn walk_all(&mut self, reached: &mut BTreeMap<VolumeIndex, u64>, out: &mut Vec<Emit>) {
         let indices: Vec<VolumeIndex> = self.volumes.keys().copied().collect();
         for volume in indices {
             let password = self.header_password();
             let Some(found) = self.volumes.get_mut(&volume) else {
                 continue;
             };
+            let before = found.walk.reach().unwrap_or(0);
             let step = found.walk.step(
                 &mut found.kept,
                 found.length,
@@ -251,6 +289,9 @@ impl RarStore {
             );
             match step {
                 Step::Walked { moved, damaged } => {
+                    if moved {
+                        reached.entry(volume).or_insert(before);
+                    }
                     self.stale |= moved;
                     if let Some(range) = damaged {
                         let crc = found.kept.read(range).map_or(0, crc32);
@@ -396,7 +437,7 @@ impl Object for RarStore {
                 found.walk.touch();
                 self.stale = true;
             }
-            self.settle(out);
+            self.settle(Some((volume, range)), out);
             if self.gone {
                 // The delivery that made the store give its set up still
                 // reaches the members announced before it, so what the
@@ -435,6 +476,12 @@ impl Object for RarStore {
             read,
             out,
         );
+        if let Some(candidate) = self.wrong_key.take() {
+            self.condemn(candidate, out);
+            // The files it keyed are locked again: the next candidate opens
+            // them, or the store asks for one.
+            self.settle(None, out);
+        }
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
@@ -445,7 +492,7 @@ impl Object for RarStore {
             found.walk.touch();
         }
         self.stale = true;
-        self.settle(out);
+        self.settle(None, out);
         if self.gone {
             return;
         }
@@ -557,7 +604,7 @@ impl Object for RarStore {
         found.length = Some(length);
         found.walk.touch();
         self.stale = true;
-        self.settle(out);
+        self.settle(None, out);
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
@@ -569,7 +616,7 @@ impl Object for RarStore {
             volume.walk.touch();
         }
         self.stale = true;
-        self.settle(out);
+        self.settle(None, out);
     }
 
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes> {

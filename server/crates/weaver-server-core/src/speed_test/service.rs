@@ -1470,7 +1470,7 @@ async fn execute(
             }
             inner.set_phase(&cell, SpeedTestPhase::Measuring);
             cell.progress.start();
-            let sampler = spawn_sampler(cell.progress.clone(), Some(inner.handle.clone()));
+            let sampler = spawn_sampler(cell.progress.clone());
             usenet::run(
                 UsenetPlan {
                     server: server.clone(),
@@ -1513,7 +1513,7 @@ async fn execute(
             }
             inner.set_phase(&cell, SpeedTestPhase::Measuring);
             cell.progress.start();
-            let sampler = spawn_sampler(cell.progress.clone(), None);
+            let sampler = spawn_sampler(cell.progress.clone());
             bandwidth::run(
                 BandwidthPlan {
                     legs,
@@ -1535,7 +1535,7 @@ async fn execute(
             };
             inner.set_phase(&cell, SpeedTestPhase::Measuring);
             cell.progress.start();
-            let sampler = spawn_sampler(cell.progress.clone(), None);
+            let sampler = spawn_sampler(cell.progress.clone());
             let progress = cell.progress.clone();
             let leg = first.position;
             let mut measure = stop.with_duration(max_duration);
@@ -1651,17 +1651,14 @@ async fn execute(
     Outcome::Completed
 }
 
-// Close a sample bin every second, and for Usenet read the header gauge.
-fn spawn_sampler(progress: Arc<Progress>, gauge: Option<SchedulerHandle>) -> Owned<()> {
+// Close a sample bin every second.
+fn spawn_sampler(progress: Arc<Progress>) -> Owned<()> {
     Owned(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tick.tick().await;
-            if let Some(handle) = &gauge {
-                progress.note_gauge(handle.get_metrics().current_download_speed);
-            }
             progress.sample();
         }
     }))

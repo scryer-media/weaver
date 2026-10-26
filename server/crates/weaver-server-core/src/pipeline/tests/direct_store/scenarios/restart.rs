@@ -93,7 +93,13 @@ async fn restart_after_refetch_demotion_restores_incomplete_source_ownership() {
     let (persisted_progress, persisted_complete) =
         pipeline.db.load_active_file_runtime(job_id).unwrap();
     assert!(persisted_progress.is_empty() && persisted_complete.is_empty());
-    let file_progress = persisted_progress;
+    let file_progress = pipeline
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&job_id)
+        .map(|job| job.file_progress)
+        .unwrap_or_default();
     let complete_files = persisted_complete
         .into_iter()
         .map(|file_index| NzbFileId { job_id, file_index })
@@ -2272,13 +2278,18 @@ async fn a_restart_inside_a_handback_window_refuses_the_row_and_keeps_the_rebuil
         !pipeline.db.load_direct_coverage(job_id).unwrap().is_empty(),
         "non-vacuity: the row must still be standing when the crash hits"
     );
-    let (persisted_progress, persisted_complete) =
-        pipeline.db.load_active_file_runtime(job_id).unwrap();
+    let (_, persisted_complete) = pipeline.db.load_active_file_runtime(job_id).unwrap();
     assert!(
         persisted_complete.contains(&0),
         "non-vacuity: the rebuilt volume's completed-file row is durable"
     );
-    let file_progress = persisted_progress;
+    let file_progress = pipeline
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&job_id)
+        .map(|job| job.file_progress)
+        .unwrap_or_default();
     let complete_files = persisted_complete
         .into_iter()
         .map(|file_index| NzbFileId { job_id, file_index })
@@ -2467,11 +2478,15 @@ async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
     // leave behind.
     let before = generation(&pipeline);
 
-    let (reply, _rx) = tokio::sync::oneshot::channel();
-    let command = SchedulerCommand::PauseJob { job_id, reply };
-    let scope = Pipeline::pause_barrier_scope(&command)
-        .expect("a pause command must be classified as a barrier demand");
-    pipeline.demand_direct_store_barriers_for_pause(scope).await;
+    pipeline.report_all_for_test();
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.pause_job(job_id).await.unwrap();
+    assert_eq!(
+        generation(&pipeline),
+        before,
+        "recording pause does not wait for a barrier"
+    );
+    pipeline.apply_queue_intents().await;
 
     let after = generation(&pipeline);
     assert!(
@@ -2480,11 +2495,12 @@ async fn pausing_a_job_with_dirty_direct_coverage_demands_a_barrier() {
          ({before} -> {after})"
     );
 
-    // And a command that is not a pause raises no demand at all.
-    let (reply, _rx) = tokio::sync::oneshot::channel();
-    assert!(
-        Pipeline::pause_barrier_scope(&SchedulerCommand::ResumeJob { job_id, reply }).is_none(),
-        "only pause commands demand a barrier"
+    handle.resume_job(job_id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    assert_eq!(
+        generation(&pipeline),
+        after,
+        "resume does not demand a barrier"
     );
 }
 

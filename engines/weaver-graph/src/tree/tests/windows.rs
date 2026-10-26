@@ -126,7 +126,7 @@ fn windowed() -> (Tree, MemberId, NodeId, NodeId, Log) {
         .attach_window(
             NodeId::ROOT,
             (first, WINDOW),
-            Kind::Par2,
+            (Kind::Par2, &Handed::default()),
             passed,
             &mut Taping(Arc::clone(&log)),
             &mut Vec::new(),
@@ -199,7 +199,7 @@ fn a_window_on_a_closed_member_is_closed_once_it_has_what_passed() {
     tree.attach_window(
         NodeId::ROOT,
         (first, ByteRange::new(8, 12)),
-        Kind::Par2,
+        (Kind::Par2, &Handed::default()),
         vec![(8, Bytes::from_static(b"ello"), Provenance::Fresh)],
         &mut Taping(Arc::clone(&log)),
         &mut Vec::new(),
@@ -272,7 +272,7 @@ fn a_range_has_one_window_and_a_retracted_member_takes_its_windows_with_it() {
     let again = tree.attach_window(
         NodeId::ROOT,
         (first, WINDOW),
-        Kind::Par2,
+        (Kind::Par2, &Handed::default()),
         Vec::new(),
         &mut Taping(Arc::clone(&log)),
         &mut Vec::new(),

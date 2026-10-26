@@ -343,17 +343,19 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> O
     };
     // A stated position is judged by what the neighbours' headers say, and
     // a neighbour none of whose headers were read yet says nothing against
-    // it, on either side.
+    // it, on either side. A position with no place after it is none a set
+    // has.
     if let Some(stated) = this.position() {
+        let following = stated.checked_add(1)?;
         let before = stated
             .checked_sub(1)
             .and_then(|index| held.get(&index))
             .is_none_or(|previous| previous.facts.is_none() || joins(previous, stated));
-        let after = held.get(&(stated + 1)).is_none_or(|next| {
+        let after = held.get(&following).is_none_or(|next| {
             next.facts.is_none_or(|facts| {
                 let next = Nameless { facts };
                 next.kin(&this)
-                    && next.position().is_none_or(|next| next == stated + 1)
+                    && next.position().is_none_or(|next| next == following)
                     && this.runs_into(&next)
             })
         });
@@ -368,15 +370,17 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> O
     // is never its set's first.
     let fits = |slot: u32| {
         let before = slot.checked_sub(1).and_then(|index| held.get(&index));
-        let after = held.get(&(slot + 1));
+        let after = slot
+            .checked_add(1)
+            .and_then(|index| held.get(&index).map(|next| (next, index)));
         !misplaced(VolumeIndex(slot), facts)
             && (before.is_some() || after.is_some())
             && before.is_none_or(|previous| joins(previous, slot))
-            && after.is_none_or(|next| precedes(next, slot + 1))
+            && after.is_none_or(|(next, index)| precedes(next, index))
     };
     let mut candidates: Vec<u32> = held
         .keys()
-        .flat_map(|index| [index.checked_sub(1), Some(index + 1)])
+        .flat_map(|index| [index.checked_sub(1), index.checked_add(1)])
         .flatten()
         .filter(|slot| !held.contains_key(slot) && fits(*slot))
         .collect();

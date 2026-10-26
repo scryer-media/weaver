@@ -273,6 +273,15 @@ pub struct PageOut {
     pub bytes: Bytes,
 }
 
+// A hold on scratch: where it is in its volume and where its bytes start in
+// the namespace's scratch file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScratchHold {
+    pub volume: VolumeIndex,
+    pub range: ByteRange,
+    pub scratch_offset: u64,
+}
+
 // Where the bytes of a `hold` went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placed {
@@ -540,6 +549,63 @@ impl HoldLedger {
     // scratch file needs to be.
     pub fn scratch_extent(&self) -> u64 {
         self.scratch_end
+    }
+
+    // Every hold on scratch, in volume and offset order: what a checkpoint
+    // records, since the scratch file outlives the process and RAM does not.
+    pub fn scratch_holds(&self) -> Vec<ScratchHold> {
+        self.volumes
+            .iter()
+            .flat_map(|(volume, holds)| {
+                holds.values().filter_map(move |hold| match hold.location {
+                    Location::Scratch { offset, .. } => Some(ScratchHold {
+                        volume: *volume,
+                        range: hold.range,
+                        scratch_offset: offset,
+                    }),
+                    Location::Ram(_) => None,
+                })
+            })
+            .collect()
+    }
+
+    // Page every resident hold to scratch, oldest first, under the same
+    // budgets as any page-out: a graceful stop keeps what scratch can take.
+    // The first breach stops it, and what is left stays resident.
+    pub fn page_out_all(&mut self, free_disk: u64) -> Vec<PageOut> {
+        let mut free_disk = free_disk;
+        let mut page_outs = Vec::new();
+        while let Some(Ok(page_out)) = self.page_out_oldest(free_disk) {
+            free_disk = free_disk.saturating_sub(page_out.range.len());
+            page_outs.push(page_out);
+        }
+        page_outs
+    }
+
+    // A hold a checkpoint recorded on scratch, put back where it was. The
+    // scratch file is already written, so nothing is paged; the bytes are
+    // accounted as any spill is, and on a breach they are not held.
+    pub fn restore(&mut self, held: ScratchHold, free_disk: u64) -> Reserve {
+        let len = held.range.len();
+        if len == 0 {
+            return Reserve::Granted;
+        }
+        self.cut(held.volume, held.range);
+        let reserve = self
+            .accountant
+            .reserve_scratch(self.namespace, len, free_disk);
+        if reserve == Reserve::Granted {
+            self.insert(
+                held.volume,
+                held.range,
+                Location::Scratch {
+                    offset: held.scratch_offset,
+                    len,
+                },
+            );
+            self.scratch_end = self.scratch_end.max(held.scratch_offset + len);
+        }
+        reserve
     }
 
     fn allocate(&mut self, len: u64) -> u64 {
@@ -994,5 +1060,127 @@ mod tests {
     fn releasing_more_than_was_accounted_is_a_bug() {
         let accountant = Arc::new(HoldsAccountant::new(budgets(10)));
         accountant.release_resident(NS, 1);
+    }
+
+    #[test]
+    fn paging_out_all_goes_oldest_first_and_stops_at_the_first_breach() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 100,
+            scratch_total: 1_000,
+            scratch_ceiling: 6,
+            disk_reserve: 0,
+        }));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(2), 0, bytes(1, 4), PLENTY);
+        ledger.hold(VolumeIndex(0), 0, bytes(2, 4), PLENTY);
+        ledger.hold(VolumeIndex(1), 0, bytes(3, 4), PLENTY);
+
+        let page_outs = ledger.page_out_all(PLENTY);
+        assert_eq!(
+            page_outs,
+            vec![PageOut {
+                volume: VolumeIndex(2),
+                range: ByteRange::new(0, 4),
+                scratch_offset: 0,
+                bytes: bytes(1, 4),
+            }]
+        );
+        assert_eq!(
+            accountant.namespace_usage(NS),
+            NamespaceUsage {
+                resident: 8,
+                scratch: 4
+            }
+        );
+        assert_eq!(
+            ledger.scratch_holds(),
+            vec![ScratchHold {
+                volume: VolumeIndex(2),
+                range: ByteRange::new(0, 4),
+                scratch_offset: 0,
+            }]
+        );
+        let left = ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
+        assert_eq!(left[0].location, Location::Ram(bytes(2, 4)));
+    }
+
+    #[test]
+    fn paging_out_all_with_room_leaves_nothing_resident() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 10, bytes(1, 4), PLENTY);
+        ledger.hold(VolumeIndex(1), 0, bytes(2, 3), PLENTY);
+        let page_outs = ledger.page_out_all(PLENTY);
+        let offsets: Vec<(VolumeIndex, u64)> = page_outs
+            .iter()
+            .map(|page_out| (page_out.volume, page_out.scratch_offset))
+            .collect();
+        assert_eq!(offsets, vec![(VolumeIndex(0), 0), (VolumeIndex(1), 4)]);
+        assert_eq!(ledger.resident_bytes(), 0);
+        assert_eq!(ledger.scratch_extent(), 7);
+    }
+
+    #[test]
+    fn a_restored_scratch_hold_sets_the_extent_and_is_accounted() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let restored = [
+            ScratchHold {
+                volume: VolumeIndex(1),
+                range: ByteRange::new(20, 25),
+                scratch_offset: 9,
+            },
+            ScratchHold {
+                volume: VolumeIndex(0),
+                range: ByteRange::new(0, 9),
+                scratch_offset: 0,
+            },
+        ];
+        for held in restored {
+            assert_eq!(ledger.restore(held, PLENTY), Reserve::Granted);
+        }
+        assert_eq!(ledger.scratch_extent(), 14);
+        assert_eq!(ledger.scratch_bytes(), 14);
+        assert_eq!(
+            accountant.namespace_usage(NS),
+            NamespaceUsage {
+                resident: 0,
+                scratch: 14
+            }
+        );
+        assert_eq!(ledger.scratch_holds(), vec![restored[1], restored[0]]);
+
+        // A new spill goes past what was restored.
+        let outcome = ledger.hold(VolumeIndex(2), 0, bytes(5, 2), PLENTY);
+        assert_eq!(outcome.placed, Placed::Ram);
+        assert_eq!(ledger.page_out_all(PLENTY)[0].scratch_offset, 14);
+
+        let taken = ledger.take(VolumeIndex(1), ByteRange::new(22, 25));
+        assert_eq!(taken[0].location, Location::Scratch { offset: 11, len: 3 });
+        drop(ledger);
+        assert_idle(&accountant);
+    }
+
+    #[test]
+    fn a_restored_hold_past_the_scratch_ceiling_is_not_held() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 100,
+            scratch_total: 1_000,
+            scratch_ceiling: 4,
+            disk_reserve: 0,
+        }));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        let held = ScratchHold {
+            volume: VolumeIndex(0),
+            range: ByteRange::new(0, 5),
+            scratch_offset: 0,
+        };
+        assert_eq!(
+            ledger.restore(held, PLENTY),
+            Reserve::Breached(Budget::ScratchCeiling)
+        );
+        assert_eq!(ledger.total_held(), 0);
+        assert_eq!(ledger.scratch_extent(), 0);
+        assert_idle(&accountant);
     }
 }

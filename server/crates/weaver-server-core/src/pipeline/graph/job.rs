@@ -7,6 +7,7 @@
 // what the download and decode paths learn; nothing else of the pipeline
 // reaches into the tree, and nothing else writes the job's files.
 
+mod durable;
 mod loans;
 mod passwords;
 mod pieces;
@@ -14,7 +15,6 @@ mod relocate;
 mod repair;
 pub(crate) mod restore;
 mod runs;
-mod snapshot;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use super::engine::{Runs, Said};
 use super::leaf::LeafError;
 use super::limits::Caps;
 use super::namespace::{NamespaceWriter, SetState, WriteError};
-use super::root::phase::{self, RootPhase};
+use super::root::phase::{self, Activity, RootPhase};
 use super::root::{ArticleRoot, Ask, Root};
 use super::status::RepairSlots;
 use crate::operations::disk::CapacityReader;
@@ -202,6 +202,14 @@ impl GraphJob {
     }
 }
 
+impl GraphJob {
+    // Whether the root keeps decoder checksums for the member's volume.
+    #[cfg(test)]
+    pub(crate) fn checksums_held(&self, member: MemberId) -> bool {
+        self.root.checksums_held(VolumeIndex(member.0))
+    }
+}
+
 impl<R: Root> GraphJob<R> {
     // A job over `root`, whose volumes are `members` in order: each one's
     // name and, when the root knows it before any byte, its length.
@@ -274,7 +282,12 @@ impl<R: Root> GraphJob<R> {
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
     pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
-        self.runs.live() || self.loans.out()
+        self.runs.in_flight() || self.loans.out()
+    }
+
+    // Keep ownership until stopped workers report that they ended.
+    pub(in crate::pipeline) fn request_stop(&self) {
+        self.runs.request_stop();
     }
 
     // The pipeline is going down. Every run stops where it stands and is
@@ -284,8 +297,7 @@ impl<R: Root> GraphJob<R> {
         self.runs.stop(limit);
     }
 
-    // Whether a repair of the job is out on a thread.
-    #[cfg(test)]
+    // Seam for status: whether a repair of the job is out on a thread.
     pub(crate) fn repair_out(&self) -> bool {
         self.loans.out()
     }
@@ -310,9 +322,22 @@ impl<R: Root> GraphJob<R> {
     // Seam for completion, status and health: where the job stands, read
     // off the tree. Stable.
     pub(crate) fn phase(&self) -> RootPhase {
-        let activity = phase::activity(self.writer.outcomes(&self.tree));
         let extracting = phase::extracting(&self.tree) || self.runs.live();
-        RootPhase::derive(self.payload_waiting(), activity, extracting)
+        RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
+    }
+
+    // What the recovery sets are doing: repairing while a repair run is out
+    // over damage a set covers, which a run that only checks is not.
+    fn activity(&self) -> Activity {
+        let repairing = self.loans.out() && self.writer.damage_covered(&self.tree);
+        phase::activity(self.writer.outcomes(&self.tree), repairing)
+    }
+
+    // Seam for status: the job is fetching repair data. Its payload is in,
+    // no repair run is out, and a set waits on recovery volumes the root is
+    // still fetching for it.
+    pub(crate) fn fetching_repair_data(&self) -> bool {
+        !self.payload_waiting() && self.activity() == Activity::Fetching
     }
 
     // Seam for completion, status and health: the root namespace, which is
@@ -344,23 +369,65 @@ impl<R: Root> GraphJob<R> {
         self.writer.block_sizes(&self.tree, NodeId::ROOT)
     }
 
-    // Seam for the download scheduler: of the root members the post
-    // declares as indexes, the ones the root namespace holds its payload
-    // for. `None` once it holds for none.
+    // Both recovery formats report progress to the same bootstrap gate.
+    // Missing or invalid indexes settle once no article remains outstanding.
     pub(crate) fn indexes_to_come(
         &self,
-        declared: impl IntoIterator<Item = MemberId>,
+        declared: impl IntoIterator<Item = (MemberId, super::metadata::RecoveryFormat)>,
     ) -> Option<Vec<MemberId>> {
-        let held = self
-            .writer
-            .holding_for(declared, |member| self.to_come(VolumeIndex(member.0)));
-        (!held.is_empty()).then_some(held)
+        use super::metadata::{MetadataState, RecoveryFormat, RecoveryMetadata};
+        let mut metadata = RecoveryMetadata::default();
+        let declared: Vec<_> = declared.into_iter().collect();
+        let mut sampled: Vec<_> = declared.iter().map(|(_, format)| *format).collect();
+        let discovered = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .into_iter()
+            .flat_map(|namespace| {
+                namespace.members().filter_map(|member| {
+                    // Named recovery volumes remain optional. Obfuscated indexes
+                    // discovered from their fronts use the same coordinator.
+                    if weaver_graph::sniff::names_recovery(&member.name) {
+                        return None;
+                    }
+                    let (child, _) = self.tree.child_of(NodeId::ROOT, member.id)?;
+                    let format = RecoveryFormat::signed_index(
+                        self.tree.kind(child)?,
+                        namespace.first_bytes(member.id),
+                    )?;
+                    Some((member.id, format))
+                })
+            })
+            .filter(|(_, format)| {
+                // At most one unnamed candidate per format, even when every
+                // optional recovery volume repeats metadata at its front.
+                if sampled.contains(format) {
+                    return false;
+                }
+                sampled.push(*format);
+                true
+            });
+        for (member, format) in declared.into_iter().chain(discovered) {
+            let state = if self.to_come(VolumeIndex(member.0)) {
+                MetadataState::Unresolved
+            } else if self
+                .tree
+                .child_of(NodeId::ROOT, member)
+                .is_some_and(|(child, _)| self.tree.kind(child) == Some(format.kind()))
+            {
+                MetadataState::Ready
+            } else {
+                MetadataState::Unavailable
+            };
+            metadata.observe(member, format, state);
+        }
+        metadata.bootstrap_files()
     }
 
-    // Seam for completion, status and health: every root member written to
-    // a file of its own, leaves and recovery volumes alike, with the path
-    // it is written at. A member bound to an object that places its bytes
-    // elsewhere has none. Stable.
+    // Every root member written to a file of its own, leaves and recovery
+    // volumes alike, with the path it is written at. A member bound to an
+    // object that places its bytes elsewhere has none.
+    #[cfg(test)]
     pub(crate) fn member_files(&self) -> Vec<(MemberId, PathBuf)> {
         self.writer
             .files(NodeId::ROOT)
@@ -368,13 +435,30 @@ impl<R: Root> GraphJob<R> {
             .collect()
     }
 
-    // Seam for status: whether the root member is a recovery object's volume
-    // the job spends, which is not part of the release.
+    // Seam for status: whether the job spends the root member rather than
+    // hand it over, as the tree rules: recovery data, bound or named so, and
+    // the volumes an object consumed to make what it hands over.
     pub(crate) fn spends(&self, member: MemberId) -> bool {
-        self.tree
-            .child_of(NodeId::ROOT, member)
-            .and_then(|(child, _)| self.tree.recovery(child))
-            .is_some_and(|recovery| !recovery.released())
+        self.tree.spends(NodeId::ROOT, member)
+    }
+
+    // Seam for status: the files that hold the bytes of every root member
+    // the job spends, its own file or what the object that consumed it kept
+    // of it. Once the job delivers they are not part of the release.
+    pub(crate) fn spent_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self
+            .writer
+            .files(NodeId::ROOT)
+            .filter(|(member, _)| self.spends(*member))
+            .map(|(_, path)| path.to_path_buf())
+            .collect();
+        files.extend(self.namespace().records().filter_map(|record| {
+            let (child, volume) = self.tree.child_of(NodeId::ROOT, record.id)?;
+            self.spends(record.id)
+                .then(|| self.writer.kept_file(child, volume))
+                .flatten()
+        }));
+        files
     }
 
     // Articles the queues do not hold were fetched by an earlier run.
@@ -391,6 +475,15 @@ impl<R: Root> GraphJob<R> {
     pub(crate) fn sample(&mut self) -> Vec<R::Move> {
         self.root.sample();
         self.root.take_moves()
+    }
+
+    pub(crate) fn resume_runs(
+        &mut self,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        self.step_runs(Vec::new(), limit)?;
+        self.lend(slots, limit)
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step
@@ -522,12 +615,6 @@ impl<R: Root> GraphJob<R> {
     // come.
     pub(crate) fn to_come(&self, volume: VolumeIndex) -> bool {
         self.root.volume_to_come(volume)
-    }
-
-    // The articles the queue holds parked when the job is installed: they
-    // are fetched only once something asks for them.
-    pub(crate) fn parked(&mut self, held: impl FnMut(VolumeIndex, u32) -> bool) {
-        self.root.parked(held);
     }
 
     // One round of seeks: every object's standing wants lifted to the root,

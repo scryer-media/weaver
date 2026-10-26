@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::jobs::assembly::DetectedArchiveIdentity;
+use crate::jobs::assembly::{DetectedArchiveIdentity, FileCoverage};
 use crate::jobs::ids::{JobId, NzbFileId};
 
 #[derive(Debug, Clone)]
@@ -89,7 +89,9 @@ pub struct RecoveredJob {
     pub nzb_path: PathBuf,
     pub nzb_zstd: Option<Vec<u8>>,
     pub output_dir: PathBuf,
-    pub file_progress: HashMap<u32, u64>,
+    // Written coverage per incomplete file, from rows this binary's schema
+    // can read. A row it cannot is refused at load and leaves no entry.
+    pub file_progress: HashMap<u32, FileCoverage>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub file_identities: HashMap<u32, ActiveFileIdentity>,
     pub complete_files: HashSet<NzbFileId>,
@@ -126,7 +128,8 @@ pub struct ActivePar2File {
 pub struct ActiveFileProgress {
     pub job_id: JobId,
     pub file_index: u32,
-    pub contiguous_bytes_written: u64,
+    // The file's written coverage as of the restart barrier that wrote it.
+    pub coverage: FileCoverage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

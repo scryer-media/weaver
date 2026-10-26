@@ -743,10 +743,8 @@ mod tests {
     #[tokio::test]
     async fn a_peer_taken_in_is_counted() {
         let watched = Arc::new(Watched::new());
-        let sockets = ProbeSockets::new(
-            Arc::new(KernelSockets::new(None).unwrap()),
-            watched.clone(),
-        );
+        let sockets =
+            ProbeSockets::new(Arc::new(KernelSockets::new(None).unwrap()), watched.clone());
         let listener = sockets
             .listen_tcp(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await

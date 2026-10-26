@@ -87,7 +87,6 @@ pub(super) async fn submit_uu_segment_named(
             },
         )
         .await;
-    settle_segment_write_work(pipeline).await;
 }
 
 // A job whose declared segment sizes are uuencode-encoded (~1.38x the decoded

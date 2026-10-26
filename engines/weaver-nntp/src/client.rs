@@ -65,10 +65,15 @@ impl NntpClientConfig {
 #[derive(Clone)]
 pub struct NntpClient {
     pool: Arc<NntpPool>,
+    work_guard: Option<Arc<dyn Fn(ServerId) -> bool + Send + Sync>>,
     max_retries_per_server: u32,
     // Per-article active-time budget, excluding deliberate local rate waits.
     soft_timeout: Duration,
 }
+
+// A queued probe rechecks the same article eligibility and caller lifecycle
+// at its socket owner before issuing commands.
+pub type ProbeWorkGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 
 // How many yielding `try_lock` attempts an owned-lane server selection makes
 // on the shared health mutex before reporting contention. The critical
@@ -90,6 +95,11 @@ pub enum BlockingBodyLaneAcquireError {
     // thing: the permits are free and the sockets are idle, and reporting it
     // as saturation points the reader at a leak that is not there.
     ServerRecovering,
+    // The server refuses this pool's credentials, either on this dial or by
+    // the disable an earlier refusal left (`NntpPool::refuses_credentials`).
+    // A verdict, not a wait: the leased articles take the failure, so the
+    // server leaves their candidates instead of holding them in the queue.
+    CredentialsRefused { server: ServerId, error: NntpError },
     NoEligibleServer,
     // The health mutex was held elsewhere, so candidates could not be ranked.
     // This says nothing about server availability — the caller should hand
@@ -100,14 +110,24 @@ pub enum BlockingBodyLaneAcquireError {
 }
 
 impl BlockingBodyLaneAcquireError {
-    fn from_connect_error(error: NntpError) -> Self {
+    fn from_connect_error(server: ServerId, error: NntpError) -> Self {
         if matches!(
             error,
             NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
         ) {
             Self::ProviderCapacity(error)
+        } else if error.is_credentials_refusal() {
+            Self::CredentialsRefused { server, error }
         } else {
             Self::Other(error)
+        }
+    }
+
+    // The server whose answer this is, where the refusal is one server's.
+    pub fn server(&self) -> Option<ServerId> {
+        match self {
+            Self::CredentialsRefused { server, .. } => Some(*server),
+            _ => None,
         }
     }
 
@@ -123,7 +143,9 @@ impl BlockingBodyLaneAcquireError {
     // lane's own bookkeeping and carry no server answer to report.
     pub fn nntp_error(&self) -> Option<&NntpError> {
         match self {
-            Self::ProviderCapacity(error) | Self::Other(error) => Some(error),
+            Self::ProviderCapacity(error)
+            | Self::Other(error)
+            | Self::CredentialsRefused { error, .. } => Some(error),
             Self::LocalCapacity
             | Self::ServerRecovering
             | Self::NoEligibleServer
@@ -148,6 +170,7 @@ impl BlockingBodyLaneAcquireError {
             Self::ProviderCapacity(_) => "provider_capacity",
             Self::LocalCapacity => "local_capacity",
             Self::ServerRecovering => "server_recovering",
+            Self::CredentialsRefused { .. } => "credentials_refused",
             Self::NoEligibleServer => "no_eligible_server",
             Self::SelectionContended => "selection_contended",
             Self::Other(_) => "other",
@@ -162,6 +185,13 @@ impl std::fmt::Display for BlockingBodyLaneAcquireError {
             Self::LocalCapacity => formatter.write_str("blocking BODY lane capacity is saturated"),
             Self::ServerRecovering => formatter
                 .write_str("server is recovering; the recovery probe connection is already out"),
+            Self::CredentialsRefused { server, error } => {
+                write!(
+                    formatter,
+                    "server {} refuses credentials: {error}",
+                    server.0
+                )
+            }
             Self::NoEligibleServer => formatter.write_str("no eligible blocking BODY server"),
             Self::SelectionContended => {
                 formatter.write_str("blocking BODY server selection contended on server health")
@@ -984,6 +1014,7 @@ impl NntpClient {
         pool.start_route_probes();
         NntpClient {
             pool,
+            work_guard: None,
             max_retries_per_server,
             soft_timeout,
         }
@@ -994,9 +1025,22 @@ impl NntpClient {
         pool.start_route_probes();
         NntpClient {
             pool,
+            work_guard: None,
             max_retries_per_server: 1,
             soft_timeout: Duration::from_secs(15),
         }
+    }
+
+    pub fn with_work_guard(
+        &self,
+        guard: impl Fn(ServerId) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let mut client = self.clone();
+        let previous = client.work_guard.take();
+        client.work_guard = Some(Arc::new(move |server| {
+            previous.as_ref().is_none_or(|previous| previous(server)) && guard(server)
+        }));
+        client
     }
 
     pub async fn body_server_order(&self, exclude: &[usize]) -> Vec<ServerId> {
@@ -1182,7 +1226,7 @@ impl NntpClient {
             return Ok(Vec::new());
         }
 
-        let order = self.build_server_order(&[]).await;
+        let order = self.article_server_order(&[], &[]).await;
         if order.is_empty() {
             return Err(NntpError::ServiceUnavailable);
         }
@@ -1200,13 +1244,28 @@ impl NntpClient {
         let mut had_success = false;
         let mut last_error: Option<NntpError> = None;
         let mut had_retryable_uncertainty = false;
+        let mut missing = vec![Vec::new(); message_ids.len()];
 
         for idx in order {
             if remaining.is_empty() {
                 break;
             }
 
-            let batch: Vec<&str> = remaining.iter().map(|&i| message_ids[i]).collect();
+            let policy = self.pool.provider_policy().await;
+            let selected: Vec<_> = remaining
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    matches!(
+                        policy.eligibility(idx, &missing[i], &[], 1),
+                        crate::provider_policy::ArticleEligibility::Eligible(_)
+                    )
+                })
+                .collect();
+            if selected.is_empty() {
+                continue;
+            }
+            let batch: Vec<&str> = selected.iter().map(|&i| message_ids[i]).collect();
             let start = Instant::now();
 
             match self.stat_many_from_server(ServerId(idx), &batch).await {
@@ -1214,15 +1273,14 @@ impl NntpClient {
                     had_success = true;
                     self.record_server_success(idx, start.elapsed()).await;
 
-                    let mut next_remaining = Vec::with_capacity(remaining.len());
-                    for (original_idx, exists) in remaining.iter().copied().zip(results) {
+                    for (original_idx, exists) in selected.into_iter().zip(results) {
                         if exists {
                             found[original_idx] = true;
                         } else {
-                            next_remaining.push(original_idx);
+                            missing[original_idx].push(idx);
                         }
                     }
-                    remaining = next_remaining;
+                    remaining.retain(|&i| !found[i]);
                 }
                 Err(NntpError::AuthenticationFailed)
                 | Err(NntpError::AuthenticationRejected)
@@ -1237,6 +1295,11 @@ impl NntpClient {
             }
         }
 
+        had_retryable_uncertainty |= remaining.iter().any(|&i| {
+            (0..self.pool.server_count()).any(|server| {
+                !missing[i].contains(&server) && !self.pool.refuses_credentials(server)
+            })
+        });
         if remaining.is_empty() {
             Ok(found)
         } else if had_retryable_uncertainty {
@@ -1280,95 +1343,129 @@ impl NntpClient {
         message_ids: &[&str],
         exclude: &[usize],
     ) -> Option<ProbeBatchResult> {
-        if message_ids.is_empty() {
-            return Some(ProbeBatchResult {
-                exists: Vec::new(),
-                inconclusive: false,
-            });
-        }
+        self.confirm_exists_for_probe_using(message_ids, exclude, |_, _, _| async { None })
+            .await
+    }
 
-        let order = self.build_server_order(exclude).await;
-        if order.is_empty() {
+    // Cached and fresh sockets share this per-article walk. The callback may
+    // answer on an owned socket; returning None asks the pool for a socket.
+    pub async fn confirm_exists_for_probe_using<F, Fut>(
+        &self,
+        message_ids: &[&str],
+        exclude: &[usize],
+        mut cached: F,
+    ) -> Option<ProbeBatchResult>
+    where
+        F: FnMut(usize, Vec<String>, ProbeWorkGuard) -> Fut,
+        Fut: Future<Output = Option<ProbeBatchResult>>,
+    {
+        let order = self.article_server_order(exclude, &[]).await;
+        if order.is_empty() && !message_ids.is_empty() {
             return None;
         }
-
-        let mut exists = match self.stat_many_in_order(message_ids, order.clone()).await {
-            Ok(results) => results,
-            Err(error) => {
-                // Why a batch could not settle is only knowable here; the
-                // caller sees a flag and would otherwise be left guessing
-                // between a wire fault and a connection it never got.
-                warn!(
-                    servers = ?order,
-                    batch_len = message_ids.len(),
-                    %error,
-                    "probe confirmation: STAT batch left the batch unverified"
-                );
-                return Some(ProbeBatchResult {
-                    exists: vec![false; message_ids.len()],
-                    inconclusive: true,
-                });
-            }
-        };
-
-        // What STAT reported missing is re-checked with HEAD before the
-        // verdict stands — as one pipelined batch per server, narrowing to
-        // what the servers before it could not find, the same walk STAT took.
-        // Asking per article through the failover fetch made a verdict on N
-        // misses cost N round trips per server, and a missing article is
-        // exactly the case where every server has to be asked.
-        let mut remaining: Vec<usize> = exists
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, found)| (!found).then_some(idx))
-            .collect();
-        for idx in order {
-            if remaining.is_empty() {
-                break;
-            }
-            let Some(config) = self.pool.server_configs().get(idx) else {
-                continue;
-            };
-            // A server that has refused HEAD is an answer about the command,
-            // not a fault: its STAT verdict stands for what it was asked.
-            if !crate::server_caps::supports_head(&config.host, config.port) {
+        let mut exists = vec![false; message_ids.len()];
+        let mut missing = vec![Vec::new(); message_ids.len()];
+        for server in order {
+            let policy = self.pool.provider_policy().await;
+            let selected: Vec<_> = (0..message_ids.len())
+                .filter(|&i| {
+                    !exists[i]
+                        && matches!(
+                            policy.eligibility(server, &missing[i], exclude, 1),
+                            crate::provider_policy::ArticleEligibility::Eligible(_)
+                        )
+                })
+                .collect();
+            if selected.is_empty() {
                 continue;
             }
-            let batch: Vec<&str> = remaining.iter().map(|&i| message_ids[i]).collect();
-            match self.head_many_from_server(ServerId(idx), &batch).await {
-                Ok(results) => {
-                    let mut next_remaining = Vec::with_capacity(remaining.len());
-                    for (original_idx, found) in remaining.iter().copied().zip(results) {
-                        if found {
-                            exists[original_idx] = true;
-                        } else {
-                            next_remaining.push(original_idx);
-                        }
-                    }
-                    remaining = next_remaining;
+            let batch: Vec<_> = selected
+                .iter()
+                .map(|&i| message_ids[i].to_string())
+                .collect();
+            let pool = Arc::clone(&self.pool);
+            let excluded = exclude.to_vec();
+            let attempted: Vec<_> = selected.iter().map(|&i| missing[i].clone()).collect();
+            let caller_guard = self.work_guard.clone();
+            let guard: ProbeWorkGuard = Arc::new(move || {
+                caller_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard(ServerId(server)))
+                    && pool.try_provider_policy().is_some_and(|policy| {
+                        attempted.iter().all(|missing| {
+                            matches!(
+                                policy.eligibility(server, missing, &excluded, 1),
+                                crate::provider_policy::ArticleEligibility::Eligible(_)
+                            )
+                        })
+                    })
+            });
+            let result = match cached(server, batch.clone(), Arc::clone(&guard)).await {
+                Some(result) => result,
+                None => {
+                    let borrowed: Vec<_> = batch.iter().map(String::as_str).collect();
+                    let client = self.with_work_guard(move |_| guard());
+                    client.confirm_probe_on_server(server, &borrowed).await
                 }
-                // The refusal just happened on this batch; it has been recorded
-                // against the server and the next one is asked instead.
-                Err(NntpError::CommandNotRecognized) => {}
-                Err(error) => {
-                    warn!(
-                        server = idx,
-                        batch_len = batch.len(),
-                        %error,
-                        "probe confirmation: HEAD recheck left the batch unverified"
-                    );
-                    return Some(ProbeBatchResult {
-                        exists,
-                        inconclusive: true,
-                    });
+            };
+            for (slot, &original) in selected.iter().enumerate() {
+                if result.exists.get(slot) == Some(&true) {
+                    exists[original] = true;
+                } else if !result.inconclusive {
+                    missing[original].push(server);
                 }
             }
         }
-
+        // An outage, a local wait or a protected Backfill account leaves a
+        // miss unproven. Only actual misses and credential refusals settle it.
+        let inconclusive = (0..message_ids.len()).any(|i| {
+            !exists[i]
+                && (0..self.pool.server_count()).any(|server| {
+                    !exclude.contains(&server)
+                        && !missing[i].contains(&server)
+                        && !self.pool.refuses_credentials(server)
+                })
+        });
         Some(ProbeBatchResult {
             exists,
-            inconclusive: false,
+            inconclusive,
         })
+    }
+
+    async fn confirm_probe_on_server(&self, server: usize, ids: &[&str]) -> ProbeBatchResult {
+        let Ok(mut exists) = self.stat_many_from_server(ServerId(server), ids).await else {
+            return ProbeBatchResult {
+                exists: vec![false; ids.len()],
+                inconclusive: true,
+            };
+        };
+        let config = &self.pool.server_configs()[server];
+        let missing: Vec<_> = exists
+            .iter()
+            .enumerate()
+            .filter_map(|(i, found)| (!found).then_some(i))
+            .collect();
+        if !missing.is_empty() && crate::server_caps::supports_head(&config.host, config.port) {
+            let batch: Vec<_> = missing.iter().map(|&i| ids[i]).collect();
+            match self.head_many_from_server(ServerId(server), &batch).await {
+                Ok(found) => {
+                    for (i, found) in missing.into_iter().zip(found) {
+                        exists[i] = found;
+                    }
+                }
+                Err(NntpError::CommandNotRecognized) => {}
+                Err(_) => {
+                    return ProbeBatchResult {
+                        exists,
+                        inconclusive: true,
+                    };
+                }
+            }
+        }
+        ProbeBatchResult {
+            exists,
+            inconclusive: false,
+        }
     }
 
     // Fetch the body of an article by message-id, with multi-server failover.
@@ -1425,6 +1522,17 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
     ) -> FetchBodyTrace {
+        self.fetch_body_with_groups_ordered_traced(message_id, groups, exclude, &[])
+            .await
+    }
+
+    async fn fetch_body_with_groups_ordered_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+        avoid: &[usize],
+    ) -> FetchBodyTrace {
         if groups.is_empty() {
             return FetchBodyTrace {
                 attempts: Vec::new(),
@@ -1434,7 +1542,7 @@ impl NntpClient {
             };
         }
 
-        let order = self.build_server_order(exclude).await;
+        let order = self.article_server_order(exclude, avoid).await;
 
         if order.is_empty() {
             return FetchBodyTrace {
@@ -1448,6 +1556,25 @@ impl NntpClient {
         let mut last_retryable_error: Option<NntpError> = None;
 
         for idx in order {
+            if !self.article_attempt_eligible(idx, exclude, &attempts).await {
+                if let Some(rejection) = self
+                    .pool
+                    .server_transfer_control(ServerId(idx))
+                    .and_then(|control| control.quota_rejection_for(1))
+                {
+                    attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
+                        connection_health: None,
+                        server_idx: idx,
+                        remote_ip: None,
+                        elapsed: Duration::ZERO,
+                        outcome: FetchAttemptOutcome::QuotaBlocked,
+                        error: Some("server download quota blocked".into()),
+                    });
+                    last_error = Some(NntpError::quota_blocked(rejection));
+                }
+                continue;
+            }
             let server = ServerId(idx);
             let start = Instant::now();
 
@@ -1562,21 +1689,8 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
     ) -> FetchBodyTrace {
-        if exclude.is_empty() {
-            return self.fetch_body_with_groups_traced(message_id, groups).await;
-        }
-
-        let preferred = self
-            .fetch_body_with_groups_excluding_traced(message_id, groups, exclude)
-            .await;
-
-        if preferred.attempts.is_empty()
-            && matches!(preferred.result, Err(NntpError::PoolExhausted))
-        {
-            self.fetch_body_with_groups_traced(message_id, groups).await
-        } else {
-            preferred
-        }
+        self.fetch_body_with_groups_ordered_traced(message_id, groups, &[], exclude)
+            .await
     }
 
     // Fetch and decode a yEnc BODY by message-id using streamed NNTP chunks.
@@ -1604,27 +1718,8 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
     ) -> DecodedBodyTrace {
-        if exclude.is_empty() {
-            return self
-                .fetch_body_decoded_with_groups_traced(message_id, groups)
-                .await;
-        }
-
-        let preferred = self
-            .fetch_body_decoded_with_groups_excluding_traced(message_id, groups, exclude)
-            .await;
-
-        if preferred.attempts.is_empty()
-            && matches!(
-                preferred.result,
-                Err(DecodedBodyError::Nntp(NntpError::PoolExhausted))
-            )
-        {
-            self.fetch_body_decoded_with_groups_traced(message_id, groups)
-                .await
-        } else {
-            preferred
-        }
+        self.fetch_body_decoded_with_groups_ordered_traced(message_id, groups, &[], exclude)
+            .await
     }
 
     pub async fn fetch_bodies_decoded_with_groups_prefer_excluding_traced(
@@ -1684,10 +1779,7 @@ impl NntpClient {
             return;
         }
 
-        let mut order = self.build_server_order(exclude).await;
-        if order.is_empty() && !exclude.is_empty() {
-            order = self.build_server_order(&[]).await;
-        }
+        let order = self.article_server_order(&[], exclude).await;
 
         if order.is_empty() {
             for message_idx in 0..message_ids.len() {
@@ -1720,6 +1812,21 @@ impl NntpClient {
                 }
                 (idx, std::mem::take(&mut pending))
             };
+            let mut eligible = Vec::with_capacity(pending_now.len());
+            for message_idx in pending_now {
+                if self
+                    .article_attempt_eligible(idx, &[], &attempts_by_index[message_idx])
+                    .await
+                {
+                    eligible.push(message_idx);
+                } else {
+                    pending.push(message_idx);
+                }
+            }
+            let pending_now = eligible;
+            if pending_now.is_empty() {
+                continue;
+            }
             let pending_ids: Vec<String> = pending_now
                 .iter()
                 .map(|message_idx| message_ids[*message_idx].to_string())
@@ -2246,7 +2353,18 @@ impl NntpClient {
         groups: &[String],
         exclude: &[usize],
     ) -> DecodedBodyTrace {
-        let order = self.build_server_order(exclude).await;
+        self.fetch_body_decoded_with_groups_ordered_traced(message_id, groups, exclude, &[])
+            .await
+    }
+
+    async fn fetch_body_decoded_with_groups_ordered_traced(
+        &self,
+        message_id: &str,
+        groups: &[String],
+        exclude: &[usize],
+        avoid: &[usize],
+    ) -> DecodedBodyTrace {
+        let order = self.article_server_order(exclude, avoid).await;
 
         if order.is_empty() {
             return DecodedBodyTrace {
@@ -2260,6 +2378,25 @@ impl NntpClient {
         let mut attempts = Vec::new();
 
         for idx in order {
+            if !self.article_attempt_eligible(idx, exclude, &attempts).await {
+                if let Some(rejection) = self
+                    .pool
+                    .server_transfer_control(ServerId(idx))
+                    .and_then(|control| control.quota_rejection_for(1))
+                {
+                    attempts.push(FetchAttemptTrace {
+                        route_feedback: None,
+                        connection_health: None,
+                        server_idx: idx,
+                        remote_ip: None,
+                        elapsed: Duration::ZERO,
+                        outcome: FetchAttemptOutcome::QuotaBlocked,
+                        error: Some("server download quota blocked".into()),
+                    });
+                    last_error = Some(DecodedBodyError::Nntp(NntpError::quota_blocked(rejection)));
+                }
+                continue;
+            }
             let server = ServerId(idx);
             let start = Instant::now();
 
@@ -2505,15 +2642,30 @@ impl NntpClient {
                 Some(rejection) => {
                     BlockingBodyLaneAcquireError::Other(NntpError::quota_blocked(rejection))
                 }
-                None => BlockingBodyLaneAcquireError::NoEligibleServer,
+                None => self
+                    .credentials_refusal(exclude)
+                    .unwrap_or(BlockingBodyLaneAcquireError::NoEligibleServer),
             });
         }
 
         let mut saw_local_capacity = false;
         let mut saw_recovery_gate = false;
+        let mut credentials_refused = None;
         let mut provider_capacity_error = None;
         let mut other_error = None;
         for server in selection.eligible {
+            let Some(policy) = self.pool.try_provider_policy() else {
+                return Err(BlockingBodyLaneAcquireError::SelectionContended);
+            };
+            if !matches!(
+                policy.eligibility(server.0, exclude, &[], requested_body_bytes),
+                crate::provider_policy::ArticleEligibility::Eligible(_)
+            ) {
+                // An occupied permit in a higher group cannot turn this
+                // request into lower-priority demand.
+                saw_local_capacity = true;
+                continue;
+            }
             let permit = match self
                 .pool
                 .try_acquire_blocking_permit_for_work(server, demanded)
@@ -2524,6 +2676,12 @@ impl NntpClient {
                 // single probe.
                 Err(NntpError::ServerRecovering) => {
                     saw_recovery_gate = true;
+                    continue;
+                }
+                Err(error) if error.is_credentials_refusal() => {
+                    credentials_refused.get_or_insert(
+                        BlockingBodyLaneAcquireError::CredentialsRefused { server, error },
+                    );
                     continue;
                 }
                 Err(_) => {
@@ -2596,12 +2754,15 @@ impl NntpClient {
                             "blocking BODY lane connect failed"
                         );
                     }
-                    match BlockingBodyLaneAcquireError::from_connect_error(error) {
+                    match BlockingBodyLaneAcquireError::from_connect_error(server, error) {
                         BlockingBodyLaneAcquireError::ProviderCapacity(error) => {
                             provider_capacity_error = Some(error);
                         }
                         BlockingBodyLaneAcquireError::Other(error) => {
                             other_error = Some(error);
+                        }
+                        refused @ BlockingBodyLaneAcquireError::CredentialsRefused { .. } => {
+                            credentials_refused.get_or_insert(refused);
                         }
                         BlockingBodyLaneAcquireError::LocalCapacity
                         | BlockingBodyLaneAcquireError::ServerRecovering
@@ -2619,9 +2780,36 @@ impl NntpClient {
             Err(BlockingBodyLaneAcquireError::LocalCapacity)
         } else if saw_recovery_gate {
             Err(BlockingBodyLaneAcquireError::ServerRecovering)
+        } else if let Some(refused) = credentials_refused {
+            // Last of the refusals that name a server: any wait above means
+            // another server may still serve the work.
+            Err(refused)
         } else {
-            Err(BlockingBodyLaneAcquireError::NoEligibleServer)
+            Err(self
+                .credentials_refusal(exclude)
+                .unwrap_or(BlockingBodyLaneAcquireError::NoEligibleServer))
         }
+    }
+
+    // The refusal of the first server this request could otherwise be sent to
+    // that refuses this pool's credentials, if one does. Health keeps such a
+    // server out of the ranking, so without this its refusal would read as
+    // "no eligible server", which waits: the work it alone may serve would
+    // sit in the queue for as long as the credentials stay wrong.
+    fn credentials_refusal(&self, exclude: &[usize]) -> Option<BlockingBodyLaneAcquireError> {
+        let backfill_flags = self.pool.server_backfill_flags();
+        let backfill_unlocked = self.pool.fill_servers_exhausted_or_auth_disabled(exclude);
+        (0..self.pool.server_count())
+            .find(|idx| {
+                !exclude.contains(idx)
+                    && self.pool.route_available(*idx)
+                    && (!backfill_flags[*idx] || backfill_unlocked)
+                    && self.pool.refuses_credentials(*idx)
+            })
+            .map(|idx| BlockingBodyLaneAcquireError::CredentialsRefused {
+                server: ServerId(idx),
+                error: NntpError::AuthenticationRejected,
+            })
     }
 
     // Whether the owned blocking lanes could take this work, and whether the
@@ -2764,9 +2952,7 @@ impl NntpClient {
         }
         let mut health = health?;
         health.check_reenable_all();
-        let backfill_unlocked = self
-            .pool
-            .fill_servers_exhausted_or_auth_disabled(exclude, &health);
+        let backfill_unlocked = self.pool.fill_servers_exhausted_or_auth_disabled(exclude);
 
         let mut candidates = Vec::with_capacity(server_count);
         let mut quota_blocked = None;
@@ -2837,7 +3023,10 @@ impl NntpClient {
         error: &NntpError,
         ticket: &crate::recovery::ConnectionHealth,
     ) {
-        if matches!(error, NntpError::TooManyConnections) {
+        if matches!(
+            error,
+            NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
+        ) {
             // Provider admission pressure parks new sockets, it does not make
             // the server unhealthy. Cooling the whole server here would also
             // block already-established healthy lanes from refilling.
@@ -2860,10 +3049,13 @@ impl NntpClient {
                 .blocking_lock()
                 .record_connection_outcome(server_idx, ticket, false, true);
         } else if cooldown_reason(error).is_some() {
-            self.pool
-                .health()
-                .blocking_lock()
-                .record_connection_outcome(server_idx, ticket, false, false);
+            self.pool.note_blocking_connect_failure(server_idx);
+            if !self.pool.has_established_sockets(server_idx) {
+                self.pool
+                    .health()
+                    .blocking_lock()
+                    .record_connection_outcome(server_idx, ticket, false, false);
+            }
         }
         self.pool.retire_quarantined_idle(server_idx);
     }
@@ -2983,8 +3175,15 @@ impl NntpClient {
         deadline: &mut TokioInstant,
     ) -> Result<PooledConnection> {
         self.pool
-            .acquire_before_deadline(server, None, true, deadline)
+            .acquire_guarded_before_deadline(
+                server,
+                None,
+                true,
+                deadline,
+                self.work_guard.as_deref(),
+            )
             .await
+            .and_then(|conn| self.validate_acquired_work(server, conn))
             .map_err(|error| self.map_acquire_timeout(error))
     }
 
@@ -2994,9 +3193,27 @@ impl NntpClient {
         deadline: &mut TokioInstant,
     ) -> Result<PooledConnection> {
         self.pool
-            .acquire_before_deadline(server, None, false, deadline)
+            .acquire_guarded_before_deadline(
+                server,
+                None,
+                false,
+                deadline,
+                self.work_guard.as_deref(),
+            )
             .await
+            .and_then(|conn| self.validate_acquired_work(server, conn))
             .map_err(|error| self.map_acquire_timeout(error))
+    }
+
+    fn validate_acquired_work(
+        &self,
+        server: ServerId,
+        conn: PooledConnection,
+    ) -> Result<PooledConnection> {
+        if self.work_guard.as_ref().is_some_and(|guard| !guard(server)) {
+            return Err(NntpError::AcquireTimeout(0));
+        }
+        Ok(conn)
     }
 
     fn map_acquire_timeout(&self, error: NntpError) -> NntpError {
@@ -3029,6 +3246,50 @@ impl NntpClient {
         NntpError::AcquireTimeout(self.soft_timeout.as_secs())
     }
 
+    // Rank candidates without granting permission to use them. Eligibility
+    // is evaluated for each article immediately before its next attempt.
+    async fn article_server_order(&self, exclude: &[usize], avoid: &[usize]) -> Vec<usize> {
+        let mut groups = std::collections::BTreeMap::new();
+        for idx in 0..self.pool.server_count() {
+            if !exclude.contains(&idx) {
+                groups
+                    .entry((
+                        self.pool.server_backfill_flags()[idx],
+                        self.pool.server_groups()[idx],
+                    ))
+                    .or_insert_with(Vec::new)
+                    .push(idx);
+            }
+        }
+        let mut order = Vec::new();
+        for group in groups.into_values() {
+            let mut ranked = self.rank_servers_in_group(&group).await;
+            ranked.sort_by_key(|idx| avoid.contains(idx));
+            order.extend(ranked);
+        }
+        order
+    }
+
+    async fn article_attempt_eligible(
+        &self,
+        server: usize,
+        exclude: &[usize],
+        attempts: &[FetchAttemptTrace],
+    ) -> bool {
+        let missing: Vec<_> = attempts
+            .iter()
+            .filter(|attempt| matches!(attempt.outcome, FetchAttemptOutcome::NotFound))
+            .map(|attempt| attempt.server_idx)
+            .collect();
+        matches!(
+            self.pool
+                .provider_policy()
+                .await
+                .eligibility(server, &missing, exclude, 1),
+            crate::provider_policy::ArticleEligibility::Eligible(_)
+        )
+    }
+
     // Build the server try-order, exhausting lower-priority fill groups
     // before higher-priority ones, with backfill servers reachable only
     // once every fill server is excluded for this request.
@@ -3057,9 +3318,7 @@ impl NntpClient {
         // Check health to skip disabled servers.
         let mut health = self.pool.health().lock().await;
         health.check_reenable_all();
-        let backfill_unlocked = self
-            .pool
-            .fill_servers_exhausted_or_auth_disabled(exclude, &health);
+        let backfill_unlocked = self.pool.fill_servers_exhausted_or_auth_disabled(exclude);
 
         #[derive(Default)]
         struct GroupCandidates {
@@ -3211,11 +3470,21 @@ impl NntpClient {
         kind: FetchKind,
         exclude: &[usize],
     ) -> Result<Bytes> {
-        let order = self.build_server_order(exclude).await;
+        let order = self.article_server_order(exclude, &[]).await;
         let mut last_error: Option<NntpError> = None;
         let mut last_retryable_error: Option<NntpError> = None;
 
+        let mut missing = Vec::new();
         for idx in order {
+            if !matches!(
+                self.pool
+                    .provider_policy()
+                    .await
+                    .eligibility(idx, &missing, exclude, 1),
+                crate::provider_policy::ArticleEligibility::Eligible(_)
+            ) {
+                continue;
+            }
             let server = ServerId(idx);
             let start = Instant::now();
 
@@ -3228,6 +3497,7 @@ impl NntpClient {
                 Err(NntpError::ArticleNotFound)
                 | Err(NntpError::NoSuchArticle { .. })
                 | Err(NntpError::NoArticleWithNumber) => {
+                    missing.push(idx);
                     debug!(
                         server = idx,
                         message_id, "article not found, trying next server"

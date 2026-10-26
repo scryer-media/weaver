@@ -121,7 +121,12 @@ async function resumeAll(request: APIRequestContext): Promise<void> {
 }
 
 async function cancelJob(request: APIRequestContext, id: number): Promise<void> {
-  await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id });
+  const result = await graphql<{ cancelJob: boolean }>(
+    request, "mutation($id: Int!) { cancelJob(id: $id) }", { id },
+  );
+  if (!result.cancelJob) {
+    throw new Error(`failed to cancel event-script job ${id}`);
+  }
 }
 
 async function markGood(request: APIRequestContext, id: number): Promise<void> {
@@ -328,6 +333,7 @@ test("Q06 NZB_DELETED follows a user cancel; deleteHistory raises none", async (
     const [deleted] = await waitRecords(script, 1, forJob(first));
     expect(deleted!.env).toMatchObject({ NZBNA_EVENT: "NZB_DELETED", NZBNA_NZBID: String(first), NZBNA_DELETESTATUS: "MANUAL" });
 
+    await waitTerminal(request, first);
     await graphql(request, "mutation($id: Int!) { deleteHistory(id: $id, deleteFiles: true) { id } }", { id: first });
     // Queue events drain one at a time in admission order, so once a later
     // sentinel's event has run, any event deleteHistory raised has run too.

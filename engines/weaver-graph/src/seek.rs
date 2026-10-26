@@ -27,12 +27,24 @@ impl Weight {
     pub const FIRST: Weight = Weight(0);
 }
 
+// Whether the asker wants the bytes now or says they are not wanted yet. A
+// deferred seek travels the same walk as any other and is translated the
+// same way; the root parks the units that carry it, so nothing fetches them
+// until a later seek of the same walk wants them now. It bids for nothing
+// and its answer is only how many units it parked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum When {
+    Now,
+    Deferred,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Seek {
     pub volume: VolumeIndex,
     pub range: ByteRange,
     pub purpose: Purpose,
     pub weight: Weight,
+    pub when: When,
 }
 
 impl Seek {
@@ -42,6 +54,7 @@ impl Seek {
             range,
             purpose: Purpose::Data,
             weight,
+            when: When::Now,
         }
     }
 
@@ -51,6 +64,28 @@ impl Seek {
             range,
             purpose: Purpose::Recovery,
             weight,
+            when: When::Now,
+        }
+    }
+
+    // Recovery bytes the asker knows it holds and does not want yet.
+    pub fn deferred(volume: VolumeIndex, range: ByteRange) -> Self {
+        Self {
+            volume,
+            range,
+            purpose: Purpose::Recovery,
+            weight: Weight::FIRST,
+            when: When::Deferred,
+        }
+    }
+
+    // What an ask that cannot be reordered answers: an asker that wants the
+    // bytes now waits for the normal order; one that deferred them parked
+    // nothing.
+    pub fn unseekable(self) -> Pull {
+        match self.when {
+            When::Now => Pull::Unseekable,
+            When::Deferred => Pull::Moved(0),
         }
     }
 }

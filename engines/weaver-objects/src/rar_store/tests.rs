@@ -526,6 +526,47 @@ fn a_wrong_password_then_the_right_one() {
     posted_whole(&owner);
 }
 
+// A RAR4 file key has no check of its own, so a candidate that did not open
+// the headers keys the files on trial: a whole-file checksum that fails on
+// bytes as they were posted condemns it, the store asks for every part it
+// read again, and the next candidate opens the same bytes.
+#[test]
+fn a_wrong_rar4_key_on_verified_bytes_is_condemned_and_the_right_one_opens_the_same_bytes() {
+    let volumes = write(&items(), &encrypted(Version::Rar4, false));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 4096);
+    owner.offer("not-the-passphrase");
+    let asked_again = owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Again { .. }))
+        .count();
+    assert_eq!(asked_again, files().len(), "one part of each file, once");
+    assert!(owner.members.values().all(|got| !got.closed));
+    owner.offer(PASSWORD);
+    owner.close(0);
+    owner
+        .said
+        .retain(|emit| !matches!(emit, Emit::NeedsPassword | Emit::Again { .. }));
+    no_trouble(&owner);
+    streamed(&owner);
+    posted_whole(&owner);
+}
+
+#[test]
+fn every_rar4_candidate_wrong_on_verified_bytes_needs_a_password() {
+    let volumes = write(&items(), &encrypted(Version::Rar4, false));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 4096);
+    owner.offer("not-the-passphrase");
+    owner.offer("not-that-either");
+    owner.close(0);
+    assert!(owner.members.values().all(|got| !got.closed));
+    assert!(!owner.said.contains(&Emit::Refuse(Why::Encrypted)));
+    owner.quiet();
+    assert!(owner.said.contains(&Emit::Refuse(Why::Encrypted)));
+}
+
 // RAR5 proves a candidate by its password check; RAR4 lets it through to
 // the walk, whose first header refutes a wrong one by its CRC.
 #[test]
@@ -708,6 +749,60 @@ fn a_damaged_member_byte_is_reported_at_its_volume_range() {
     }
 }
 
+// An article delivered damaged runs from the first file's data over the
+// next file's header, intact, into that file's data. The walk reads damaged
+// bytes only once the volume closes, so until then the store keeps the
+// article from that header on as its own. The close names the file whose
+// first bytes it kept, with no byte arriving: the store says they are no
+// longer its own, and the file gets them, as they came, from where the
+// owner kept them.
+#[test]
+fn bytes_kept_behind_a_header_read_at_close_reach_the_file_it_names() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let real = write(&items(), &Options::new(version)).remove(0);
+        let [(_, alpha), (_, beta), _] = &files()[..] else {
+            unreachable!("three files")
+        };
+        let alpha_end = (find(&real, &alpha[..64]) + alpha.len()) as u64;
+        let beta_at = find(&real, &beta[..64]) as u64;
+        let article = ByteRange::new(alpha_end - 100, beta_at + 100);
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), vec![real]);
+        owner.deliver(0, ByteRange::new(0, article.start));
+        owner.deliver_as(0, article, Provenance::Damaged, None);
+        owner.deliver(0, ByteRange::new(article.end, length));
+        assert_eq!(
+            owner.members.len(),
+            1,
+            "{version:?} only the file before it"
+        );
+        owner.close(0);
+        let got = owner.member("beta.bin");
+        assert!(got.bytes == *beta, "{version:?}");
+        assert!(
+            got.coverage.covered(ByteRange::new(0, beta.len() as u64)),
+            "{version:?}"
+        );
+        assert!(
+            got.coverage.damaged(ByteRange::new(0, 100)),
+            "{version:?} the kept bytes came damaged"
+        );
+        assert!(
+            got.coverage
+                .verified(ByteRange::new(100, beta.len() as u64)),
+            "{version:?}"
+        );
+        assert!(
+            owner.said.iter().any(|emit| matches!(
+                emit,
+                Emit::Unkept { volume: VolumeIndex(0), range, .. } if range.start == beta_at
+            )),
+            "{version:?} {:?}",
+            owner.said
+        );
+    }
+}
+
 // A damaged article inside the first part of a split file: the namespace
 // already marks it where it lies, so neither the part's own CRC nor the
 // file's blames anything, and the repair is what they judge.
@@ -760,7 +855,7 @@ fn the_recovery_record_is_announced() {
             let announced = owner.said.iter().any(|emit| {
                 matches!(
                     emit,
-                    Emit::RecoveryAt { volume: found, range, kind: RecoveryKind::Rar }
+                    Emit::RecoveryAt { volume: found, range, kind: RecoveryKind::Rar, .. }
                         if found.0 as usize == volume && range.contains(at)
                 )
             });
@@ -876,6 +971,25 @@ fn fixture(name: &str) -> Vec<u8> {
         .join("../../server/crates/weaver-server-core/tests/fixtures")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+#[test]
+fn a_volume_numbered_last_of_all_numbers_is_placed_nowhere() {
+    use super::claim::place;
+    use crate::quiet::Placed;
+    let mut facts = unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+        Cursor::new(fixture("rar5/rar5_store.rar")),
+        None,
+        Arc::new(unrar_rs::KdfCache::new()),
+    )
+    .unwrap()
+    .facts;
+    facts.is_volume = true;
+    let held = std::collections::BTreeMap::new();
+    facts.volume_number = Some(5);
+    assert_eq!(place(&facts, &held), Some(Placed::At(VolumeIndex(5))));
+    facts.volume_number = Some(u32::MAX);
+    assert_eq!(place(&facts, &held), None);
 }
 
 // A fixture written by RAR itself streams to what unrar-rs extracts from it.

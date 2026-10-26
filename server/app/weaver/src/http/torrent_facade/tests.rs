@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast};
 use tower::ServiceExt;
 
 use weaver_server_core::auth::{ApiKeyAuthRow, ApiKeyCache, LoginAuthCache, hash_api_key};
@@ -33,7 +33,7 @@ use weaver_server_core::torrents::sessions::{
 };
 use weaver_server_core::torrents::{TorrentFile, TorrentSource, TorrentState, status};
 use weaver_server_core::watch_folder::WatchFolderService;
-use weaver_server_core::{Database, SchedulerCommand, SchedulerHandle, SharedPipelineState};
+use weaver_server_core::{Database, SchedulerHandle, SharedPipelineState};
 
 use super::*;
 
@@ -102,35 +102,14 @@ impl Routes for Offline {
     }
 }
 
-// A scheduler that answers every bandwidth change and puts holds in force.
+// A scheduler with no pipeline behind it: bandwidth changes and holds are
+// written to its queue, where the facade reads them back.
 fn scheduler() -> SchedulerHandle {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let (event_tx, _) = broadcast::channel(1);
-    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-    let holds = state.clone();
-    tokio::spawn(async move {
-        while let Some(command) = cmd_rx.recv().await {
-            match command {
-                SchedulerCommand::SetBandwidth { reply, .. } => {
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::Pause { hold, reply } => {
-                    holds.hold(hold);
-                    let _ = reply.send(());
-                }
-                SchedulerCommand::Resume {
-                    origin,
-                    owner,
-                    reply,
-                } => {
-                    holds.release(origin, owner);
-                    let _ = reply.send(());
-                }
-                _ => {}
-            }
-        }
-    });
-    SchedulerHandle::new(cmd_tx, event_tx, state)
+    SchedulerHandle::new(
+        event_tx,
+        SharedPipelineState::new(PipelineMetrics::new(), vec![]),
+    )
 }
 
 fn config(complete_dir: &std::path::Path) -> SharedConfig {
@@ -148,6 +127,7 @@ fn config(complete_dir: &std::path::Path) -> SharedConfig {
         bandwidth: Default::default(),
         cleanup_after_extract: None,
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -156,17 +136,6 @@ fn config(complete_dir: &std::path::Path) -> SharedConfig {
         metrics: Default::default(),
         config_path: None,
     }))
-}
-
-// A scheduler that is gone: every command to it fails.
-fn closed_scheduler() -> SchedulerHandle {
-    let (cmd_tx, _) = mpsc::channel(8);
-    let (event_tx, _) = broadcast::channel(1);
-    SchedulerHandle::new(
-        cmd_tx,
-        event_tx,
-        SharedPipelineState::new(PipelineMetrics::new(), vec![]),
-    )
 }
 
 struct Rig {
@@ -1711,21 +1680,6 @@ async fn a_caller_is_refused_before_its_body_is_read() {
     let read = rig.send(counted_add(&reads, Some(ADMIN))).await;
     assert_eq!(read.status, StatusCode::BAD_REQUEST);
     assert!(reads.load(Ordering::SeqCst) > 0);
-}
-
-#[tokio::test]
-async fn an_internal_failure_is_logged_not_shown() {
-    let rig = rig_from(false, RuntimeSecurityConfig::default(), closed_scheduler()).await;
-    let failed = rig
-        .post(
-            "/api/v2/app/setPreferences",
-            &format!("json={}", url_encode(r#"{"dl_limit":1024}"#)),
-        )
-        .await;
-    assert_eq!(
-        (failed.status, failed.body.as_str()),
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-    );
 }
 
 fn login(password: &str) -> Request<Body> {

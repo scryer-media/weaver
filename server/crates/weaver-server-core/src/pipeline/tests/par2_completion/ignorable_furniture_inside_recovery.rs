@@ -1262,6 +1262,7 @@ async fn a_promoted_volume_whose_segments_are_parked_is_not_read_back() {
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: missing_segment,
             message_id: MessageId::new("silver-horizon-parked-vol02-1@example.com"),
             groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),

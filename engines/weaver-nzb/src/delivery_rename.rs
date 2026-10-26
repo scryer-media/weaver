@@ -30,6 +30,9 @@ pub struct DeliveredFile<'a> {
     // a bare filename.
     pub relative_path: &'a str,
     pub bytes: u64,
+    // The extension the file's leading bytes identify, when its name carries
+    // none. The caller sniffs; see [`crate::content_sniff`].
+    pub content_extension: Option<&'a str>,
 }
 
 // One rename to apply, both paths relative to the delivery root.
@@ -220,7 +223,8 @@ pub fn looks_obfuscated_for_delivery(name: &str) -> bool {
 // legal path component. `full_stem` is the name `target_stem` was cleaned or
 // shortened from, and only names each rename's `full_to`. `files[candidate]` keeps its own extension, and every
 // other file whose name begins with the candidate's stem keeps everything
-// after it — that is what carries `-sample` and `.eng.srt` across.
+// after it — that is what carries `-sample` and `.eng.srt` across. A file
+// whose name has no extension takes its content's.
 //
 // Returns an empty plan when the candidate would not actually change name.
 pub fn plan_renames(
@@ -241,7 +245,11 @@ pub fn plan_renames(
     if old_stem.is_empty() || old_stem == target_stem {
         return Vec::new();
     }
-    let candidate_suffix = &candidate_name[old_stem.len()..];
+    let candidate_suffix = with_content_extension(
+        &candidate_name[old_stem.len()..],
+        candidate_name,
+        candidate_file,
+    );
 
     // Every name the delivery already occupies, plus every name this plan is
     // about to create. Collisions are resolved by numbering the stem rather
@@ -255,7 +263,7 @@ pub fn plan_renames(
         .collect();
 
     let parent = parent_of(candidate_file.relative_path);
-    let final_stem = allocate_free_stem(target_stem, candidate_suffix, parent, &occupied);
+    let final_stem = allocate_free_stem(target_stem, &candidate_suffix, parent, &occupied);
     let candidate_to = join_relative(parent, &format!("{final_stem}{candidate_suffix}"));
     occupied.insert(collision_key(&candidate_to));
 
@@ -282,6 +290,7 @@ pub fn plan_renames(
         if !suffix.is_empty() && !suffix.starts_with(['.', '-', '_', ' ']) {
             continue;
         }
+        let suffix = with_content_extension(suffix, name, file);
         let sibling_parent = parent_of(file.relative_path);
         let to = join_relative(sibling_parent, &format!("{final_stem}{suffix}"));
         if !occupied.insert(collision_key(&to)) {
@@ -297,6 +306,63 @@ pub fn plan_renames(
     }
 
     plan
+}
+
+// Plans the renames that give every file whose name has no extension the
+// one its content identifies, beside the renames already `planned`. A file
+// `planned` moves already took its content's extension there; one whose
+// content named nothing keeps its name.
+pub fn plan_content_extensions(
+    files: &[DeliveredFile<'_>],
+    planned: &[PlannedRename],
+) -> Vec<PlannedRename> {
+    let moved: std::collections::HashSet<&str> =
+        planned.iter().map(|rename| rename.from.as_str()).collect();
+    let mut occupied: std::collections::HashSet<String> = files
+        .iter()
+        .filter(|file| !moved.contains(file.relative_path))
+        .map(|file| collision_key(file.relative_path))
+        .chain(planned.iter().map(|rename| collision_key(&rename.to)))
+        .collect();
+    let mut plan = Vec::new();
+    for file in files {
+        if moved.contains(file.relative_path) {
+            continue;
+        }
+        let name = file_name_of(file.relative_path);
+        let suffix = with_content_extension("", name, file);
+        if suffix.is_empty() {
+            continue;
+        }
+        let parent = parent_of(file.relative_path);
+        // A trailing dot is an empty extension, not part of the stem.
+        let base = name.strip_suffix('.').unwrap_or(name);
+        let stem = allocate_free_stem(base, &suffix, parent, &occupied);
+        let to = join_relative(parent, &format!("{stem}{suffix}"));
+        occupied.insert(collision_key(&to));
+        plan.push(PlannedRename {
+            from: file.relative_path.to_string(),
+            full_to: join_relative(parent, &format!("{base}{suffix}")),
+            to,
+        });
+    }
+    plan
+}
+
+// Whether a bare filename carries no extension, so its content may name one.
+pub fn lacks_extension(name: &str) -> bool {
+    extension_of(name).is_none()
+}
+
+// `suffix`, the part of `name` a rename keeps, with the file's content
+// extension after it when `name` has no extension of its own.
+fn with_content_extension(suffix: &str, name: &str, file: &DeliveredFile<'_>) -> String {
+    match file.content_extension {
+        Some(extension) if lacks_extension(name) && !extension.is_empty() => {
+            format!("{suffix}.{extension}")
+        }
+        _ => suffix.to_string(),
+    }
 }
 
 fn has_executable_extension(name: &str) -> bool {
@@ -416,6 +482,14 @@ mod tests {
         DeliveredFile {
             relative_path,
             bytes,
+            content_extension: None,
+        }
+    }
+
+    fn sniffed<'a>(relative_path: &'a str, bytes: u64, extension: &'a str) -> DeliveredFile<'a> {
+        DeliveredFile {
+            content_extension: Some(extension),
+            ..file(relative_path, bytes)
         }
     }
 
@@ -674,6 +748,100 @@ mod tests {
         assert_eq!(plan[0].full_to, "payload/Silver Horizon: Part 2.mkv");
         assert_eq!(plan[1].to, "subs/Silver Horizon_ Part 2.1.eng.srt");
         assert_eq!(plan[1].full_to, "subs/Silver Horizon: Part 2.eng.srt");
+    }
+
+    // ── content extensions ──────────────────────────────────────────────
+
+    #[test]
+    fn an_extensionless_candidate_takes_its_content_extension() {
+        let files = [
+            sniffed("Yb5drZSkNi20UCMkb", 900 * MIB, "mkv"),
+            file("Yb5drZSkNi20UCMkb.eng.srt", 40 * 1024),
+        ];
+        let plan = plan_renames(&files, 0, "Silver Horizon 2024", "Silver Horizon: 2024");
+        assert_eq!(
+            plan,
+            vec![
+                PlannedRename {
+                    from: "Yb5drZSkNi20UCMkb".into(),
+                    to: "Silver Horizon 2024.mkv".into(),
+                    full_to: "Silver Horizon: 2024.mkv".into(),
+                },
+                PlannedRename {
+                    from: "Yb5drZSkNi20UCMkb.eng.srt".into(),
+                    to: "Silver Horizon 2024.eng.srt".into(),
+                    full_to: "Silver Horizon: 2024.eng.srt".into(),
+                },
+            ]
+        );
+        assert!(plan_content_extensions(&files, &plan).is_empty());
+    }
+
+    #[test]
+    fn a_content_extension_never_replaces_a_real_one() {
+        let files = [sniffed("Yb5drZSkNi20UCMkb.avi", 900 * MIB, "mkv")];
+        let plan = plan_renames(&files, 0, "Silver Horizon", "Silver Horizon");
+        assert_eq!(plan[0].to, "Silver Horizon.avi");
+        assert!(plan_content_extensions(&files, &[]).is_empty());
+    }
+
+    #[test]
+    fn every_extensionless_file_left_in_place_takes_its_content_extension() {
+        let files = [
+            sniffed("Silver Horizon 2024", 900 * MIB, "mkv"),
+            sniffed("extras/Quiet Harbour", 300 * MIB, "mp4"),
+            file("extras/notes", 1024),
+            file("Silver Horizon 2024.nfo", 1024),
+        ];
+        assert_eq!(
+            plan_content_extensions(&files, &[]),
+            vec![
+                PlannedRename {
+                    from: "Silver Horizon 2024".into(),
+                    to: "Silver Horizon 2024.mkv".into(),
+                    full_to: "Silver Horizon 2024.mkv".into(),
+                },
+                PlannedRename {
+                    from: "extras/Quiet Harbour".into(),
+                    to: "extras/Quiet Harbour.mp4".into(),
+                    full_to: "extras/Quiet Harbour.mp4".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_content_extension_rename_is_numbered_past_a_taken_name() {
+        let files = [
+            sniffed("Silver Horizon", 900 * MIB, "mkv"),
+            file("Silver Horizon.mkv", 4096),
+        ];
+        let plan = plan_content_extensions(&files, &[]);
+        assert_eq!(plan[0].to, "Silver Horizon.1.mkv");
+        assert_eq!(plan[0].full_to, "Silver Horizon.mkv");
+    }
+
+    #[test]
+    fn a_content_extension_rename_avoids_a_name_already_planned() {
+        let files = [
+            sniffed("Yb5drZSkNi20UCMkb", 900 * MIB, "mkv"),
+            sniffed("Silver Horizon", 4 * MIB, "mkv"),
+        ];
+        let planned = plan_renames(&files, 0, "Silver Horizon", "Silver Horizon");
+        assert_eq!(planned[0].to, "Silver Horizon.mkv");
+        let plan = plan_content_extensions(&files, &planned);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].from, "Silver Horizon");
+        assert_eq!(plan[0].to, "Silver Horizon.1.mkv");
+    }
+
+    #[test]
+    fn only_a_name_without_an_extension_lacks_one() {
+        assert!(lacks_extension("Silver Horizon 2024"));
+        assert!(lacks_extension("Silver Horizon S01E03."));
+        // A suffix too long to be an extension is part of the name.
+        assert!(lacks_extension("Silver.Horizon.S01E03"));
+        assert!(!lacks_extension("Silver Horizon.mkv"));
     }
 
     #[test]

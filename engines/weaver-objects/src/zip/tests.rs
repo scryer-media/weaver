@@ -12,7 +12,7 @@ use weaver_graph::{ByteRange, Emit, Kind, ObjectId, Provenance, Pull, VolumeInde
 
 use super::Zip;
 use super::records::{self, LOCAL_LEN};
-use crate::testing::payload;
+use crate::testing::{payload, zip64_end};
 use owner::Owner;
 
 fn files() -> Vec<(&'static str, Vec<u8>)> {
@@ -318,6 +318,24 @@ fn an_entry_sized_after_its_data_cannot_be_walked() {
     owner.whole(4096);
     no_trouble(&owner);
     streamed(&owner);
+}
+
+#[test]
+fn an_archive_ended_by_zip64_records_streams_and_one_placing_them_past_its_bytes_goes_to_an_engine()
+{
+    let mut bytes = archive();
+    zip64_end(&mut bytes, 1, |_| {});
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.whole(4096);
+    no_trouble(&owner);
+    streamed(&owner);
+
+    let mut bytes = archive();
+    zip64_end(&mut bytes, 1, |said| said.record = u64::MAX - 8);
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
+    assert!(owner.members.is_empty());
 }
 
 #[test]

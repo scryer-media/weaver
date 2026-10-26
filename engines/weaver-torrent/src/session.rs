@@ -1231,8 +1231,7 @@ fn merge_tracker_tiers(
     extra: impl IntoIterator<Item = url::Url>,
     trackers_only: bool,
 ) -> Vec<Vec<Tracker>> {
-    let extra =
-        (!trackers_only).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
+    let extra = (!trackers_only).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
     crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
 }
 
@@ -3772,7 +3771,10 @@ mod tests {
         // The extra trackers are the operator's.
         let mut merged = own_tiers();
         merged.push(operator("http://extra.test/announce"));
-        assert_eq!(merge_tracker_tiers(own_tiers(), extra.clone(), false), merged);
+        assert_eq!(
+            merge_tracker_tiers(own_tiers(), extra.clone(), false),
+            merged
+        );
         assert_eq!(merge_tracker_tiers(own_tiers(), extra, true), own_tiers());
 
         // A tracker repeated in a later tier keeps only its first place, and

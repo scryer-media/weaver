@@ -173,6 +173,13 @@ impl Pipeline {
                 batches.iter().map(|(path, _)| path.clone()).collect(),
             );
             let done_tx = self.direct_placement_done_tx.clone();
+            let counters = self.shared_state.queue.job_counters(job_id);
+            let placed_bytes: u64 = batches
+                .iter()
+                .flat_map(|(_, writes)| writes.iter())
+                .flat_map(|(_, chunks)| chunks.iter())
+                .map(|chunk| chunk.len() as u64)
+                .sum();
             #[cfg(test)]
             let hold = self.direct_placement_hold.clone();
             #[cfg(test)]
@@ -202,6 +209,13 @@ impl Pipeline {
                 // Every write has returned; a handle close waiting on these
                 // destinations may go ahead. On a panic the ticket drops
                 // while the task unwinds, still before the outcome is sent.
+                if result.is_ok()
+                    && let Some(counters) = counters
+                {
+                    counters
+                        .placed
+                        .fetch_add(placed_bytes, std::sync::atomic::Ordering::Relaxed);
+                }
                 drop(ticket);
                 DirectPlacementOutcome { prepared, result }
             });

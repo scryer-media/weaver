@@ -57,9 +57,8 @@ async fn finish_download(
     job_id: JobId,
     data: Result<DownloadPayload, DownloadError>,
 ) {
-    pipeline.active_downloads = 1;
+    hold_on_test_lane(pipeline, &[slot_segment(job_id)]);
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,

@@ -318,9 +318,7 @@ impl Pipeline {
         // admitted by its posted names can take it on as its own.
         self.bind_unposted_direct_volumes(job_id);
 
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::Par2MetadataLoaded { job_id });
+        self.emit_job_event(PipelineEvent::Par2MetadataLoaded { job_id });
     }
 
     // Select the compatibility view used by legacy single-set helpers.

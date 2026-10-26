@@ -774,6 +774,16 @@ pub struct SemanticPromotionResult {
     pub message: Option<String>,
 }
 
+/// One job's result from a batched cancel.
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct CancelJobResult {
+    pub id: u64,
+    pub cancelled: bool,
+    /// `NOT_FOUND`, `CONFLICT` or `INTERNAL` when the job was not cancelled.
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
 pub struct QueueCommandResult {
     pub success: bool,
@@ -1678,6 +1688,12 @@ fn resolve_queue_item_state(
         return state;
     }
 
+    if info.download_wait_reason.as_deref() == Some("nzb_slot")
+        && info.run_state != weaver_server_core::RunState::Paused
+    {
+        return QueueItemState::Queued;
+    }
+
     // The delivery tail runs strictly after the download lane settles: the
     // final move is gated on the terminal delivery census, and post-processing
     // follows it. The pipeline still force-projects `download_state =
@@ -1694,6 +1710,20 @@ fn resolve_queue_item_state(
             }
             _ => {}
         }
+    }
+
+    // The pipeline sets `fetching_repair_data` only once the payload is in,
+    // so recovery articles still on the wire are the work the row names.
+    if include_finalization_states
+        && info.fetching_repair_data
+        && matches!(
+            info.post_state,
+            weaver_server_core::PostState::Idle
+                | weaver_server_core::PostState::WaitingForVolumes
+                | weaver_server_core::PostState::AwaitingRepair
+        )
+    {
+        return QueueItemState::FetchingRepairData;
     }
 
     match info.download_state {
@@ -1744,6 +1774,25 @@ fn resolve_queue_item_state(
 pub fn queue_item_state_from_job_info_for_download_accounting(
     info: &weaver_server_core::JobInfo,
 ) -> QueueItemState {
+    // The control and terminal lanes rule here as everywhere: a started
+    // download the global pause holds is Paused, not active.
+    if let Some(state) = terminal_queue_item_state(info) {
+        return state;
+    }
+    if info.download_wait_reason.as_deref() == Some("nzb_slot")
+        && info.run_state != weaver_server_core::RunState::Paused
+    {
+        return QueueItemState::Queued;
+    }
+    // A started download that holds no lane right now has still started for
+    // the counters, unless propagation holds it.
+    if info.status == weaver_server_core::JobStatus::Downloading
+        && info.download_state == weaver_server_core::DownloadState::Queued
+        && info.download_wait_reason.as_deref()
+            != Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON)
+    {
+        return QueueItemState::Downloading;
+    }
     resolve_queue_item_state(info, false)
 }
 

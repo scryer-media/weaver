@@ -585,6 +585,44 @@ pub(in crate::pipeline::tests) fn header_encrypted_store_set(
     password: &'static str,
     check: HeaderCheck,
 ) -> Vec<(String, Vec<u8>)> {
+    header_encrypted_store_set_with_records(
+        member_name,
+        payload,
+        volume_count,
+        (password, check),
+        |_| None,
+    )
+}
+
+// [`header_encrypted_store_set`] with a RAR5 recovery record of `parity`
+// units in each volume over every byte before its `RR` header, as
+// `rar a -m0 -hp -rr` writes one: the header is enciphered with the rest,
+// the record's chunks are not.
+pub(in crate::pipeline::tests) fn protected_header_encrypted_store_set(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    password: &'static str,
+    parity: u16,
+) -> Vec<(String, Vec<u8>)> {
+    header_encrypted_store_set_with_records(
+        member_name,
+        payload,
+        volume_count,
+        (password, HeaderCheck::For(password)),
+        |protected| Some(weaver_objects::rar_record::encode::rar5(protected, parity)),
+    )
+}
+
+// [`header_encrypted_store_set`], each volume carrying the record `record`
+// makes of its bytes before the record's header, when it makes one.
+fn header_encrypted_store_set_with_records(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    (password, check): (&'static str, HeaderCheck),
+    record: impl Fn(&[u8]) -> Option<Vec<u8>>,
+) -> Vec<(String, Vec<u8>)> {
     let header_key = unrar_rs::derive_rar5_material(password, &TEST_HP_SALT, TEST_HP_KDF_LG2)
         .expect("the fixture KDF count is derivable")
         .key;
@@ -657,6 +695,14 @@ pub(in crate::pipeline::tests) fn header_encrypted_store_set(
                 ),
             ));
             bytes.extend_from_slice(part);
+            if let Some(record) = record(&bytes) {
+                bytes.extend_from_slice(&seal(
+                    3,
+                    &mut iv,
+                    &build_test_rar_service_header("RR", record.len() as u64),
+                ));
+                bytes.extend(record);
+            }
             bytes.extend_from_slice(&seal(2, &mut iv, &build_test_rar_end_header(!is_last)));
 
             (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)

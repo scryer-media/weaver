@@ -19,6 +19,13 @@ const ENCRYPTED: &[u8] = include_bytes!(
 const ENCRYPTED_MEMBER: &[u8] = include_bytes!(
     "../../../../server/crates/weaver-server-core/tests/fixtures/originals/small.txt"
 );
+// A member-encrypted RAR4 archive compressed with LZ, password `testpass123`,
+// holding `compressible.txt`: a RAR4 key has no check of its own, so a wrong
+// one shows only in what the decoder makes of the bytes.
+const ENCRYPTED_LZ: &[u8] = include_bytes!(
+    "../../../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar4_enc_lz.rar"
+);
+const ENCRYPTED_LZ_MEMBER_LEN: u64 = 226_943;
 
 // RAR5 store volumes, written here the way the format lays them out.
 mod rar5 {
@@ -352,8 +359,8 @@ fn claim_names_the_volumes_of_its_own_set_only() {
     let mut old = named(&["set.rar"]);
     assert_eq!(old.claim("set.r00", b"", None), Some(VolumeIndex(1)));
     assert_eq!(old.claim("SET.R41", b"", None), Some(VolumeIndex(42)));
-    // `.sNN` is numbered as `.rNN` is.
-    assert_eq!(old.claim("set.s00", b"", None), Some(VolumeIndex(1)));
+    // `.sNN` follows `.r99`.
+    assert_eq!(old.claim("set.s00", b"", None), Some(VolumeIndex(101)));
     assert_eq!(old.claim("set.part2.rar", b"", None), None);
     assert_eq!(old.claim("set.rar", b"", None), Some(VolumeIndex(0)));
 }
@@ -426,11 +433,10 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
     engine.wants(&mut seeks);
     assert!(
         seeks.is_empty(),
-        "nothing is bid before the run says where it is"
+        "nothing is bid but where the owner says the run is"
     );
 
-    engine.reached(VolumeIndex(0), 10);
-    engine.wants(&mut seeks);
+    engine.bid(VolumeIndex(0), &mut seeks);
     let bids: Vec<_> = seeks
         .iter()
         .map(|seek| (seek.volume.0, seek.weight.0, seek.purpose))
@@ -439,8 +445,7 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
 
     seeks.clear();
     engine.bound(VolumeIndex(3), "set.part4.rar", &[], None);
-    engine.reached(VolumeIndex(1), 0);
-    engine.wants(&mut seeks);
+    engine.bid(VolumeIndex(1), &mut seeks);
     let bids: Vec<_> = seeks
         .iter()
         .map(|seek| (seek.volume.0, seek.weight.0))
@@ -532,6 +537,35 @@ fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
             Said::Closed(0),
         ]
     );
+}
+
+// A wrong RAR4 key fails the decoder before any checksum: on bytes as they
+// were posted, that asks for another password and says no damage.
+#[test]
+fn a_wrong_rar4_key_the_decoder_rejects_asks_for_another_and_the_right_one_extracts() {
+    let mut engine = named(&["rar4_enc_lz.rar"]);
+    let mut out = Vec::new();
+    engine.offer_password("not-the-password", &mut out);
+    let wrong = run(&mut engine, vec![ENCRYPTED_LZ.to_vec()]);
+    assert_eq!(wrong.last(), Some(&Said::NeedsPassword));
+    assert!(
+        !wrong
+            .iter()
+            .any(|said| { matches!(said, Said::Closed(_) | Said::Damaged(..) | Said::Refuse(_)) })
+    );
+
+    engine.offer_password("testpass123", &mut out);
+    assert!(out.is_empty());
+    let right = run(&mut engine, vec![ENCRYPTED_LZ.to_vec()]);
+    assert_eq!(
+        right[0],
+        Said::Member(0, "compressible.txt".into(), Some(ENCRYPTED_LZ_MEMBER_LEN))
+    );
+    assert!(matches!(
+        &right[1],
+        Said::Bytes(0, bytes) if bytes.len() as u64 == ENCRYPTED_LZ_MEMBER_LEN
+    ));
+    assert_eq!(right[2], Said::Closed(0));
 }
 
 #[test]

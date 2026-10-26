@@ -1512,6 +1512,7 @@ async fn a_second_index_still_on_the_wire_is_not_an_ignorable_residual() {
             .unwrap();
         // The second index is still coming: incomplete, and its article queued.
         state.download_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -2115,6 +2116,73 @@ async fn a_landed_recovery_volume_repairs_on_the_analysis_that_asked_for_it() {
     );
 }
 
+// The repair runs on a blocking worker the actor awaits inline, so the
+// shutdown check at the top of the actor's loop cannot reach it. Shutdown
+// still fires the job's token: the retained session stops as cancelled,
+// writes nothing, and the job is left for a restart to repair again.
+#[tokio::test]
+async fn shutdown_cancels_a_par2_repair_the_actor_awaits_inline() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30952);
+    let fixture =
+        install_parked_recovery_par2_job(&mut pipeline, job_id, "Silver Horizon Shutdown Repair")
+            .await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    land_parked_recovery_volume(&mut pipeline, job_id, &fixture).await;
+    let damaged_payload = std::fs::read(&fixture.payload_path).unwrap();
+    assert_ne!(damaged_payload, fixture.original_payload);
+
+    let token = pipeline.par2_cancellation_token(job_id);
+    let queue = Arc::clone(&pipeline.shared_state.queue);
+    let working_dir = fixture.payload_path.parent().unwrap().to_path_buf();
+    let hold =
+        crate::e2e_failpoint::Hold::install(crate::e2e_failpoint::PAR2_REPAIR_RUN, &working_dir);
+
+    let mut check = Box::pin(pipeline.check_job_completion(job_id));
+    tokio::select! {
+        biased;
+        () = &mut check => panic!("the check must wait on the held repair"),
+        () = hold.arrived() => {}
+    }
+    queue.write_intent(|inner| {
+        inner.globals.shutting_down = true;
+        crate::pipeline::queue::Change::changed(())
+    });
+    let pending = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(check.as_mut(), cx).is_pending())
+    })
+    .await;
+    let fired = token.is_cancelled();
+    // Released before asserting: a parked worker would hold the runtime open.
+    hold.release();
+    assert!(pending, "the check still waits for the repair to return");
+    assert!(
+        fired,
+        "shutdown must fire the token the inline repair runs under"
+    );
+    check.await;
+
+    assert_eq!(
+        std::fs::read(&fixture.payload_path).unwrap(),
+        damaged_payload,
+        "a cancelled repair must write nothing"
+    );
+    assert!(
+        !matches!(
+            job_status_for_assert(&pipeline, job_id),
+            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
+        ),
+        "a repair stopped for shutdown is no verdict; {}",
+        debug_job_state(&pipeline, job_id)
+    );
+    assert!(
+        !pipeline.par2_verified.contains(&job_id),
+        "the job must stay unverified for a restart to repair"
+    );
+}
+
 // The shortcut is an optimisation, not a promise about the disk.
 //
 // With the retained session forced off — the one-shot shape a session
@@ -2696,5 +2764,76 @@ async fn a_rebind_between_submit_and_done_discards_the_analysis_verdict() {
     assert_eq!(
         pipeline.par2_repairer_analyze_calls, 2,
         "a fresh read must be submitted against the rebound identities"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_cancels_the_retained_par2_session_and_leaves_the_job_resumable() {
+    // The analysis worker carries the retained session and the job's token,
+    // and the runtime waits for it before the process exits. Shutdown fires
+    // that token and forgets the ticket: the read stops, its cancelled verdict
+    // is never the job's answer, and the job keeps the state a restart reads
+    // again.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30606);
+    let working_dir =
+        insert_damaged_job_ready_for_analysis(&mut pipeline, job_id, "analysis-shutdown").await;
+    let set_id = pipeline
+        .par2_runtime(job_id)
+        .and_then(|runtime| runtime.served)
+        .expect("the fixture serves one recovery set");
+
+    pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.par2_analysis_in_flight.contains_key(&job_id));
+    let status_before = job_status_for_assert(&pipeline, job_id);
+
+    pipeline.cancel_par2_work_for_shutdown();
+
+    assert!(
+        pipeline
+            .par2_cancellations
+            .get(&job_id)
+            .is_some_and(par2_rs::CancellationToken::is_cancelled),
+        "shutdown must fire the token the retained session reads under"
+    );
+    assert!(
+        !pipeline.par2_analysis_in_flight.contains_key(&job_id),
+        "shutdown must forget the outstanding ticket"
+    );
+    let done = next_par2_analysis_done(&mut pipeline).await;
+    pipeline.handle_par2_analysis_done(done).await;
+    assert!(
+        !pipeline.par2_analysis_results.contains_key(&job_id),
+        "a cancelled read must not be parked as the job's verdict"
+    );
+    assert!(!pipeline.par2_verified.contains(&job_id));
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        status_before,
+        "a cancelled read must leave the job's state as it was"
+    );
+
+    // A session opened under the fired token returns cancelled instead of
+    // reading: the scan stops at its poll rather than running to the end.
+    let (mut session, _) = pipeline
+        .take_or_open_par2_repair_session(
+            job_id,
+            set_id,
+            working_dir,
+            crate::pipeline::completion::finalize::check::configured_par2_repair_memory_limit_bytes(
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the set still opens a retained session");
+    let error = session
+        .analyze()
+        .expect_err("a cancelled session must not produce a verdict");
+    assert!(
+        error.to_string().contains("operation cancelled"),
+        "the session must stop as cancelled, got {error}"
     );
 }

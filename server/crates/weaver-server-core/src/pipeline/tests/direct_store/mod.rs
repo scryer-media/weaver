@@ -1949,10 +1949,40 @@ pub(in crate::pipeline::tests) fn protected_store_set(
     })
 }
 
+// [`protected_store_set`] with a second member, `lead`, stored whole in the
+// first volume ahead of the split one.
+pub(in crate::pipeline::tests) fn protected_store_set_led_by(
+    lead: (&str, &[u8]),
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    parity: u16,
+) -> Vec<(String, Vec<u8>)> {
+    led_store_set_with_records(
+        Some(lead),
+        member_name,
+        payload,
+        volume_count,
+        |protected, _| weaver_objects::rar_record::encode::rar5(protected, parity),
+    )
+}
+
 // A store set whose volumes each end in an `RR` service header, the record
 // `record` makes of the bytes before it and the volume's index, and the end
 // header.
 fn store_set_with_records(
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+    record: impl Fn(&[u8], usize) -> Vec<u8>,
+) -> Vec<(String, Vec<u8>)> {
+    led_store_set_with_records(None, member_name, payload, volume_count, record)
+}
+
+// [`store_set_with_records`], `lead` stored whole in the first volume ahead
+// of the split member when there is one.
+fn led_store_set_with_records(
+    lead: Option<(&str, &[u8])>,
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -1983,6 +2013,16 @@ fn store_set_with_records(
                 if is_first { 0x0001 } else { 0x0001 | 0x0002 },
                 (!is_first).then_some(volume as u64),
             ));
+            if let Some((name, body)) = lead.filter(|_| is_first) {
+                bytes.extend_from_slice(&build_test_rar_file_header(
+                    name,
+                    0,
+                    body.len() as u64,
+                    body.len() as u64,
+                    Some(checksum::crc32(body)),
+                ));
+                bytes.extend_from_slice(body);
+            }
             bytes.extend_from_slice(&build_test_rar_file_header(
                 member_name,
                 split_flags,

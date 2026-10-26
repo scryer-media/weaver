@@ -43,7 +43,7 @@ async fn acquisition_budget<T>(
     }
 }
 use crate::error::{NntpError, Result};
-use crate::health::{DisableReason, HealthConfig, HealthTracker, ServerState};
+use crate::health::{HealthConfig, HealthTracker, ServerState};
 use crate::transfer::{ServerTransferControl, StableServerId};
 
 // Identifies a specific server in the configuration.
@@ -187,6 +187,7 @@ pub struct BlockingConnectionPermit {
     _permit: OwnedSemaphorePermit,
     pub(crate) socket_slot: crate::socket_budget::SocketSlot,
     pub(crate) health_lease: Arc<crate::recovery::ConnectionHealthLease>,
+    pub(crate) max_idle_age: Duration,
 }
 
 #[cfg(test)]
@@ -196,6 +197,7 @@ impl BlockingConnectionPermit {
     pub(crate) fn for_tests() -> Self {
         let semaphore = Arc::new(Semaphore::new(1));
         Self {
+            max_idle_age: Duration::from_mins(5),
             _permit: semaphore
                 .try_acquire_owned()
                 .expect("a fresh semaphore always has its one permit"),
@@ -721,13 +723,32 @@ impl NntpPool {
         demanded: bool,
         deadline: &mut tokio::time::Instant,
     ) -> Result<PooledConnection> {
+        self.acquire_guarded_before_deadline(server, initial_group, demanded, deadline, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_guarded_before_deadline(
+        &self,
+        server: ServerId,
+        initial_group: Option<&str>,
+        demanded: bool,
+        deadline: &mut tokio::time::Instant,
+        guard: Option<&(dyn Fn(ServerId) -> bool + Send + Sync)>,
+    ) -> Result<PooledConnection> {
         if self.shutdown.is_cancelled() {
             return Err(NntpError::PoolShutdown);
         }
         let idx = server.0;
         let permit = acquisition_budget(Some(deadline), self.acquire_dispatch_permit(idx)).await?;
-        self.acquire_with_permit_budget(idx, Some(permit), initial_group, Some(deadline), demanded)
-            .await
+        self.acquire_with_permit_budget(
+            idx,
+            Some(permit),
+            initial_group,
+            Some(deadline),
+            demanded,
+            guard,
+        )
+        .await
     }
 
     pub(crate) async fn acquire_extra_before_deadline(
@@ -805,7 +826,7 @@ impl NntpPool {
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
         initial_group: Option<&str>,
     ) -> Result<PooledConnection> {
-        self.acquire_with_permit_budget(idx, permit, initial_group, None, false)
+        self.acquire_with_permit_budget(idx, permit, initial_group, None, false, None)
             .await
     }
 
@@ -816,9 +837,13 @@ impl NntpPool {
         initial_group: Option<&str>,
         mut deadline: Option<&mut tokio::time::Instant>,
         demanded: bool,
+        guard: Option<&(dyn Fn(ServerId) -> bool + Send + Sync)>,
     ) -> Result<PooledConnection> {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
+            if guard.is_some_and(|guard| !guard(ServerId(idx))) {
+                return Err(NntpError::AcquireTimeout(0));
+            }
             // Subscribe before inspecting the cache and physical capacity.
             let mut changed = self.socket_budgets[idx].subscribe();
             if deadline
@@ -877,6 +902,9 @@ impl NntpPool {
                         }
                     }
 
+                    if guard.is_some_and(|guard| !guard(ServerId(idx))) {
+                        return Err(NntpError::AcquireTimeout(0));
+                    }
                     debug!(server = idx, "creating new connection");
                     let health_lease = self.recovery_gates[idx]
                         .admit(demanded)
@@ -948,13 +976,15 @@ impl NntpPool {
                                         | NntpError::AuthenticationRequired
                                         | NntpError::AccessDenied
                                 );
-                                self.health.lock().await.record_connection_outcome(
-                                    idx,
-                                    &health_lease.0,
-                                    false,
-                                    auth,
-                                );
-                                self.retire_quarantined_idle(idx);
+                                if auth || !self.has_established_sockets(idx) {
+                                    self.health.lock().await.record_connection_outcome(
+                                        idx,
+                                        &health_lease.0,
+                                        false,
+                                        auth,
+                                    );
+                                    self.retire_quarantined_idle(idx);
+                                }
                             }
                             // Record the failure timestamp.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
@@ -1437,6 +1467,59 @@ impl NntpPool {
         );
     }
 
+    pub async fn provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
+        let mut health = self.health.lock().await;
+        self.sample_provider_policy(&mut health)
+    }
+
+    // Native lane workers can wait for the short health critical section;
+    // contention is not a reason to surrender reserved article work.
+    pub fn blocking_provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
+        self.sample_provider_policy(&mut self.health.blocking_lock())
+    }
+
+    // Contention is a retry, never permission to choose a lower group.
+    pub fn try_provider_policy(&self) -> Option<crate::provider_policy::ProviderPolicy> {
+        let mut health = self.health.try_lock().ok()?;
+        Some(self.sample_provider_policy(&mut health))
+    }
+
+    fn sample_provider_policy(
+        &self,
+        health: &mut HealthTracker,
+    ) -> crate::provider_policy::ProviderPolicy {
+        use crate::provider_policy::{ProviderGroup, ProviderPolicy, ProviderState};
+        health.check_reenable_all();
+        ProviderPolicy {
+            servers: (0..self.configs.len())
+                .map(|idx| {
+                    let quota_remaining =
+                        self.transfer_controls[idx]
+                            .as_ref()
+                            .map_or(u64::MAX, |control| {
+                                let quota = control.snapshot();
+                                if quota.quota_enabled {
+                                    quota
+                                        .quota_limit_bytes
+                                        .saturating_sub(quota.quota_used_bytes)
+                                } else {
+                                    u64::MAX
+                                }
+                            });
+                    ProviderState {
+                        group: ProviderGroup {
+                            backfill: self.backfill[idx],
+                            priority: self.server_groups()[idx],
+                        },
+                        available: health.is_available(idx) && self.route_available(idx),
+                        refuses_credentials: self.refuses_credentials(idx),
+                        quota_remaining,
+                    }
+                })
+                .collect(),
+        }
+    }
+
     // Inspect BODY eligibility without allocating or ranking server candidates.
     pub async fn body_server_availability(
         &self,
@@ -1457,7 +1540,7 @@ impl NntpPool {
         let excludes = (0..self.configs.len())
             .filter(|idx| is_excluded(*idx))
             .collect::<Vec<_>>();
-        let backfill_unlocked = self.fill_servers_exhausted_or_auth_disabled(&excludes, &health);
+        let backfill_unlocked = self.fill_servers_exhausted_or_auth_disabled(&excludes);
         let mut retry_after = None;
         for server_idx in 0..self.configs.len() {
             if is_excluded(server_idx)
@@ -1495,12 +1578,27 @@ impl NntpPool {
             .iter()
             .enumerate()
             .filter(|(_, backfill)| !**backfill)
-            .all(|(idx, _)| exclude.contains(&idx) || !self.route_available(idx))
+            .all(|(idx, _)| exclude.contains(&idx))
+    }
+
+    // Whether this server refuses this pool's credentials: health disabled it
+    // for `DisableReason::AuthFailure` and that disable still runs. This is
+    // the one answer to "may this server serve an article" beyond the
+    // article's own exclusions and its job's retention: a refusing server
+    // serves nothing, so the work it alone could serve is unservable, not
+    // waiting. Every other quarantine (transport, capacity, an outage) is a
+    // wait. Lock-free on a healthy server; reads the recovery gate, which
+    // holds the same deadline the health state does.
+    pub fn refuses_credentials(&self, idx: usize) -> bool {
+        self.recovery_gates
+            .get(idx)
+            .is_some_and(|gate| gate.refuses_credentials())
     }
 
     // The ordering-side backfill gate: every fill server is either excluded
-    // for this request or disabled by health for a reason that will not
-    // heal on its own (`DisableReason::AuthFailure`).
+    // for this request or refusing this pool's credentials
+    // ([`Self::refuses_credentials`]), a condition that will not heal on its
+    // own.
     //
     // A fill server with bad credentials re-disables on every probe, so it
     // never produces the 430 that would exclude it and otherwise pins an
@@ -1515,29 +1613,17 @@ impl NntpPool {
     // `FailureRatio` disable is an outage that heals by itself; in both cases
     // waiting is far cheaper than spilling the whole queue onto a paid
     // backfill account. Note
-    // this is an *ordering* gate only — disabled servers must never enter a
-    // request's exclude set, or exhaustion booking would declare the segment
-    // missing before backfill was ever tried.
-    pub fn fill_servers_exhausted_or_auth_disabled(
-        &self,
-        exclude: &[usize],
-        health: &HealthTracker,
-    ) -> bool {
+    // this is an *ordering* gate only — a server disabled for any of those
+    // reasons must never enter a request's exclude set, or exhaustion booking
+    // would declare the segment missing before it came back. A credentials
+    // refusal is the exception: it is the server's answer for the article,
+    // and exhaustion still counts every backfill server before booking.
+    pub fn fill_servers_exhausted_or_auth_disabled(&self, exclude: &[usize]) -> bool {
         self.backfill
             .iter()
             .enumerate()
             .filter(|(_, backfill)| !**backfill)
-            .all(|(idx, _)| {
-                exclude.contains(&idx)
-                    || !self.route_available(idx)
-                    || matches!(
-                        health.server(idx).state(),
-                        ServerState::Disabled {
-                            reason: DisableReason::AuthFailure,
-                            ..
-                        }
-                    )
-            })
+            .all(|(idx, _)| exclude.contains(&idx) || self.refuses_credentials(idx))
     }
 
     // Access the health tracker for observability.
@@ -1595,6 +1681,15 @@ impl NntpPool {
         if idx >= self.semaphores.len() {
             return Err(NntpError::PoolExhausted);
         }
+        let recent_failure = self.last_connect_failure[idx]
+            .try_lock()
+            .map_err(|_| NntpError::PoolExhausted)?;
+        if !self.is_over_limit(server)
+            && recent_failure.is_some_and(|at| at.elapsed() < self.reconnect_delay)
+        {
+            return Err(NntpError::ServerRecovering);
+        }
+        drop(recent_failure);
         let permit = self.semaphores[idx]
             .clone()
             .try_acquire_owned()
@@ -1604,9 +1699,15 @@ impl NntpPool {
         // gate holding the tier open for one probe, and reading it as
         // saturation sends the operator looking for a permit leak on a server
         // that has every permit free.
-        let health_lease = self.recovery_gates[idx]
-            .admit(demanded)
-            .ok_or(NntpError::ServerRecovering)?;
+        // Except for a server refusing this pool's credentials: no probe
+        // is due there, and its refusal is the answer the work gets.
+        let health_lease = self.recovery_gates[idx].admit(demanded).ok_or_else(|| {
+            if self.refuses_credentials(idx) {
+                NntpError::AuthenticationRejected
+            } else {
+                NntpError::ServerRecovering
+            }
+        })?;
         let socket_slot = budget
             .try_acquire()
             .or_else(|| {
@@ -1615,10 +1716,20 @@ impl NntpPool {
             })
             .ok_or(NntpError::PoolExhausted)?;
         Ok(BlockingConnectionPermit {
+            max_idle_age: self.max_idle_age,
             _permit: permit,
             socket_slot,
             health_lease: Arc::new(health_lease),
         })
+    }
+
+    pub(crate) fn has_established_sockets(&self, idx: usize) -> bool {
+        let sockets = self.socket_budgets[idx].snapshot();
+        sockets.physical > sockets.dialing + sockets.closing
+    }
+
+    pub(crate) fn note_blocking_connect_failure(&self, idx: usize) {
+        *self.last_connect_failure[idx].blocking_lock() = Some(Instant::now());
     }
 
     pub(crate) fn with_blocking_connect_admission<T>(
@@ -1821,7 +1932,7 @@ mod recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::{HealthConfig, ServerState};
+    use crate::health::{DisableReason, HealthConfig, ServerState};
 
     #[tokio::test]
     async fn idle_route_probe_opens_one_socket_and_preserves_provider_health() {
@@ -2763,7 +2874,7 @@ mod tests {
             "the healthy backfill server must be visible past a disabled fill tier"
         );
         assert!(
-            disabled.fill_servers_exhausted_or_auth_disabled(&[], &*disabled.health().lock().await),
+            disabled.fill_servers_exhausted_or_auth_disabled(&[]),
             "the ordering gate itself must agree"
         );
         assert!(
@@ -2786,7 +2897,7 @@ mod tests {
             "a 5-10s cooldown must wait, not spill onto backfill"
         );
         assert!(
-            !cooling.fill_servers_exhausted_or_auth_disabled(&[], &*cooling.health().lock().await),
+            !cooling.fill_servers_exhausted_or_auth_disabled(&[]),
             "CoolingDown must not open the backfill gate"
         );
 
@@ -2815,7 +2926,7 @@ mod tests {
             "an outage disable heals on its own and must wait, not spill onto backfill"
         );
         assert!(
-            !outage.fill_servers_exhausted_or_auth_disabled(&[], &*outage.health().lock().await),
+            !outage.fill_servers_exhausted_or_auth_disabled(&[]),
             "ConsecutiveFailures must not open the backfill gate"
         );
     }

@@ -161,7 +161,7 @@ fn window(tree: &mut Tree, node: NodeId, member: MemberId, range: ByteRange) -> 
     tree.attach_window(
         node,
         (member, range),
-        Kind::Par2,
+        (Kind::Par2, &Handed::default()),
         Vec::new(),
         &mut Sets,
         &mut Vec::new(),

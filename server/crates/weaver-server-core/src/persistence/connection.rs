@@ -773,6 +773,14 @@ enum DbWriteCommand {
         // history row is queryable through the read paths.
         committed: Option<oneshot::Sender<()>>,
     },
+    // Several jobs' archives as one ordered write. Each archive keeps its own
+    // transaction; `committed` fires once every one has run, naming the jobs
+    // whose archive failed and why.
+    ArchiveJobs {
+        jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
+        committed: oneshot::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
+    },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
     },
@@ -829,7 +837,10 @@ impl DbWriteCommand {
             Self::Write {
                 lane: Some(lane), ..
             } => Some((&[], *lane)),
-            Self::Write { lane: None, .. } | Self::Flush { .. } => None,
+            // Spans many jobs' lanes, so it is a barrier: every earlier write
+            // for any of its jobs (a support facts save among them), every
+            // event batch and every attribution checkpoint lands first.
+            Self::ArchiveJobs { .. } | Self::Write { lane: None, .. } | Self::Flush { .. } => None,
         }
     }
 }
@@ -865,7 +876,7 @@ async fn execute_write_command(
             committed,
         } => {
             let writer = writer.clone();
-            tokio::task::spawn_blocking(move || {
+            let archived = tokio::task::spawn_blocking(move || {
                 // Capture the cache generation *before* the archive
                 // read so a concurrent history-delete that bumps the
                 // generation makes the conditional insert a no-op,
@@ -885,13 +896,52 @@ async fn execute_write_command(
                             error = %error,
                             "failed to archive job on database writer path"
                         );
+                        return false;
                     }
                 }
+                true
             })
-            .await
-            .ok();
-            if let Some(committed) = committed {
+            .await;
+            if matches!(archived, Ok(true))
+                && let Some(committed) = committed
+            {
                 let _ = committed.send(());
+            }
+        }
+        DbWriteCommand::ArchiveJobs {
+            jobs,
+            failure_kind,
+            committed,
+        } => {
+            let writer = writer.clone();
+            let failed = tokio::task::spawn_blocking(move || {
+                let mut failed = BTreeMap::new();
+                for (job_id, history) in jobs {
+                    // Taken before each archive read, as for one archive.
+                    let observed_generation = writer.job_history_cache_generation();
+                    match writer.archive_job_with_terminal_cause(
+                        job_id,
+                        &history,
+                        None,
+                        failure_kind,
+                    ) {
+                        Ok(Some(row)) => writer.cache_job_history_at(row, observed_generation),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                error = %error,
+                                "failed to archive job on database writer path"
+                            );
+                            failed.insert(job_id, error.to_string());
+                        }
+                    }
+                }
+                failed
+            })
+            .await;
+            if let Ok(failed) = failed {
+                let _ = committed.send(failed);
             }
         }
         DbWriteCommand::InsertJobEvents { events } => {
@@ -1031,6 +1081,7 @@ impl DbWriteCommand {
     fn label(&self) -> &'static str {
         match self {
             Self::ArchiveJob { .. } => "archive_job",
+            Self::ArchiveJobs { .. } => "archive_jobs",
             Self::InsertJobEvents { .. } => "insert_job_events",
             Self::Write { label, .. } => label,
             Self::Flush { .. } => "flush",
@@ -1085,12 +1136,6 @@ impl JobHistoryCache {
         self.rows.remove(&job_id);
         self.insertion_order
             .retain(|cached_id| *cached_id != job_id);
-        self.generation = self.generation.wrapping_add(1);
-    }
-
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.insertion_order.clear();
         self.generation = self.generation.wrapping_add(1);
     }
 }
@@ -1262,17 +1307,17 @@ impl Database {
     }
 
     pub(crate) fn invalidate_job_history_cache(&self, job_id: u64) {
-        self.job_history_cache
-            .lock()
-            .expect("job history cache poisoned")
-            .remove(job_id);
+        self.invalidate_job_history_cache_for(&[job_id]);
     }
 
-    pub(crate) fn clear_job_history_cache(&self) {
-        self.job_history_cache
+    pub(crate) fn invalidate_job_history_cache_for(&self, job_ids: &[u64]) {
+        let mut cache = self
+            .job_history_cache
             .lock()
-            .expect("job history cache poisoned")
-            .clear();
+            .expect("job history cache poisoned");
+        for job_id in job_ids {
+            cache.remove(*job_id);
+        }
     }
 
     #[track_caller]
@@ -1466,6 +1511,26 @@ impl Database {
                 typed_terminal_cause,
                 failure_kind,
                 committed: Some(committed_tx),
+            },
+            "archive",
+        )?;
+        Ok(committed_rx)
+    }
+
+    // Queue several jobs' history archives as one ordered write, and hand
+    // back a signal that fires once every archive has run, naming the jobs
+    // whose archive failed. A dropped signal means the writer closed first.
+    pub(crate) fn try_queue_archive_jobs(
+        &self,
+        jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
+    ) -> Result<oneshot::Receiver<BTreeMap<crate::jobs::ids::JobId, String>>, StateError> {
+        let (committed_tx, committed_rx) = oneshot::channel();
+        self.try_send_with_retry(
+            DbWriteCommand::ArchiveJobs {
+                jobs,
+                failure_kind,
+                committed: committed_tx,
             },
             "archive",
         )?;

@@ -332,7 +332,7 @@ fn wants_asks_for_recovery_while_short() {
     let wrong = job.store.members[&member].clone();
     feed(&mut job, member, &wrong, Some(bad));
     let mut seeks = Vec::new();
-    Recovery::wants(&mut job.object, &mut seeks);
+    Recovery::wants(&job.object, &mut seeks);
     assert!(!seeks.is_empty());
     assert!(
         seeks
@@ -397,11 +397,11 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
 
 // An object that has found no set has not ruled while its volume's bytes
 // may still hold one: the front of an index is only a packet header. Once
-// the volume is read through with no set in it, there is nothing to rule
-// on: it is Clean, not due again every step, and a set found later makes it
-// due once.
+// the volume is read through with no set in it, nothing was checked: it is
+// Unread, no verdict on any member, not due again every step, and a set
+// found later makes it due once.
 #[test]
-fn an_object_with_no_sets_rules_clean_once_a_volume_is_read_through() {
+fn an_object_with_no_sets_rules_unread_once_a_volume_is_read_through() {
     let data = payload(18, 5000);
     let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
     let mut job = Job::new(Par2::new(OWN), OWN);
@@ -423,9 +423,9 @@ fn an_object_with_no_sets_rules_clean_once_a_volume_is_read_through() {
     assert!(job.object.sets.is_empty());
     assert_eq!(job.object.outcome(), None);
     job.object.volume_closed(volume, &mut out);
-    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
-    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
     job.volume(&files[1].0, &files[1].1, ARTICLE as usize, false);
     assert_eq!(job.object.outcome(), None);
 }
@@ -488,7 +488,7 @@ fn named_volume(job: &mut Job<Par2>, file: &(String, Vec<u8>)) -> weaver_graph::
 
 fn wanted(job: &mut Job<Par2>) -> Vec<weaver_graph::VolumeIndex> {
     let mut seeks = Vec::new();
-    Recovery::wants(&mut job.object, &mut seeks);
+    Recovery::wants(&job.object, &mut seeks);
     let mut volumes: Vec<_> = seeks.iter().map(|seek| seek.volume).collect();
     volumes.dedup();
     volumes
@@ -827,4 +827,138 @@ fn a_repair_larger_than_the_memory_limit_reads_one_slice_at_a_time() {
     );
     assert!(access.widest <= SLICE, "{}", access.widest);
     assert!(job.store.members[&member] == data);
+}
+
+// A recovery volume whose first article arrived, the rest still to come.
+fn head(job: &mut Job<Par2>, file: &(String, Vec<u8>)) -> weaver_graph::VolumeIndex {
+    let volume = job.name(&file.0, &file.1);
+    let end = (ARTICLE as usize).min(file.1.len());
+    job.object.deliver(
+        weaver_graph::Delivery {
+            volume,
+            offset: 0,
+            bytes: &file.1[..end],
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    volume
+}
+
+fn seeks(object: &Par2) -> Vec<weaver_graph::Seek> {
+    let mut out = Vec::new();
+    Recovery::wants(object, &mut out);
+    out
+}
+
+// The head of a recovery volume arrives before any damage: what it showed
+// says the volume carries blocks, and the rest of it is deferred.
+#[test]
+fn a_recovery_volume_whose_head_arrived_before_damage_is_deferred() {
+    let data = payload(40, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = job(&files[..1]);
+    let volume = head(&mut job, &files[1]);
+    job.member("payload.bin", &data);
+    bind(&mut job);
+    assert_eq!(
+        seeks(&job.object),
+        vec![weaver_graph::Seek::deferred(
+            volume,
+            ByteRange::new(ARTICLE, u64::MAX)
+        )]
+    );
+}
+
+const DAMAGED: [usize; 4] = [100, 1100, 2100, 3100];
+
+// Damage appears: four slices bad, three blocks in hand from the heads. The
+// one block short is wanted from the volume named for the fewest blocks,
+// whole, and the others stay deferred.
+#[test]
+fn damage_raises_the_smallest_volumes_its_shortfall_needs_and_defers_the_rest() {
+    let data = payload(41, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 8, 3);
+    let mut volumes: Vec<_> = files[1..].to_vec();
+    let blocks = |name: &str| crate::recovery_volume::named_blocks(name, ".par2").unwrap_or(0);
+    volumes.sort_by_key(|(name, _)| std::cmp::Reverse(blocks(name)));
+    let mut job = job(&files[..1]);
+    let sampled: Vec<_> = volumes.iter().map(|file| head(&mut job, file)).collect();
+    let mut wrong = data.clone();
+    for at in DAMAGED {
+        wrong[at] ^= 0x33;
+    }
+    let bad = ByteRange::new(0, 3500);
+    let member = job.member("payload.bin", &wrong);
+    job.arrive(member, 0, &wrong[..3500], Provenance::Damaged);
+    bind(&mut job);
+    feed(&mut job, member, &wrong, Some(bad));
+    let wanted = seeks(&job.object);
+    let names: Vec<_> = volumes.iter().map(|(name, _)| name.as_str()).collect();
+    let now: Vec<_> = wanted
+        .iter()
+        .filter(|seek| seek.when == weaver_graph::When::Now)
+        .map(|seek| seek.volume)
+        .collect();
+    let later: Vec<_> = wanted
+        .iter()
+        .filter(|seek| seek.when == weaver_graph::When::Deferred)
+        .map(|seek| seek.volume)
+        .collect();
+    let smallest = *sampled.last().unwrap();
+    assert_eq!(now, vec![smallest], "{names:?} {later:?}");
+    assert!(later.iter().all(|volume| *volume != smallest));
+    assert_eq!(later.len(), sampled.len() - 1);
+    assert!(
+        wanted
+            .iter()
+            .filter(|seek| seek.when == weaver_graph::When::Now)
+            .all(|seek| seek.purpose == weaver_graph::Purpose::Recovery
+                && seek.range == ByteRange::new(ARTICLE, u64::MAX))
+    );
+}
+
+// One recovery packet past the hold cap, every piece but its first article
+// arriving first: the hold fills to just under the cap, and the first
+// article, which would take it over, lands at the front, so it is walked
+// and the held bytes drain into the packet.
+#[test]
+fn the_article_that_closes_the_gap_is_walked_with_the_hold_full() {
+    use par2_rs::FileHashState;
+    use par2_rs::packet::{HEADER_SIZE, MAGIC};
+
+    use super::walker::{Found, Walker};
+
+    let data = payload(9, 8 * 1024 * 1024);
+    let length = (HEADER_SIZE + 4 + data.len()) as u64;
+    let mut packet = Vec::with_capacity(length as usize);
+    packet.extend_from_slice(MAGIC);
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.extend_from_slice(&[0; 16]);
+    packet.extend_from_slice(&[7; 16]);
+    packet.extend_from_slice(b"PAR 2.0\0RecvSlic");
+    packet.extend_from_slice(&3u32.to_le_bytes());
+    packet.extend_from_slice(&data);
+    let mut hasher = FileHashState::new();
+    hasher.update(&packet[32..]);
+    let hash = hasher.finalize();
+    packet[16..32].copy_from_slice(&hash);
+
+    let first = 4096;
+    let mut walker = Walker::default();
+    let mut found = Vec::new();
+    for (index, piece) in packet[first..].chunks(64 * 1024).enumerate() {
+        walker.deliver((first + index * 64 * 1024) as u64, piece, &mut found);
+    }
+    assert!(found.is_empty(), "nothing walks before the front arrives");
+    walker.deliver(0, &packet[..first], &mut found);
+    assert!(
+        matches!(
+            found.as_slice(),
+            [Found::Recovery { exponent: 3, range, .. }] if *range == ByteRange::new(0, length)
+        ),
+        "{found:?}"
+    );
+    assert_eq!(walker.front(), length);
 }

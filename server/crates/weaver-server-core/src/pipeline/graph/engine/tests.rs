@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant, HoldsNamespace};
 use weaver_graph::{
-    ByteRange, Extraction, MemberId, NodeId, Provenance, Seek, Sink, VolumeIndex, Volumes, Weight,
-    Why,
+    ByteRange, Extraction, Lost, MemberId, NodeId, Provenance, Seek, Sink, VolumeIndex, Volumes,
+    Weight, Why,
 };
 
 use super::echo::{Echoes, HEADER, SIGNATURE};
-use super::volumes::{RunVolumes, Unreadable};
+use super::volumes::RunVolumes;
 use super::{Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::envelope::{Envelopes, Shelf};
@@ -96,7 +96,9 @@ fn a_read_over_damaged_bytes_waits_for_their_repair() {
     assert_eq!(shelf.reached(), Some((FIRST, 12)));
 }
 
-// Damaged bytes nothing will repair are lost to a read, as missing ones are.
+// Damaged bytes nothing will repair are lost to a read, as missing ones are:
+// the read ends short where they begin, and the next fails on exactly them,
+// until the run says it read on past them.
 #[test]
 fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
     let dir = tempfile::tempdir().unwrap();
@@ -110,15 +112,22 @@ fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
     close(&shelf, 0, 14, false);
     let volumes = reader(&shelf);
     let waiting = Arc::clone(&volumes);
-    let read = std::thread::spawn(move || read(&waiting, 4, 8));
+    let first = std::thread::spawn(move || read(&waiting, 4, 8));
     close(&shelf, 0, 14, true);
-    let error = read.join().unwrap().unwrap_err();
+    assert_eq!(first.join().unwrap().unwrap(), b"t");
+    let error = read(&volumes, 5, 7).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
-    let lost = error.get_ref().unwrap().downcast_ref::<Unreadable>();
-    assert!(matches!(
+    let lost = Lost::of(&error).unwrap();
+    assert_eq!(
         lost,
-        Some(Unreadable::Lost { volume: FIRST, range }) if *range == ByteRange::new(4, 12)
-    ));
+        Lost {
+            volume: FIRST,
+            range: ByteRange::new(5, 12)
+        }
+    );
+    assert!(volumes.lost());
+    volumes.bridged(lost);
+    assert!(!volumes.lost(), "a span the run read on past still ends it");
 }
 
 #[test]
@@ -171,15 +180,19 @@ fn a_read_of_bytes_nothing_will_bring_fails_as_lost() {
     // The read waits while the volume can still grow, and fails once it
     // settles short of the range.
     let waiting = Arc::clone(&volumes);
-    let read = std::thread::spawn(move || read(&waiting, 2, 4));
+    let first = std::thread::spawn(move || read(&waiting, 2, 4));
     close(&shelf, 0, 10, true);
-    let error = read.join().unwrap().unwrap_err();
+    assert_eq!(first.join().unwrap().unwrap(), b"23");
+    let error = read(&volumes, 4, 2).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
-    let lost = error.get_ref().unwrap().downcast_ref::<Unreadable>();
-    assert!(matches!(
-        lost,
-        Some(Unreadable::Lost { volume: FIRST, range }) if *range == ByteRange::new(2, 6)
-    ));
+    assert_eq!(
+        Lost::of(&error),
+        Some(Lost {
+            volume: FIRST,
+            range: ByteRange::new(4, 6)
+        })
+    );
+    assert!(volumes.lost());
 }
 
 #[test]

@@ -39,7 +39,6 @@ impl Builder for Echoes {
         }
         Some(Box::new(Echo {
             volumes: self.volumes,
-            reached: None,
             bids: Arc::clone(&self.bids),
             window: self.window,
         }))
@@ -59,7 +58,6 @@ impl Builder for Echoes {
 
 struct Echo {
     volumes: u32,
-    reached: Option<VolumeIndex>,
     bids: Arc<Mutex<Vec<Seek>>>,
     window: u64,
 }
@@ -80,20 +78,7 @@ impl Object for Echo {
     }
     fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
-    fn wants(&self, out: &mut Vec<Seek>) {
-        let Some(on) = self.reached else {
-            return;
-        };
-        for (weight, volume) in (on.0 + 1..self.volumes).enumerate() {
-            let seek = Seek::data(
-                VolumeIndex(volume),
-                ByteRange::new(0, u64::MAX),
-                Weight(weight as u32 + 1),
-            );
-            self.bids.lock().unwrap().push(seek);
-            out.push(seek);
-        }
-    }
+    fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope {
@@ -127,8 +112,16 @@ impl Engine for Echo {
             volumes: self.volumes,
         })
     }
-    fn reached(&mut self, volume: VolumeIndex, _: u64) {
-        self.reached = Some(volume);
+    fn bid(&self, reached: VolumeIndex, out: &mut Vec<Seek>) {
+        for (weight, volume) in (reached.0 + 1..self.volumes).enumerate() {
+            let seek = Seek::data(
+                VolumeIndex(volume),
+                ByteRange::new(0, u64::MAX),
+                Weight(weight as u32 + 1),
+            );
+            self.bids.lock().unwrap().push(seek);
+            out.push(seek);
+        }
     }
     fn reserve(&self) -> Option<u64> {
         Some(self.window)

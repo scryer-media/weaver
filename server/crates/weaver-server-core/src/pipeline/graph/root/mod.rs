@@ -32,6 +32,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use weaver_graph::{
     ByteRange, MemberId, NodeId, Part, Pull, Purpose, Seek, Segment, Tree, VolumeIndex, Weight,
+    When,
 };
 
 use self::facts::{Parts, PostFacts, RootFactsError};
@@ -96,9 +97,6 @@ pub(crate) trait Root: Segments {
     fn volume_to_come(&self, volume: VolumeIndex) -> bool {
         self.volume_waiting(volume)
     }
-    // The units the queue holds parked when the job is installed: fetched
-    // only once something asks for them.
-    fn parked(&mut self, _held: impl FnMut(VolumeIndex, u32) -> bool) {}
     // What the root asks for itself before a round of seeks, from what the
     // tree knows now.
     fn bootstrap(&mut self, tree: &Tree);
@@ -116,6 +114,12 @@ pub(crate) trait Root: Segments {
     fn unarrive(&mut self, volume: VolumeIndex, unit: u32);
     // Units this run does not fetch: in hand, or lost for good.
     fn settled(&self) -> Vec<(VolumeIndex, u32)>;
+    // The bytes of the units `settled` names: what a checkpoint taken now
+    // spares a restore fetching again.
+    fn settled_bytes(&self) -> u64;
+    // The volume's member is proven whole: what the root keeps to check its
+    // units again is dropped.
+    fn seal(&mut self, volume: VolumeIndex);
     // Whether bytes read back still match what the root was handed.
     fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool;
     // Whether a restore reads the member's units back and delivers them
@@ -134,6 +138,9 @@ pub(crate) struct ArticleRoot {
     // file of its number whatever a recovery set renames it to, so this,
     // not the member's name, is what says a restore has the right post.
     posted: Vec<String>,
+    // The members the post declares as indexes, by their posted names: the
+    // root asks for them first, whole.
+    pub(crate) indexes: Vec<VolumeIndex>,
 }
 
 impl ArticleRoot {
@@ -144,6 +151,12 @@ impl ArticleRoot {
             window: Window::default(),
             checksums: Checksums::default(),
             posted: files.iter().map(|file| file.name.clone()).collect(),
+            indexes: files
+                .iter()
+                .zip(0u32..)
+                .filter(|(file, _)| sample::declared_index(&file.name))
+                .map(|(_, index)| VolumeIndex(index))
+                .collect(),
         }
     }
 
@@ -166,7 +179,7 @@ impl ArticleRoot {
     }
 
     // Answer one round of seeks: each moves its articles to the class the
-    // round gives it.
+    // round gives it, and a deferred one parks them.
     pub(crate) fn answer(
         &mut self,
         asks: &[Ask],
@@ -178,6 +191,7 @@ impl ArticleRoot {
             .zip(classes)
             .map(|(ask, asked)| {
                 let class = asked.map(|asked| match asked {
+                    Asked::Parked => Class::Parked,
                     Asked::Critical => Class::Critical,
                     Asked::Recovery => Class::Recovery,
                     Asked::Window(rank) => Class::Window(rank),
@@ -191,6 +205,16 @@ impl ArticleRoot {
                 .seek(bid.volume, bid.range, Some(Class::Window(rank)));
         }
         answers
+    }
+
+    // The member of the volume is proven whole: its checksums are dropped.
+    pub(crate) fn seal(&mut self, volume: VolumeIndex) {
+        self.checksums.seal(volume);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checksums_held(&self, volume: VolumeIndex) -> bool {
+        self.checksums.holds(volume)
     }
 
     // The ranges of lost articles that can now be marked damaged.
@@ -251,11 +275,8 @@ impl Root for ArticleRoot {
         self.map.volume_to_come(volume)
     }
 
-    fn parked(&mut self, held: impl FnMut(VolumeIndex, u32) -> bool) {
-        self.map.parked(held);
-    }
-
     fn bootstrap(&mut self, tree: &Tree) {
+        sample::indexes(&self.indexes, &self.map, &mut self.window);
         let map = &self.map;
         sample::bootstrap(tree, |volume| map.volume_waiting(volume), &mut self.window);
         sample::fronts(tree, &mut self.map);
@@ -289,6 +310,15 @@ impl Root for ArticleRoot {
         self.map.settled()
     }
 
+    // The post's encoded bytes of those articles.
+    fn settled_bytes(&self) -> u64 {
+        self.map.settled_bytes()
+    }
+
+    fn seal(&mut self, volume: VolumeIndex) {
+        ArticleRoot::seal(self, volume);
+    }
+
     fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool {
         ArticleRoot::matches(self, volume, range, bytes)
     }
@@ -319,13 +349,15 @@ impl Segments for ArticleRoot {
 // How soon a round fetches what one ask carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Asked {
+    // Deferred: only what is still in the normal order waits for an ask.
+    Parked,
     Critical,
     Recovery,
     Window(u32),
 }
 
-// One round of seeks, for every root alike. A recovery seek is promoted; an
-// unweighted data seek is critical; a weighted one is a bid, and only bids
+// One round of seeks, for every root alike. A deferred seek parks; a
+// recovery seek is promoted; an unweighted data seek is critical; a weighted one is a bid, and only bids
 // the window draws move anything, so an undrawn bid's ask has no class.
 // Bids already in the window (the bootstrap's) take part in the same draw,
 // and every bid drawn comes back with its rank, so the ones no seek of this
@@ -349,15 +381,18 @@ pub(crate) fn round(
     let drawn = window.draw(queued);
     let classes = asks
         .iter()
-        .map(|ask| match (ask.seek.purpose, is_bid(ask.seek)) {
-            (Purpose::Recovery, _) => Some(Asked::Recovery),
-            (Purpose::Data, false) => Some(Asked::Critical),
-            (Purpose::Data, true) => window.rank(ask.seek.volume).map(Asked::Window),
-        })
+        .map(
+            |ask| match (ask.seek.when, ask.seek.purpose, is_bid(ask.seek)) {
+                (When::Deferred, _, _) => Some(Asked::Parked),
+                (When::Now, Purpose::Recovery, _) => Some(Asked::Recovery),
+                (When::Now, Purpose::Data, false) => Some(Asked::Critical),
+                (When::Now, Purpose::Data, true) => window.rank(ask.seek.volume).map(Asked::Window),
+            },
+        )
         .collect();
     (classes, drawn)
 }
 
 fn is_bid(seek: Seek) -> bool {
-    seek.purpose == Purpose::Data && seek.weight > Weight::FIRST
+    seek.when == When::Now && seek.purpose == Purpose::Data && seek.weight > Weight::FIRST
 }

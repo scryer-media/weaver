@@ -232,6 +232,9 @@ impl Database {
             bandwidth,
             cleanup_after_extract,
             propagation_delay_secs,
+            max_concurrent_nzbs: settings
+                .get("max_concurrent_nzbs")
+                .and_then(|value| value.parse().ok()),
             watch_folder,
             duplicate_policy,
             direct_store,
@@ -369,6 +372,9 @@ impl Database {
         self.set_network_bandwidth(&config.bandwidth)?;
         if let Some(delay) = config.propagation_delay_secs {
             self.set_setting("propagation_delay_secs", &delay.to_string())?;
+        }
+        if let Some(limit) = config.max_concurrent_nzbs {
+            self.set_setting("max_concurrent_nzbs", &limit.to_string())?;
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;

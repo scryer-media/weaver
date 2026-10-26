@@ -28,7 +28,7 @@ import { Cell } from "../../../components/rows";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
 import { formatHostnames, formatLatency } from "../../../data/format";
-import { SettingsBlocks, useSettingsPanelActive, type SettingsBlock } from "../framework";
+import { SettingsBlocks, usePanelStatus, useSettingsPanelActive, type SettingsBlock } from "../framework";
 import { quotaDraft, quotaFields, quotaInput, trimNumber, type QuotaDraft } from "../quota";
 
 /**
@@ -221,7 +221,7 @@ function serverInput(form: ServerForm) {
 
 export function ProvidersPanel() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
+  const [{ data, fetching, error: listError }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
   const [, addServer] = useMutation(ADD_SERVER_MUTATION);
   const [, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
   const [, removeServer] = useMutation(REMOVE_SERVER_MUTATION);
@@ -249,6 +249,12 @@ export function ProvidersPanel() {
     variables: { id: typeof editingId === "number" ? editingId : 0 },
     pause: typeof editingId !== "number",
   });
+
+  // A list that could not be read says why: in place of the table when there
+  // are no rows to show, on the status line beside rows the answer still held.
+  const listFailure = listError ? refusalMessage(t, listError) : null;
+  const failureBesideRows = (data?.servers?.length ?? 0) > 0 ? listFailure : null;
+  usePanelStatus(failureBesideRows, failureBesideRows !== null);
 
   const servers = useMemo(
     () =>
@@ -463,6 +469,15 @@ export function ProvidersPanel() {
         "",
       ],
       empty: t("next.providers.empty"),
+      failure: listFailure === null
+        ? undefined
+        : {
+            message: listFailure,
+            retry: {
+              label: t("next.networking.retry"),
+              onClick: () => void reexecute({ requestPolicy: "network-only" }),
+            },
+          },
       add: { label: t("next.providers.add"), onClick: addProvider },
       onRowClick: (id) => editProvider(Number(id)),
       rows: servers.map((server) => ({

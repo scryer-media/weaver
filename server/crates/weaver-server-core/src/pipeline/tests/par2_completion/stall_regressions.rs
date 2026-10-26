@@ -72,6 +72,7 @@ async fn exhausted_promoted_rar_recovery_reaches_the_next_wave() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,

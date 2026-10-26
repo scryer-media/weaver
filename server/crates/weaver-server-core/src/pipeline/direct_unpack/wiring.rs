@@ -550,6 +550,15 @@ impl DirectUnpackRuntime {
             || !self.pending_virtual_refresh.is_empty()
     }
 
+    pub(crate) fn has_job_work_in_flight(&self, id: JobId) -> bool {
+        self.armed.keys().any(|(job, _)| *job == id)
+            || self.draining.iter().any(|((job, _), _)| *job == id)
+            || self
+                .pending_virtual_refresh
+                .iter()
+                .any(|(job, _)| *job == id)
+    }
+
     // Outcome counters, as a snapshot.
     //
     // The exported metric surface is the per-event `direct_unpack.*` records
@@ -687,7 +696,11 @@ impl Pipeline {
     // latching when the answer is only "not yet" — no bytes on part one — so a
     // later part's completion can try again.
     pub(in crate::pipeline) fn try_arm_direct_unpack(&mut self, job_id: JobId, set_name: &str) {
-        if self.direct_unpack.gate() != DirectUnpackGate::Enabled {
+        // `[direct_unpack]` is a classic switch: a graph job's objects read
+        // their own members.
+        if self.direct_unpack.gate() != DirectUnpackGate::Enabled
+            || !self.job_engine(job_id).classic_switches_apply()
+        {
             return;
         }
         let key = (job_id, set_name.to_string());
@@ -909,6 +922,7 @@ impl Pipeline {
     pub(in crate::pipeline) fn try_arm_rar_chase(&mut self, job_id: JobId, set_name: &str) {
         let key = (job_id, set_name.to_string());
         if self.direct_unpack.gate() != DirectUnpackGate::Enabled
+            || !self.job_engine(job_id).classic_switches_apply()
             || self.rar_chase_owns_set(job_id, set_name)
             || self.direct_unpack.latched.contains_key(&key)
             || self
@@ -1802,17 +1816,18 @@ impl Pipeline {
 
     // The contiguous, verified prefix the download has committed for a part.
     //
-    // The same value [`Pipeline::note_file_progress_floor`] maintains: the
-    // in-memory floor if there is one, else the persisted floor a restart
-    // would resume from.
+    // Read from the assembly's written coverage: the decoded bytes its first
+    // run holds from offset zero, including a run a restart restored.
     fn direct_unpack_progress_floor(&self, job_id: JobId, path: &std::path::Path) -> Option<u64> {
         let file_id = self.direct_unpack_file_id_for_part(job_id, path)?;
         Some(
-            self.pending_file_progress
-                .get(&file_id)
-                .copied()
-                .or_else(|| self.persisted_file_progress.get(&file_id).copied())
-                .unwrap_or(0),
+            self.jobs
+                .get(&job_id)
+                .and_then(|state| state.assembly.file(file_id))
+                .map_or(
+                    0,
+                    crate::jobs::assembly::FileAssembly::committed_decoded_prefix,
+                ),
         )
     }
 

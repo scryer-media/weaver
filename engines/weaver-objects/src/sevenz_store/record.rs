@@ -5,7 +5,9 @@
 // bytes are its files' bytes, an open AES folder's go through its cipher,
 // and a locked one's stay held. Each member closes once its whole extent is
 // covered, and its CRC32 is folded as its bytes pass, so a checksum that
-// fails marks the member's extent damaged for the recovery beside it.
+// fails marks the member's extent damaged for the recovery beside it, unless
+// the bytes are verified and the key that read them is on trial: then it is
+// the key that is wrong.
 
 use std::sync::Arc;
 
@@ -144,10 +146,22 @@ impl SevenZipStore {
             },
         );
         let whole = ByteRange::new(0, entry.length);
-        let verdict = entry.crc.map(|expected| {
-            let folded = self.grid.fold(member, WHOLE, 0, whole);
-            grid::verdict(folded, entry.length, 0, expected)
-        });
+        let folded = self.grid.fold(member, WHOLE, 0, whole);
+        let verdict = entry
+            .crc
+            .map(|expected| grid::verdict(folded, entry.length, 0, expected));
+        // Verified bytes that fail under a key nothing proved condemn the
+        // key, not the bytes.
+        let enciphered = entry
+            .folder
+            .is_some_and(|folder| map.folders[folder].aes.is_some());
+        if verdict == Some(SliceVerdict::Damaged)
+            && enciphered
+            && self.on_trial()
+            && folded.is_some_and(|folded| folded.verified)
+        {
+            self.wrong_key = true;
+        }
         let Some(said) = Arc::make_mut(&mut self.members).get_mut(member.0 as usize) else {
             return;
         };
@@ -157,7 +171,7 @@ impl SevenZipStore {
             out.push(Emit::MemberClosed(member));
         }
         match verdict {
-            Some(SliceVerdict::Damaged) if !said.damaged => {
+            Some(SliceVerdict::Damaged) if !said.damaged && !self.wrong_key => {
                 said.damaged = true;
                 let mut extents = Vec::new();
                 self.extent_in(map, member, whole, &mut extents);

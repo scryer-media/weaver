@@ -83,7 +83,7 @@ fn act(twin: &mut Twin, act: Act) -> (Vec<weaver_graph::SliceVerdict>, Vec<Seek>
         }
     }
     let mut seeks = Vec::new();
-    Recovery::wants(&mut twin.job.object, &mut seeks);
+    Recovery::wants(&twin.job.object, &mut seeks);
     (verdicts(&twin.job, twin.member), seeks)
 }
 

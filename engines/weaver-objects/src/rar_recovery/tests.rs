@@ -288,3 +288,85 @@ fn a_set_survives_a_restart() {
     back.recovery().expect("a recovery").absent(&mut absent);
     assert_eq!(absent, vec![("lantern.part02.rar".to_owned(), 300)]);
 }
+
+// A recovery volume whose front was handed over, the rest still to come.
+fn sampled(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> VolumeIndex {
+    let front = &bytes[..bytes.len().min(64)];
+    let volume = match job.object.claim(name, front, None) {
+        Some(volume) => volume,
+        None => VolumeIndex(0),
+    };
+    job.object.bound(volume, name, front, None);
+    job.object
+        .sized(volume, bytes.len() as u64, &mut Vec::new());
+    volume
+}
+
+fn wants(object: &RarRecovery) -> Vec<Seek> {
+    let mut out = Vec::new();
+    Recovery::wants(object, &mut out);
+    out
+}
+
+// Its front told what it is; the rest waits until the set is short.
+#[test]
+fn a_sampled_recovery_volume_is_deferred_while_nothing_is_short() {
+    let mut job = job();
+    let bytes = rev5(3, 2, 3, &[300, 300, 300]);
+    let volume = sampled(&mut job, "lantern.part1.rev", &bytes);
+    assert_eq!(
+        wants(&job.object),
+        vec![Seek::deferred(volume, ByteRange::new(0, u64::MAX))]
+    );
+}
+
+// A data volume is gone: as many recovery volumes as the set is short of
+// are wanted whole, now, and the rest stay deferred.
+#[test]
+fn a_lost_data_volume_raises_as_many_recovery_volumes_as_it_needs() {
+    let mut job = job();
+    let sizes = [300, 300, 300];
+    let first = sampled(&mut job, "lantern.part1.rev", &rev5(3, 2, 3, &sizes));
+    let second = sampled(&mut job, "lantern.part2.rev", &rev5(3, 2, 4, &[]));
+    data(&mut job, "lantern.part01.rar");
+    data(&mut job, "lantern.part02.rar");
+    bind(&mut job);
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        wants(&job.object),
+        vec![
+            Seek::recovery(first, ByteRange::new(0, u64::MAX), Weight::FIRST),
+            Seek::deferred(second, ByteRange::new(0, u64::MAX)),
+        ]
+    );
+}
+
+// A RAR3 recovery volume says what it is at its end: the footer is wanted
+// now, and the bytes between the front and it wait.
+#[test]
+fn a_rar3_recovery_volume_wants_its_footer_and_defers_the_rest() {
+    let mut job = job();
+    let bytes = rev3(3, 250);
+    let volume = sampled(&mut job, "lantern.part1.rev", &bytes);
+    let footer = (250 - RAR3_FOOTER) as u64;
+    assert_eq!(
+        wants(&job.object),
+        vec![
+            Seek::recovery(volume, ByteRange::new(footer, 250), Weight::FIRST),
+            Seek::deferred(volume, ByteRange::new(0, footer)),
+        ]
+    );
+}
+
+// Nothing of the deferral is kept: the object a restart rebuilds defers the
+// same bytes from what it parsed.
+#[test]
+fn a_deferral_is_said_again_after_a_restart() {
+    let mut job = job();
+    let bytes = rev5(3, 2, 3, &[300, 300, 300]);
+    sampled(&mut job, "lantern.part1.rev", &bytes);
+    let back = crate::restore(&job.object.facts()).expect("restores");
+    let mut again = Vec::new();
+    back.wants(&mut again);
+    assert_eq!(again, wants(&job.object));
+}

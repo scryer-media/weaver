@@ -16,7 +16,14 @@ mod worker;
 pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;
 
 pub(super) use worker::HeldDownloadRefill;
-pub(crate) use worker::{JobLogThrottle, KeyedLogThrottle};
+#[cfg(test)]
+pub(in crate::pipeline) use worker::{
+    DOWNLOAD_DISPATCH_STALL_KICK_AFTER, DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+};
+pub(crate) use worker::{
+    DOWNLOAD_STALL_RECOVERY_ENV, DispatchStallWatch, JobLogThrottle, KeyedLogThrottle,
+    download_stall_recovery_from_env_value,
+};
 
 pub use queue::{DownloadQueue, DownloadWork};
 pub(super) use transport::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};

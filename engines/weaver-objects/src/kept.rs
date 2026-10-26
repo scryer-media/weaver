@@ -14,6 +14,9 @@ use weaver_graph::{ByteRange, Coverage, Provenance};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Piece {
     range: ByteRange,
+    // The range's bytes from its start, as far as the last byte that
+    // arrived: a wanted range holds only what reached it, however long it
+    // is declared to be.
     bytes: Vec<u8>,
     coverage: Coverage,
 }
@@ -27,19 +30,33 @@ pub(crate) struct Kept {
     generation: u64,
 }
 
+impl Piece {
+    // The part of the range its bytes reach.
+    fn held(&self) -> ByteRange {
+        ByteRange::at(self.range.start, self.bytes.len() as u64)
+    }
+}
+
+// A piece's bytes at `at..at + len`, grown to reach them.
+fn reach(bytes: &mut Vec<u8>, at: usize, len: usize) -> &mut [u8] {
+    if bytes.len() < at + len {
+        bytes.resize(at + len, 0);
+    }
+    &mut bytes[at..at + len]
+}
+
 impl Kept {
     // Whether restored pieces are ones it could have kept: each under its
-    // own start, disjoint, as long as its range, covered only inside it.
+    // own start, disjoint, no longer than its range, covered only inside
+    // the bytes it holds.
     pub(crate) fn sound(&self) -> bool {
         let mut end = 0;
         self.pieces.iter().all(|(start, piece)| {
+            let held = piece.held();
             let fits = *start == piece.range.start
                 && piece.range.start >= end
-                && piece.bytes.len() as u64 == piece.range.len()
-                && piece
-                    .coverage
-                    .runs()
-                    .all(|run| piece.range.covers(run.range));
+                && piece.range.covers(held)
+                && piece.coverage.runs().all(|run| held.covers(run.range));
             end = piece.range.end;
             fits
         })
@@ -79,13 +96,13 @@ impl Kept {
         }
         let mut grown = Piece {
             range: merged,
-            bytes: vec![0; merged.len() as usize],
+            bytes: Vec::new(),
             coverage: Coverage::new(),
         };
         for start in touching {
             if let Some(piece) = self.pieces.remove(&start) {
                 let at = (piece.range.start - merged.start) as usize;
-                grown.bytes[at..at + piece.bytes.len()].copy_from_slice(&piece.bytes);
+                reach(&mut grown.bytes, at, piece.bytes.len()).copy_from_slice(&piece.bytes);
                 for run in piece.coverage.runs() {
                     grown.coverage.write(run.range, run.provenance);
                 }
@@ -136,13 +153,13 @@ impl Kept {
             let from = &bytes
                 [(overlap.start - range.start) as usize..(overlap.end - range.start) as usize];
             let at = (overlap.start - piece.range.start) as usize;
-            let into = &mut piece.bytes[at..at + from.len()];
+            let into = reach(&mut piece.bytes, at, from.len());
             let same = piece.coverage.covered(overlap)
                 && piece
                     .coverage
                     .overlapping(overlap)
                     .all(|run| run.provenance == provenance)
-                && into == from;
+                && *into == *from;
             if !same {
                 into.copy_from_slice(from);
                 piece.coverage.write(overlap, provenance);
@@ -274,5 +291,22 @@ mod tests {
         assert_eq!(missing, vec![ByteRange::new(20, 40)]);
         assert!(kept.absorb(ByteRange::new(12, 13), &[9], Provenance::Repaired));
         assert!(kept.verified(ByteRange::new(10, 20)));
+    }
+
+    #[test]
+    fn a_range_wanted_far_past_any_byte_holds_only_what_arrived() {
+        let mut kept = Kept::default();
+        let declared = ByteRange::new(32, 1 << 62);
+        kept.want(declared);
+        assert_eq!(kept.from(32), &[] as &[u8]);
+        assert!(kept.absorb(ByteRange::new(0, 64), &[7; 64], Provenance::Fresh));
+        assert_eq!(kept.read(ByteRange::new(32, 64)), Some(&[7u8; 32][..]));
+        assert_eq!(kept.read(declared), None);
+        kept.want(ByteRange::new(0, 40));
+        assert_eq!(kept.from(32), &[7u8; 32][..]);
+        assert!(kept.sound());
+        let mut missing = Vec::new();
+        kept.missing(declared, &mut missing);
+        assert_eq!(missing, vec![ByteRange::new(64, 1 << 62)]);
     }
 }

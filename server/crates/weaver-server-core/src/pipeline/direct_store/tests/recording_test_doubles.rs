@@ -2227,6 +2227,7 @@ fn settings_resolve_reads_the_config_table() {
         bandwidth: Default::default(),
         cleanup_after_extract: None,
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: crate::jobs::DuplicatePolicy::default(),
         direct_store: None,

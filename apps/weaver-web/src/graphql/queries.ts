@@ -469,6 +469,7 @@ const GENERAL_SETTINGS_FIELDS = `
     cleanupAfterExtract
     maxRetries
     propagationDelaySecs
+    maxConcurrentNzbs
     enableSrrdbLookup
     duplicatePolicy {
       strictActiveOrSuccess

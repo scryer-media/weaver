@@ -321,19 +321,14 @@ fn damaged_parity_is_named_and_what_the_record_proves_ends_at_its_header() {
 }
 
 #[test]
-fn a_record_that_never_finds_its_volume_waits_and_once_closed_is_impossible() {
+fn a_record_that_never_finds_its_volume_waits_and_once_closed_says_nothing() {
     let mut job = Job::new(RarRecord::new(), weaver_graph::ObjectId(9));
     job.object.bound(VolumeIndex(0), VOLUME, &[], None);
     bind(&mut job);
     assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
     close(&mut job);
-    assert_eq!(
-        job.object.repair(&mut job.store),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
 }
 
 #[test]
@@ -374,23 +369,23 @@ fn a_rar3_volume_rebuilds_one_sector_per_slot_and_no_more() {
     );
 }
 
-// An enciphered volume asks for every candidate once closed, and the
-// ruling reads under the one that leads to the record, whatever came first.
+// What the volume's store hands the record: the candidate its headers
+// opened on.
+fn hand(object: &mut dyn Object, secret: &str) {
+    object.handed(&Handed::new(Zeroizing::new(secret.to_owned())));
+}
+
+// The store hands the candidate that opened the headers; the record reads
+// under it and asks for none.
 #[test]
-fn a_volume_with_enciphered_headers_is_rebuilt_under_the_candidate_that_opens_them() {
+fn a_volume_with_enciphered_headers_is_rebuilt_under_the_candidate_its_store_hands() {
     let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
     let (mut job, member) = job(&volume);
-    job.object
-        .bound(VolumeIndex(0), VOLUME, &volume[..64], None);
+    hand(&mut job.object, PASSWORD);
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     let mut asked = Vec::new();
     job.object.volume_closed(VolumeIndex(0), &mut asked);
-    assert_eq!(asked, vec![Emit::NeedsPassword]);
-    for secret in ["not-the-key", PASSWORD] {
-        let mut asked = Vec::new();
-        job.object.offer_password(secret, &mut asked);
-        assert_eq!(asked, vec![Emit::NeedsPassword], "{secret}");
-    }
+    assert!(asked.is_empty(), "{asked:?}");
     assert_eq!(
         job.object.repair(&mut job.store),
         RepairOutcome::Repaired { slices: 1 }
@@ -398,42 +393,73 @@ fn a_volume_with_enciphered_headers_is_rebuilt_under_the_candidate_that_opens_th
     assert!(job.store.members[&member] == volume, "rebuilt bytes");
 }
 
-// No candidate that opens the headers leads to no record: the record could
-// not be read.
+// The candidate is never kept: a restored record reads under the one its
+// store hands it again.
 #[test]
-fn a_volume_with_enciphered_headers_and_no_candidate_that_opens_them_is_unread() {
+fn a_restored_record_reads_under_the_candidate_its_store_hands_again() {
     let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
     let (mut job, member) = job(&volume);
-    job.object
-        .bound(VolumeIndex(0), VOLUME, &volume[..64], None);
+    hand(&mut job.object, PASSWORD);
+    close(&mut job);
+    let mut restored = crate::restore(&job.object.facts()).expect("restores");
+    hand(restored.as_mut(), PASSWORD);
+    job.store.members.get_mut(&member).unwrap()[700] ^= 1;
+    let recovery = restored.recovery_mut().expect("a recovery object");
+    recovery.bind(&mut job.namespace, &mut Vec::new());
+    assert_eq!(
+        recovery.repair(&mut job.store),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&member] == volume, "rebuilt bytes");
+}
+
+// Enciphered headers and nothing handed that opens them lead to no record:
+// the record could not be read, and says nothing of its volume.
+#[test]
+fn a_volume_with_enciphered_headers_and_no_candidate_that_opens_them_says_nothing() {
+    let volume = sealed_rar3_volume(&payload(8, 6_000), 4);
+    let (mut job, member) = job(&volume);
+    hand(&mut job.object, "not-the-key");
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     close(&mut job);
-    job.object.offer_password("not-the-key", &mut Vec::new());
-    assert_eq!(
-        job.object.repair(&mut job.store),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert!(!job.object.covers(member));
+    assert!(verdicts(&job, member).is_empty());
     assert!(job.store.members[&member] != volume, "nothing written");
 }
 
+// A record that cannot be read covers nothing and rules unread: it vouches
+// for no byte of its volume.
 #[test]
-fn a_volume_whose_record_cannot_be_read_is_impossible() {
+fn a_volume_whose_record_cannot_be_read_says_nothing_of_it() {
     let mut volume = rar5_volume(&payload(9, 5000), 2);
     let record = 8 + 5000 + 24;
     let end = volume.len() - 8;
     volume[record..end].fill(0);
-    let (mut job, _) = job(&volume);
+    let (mut job, member) = job(&volume);
     close(&mut job);
-    assert_eq!(
-        job.object.repair(&mut job.store),
-        RepairOutcome::Impossible {
-            damaged: 1,
-            reachable: 0
-        }
-    );
+    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert!(!job.object.covers(member));
+    assert!(verdicts(&job, member).is_empty());
+}
+
+// A closed volume, damaged, in which no record is found: the record read
+// nothing, so it gives no verdict. It is not clean on the damage it never
+// checked, and it is not waiting: nothing more will come for it to read.
+#[test]
+fn an_unread_record_gives_no_verdict() {
+    let mut volume = b"Rar!\x1a\x07\x01\x00".to_vec();
+    volume.extend(payload(14, 5000));
+    volume.extend_from_slice(&[0x1d, 0x77, 0x56, 0x51, 0x03, 0x05, 0x04, 0x00]);
+    let (mut job, member) = job(&volume);
+    job.store.members.get_mut(&member).unwrap()[900] ^= 1;
+    close(&mut job);
+    let ruled = job.object.repair(&mut job.store);
+    assert_eq!(ruled, RepairOutcome::Unread);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    assert!(!job.object.covers(member));
+    assert!(verdicts(&job, member).is_empty());
+    assert_eq!(job.store.writes, 0);
 }
 
 #[test]

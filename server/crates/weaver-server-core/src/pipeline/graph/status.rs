@@ -60,6 +60,9 @@ pub(crate) trait RootJob {
     fn unpacked(&self) -> bool;
     // The breach of the job's extraction budget, once one stands.
     fn refusal(&self) -> Option<&ExtractionFailure>;
+    // A repair of the job is out on a thread: the set it was lent from has
+    // its ruling still to come, whatever it said as it left.
+    fn repair_out(&self) -> bool;
 }
 
 // The job's own seams. GraphJob repairs inside its article path, once the
@@ -112,6 +115,10 @@ impl RootJob for GraphJob {
     fn refusal(&self) -> Option<&ExtractionFailure> {
         self.writer().refusal()
     }
+
+    fn repair_out(&self) -> bool {
+        GraphJob::repair_out(self)
+    }
 }
 
 // What an advance came to.
@@ -135,6 +142,11 @@ pub(crate) fn drive(
     asker: AskerId,
     limit: usize,
 ) -> Step {
+    // Nothing is ruled while a set's repair is out: what it comes back with
+    // may make whole what the job would otherwise end short of.
+    if job.repair_out() {
+        return Step::Wait;
+    }
     let summary = job.recovery_summary();
     if !summary.settled() {
         let Some(ticket) = slots.admit(asker, limit) else {

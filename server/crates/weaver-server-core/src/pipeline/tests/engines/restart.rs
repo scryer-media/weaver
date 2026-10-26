@@ -29,11 +29,12 @@ use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_store_set, header_encrypted_store_set,
 };
 use crate::pipeline::tests::direct_store::{
-    obfuscate_volumes, protected_rar4_store_set, protected_store_set, single_member_store_set,
+    obfuscate_volumes, protected_rar4_store_set, protected_sealed_rar4_store_set,
+    protected_store_set, single_member_store_set,
 };
 use crate::pipeline::tests::{
-    insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
-    pump_pipeline_runtime_queues, retire_pipeline_database,
+    insert_active_job, insert_active_job_on, job_status_for_assert,
+    new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::pipeline::{Pipeline, PipelineEvent};
 
@@ -92,7 +93,7 @@ pub(super) async fn run_restarting_at(
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     stamp_graph(&pipeline.db);
     pipeline.admit_graph_job(JOB, Engine::Graph);
     assert!(pipeline.is_graph_job(JOB));
@@ -422,7 +423,7 @@ async fn run_restarted_once_done(scenario: &Scenario) -> RestartedDone {
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     stamp_graph(&pipeline.db);
     pipeline.admit_graph_job(JOB, Engine::Graph);
     let mut sent = pipeline.event_tx.subscribe();
@@ -533,7 +534,7 @@ pub(super) async fn run_restarted_while_repairing(scenario: &Scenario) -> (Resta
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
-    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
     stamp_graph(&pipeline.db);
     pipeline.admit_graph_job(JOB, Engine::Graph);
     let mut sent = pipeline.event_tx.subscribe();
@@ -696,6 +697,40 @@ async fn a_rar4_volume_repaired_from_its_recovery_record_restarted_after_every_a
     restart_row(Scenario::new(posts).damaged(0, 2)).await;
 }
 
+// A RAR4 `-hp` set whose volumes each carry a record, one article of the
+// first served damaged, under `scenario`'s candidates. The candidate that
+// proved itself on the first enciphered header is the one each restore
+// offers again, to the store and to the record alike, so the record reads
+// under it and rebuilds the sector as a run that never restarted does.
+async fn sealed_rar4_record_restart_row(scenario: impl Fn(Scenario) -> Scenario) {
+    let body = payload(8 * ARTICLE + 17, 78);
+    let posts = volumes(protected_sealed_rar4_store_set(
+        "beacon.bin",
+        &body,
+        2,
+        1,
+        SECRET,
+    ));
+    restart_row(scenario(Scenario::new(posts).damaged(0, 2))).await;
+}
+
+#[tokio::test]
+async fn a_rar4_hp_volume_repaired_from_its_recovery_record_restarted_after_every_article_is_repaired_with_no_refetch()
+ {
+    sealed_rar4_record_restart_row(|scenario| scenario.password(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_rar4_hp_volume_proven_on_its_first_candidate_restarted_after_every_article_is_repaired_with_no_refetch()
+ {
+    sealed_rar4_record_restart_row(|scenario| {
+        scenario
+            .global_password(SECRET)
+            .global_password("lantern-restart-wrong")
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn an_xz_stream_inside_a_rar_volume_restarted_after_every_article_delivers_the_file() {
     let compressed = xz(&payload(30 * ARTICLE + 3, 75));
@@ -745,6 +780,79 @@ async fn a_graph_job_with_no_checkpoint_is_refused_at_restore() {
         .await;
     assert!(pipeline.blocked_restores.contains_key(&JOB));
     assert!(!pipeline.graph_jobs.contains_key(&JOB));
+}
+
+// A restored graph job's durable download floor is what its checkpoints
+// settle. The graph writes the job's files and its checkpoint is the barrier,
+// so the floor moves with every checkpoint the restored job takes; a floor
+// read off the file coverage barrier never moves past the restored one, and
+// the restart lead gate holds the job to one article at a time with nothing
+// to flush.
+#[tokio::test]
+async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 73))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), Engine::Graph).await;
+    stamp_graph(&pipeline.db);
+    pipeline.admit_graph_job(JOB, Engine::Graph);
+    for _ in 0..4 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    let mut in_memory = BTreeSet::new();
+    let mut pipeline = restart(&temp_dir, pipeline, &scenario, &mut in_memory, &mut |_| {}).await;
+    let restored = pipeline.jobs[&JOB].restored_download_floor_bytes;
+    assert!(restored > 0, "the fixture restores with a durable floor");
+    assert_eq!(pipeline.durable_download_floor_bytes_for_job(JOB), restored);
+
+    // Three more articles, each checkpointed by the step that took it.
+    let mut served = 0u64;
+    for _ in 0..3 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        served += u64::from(work.byte_estimate);
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    assert!(
+        !pipeline
+            .pending_file_progress
+            .keys()
+            .any(|file| file.job_id == JOB),
+        "a graph job leaves the file coverage barrier nothing to flush"
+    );
+    let floor = pipeline.durable_download_floor_bytes_for_job(JOB);
+    assert_eq!(
+        floor,
+        restored + served,
+        "the floor is what the graph checkpoint settles"
+    );
+
+    // Accepted bytes placed so that a floor frozen at the restored one leaves
+    // the job past its lead limit, and the checkpointed floor leaves room for
+    // a lease of more than one article.
+    let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+    let estimate = u64::from(work.byte_estimate);
+    let limit = Pipeline::restart_durable_lead_limit_bytes();
+    pipeline.jobs.get_mut(&JOB).unwrap().downloaded_bytes = floor + limit - 2 * estimate;
+    let admission = pipeline.checkpoint_admission(JOB);
+    assert_eq!(admission.decision(&work, &[]).as_str(), "within_limit");
+    assert_eq!(
+        admission
+            .decision(&work, std::slice::from_ref(&work))
+            .as_str(),
+        "within_limit",
+        "a restored graph job must not drop to one article at a time"
+    );
+    retire_pipeline_database(pipeline).await;
 }
 
 // The row stamped graph as an admission stamps it, with no checkpoint

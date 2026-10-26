@@ -6,6 +6,85 @@ use super::*;
 use crate::pipeline::health::ProbeTally;
 
 #[tokio::test]
+async fn health_probes_skip_retention_excluded_primary_and_unlock_backfill() {
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let commands = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let mut servers = tokio::task::JoinSet::new();
+    let mut configs = Vec::new();
+    for index in 0..2 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        configs.push(weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+                tls: false,
+                ..Default::default()
+            },
+            max_connections: 1,
+            retention_days: if index == 0 { 1 } else { 0 },
+            backfill: index == 1,
+            ..Default::default()
+        });
+        let commands = Arc::clone(&commands);
+        servers.spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            write.write_all(b"200 ready\r\n").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(command) = lines.next_line().await.unwrap() {
+                if command == "CAPABILITIES" {
+                    write
+                        .write_all(b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(command.starts_with("STAT "), "{command}");
+                    commands[index].fetch_add(1, Ordering::SeqCst);
+                    write
+                        .write_all(b"223 1 <probe@example.invalid>\r\n")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+    }
+    pipeline.nntp = Arc::new(NntpClient::new(NntpClientConfig {
+        servers: configs,
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(3600),
+    }));
+    let job_id = JobId(30601);
+    let mut spec = segmented_job_spec("retention probe", "payload.bin", &[128]);
+    spec.files[0].posted_at_epoch = Some(1);
+    pipeline
+        .add_job(
+            job_id,
+            spec,
+            PathBuf::from("retention-probe.nzb"),
+            sample_nzb_zstd(),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(pipeline.activate_health_probes(job_id));
+    let result = pipeline.probe_result_rx.recv().await.unwrap();
+    assert_eq!(result.job_id, job_id);
+    assert_eq!(result.total, 1);
+    assert_eq!(result.missed, 0);
+    assert_eq!(result.unverified, 0);
+    assert_eq!(commands[0].load(Ordering::SeqCst), 0);
+    assert_eq!(commands[1].load(Ordering::SeqCst), 1);
+    servers.abort_all();
+    while servers.join_next().await.is_some() {}
+}
+
+#[tokio::test]
 async fn upstream_probe_does_not_misclassify_unknown_numeric_plain_files() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -641,6 +720,7 @@ async fn health_probe_in_flight_does_not_delay_recovery_promotion() {
         state.download_queue = DownloadQueue::new();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
@@ -1051,12 +1131,21 @@ async fn a_single_file_failing_while_the_job_lands_does_not_probe() {
 
 // Damage spread across files with no recovery data probes, and a round that
 // comes back entirely missing abandons the job.
+//
+// The post is below the first-article sample's size, so the probe's verdict is
+// the only one and the job fails in its words. A post the sample can speak for
+// is pinned in `first_article_gate`.
 #[tokio::test]
 async fn damage_across_files_without_recovery_probes_and_all_missing_aborts() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30332);
-    let spec = standalone_job_spec("Dead Release", &many_standalone_files("dead", 20));
+    // Two small files fail first, which keeps health above critical so the
+    // probe is what decides.
+    let files: Vec<(String, u32)> = (0..9)
+        .map(|idx| (format!("dead-{idx}.bin"), if idx < 2 { 64 } else { 512 }))
+        .collect();
+    let spec = standalone_job_spec("Dead Release", &files);
     insert_active_job(&mut pipeline, job_id, spec).await;
 
     for file_index in 0..2u32 {
@@ -1114,6 +1203,7 @@ async fn booked_damage_promotes_recovery_before_any_checkpoint() {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.recovery_queue = DownloadQueue::new();
         state.recovery_queue.push(DownloadWork {
+            counters: None,
             segment_id: SegmentId {
                 file_id: NzbFileId {
                     job_id,
