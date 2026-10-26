@@ -50,17 +50,7 @@ type Scenario struct {
 	// exercises the path under test; set this to a stable substring of the
 	// terminal error and the run has to fail for that reason. Matched
 	// case-insensitively against the job's terminal error message.
-	ExpectedErrorContains string `json:"expectedErrorContains,omitempty"`
-	// ExpectedOutcomeByEngine and ExpectedErrorContainsByEngine replace
-	// expected_outcome and expectedErrorContains for the engine named by
-	// WEAVER_ENGINE (engineUnderTest), keyed by the engine's name ("graph");
-	// an engine the map does not name falls back to the unkeyed field. They
-	// exist for a fixture whose correct outcome is an engine ruling, not a
-	// product fault: the graph delivers both members of an archive whose names
-	// collide, and words its failures its own way. Read through
-	// Scenario.expectedOutcome and Scenario.expectedErrorContains.
-	ExpectedOutcomeByEngine            map[string]string `json:"expectedOutcomeByEngine,omitempty"`
-	ExpectedErrorContainsByEngine      map[string]string `json:"expectedErrorContainsByEngine,omitempty"`
+	ExpectedErrorContains              string            `json:"expectedErrorContains,omitempty"`
 	Password                           string            `json:"password,omitempty"`
 	SegmentSize                        int               `json:"segment_size,omitempty"`
 	NZBSegmentNumbers                  []int             `json:"nzb_segment_numbers,omitempty"`
@@ -104,7 +94,6 @@ type ScenarioRuntimeAssertions struct {
 	DirectStore         *ScenarioDirectStoreAssertion         `json:"directStore,omitempty"`
 	DirectUnpack        *ScenarioDirectUnpackAssertion        `json:"directUnpack,omitempty"`
 	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
-	HealthProbe         *ScenarioHealthProbeAssertion         `json:"healthProbe,omitempty"`
 	Log                 *ScenarioLogAssertion                 `json:"log,omitempty"`
 }
 
@@ -138,26 +127,6 @@ type ScenarioLogLineAssertion struct {
 	ForbidConsecutiveRepeats bool `json:"forbidConsecutiveRepeats,omitempty"`
 }
 
-// ScenarioHealthProbeAssertion pins how the health probe behaved on a job that
-// still completed. A job can finish with the right bytes after the probe sat
-// on its soft timeout for every article it could not sample, so the outcome
-// alone never sees that stall; the probe's own log lines do.
-type ScenarioHealthProbeAssertion struct {
-	// RequireActivated demands the probe actually ran for this job — the
-	// fixture's damage must be enough to cross the activation threshold, or
-	// the rest of the assertion is vacuous.
-	RequireActivated bool `json:"requireActivated,omitempty"`
-	// ForbidActivated demands the probe stayed off for this job — the damage
-	// is a hole the recovery set already covers, or a single file failing
-	// while the rest of the posting lands, and sampling would add nothing.
-	ForbidActivated bool `json:"forbidActivated,omitempty"`
-	// ForbidInconclusive fails the job if any probe round ended inconclusive:
-	// a confirmation batch that hit its transport deadline instead of getting
-	// an answer, which on a healthy server is the probe waiting on a lane it
-	// should have been handed.
-	ForbidInconclusive bool `json:"forbidInconclusive,omitempty"`
-}
-
 type ScenarioFileIdentityRewriteAssertion struct {
 	RequiredCurrentFilenames     []string `json:"requiredCurrentFilenames,omitempty"`
 	ForbiddenCurrentFilenames    []string `json:"forbiddenCurrentFilenames,omitempty"`
@@ -170,24 +139,18 @@ type ScenarioPar2CleanSettlementAssertion struct {
 	VerificationReadBytes        uint64              `json:"verificationReadBytes"`
 }
 
-// ScenarioDirectStoreAssertion pins the exceptional direct-store path in a
-// fixture which otherwise has byte-identical conventional output. It is only
-// evaluated in a direct-store phase.
+// ScenarioDirectStoreAssertion pins how a stored archive was read in place, in
+// a fixture whose output is byte-identical either way. graphDirectStoreVerdict
+// says what each field means.
 type ScenarioDirectStoreAssertion struct {
 	ExpectedDemotionReason           string `json:"expectedDemotionReason"`
 	RequireRoutedByteMaterialization bool   `json:"requireRoutedByteMaterialization"`
 	ForbidVolumeRefetch              bool   `json:"forbidVolumeRefetch"`
 }
 
-// ScenarioDirectUnpackAssertion pins what the 7z direct-unpack chase did, read
-// from weaver's own log lines — the harness has no metrics surface, and the
-// chase is otherwise invisible by design: a consumed chase and a conventional
-// extraction deliver byte-identical output.
-//
-// The positive fields are only evaluated in a phase that ran with the gate on;
-// ForbidAnyActivity is only evaluated in a phase that ran with it off, so one
-// scenario proves engagement where the feature is enabled and darkness where it
-// is not.
+// ScenarioDirectUnpackAssertion pins how an archive was opened in the stream,
+// read from weaver's own log lines: the output is byte-identical however it was
+// read. graphDirectUnpackVerdict says what each field means.
 type ScenarioDirectUnpackAssertion struct {
 	// RequireArmed demands the set was admitted to a chase.
 	RequireArmed bool `json:"requireArmed,omitempty"`
@@ -211,15 +174,8 @@ type ScenarioQueueLivenessAssertion struct {
 	ProbeSlug string `json:"probeSlug"`
 }
 
-// expectedOutcome is the outcome the scenario expects of the engine under test.
+// expectedOutcome is the outcome the scenario expects.
 func (s *Scenario) expectedOutcome() string {
-	return s.expectedOutcomeFor(engineUnderTest())
-}
-
-func (s *Scenario) expectedOutcomeFor(engine weaverEngine) string {
-	if outcome, ok := s.ExpectedOutcomeByEngine[string(engine)]; ok {
-		return outcome
-	}
 	return s.ExpectedOutcome
 }
 
@@ -254,16 +210,8 @@ func (s *Scenario) deliveredOn(status string) bool {
 	return false
 }
 
-// expectedErrorContains is the terminal error substring the scenario expects of
-// the engine under test.
+// expectedErrorContains is the terminal error substring the scenario expects.
 func (s *Scenario) expectedErrorContains() string {
-	return s.expectedErrorContainsFor(engineUnderTest())
-}
-
-func (s *Scenario) expectedErrorContainsFor(engine weaverEngine) string {
-	if expected, ok := s.ExpectedErrorContainsByEngine[string(engine)]; ok {
-		return expected
-	}
 	return s.ExpectedErrorContains
 }
 
@@ -300,13 +248,6 @@ func (s *Scenario) queueLivenessAssertion() *ScenarioQueueLivenessAssertion {
 		return nil
 	}
 	return s.RuntimeAssertions.QueueLiveness
-}
-
-func (s *Scenario) healthProbeAssertion() *ScenarioHealthProbeAssertion {
-	if s == nil || s.RuntimeAssertions == nil {
-		return nil
-	}
-	return s.RuntimeAssertions.HealthProbe
 }
 
 func (s *Scenario) logAssertion() *ScenarioLogAssertion {
@@ -1347,13 +1288,12 @@ var canonicalFixtureSlugs = []string{
 	"brotli-single",
 	"bzip2-single",
 	"deflate-single",
-	// Direct-store routing writes a RAR set's members straight to their
-	// destinations and never materialises the source volumes. Its output is
-	// byte-identical to the conventional path, so these fixtures prove nothing
-	// by their bytes alone — what they prove is that the sets weaver *should*
-	// route direct still do, asserted from weaver's own counters after the run
-	// (see assertDirectStoreEngagement). Each is store-method and non-solid;
-	// archives direct-store is right to refuse are the rest of this corpus.
+	// A stored RAR set's members are written straight to their destinations
+	// and the source volumes are never materialised. The output is the same
+	// either way, so these fixtures prove nothing by their bytes alone; what
+	// they prove is that the sets weaver should read in place still are,
+	// asserted from the graph's lines after the run (see
+	// assertDirectStoreEngagement). Each is store-method and non-solid.
 	"direct-store-encrypted",
 	"direct-store-encrypted-par2-repair",
 	"direct-store-hp",

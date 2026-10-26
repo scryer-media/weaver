@@ -4,6 +4,11 @@
 use super::*;
 
 impl Pipeline {
+    // The job's root says which of its articles it waits on.
+    pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
+        self.graph_article_waited_on(segment_id).unwrap_or(false)
+    }
+
     pub(crate) fn note_retry_scheduled(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
         *self.pending_retries_by_job.entry(job_id).or_default() += 1;
@@ -115,25 +120,12 @@ impl Pipeline {
         retry_count: u32,
         exclude_servers: Vec<usize>,
     ) -> bool {
-        let job_id = segment_id.file_id.job_id;
         // Built as a retry is: park/restore drops any rotation hint, which
         // is advisory, and the next transport failure recomputes it.
         let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
             return false;
         };
-        let Some(work) = self.requeue_graph_work(work) else {
-            self.update_queue_metrics();
-            return true;
-        };
-        let parks = self.requeue_parks(&work);
-        let Some(state) = self.jobs.get_mut(&job_id) else {
-            return false;
-        };
-        if parks {
-            state.recovery_queue.push(work);
-        } else {
-            state.download_queue.push(work);
-        }
+        self.enqueue_download_work(work);
         self.update_queue_metrics();
         true
     }

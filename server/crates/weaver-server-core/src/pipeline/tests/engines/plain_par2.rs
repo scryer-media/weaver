@@ -6,12 +6,11 @@
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Post, Scenario, assert_same, one_block_article, par2_set, payload,
-    repair_and_terminal_events, run, run_both,
+    ARTICLE, Claim, Post, Scenario, assert_fetched_once, one_block_article, par2_set, payload,
+    repair_and_terminal_events, run,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 
 // Plain files followed by one PAR2 set over them, the index then the
 // volume; the files are numbered as listed, the index and volume after.
@@ -38,8 +37,8 @@ async fn plain_files_clean() {
         Post::plain("lantern.bin", payload(3 * ARTICLE, 1)),
         Post::plain("beacon.dat", payload(2 * ARTICLE - 9, 2)),
     ]);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert!(claims_all(&graph.graph().claims, Claim::Complete));
@@ -49,8 +48,8 @@ async fn plain_files_clean() {
 async fn one_damaged_article_under_par2_is_repaired() {
     let data = payload(4 * ARTICLE, 3);
     let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2)).damaged(0, 1);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert_eq!(
@@ -70,8 +69,8 @@ async fn two_damaged_articles_across_two_files_under_one_set_are_repaired() {
     ))
     .damaged(0, 1)
     .damaged(1, 2);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert_eq!(
@@ -84,8 +83,8 @@ async fn two_damaged_articles_across_two_files_under_one_set_are_repaired() {
 async fn a_lost_article_under_par2_is_repaired_with_its_blocks_reported() {
     let scenario =
         Scenario::new(covered(&[("lantern.bin", payload(4 * ARTICLE, 6))], 2)).lost(0, 1);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     let view = graph.graph();
@@ -101,8 +100,8 @@ async fn a_lost_recovery_article_lowers_the_blocks_reachable_and_the_repair_succ
     let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 7))], 4);
     let lost = one_block_article(&posts[2]);
     let scenario = Scenario::new(posts).damaged(0, 2).lost(2, lost);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     let view = graph.graph();
@@ -114,38 +113,21 @@ async fn a_lost_recovery_article_lowers_the_blocks_reachable_and_the_repair_succ
 }
 
 // Two damaged slices against a set of two blocks, one of them lost with its
-// volume article. The graph counts what the lost article cost and fails the
-// repair as one block reachable; classic fails it as one block advertised.
-// Both file it under repair and deliver nothing. (Classic completed only
-// while the harness payload repeated every two slices: its PAR2 scan found
-// each damaged slice's bytes whole at another offset, so nothing was
-// missing.)
+// volume article. The graph counts what the lost article cost, fails the
+// repair as one block reachable, files it under repair and delivers
+// nothing.
 #[tokio::test]
-async fn a_lost_recovery_article_short_of_blocks_fails_as_repair_under_both_engines() {
+async fn a_lost_recovery_article_short_of_blocks_fails_as_repair() {
     let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 8))], 2);
     let lost = one_block_article(&posts[2]);
     let scenario = Scenario::new(posts)
         .damaged(0, 1)
         .damaged(0, 2)
         .lost(2, lost);
-    let (classic, graph) = run_both(&scenario).await;
-    for outcome in [&classic, &graph] {
-        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
-        assert_eq!(outcome.failure_kind, Some(HistoryFailureKind::Repair));
-        assert!(
-            outcome.files.is_empty(),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.files.keys()
-        );
-    }
-    assert_eq!(
-        classic.failure.as_deref(),
-        Some(
-            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
-             2 damaged slices, only 1 recovery blocks advertised"
-        )
-    );
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
 
     let view = graph.graph();
     assert_eq!(view.blocks_reachable, 1);
@@ -167,25 +149,15 @@ async fn a_lost_recovery_article_short_of_blocks_fails_as_repair_under_both_engi
     );
 }
 
-// A damaged article no recovery covers, in the job's only file. Divergence:
-// the graph keeps the article and claims the file damaged, and since nothing
-// is whole the job fails for the short file; classic fails the download.
+// A damaged article no recovery covers, in the job's only file: the graph
+// keeps the article and claims the file damaged, and since nothing is whole
+// the job fails for the short file.
 #[tokio::test]
-async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged_under_graph() {
+async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged() {
     let scenario =
         Scenario::new(vec![Post::plain("lantern.bin", payload(10 * ARTICLE, 9))]).damaged(0, 4);
-    let (classic, graph) = run_both(&scenario).await;
-    for outcome in [&classic, &graph] {
-        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
-    }
-    assert!(
-        classic
-            .failure
-            .as_deref()
-            .is_some_and(|error| error.starts_with("download incomplete")),
-        "{:?}",
-        classic.failure
-    );
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
     // Nothing is whole: the job fails, naming the short file.
     assert_eq!(
         graph.failure.as_deref(),
@@ -196,10 +168,10 @@ async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged_unde
     assert_eq!(graph.graph().claims["lantern.bin"], Claim::Damaged);
 }
 
-// Divergence: a damaged member no set covers. Classic refuses the job for
-// it; the graph leaves it a damaged leaf and delivers the rest repaired.
+// A damaged member no set covers: the graph leaves it a damaged leaf and
+// delivers the rest repaired.
 #[tokio::test]
-async fn a_damaged_member_no_set_covers_is_refused_under_classic_and_a_damaged_leaf_under_graph() {
+async fn a_damaged_member_no_set_covers_is_a_damaged_leaf() {
     let covered_data = payload(3 * ARTICLE, 10);
     let mut posts = vec![
         Post::plain("lantern.bin", covered_data.clone()),
@@ -207,20 +179,8 @@ async fn a_damaged_member_no_set_covers_is_refused_under_classic_and_a_damaged_l
     ];
     posts.extend(par2_set("lantern", &[("lantern.bin", &covered_data)], 2));
     let scenario = Scenario::new(posts).damaged(1, 1);
-    let (classic, graph) = run_both(&scenario).await;
-    for outcome in [&classic, &graph] {
-        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
-    }
-    assert!(
-        classic
-            .failure
-            .as_deref()
-            .is_some_and(|error| error.starts_with(
-                "retained damaged article bytes require verification or repair: beacon.bin"
-            )),
-        "{:?}",
-        classic.failure
-    );
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
     // The damaged leaf beside the whole member makes the job Partial.
     assert_eq!(
         graph.status,
@@ -237,9 +197,9 @@ async fn a_damaged_member_no_set_covers_is_refused_under_classic_and_a_damaged_l
 
 // The grid: every article of a clean PAR2 job arrived with a verified
 // checksum, so the graph rules on it from what passed and reads nothing
-// back. Classic's figure is what it is.
+// back.
 #[tokio::test]
-async fn a_clean_par2_job_reads_none_of_its_files_back_under_graph() {
+async fn a_clean_par2_job_reads_none_of_its_files_back() {
     let scenario = Scenario::new(covered(
         &[
             ("lantern.bin", payload(4 * ARTICLE, 12)),
@@ -247,21 +207,20 @@ async fn a_clean_par2_job_reads_none_of_its_files_back_under_graph() {
         ],
         2,
     ));
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert_eq!(graph.reads, 0, "the graph read a member back");
-    assert_eq!(graph.volume_samples(&classic), vec![(3, 0)]);
     assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
 }
 
 // A PAR2 set rebuilds the one damaged article: the graph announces the
 // repair once, with the slice it rebuilt, before the job completes.
 #[tokio::test]
-async fn a_par2_repair_is_announced_once_before_the_job_completes_under_graph() {
+async fn a_par2_repair_is_announced_once_before_the_job_completes() {
     let data = payload(4 * ARTICLE, 21);
     let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2)).damaged(0, 1);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     assert_eq!(
         repair_and_terminal_events(&graph),
@@ -272,13 +231,13 @@ async fn a_par2_repair_is_announced_once_before_the_job_completes_under_graph() 
 // Three damaged slices against two recovery blocks: the repair did not
 // hold, so nothing announces one, and the job fails.
 #[tokio::test]
-async fn a_par2_set_short_of_blocks_announces_no_repair_and_fails_under_graph() {
+async fn a_par2_set_short_of_blocks_announces_no_repair_and_fails() {
     let data = payload(4 * ARTICLE, 22);
     let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2))
         .damaged(0, 0)
         .damaged(0, 1)
         .damaged(0, 2);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert_eq!(
         graph.graph().outcomes,
@@ -296,43 +255,25 @@ async fn a_par2_set_short_of_blocks_announces_no_repair_and_fails_under_graph() 
 // Twelve slices of `lantern.bin` zeroed before posting, so every article
 // arrives with a good checksum and only the set's slice checksums can see
 // the damage, against one recovery block.
-// Graph: the set rules the repair impossible and reports the slices it
+// The set rules the repair impossible and reports the slices it
 // proved bad, so the member is a damaged leaf the failed set covers:
-// unrepaired, not delivered, and the job fails as a repair failure. Classic
-// fails it as a repair failure too.
+// unrepaired, not delivered, and the job fails as a repair failure.
 #[tokio::test]
-async fn zeroed_slices_in_clean_articles_short_of_par2_recovery_fail_as_repair_under_both_engines()
-{
+async fn zeroed_slices_in_clean_articles_short_of_par2_recovery_fail_as_repair() {
     let original = payload(40 * ARTICLE, 0);
     let mut posted = original.clone();
     posted[20 * ARTICLE..32 * ARTICLE].fill(0);
     let mut posts = vec![Post::plain("lantern.bin", posted)];
     posts.extend(par2_set("lantern", &[("lantern.bin", &original)], 1));
-    let (classic, graph) = run_both(&Scenario::new(posts)).await;
-    for outcome in [&classic, &graph] {
-        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
-        assert_eq!(
-            outcome.failure_kind,
-            Some(HistoryFailureKind::Repair),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.failure
-        );
-        assert!(
-            outcome.files.is_empty(),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.files.keys()
-        );
-    }
-    // Classic counts the blocks the set advertises rather than reaches.
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(graph.refetched().is_empty());
     assert_eq!(
-        classic.failure.as_deref(),
-        Some(
-            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
-             12 damaged slices, only 1 recovery blocks advertised"
-        )
+        graph.failure_kind,
+        Some(HistoryFailureKind::Repair),
+        "{:?}",
+        graph.failure
     );
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
 
     let view = graph.graph();
     assert_eq!(
@@ -372,7 +313,7 @@ async fn a_waiting_set_rules_in_the_step_its_first_block_arrives() {
         (articles(&posts[0]), articles(&posts[1]), articles(volume));
     assert!(needed + 1 < volume_articles, "blocks follow the first");
     let scenario = Scenario::new(posts).damaged(0, 1);
-    let (_temp_dir, mut pipeline, _) = admit(&scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
     let order = (0..index_articles)
         .map(|ordinal| (1, ordinal))
         .chain([(2, 0)])
@@ -400,11 +341,11 @@ async fn a_waiting_set_rules_in_the_step_its_first_block_arrives() {
 // its slices: the set asks for its volume and rebuilds the whole file from
 // nothing, exactly as it rebuilds a file only some of whose articles came.
 #[tokio::test]
-async fn an_entirely_lost_payload_under_par2_is_rebuilt_under_graph() {
+async fn an_entirely_lost_payload_under_par2_is_rebuilt() {
     let scenario = Scenario::new(covered(&[("lantern.bin", payload(2 * ARTICLE, 23))], 2))
         .lost(0, 0)
         .lost(0, 1);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert_eq!(

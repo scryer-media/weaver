@@ -18,29 +18,174 @@ use weaver_graph::{MemberId, NodeId, Tree};
 use crate::RuntimeTuner;
 use crate::operations::disk::{Capacity, CapacityDebits};
 use crate::pipeline::completion::finalize::MAX_GRAPH_NESTING_DEPTH;
-use crate::pipeline::direct_store::DirectStoreSettings;
 use crate::pipeline::extraction::{ExtractionFailure, ExtractionLimits, ExtractionRejectionReason};
 use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::leaf::Leaf;
 use crate::post_processing::model::{PostProcessingSettings, unwanted_extension_reason};
 
-// The holds budgets and the number of slots.
+// The hold settings, resolved once at pipeline construction. Each value is
+// read from the environment, then from the `[direct_store]` settings table,
+// then from a default the host informs.
 //
-//   resident_limit   holds_resident_limit_bytes, process-wide RAM, as before
-//   scratch_total    holds_scratch_total_bytes, process-wide scratch, as before
-//   scratch_ceiling  holds_scratch_ceiling_bytes, which bounded one set's
-//                    scratch and now bounds one namespace's
-//   disk_reserve     holds_disk_reserve_bytes, zero still disables it
-//   slots            the extraction concurrency the tuner allows, which
-//                    already bounds streaming member extractions
-pub(crate) fn budgets(holds: &DirectStoreSettings, tuner: &RuntimeTuner) -> (HoldBudgets, usize) {
-    let budgets = HoldBudgets {
-        resident_limit: holds.holds_resident_limit_bytes,
-        scratch_total: holds.holds_scratch_total_bytes,
-        scratch_ceiling: holds.holds_scratch_ceiling_bytes,
-        disk_reserve: holds.holds_disk_reserve_bytes,
-    };
-    (budgets, tuner.max_concurrent_extractions())
+//   resident_limit   process-wide RAM the holds may keep resident
+//   scratch_total    process-wide scratch the holds may page to
+//   scratch_ceiling  scratch one namespace's holds may page to
+//   disk_reserve     free space the working filesystem keeps under scratch;
+//                    zero disables it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HoldSettings {
+    pub(crate) resident_limit_bytes: u64,
+    pub(crate) scratch_total_bytes: u64,
+    pub(crate) scratch_ceiling_bytes: u64,
+    pub(crate) disk_reserve_bytes: u64,
+}
+
+// Environment overrides for the hold settings, in bytes.
+const SCRATCH_CEILING_ENV: &str = "WEAVER_RAR_DIRECT_STORE_SCRATCH_CEILING_BYTES";
+const RESIDENT_LIMIT_ENV: &str = "WEAVER_RAR_DIRECT_STORE_HOLDS_RESIDENT_LIMIT_BYTES";
+const SCRATCH_TOTAL_ENV: &str = "WEAVER_RAR_DIRECT_STORE_HOLDS_SCRATCH_TOTAL_BYTES";
+const DISK_RESERVE_ENV: &str = "WEAVER_RAR_DIRECT_STORE_HOLDS_DISK_RESERVE_BYTES";
+
+// One namespace's scratch ceiling when nothing configures it.
+const SCRATCH_CEILING_DEFAULT_BYTES: u64 = 1024 * 1024 * 1024;
+// The smallest resident limit a host derives, and a sixteenth of the most.
+const RESIDENT_LIMIT_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+// How many namespaces' worth of scratch the process-wide total allows when
+// nothing configures it.
+const SCRATCH_TOTAL_NAMESPACES: u64 = 4;
+
+// What the environment says about the hold settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HoldEnv {
+    pub(crate) scratch_ceiling: Option<u64>,
+    pub(crate) resident_limit: Option<u64>,
+    pub(crate) scratch_total: Option<u64>,
+    pub(crate) disk_reserve: Option<u64>,
+}
+
+impl HoldEnv {
+    // The process environment's overrides.
+    pub(crate) fn read() -> Self {
+        let bytes = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        };
+        Self {
+            scratch_ceiling: bytes(SCRATCH_CEILING_ENV),
+            resident_limit: bytes(RESIDENT_LIMIT_ENV),
+            scratch_total: bytes(SCRATCH_TOTAL_ENV),
+            disk_reserve: bytes(DISK_RESERVE_ENV),
+        }
+    }
+}
+
+// What the host can tell the defaults: the memory the process may use, the
+// size of the filesystem under the working directory, and how much of that
+// memory the hardware profile lets resident holds claim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HostFacts {
+    pub(crate) total_memory_bytes: Option<u64>,
+    pub(crate) working_fs_total_bytes: Option<u64>,
+    // The hardware profile's cap on the derived resident limit. A configured
+    // limit is the operator's own number and is never capped.
+    pub(crate) resident_default_cap_bytes: Option<u64>,
+}
+
+impl HostFacts {
+    // Probes the real host. `working_dir` may not exist yet at startup, so
+    // the nearest existing ancestor answers for its filesystem.
+    pub(crate) fn probe(
+        working_dir: &std::path::Path,
+        resident_default_cap_bytes: Option<u64>,
+    ) -> Self {
+        let working_fs_total_bytes = match crate::operations::probe_nearest_disk_space(working_dir)
+        {
+            Ok(space) => Some(space.total_bytes),
+            Err(error) => {
+                warn!(
+                    path = %working_dir.display(),
+                    error = %error,
+                    "working directory capacity is unknown; hold limits fall back to their defaults"
+                );
+                None
+            }
+        };
+        Self {
+            total_memory_bytes: crate::runtime::system_probe::detect_total_memory_bytes(),
+            working_fs_total_bytes,
+            resident_default_cap_bytes,
+        }
+    }
+}
+
+impl HoldSettings {
+    // Resolves the settings against a loaded config on a probed host.
+    pub(crate) fn resolve(config: &crate::settings::Config, host: HostFacts) -> Self {
+        Self::resolve_parts(config.direct_store.as_ref(), HoldEnv::read(), host)
+    }
+
+    // The precedence rule itself, with the environment and the host passed in.
+    pub(crate) fn resolve_parts(
+        config: Option<&crate::settings::DirectStoreOverrides>,
+        env: HoldEnv,
+        host: HostFacts,
+    ) -> Self {
+        let pick = |from_env: Option<u64>, from_config: Option<u64>, default: u64| {
+            from_env.or(from_config).unwrap_or(default)
+        };
+        let scratch_ceiling_bytes = pick(
+            env.scratch_ceiling,
+            config.and_then(|cfg| cfg.holds_scratch_ceiling_bytes),
+            SCRATCH_CEILING_DEFAULT_BYTES,
+        );
+        let derived_resident_limit = host
+            .total_memory_bytes
+            .map_or(4 * RESIDENT_LIMIT_FLOOR_BYTES, |total| {
+                (total / 16).clamp(RESIDENT_LIMIT_FLOOR_BYTES, 16 * RESIDENT_LIMIT_FLOOR_BYTES)
+            });
+        let default_resident_limit = host
+            .resident_default_cap_bytes
+            .map_or(derived_resident_limit, |cap| {
+                derived_resident_limit.min(cap)
+            });
+        Self {
+            resident_limit_bytes: pick(
+                env.resident_limit,
+                config.and_then(|cfg| cfg.holds_resident_limit_bytes),
+                default_resident_limit,
+            ),
+            scratch_total_bytes: pick(
+                env.scratch_total,
+                config.and_then(|cfg| cfg.holds_scratch_total_bytes),
+                scratch_ceiling_bytes.saturating_mul(SCRATCH_TOTAL_NAMESPACES),
+            ),
+            scratch_ceiling_bytes,
+            disk_reserve_bytes: pick(
+                env.disk_reserve,
+                config.and_then(|cfg| cfg.holds_disk_reserve_bytes),
+                crate::pipeline::extraction::safety::default_disk_reserve_bytes(
+                    host.working_fs_total_bytes,
+                ),
+            ),
+        }
+    }
+
+    // The budgets the holds accountant enforces.
+    pub(crate) fn budgets(&self) -> HoldBudgets {
+        HoldBudgets {
+            resident_limit: self.resident_limit_bytes,
+            scratch_total: self.scratch_total_bytes,
+            scratch_ceiling: self.scratch_ceiling_bytes,
+            disk_reserve: self.disk_reserve_bytes,
+        }
+    }
+}
+
+// How many namespaces may extract at once: the extraction concurrency the
+// tuner allows, which already bounds streaming member extractions.
+pub(crate) fn slots(tuner: &RuntimeTuner) -> usize {
+    tuner.max_concurrent_extractions()
 }
 
 // How deep a graph job's namespaces may nest, handed to its tree beside the
@@ -48,8 +193,8 @@ pub(crate) fn budgets(holds: &DirectStoreSettings, tuner: &RuntimeTuner) -> (Hol
 // member is refused as the container it is, and the job goes on.
 pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 
-// The job's extraction budget: the limits classic's extraction enforces, one
-// budget per job, read where the namespace writes. Every byte an object
+// The job's extraction budget: the operator's extraction limits, one budget
+// per job, read where the namespace writes. Every byte an object
 // produces counts, at any depth; the posts' own bytes are the job's input,
 // so they count only as what the ratio is taken over. The first breach
 // stands: every later check answers with it, so nothing more of the job is
@@ -62,8 +207,7 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   resident           what those namespaces keep in memory for their
 //                      members, against the memory limit
 //   deadline           the wall clock since the first member an object
-//                      produced reached its namespace, as classic's runs
-//                      from the job's first extraction; the posts' own
+//                      produced reached its namespace; the posts' own
 //                      writes are not under it
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take

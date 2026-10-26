@@ -24,11 +24,10 @@ use super::rar::delivered;
 use super::sevenz;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::Pipeline;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::tests::{
-    debug_job_state, hear_graph_mail, job_status_for_assert, pump_pipeline_runtime_queues,
-    rar5_fixture_bytes, retire_pipeline_database,
+    hear_graph_mail, job_status_for_assert, pump_pipeline_runtime_queues, rar5_fixture_bytes,
+    retire_pipeline_database,
 };
 
 const MIXED: &str = "rar5_multifile_lz.rar";
@@ -68,8 +67,8 @@ async fn until_refused_unrepairable(pipeline: &mut Pipeline, volumes: u32) {
         }
         assert!(
             job(pipeline).runs().live(),
-            "no run is out and nothing was refused: {}",
-            debug_job_state(pipeline, JOB)
+            "no run is out and nothing was refused: {:?}",
+            job_status_for_assert(pipeline, JOB)
         );
         let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
         pipeline.graph_run_said(said);
@@ -116,15 +115,14 @@ pub(super) async fn drive_to_finish(pipeline: &mut Pipeline, scenario: &Scenario
         idle = if moved { 0 } else { idle + 1 };
         assert!(
             idle < 2 || finished(pipeline),
-            "stalled at {:?}: {}",
-            job_status_for_assert(pipeline, JOB),
-            debug_job_state(pipeline, JOB)
+            "stalled at {:?}",
+            job_status_for_assert(pipeline, JOB)
         );
     }
 }
 
 #[tokio::test]
-async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again_under_graph() {
+async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again() {
     let posts = posts();
     let (archive, index, volume) = (
         articles(&posts[0]),
@@ -132,7 +130,7 @@ async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again_un
         articles(&posts[2]),
     );
     let scenario = Scenario::new(posts).framed(FRAME);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     while pipeline
         .jobs
         .get_mut(&JOB)
@@ -202,8 +200,8 @@ pub(super) async fn serve_posts(
 async fn runs_before_the_repair(pipeline: &mut Pipeline) -> Said {
     assert!(
         job(pipeline).repair_out(),
-        "{}",
-        debug_job_state(pipeline, JOB)
+        "{:?}",
+        job_status_for_assert(pipeline, JOB)
     );
     let mut repaired = None;
     while repaired.is_none() || job(pipeline).runs().live() {
@@ -231,13 +229,10 @@ async fn until_no_run(pipeline: &mut Pipeline) {
 }
 
 fn job(pipeline: &Pipeline) -> &crate::pipeline::graph::job::GraphJob {
-    pipeline.graph_jobs.get(&JOB).unwrap_or_else(|| {
-        panic!(
-            "{:?}: {}",
-            job_status_for_assert(pipeline, JOB),
-            debug_job_state(pipeline, JOB)
-        )
-    })
+    pipeline
+        .graph_jobs
+        .get(&JOB)
+        .unwrap_or_else(|| panic!("{:?}", job_status_for_assert(pipeline, JOB)))
 }
 
 // The set's outcomes as the job reports them.
@@ -297,9 +292,9 @@ fn four_volumes_zeroed() -> Vec<Post> {
 // is offered all four again: the volumes it was not yet handed go on from
 // their own files, as they arrived, and the member decodes whole.
 #[tokio::test]
-async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_again_under_graph() {
+async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_again() {
     let scenario = Scenario::new(four_volumes_zeroed()).framed(SLICE);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     while pipeline
         .jobs
         .get_mut(&JOB)
@@ -344,8 +339,8 @@ async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_ag
 // for a wrong password. The set repairs the slice, the engine reads the
 // repaired bytes through on the same password, and nothing is left asking.
 #[tokio::test]
-async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_repaired_it_delivers_under_graph()
- {
+async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_repaired_it_delivers()
+{
     let archive = sevenz::sealed_header(Lzma2Options::from_level(1).into());
     let volumes = sevenz::split(&archive, 3);
     let files: Vec<(&str, &[u8])> = volumes
@@ -357,7 +352,7 @@ async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_re
     posts[1].bytes[ARTICLE..2 * ARTICLE].fill(0);
     posts.extend(set);
     let scenario = Scenario::new(posts).password(sevenz::SECRET);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     while pipeline
         .jobs
         .get_mut(&JOB)
@@ -403,8 +398,7 @@ async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_re
 // files, repairs the slice, the archive is read again whole, and the job
 // completes.
 #[tokio::test]
-async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_delivers_under_graph()
-{
+async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_delivers() {
     let original = sevenz::container(Lzma2Options::from_level(1).into(), None);
     let mut posted = original.clone();
     let quill = sevenz::packed_end(&original) / ARTICLE - 1;
@@ -413,7 +407,7 @@ async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_de
     posts.extend(par3_set("lantern", &[("lantern.7z", &original)], 4));
     let count = posts.len() as u32;
     let scenario = Scenario::new(posts);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     while pipeline
         .jobs
         .get_mut(&JOB)
@@ -486,14 +480,14 @@ fn extracted(pipeline: &Pipeline) -> Vec<std::path::PathBuf> {
 // node's members are: it is delivered once, under its own name, with the
 // bytes it had.
 #[tokio::test]
-async fn a_member_delivered_whole_before_its_archive_was_refused_is_made_over_once_under_graph() {
+async fn a_member_delivered_whole_before_its_archive_was_refused_is_made_over_once() {
     let original = rar5_fixture_bytes(MIXED);
     let mut posted = original.clone();
     posted[FLIPPED_SECOND] ^= 0xff;
     let mut posts = vec![Post::plain("mixed.rar", posted)];
     posts.extend(par2_volumes("mixed", &[("mixed.rar", &original)], 2, 1));
     let scenario = Scenario::new(posts).framed(FRAME);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     while pipeline
         .jobs
         .get_mut(&JOB)

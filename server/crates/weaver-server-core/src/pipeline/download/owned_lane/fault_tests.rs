@@ -70,7 +70,6 @@ async fn queued_tail_and_granted_refill_are_returned_when_the_job_becomes_inelig
                         (0..3).map(|i| tail_work(i, 0)).collect(),
                     ),
                 },
-                None,
             );
         });
         let request = refills
@@ -192,7 +191,6 @@ async fn transport_fault_after_prefetch_releases_the_granted_connection_class() 
                 parked_tx,
                 initial_lease: test_lease(JobId(42), 0, vec![], vec![tail_work(0, 0)]),
             },
-            None,
         );
     });
     async {
@@ -305,7 +303,6 @@ async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
                 parked_tx,
                 initial_lease: test_lease(JobId(42), 0, vec![], works),
             },
-            None,
         );
     });
     async {
@@ -359,228 +356,6 @@ async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
     .await;
     worker.await.unwrap();
     server.await.unwrap();
-}
-
-// A probe reaching a lane mid-lease is answered once the ring drains.
-//
-// The lane has three BODY responses outstanding when the probe arrives. The
-// worker takes the probe up, stops issuing, reads the three responses, and
-// only then writes the STAT: on the wire every BODY precedes it, so the STAT
-// never reads an article payload as its status line. The answer is the
-// server's, not an inconclusive shrug, and the lease still parks normally.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
-    busy_probe_after_drain(false, 0, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_probe_invalidated_after_pickup_never_reaches_the_cached_socket() {
-    busy_probe_after_drain(true, 0, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_probe_for_another_provider_never_reaches_the_busy_socket() {
-    busy_probe_after_drain(false, 1, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_probe_for_a_new_configuration_never_reaches_the_old_socket() {
-    busy_probe_after_drain(false, 0, true).await;
-}
-
-async fn busy_probe_after_drain(invalidate: bool, expected_server: usize, changed_pool: bool) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let order: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (bodies_seen_tx, bodies_seen_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel::<()>();
-    let (drain_tx, drain_rx) = oneshot::channel::<()>();
-    let server_order = Arc::clone(&order);
-    let server = tokio::spawn(async move {
-        let mut bodies_seen_tx = Some(bodies_seen_tx);
-        let mut release_rx = Some(release_rx);
-        let mut drain_rx = Some(drain_rx);
-        let mut held: Vec<String> = Vec::new();
-        let (socket, _) = listener.accept().await.unwrap();
-        let (reader, mut writer) = socket.into_split();
-        writer.write_all(b"200 fixture ready\r\n").await.unwrap();
-        let mut lines = BufReader::new(reader).lines();
-        while let Some(line) = lines.next_line().await.unwrap() {
-            if line == "CAPABILITIES" {
-                writer
-                    .write_all(b"101 Capabilities\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n")
-                    .await
-                    .unwrap();
-            } else if line.starts_with("BODY ") {
-                server_order.lock().unwrap().push("BODY".into());
-                held.push(line);
-                if held.len() == 3 {
-                    bodies_seen_tx.take().unwrap().send(()).unwrap();
-                    release_rx.take().unwrap().await.unwrap();
-                    writer.write_all(b"430 no such article\r\n").await.unwrap();
-                    held.remove(0);
-                    drain_rx.take().unwrap().await.unwrap();
-                    for _ in held.drain(..) {
-                        writer.write_all(b"430 no such article\r\n").await.unwrap();
-                    }
-                }
-            } else if let Some(id) = line.strip_prefix("STAT ") {
-                server_order.lock().unwrap().push("STAT".into());
-                writer
-                    .write_all(format!("223 0 {id}\r\n").as_bytes())
-                    .await
-                    .unwrap();
-            } else if line.starts_with("HEAD ") {
-                server_order.lock().unwrap().push("HEAD".into());
-                writer.write_all(b"430 no such article\r\n").await.unwrap();
-            } else if line == "QUIT" {
-                writer.write_all(b"205 bye\r\n").await.unwrap();
-                break;
-            } else {
-                writer.write_all(b"500 unsupported\r\n").await.unwrap();
-            }
-        }
-    });
-    let nntp = Arc::new(weaver_nntp::NntpClient::new(
-        weaver_nntp::client::NntpClientConfig::single(
-            weaver_nntp::ServerConfig {
-                host: "127.0.0.1".into(),
-                port,
-                tls: false,
-                ..Default::default()
-            },
-            1,
-        ),
-    ));
-    let (event_tx, mut events) = mpsc::channel(16);
-    let (refill_tx, mut refills) = mpsc::channel(16);
-    let (parked_tx, mut parks) = mpsc::channel(16);
-    let (commands_tx, commands_rx) = std_mpsc::channel();
-    let shared = Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
-        workers: vec![OwnedLaneWorkerSlot {
-            sender: commands_tx.clone(),
-            idle: None,
-            busy_server: None,
-        }],
-        queued_runs: VecDeque::new(),
-        probe_starved_jobs: std::collections::HashSet::new(),
-    }));
-    let client = Arc::clone(&nntp);
-    let worker_shared = Arc::clone(&shared);
-    let worker = tokio::task::spawn_blocking(move || {
-        let mut cached = None;
-        run_owned_blocking_download_lane(
-            &mut cached,
-            OwnedLaneRun {
-                nntp: client,
-                state: test_admitted_state(JobId(42)),
-                event_tx,
-                refill_tx,
-                parked_tx,
-                initial_lease: test_lease(
-                    JobId(42),
-                    0,
-                    vec![],
-                    vec![tail_work(0, 0), tail_work(1, 0), tail_work(2, 0)],
-                ),
-            },
-            Some(WorkerLink {
-                index: 0,
-                shared: &worker_shared,
-                commands: &commands_rx,
-            }),
-        )
-    });
-    let (picked_up_tx, picked_up_rx) = oneshot::channel();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let guard_allowed = Arc::clone(&allowed);
-    let expected_pool = if changed_pool {
-        let replacement = weaver_nntp::NntpClient::new(
-            weaver_nntp::client::NntpClientConfig::single(weaver_nntp::ServerConfig::default(), 1),
-        );
-        Arc::clone(replacement.pool())
-    } else {
-        Arc::clone(nntp.pool())
-    };
-    async {
-        bodies_seen_rx.await.expect("three BODYs pipelined before any answer");
-        assert_eq!(
-            lock_pool(&shared).workers[0].busy_server,
-            Some(0),
-            "a lane on a connection publishes its server for the probe router"
-        );
-        commands_tx
-            .send(OwnedLanePoolCommand::Probe {
-                expected_socket: ProbeSocket { server: expected_server, pool: Some(expected_pool) },
-                message_ids: Arc::from(["<probe@silver.horizon>".to_string()]),
-                guard: Some(Arc::new(move || guard_allowed.load(Ordering::SeqCst))),
-                picked_up: picked_up_tx,
-                reply: reply_tx,
-            })
-            .unwrap();
-        release_tx.send(()).unwrap();
-        picked_up_rx.await.expect("the busy worker takes the probe up");
-        allowed.store(!invalidate, Ordering::SeqCst);
-        drain_tx.send(()).unwrap();
-        let answer = reply_rx
-            .await
-            .expect("the worker answers rather than dropping the probe");
-        if expected_server != 0 || changed_pool {
-            assert!(answer.is_none(), "a different provider or configuration cannot answer this probe");
-        } else {
-            let answer = answer.expect("the matching lane answers the probe");
-            assert_eq!(answer.exists, vec![!invalidate]);
-            assert_eq!(answer.inconclusive, invalidate);
-        }
-
-        let mut results = 0;
-        loop {
-            tokio::select! {
-                Some(request) = refills.recv() => {
-                    assert!(request.response_tx.send(DownloadLaneRefillResponse { lease: None, park_reason: LaneParkReason::NoWork }).is_ok());
-                }
-                Some(event) = events.recv() => {
-                    let OwnedDownloadLaneEvent::BatchComplete { results: batch, ack, .. } = event else { panic!("unexpected acquisition failure"); };
-                    results += batch.len();
-                    if let Some(ack) = ack { ack.send(()).unwrap(); }
-                }
-                Some(park) = parks.recv() => {
-                    assert!(matches!(park.reason, LaneParkReason::NoWork), "the lease parks normally after the probe");
-                    break;
-                }
-            }
-        }
-        assert_eq!(results, 3, "every BODY on the ring is still reported");
-    }
-    .await;
-    let deferred = worker.await.unwrap();
-    assert!(
-        deferred.is_empty(),
-        "nothing but the probe reached the worker"
-    );
-    drop(nntp);
-    server.await.unwrap();
-
-    let order = order.lock().unwrap();
-    if invalidate || expected_server != 0 || changed_pool {
-        assert_eq!(*order, vec!["BODY", "BODY", "BODY"]);
-        return;
-    }
-    let last_body = order.iter().rposition(|command| command == "BODY").unwrap();
-    let first_stat = order
-        .iter()
-        .position(|command| command == "STAT")
-        .expect("the probe reached the wire");
-    assert_eq!(order.iter().filter(|command| *command == "BODY").count(), 3);
-    assert!(
-        last_body < first_stat,
-        "every BODY precedes the STAT on the wire: {order:?}"
-    );
-    assert!(
-        !order.iter().any(|command| command == "HEAD"),
-        "STAT settled the batch"
-    );
 }
 
 // A parking lane asks the allocator to release its idle memory, exactly once.
@@ -659,7 +434,6 @@ async fn a_parking_lane_releases_its_idle_thread_memory_once() {
                 parked_tx,
                 initial_lease: test_lease(JobId(42), 0, vec![], vec![tail_work(0, 0)]),
             },
-            None,
         );
     });
     async {

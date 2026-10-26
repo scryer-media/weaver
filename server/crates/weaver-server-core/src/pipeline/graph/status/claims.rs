@@ -14,7 +14,7 @@ use crate::post_processing::model::PipelineFailureStage;
 
 // Below this share of its length, a member has produced no delivery
 // evidence: what is on disk for it is a rounding error, not a short
-// delivery. The same share the classic census holds a file to.
+// delivery.
 const EVIDENCE_PERCENT: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

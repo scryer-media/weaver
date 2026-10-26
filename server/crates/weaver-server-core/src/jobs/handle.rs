@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
-use crate::jobs::ids::{JobId, NzbFileId};
+use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
 
 use crate::jobs::error::SchedulerError;
@@ -39,25 +39,6 @@ struct JobCancellationState {
 }
 
 impl JobCancellationRegistry {
-    fn register(&self, job_id: JobId, callback: JobCancellationCallback) {
-        let cancel_now = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("job cancellation registry poisoned");
-            let cancel_now = state.requested.contains(&job_id);
-            state
-                .callbacks
-                .entry(job_id)
-                .or_default()
-                .push(Arc::clone(&callback));
-            cancel_now
-        };
-        if cancel_now {
-            callback();
-        }
-    }
-
     fn cancel(&self, job_id: JobId) -> bool {
         let callbacks = {
             let mut state = self
@@ -72,14 +53,6 @@ impl JobCancellationRegistry {
             callback();
         }
         cancelled
-    }
-
-    fn requested(&self, job_id: JobId) -> bool {
-        self.state
-            .lock()
-            .expect("job cancellation registry poisoned")
-            .requested
-            .contains(&job_id)
     }
 
     fn clear(&self, job_id: JobId) {
@@ -117,10 +90,6 @@ pub struct SharedPipelineState {
     // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
     // the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
-    // How a direct-unpack chase widens its 7z decoder, as the hardware
-    // profile in force decides it. Read when a chase starts, so a profile put
-    // in force now reaches the next chase.
-    chase_widening: Arc<RwLock<crate::runtime::hardware_profile::ChaseWidening>>,
     job_cancellations: JobCancellationRegistry,
     // The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     // kept off the job-level broadcast: a download emits several of these
@@ -157,9 +126,6 @@ impl SharedPipelineState {
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
-            chase_widening: Arc::new(RwLock::new(
-                crate::runtime::hardware_profile::ChaseWidening::default(),
-            )),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
@@ -302,20 +268,8 @@ impl SharedPipelineState {
         self.metrics.raw_snapshot()
     }
 
-    pub(crate) fn register_job_cancellation(
-        &self,
-        job_id: JobId,
-        callback: JobCancellationCallback,
-    ) {
-        self.job_cancellations.register(job_id, callback);
-    }
-
     pub(crate) fn cancel_active_job_work(&self, job_id: JobId) -> bool {
         self.job_cancellations.cancel(job_id)
-    }
-
-    pub(crate) fn is_job_cancellation_requested(&self, job_id: JobId) -> bool {
-        self.job_cancellations.requested(job_id)
     }
 
     pub(crate) fn clear_job_cancellations(&self, job_id: JobId) {
@@ -477,18 +431,6 @@ impl SharedPipelineState {
     pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
         self.sevenz_decode_memory_bytes
             .store(bytes.max(1), Ordering::Relaxed);
-    }
-
-    // How a direct-unpack chase widens its 7z decoder. The balanced
-    // profile's widening until a profile is put in force.
-    pub fn chase_widening(&self) -> crate::runtime::hardware_profile::ChaseWidening {
-        *self.chase_widening.read().unwrap()
-    }
-
-    // Apply the chosen profile's chase widening. Chases already running keep
-    // the widening they started with.
-    pub fn set_chase_widening(&self, widening: crate::runtime::hardware_profile::ChaseWidening) {
-        *self.chase_widening.write().unwrap() = widening;
     }
 
     // The hardware profile in force, or `None` before a pipeline has
@@ -762,11 +704,8 @@ pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
-    pub complete_files: HashSet<NzbFileId>,
-    pub file_progress: HashMap<u32, crate::jobs::assembly::FileCoverage>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub file_identities: HashMap<u32, ActiveFileIdentity>,
-    pub extracted_members: HashSet<String>,
     pub status: JobStatus,
     pub download_state: Option<crate::jobs::model::DownloadState>,
     pub post_state: Option<crate::jobs::model::PostState>,

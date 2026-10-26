@@ -5,7 +5,6 @@
 // how, what it bound a member as, and each file as it was delivered.
 
 use super::harness::{ARTICLE, Post, Scenario, par2_set, payload, run};
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::lines::Lines;
 
 const JOB: u64 = super::harness::JOB.0;
@@ -56,7 +55,7 @@ const RULED: [&str; 11] = [
 
 async fn ruled(scenario: Scenario) -> (String, u64) {
     let (lines, _guard) = Lines::capture();
-    let outcome = run(&scenario, Engine::Graph).await;
+    let outcome = run(&scenario).await;
     assert!(outcome.completed(), "{:?}", outcome.failure);
     let ruled = lines.of("recovery set ruled");
     assert_eq!(ruled.len(), 1, "{ruled:?}");
@@ -150,10 +149,10 @@ async fn an_obfuscated_member_logs_recovery_bound_by_content() {
     let beacon = payload(2 * ARTICLE + 5, 44);
     let files: [(&str, &[u8]); 2] = [("lantern.bin", &lamp), ("beacon.bin", &beacon)];
     let (lines, _guard) = Lines::capture();
-    let outcome = run(
-        &Scenario::new(covered(&files, &["3f9a0c71e25b84d6", "beacon.bin"])),
-        Engine::Graph,
-    )
+    let outcome = run(&Scenario::new(covered(
+        &files,
+        &["3f9a0c71e25b84d6", "beacon.bin"],
+    )))
     .await;
     assert!(outcome.completed(), "{:?}", outcome.failure);
     let mut bound: Vec<String> = lines
@@ -192,13 +191,10 @@ async fn an_obfuscated_member_logs_recovery_bound_by_content() {
 #[tokio::test]
 async fn a_delivery_the_ledger_renamed_logs_member_delivered_from_its_wanted_name() {
     let (lines, _guard) = Lines::capture();
-    let outcome = run(
-        &Scenario::new(vec![
-            Post::plain("lantern.bin", payload(2 * ARTICLE, 45)),
-            Post::plain("Lantern.bin", payload(ARTICLE + 3, 46)),
-        ]),
-        Engine::Graph,
-    )
+    let outcome = run(&Scenario::new(vec![
+        Post::plain("lantern.bin", payload(2 * ARTICLE, 45)),
+        Post::plain("Lantern.bin", payload(ARTICLE + 3, 46)),
+    ]))
     .await;
     assert!(outcome.completed(), "{:?}", outcome.failure);
     assert_eq!(

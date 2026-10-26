@@ -116,7 +116,6 @@ fn history(job_id: u64, status: &str) -> JobHistoryRow {
 
 fn active_backfill_job(job_id: u64, nzb_zstd: Vec<u8>) -> ActiveJob {
     ActiveJob {
-        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(job_id),
         nzb_hash: [job_id as u8; 32],
         nzb_path: PathBuf::from(format!("job-{job_id}.nzb")),

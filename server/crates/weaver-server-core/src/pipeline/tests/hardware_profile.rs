@@ -86,10 +86,6 @@ fn assert_limits_of(pipeline: &Pipeline, profile: HardwareProfile) {
         tuning.extract_threads
     );
     assert_eq!(
-        pipeline.chase_pool.current_num_threads(),
-        tuning.extract_threads
-    );
-    assert_eq!(
         pipeline.shared_state.sevenz_decode_memory_bytes(),
         tuning.sevenz_decode_memory_bytes
     );
@@ -123,7 +119,6 @@ async fn a_chosen_profile_is_in_force_for_the_next_activity() {
     );
     // What an extraction that started before the change holds.
     let running_pool = Arc::clone(&pipeline.pp_pool);
-    let running_budget = pipeline.process_memory_budget.for_job(1);
 
     choose(&mut pipeline, HardwareProfile::Efficient).await;
 
@@ -145,10 +140,6 @@ async fn a_chosen_profile_is_in_force_for_the_next_activity() {
     // Running work finishes on what it started with.
     assert!(!Arc::ptr_eq(&running_pool, &pipeline.pp_pool));
     assert_eq!(running_pool.current_num_threads(), 6);
-    assert_ne!(
-        running_budget.limit(),
-        pipeline.process_memory_budget.limit()
-    );
 }
 
 #[tokio::test]

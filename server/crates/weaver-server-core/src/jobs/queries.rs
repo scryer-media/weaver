@@ -2,17 +2,14 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::StateError;
 use crate::jobs::assembly::{DetectedArchiveIdentity, DetectedArchiveKind, FileCoverage};
 use crate::jobs::ids::{JobId, NzbFileId};
-use crate::jobs::record::{
-    ActiveFileIdentity, ActivePar2File, ExtractionChunk, FileIdentitySource, RarVolumeFactsBySet,
-    RecoveredJob,
-};
+use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource, RecoveredJob};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
 type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
 
@@ -35,51 +32,6 @@ fn metadata_from_json(raw: Option<String>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-fn extracted_member_marker_valid(
-    job_id: JobId,
-    member_name: &str,
-    output_path: &str,
-    output_size: i64,
-) -> bool {
-    if output_size < 0 || output_path.is_empty() {
-        tracing::debug!(
-            job_id = job_id.0,
-            member = %member_name,
-            output_path = %output_path,
-            output_size,
-            "discarding unvalidated extracted member marker"
-        );
-        return false;
-    }
-
-    match std::fs::metadata(Path::new(output_path)) {
-        Ok(metadata) if metadata.is_file() && metadata.len() == output_size as u64 => true,
-        Ok(metadata) => {
-            tracing::debug!(
-                job_id = job_id.0,
-                member = %member_name,
-                output_path = %output_path,
-                output_size,
-                actual_size = metadata.len(),
-                is_file = metadata.is_file(),
-                "discarding stale extracted member marker"
-            );
-            false
-        }
-        Err(error) => {
-            tracing::debug!(
-                job_id = job_id.0,
-                member = %member_name,
-                output_path = %output_path,
-                output_size,
-                error = %error,
-                "discarding missing extracted member marker"
-            );
-            false
-        }
-    }
-}
-
 fn detected_from_row(
     kind: String,
     set_name: String,
@@ -92,35 +44,7 @@ fn detected_from_row(
     })
 }
 
-fn extraction_chunk_from_row(row: SqlRow) -> Result<ExtractionChunk, StateError> {
-    Ok(ExtractionChunk {
-        member_name: row.text("member_name")?,
-        volume_index: row.i64("volume_index")? as u32,
-        bytes_written: row.i64("bytes_written")? as u64,
-        temp_path: row.text("temp_path")?,
-        start_offset: row.i64("start_offset")? as u64,
-        end_offset: row.i64("end_offset")? as u64,
-        verified: row.bool("verified")?,
-        appended: row.bool("appended")?,
-    })
-}
-
 impl Database {
-    // Completed-file digests that are safe to treat as *calculated from the
-    // downloaded bytes*: rows whose `md5_provenance` records how the value
-    // was obtained ('streamed' or 'verified'). Legacy rows — written before
-    // provenance existed — are excluded here, because they may hold a PAR2
-    // description's EXPECTED hash copied verbatim, and quick verification
-    // must never treat an expectation as an observation. Use
-    // [`Self::load_complete_file_hashes_any`] where a hash is only an
-    // identity hint.
-    pub fn load_complete_file_hashes(
-        &self,
-        job_id: JobId,
-    ) -> Result<HashMap<u32, [u8; 16]>, StateError> {
-        self.load_complete_file_hashes_inner(job_id, true)
-    }
-
     // Every persisted completed-file digest regardless of provenance,
     // including legacy rows of unknown origin. Identity hints only — never
     // verification evidence.
@@ -165,85 +89,8 @@ impl Database {
         })
     }
 
-    pub fn load_par2_files(
-        &self,
-        job_id: JobId,
-    ) -> Result<HashMap<u32, ActivePar2File>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT file_index, filename, recovery_block_count, promoted
-                 FROM active_par2_files
-                 WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut files = HashMap::new();
-            for row in rows {
-                let file = ActivePar2File {
-                    file_index: row.i64("file_index")? as u32,
-                    filename: row.text("filename")?,
-                    recovery_block_count: row.i64("recovery_block_count")? as u32,
-                    promoted: row.bool("promoted")?,
-                };
-                files.insert(file.file_index, file);
-            }
-            Ok(files)
-        })
-    }
-
-    pub fn load_failed_extractions(&self, job_id: JobId) -> Result<HashSet<String>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT member_name FROM active_failed_extractions
-                 WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            rows.into_iter()
-                .map(|row| row.text("member_name"))
-                .collect::<Result<HashSet<_>, _>>()
-        })
-    }
-
-    pub fn load_active_job_normalization_retried(&self, job_id: JobId) -> Result<bool, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let row = SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT normalization_retried FROM active_jobs WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            row.map(|row| row.bool("normalization_retried"))
-                .transpose()
-                .map(|value| value.unwrap_or(false))
-        })
-    }
-
-    // The engine an active job was stamped with, so a restore resumes it on
-    // that engine rather than on whatever the switch says now. `None` when the
-    // job has no active row.
-    pub fn load_active_job_engine(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<crate::pipeline::graph::Engine>, StateError> {
-        self.load_job_engine("SELECT engine FROM active_jobs WHERE job_id = {}", job_id)
-    }
-
-    // The engine a finished job ran on, carried over from its active row.
-    pub fn load_job_history_engine(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<crate::pipeline::graph::Engine>, StateError> {
-        self.load_job_engine("SELECT engine FROM job_history WHERE job_id = {}", job_id)
-    }
-
     // The root phase of a graph job, which is its status while it runs its
-    // tree. A classic job never writes it, so its column stays NULL.
+    // tree.
     pub fn save_active_job_root_phase(
         &self,
         job_id: JobId,
@@ -277,32 +124,6 @@ impl Database {
                 .map(|row| row.opt_text("root_phase"))
                 .transpose()?
                 .flatten())
-        })
-    }
-
-    fn load_job_engine(
-        &self,
-        sql: &'static str,
-        job_id: JobId,
-    ) -> Result<Option<crate::pipeline::graph::Engine>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let row = SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                sql,
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            // An unknown stored value is a corrupt row, not a reason to guess
-            // an engine: running a job on the wrong one would misread its state.
-            row.map(|row| {
-                row.text("engine")?.parse().map_err(
-                    |error: crate::pipeline::graph::UnknownEngine| {
-                        StateError::Database(format!("job {}: {error}", job_id.0))
-                    },
-                )
-            })
-            .transpose()
         })
     }
 
@@ -362,11 +183,9 @@ impl Database {
                     nzb_path: PathBuf::from(row.text("nzb_path")?),
                     nzb_zstd: row.opt_bytes("nzb_zstd")?,
                     output_dir: PathBuf::from(row.text("output_dir")?),
-                    file_progress: HashMap::new(),
                     detected_archives: HashMap::new(),
                     file_identities: HashMap::new(),
                     complete_files: HashSet::new(),
-                    extracted_members: HashSet::new(),
                     status: row.text("status")?,
                     download_state: row.opt_text("download_state")?,
                     post_state: row.opt_text("post_state")?,
@@ -387,34 +206,6 @@ impl Database {
                     )?,
                 };
                 jobs.insert(job_id, job);
-            }
-
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, file_index, coverage
-                 FROM active_file_progress",
-                &[],
-            )
-            .await?;
-            for row in rows {
-                let job_id = JobId(row.i64("job_id")? as u64);
-                let file_index = row.i64("file_index")? as u32;
-                let Some(job) = jobs.get_mut(&job_id) else {
-                    continue;
-                };
-                // Refused whole, never half-trusted: the file downloads from
-                // nothing, which is always correct.
-                match FileCoverage::decode(&row.bytes("coverage")?) {
-                    Ok(coverage) => {
-                        job.file_progress.insert(file_index, coverage);
-                    }
-                    Err(error) => tracing::warn!(
-                        job_id = job_id.0,
-                        file_index,
-                        %error,
-                        "file coverage checkpoint refused; the file redownloads"
-                    ),
-                }
             }
 
             let rows = SqlRuntime::fetch_all(
@@ -497,8 +288,6 @@ impl Database {
                     .map(|file_id| file_id.file_index)
                     .collect::<HashSet<_>>();
                 let before_detected = job.detected_archives.len();
-                job.file_progress
-                    .retain(|file_index, _| !completed_indices.contains(file_index));
                 job.detected_archives
                     .retain(|file_index, _| completed_indices.contains(file_index));
                 for identity in job.file_identities.values_mut() {
@@ -513,29 +302,6 @@ impl Database {
                         discarded_detected,
                         "discarded stale archive discovery cache entries for incomplete files"
                     );
-                }
-            }
-
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, member_name, output_path, output_size FROM active_extracted",
-                &[],
-            )
-            .await?;
-            for row in rows {
-                let job_id = JobId(row.i64("job_id")? as u64);
-                if let Some(job) = jobs.get_mut(&job_id) {
-                    let member_name = row.text("member_name")?;
-                    let output_path = row.text("output_path")?;
-                    let output_size = row.i64("output_size")?;
-                    if extracted_member_marker_valid(
-                        job_id,
-                        &member_name,
-                        &output_path,
-                        output_size,
-                    ) {
-                        job.extracted_members.insert(member_name);
-                    }
                 }
             }
 
@@ -652,35 +418,6 @@ impl Database {
         })
     }
 
-    pub fn load_detected_archive_identities(
-        &self,
-        job_id: JobId,
-    ) -> Result<HashMap<u32, DetectedArchiveIdentity>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT file_index, kind, set_name, volume_index
-                 FROM active_detected_archives
-                 WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut detected = HashMap::new();
-            for row in rows {
-                let Some(identity) = detected_from_row(
-                    row.text("kind")?,
-                    row.text("set_name")?,
-                    row.opt_i64("volume_index")?,
-                ) else {
-                    continue;
-                };
-                detected.insert(row.i64("file_index")? as u32, identity);
-            }
-            Ok(detected)
-        })
-    }
-
     pub fn max_job_id_all(&self) -> Result<u64, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -703,141 +440,6 @@ impl Database {
                 .transpose()?
                 .flatten()
                 .unwrap_or(0) as u64)
-        })
-    }
-
-    pub fn get_extraction_chunks(
-        &self,
-        job_id: JobId,
-        set_name: &str,
-    ) -> Result<Vec<ExtractionChunk>, StateError> {
-        let datastore = self.datastore();
-        let set_name = set_name.to_string();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT member_name, volume_index, bytes_written, temp_path,
-                        start_offset, end_offset, verified, appended
-                 FROM active_extraction_chunks
-                 WHERE job_id = {} AND set_name = {}
-                 ORDER BY member_name, volume_index",
-                &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
-            )
-            .await?;
-            rows.into_iter().map(extraction_chunk_from_row).collect()
-        })
-    }
-
-    pub fn load_archive_headers(
-        &self,
-        job_id: JobId,
-        set_name: &str,
-    ) -> Result<Option<Vec<u8>>, StateError> {
-        let datastore = self.datastore();
-        let set_name = set_name.to_string();
-        self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT headers FROM active_archive_headers
-                 WHERE job_id = {} AND set_name = {}",
-                &[SqlArg::I64(job_id.0 as i64), SqlArg::Text(set_name)],
-            )
-            .await?
-            .map(|row| row.bytes("headers"))
-            .transpose()
-        })
-    }
-
-    pub fn load_all_archive_headers(
-        &self,
-        job_id: JobId,
-    ) -> Result<HashMap<String, Vec<u8>>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT set_name, headers FROM active_archive_headers
-                 WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut headers = HashMap::new();
-            for row in rows {
-                headers.insert(row.text("set_name")?, row.bytes("headers")?);
-            }
-            Ok(headers)
-        })
-    }
-
-    pub fn load_all_rar_volume_facts(
-        &self,
-        job_id: JobId,
-    ) -> Result<RarVolumeFactsBySet, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT set_name, volume_index, facts_blob
-                 FROM active_rar_volume_facts
-                 WHERE job_id = {}
-                 ORDER BY set_name, volume_index",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut grouped: RarVolumeFactsBySet = HashMap::new();
-            for row in rows {
-                grouped
-                    .entry(row.text("set_name")?)
-                    .or_default()
-                    .push((row.i64("volume_index")? as u32, row.bytes("facts_blob")?));
-            }
-            Ok(grouped)
-        })
-    }
-
-    // Reads every direct-store coverage checkpoint for a job, keyed by archive
-    // set name. One statement, one row per set — restart never
-    // pays a per-volume round trip.
-    pub fn load_direct_coverage(
-        &self,
-        job_id: JobId,
-    ) -> Result<HashMap<String, Vec<u8>>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT set_name, snapshot FROM active_direct_coverage
-                 WHERE job_id = {}
-                 ORDER BY set_name",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?;
-            let mut coverage = HashMap::new();
-            for row in rows {
-                coverage.insert(row.text("set_name")?, row.bytes("snapshot")?);
-            }
-            Ok(coverage)
-        })
-    }
-
-    pub fn load_deleted_volume_statuses(
-        &self,
-        job_id: JobId,
-    ) -> Result<Vec<(String, u32)>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT set_name, volume_index
-                 FROM active_volume_status
-                 WHERE job_id = {} AND deleted = {}
-                 ORDER BY set_name, volume_index",
-                &[SqlArg::I64(job_id.0 as i64), SqlArg::Bool(true)],
-            )
-            .await?;
-            rows.into_iter()
-                .map(|row| Ok((row.text("set_name")?, row.i64("volume_index")? as u32)))
-                .collect()
         })
     }
 }

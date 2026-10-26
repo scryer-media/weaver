@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Acceptance under both engines: one generated job admitted twice, once
-// under `Engine::Classic` and once under `Engine::Graph`, served the same
-// articles, settled through the same completion gate, and compared.
+// Acceptance through the graph engine: one generated job admitted, served
+// its articles, settled through the completion gate, and judged by what it
+// delivered.
 //
 // The harness API (everything a scenario needs; the body need not be read):
 //
@@ -18,7 +18,7 @@
 //   par3_set(base, files, blocks) a PAR3 index and its volumes of `blocks`
 //                                 recovery blocks over `files`, blocks of
 //                                 ARTICLE, named as the creator names them
-//   recovery_blocks(post)       per recovery block of a volume, the
+//   recovery_blocks(post)         per recovery block of a volume, the
 //                                 articles holding its bytes
 //   one_block_article(post)       an article of a volume whose loss costs
 //                                 exactly one recovery block
@@ -36,19 +36,16 @@
 //     .password(secret)           the password the job is submitted with
 //     .global_password(secret)    a password among the candidates every
 //                                 job is offered, the job has none of its own
-//   run_both(&scenario)           -> (classic Outcome, graph Outcome)
-//   run(&scenario, engine)        -> Outcome, for divergence tests
-//   try_run(&scenario, engine)    -> Result<Outcome, Stall>: Err when the job
+//   run(&scenario)                -> Outcome
+//   try_run(&scenario)            -> Result<Outcome, Stall>: Err when the job
 //                                 stops moving before it finishes
-//   Stall { engine, status,       the status it stalled at, and the
-//           state }               pipeline's state then, for the message
-//   assert_same(&classic, &graph) the same status, failure kind, delivered
-//                                 files and bytes, claims, and article
-//                                 requests; neither engine asked for an
-//                                 article twice
+//   Stall { status, state }       the status it stalled at, and the
+//                                 pipeline's state then, for the message
+//   admit(&scenario)              a fresh pipeline with the job admitted,
+//                                 for a row that drives the job itself
 //
 //   Outcome {
-//     engine, status,             the job's last status
+//     status,                     the job's last status
 //     failure,                    the failure message, when it failed
 //     failure_kind,               the history row's failure kind
 //     files,                      delivered path (under the complete
@@ -57,10 +54,8 @@
 //                                 read off what was delivered
 //     requests,                   (file, ordinal) to times it was asked for
 //     order,                      every (file, ordinal) asked, in order
-//     reads,                      graph: member reads its repairs made;
-//                                 classic: PAR2 verification passes that
-//                                 read files back
-//     graph: Option<GraphView>,   the graph job as last seen before it
+//     reads,                      member reads its repairs made
+//     graph: GraphView,           the graph job as last seen before it
 //                                 finished: namespace claims by output
 //                                 name, blocks reachable, repair
 //                                 outcomes, and the delivery: the files
@@ -75,11 +70,12 @@ mod binding_order;
 mod caps;
 mod checkpoint_cost;
 mod deep;
+mod delivery;
 mod depth;
-mod divergence;
 mod embedded;
 mod encrypted_hex;
 pub(in crate::pipeline::tests) mod harness;
+mod lifecycle;
 mod lines;
 mod nesting;
 mod pairings;

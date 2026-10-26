@@ -9,11 +9,10 @@ use std::collections::BTreeMap;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, par2_set, payload, run, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, par2_set, payload, run,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 
 // PAR2 names a file by the MD5 of at most this much of its front; damage
 // past it leaves an obfuscated member recognisable by its front.
@@ -33,13 +32,6 @@ fn delivered<'a>(outcome: &'a Outcome, name: &str) -> Option<&'a [u8]> {
         .map(Vec::as_slice)
 }
 
-fn failed_with(outcome: &Outcome, prefix: &str) -> bool {
-    outcome
-        .failure
-        .as_deref()
-        .is_some_and(|error| error.starts_with(prefix))
-}
-
 // `lantern.bin` under the lantern set and `beacon.bin` under the beacon
 // set, the payload files first, then each set's index and volume.
 #[tokio::test]
@@ -53,8 +45,8 @@ async fn two_sets_in_one_job_each_repair_their_own_damage() {
     posts.extend(par2_set("lantern", &[("lantern.bin", &lantern)], 2));
     posts.extend(par2_set("beacon", &[("beacon.bin", &beacon)], 2));
     let scenario = Scenario::new(posts).damaged(0, 1).damaged(1, 2);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert!(claims_all(&graph.graph().claims, Claim::Complete));
@@ -91,8 +83,8 @@ fn shared_member() -> Vec<Post> {
 #[tokio::test]
 async fn a_member_two_sets_describe_is_repaired_once() {
     let scenario = Scenario::new(shared_member()).damaged(1, 1);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert_eq!(
@@ -101,25 +93,16 @@ async fn a_member_two_sets_describe_is_repaired_once() {
     );
 }
 
-// The member's binding answers to the first set that describes it under
-// both engines: its shortfall is the repair's, though the second set alone
-// holds blocks enough. Classic fails the job. Under the graph the members
-// it never reached are delivered whole beside it, so the job ends Partial
-// (the partial-extraction ruling of 2026-10-18), its failure the repair's.
+// The member's binding answers to the first set that describes it: its
+// shortfall is the repair's, though the second set alone holds blocks
+// enough. The members it never reached are delivered whole beside it, so
+// the job ends Partial, its failure the repair's.
 #[tokio::test]
 async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
     let scenario = Scenario::new(shared_member()).damaged(1, 0).damaged(1, 2);
-    let (classic, graph) = run_both(&scenario).await;
-    for outcome in [&classic, &graph] {
-        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
-        assert_eq!(outcome.failure_kind, Some(HistoryFailureKind::Repair));
-    }
-    assert!(
-        failed_with(&classic, "PAR2 recovery failed for 1 set(s): lantern.par2"),
-        "{:?}",
-        classic.failure
-    );
-    assert!(classic.files.is_empty());
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert_eq!(
         graph.status,
         Some(JobStatus::Partial),
@@ -128,11 +111,6 @@ async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
     );
     assert_eq!(graph.claims["lantern.bin"], Claim::Complete);
     assert_eq!(graph.claims["beacon.bin"], Claim::Complete);
-    assert!(failed_with(
-        &classic,
-        "PAR2 recovery failed for 1 set(s): lantern.par2 (ember.bin, lantern.bin): \
-         not repairable: 2 damaged slices, only 1 recovery blocks advertised"
-    ));
     assert_eq!(
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Impossible {
@@ -142,18 +120,13 @@ async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
     );
 }
 
-// Divergence: `quill.bin` is described by both sets with different bytes,
+// `quill.bin` is described by both sets with different bytes,
 // the posted bytes being the lantern set's. A name two sets answer
 // differently binds nothing by name; the posted bytes compute to the
 // lantern set's file id, so that set binds the member by id, finds it
 // clean, and the graph delivers it as posted, reading nothing back.
-// Classic binds the name to the beacon set as well, finds all three of its
-// slices wrong against two recovery blocks, and fails the job as a repair.
-// (It rewrote the file to the beacon set's bytes only while the harness
-// payload repeated every two slices, so two blocks rebuilt three slices.)
 #[tokio::test]
-async fn a_name_two_sets_describe_differently_is_bound_by_id_under_graph_and_fails_the_other_sets_repair_under_classic()
- {
+async fn a_name_two_sets_describe_differently_is_bound_by_id() {
     let quill = payload(3 * ARTICLE, 26);
     let other_quill = payload(3 * ARTICLE, 27);
     let lantern = payload(3 * ARTICLE, 28);
@@ -174,20 +147,8 @@ async fn a_name_two_sets_describe_differently_is_bound_by_id_under_graph_and_fai
         2,
     ));
     let scenario = Scenario::new(posts);
-    let (classic, graph) = run_both(&scenario).await;
-    for outcome in [&classic, &graph] {
-        assert!(outcome.refetched().is_empty(), "{}", outcome.engine);
-    }
-
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Repair));
-    assert_eq!(
-        classic.failure.as_deref(),
-        Some(
-            "PAR2 recovery failed for 1 set(s): beacon.par2 (beacon.bin, quill.bin): \
-             not repairable: 3 damaged slices, only 2 recovery blocks advertised"
-        )
-    );
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
 
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
@@ -234,20 +195,19 @@ fn delivered_as_described(outcome: &Outcome, files: &[(&str, Vec<u8>)]) {
         .iter()
         .map(|(name, bytes)| (name.clone(), bytes.as_slice()))
         .collect();
-    assert!(got == expected, "{}: {:?}", outcome.engine, got.keys());
+    assert!(got == expected, "{:?}", got.keys());
 }
 
 #[tokio::test]
-async fn obfuscated_names_are_renamed_by_the_set_under_both_engines() {
+async fn obfuscated_names_are_renamed_by_the_set() {
     let files = [
         ("lantern.bin", payload(3 * ARTICLE, 30)),
         ("beacon.bin", payload(2 * ARTICLE + 7, 31)),
     ];
     let scenario = Scenario::new(obfuscated(&files, 2));
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
-    delivered_as_described(&classic, &files);
     delivered_as_described(&graph, &files);
     let view = graph.graph();
     assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
@@ -260,17 +220,16 @@ async fn obfuscated_names_are_renamed_by_the_set_under_both_engines() {
 }
 
 #[tokio::test]
-async fn a_damaged_obfuscated_member_is_repaired_and_renamed_under_both_engines() {
+async fn a_damaged_obfuscated_member_is_repaired_and_renamed() {
     let files = [
         ("lantern.bin", payload(HASH_WINDOW + 4 * ARTICLE, 32)),
         ("beacon.bin", payload(2 * ARTICLE + 7, 33)),
     ];
     let past_window = (HASH_WINDOW / ARTICLE) as u32 + 1;
     let scenario = Scenario::new(obfuscated(&files, 2)).damaged(0, past_window);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
     assert!(graph.completed(), "{:?}", graph.failure);
-    delivered_as_described(&classic, &files);
     delivered_as_described(&graph, &files);
     let view = graph.graph();
     assert_eq!(
@@ -283,12 +242,11 @@ async fn a_damaged_obfuscated_member_is_repaired_and_renamed_under_both_engines(
 // Two files posted under each other's names, the set describing them under
 // their own: each member's front says which file it is, so the set binds
 // it by content over the name it was posted as, finds both clean, and the
-// namespace puts both names back. The index comes first, so under the graph
-// each member is bound by its name until its front is in, and the slices
-// checked against the wrong file in that while ask for the recovery volume
-// ahead; classic asks for none of it.
+// namespace puts both names back. The index comes first, so each member is
+// bound by its name until its front is in, and the slices checked against
+// the wrong file in that while ask for the recovery volume ahead.
 #[tokio::test]
-async fn swapped_names_are_put_back_by_the_set_under_both_engines() {
+async fn swapped_names_are_put_back_by_the_set() {
     let files = [
         ("lantern.bin", payload(3 * ARTICLE, 34)),
         ("beacon.bin", payload(2 * ARTICLE + 7, 35)),
@@ -303,7 +261,7 @@ async fn swapped_names_are_put_back_by_the_set_under_both_engines() {
     ];
     posts.extend(par2_set("lantern", &described, 2));
     let scenario = Scenario::new(posts);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     delivered_as_described(&graph, &files);
     let view = graph.graph();
@@ -311,8 +269,6 @@ async fn swapped_names_are_put_back_by_the_set_under_both_engines() {
     assert!(claims_all(&view.claims, Claim::Complete));
     assert_eq!(graph.reads, 0, "nothing was read back");
     assert!(graph.refetched().is_empty());
-    assert!(classic.completed(), "{:?}", classic.failure);
-    delivered_as_described(&classic, &files);
 }
 
 // The same swap with every article of the recovery volume gone: the set
@@ -337,7 +293,7 @@ async fn swapped_names_are_put_back_by_a_set_whose_recovery_volume_is_gone() {
     let scenario = (0..articles).fold(Scenario::new(posts), |scenario, ordinal| {
         scenario.lost(3, ordinal)
     });
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     delivered_as_described(&graph, &files);
     let view = graph.graph();

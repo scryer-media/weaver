@@ -10,13 +10,13 @@
 // Bytes land at their member offsets in whatever order they arrive, so the
 // file is sparse until it is covered. Windows needs that asked for before the
 // first write or it allocates every hole, which is why every leaf is created
-// through the direct store's sparse marker.
+// through the sparse marker.
 
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::pipeline::direct_store::sparse::{SparseMarking, create_sparse};
+use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
@@ -176,8 +176,8 @@ impl Leaf {
     fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
             create_parent(&self.path)?;
-            let file = create_sparse(&self.path, &SparseMarking::Platform)
-                .map_err(LeafError::io(&self.path))?;
+            let file =
+                create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
             if let Some(length) = length {
                 let current = file.metadata().map_err(LeafError::io(&self.path))?.len();
                 if current < length {
@@ -191,12 +191,36 @@ impl Leaf {
 }
 
 // An output name as a path relative to the directory it is written under,
-// refused when it would leave it. The same validator the extractor uses, so
-// the two never disagree on which names are safe.
+// refused when it would leave it: an absolute path, `..`, a root or prefix
+// component, a Windows drive letter, an embedded NUL, or nothing at all.
 fn relative_path(output_name: &str) -> Result<PathBuf, LeafError> {
+    let unsafe_name = || LeafError::UnsafeName(output_name.to_owned());
     let normalized = output_name.replace('\\', "/");
-    crate::pipeline::extraction::validate_relative_output_path(normalized.trim_end_matches('/'))
-        .map_err(|_| LeafError::UnsafeName(output_name.to_owned()))
+    let name = normalized.trim_end_matches('/');
+    let path = Path::new(name);
+    if name.is_empty() || name.contains('\0') || path.is_absolute() {
+        return Err(unsafe_name());
+    }
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let bytes = part.as_encoded_bytes();
+                if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                    return Err(unsafe_name());
+                }
+                safe.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(unsafe_name());
+            }
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        return Err(unsafe_name());
+    }
+    Ok(safe)
 }
 
 fn create_parent(path: &Path) -> Result<(), LeafError> {

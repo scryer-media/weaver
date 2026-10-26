@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Recovery an archive carries inside itself, and recovery beside an
-// enciphered archive, under both engines: a PAR2 or PAR3 set appended to a
+// enciphered archive: a PAR2 or PAR3 set appended to a
 // stored 7z and repaired through it, a trailing PAR3 that loses one of its
 // own articles, a RAR5 volume repaired from the recovery record it carries,
 // and an AES 7z repaired through what was posted.
@@ -13,9 +13,7 @@ use sevenz_turbo::encoder_options::AesEncoderOptions;
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
 use weaver_graph::recovery::RepairOutcome;
 
-use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, par2_set, par3_set, payload, run_both,
-};
+use super::harness::{ARTICLE, Claim, Outcome, Post, Scenario, par2_set, par3_set, payload, run};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::protected_store_set;
@@ -107,8 +105,7 @@ fn delivered(name: &str) -> String {
 fn assert_members(outcome: &Outcome) {
     assert!(
         outcome.completed(),
-        "{}: {:?} {:?}",
-        outcome.engine,
+        "{:?} {:?}",
         outcome.status,
         outcome.failure
     );
@@ -116,14 +113,12 @@ fn assert_members(outcome: &Outcome) {
     assert_eq!(
         outcome.files.keys().cloned().collect::<Vec<_>>(),
         names,
-        "{}: delivered names",
-        outcome.engine
+        "delivered names",
     );
     for (name, bytes) in members() {
         assert!(
             outcome.files.get(&delivered(name)) == Some(&bytes),
-            "{}: {name} bytes",
-            outcome.engine
+            "{name} bytes",
         );
     }
 }
@@ -139,29 +134,19 @@ fn assert_repaired_once(graph: &Outcome, blocks: u64) {
 
 // The second article is member bytes: the first holds the signature header.
 #[tokio::test]
-async fn a_stored_7z_carrying_a_trailing_par2_fails_unpacking_under_classic_and_is_repaired_under_graph()
- {
+async fn a_stored_7z_carrying_a_trailing_par2_is_repaired() {
     let archive = stored(None);
     let post = trailing(&archive, par2_bytes(&archive, 2));
-    let (classic, graph) = run_both(&Scenario::new(vec![post]).damaged(0, 1)).await;
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert_eq!(
-        classic.failure.as_deref(),
-        Some("archive file lantern.7z is incomplete after downloads and recovery settled")
-    );
+    let graph = run(&Scenario::new(vec![post]).damaged(0, 1)).await;
     assert_members(&graph);
     assert_repaired_once(&graph, 2);
 }
 
 #[tokio::test]
-async fn a_stored_7z_carrying_a_trailing_par3_is_repaired_under_both_engines_and_only_classic_refetches()
- {
+async fn a_stored_7z_carrying_a_trailing_par3_is_repaired() {
     let archive = stored(None);
     let post = trailing(&archive, par3_bytes(&archive, 2));
-    let (classic, graph) = run_both(&Scenario::new(vec![post]).damaged(0, 1)).await;
-    assert_members(&classic);
-    assert_eq!(classic.refetched(), vec![(0, 0)]);
+    let graph = run(&Scenario::new(vec![post]).damaged(0, 1)).await;
     assert_members(&graph);
     assert_repaired_once(&graph, 2);
 }
@@ -169,42 +154,27 @@ async fn a_stored_7z_carrying_a_trailing_par3_is_repaired_under_both_engines_and
 // Three recovery blocks, one lost with its article: two remain for the one
 // damaged slice.
 #[tokio::test]
-async fn a_trailing_par3_losing_one_of_its_blocks_still_repairs_under_both_engines_and_only_classic_refetches()
- {
+async fn a_trailing_par3_losing_one_of_its_blocks_still_repairs() {
     let archive = stored(None);
     let post = trailing(&archive, par3_bytes(&archive, 3));
     let lost = last_block_article(&post);
     let scenario = Scenario::new(vec![post]).damaged(0, 1).lost(0, lost);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
-    assert_eq!(classic.refetched(), vec![(0, 0)]);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert_repaired_once(&graph, 2);
 }
 
 // One recovery block, lost with its article: nothing is left to repair the
-// damaged slice with. Classic fails the job. Under the graph the member the
-// damage never reached is delivered whole beside the container as it
-// stands, so the job ends Partial (the partial-extraction ruling of
-// 2026-10-18), its failure the repair's.
+// damaged slice with. The member the damage never reached is delivered
+// whole beside the container as it stands, so the job ends Partial, its
+// failure the repair's.
 #[tokio::test]
-async fn a_trailing_par3_losing_its_only_block_fails_for_health_under_classic_and_ends_partial_for_repair_under_graph()
- {
+async fn a_trailing_par3_losing_its_only_block_ends_partial_for_repair() {
     let archive = stored(None);
     let post = trailing(&archive, par3_bytes(&archive, 1));
     let lost = last_block_article(&post);
     let scenario = Scenario::new(vec![post]).damaged(0, 1).lost(0, lost);
-    let (classic, graph) = run_both(&scenario).await;
-    assert!(classic.files.is_empty(), "{:?}", classic.files.keys());
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Health));
-    assert!(
-        classic
-            .failure
-            .as_deref()
-            .is_some_and(|error| error.starts_with("PAR3 recovery exhausted")),
-        "{:?}",
-        classic.failure
-    );
+    let graph = run(&scenario).await;
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
         vec![delivered("lantern.7z"), delivered("quill.bin")]
@@ -232,18 +202,17 @@ async fn a_trailing_par3_losing_its_only_block_fails_for_health_under_classic_an
 }
 
 // The record is the volume's own recovery, and one article of the member
-// is served damaged. The graph reads the volume back through its record,
-// rebuilds the damaged bytes in place and delivers the member whole, asking
-// for nothing twice. Classic reads no record and fails at unpack.
+// is served damaged. The volume is read back through its record, the
+// damaged bytes rebuilt in place and the member delivered whole, asking for
+// nothing twice.
 #[tokio::test]
-async fn a_rar5_volume_with_a_damaged_article_is_repaired_from_its_recovery_record_under_graph_and_fails_under_classic()
- {
+async fn a_rar5_volume_with_a_damaged_article_is_repaired_from_its_recovery_record() {
     let body = payload(6 * ARTICLE + 5, 43);
     let posts = protected_store_set("beacon.bin", &body, 1, 1)
         .into_iter()
         .map(|(name, bytes)| Post::plain(&name, bytes))
         .collect();
-    let (classic, graph) = run_both(&Scenario::new(posts).damaged(0, 2)).await;
+    let graph = run(&Scenario::new(posts).damaged(0, 2)).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(graph.files.get(&delivered("beacon.bin")), Some(&body));
     assert_eq!(
@@ -255,23 +224,18 @@ async fn a_rar5_volume_with_a_damaged_article_is_repaired_from_its_recovery_reco
     );
     assert!(graph.reads > 0, "the repair read nothing back");
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
-    assert!(!classic.completed(), "{:?}", classic.status);
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
 }
 
 // The second article lies inside the enciphered packed stream. The graph
 // repair reads the posted cipher back through the store and writes the
 // rebuilt bytes as repaired.
 #[tokio::test]
-async fn an_aes_7z_beside_par2_with_a_damaged_cipher_article_is_repaired_under_both_engines_and_only_classic_refetches()
- {
+async fn an_aes_7z_beside_par2_with_a_damaged_cipher_article_is_repaired() {
     let archive = stored(Some(SECRET));
     let mut posts = vec![Post::plain("lantern.7z", archive.clone())];
     posts.extend(par2_set("lantern", &[("lantern.7z", &archive)], 2));
     let scenario = Scenario::new(posts).password(SECRET).damaged(0, 1);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
-    assert_eq!(classic.refetched(), vec![(0, 0)]);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert_repaired_once(&graph, 2);
     assert!(graph.reads > 0, "the repair read nothing back");

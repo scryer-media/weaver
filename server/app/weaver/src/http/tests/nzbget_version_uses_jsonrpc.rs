@@ -2659,7 +2659,7 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
 }
 
 #[tokio::test]
-async fn nzbget_listfiles_reports_nzb_files_with_progress() {
+async fn nzbget_listfiles_reports_nzb_files() {
     let db = Database::open_in_memory().unwrap();
     let job = nzbget_test_job(
         55,
@@ -2670,7 +2670,6 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         vec![],
     );
     db.create_active_job(&weaver_server_core::ActiveJob {
-        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(55),
         nzb_hash: [7u8; 32],
         nzb_path: "/tmp/weaver/nzb/55.nzb".into(),
@@ -2690,19 +2689,6 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         supplied_password_candidates: Vec::new(),
     })
     .unwrap();
-    db.upsert_file_progress_batch(&[weaver_server_core::ActiveFileProgress {
-        job_id: JobId(55),
-        file_index: 0,
-        coverage: weaver_server_core::jobs::assembly::FileCoverage::from_ordered_runs([
-            weaver_server_core::jobs::assembly::CoverageRun {
-                first_ordinal: 0,
-                ordinals: 1,
-                start: 0,
-                end: 150_000,
-            },
-        ]),
-    }])
-    .unwrap();
     let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
 
@@ -2721,7 +2707,7 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         .unwrap();
     assert_eq!(alpha["NZBID"], 55);
     assert_eq!(alpha["FileSizeLo"], 600_000);
-    assert_eq!(alpha["RemainingSizeLo"], 450_000);
+    assert_eq!(alpha["RemainingSizeLo"], 600_000);
     let beta = files
         .iter()
         .find(|file| file["Filename"] == "beta.par2")
@@ -4167,7 +4153,6 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
     let xml = minimal_nzb("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR");
     let nzb_zstd = weaver_server_core::ingest::compress_nzb_bytes(xml.as_bytes()).unwrap();
     db.create_active_job(&weaver_server_core::ActiveJob {
-        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(10_000),
         nzb_hash: weaver_server_core::ingest::hash_persisted_nzb_bytes(&nzb_zstd),
         nzb_path: std::path::PathBuf::from("Silver.Horizon.S05.720p.BluRay.DD5.1.x264-WVR.nzb"),

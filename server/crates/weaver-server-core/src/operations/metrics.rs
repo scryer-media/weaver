@@ -65,10 +65,6 @@ pub enum SchedulerBlockClause {
     Propagation,
     // The job's posts are older than the server's retention.
     Retention,
-    // A direct-store set's disk budget is full.
-    DirectStore,
-    // A demotion sweep holds the article's file.
-    SweepHeld,
     // The article excludes the server, or its rotation hint points away.
     ServerExclusion,
     // A backfill server waits for the fill servers to give the article up.
@@ -84,12 +80,10 @@ pub enum SchedulerBlockClause {
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 8;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
-        Self::DirectStore,
-        Self::SweepHeld,
         Self::ServerExclusion,
         Self::Backfill,
         Self::RecoveryMetadataBootstrap,
@@ -102,8 +96,6 @@ impl SchedulerBlockClause {
         match self {
             Self::Propagation => "propagation",
             Self::Retention => "retention",
-            Self::DirectStore => "direct_store",
-            Self::SweepHeld => "sweep_held",
             Self::ServerExclusion => "server_exclusion",
             Self::Backfill => "backfill",
             Self::RecoveryMetadataBootstrap => "recovery_metadata_bootstrap",
@@ -377,20 +369,6 @@ pub struct PipelineMetrics {
     pub uu_spooled_bytes: AtomicU64,
     pub uu_spooled_segments: AtomicUsize,
     pub direct_write_evictions: AtomicU64,
-    // Direct-store engagement, as lifetime counters. These four exist so an
-    // external observer — the e2e harness, or someone staring at a production
-    // box — can tell whether direct routing actually carried a job or quietly
-    // fell back to the conventional path: the output bytes are identical
-    // either way, so nothing downstream can answer that. Admitted says the
-    // gate engaged; finalized-direct says a set completed without ever
-    // writing a source volume; demoted says one left direct routing (the
-    // per-reason breakdown stays in the logs and the `direct_store.demoted.*`
-    // perf-probe keys); repaired-while-direct says damage was repaired
-    // without leaving.
-    pub direct_sets_admitted: AtomicU64,
-    pub direct_sets_demoted: AtomicU64,
-    pub direct_sets_finalized_direct: AtomicU64,
-    pub direct_sets_repaired_while_direct: AtomicU64,
     // Delivered files renamed out of an obfuscated in-archive member name.
     pub deobfuscated_members_renamed: AtomicU64,
     pub decode_pressure_soft_limit_bytes: AtomicU64,
@@ -567,10 +545,6 @@ impl PipelineMetrics {
             uu_spooled_bytes: AtomicU64::new(0),
             uu_spooled_segments: AtomicUsize::new(0),
             direct_write_evictions: AtomicU64::new(0),
-            direct_sets_admitted: AtomicU64::new(0),
-            direct_sets_demoted: AtomicU64::new(0),
-            direct_sets_finalized_direct: AtomicU64::new(0),
-            direct_sets_repaired_while_direct: AtomicU64::new(0),
             deobfuscated_members_renamed: AtomicU64::new(0),
             decode_pressure_soft_limit_bytes: AtomicU64::new(0),
             decode_pressure_hard_limit_bytes: AtomicU64::new(0),
@@ -742,12 +716,6 @@ impl PipelineMetrics {
             uu_spooled_bytes: self.uu_spooled_bytes.load(Ordering::Relaxed),
             uu_spooled_segments: self.uu_spooled_segments.load(Ordering::Relaxed),
             direct_write_evictions: self.direct_write_evictions.load(Ordering::Relaxed),
-            direct_sets_admitted: self.direct_sets_admitted.load(Ordering::Relaxed),
-            direct_sets_demoted: self.direct_sets_demoted.load(Ordering::Relaxed),
-            direct_sets_finalized_direct: self.direct_sets_finalized_direct.load(Ordering::Relaxed),
-            direct_sets_repaired_while_direct: self
-                .direct_sets_repaired_while_direct
-                .load(Ordering::Relaxed),
             deobfuscated_members_renamed: self.deobfuscated_members_renamed.load(Ordering::Relaxed),
             decode_pressure_soft_limit_bytes: self
                 .decode_pressure_soft_limit_bytes
@@ -998,10 +966,6 @@ pub struct MetricsSnapshot {
     pub uu_spooled_bytes: u64,
     pub uu_spooled_segments: usize,
     pub direct_write_evictions: u64,
-    pub direct_sets_admitted: u64,
-    pub direct_sets_demoted: u64,
-    pub direct_sets_finalized_direct: u64,
-    pub direct_sets_repaired_while_direct: u64,
     pub deobfuscated_members_renamed: u64,
     pub decode_pressure_soft_limit_bytes: u64,
     pub decode_pressure_hard_limit_bytes: u64,

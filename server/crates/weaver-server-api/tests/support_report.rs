@@ -46,7 +46,6 @@ fn seed_history_job(h: &TestHarness, job_id: u64) {
 
 fn seed_history_job_with_facts(h: &TestHarness, job_id: u64, facts: Option<String>) {
     h.db.create_active_job(&ActiveJob {
-        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(job_id),
         nzb_hash: [0x22; 32],
         nzb_path: PathBuf::from(format!("/data/{SENTINEL}.nzb")),

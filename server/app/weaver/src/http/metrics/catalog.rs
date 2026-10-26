@@ -216,8 +216,6 @@ metric_families! {
         "Duration of the hard pressure stall in progress; zero when not stalled.");
     DIRECT_WRITE_EVICTIONS = ("weaver_pipeline_direct_write_evictions_total", Counter, [],
         "Direct write evictions.");
-    DIRECT_STORE_SETS = ("weaver_direct_store_sets_total", Counter, ["event"],
-        "RAR direct-store set lifecycle events.");
     DEOBFUSCATED_MEMBERS = ("weaver_deobfuscated_members_renamed_total", Counter, [],
         "Delivered files renamed out of an obfuscated in-archive member name.");
 

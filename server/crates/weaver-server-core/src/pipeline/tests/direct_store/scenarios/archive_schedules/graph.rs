@@ -10,9 +10,7 @@ use weaver_graph::recovery::RepairOutcome;
 
 use super::*;
 use crate::history::HistoryFailureKind;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::engines::harness::{JOB, finished};
-use crate::pipeline::tests::engines::restart::stamp_graph;
 
 pub(in crate::pipeline::tests) mod grouping;
 mod two_sets;
@@ -178,28 +176,6 @@ fn rar_recovers(
         }
     }
     recovered
-}
-
-// Whether a schedule has a meaning under the graph. A demotion hands a
-// direct set to conventional extraction, and the graph has no such hand-off
-// to take; every other boundary action is a pipeline going down.
-pub(in super::super) fn runs_under_graph(interruption: Interruption) -> bool {
-    !matches!(
-        interruption,
-        Interruption::Demote(_)
-            | Interruption::Combined {
-                action: BoundaryAction::Demote,
-                ..
-            }
-            | Interruption::Twice {
-                first: BoundaryAction::Demote,
-                ..
-            }
-            | Interruption::Twice {
-                second: BoundaryAction::Demote,
-                ..
-            }
-    )
 }
 
 // What a schedule loses: an article of a volume, or a volume the post never
@@ -499,11 +475,8 @@ async fn restore(
             job_id: JOB,
             job_hash: recovered.nzb_hash,
             spec: spec.clone(),
-            complete_files: recovered.complete_files,
-            file_progress: recovered.file_progress,
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
-            extracted_members: recovered.extracted_members,
             status: crate::jobs::model::job_status_from_persisted_str(
                 &recovered.status,
                 recovered.error.as_deref(),
@@ -524,7 +497,7 @@ async fn restore(
         .await
         .unwrap();
     assert!(
-        !pipeline.blocked_restores.contains_key(&JOB) && pipeline.is_graph_job(JOB),
+        !pipeline.blocked_restores.contains_key(&JOB) && pipeline.graph_jobs.contains_key(&JOB),
         "a graph job restores from its checkpoint: {trace:?}"
     );
     (pipeline, true)
@@ -540,7 +513,6 @@ async fn drive_graph_schedule(
     wanted: &[&str],
     interruption: Interruption,
 ) -> GraphOutcome {
-    assert!(runs_under_graph(interruption), "{interruption:?}");
     enable_schedule_trace();
     // Every volume the set is written as: what a recovery set or a listing
     // describes. The run serves the ones the post carries.
@@ -569,9 +541,6 @@ async fn drive_graph_schedule(
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     insert_active_job(&mut pipeline, JOB, spec.clone()).await;
-    stamp_graph(&pipeline.db);
-    pipeline.admit_graph_job(JOB, Engine::Graph);
-    assert!(pipeline.is_graph_job(JOB));
     let index = run.recovery.first().map(|carrier| (carrier.index, 0));
     if let Some(index) = index
         && index_first
@@ -584,7 +553,6 @@ async fn drive_graph_schedule(
     for (step, action, arrives) in interruption.boundaries(order.len()) {
         match action {
             BoundaryAction::None => {}
-            BoundaryAction::Demote => unreachable!("no schedule the graph runs demotes"),
             action @ (BoundaryAction::Restart | BoundaryAction::Crash) => {
                 if action == BoundaryAction::Restart {
                     pipeline.drain().await;
@@ -600,9 +568,6 @@ async fn drive_graph_schedule(
                 run.trace
                     .push(format!("{action:?} at {step}: status={status:?}"));
                 retire_pipeline_database(pipeline).await;
-                // The write handles are process-wide; a dead process takes its
-                // handles with it, so the next incarnation must open its own.
-                settle_direct_output_removals(root.path()).await;
                 let restored;
                 (pipeline, restored) = restore(&root, &spec, &mut run.trace).await;
                 if !restored {
@@ -654,11 +619,6 @@ async fn drive_graph_schedule(
             break;
         }
         let before = fingerprint(&pipeline);
-        // The idle tick: bytes held out of order behind an article that
-        // will never commit are written out.
-        if pipeline.write_buffered_bytes > 0 {
-            pipeline.flush_quiescent_write_backlog().await;
-        }
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }
@@ -695,26 +655,18 @@ async fn drive_graph_schedule(
         }
         let after = fingerprint(&pipeline);
         if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
-            panic!(
-                "graph schedule stalled at {after}: {} trace={:?}",
-                debug_job_state(&pipeline, JOB),
-                run.trace
-            );
+            panic!("graph schedule stalled at {after}: trace={:?}", run.trace);
         }
     }
     let status = retired.unwrap_or_else(|| job_status_for_assert(&pipeline, JOB));
     run.trace.push(format!(
-        "terminal {status:?}: {}; bound={:?}; recovery={:?}; rerequested={:?}",
-        debug_job_state(&pipeline, JOB),
-        run.bound,
-        run.outcomes,
-        run.rerequested
+        "terminal {status:?}; bound={:?}; recovery={:?}; rerequested={:?}",
+        run.bound, run.outcomes, run.rerequested
     ));
     let files = wanted
         .iter()
         .map(|name| ((*name).to_string(), std::fs::read(output.join(name)).ok()))
         .collect();
-    settle_direct_output_removals(root.path()).await;
     let mut published = files_under(&output);
     published.remove(crate::jobs::working_dir::OUTPUT_DIR_MARKER);
     let mut leftovers: BTreeSet<String> = files_under(&pipeline.intermediate_dir)
@@ -762,9 +714,7 @@ pub(in super::super) fn graph_schedules(
     };
     cases
         .into_iter()
-        .filter(|(_, (_, interruption))| {
-            runs_under_graph(*interruption) && interruption.fits(volumes)
-        })
+        .filter(|(_, (_, interruption))| interruption.fits(volumes))
         .collect()
 }
 
@@ -880,9 +830,6 @@ pub(in super::super) async fn graph_fixture_cases(
 async fn graph_wrong_password(fixture: &GraphFixture, selection: Selection) -> Vec<String> {
     let mut reports = Vec::new();
     for (case, schedule) in wrong_password_schedules(selection).into_iter().enumerate() {
-        if !runs_under_graph(schedule.1) {
-            continue;
-        }
         let mut wrong = fixture.spec.clone();
         wrong.password = Some("incorrect-key".to_string());
         let cell = format!("{} wrong password case={case}", fixture.label);

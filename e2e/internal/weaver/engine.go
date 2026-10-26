@@ -4,42 +4,11 @@
 package weaver
 
 import (
-	"os"
 	"strconv"
 	"strings"
 )
 
-// weaverEngine names the pipeline the managed weaver ran a phase with. The
-// harness judges every runtime assertion that reads engine internals by the
-// engine's own evidence: the classic engine's log lines and state rows, or the
-// graph engine's observability lines.
-type weaverEngine string
-
-const (
-	engineClassic weaverEngine = "classic"
-	engineGraph   weaverEngine = "graph"
-)
-
-// weaverEngineEnv is the switch weaver reads to pick its pipeline. It reaches
-// the managed weaver through the inherited environment (managedWeaverEnv), so
-// the harness reads the same value the product read.
-const weaverEngineEnv = "WEAVER_ENGINE"
-
-// engineUnderTest is the engine this harness process tests: `classic` when
-// WEAVER_ENGINE says so, the graph engine for anything else, unset included,
-// as weaver itself reads the switch.
-func engineUnderTest() weaverEngine {
-	return parseWeaverEngine(os.Getenv(weaverEngineEnv))
-}
-
-func parseWeaverEngine(value string) weaverEngine {
-	if strings.EqualFold(strings.TrimSpace(value), string(engineClassic)) {
-		return engineClassic
-	}
-	return engineGraph
-}
-
-// The graph engine's observability lines, one per fact, each carrying
+// The graph's observability lines, one per fact, each carrying
 // `job_id` first and its fields as `key=value`.
 const (
 	graphLogTarget              = "weaver_server_core::pipeline::graph"

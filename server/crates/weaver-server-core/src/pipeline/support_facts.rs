@@ -18,18 +18,6 @@ fn gap_position(segment_id: SegmentId) -> GapPosition {
 }
 
 impl Pipeline {
-    // A set's demotion, recorded with the job's status at the time.
-    pub(super) fn note_demotion_support_fact(&mut self, job_id: JobId, reason: &'static str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            let stage = state.status.persisted_status();
-            state.support_facts.note_demotion(reason, stage, now);
-            self.dirty_support_facts.insert(job_id);
-        }
-    }
-
     // A segment's pending-to-terminal edge.
     pub(super) fn note_gap_support_fact(
         &mut self,
@@ -65,20 +53,6 @@ impl Pipeline {
             .collect();
         if let Some(job) = self.jobs.get_mut(&job_id) {
             job.support_facts.note_gap_servers(server_ids);
-            self.dirty_support_facts.insert(job_id);
-        }
-    }
-
-    // A gap a verified late replacement filled.
-    pub(super) fn forget_gap_support_fact(
-        &mut self,
-        segment_id: SegmentId,
-        state: SegmentTerminalState,
-    ) {
-        let job_id = segment_id.file_id.job_id;
-        if let Some(job) = self.jobs.get_mut(&job_id) {
-            job.support_facts
-                .forget_gap(gap_kind(state), gap_position(segment_id));
             self.dirty_support_facts.insert(job_id);
         }
     }

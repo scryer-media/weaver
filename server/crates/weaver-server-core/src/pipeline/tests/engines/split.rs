@@ -9,8 +9,7 @@ use weaver_graph::recovery::RepairOutcome;
 
 use crate::jobs::model::JobStatus;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run, run_both};
-use crate::pipeline::graph::Engine;
+use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run};
 
 const NAME: &str = "lantern.bin";
 const PIECE: usize = 6 * ARTICLE;
@@ -31,27 +30,24 @@ fn pieces(bytes: &[u8]) -> Vec<Post> {
 fn assert_joined(outcome: &Outcome) {
     assert!(
         outcome.completed(),
-        "{}: {:?} {:?}",
-        outcome.engine,
+        "{:?} {:?}",
         outcome.status,
         outcome.failure
     );
     assert_eq!(
         outcome.files.keys().cloned().collect::<Vec<_>>(),
         vec![format!("lantern beacon/{NAME}")],
-        "{}: delivered names",
-        outcome.engine
+        "delivered names",
     );
     assert!(
         outcome.files[&format!("lantern beacon/{NAME}")] == joined(),
-        "{}: joined bytes",
-        outcome.engine
+        "joined bytes",
     );
 }
 
 #[tokio::test]
-async fn a_clean_plain_split_is_delivered_joined_under_graph() {
-    let (_, graph) = run_both(&Scenario::new(pieces(&joined()))).await;
+async fn a_clean_plain_split_is_delivered_joined() {
+    let graph = run(&Scenario::new(pieces(&joined()))).await;
     assert_joined(&graph);
     assert!(graph.graph().outcomes.is_empty());
 }
@@ -59,8 +55,7 @@ async fn a_clean_plain_split_is_delivered_joined_under_graph() {
 // The usual shape: the set describes the pieces as posted. It repairs the
 // middle piece in place, and the joined file is what is delivered.
 #[tokio::test]
-async fn a_plain_split_under_par2_over_its_pieces_is_repaired_and_delivered_joined_under_both_engines()
- {
+async fn a_plain_split_under_par2_over_its_pieces_is_repaired_and_delivered_joined() {
     let original = joined();
     let posted = pieces(&original);
     let described: Vec<(String, Vec<u8>)> = posted
@@ -73,14 +68,7 @@ async fn a_plain_split_under_par2_over_its_pieces_is_repaired_and_delivered_join
         .collect();
     let mut posts = posted;
     posts.extend(par2_set("lantern", &described, 2));
-    let (classic, graph) = run_both(&Scenario::new(posts).damaged(1, 2)).await;
-    // Classic leaves the joined file it staged behind too; only the joined
-    // file is compared there.
-    assert!(classic.completed(), "classic: {:?}", classic.failure);
-    assert_eq!(
-        classic.files.get(&format!("lantern beacon/{NAME}")),
-        Some(&original)
-    );
+    let graph = run(&Scenario::new(posts).damaged(1, 2)).await;
     assert_joined(&graph);
     assert_eq!(
         graph.graph().outcomes,
@@ -90,21 +78,12 @@ async fn a_plain_split_under_par2_over_its_pieces_is_repaired_and_delivered_join
 // Three slices of the middle piece zeroed as posted: every article arrives
 // whole, and only the set's hashes over the joined file say they are wrong.
 #[tokio::test]
-async fn a_plain_split_under_par2_over_the_joined_file_is_repaired_and_delivered_joined_under_both_engines()
- {
+async fn a_plain_split_under_par2_over_the_joined_file_is_repaired_and_delivered_joined() {
     let original = joined();
     let mut posts = pieces(&original);
     posts[1].bytes[ARTICLE..4 * ARTICLE].fill(0);
     posts.extend(par2_set("lantern", &[(NAME, &original)], 4));
-    let (classic, graph) = run_both(&Scenario::new(posts)).await;
-    // Classic joins and repairs too, though it may leave the pieces it
-    // joined behind in its staging directory; only the joined file is
-    // compared there.
-    assert!(classic.completed(), "classic: {:?}", classic.failure);
-    assert_eq!(
-        classic.files.get(&format!("lantern beacon/{NAME}")),
-        Some(&original)
-    );
+    let graph = run(&Scenario::new(posts)).await;
     assert_joined(&graph);
     assert_eq!(
         graph.graph().outcomes,
@@ -115,16 +94,11 @@ async fn a_plain_split_under_par2_over_the_joined_file_is_repaired_and_delivered
 // Nothing damaged: the set over the joined file rules it clean where it is
 // joined, and rebuilds nothing.
 #[tokio::test]
-async fn a_clean_plain_split_under_par2_over_the_joined_file_is_ruled_clean_under_both_engines() {
+async fn a_clean_plain_split_under_par2_over_the_joined_file_is_ruled_clean() {
     let original = joined();
     let mut posts = pieces(&original);
     posts.extend(par2_set("lantern", &[(NAME, &original)], 4));
-    let (classic, graph) = run_both(&Scenario::new(posts)).await;
-    assert!(classic.completed(), "classic: {:?}", classic.failure);
-    assert_eq!(
-        classic.files.get(&format!("lantern beacon/{NAME}")),
-        Some(&original)
-    );
+    let graph = run(&Scenario::new(posts)).await;
     assert_joined(&graph);
     assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
 }
@@ -133,33 +107,28 @@ async fn a_clean_plain_split_under_par2_over_the_joined_file_is_ruled_clean_unde
 // is joined that it cannot rebuild it, the job fails as a recovery failure,
 // and the pieces are never delivered in its place.
 #[tokio::test]
-async fn a_plain_split_whose_par2_over_the_joined_file_is_short_fails_without_its_pieces_under_both_engines()
- {
+async fn a_plain_split_whose_par2_over_the_joined_file_is_short_fails_without_its_pieces() {
     let original = joined();
     let mut posts = pieces(&original);
     posts[1].bytes[ARTICLE..4 * ARTICLE].fill(0);
     posts.extend(par2_set("lantern", &[(NAME, &original)], 2));
-    let (classic, graph) = run_both(&Scenario::new(posts)).await;
-    for outcome in [&classic, &graph] {
-        assert!(
-            matches!(
-                &outcome.status,
-                Some(JobStatus::Failed { error }) if error.starts_with("PAR2 recovery failed")
-            ),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.status
-        );
-        assert!(
-            outcome
-                .files
-                .keys()
-                .all(|name| !name.starts_with(&format!("lantern beacon/{NAME}."))),
-            "{}: pieces delivered: {:?}",
-            outcome.engine,
-            outcome.files.keys().collect::<Vec<_>>()
-        );
-    }
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(
+        matches!(
+            &graph.status,
+            Some(JobStatus::Failed { error }) if error.starts_with("PAR2 recovery failed")
+        ),
+        "{:?}",
+        graph.status
+    );
+    assert!(
+        graph
+            .files
+            .keys()
+            .all(|name| !name.starts_with(&format!("lantern beacon/{NAME}."))),
+        "pieces delivered: {:?}",
+        graph.files.keys().collect::<Vec<_>>()
+    );
     assert!(graph.files.is_empty(), "graph: {:?}", graph.files.keys());
     assert_eq!(
         graph.graph().outcomes,
@@ -174,12 +143,11 @@ async fn a_plain_split_whose_par2_over_the_joined_file_is_short_fails_without_it
 // joined file where the join writes it, and that file is what is handed
 // over, whole, with none of the pieces beside it.
 #[tokio::test]
-async fn a_plain_split_with_a_lost_article_under_par2_over_the_joined_file_is_repaired_under_graph()
-{
+async fn a_plain_split_with_a_lost_article_under_par2_over_the_joined_file_is_repaired() {
     let original = joined();
     let mut posts = pieces(&original);
     posts.extend(par2_set("lantern", &[(NAME, &original)], 2));
-    let graph = run(&Scenario::new(posts).lost(1, 2), Engine::Graph).await;
+    let graph = run(&Scenario::new(posts).lost(1, 2)).await;
     assert_joined(&graph);
     assert_eq!(
         graph.graph().outcomes,

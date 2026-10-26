@@ -6,7 +6,6 @@
 // volume it repeats, so the set is one set and its member one file, and
 // an article one copy lost the other brings.
 
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::{
     single_member_rar4_store_set_numbered, single_member_store_set,
 };
@@ -50,14 +49,14 @@ fn assert_one_member(graph: &Outcome, body: &[u8]) {
 async fn a_rar5_set_posted_twice_is_one_set() {
     let body = body();
     let scenario = Scenario::new(twice(single_member_store_set(MEMBER, &body, 2)));
-    assert_one_member(&run(&scenario, Engine::Graph).await, &body);
+    assert_one_member(&run(&scenario).await, &body);
 }
 
 #[tokio::test]
 async fn a_rar5_set_posted_twice_served_last_article_first_is_one_set() {
     let body = body();
     let scenario = Scenario::new(twice(single_member_store_set(MEMBER, &body, 2))).backwards();
-    assert_one_member(&run(&scenario, Engine::Graph).await, &body);
+    assert_one_member(&run(&scenario).await, &body);
 }
 
 #[tokio::test]
@@ -67,7 +66,7 @@ async fn a_rar4_set_posted_twice_fetched_copy_first_is_one_set() {
         MEMBER, &body, 2,
     )))
     .together(&[3, 2, 1, 0]);
-    assert_one_member(&run(&scenario, Engine::Graph).await, &body);
+    assert_one_member(&run(&scenario).await, &body);
 }
 
 // No recovery set is posted: the copy's article is the only one that
@@ -76,7 +75,7 @@ async fn a_rar4_set_posted_twice_fetched_copy_first_is_one_set() {
 async fn an_article_one_copy_lost_the_other_brings() {
     let body = body();
     let scenario = Scenario::new(twice(single_member_store_set(MEMBER, &body, 2))).lost(0, 2);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_one_member(&graph, &body);
     assert!(
         graph
@@ -95,7 +94,7 @@ async fn an_article_one_copy_lost_the_other_brings() {
 async fn an_article_one_copy_damaged_the_other_brings_whole() {
     let body = body();
     let scenario = Scenario::new(twice(single_member_store_set(MEMBER, &body, 2))).damaged(0, 2);
-    assert_one_member(&run(&scenario, Engine::Graph).await, &body);
+    assert_one_member(&run(&scenario).await, &body);
 }
 
 // The same for a stored RAR4 set, damaged in the copy fetched second.
@@ -106,7 +105,7 @@ async fn a_rar4_article_one_copy_damaged_the_other_brings_whole() {
         MEMBER, &body, 2,
     )))
     .damaged(2, 2);
-    assert_one_member(&run(&scenario, Engine::Graph).await, &body);
+    assert_one_member(&run(&scenario).await, &body);
 }
 
 // The same, the copy lost where the first copy is whole, and the first
@@ -117,7 +116,7 @@ async fn articles_each_copy_lost_the_other_brings() {
     let scenario = Scenario::new(twice(single_member_store_set(MEMBER, &body, 2)))
         .lost(2, 1)
         .lost(1, 2);
-    assert_one_member(&run(&scenario, Engine::Graph).await, &body);
+    assert_one_member(&run(&scenario).await, &body);
 }
 
 // Every copy under a name of its own that says nothing: the headers place
@@ -135,7 +134,7 @@ async fn a_rar5_set_posted_twice_under_names_that_say_nothing_is_one_set() {
             )
         })
         .collect();
-    assert_one_member(&run(&Scenario::new(posts), Engine::Graph).await, &body);
+    assert_one_member(&run(&Scenario::new(posts)).await, &body);
 }
 
 // The same for a stored RAR4 set, whose fronts state no volume number: each
@@ -153,7 +152,7 @@ async fn a_rar4_set_posted_twice_under_names_that_say_nothing_is_one_set() {
             )
         })
         .collect();
-    let graph = run(&Scenario::new(posts), Engine::Graph).await;
+    let graph = run(&Scenario::new(posts)).await;
     assert!(
         graph.completed(),
         "{:?} {:?} {:#?}",
@@ -180,7 +179,7 @@ async fn an_article_damaged_in_both_copies_is_repaired() {
         .collect();
     posts.extend(par2_set("lantern", &named, 2));
     let scenario = Scenario::new(posts).damaged(0, 2).damaged(2, 2);
-    assert_one_member(&run(&scenario, Engine::Graph).await, &body);
+    assert_one_member(&run(&scenario).await, &body);
 }
 
 // A set posted twice, restarted after every article: the restored tree
@@ -200,7 +199,7 @@ async fn a_set_posted_twice_fetched_side_by_side_closes_each_member_across_resta
     let body = body();
     let scenario =
         Scenario::new(twice(single_member_store_set(MEMBER, &body, 2))).together(&[0, 2, 1, 3]);
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     let mut copies_closed = 0;
     let restarted = run_restarting(&scenario, &mut |rows| {
         for copy in rows.members.iter().filter(|row| row.closed) {
@@ -240,7 +239,7 @@ async fn a_split_sevenz_posted_twice_is_one_set() {
         .map(|post| Post::plain(&post.name.replace(".7z.00", ".7z.000"), post.bytes.clone()))
         .collect();
     let scenario = Scenario::new(pieces.into_iter().chain(copies).collect());
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     let names: Vec<String> = graph.files.keys().cloned().collect();
     assert_eq!(

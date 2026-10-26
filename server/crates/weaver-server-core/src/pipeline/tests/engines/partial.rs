@@ -7,22 +7,17 @@
 // graph delivered, what it lists as withheld, damaged and unrepaired, the
 // `object refused` and `member delivered` lines, and the job's status:
 // Complete when nothing is short, Partial when some file is whole, else
-// Failed. What classic does with the same job is asserted beside it, so a
-// divergence is visible. `Why::TooDeep` has its rows in `caps.rs`.
+// Failed. `Why::TooDeep` has its rows in `caps.rs`.
 
 use std::io::Cursor;
 
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
 use weaver_graph::Why;
 
-use super::harness::{
-    ARTICLE, Outcome, Post, Scenario, assert_fails_leaving, par2_set, payload, run, try_run,
-};
+use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, try_run};
 use super::restart::run_restarting;
 use super::streams::tar;
-use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::lines::Lines;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
 use crate::pipeline::tests::direct_store::scenarios::{
@@ -303,9 +298,9 @@ fn tails(lines: Vec<String>, from: &str) -> Vec<String> {
     tails
 }
 
-async fn under_graph(scenario: &Scenario, expect: Graph) -> Outcome {
+async fn run_expecting(scenario: &Scenario, expect: Graph) -> Outcome {
     let (lines, guard) = Lines::capture();
-    let outcome = match try_run(scenario, Engine::Graph).await {
+    let outcome = match try_run(scenario).await {
         Ok(outcome) => outcome,
         Err(stall) => panic!("graph stalled at {:?}: {}", stall.status, stall.state),
     };
@@ -408,51 +403,6 @@ async fn under_graph(scenario: &Scenario, expect: Graph) -> Outcome {
     outcome
 }
 
-enum Classic {
-    // The job fails as this kind with an error that starts so, leaving
-    // exactly these paths under the complete folder.
-    FailsAs(HistoryFailureKind, &'static str, &'static [&'static str]),
-    // The job fails with an error that starts so.
-    Fails(&'static str),
-    // The job completes with exactly these files.
-    Completes(&'static [&'static str]),
-}
-
-async fn under_classic(scenario: &Scenario, expect: Classic) {
-    let outcome = run(scenario, Engine::Classic).await;
-    match expect {
-        Classic::FailsAs(kind, error, left) => {
-            assert_fails_leaving(&outcome, kind, error, left);
-        }
-        Classic::Fails(prefix) => {
-            let error = match &outcome.status {
-                Some(JobStatus::Failed { error }) => error.clone(),
-                other => panic!("classic: {other:?}, not a failure"),
-            };
-            assert!(error.starts_with(prefix), "classic: {error}");
-        }
-        Classic::Completes(files) => {
-            assert_eq!(
-                outcome.status,
-                Some(JobStatus::Complete),
-                "classic: {:?}",
-                outcome.failure
-            );
-            let wanted: Vec<String> = sorted(
-                &files
-                    .iter()
-                    .map(|name| format!("{FOLDER}/{name}"))
-                    .collect::<Vec<_>>(),
-            );
-            assert_eq!(
-                outcome.files.keys().cloned().collect::<Vec<_>>(),
-                wanted,
-                "classic"
-            );
-        }
-    }
-}
-
 fn file(name: &str, bytes: Option<Vec<u8>>) -> (String, Option<Vec<u8>>) {
     (name.to_string(), bytes)
 }
@@ -473,14 +423,12 @@ const QUILL: &str = "name=quill.bin from=quill.bin depth=0 whole=true";
 
 // Encrypted, content only: the headers read, the bytes do not.
 
-// Classic fails the job as Repair, not Password, delivering nothing, not
-// even the plain file.
 #[tokio::test]
-async fn an_encrypted_rar_with_no_password_beside_a_plain_file_ends_partial_with_the_archive_withheld_under_graph_and_fails_as_repair_under_classic()
+async fn an_encrypted_rar_with_no_password_beside_a_plain_file_ends_partial_with_the_archive_withheld()
  {
     let volumes = encrypted(2, 5);
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -501,24 +449,13 @@ async fn an_encrypted_rar_with_no_password_beside_a_plain_file_ends_partial_with
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "no retryable work remains for incomplete RAR sets",
-            &[],
-        ),
-    )
-    .await;
 }
 
-// Classic fails the job as Repair, not Password, delivering nothing.
 #[tokio::test]
-async fn an_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume_withheld_under_graph_and_fails_as_repair_under_classic()
- {
+async fn an_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume_withheld() {
     let volumes = encrypted(1, 5);
     let scenario = Scenario::new(beside(nest(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -533,26 +470,15 @@ async fn an_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume_withh
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "no retryable work remains for incomplete RAR sets",
-            &[],
-        ),
-    )
-    .await;
 }
 
 // The set's volumes, met one after another inside the outer member, belong
 // to one object as they do at the root.
-// Classic fails the job as Repair, not Password, delivering nothing.
 #[tokio::test]
-async fn an_encrypted_two_volume_rar_inside_a_stored_rar_withholds_both_volumes_encrypted_under_graph_and_fails_as_repair_under_classic()
- {
+async fn an_encrypted_two_volume_rar_inside_a_stored_rar_withholds_both_volumes_encrypted() {
     let volumes = encrypted(2, 5);
     let scenario = Scenario::new(beside(nest(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -573,25 +499,15 @@ async fn an_encrypted_two_volume_rar_inside_a_stored_rar_withholds_both_volumes_
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "no retryable work remains for incomplete RAR sets",
-            &[],
-        ),
-    )
-    .await;
 }
 
 // Encrypted headers: nothing names the members.
 
 #[tokio::test]
-async fn a_header_encrypted_rar_with_no_password_ends_partial_with_the_archive_withheld_under_graph_and_fails_on_the_password_under_classic()
- {
+async fn a_header_encrypted_rar_with_no_password_ends_partial_with_the_archive_withheld() {
     let volumes = header_encrypted(2);
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -612,15 +528,13 @@ async fn a_header_encrypted_rar_with_no_password_ends_partial_with_the_archive_w
         },
     )
     .await;
-    under_classic(&scenario, Classic::Fails("WEAVER_PASSWORD_REQUIRED")).await;
 }
 
 #[tokio::test]
-async fn a_header_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volumes_withheld_under_graph_and_fails_to_start_under_classic()
- {
+async fn a_header_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volumes_withheld() {
     let volumes = header_encrypted(2);
     let scenario = Scenario::new(beside(nest(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -639,11 +553,6 @@ async fn a_header_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume
             ],
             delivered: &[QUILL],
         },
-    )
-    .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("nested archive extraction could not be started"),
     )
     .await;
 }
@@ -651,13 +560,12 @@ async fn a_header_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume
 // Compressed: the store hands the archive to its engine.
 
 #[tokio::test]
-async fn an_lzma2_7z_is_refused_compressed_by_the_store_and_delivered_whole_by_the_engine_under_both_engines()
- {
+async fn an_lzma2_7z_is_refused_compressed_by_the_store_and_delivered_whole_by_the_engine() {
     let scenario = Scenario::new(beside(vec![Post::plain(
         "lantern.7z",
         two_files(EncoderMethod::LZMA2),
     )]));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -679,21 +587,15 @@ async fn an_lzma2_7z_is_refused_compressed_by_the_store_and_delivered_whole_by_t
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Completes(&["beacon.bin", "ember.bin", "quill.bin"]),
-    )
-    .await;
 }
 
 #[tokio::test]
-async fn an_lzma2_7z_inside_a_stored_rar_is_refused_compressed_and_delivered_whole_by_the_engine_under_graph_under_both_engines()
- {
+async fn an_lzma2_7z_inside_a_stored_rar_is_refused_compressed_and_delivered_whole_by_the_engine() {
     let scenario = Scenario::new(beside(nest(&one(
         "lantern.7z",
         two_files(EncoderMethod::LZMA2),
     ))));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -715,22 +617,16 @@ async fn an_lzma2_7z_inside_a_stored_rar_is_refused_compressed_and_delivered_who
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Completes(&["beacon.bin", "ember.bin", "quill.bin"]),
-    )
-    .await;
 }
 
 // The store refuses the member compressed; the engine it goes to cannot
 // decode it, and the volume is delivered damaged as it stands.
-// Classic fails the job as Repair, delivering nothing.
 #[tokio::test]
 async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_damaged_unrepairable_after_the_store_refuses_it_compressed()
  {
     let volumes = miscompressed_rar();
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -751,26 +647,16 @@ async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "no retryable work remains for incomplete RAR sets",
-            &[],
-        ),
-    )
-    .await;
 }
 
 // One level down the same member is delivered the same way, its volume
 // damaged at depth 1.
-// Classic fails the job as Repair, delivering nothing.
 #[tokio::test]
 async fn a_rar_inside_a_stored_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_damaged_unrepairable()
  {
     let volumes = miscompressed_rar();
     let scenario = Scenario::new(beside(nest(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -791,24 +677,12 @@ async fn a_rar_inside_a_stored_rar_whose_member_names_a_method_its_bytes_do_not_
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "no retryable work remains for incomplete RAR sets",
-            &[],
-        ),
-    )
-    .await;
 }
 
-// Classic rejects the link and fails the whole job as Unpack, delivering
-// nothing.
 #[tokio::test]
-async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_file_under_graph_and_rejects_the_job_under_classic()
- {
+async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_file() {
     let scenario = Scenario::new(beside(posts(&symlink_rar())));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -823,24 +697,13 @@ async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_fi
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Unpack,
-            "WEAVER_EXTRACTION_REJECTED[unsupported_entry]",
-            &[],
-        ),
-    )
-    .await;
 }
 
-// Classic rejects the link and fails the whole job as Unpack, delivering
-// nothing.
 #[tokio::test]
-async fn a_rar_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_refuses_the_link_not_a_file_under_graph_and_rejects_the_job_under_classic()
+async fn a_rar_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_refuses_the_link_not_a_file()
  {
     let scenario = Scenario::new(beside(nest(&symlink_rar())));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -855,22 +718,12 @@ async fn a_rar_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_refus
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Unpack,
-            "WEAVER_EXTRACTION_REJECTED[unsupported_entry]",
-            &[],
-        ),
-    )
-    .await;
 }
 
 #[tokio::test]
-async fn a_7z_holding_a_symlink_delivers_its_file_and_drops_the_link_under_graph_and_writes_the_link_as_a_file_under_classic()
- {
+async fn a_7z_holding_a_symlink_delivers_its_file_and_drops_the_link() {
     let scenario = Scenario::new(beside(vec![Post::plain("lantern.7z", symlink_7z())]));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -885,18 +738,12 @@ async fn a_7z_holding_a_symlink_delivers_its_file_and_drops_the_link_under_graph
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Completes(&["beacon.bin", "link.bin", "quill.bin"]),
-    )
-    .await;
 }
 
 #[tokio::test]
-async fn a_7z_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_drops_the_link_under_graph_and_writes_the_link_as_a_file_under_classic()
- {
+async fn a_7z_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_drops_the_link() {
     let scenario = Scenario::new(beside(nest(&one("lantern.7z", symlink_7z()))));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -909,23 +756,16 @@ async fn a_7z_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_drops_
             refused: &["kind=sevenz_store member=lantern.7z why=not_a_file"],
             delivered: &["name=beacon.bin from=beacon.bin depth=2 whole=true", QUILL],
         },
-    )
-    .await;
-    under_classic(
-        &scenario,
-        Classic::Completes(&["beacon.bin", "link.bin", "quill.bin"]),
     )
     .await;
 }
 
 // A directory entry is placed, not refused: it is listed among the whole
 // deliveries under its own name.
-// Classic delivers the file in its directory too, and completes.
 #[tokio::test]
-async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the_directory_whole_under_graph_and_delivers_the_file_under_classic()
- {
+async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the_directory_whole() {
     let scenario = Scenario::new(beside(posts(&directory_rar())));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -944,19 +784,13 @@ async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Completes(&["gallery/beacon.bin", "quill.bin"]),
-    )
-    .await;
 }
 
-// Classic delivers the file in its directory too, and completes.
 #[tokio::test]
-async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_the_file_and_lists_the_directory_whole_under_graph_and_delivers_the_file_under_classic()
+async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_the_file_and_lists_the_directory_whole()
  {
     let scenario = Scenario::new(beside(nest(&directory_rar())));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -975,11 +809,6 @@ async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_th
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Completes(&["gallery/beacon.bin", "quill.bin"]),
-    )
-    .await;
 }
 
 // First bytes lost: what would name the members never came, so the volumes
@@ -990,7 +819,7 @@ async fn a_rar_whose_first_volume_never_arrives_delivers_the_tail_volumes_first_
     let mut volumes = store(3);
     volumes.remove(0);
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1012,11 +841,6 @@ async fn a_rar_whose_first_volume_never_arrives_delivers_the_tail_volumes_first_
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("no first RAR volume (volume 0) was found"),
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -1025,7 +849,7 @@ async fn a_rar_inside_a_stored_rar_whose_first_volume_never_arrives_delivers_the
     let mut volumes = store(3);
     volumes.remove(0);
     let scenario = Scenario::new(beside(nest(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1047,11 +871,6 @@ async fn a_rar_inside_a_stored_rar_whose_first_volume_never_arrives_delivers_the
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("no first RAR volume (volume 0) was found"),
-    )
-    .await;
 }
 
 // Articles of eight bytes: the first holds the signature alone, the second,
@@ -1061,7 +880,7 @@ async fn a_rar_whose_first_volumes_main_header_article_never_arrives_delivers_it
  {
     let volumes = store(3);
     let scenario = Scenario::new(beside(posts(&volumes))).framed(8).lost(0, 1);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1094,21 +913,15 @@ async fn a_rar_whose_first_volumes_main_header_article_never_arrives_delivers_it
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("archive file silver.horizon.part01.rar is incomplete"),
-    )
-    .await;
 }
 
 // Unrepairable: damage no recovery object covers.
 
 #[tokio::test]
-async fn a_rar_volume_whose_middle_article_never_arrives_is_delivered_damaged_unrepairable_under_graph_and_fails_incomplete_under_classic()
- {
+async fn a_rar_volume_whose_middle_article_never_arrives_is_delivered_damaged_unrepairable() {
     let volumes = store(1);
     let scenario = Scenario::new(beside(posts(&volumes))).lost(0, 3);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1126,11 +939,6 @@ async fn a_rar_volume_whose_middle_article_never_arrives_is_delivered_damaged_un
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("archive file silver.horizon.part01.rar is incomplete"),
-    )
-    .await;
 }
 
 // The lost article lies in the inner volume's member data, as at the root;
@@ -1141,7 +949,7 @@ async fn a_rar_inside_a_stored_rar_whose_middle_article_never_arrives_delivers_t
  {
     let volumes = store(1);
     let scenario = Scenario::new(beside(nest(&volumes))).lost(0, 3);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1159,22 +967,16 @@ async fn a_rar_inside_a_stored_rar_whose_middle_article_never_arrives_delivers_t
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("archive file lantern.rar is incomplete"),
-    )
-    .await;
 }
 
 // The lost article holds the end header alone: the member is whole and its
 // checksum agrees.
 #[tokio::test]
-async fn a_rar_volume_whose_end_header_article_never_arrives_delivers_its_member_whole_under_graph_and_fails_incomplete_under_classic()
- {
+async fn a_rar_volume_whose_end_header_article_never_arrives_delivers_its_member_whole() {
     let volumes = store(1);
     let last = articles(&volumes[0].1) - 1;
     let scenario = Scenario::new(beside(posts(&volumes))).lost(0, last);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -1189,20 +991,14 @@ async fn a_rar_volume_whose_end_header_article_never_arrives_delivers_its_member
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("archive file silver.horizon.part01.rar is incomplete"),
-    )
-    .await;
 }
 
 // Unsupported: the format is known, the shape is not.
 
 #[tokio::test]
-async fn a_tar_whose_entry_size_is_not_a_number_is_delivered_raw_unsupported_under_graph_and_fails_under_classic()
- {
+async fn a_tar_whose_entry_size_is_not_a_number_is_delivered_raw_unsupported() {
     let scenario = Scenario::new(beside(vec![Post::plain("lantern.tar", unsized_tar())]));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -1220,14 +1016,12 @@ async fn a_tar_whose_entry_size_is_not_a_number_is_delivered_raw_unsupported_und
         },
     )
     .await;
-    under_classic(&scenario, Classic::Fails("failed to read tar entry")).await;
 }
 
 #[tokio::test]
-async fn a_tar_inside_a_stored_rar_whose_entry_size_is_not_a_number_is_delivered_raw_unsupported_under_graph_and_fails_under_classic()
- {
+async fn a_tar_inside_a_stored_rar_whose_entry_size_is_not_a_number_is_delivered_raw_unsupported() {
     let scenario = Scenario::new(beside(nest(&one("lantern.tar", unsized_tar()))));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -1245,16 +1039,15 @@ async fn a_tar_inside_a_stored_rar_whose_entry_size_is_not_a_number_is_delivered
         },
     )
     .await;
-    under_classic(&scenario, Classic::Fails("failed to read tar entry")).await;
 }
 
 // The store refuses a path that climbs out of the namespace; the engine
 // delivers the entry under its last component.
 #[tokio::test]
-async fn a_7z_whose_entry_path_climbs_out_is_refused_unsupported_and_delivered_under_its_last_name_under_graph_and_rejected_unsafe_under_classic()
- {
+async fn a_7z_whose_entry_path_climbs_out_is_refused_unsupported_and_delivered_under_its_last_name()
+{
     let scenario = Scenario::new(beside(vec![Post::plain("lantern.7z", climbing_7z())]));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -1276,18 +1069,13 @@ async fn a_7z_whose_entry_path_climbs_out_is_refused_unsupported_and_delivered_u
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("WEAVER_EXTRACTION_REJECTED[unsafe_path]"),
-    )
-    .await;
 }
 
 #[tokio::test]
-async fn a_7z_inside_a_stored_rar_whose_entry_path_climbs_out_is_refused_unsupported_and_delivered_under_its_last_name_under_graph_and_rejected_unsafe_under_classic()
+async fn a_7z_inside_a_stored_rar_whose_entry_path_climbs_out_is_refused_unsupported_and_delivered_under_its_last_name()
  {
     let scenario = Scenario::new(beside(nest(&one("lantern.7z", climbing_7z()))));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -1309,24 +1097,16 @@ async fn a_7z_inside_a_stored_rar_whose_entry_path_climbs_out_is_refused_unsuppo
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("WEAVER_EXTRACTION_REJECTED[unsafe_path]"),
-    )
-    .await;
 }
 
 // Unmapped: every volume is in, and the object never placed what it named.
 
-// Classic fails the job as Repair on the missing volume, leaving the
-// member it staged from the first volume in its unpack folder.
 #[tokio::test]
-async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_under_graph_and_fails_missing_a_volume_under_classic()
- {
+async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped() {
     let mut volumes = store(3);
     volumes.pop();
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1347,26 +1127,15 @@ async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_un
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "missing RAR volume after recovery settled",
-            &[".weaver-direct-unpack/93001/silver.horizon.0/beacon.bin"],
-        ),
-    )
-    .await;
 }
 
-// Classic fails the job on the missing volume, as Unpack two deep where
-// the root row fails as Repair, delivering nothing.
 #[tokio::test]
-async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped_under_graph_and_fails_missing_a_volume_under_classic()
- {
+async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped()
+{
     let mut volumes = store(3);
     volumes.pop();
     let scenario = Scenario::new(beside(nest(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1387,23 +1156,13 @@ async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Unpack,
-            "missing RAR volume after recovery settled",
-            &[],
-        ),
-    )
-    .await;
 }
 
 #[tokio::test]
-async fn a_7z_whose_last_part_never_arrives_withholds_its_parts_unmapped_under_graph_and_fails_missing_a_part_under_classic()
- {
+async fn a_7z_whose_last_part_never_arrives_withholds_its_parts_unmapped() {
     let volumes = sevenz_without_its_last_part();
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1422,21 +1181,15 @@ async fn a_7z_whose_last_part_never_arrives_withholds_its_parts_unmapped_under_g
             ],
             delivered: &[QUILL],
         },
-    )
-    .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("failed to read 7z archive: missing 7z part"),
     )
     .await;
 }
 
 #[tokio::test]
-async fn a_7z_inside_a_stored_rar_whose_last_part_never_arrives_withholds_its_parts_unmapped_under_graph_and_fails_missing_a_part_under_classic()
- {
+async fn a_7z_inside_a_stored_rar_whose_last_part_never_arrives_withholds_its_parts_unmapped() {
     let volumes = sevenz_without_its_last_part();
     let scenario = Scenario::new(beside(nest(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1455,11 +1208,6 @@ async fn a_7z_inside_a_stored_rar_whose_last_part_never_arrives_withholds_its_pa
             ],
             delivered: &[QUILL],
         },
-    )
-    .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("failed to read 7z archive: missing 7z part"),
     )
     .await;
 }
@@ -1481,7 +1229,7 @@ async fn a_member_a_set_covers_but_cannot_rebuild_is_listed_unrepaired_and_the_j
     ))
     .lost(0, 1)
     .lost(0, 3);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Failed(
@@ -1498,13 +1246,6 @@ async fn a_member_a_set_covers_but_cannot_rebuild_is_listed_unrepaired_and_the_j
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails(
-            "PAR2 recovery failed for 1 set(s): ember.par2 (ember.bin): not repairable: 2 damaged slices",
-        ),
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -1513,7 +1254,7 @@ async fn a_stored_rar_a_set_covers_but_cannot_rebuild_is_listed_unrepaired_and_t
     let scenario = Scenario::new(under_one_block("lantern.rar", "lantern", outer))
         .lost(0, 3)
         .lost(0, 5);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Failed(
@@ -1530,13 +1271,6 @@ async fn a_stored_rar_a_set_covers_but_cannot_rebuild_is_listed_unrepaired_and_t
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails(
-            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.rar): not repairable: 2 damaged slices",
-        ),
-    )
-    .await;
 }
 
 // Quiet: once nothing more will arrive and no repair will come, each
@@ -1549,10 +1283,10 @@ async fn a_stored_rar_a_set_covers_but_cannot_rebuild_is_listed_unrepaired_and_t
 // store refuses itself unrepairable. `ember.bin`, closed whole, stays
 // delivered.
 #[tokio::test]
-async fn a_stored_7z_with_a_damaged_member_and_no_par2_refuses_itself_unrepairable_under_graph() {
+async fn a_stored_7z_with_a_damaged_member_and_no_par2_refuses_itself_unrepairable() {
     let archive = two_files(EncoderMethod::COPY);
     let scenario = Scenario::new(beside(vec![Post::plain("lantern.7z", archive)])).lost(0, 3);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1581,11 +1315,11 @@ async fn a_stored_7z_with_a_damaged_member_and_no_par2_refuses_itself_unrepairab
 // quiet the zip hears the loss and walks its local headers instead; both
 // members are found whole, and with nothing short the zip refuses nothing.
 #[tokio::test]
-async fn a_stored_zip_whose_central_directory_article_never_arrives_rules_for_itself_under_graph() {
+async fn a_stored_zip_whose_central_directory_article_never_arrives_rules_for_itself() {
     let archive = super::zip::archive(super::zip::stored());
     let last = articles(&archive) - 1;
     let scenario = Scenario::new(vec![Post::plain("lantern.zip", archive)]).lost(0, last);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Complete),
@@ -1613,11 +1347,11 @@ async fn a_stored_zip_whose_central_directory_article_never_arrives_rules_for_it
 // whose run asks for one. The job has none to give, and once it is quiet
 // the engine, still asking, refuses itself for its shut headers.
 #[tokio::test]
-async fn a_header_encrypted_rar_with_no_check_and_no_password_refuses_itself_encrypted_header_at_quiet_under_graph()
+async fn a_header_encrypted_rar_with_no_check_and_no_password_refuses_itself_encrypted_header_at_quiet()
  {
     let volumes = header_encrypted_store_set("beacon.bin", &body(), 1, SECRET, HeaderCheck::Absent);
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1642,11 +1376,11 @@ async fn a_header_encrypted_rar_with_no_check_and_no_password_refuses_itself_enc
 // it. Nothing posted was lost, so once the job is quiet the store refuses
 // itself unmapped.
 #[tokio::test]
-async fn a_rar_that_announced_a_member_it_never_placed_refuses_itself_unmapped_under_graph() {
+async fn a_rar_that_announced_a_member_it_never_placed_refuses_itself_unmapped() {
     let mut volumes = store(2);
     volumes.pop();
     let scenario = Scenario::new(beside(posts(&volumes)));
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1672,11 +1406,10 @@ fn three_one_withheld() -> Scenario {
     Scenario::new(posted)
 }
 
-// Classic fails the whole job as Repair, delivering neither whole member.
 #[tokio::test]
 async fn a_job_of_three_members_one_withheld_ends_partial_with_two_delivered() {
     let scenario = three_one_withheld();
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1695,19 +1428,8 @@ async fn a_job_of_three_members_one_withheld_ends_partial_with_two_delivered() {
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "no retryable work remains for incomplete RAR sets",
-            &[],
-        ),
-    )
-    .await;
 }
 
-// Classic fails the job as Repair, leaving each set's staged member in its
-// unpack folder.
 #[tokio::test]
 async fn a_job_of_three_members_all_withheld_fails() {
     let posted: Vec<Post> = [("lantern.rar", 5), ("quill.rar", 6), ("ember.rar", 7)]
@@ -1715,7 +1437,7 @@ async fn a_job_of_three_members_all_withheld_fails() {
         .map(|(name, seed)| Post::plain(name, encrypted(1, seed).remove(0).1))
         .collect();
     let scenario = Scenario::new(posted);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Failed(
@@ -1740,19 +1462,6 @@ async fn a_job_of_three_members_all_withheld_fails() {
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::FailsAs(
-            HistoryFailureKind::Repair,
-            "no retryable work remains for incomplete RAR sets",
-            &[
-                ".weaver-direct-unpack/93001/ember.2/beacon.bin",
-                ".weaver-direct-unpack/93001/lantern.0/beacon.bin",
-                ".weaver-direct-unpack/93001/quill.1/beacon.bin",
-            ],
-        ),
-    )
-    .await;
 }
 
 // An encrypted archive withheld, a damaged one delivered as it stands, and
@@ -1764,7 +1473,7 @@ async fn a_job_whose_only_whole_file_is_a_withheld_archives_sibling_ends_partial
     posted.extend(posts(&store(1)));
     posted.push(Post::plain("quill.bin", quill()));
     let scenario = Scenario::new(posted).lost(1, 3);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1789,11 +1498,6 @@ async fn a_job_whose_only_whole_file_is_a_withheld_archives_sibling_ends_partial
         },
     )
     .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("archive file silver.horizon.part01.rar is incomplete"),
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -1810,7 +1514,7 @@ async fn two_sets_one_short_of_blocks_end_partial_with_the_other_sets_files_whol
         .lost(0, 1)
         .lost(0, 3)
         .lost(quill_index, 2);
-    let graph = under_graph(
+    let graph = run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
@@ -1829,13 +1533,6 @@ async fn two_sets_one_short_of_blocks_end_partial_with_the_other_sets_files_whol
         graph.files[&format!("{FOLDER}/ember.bin")] != short,
         "the short set's file is delivered as it stands, not rebuilt"
     );
-    under_classic(
-        &scenario,
-        Classic::Fails(
-            "PAR2 recovery failed for 1 set(s): ember.par2 (ember.bin): not repairable: 2 damaged slices",
-        ),
-    )
-    .await;
 }
 
 // Restored after every article, the job comes to the same status and the
@@ -1843,7 +1540,7 @@ async fn two_sets_one_short_of_blocks_end_partial_with_the_other_sets_files_whol
 #[tokio::test]
 async fn a_partial_job_restarted_after_every_article_ends_partial_with_the_same_lists() {
     let scenario = three_one_withheld();
-    let whole = match try_run(&scenario, Engine::Graph).await {
+    let whole = match try_run(&scenario).await {
         Ok(outcome) => outcome,
         Err(stall) => panic!("graph stalled at {:?}: {}", stall.status, stall.state),
     };
@@ -1868,7 +1565,7 @@ async fn a_uuencoded_file_whose_middle_article_never_arrives_is_damaged_to_its_e
     let scenario = Scenario::new(vec![Post::plain("ember.bin", noise(7 * ARTICLE + 20, 61))])
         .uuencoded()
         .lost(0, 3);
-    under_graph(
+    run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Failed(
@@ -1883,11 +1580,6 @@ async fn a_uuencoded_file_whose_middle_article_never_arrives_is_damaged_to_its_e
             refused: &[],
             delivered: &[],
         },
-    )
-    .await;
-    under_classic(
-        &scenario,
-        Classic::Fails("download incomplete after exhausting retries: 0/1 data files complete"),
     )
     .await;
 }

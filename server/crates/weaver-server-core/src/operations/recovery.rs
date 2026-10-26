@@ -59,17 +59,8 @@ pub async fn recover_server_state(
             info!(
                 active_file_progress = counts.active_file_progress,
                 active_files = counts.active_files,
-                active_par2 = counts.active_par2,
-                active_par2_files = counts.active_par2_files,
                 active_extracted = counts.active_extracted,
-                active_failed_extractions = counts.active_failed_extractions,
-                active_extraction_chunks = counts.active_extraction_chunks,
-                active_archive_headers = counts.active_archive_headers,
-                active_rar_volume_facts = counts.active_rar_volume_facts,
                 active_detected_archives = counts.active_detected_archives,
-                active_volume_status = counts.active_volume_status,
-                active_rar_verified_suspect = counts.active_rar_verified_suspect,
-                active_direct_coverage = counts.active_direct_coverage,
                 graph_checkpoint = counts.graph_checkpoint,
                 "removed orphaned active-state rows before recovery"
             );
@@ -206,11 +197,8 @@ pub async fn recover_server_state(
                             job_id,
                             job_hash: recovered.nzb_hash,
                             spec,
-                            complete_files: recovered.complete_files,
-                            file_progress: recovered.file_progress,
                             detected_archives: recovered.detected_archives,
                             file_identities: recovered.file_identities,
-                            extracted_members: recovered.extracted_members,
                             status,
                             download_state,
                             post_state,
@@ -492,11 +480,10 @@ mod tests {
     use crate::StateError;
     use crate::jobs::working_dir::working_dir_marker_path;
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-    use crate::{ActiveJob, Database, JobHistoryRow, JobId, NzbFileId};
+    use crate::{ActiveJob, Database, JobHistoryRow, JobId};
 
     fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
         ActiveJob {
-            engine: crate::pipeline::graph::Engine::Classic,
             job_id: JobId(id),
             nzb_hash: [0xAA; 32],
             nzb_path,
@@ -706,15 +693,6 @@ mod tests {
         assert!(!orphan_output_dir.exists());
         assert!(unrelated_output_dir.exists());
         assert_eq!(recovered.to_restore.len(), 1);
-        assert!(
-            recovered.to_restore[0]
-                .request
-                .complete_files
-                .contains(&NzbFileId {
-                    job_id: JobId(1),
-                    file_index: 0,
-                })
-        );
     }
 
     #[tokio::test]

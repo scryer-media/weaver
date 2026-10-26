@@ -22,16 +22,13 @@ use super::{ArticleRoot, Ask};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::operations::disk::CapacityReader;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{RunMail, Runs};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::{
-    insert_active_job, insert_active_job_on, new_direct_pipeline, retire_pipeline_database,
-    sample_nzb_zstd,
+    insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd,
 };
 use crate::pipeline::{
     DecodeResult, DecodedChunk, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -260,25 +257,6 @@ fn segment_id(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId 
         file_id: NzbFileId { job_id, file_index },
         segment_number,
     }
-}
-
-// Stamp a row graph behind the switch's back, the way a row written by a
-// process with the switch on reads after a restart with it off.
-pub(in crate::pipeline::graph) fn stamp_graph(db: &crate::Database, job_id: JobId) {
-    let datastore = db.datastore();
-    db.run_sql_blocking(async move {
-        SqlRuntime::execute(
-            datastore.read_exec(),
-            "UPDATE active_jobs SET engine = {} WHERE job_id = {}",
-            &[
-                SqlArg::Text(Engine::Graph.as_str().to_string()),
-                SqlArg::I64(job_id.0 as i64),
-            ],
-        )
-        .await?;
-        Ok(())
-    })
-    .unwrap();
 }
 
 #[test]
@@ -595,7 +573,7 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(91_003);
-    // More members than the classic sample takes, and a recovery volume.
+    // More members than the policy sample takes, and a recovery volume.
     let mut files: Vec<(String, FileRole, u32)> = (0..40)
         .map(|index| {
             (
@@ -607,14 +585,7 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
         .collect();
     files.push(("lantern.vol0+4.par2".to_string(), recovery_role(), 3));
     let members = files.len();
-    insert_active_job_on(
-        &mut pipeline,
-        job_id,
-        spec("lantern sample", files),
-        Engine::Graph,
-    )
-    .await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
+    insert_active_job(&mut pipeline, job_id, spec("lantern sample", files)).await;
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let leading: Vec<SegmentId> = (0..members)
@@ -634,8 +605,7 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
     );
 }
 
-// Every file role the classic engine ranks or parks, in an order no role
-// ranking would keep.
+// Every file role, in an order no ranking by role would keep.
 fn ranked_roles() -> Vec<(String, FileRole, u32)> {
     vec![
         ("lantern.vol0+4.par2".to_string(), recovery_role(), 2),
@@ -662,10 +632,8 @@ fn ranked_roles() -> Vec<(String, FileRole, u32)> {
     ]
 }
 
-#[tokio::test]
-async fn a_graph_job_is_queued_in_posted_order_at_one_neutral_priority() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+#[test]
+fn a_job_is_queued_in_posted_order_at_one_neutral_priority() {
     let job_id = JobId(91_010);
     let files = ranked_roles();
     let posted: Vec<SegmentId> = files
@@ -675,20 +643,16 @@ async fn a_graph_job_is_queued_in_posted_order_at_one_neutral_priority() {
             (0..*segments).map(move |ordinal| segment_id(job_id, index as u32, ordinal))
         })
         .collect();
-    insert_active_job_on(
-        &mut pipeline,
+    let (_, mut download_queue) = crate::pipeline::Pipeline::build_job_assembly(
         job_id,
-        spec("lantern posted", files),
-        Engine::Graph,
-    )
-    .await;
+        &spec("lantern posted", files),
+        &HashSet::new(),
+    );
 
-    let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    // Nothing is parked by its name: the recovery volume waits in the
-    // download queue with everything else, and nothing marks it recovery.
-    assert_eq!(state.recovery_queue.count_matching(|_| true), 0);
+    // Nothing is ranked by its role: the recovery volume waits in the
+    // queue with everything else, and nothing marks it recovery.
     let mut queued = Vec::new();
-    while let Some(work) = state.download_queue.pop() {
+    while let Some(work) = download_queue.pop() {
         assert_eq!(work.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
         assert!(!work.is_recovery);
         assert!(!work.completion_critical);
@@ -702,14 +666,12 @@ async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(91_011);
-    insert_active_job_on(
+    insert_active_job(
         &mut pipeline,
         job_id,
         spec("lantern requeued", ranked_roles()),
-        Engine::Graph,
     )
     .await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     while state.download_queue.pop().is_some() {}
 
@@ -790,8 +752,7 @@ async fn a_lost_article_marks_its_range_damaged() {
             ("lantern.dat".to_string(), FileRole::Standalone, 19),
         ],
     );
-    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
+    insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.book_terminal_segment(segment_id(job_id, 0, 0), SegmentTerminalState::Missing);
     assert_eq!(
         damaged_ranges(&pipeline.graph_jobs[&job_id], 0),
@@ -820,8 +781,7 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
         "lantern damaged",
         vec![("lantern.bin".to_string(), FileRole::Standalone, 1)],
     );
-    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
+    insert_active_job(&mut pipeline, job_id, spec).await;
     let body = vec![3u8; 64];
     pipeline
         .handle_decode_success(
@@ -1040,49 +1000,33 @@ fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
     assert_eq!(changed(400), small);
 }
 
-// With the switch unset a new job is a graph job, row and runtime both; a
-// switch naming classic opts it into the classic pipeline. The decision is
-// driven through `Engine::parse`, never the process variable.
+// Admission makes every new job a graph job.
 #[tokio::test]
-async fn admission_with_the_switch_unset_stamps_graph_and_classic_is_the_opt_in() {
-    for (switch, engine, job_id) in [
-        (None, Engine::Graph, JobId(91_008)),
-        (Some("classic"), Engine::Classic, JobId(91_009)),
-    ] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        let mut resources = pipeline.admission_resources();
-        resources.engine = Engine::parse(switch);
-        let prepared = crate::pipeline::Pipeline::prepare_add(
-            &resources,
-            job_id,
-            spec(
-                "lantern default",
-                vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
-            ),
-            PathBuf::from("lantern-default.nzb"),
-            sample_nzb_zstd(),
-            crate::jobs::AddJobOptions::default(),
-        )
-        .await
-        .unwrap();
-        pipeline.install_prepared_add(job_id, prepared);
-        assert_eq!(
-            pipeline.db.load_active_job_engine(job_id).unwrap(),
-            Some(engine),
-            "{switch:?}"
-        );
-        assert_eq!(
-            pipeline.graph_jobs.contains_key(&job_id),
-            engine == Engine::Graph,
-            "{switch:?}"
-        );
-        retire_pipeline_database(pipeline).await;
-    }
+async fn admission_makes_a_graph_job() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(91_008);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let resources = pipeline.admission_resources();
+    let prepared = crate::pipeline::Pipeline::prepare_add(
+        &resources,
+        job_id,
+        spec(
+            "lantern default",
+            vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
+        ),
+        PathBuf::from("lantern-default.nzb"),
+        sample_nzb_zstd(),
+        crate::jobs::AddJobOptions::default(),
+    )
+    .await
+    .unwrap();
+    pipeline.install_prepared_add(job_id, prepared);
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    retire_pipeline_database(pipeline).await;
 }
 
 #[tokio::test]
-async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
+async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(91_006);
     let restored_id = JobId(91_007);
@@ -1102,20 +1046,10 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
             )
             .await
             .unwrap();
-        let switch = Engine::from_environment();
-        assert_eq!(
-            pipeline.db.load_active_job_engine(job_id).unwrap(),
-            Some(switch)
-        );
-        assert_eq!(
-            pipeline.graph_jobs.contains_key(&job_id),
-            switch == Engine::Graph
-        );
+        assert!(pipeline.graph_jobs.contains_key(&job_id));
 
-        // A row stamped graph, whatever the switch says, with the checkpoint
-        // its admission took.
+        // A row with the checkpoint its admission took.
         let working_dir = insert_active_job(&mut pipeline, restored_id, lantern.clone()).await;
-        stamp_graph(&pipeline.db, restored_id);
         let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
         let pending = checkpoint::Pending::default();
         assert!(pending.put(&admitted));
@@ -1133,11 +1067,8 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
             job_id: restored_id,
             job_hash: [0; 32],
             spec: lantern,
-            complete_files: HashSet::new(),
-            file_progress: Default::default(),
             detected_archives: Default::default(),
             file_identities: Default::default(),
-            extracted_members: HashSet::new(),
             status: JobStatus::Downloading,
             download_state: None,
             post_state: None,
@@ -1152,10 +1083,6 @@ async fn admission_stamps_the_switch_and_a_restore_keeps_the_row() {
         .await
         .unwrap();
     assert!(pipeline.graph_jobs.contains_key(&restored_id));
-    assert_eq!(
-        pipeline.db.load_active_job_engine(restored_id).unwrap(),
-        Some(Engine::Graph)
-    );
     pipeline.db.flush_write_queue().await.unwrap();
     assert_eq!(
         pipeline

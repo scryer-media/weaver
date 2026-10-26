@@ -26,7 +26,6 @@ use weaver_graph::{
 
 use self::loans::Loans;
 use self::passwords::Passwords;
-use super::Engine;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::leaf::LeafError;
@@ -107,37 +106,30 @@ pub(crate) struct RootFile {
 }
 
 impl GraphJob {
-    // The runtime a job admitted under `engine` gets, if any: a classic job
-    // has none. `scope` is the job's process-wide id.
-    pub(crate) fn for_engine(
-        engine: Engine,
-        scope: u64,
-        files: &[RootFile],
-        storage: Storage,
-    ) -> Option<Self> {
-        (engine == Engine::Graph).then(|| {
-            let runs = Runs::new(
-                scope,
-                storage.slots,
-                storage.mail,
-                Arc::clone(&storage.accountant),
-            );
-            let writer = NamespaceWriter::new(
-                scope,
-                storage.working_dir,
-                storage.accountant,
-                storage.free_disk,
-            )
-            .capped(storage.caps);
-            Self::new(
-                files,
-                Box::new(weaver_objects::Objects),
-                writer,
-                runs,
-                storage.nesting,
-            )
-            .offering(storage.passwords)
-        })
+    // The runtime a job admitted fresh gets. `scope` is the job's
+    // process-wide id.
+    pub(crate) fn admit(scope: u64, files: &[RootFile], storage: Storage) -> Self {
+        let runs = Runs::new(
+            scope,
+            storage.slots,
+            storage.mail,
+            Arc::clone(&storage.accountant),
+        );
+        let writer = NamespaceWriter::new(
+            scope,
+            storage.working_dir,
+            storage.accountant,
+            storage.free_disk,
+        )
+        .capped(storage.caps);
+        Self::new(
+            files,
+            Box::new(weaver_objects::Objects),
+            writer,
+            runs,
+            storage.nesting,
+        )
+        .offering(storage.passwords)
     }
 
     pub(crate) fn new(

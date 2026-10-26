@@ -128,3 +128,99 @@ impl Pipeline {
         }
     }
 }
+
+impl Pipeline {
+    // Build a report for the one job whose stage changed.
+    pub(crate) fn job_report(&self, job_id: JobId) -> Option<JobInfo> {
+        let state = self.jobs.get(&job_id)?;
+        if is_terminal_status(&state.status) {
+            return None;
+        }
+        let total = state.spec.total_bytes;
+        let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
+            state.assembly.optional_recovery_bytes();
+        let health = health_milli(total, state.failed_bytes);
+        let status = if self.awaiting_queue_script_barrier(state.job_id)
+            && state.status == JobStatus::Downloading
+        {
+            // The download is complete; its queue scripts are being admitted.
+            JobStatus::AwaitingQueueScripts
+        } else {
+            state.status.clone()
+        };
+        let (download_state, post_state, run_state) =
+            crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
+        let remaining_par_files = state
+            .assembly
+            .files()
+            .filter(|file| {
+                matches!(
+                    file.role(),
+                    weaver_model::files::FileRole::Par2 {
+                        is_index: false,
+                        ..
+                    }
+                ) && !file.is_complete()
+            })
+            .count() as u32;
+        let download_wait = self.download_wait_by_job.get(&state.job_id);
+        Some(JobInfo {
+            job_id: state.job_id,
+            job_hash: Some(state.job_hash),
+            name: state.spec.name.clone(),
+            error: if let JobStatus::Failed { error } = &state.status {
+                Some(error.clone())
+            } else if self.blocked_restores.contains_key(&state.job_id) {
+                state.failure_error.clone()
+            } else {
+                None
+            },
+            download_wait_reason: download_wait
+                .map(|wait| wait.reason)
+                .or_else(|| self.job_dispatch_hold_reason(state.job_id))
+                .map(str::to_owned),
+            download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
+            status,
+            download_state,
+            finalizing_download: self.jobs_finalizing_download.contains(&state.job_id),
+            fetching_repair_data: self
+                .graph_jobs
+                .get(&state.job_id)
+                .is_some_and(|graph| graph.fetching_repair_data()),
+            post_state,
+            run_state,
+            progress: Self::effective_progress(state),
+            total_bytes: total,
+            downloaded_bytes: Self::effective_downloaded_bytes(state),
+            optional_recovery_bytes,
+            optional_recovery_downloaded_bytes,
+            phase_progress: Vec::new(),
+            failed_bytes: state.failed_bytes,
+            health,
+            terminal_discards: Vec::new(),
+            total_files: self.blocked_restores.get(&state.job_id).map_or_else(
+                || state.assembly.total_file_count() as u32,
+                |request| request.spec.files.len() as u32,
+            ),
+            completed_files: if self.blocked_restores.contains_key(&state.job_id) {
+                0
+            } else {
+                state.assembly.complete_file_count() as u32
+            },
+            remaining_par_files,
+            password: state.spec.password.clone(),
+            category: state.spec.category.clone(),
+            metadata: state.spec.metadata.clone(),
+            output_dir: Some(state.working_dir.display().to_string()),
+            server_attribution: state.server_attribution.contributions().to_vec(),
+            created_at_epoch_ms: state.created_at_epoch_ms,
+        })
+    }
+
+    // List all jobs: the live ones, then history.
+    #[cfg(test)]
+    pub(crate) fn list_jobs(&self) -> Vec<JobInfo> {
+        self.report_all_for_test();
+        self.shared_state.list_jobs()
+    }
+}

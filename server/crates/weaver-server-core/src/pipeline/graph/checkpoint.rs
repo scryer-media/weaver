@@ -289,8 +289,7 @@ impl Pending {
 
 impl Pipeline {
     // A graph job's durable download floor: the bytes its last checkpoint
-    // spares a restore. `None` for a classic job, whose floor is its file
-    // coverage barrier's.
+    // spares a restore. `None` once the job has gone.
     pub(in crate::pipeline) fn graph_checkpointed_bytes(&self, job_id: JobId) -> Option<u64> {
         self.graph_jobs
             .get(&job_id)

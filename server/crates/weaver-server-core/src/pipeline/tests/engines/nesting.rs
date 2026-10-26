@@ -13,12 +13,11 @@ use std::io::{Cursor, Write};
 use ::zip::ZipWriter;
 
 use super::depth::stored as sevenz;
-use super::harness::{ARTICLE, Outcome, Post, Scenario, run, run_both};
+use super::harness::{ARTICLE, Outcome, Post, Scenario, assert_fetched_once, run};
 use super::streams::{brotli, bzip2, deflate, gzip, tar, xz, zstd};
 use weaver_graph::Why;
 
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::lines::Lines;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
 
@@ -268,41 +267,13 @@ async fn chain_row(depth: usize) {
     let levels = &CHAIN[..depth];
     let scenario = chained(levels);
     let (lines, guard) = Lines::capture();
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     drop(guard);
     assert_delivered_at(&graph, &lines, levels);
-    let classic = run(&scenario, Engine::Classic).await;
-    assert_eq!(
-        summary(&classic),
-        CLASSIC[depth - 1],
-        "classic at {depth} deep"
-    );
-    if classic.completed()
-        && let Some(bytes) = classic.files.get(&delivered(bottom(levels)))
-    {
-        assert!(*bytes == file(), "classic: bytes");
-    }
 }
 
-// What classic does with each prefix of the chain, 1 to 10 deep: it
-// unpacks three archives deep and no further, so from four deep on it
-// delivers the gzipped tar it unpacked last beside the zip it held, and
-// never reaches the file.
-const CLASSIC: [&str; 10] = [
-    "Some(Complete) [ember.bin]",
-    "Some(Complete) [ember.bin]",
-    "Some(Complete) [ember.bin]",
-    "Some(Complete) [c.tar.gz, d.zip]",
-    "Some(Complete) [c.tar.gz, d.zip]",
-    "Some(Complete) [c.tar.gz, d.zip]",
-    "Some(Complete) [c.tar.gz, d.zip]",
-    "Some(Complete) [c.tar.gz, d.zip]",
-    "Some(Complete) [c.tar.gz, d.zip]",
-    "Some(Complete) [c.tar.gz, d.zip]",
-];
-
 #[tokio::test]
-async fn the_ten_deep_chain_delivers_its_file_under_graph() {
+async fn the_ten_deep_chain_delivers_its_file() {
     chain_row(10).await;
 }
 
@@ -318,37 +289,37 @@ macro_rules! prefixes {
 }
 
 prefixes! {
-    the_chain_1_deep_delivers_its_file_under_graph => 1,
-    the_chain_2_deep_delivers_its_file_under_graph => 2,
-    the_chain_3_deep_delivers_its_file_under_graph => 3,
-    the_chain_4_deep_delivers_its_file_under_graph => 4,
-    the_chain_5_deep_delivers_its_file_under_graph => 5,
-    the_chain_6_deep_delivers_its_file_under_graph => 6,
-    the_chain_7_deep_delivers_its_file_under_graph => 7,
-    the_chain_8_deep_delivers_its_file_under_graph => 8,
-    the_chain_9_deep_delivers_its_file_under_graph => 9,
+    the_chain_1_deep_delivers_its_file => 1,
+    the_chain_2_deep_delivers_its_file => 2,
+    the_chain_3_deep_delivers_its_file => 3,
+    the_chain_4_deep_delivers_its_file => 4,
+    the_chain_5_deep_delivers_its_file => 5,
+    the_chain_6_deep_delivers_its_file => 6,
+    the_chain_7_deep_delivers_its_file => 7,
+    the_chain_8_deep_delivers_its_file => 8,
+    the_chain_9_deep_delivers_its_file => 9,
 }
 
 #[tokio::test]
-async fn the_ten_deep_chain_delivers_alike_in_every_frame_size_under_graph() {
+async fn the_ten_deep_chain_delivers_alike_in_every_frame_size() {
     for size in [usize::MAX, 4096, 1] {
         let (lines, guard) = Lines::capture();
-        let graph = run(&chained(&CHAIN).framed(size), Engine::Graph).await;
+        let graph = run(&chained(&CHAIN).framed(size)).await;
         drop(guard);
         assert_delivered_at(&graph, &lines, &CHAIN);
     }
 }
 
 #[tokio::test]
-async fn the_ten_deep_chain_served_last_article_first_delivers_under_graph() {
+async fn the_ten_deep_chain_served_last_article_first_delivers() {
     let (lines, guard) = Lines::capture();
-    let graph = run(&chained(&CHAIN).backwards(), Engine::Graph).await;
+    let graph = run(&chained(&CHAIN).backwards()).await;
     drop(guard);
     assert_delivered_at(&graph, &lines, &CHAIN);
 }
 
 #[tokio::test]
-async fn the_ten_deep_chain_restarted_after_every_article_delivers_under_graph() {
+async fn the_ten_deep_chain_restarted_after_every_article_delivers() {
     super::restart::restart_row(chained(&CHAIN)).await;
 }
 
@@ -356,10 +327,10 @@ async fn the_ten_deep_chain_restarted_after_every_article_delivers_under_graph()
 // stored RAR, served last article first in articles of ARTICLE bytes, the
 // 7z's front split across the RAR's first two articles.
 #[tokio::test]
-async fn a_stored_7z_in_a_stored_rar_served_last_article_first_delivers_under_graph() {
+async fn a_stored_7z_in_a_stored_rar_served_last_article_first_delivers() {
     let levels = [CHAIN[0], CHAIN[1]];
     let (lines, guard) = Lines::capture();
-    let graph = run(&chained(&levels).backwards(), Engine::Graph).await;
+    let graph = run(&chained(&levels).backwards()).await;
     drop(guard);
     assert_delivered_at(&graph, &lines, &levels);
 }
@@ -396,10 +367,9 @@ fn streamed_bytes(name: &str) -> Vec<u8> {
     noise(2 * ARTICLE + seed as usize, seed)
 }
 
-// Every stream kind as a member of one store of `kind`, under both
-// engines. The graph decodes every stream where it lies; classic's outcome
-// is `classic`.
-async fn streams_under(kind: Kind, posted: &str, classic_expected: &str) {
+// Every stream kind as a member of one store of `kind`: the graph decodes
+// every stream where it lies.
+async fn streams_under(kind: Kind, posted: &str) {
     let entries: Vec<(&str, Vec<u8>)> = streamed()
         .into_iter()
         .map(|(name, _, bytes)| (name, bytes))
@@ -412,12 +382,7 @@ async fn streams_under(kind: Kind, posted: &str, classic_expected: &str) {
         _ => unreachable!("a store"),
     };
     let scenario = Scenario::new(vec![Post::plain(posted, store)]);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_eq!(summary(&classic), classic_expected, "classic");
-    for (name, bytes) in &classic.files {
-        let held = name.strip_prefix(&format!("{FOLDER}/")).unwrap();
-        assert!(*bytes == streamed_bytes(held), "classic: {held}");
-    }
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "graph: {:?}", graph.failure);
     let mut names: Vec<&str> = streamed().iter().map(|(_, name, _)| *name).collect();
     names.sort();
@@ -446,29 +411,25 @@ async fn streams_under(kind: Kind, posted: &str, classic_expected: &str) {
     assert!(delivery.withheld.is_empty(), "{delivery:?}");
 }
 
-// What classic delivers from a store of every stream kind: it unpacks the
-// store and decodes each stream it holds.
-const CLASSIC_STREAMS: &str = "Some(Complete) [br.bin, bz.bin, gz.bin, raw.bin, xz.bin, zst.bin]";
-
 #[tokio::test]
-async fn every_stream_kind_under_a_stored_rar_delivers_under_both_engines() {
-    streams_under(Kind::Rar, "lantern.rar", CLASSIC_STREAMS).await;
+async fn every_stream_kind_under_a_stored_rar_delivers() {
+    streams_under(Kind::Rar, "lantern.rar").await;
 }
 
 #[tokio::test]
-async fn every_stream_kind_under_a_stored_7z_delivers_under_both_engines() {
-    streams_under(Kind::SevenZ, "lantern.7z", CLASSIC_STREAMS).await;
+async fn every_stream_kind_under_a_stored_7z_delivers() {
+    streams_under(Kind::SevenZ, "lantern.7z").await;
 }
 
 #[tokio::test]
-async fn every_stream_kind_under_a_tar_delivers_under_both_engines() {
-    streams_under(Kind::Tar, "lantern.tar", CLASSIC_STREAMS).await;
+async fn every_stream_kind_under_a_tar_delivers() {
+    streams_under(Kind::Tar, "lantern.tar").await;
 }
 
 #[tokio::test]
-async fn every_stream_kind_under_a_stored_zip_delivers_under_both_engines() {
+async fn every_stream_kind_under_a_stored_zip_delivers() {
     // Fails under graph: see the reduced row below.
-    streams_under(Kind::Zip, "lantern.zip", CLASSIC_STREAMS).await;
+    streams_under(Kind::Zip, "lantern.zip").await;
 }
 
 // The zip row reduced: one xz in a stored zip, in articles of ARTICLE
@@ -476,15 +437,15 @@ async fn every_stream_kind_under_a_stored_zip_delivers_under_both_engines() {
 // its first, so the end of the xz's bytes reaches the stream before its
 // middle. Whole in one article it delivers.
 #[tokio::test]
-async fn a_stored_zip_of_one_xz_delivers_its_file_under_graph() {
+async fn a_stored_zip_of_one_xz_delivers_its_file() {
     let bytes = file();
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.zip",
         zip(&[("ember.bin.xz", xz(&bytes))]),
     )]);
-    let whole = run(&scenario_framed(&scenario, 4096), Engine::Graph).await;
+    let whole = run(&scenario_framed(&scenario, 4096)).await;
     assert!(whole.completed(), "in one article: {:?}", whole.failure);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "graph: {:?}", graph.failure);
     assert!(graph.files[&delivered(FILE)] == bytes, "graph: the bytes");
     assert!(graph.graph().delivery.withheld.is_empty());
@@ -500,12 +461,12 @@ fn scenario_framed(scenario: &Scenario, size: usize) -> Scenario {
 }
 
 #[tokio::test]
-async fn three_decoders_deep_xz_in_gzip_in_zstd_delivers_under_both_engines() {
+async fn three_decoders_deep_xz_in_gzip_in_zstd_delivers() {
     let scenario = Scenario::new(vec![Post::plain(
         "ember.bin.xz.gz.zst",
         zstd(&gzip(&xz(&file()))),
     )]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "graph: {:?}", graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -515,30 +476,24 @@ async fn three_decoders_deep_xz_in_gzip_in_zstd_delivers_under_both_engines() {
     let delivery = &graph.graph().delivery;
     assert_eq!(delivery.whole, [FILE], "{delivery:?}");
     assert_eq!(delivery.files[0].depth, 3, "{delivery:?}");
-    assert_eq!(summary(&classic), "Some(Complete) [ember.bin]", "classic");
-    assert!(
-        classic.files[&delivered(FILE)] == file(),
-        "classic: the bytes"
-    );
 }
 
 // The compressed RAR5 fixture (two stored members, one compressed) as a
 // member of a stored RAR: the store hands it to the engine one deep.
-// Classic delivers the same three members.
 #[tokio::test]
-async fn a_nested_stored_rar_with_one_compressed_member_among_stored_ones_delivers_under_graph() {
+async fn a_nested_stored_rar_with_one_compressed_member_among_stored_ones_delivers() {
     let mixed = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
-    let alone = run(
-        &Scenario::new(vec![Post::plain("mixed.rar", mixed.clone())]),
-        Engine::Graph,
-    )
+    let alone = run(&Scenario::new(vec![Post::plain(
+        "mixed.rar",
+        mixed.clone(),
+    )]))
     .await;
     assert!(alone.completed(), "alone: {:?}", alone.failure);
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.rar",
         rar(&[("mixed.rar", mixed)]),
     )]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(
         graph.completed(),
         "graph: {:?} {:?} {:?} {:?}",
@@ -569,14 +524,6 @@ async fn a_nested_stored_rar_with_one_compressed_member_among_stored_ones_delive
         "{delivery:?}"
     );
     assert!(delivery.withheld.is_empty(), "{delivery:?}");
-    // Classic extracts the inner RAR and delivers what the graph does.
-    let classic = run(&scenario, Engine::Classic).await;
-    assert!(classic.completed(), "classic: {}", summary(&classic));
-    assert!(
-        classic.files == graph.files,
-        "classic delivers what the graph does: {}",
-        summary(&classic)
-    );
 }
 
 // Small files, each in its own xz, stored in one 7z, run at the graph's
@@ -607,7 +554,7 @@ async fn many_xz_members(count: u64) {
         // Read when the run's pipeline builds its tuner; nextest runs each
         // test in its own process, and nothing reads it meanwhile.
         unsafe { std::env::set_var("WEAVER_MAX_CONCURRENT_EXTRACTIONS", limit.to_string()) };
-        let graph = run(&scenario, Engine::Graph).await;
+        let graph = run(&scenario).await;
         assert!(graph.completed(), "{limit}: {:?}", graph.failure);
         assert_eq!(graph.files.len(), files.len(), "{limit}: delivered");
         for (name, bytes) in &files {
@@ -633,18 +580,17 @@ async fn many_xz_members(count: u64) {
 // about an hour at each limit.
 #[tokio::test]
 #[ignore = "a thousand members runs for about an hour per slot limit: per-run-message work grows with the tree"]
-async fn a_7z_of_a_thousand_xz_members_delivers_every_member_at_slot_limits_1_2_and_8_under_graph()
-{
+async fn a_7z_of_a_thousand_xz_members_delivers_every_member_at_slot_limits_1_2_and_8() {
     many_xz_members(1000).await;
 }
 
 #[tokio::test]
-async fn a_7z_of_a_hundred_xz_members_delivers_every_member_at_slot_limits_1_2_and_8_under_graph() {
+async fn a_7z_of_a_hundred_xz_members_delivers_every_member_at_slot_limits_1_2_and_8() {
     many_xz_members(100).await;
 }
 
 #[tokio::test]
-async fn a_stored_rar_of_two_hundred_members_delivers_them_all_under_both_engines() {
+async fn a_stored_rar_of_two_hundred_members_delivers_them_all() {
     let files: Vec<(String, Vec<u8>)> = (0..200u64)
         .map(|index| {
             (
@@ -664,24 +610,13 @@ async fn a_stored_rar_of_two_hundred_members_delivers_them_all_under_both_engine
             .map(|(name, bytes)| Post::plain(&name, bytes))
             .collect(),
     );
-    let (classic, graph) = run_both(&scenario).await;
-    for outcome in [&classic, &graph] {
-        assert!(
-            outcome.completed(),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.failure
-        );
-        assert_eq!(outcome.files.len(), files.len(), "{}", outcome.engine);
-        for (name, bytes) in &files {
-            assert!(
-                outcome.files.get(&delivered(name)) == Some(bytes),
-                "{}: {name}",
-                outcome.engine
-            );
-        }
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.files.len(), files.len());
+    for (name, bytes) in &files {
+        assert!(graph.files.get(&delivered(name)) == Some(bytes), "{name}",);
     }
-    super::harness::assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
     let delivery = &graph.graph().delivery;
     assert_eq!(delivery.whole.len(), files.len());
     assert!(
@@ -699,7 +634,7 @@ async fn a_stored_rar_of_two_hundred_members_delivers_them_all_under_both_engine
 // refused at all: the zip object streams the entry whole once the xz has
 // ended and its directory is in.
 #[tokio::test]
-async fn a_sized_by_descriptor_zip_entry_under_an_xz_parent_is_refused_unbounded_under_graph() {
+async fn a_sized_by_descriptor_zip_entry_under_an_xz_parent_is_refused_unbounded() {
     assert!(!Why::UnboundedEntry.withholds());
     let mut writer = ZipWriter::new_stream(Vec::new());
     writer.start_file(FILE, super::zip::stored()).unwrap();
@@ -714,7 +649,7 @@ async fn a_sized_by_descriptor_zip_entry_under_an_xz_parent_is_refused_unbounded
     );
     let scenario = Scenario::new(vec![Post::plain("lantern.zip.xz", xz(&bytes))]);
     let (lines, guard) = Lines::capture();
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     drop(guard);
     assert!(
         lines.of("object refused").is_empty(),
@@ -727,6 +662,4 @@ async fn a_sized_by_descriptor_zip_entry_under_an_xz_parent_is_refused_unbounded
     assert!(delivery.withheld.is_empty(), "{delivery:?}");
     assert_eq!(delivery.whole, [FILE], "{delivery:?}");
     assert_eq!(delivery.files[0].depth, 2, "{delivery:?}");
-    let classic = run(&scenario, Engine::Classic).await;
-    assert_eq!(summary(&classic), "Some(Complete) [ember.bin]", "classic");
 }

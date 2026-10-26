@@ -16,10 +16,9 @@ import (
 	"strings"
 )
 
-// The graph twins of the runtime assertions that read classic internals. Each
-// reads the graph's observability lines from the same weaver log and holds the
-// job to what the classic assertion meant, as strictly: a line the assertion
-// needs and the log does not carry fails the scenario.
+// The runtime assertions read the graph's observability lines from the weaver
+// log: a line the assertion needs and the log does not carry fails the
+// scenario.
 
 // Object kinds that open an archive, as the graph's `Kind` displays them.
 var graphArchiveKinds = map[string]bool{
@@ -31,8 +30,7 @@ var graphArchiveKinds = map[string]bool{
 	"zip_engine":    true,
 }
 
-// Object kinds that route a member's stored bytes straight through, the graph's
-// counterpart of a classic direct-store set.
+// Object kinds that route a member's stored bytes straight through.
 var graphStoreKinds = map[string]bool{
 	"rar_store":    true,
 	"sevenz_store": true,
@@ -60,9 +58,8 @@ func isArchiveFileName(name string) bool {
 }
 
 // graphDirectUnpackVerdict judges a direct-unpack assertion by the graph's
-// lines. The graph has no direct-unpack gate: an archive is always opened in
-// the stream, so ForbidAnyActivity, which only ever applies with the gate off,
-// has nothing to judge. `delivered` is the job's output directory listing.
+// lines. An archive is always opened in the stream, so ForbidAnyActivity has
+// nothing to judge. `delivered` is the job's output directory listing.
 //
 // `relaunchAt` is the byte offset in `raw` where the relaunched weaver began
 // writing, or graphNoRelaunch. A restored graph job rebuilds its tree without
@@ -119,9 +116,8 @@ func graphDirectUnpackVerdict(raw string, jobID int, assertion *ScenarioDirectUn
 	switch reason := assertion.ExpectedDemotionReason; reason {
 	case "":
 	case "repair_rewrote":
-		// Classic demotes a chase whose bytes a repair rewrote. The graph
-		// repairs in the stream and nothing demotes: the members come out
-		// whole from a set that ruled repaired.
+		// A repair rewrites the archive's bytes in the stream and nothing
+		// demotes: the members come out whole from a set that ruled repaired.
 		if !graphAnyRecoverySetRuled(raw, jobID, "repaired") {
 			return errors.New("no recovery set of this job ruled repaired")
 		}
@@ -183,10 +179,9 @@ func scenarioArchiveVolumes(scenario *Scenario, localFiles []string) ([]graphVol
 }
 
 // graphDirectStoreVerdict judges a direct-store assertion by the graph's
-// lines. The graph never demotes: a set classic would demote for damage is one
-// whose recovery rules impossible, and a chain classic would find malformed
-// by its posted ordinals is one the graph routes by its headers and the
-// recovery rebinds by content. Routed-byte materialization, and the bare
+// lines. Nothing demotes: a `par2_damaged` set is one whose recovery rules
+// impossible, and a `member_malformed_chain` set is one the store routes by its
+// headers and the recovery rebinds by content. Routed-byte materialization, and the bare
 // assertion that a set routed direct, is a store object bound over every
 // volume the scenario posts.
 //
@@ -202,10 +197,8 @@ func graphDirectStoreVerdict(raw string, jobID int, assertion *ScenarioDirectSto
 			return errors.New("no recovery set of this job ruled impossible")
 		}
 	case reason == "member_malformed_chain":
-		// Classic lays a set out by its posted ordinals, so volumes posted
-		// under each other's names make a chain that disagrees with itself.
-		// A graph store places each volume where its own headers say it
-		// belongs, so that chain is never malformed to it: the volumes route
+		// Volumes posted under each other's names: a store places each
+		// volume where its own headers say it belongs, so the volumes route
 		// direct, and the recovery set binds the posted names to their bytes
 		// by content.
 		if !slices.ContainsFunc(graphLogEvents(raw, jobID, graphRecoveryBoundMessage), func(bound map[string]string) bool {
@@ -250,12 +243,12 @@ func graphAnyRecoverySetRuled(raw string, jobID int, outcome string) bool {
 	return false
 }
 
-// graphPar2Verifications maps each classic clean-verification mode to how the
-// graph reaches the same ruling: the in-stream grid vouching without a byte
-// read, or the recovery object hashing the member's bytes. The grid is the
-// graph's ruling whenever the index is read before the volumes it places, so
-// a clean set may always be vouched by it; the classic modes only say whether
-// a read ruling is allowed too.
+// graphPar2Verifications maps each clean-verification mode a scenario names to
+// how the ruling is reached: the in-stream grid vouching without a byte read,
+// or the recovery object hashing the member's bytes. The grid is the ruling
+// whenever the index is read before the volumes it places, so a clean set may
+// always be vouched by it; the named modes only say whether a read ruling is
+// allowed too.
 var graphPar2Verifications = map[string]string{
 	"grid":          "grid",
 	"file_crc":      "read",
@@ -266,10 +259,9 @@ var graphPar2Verifications = map[string]string{
 
 // graphPar2CleanSettlementVerdict judges a clean-settlement assertion by the
 // graph's `recovery set ruled` lines: one per expected set, clean, with the
-// expected slice size, reached the way the set's expected classic modes allow.
-// The classic VerificationReadBytes is the read-back of a grid-settled set; a
-// graph `grid` ruling reads no bytes by definition, so only zero is
-// expressible.
+// expected slice size, reached the way the set's expected modes allow. A
+// `grid` ruling reads no bytes by definition, so VerificationReadBytes can
+// only be zero.
 func graphPar2CleanSettlementVerdict(raw string, jobID int, assertion *ScenarioPar2CleanSettlementAssertion) error {
 	if assertion.VerificationReadBytes != 0 {
 		return fmt.Errorf(

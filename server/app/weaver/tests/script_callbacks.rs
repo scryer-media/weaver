@@ -85,7 +85,6 @@ fn on(trigger: InstanceTrigger, script: &ScriptName) -> ScriptInstanceDraft {
 // An active download 42 for commands to be applied to.
 fn job(db: &Database, directory: &Path) -> JobExecutionContext {
     db.create_active_job(&ActiveJob {
-        engine: weaver_server_core::pipeline::graph::Engine::Classic,
         job_id: JobId(42),
         nzb_hash: [42; 32],
         nzb_path: directory.join("source.nzb"),
@@ -168,7 +167,6 @@ fn config(data: &Path) -> SharedConfig {
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
         direct_store: None,
-        direct_unpack: None,
         delivery_naming: None,
         hardware_profile: None,
         metrics: Default::default(),

@@ -953,18 +953,6 @@ fn render_stalls_and_workers(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         snapshot.direct_write_evictions,
     );
 
-    for (event, value) in [
-        ("admitted", snapshot.direct_sets_admitted),
-        ("demoted", snapshot.direct_sets_demoted),
-        ("finalized_direct", snapshot.direct_sets_finalized_direct),
-        (
-            "repaired_while_direct",
-            snapshot.direct_sets_repaired_while_direct,
-        ),
-    ] {
-        out.sample(&f::DIRECT_STORE_SETS, &[("event", event)], value);
-    }
-
     out.sample(
         &f::DEOBFUSCATED_MEMBERS,
         &[],

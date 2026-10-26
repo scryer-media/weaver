@@ -17,13 +17,11 @@ use crate::jobs::model::{
 };
 use crate::pipeline::Pipeline;
 use crate::pipeline::PipelineEvent;
-use crate::pipeline::completion::NestedExtractionDecision;
 use crate::pipeline::download::queue::DownloadQueue;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::root::phase::{self, RootPhase};
 use crate::pipeline::tests::{
-    hear_graph_mail, insert_active_job, insert_active_job_on, job_status_for_assert,
-    new_direct_pipeline, rar5_fixture_bytes, standalone_job_spec, submit_decoded_segment,
+    hear_graph_mail, insert_active_job, job_status_for_assert, new_direct_pipeline,
+    standalone_job_spec, submit_decoded_segment,
 };
 
 // A graph job's reads, prepared by the test: a namespace, a summary, and the
@@ -150,9 +148,8 @@ fn sfv_line_with_crc(name: &str, crc32: u32) -> String {
     format!("{name} {crc32:08x}\n")
 }
 
-// A payload and a listing that agrees with it or not. The classic SFV pass
-// records each read it makes, so whether it ran is plain from the record.
-async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engine, agrees: bool) {
+// A payload and a listing that agrees with it or not.
+async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, agrees: bool) {
     let payload: Vec<u8> = (0..96u32).map(|value| (value % 251) as u8).collect();
     let crc = par2_rs::checksum::crc32(&payload);
     let listed = if agrees { crc } else { crc ^ 0xffff_ffff };
@@ -164,8 +161,7 @@ async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engi
             ("ember.field.sfv".to_string(), listing.len() as u32),
         ],
     );
-    insert_active_job_on(pipeline, job_id, spec, engine).await;
-    pipeline.admit_graph_job(job_id, engine);
+    insert_active_job(pipeline, job_id, spec).await;
     let file = |file_index| NzbFileId { job_id, file_index };
     submit_decoded_segment(
         pipeline,
@@ -590,11 +586,11 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
 }
 
 #[tokio::test]
-async fn a_graph_job_skips_the_old_passes_and_moves_to_complete() {
+async fn a_job_with_a_listing_moves_to_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(91_202);
-    job_with_a_listing(&mut pipeline, job_id, Engine::Graph, true).await;
+    job_with_a_listing(&mut pipeline, job_id, true).await;
     // The last article may already have advanced the job to its move.
     if !pipeline.inflight_moves.contains(&job_id) {
         settle_download_state(&mut pipeline, job_id);
@@ -604,32 +600,9 @@ async fn a_graph_job_skips_the_old_passes_and_moves_to_complete() {
     if let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) {
         panic!("the graph job failed: {error}");
     }
-    assert!(
-        pipeline.sfv_verify_read_splits.is_empty(),
-        "the listing pass must not run for a graph job"
-    );
     assert!(pipeline.inflight_moves.contains(&job_id));
     let record = &pipeline.terminal_reconciliations[&job_id];
     assert_eq!((record.failed_bytes, record.health), (0, 1000));
-}
-
-#[tokio::test]
-async fn a_classic_job_still_runs_the_old_passes() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(91_203);
-    job_with_a_listing(&mut pipeline, job_id, Engine::Classic, true).await;
-    assert!(!pipeline.is_graph_job(job_id));
-    if !pipeline.inflight_moves.contains(&job_id) {
-        settle_download_state(&mut pipeline, job_id);
-        pipeline.check_job_completion(job_id).await;
-    }
-
-    if let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) {
-        panic!("the classic job failed: {error}");
-    }
-    assert_eq!(pipeline.sfv_verify_read_splits.len(), 1);
-    assert!(pipeline.inflight_moves.contains(&job_id));
 }
 
 // The listing's own object rules for a graph job, and its failure reads as a
@@ -640,7 +613,7 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(91_208);
-    job_with_a_listing(&mut pipeline, job_id, Engine::Graph, false).await;
+    job_with_a_listing(&mut pipeline, job_id, false).await;
     if pipeline.jobs.contains_key(&job_id) {
         settle_download_state(&mut pipeline, job_id);
         pipeline.check_job_completion(job_id).await;
@@ -655,7 +628,6 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
                 .to_string()
         })
     );
-    assert!(pipeline.sfv_verify_read_splits.is_empty());
     while !matches!(
         events.recv().await.expect("pipeline event channel closed"),
         PipelineEvent::JobFailed { job_id: failed, .. } if failed == job_id
@@ -668,52 +640,15 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
 }
 
 #[tokio::test]
-async fn a_graph_job_never_rescans_its_output_for_nested_archives() {
-    for (job_id, engine, expected) in [
-        (
-            JobId(91_204),
-            Engine::Graph,
-            NestedExtractionDecision::NoNestedArchives,
-        ),
-        (
-            JobId(91_205),
-            Engine::Classic,
-            NestedExtractionDecision::Started,
-        ),
-    ] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        let spec = standalone_job_spec("Ember Nested", &[("outer.bin".to_string(), 8)]);
-        insert_active_job_on(&mut pipeline, job_id, spec, engine).await;
-        pipeline.admit_graph_job(job_id, engine);
-        let staging = temp_dir.path().join("ember-nested");
-        tokio::fs::create_dir_all(&staging).await.unwrap();
-        tokio::fs::write(
-            staging.join("inner.rar"),
-            rar5_fixture_bytes("rar5_nested_2deep.rar"),
-        )
-        .await
-        .unwrap();
-        pipeline.jobs.get_mut(&job_id).unwrap().staging_dir = Some(staging);
-        let decision = pipeline
-            .maybe_start_nested_extraction(job_id)
-            .await
-            .unwrap();
-        assert_eq!(decision, expected, "{engine:?}");
-    }
-}
-
-#[tokio::test]
 async fn a_graph_census_keeps_a_damaged_member_and_refuses_an_empty_delivery() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
 
-    // Nothing of the payload ever arrived: refused with the classic words.
+    // Nothing of the payload ever arrived: refused as never delivered.
     let job_id = JobId(91_206);
     let spec = standalone_job_spec("Ember Empty", &[("ember.bin".to_string(), 64)]);
-    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
-    let Some(Err(error)) = pipeline.reconcile_graph_delivery(job_id) else {
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let Err(error) = pipeline.reconcile_terminal_delivery(job_id) else {
         panic!("an empty graph delivery is refused");
     };
     assert_eq!(
@@ -721,10 +656,4 @@ async fn a_graph_census_keeps_a_damaged_member_and_refuses_an_empty_delivery() {
         "1 payload file(s) were never delivered and no verification, repair or discard \
          accounts for them (64 declared bytes): ember.bin"
     );
-
-    // A classic job keeps its own census.
-    let classic = JobId(91_207);
-    let spec = standalone_job_spec("Ember Classic", &[("ember.bin".to_string(), 64)]);
-    insert_active_job(&mut pipeline, classic, spec).await;
-    assert!(pipeline.reconcile_graph_delivery(classic).is_none());
 }

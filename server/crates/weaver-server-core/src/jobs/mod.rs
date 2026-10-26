@@ -14,7 +14,6 @@ pub mod persistence;
 pub mod phase_progress;
 pub mod queries;
 pub mod record;
-pub(crate) mod repair_outputs;
 pub mod repository;
 pub mod server_attribution;
 mod server_attribution_persistence;
@@ -53,7 +52,4 @@ pub use model::{
     runtime_lanes_from_status_snapshot,
 };
 pub use phase_progress::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
-pub use record::{
-    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, ExtractionChunk,
-    FileIdentitySource, RecoveredJob,
-};
+pub use record::{ActiveFileIdentity, ActiveJob, FileIdentitySource, RecoveredJob};

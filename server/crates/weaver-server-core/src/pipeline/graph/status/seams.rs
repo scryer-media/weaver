@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The pipeline's hooks into a graph job's status. Each classic gate asks one
-// of these first and keeps its own path when the job has no graph runtime.
+// The pipeline's hooks into a graph job's status.
 
 use tracing::{info, warn};
 use weaver_graph::recovery::{RepairOutcome, SetRuling};
@@ -26,9 +25,9 @@ use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
 use crate::post_processing::model::PipelineFailureStage;
 
-// The classic completion gate hands a graph job here instead of to its own
-// passes: no whole-file verification, no listing check and no re-scan of the
-// output, since the tree already ruled on every member as it arrived.
+// The completion gate hands the job here: there is no whole-file
+// verification, no listing check and no re-scan of the output, since the
+// tree already ruled on every member as it arrived.
 pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId) {
     let Some(state) = pipeline.jobs.get(&job_id) else {
         return;
@@ -47,7 +46,7 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     if pipeline.graph_status.repairs.handed(asker(job_id)) {
         pipeline.lend_graph_repairs(job_id);
     }
-    let (_, limit) = limits::budgets(&pipeline.direct_store.settings(), &pipeline.tuner);
+    let limit = limits::slots(&pipeline.tuner);
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;
     };
@@ -152,10 +151,10 @@ fn asker(job_id: JobId) -> AskerId {
 }
 
 impl Pipeline {
-    // A graph job its extraction budget refused fails now, as classic fails
-    // a job whose extraction budget refused it: at the extraction stage,
-    // with the refusal as its reason. Asked after every step, so nothing
-    // more is fetched or decoded for it. True when it failed.
+    // A graph job its extraction budget refused fails now, at the
+    // extraction stage, with the refusal as its reason. Asked after every
+    // step, so nothing more is fetched or decoded for it. True when it
+    // failed.
     pub(in crate::pipeline::graph) fn fail_graph_job_on_breach(&mut self, job_id: JobId) -> bool {
         let breached = self
             .graph_jobs
@@ -175,6 +174,8 @@ impl Pipeline {
             return false;
         };
         metrics::failed(rejection.reason().as_str());
+        self.metrics
+            .note_extraction_rejection(rejection.reason().as_str());
         self.transition_postprocessing_status(job_id, JobStatus::Extracting, None);
         self.fail_job_on_extraction_error(job_id, ExtractionError::rejected(rejection));
         true
@@ -197,10 +198,6 @@ impl Pipeline {
                 }
             }
         }
-    }
-
-    pub(in crate::pipeline) fn is_graph_job(&self, job_id: JobId) -> bool {
-        self.graph_jobs.contains_key(&job_id)
     }
 
     // What the root's recovery objects can say of a graph job now, read
@@ -236,16 +233,18 @@ impl Pipeline {
         self.graph_status.repairs.forget(asker(job_id));
     }
 
-    // The census of a graph job, from the root namespace's marks: the
-    // terminal record, or the refusal of a delivery that has nothing in it.
-    // `None` for a classic job, which keeps its own census.
-    pub(in crate::pipeline) fn reconcile_graph_delivery(
+    // The terminal record of the job's delivery, from the census of its
+    // root namespace at the last gate before the payload leaves. Returns the
+    // operator-facing failure message when the census refuses the delivery.
+    pub(in crate::pipeline) fn reconcile_terminal_delivery(
         &mut self,
         job_id: JobId,
-    ) -> Option<Result<(), String>> {
-        let job = self.graph_jobs.get(&job_id)?;
+    ) -> Result<(), String> {
+        let (Some(job), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
+        else {
+            return Ok(());
+        };
         let namespace = job.namespace();
-        let state = self.jobs.get(&job_id)?;
         let ignore = self.par2_ignore_extensions();
         let census: Vec<ClaimedMember> = state
             .spec
@@ -275,6 +274,19 @@ impl Pipeline {
             .collect();
         let total_bytes = state.spec.total_bytes;
         metrics::claimed(&census);
+        // A file that lost articles on its way in is one missing file, with
+        // every article it never received, however often the census runs.
+        for row in census.iter().filter(|row| row.lost_articles > 0) {
+            let file_id = NzbFileId {
+                job_id,
+                file_index: row.member.0,
+            };
+            if self.files_counted_missing.insert(file_id) {
+                self.metrics
+                    .job_lifecycle
+                    .note_file_missing(row.lost_articles as u64);
+            }
+        }
 
         let delivery = self.graph_delivery(job_id).unwrap_or_default();
         let refused = claims::refused(&census, &delivery);
@@ -294,7 +306,7 @@ impl Pipeline {
                 job_id,
                 crate::jobs::SemanticTerminalCause::MissingArticlesOrLowHealth,
             );
-            return Some(Err(message));
+            return Err(message);
         }
 
         for row in &census {
@@ -334,7 +346,7 @@ impl Pipeline {
                 discards: Vec::new(),
             },
         );
-        Some(Ok(()))
+        Ok(())
     }
 
     // Each file the job hands over, said once, as the job delivers: the
@@ -354,7 +366,7 @@ impl Pipeline {
 
     // What a graph job hands over, file by file at every depth, off its
     // settled claims, with the repair failure that left any of it short.
-    // `None` for a classic job.
+    // `None` once the job has gone.
     fn graph_ruling(&self, job_id: JobId) -> Option<(Delivery, Option<Failure>)> {
         let job = self.graph_jobs.get(&job_id)?;
         let state = self.jobs.get(&job_id)?;
@@ -406,7 +418,7 @@ impl Pipeline {
     // Why a graph job delivered short of whole, for its terminal record: the
     // stage that left it short, and the error a recovery object that could
     // not rebuild what it found words, or else what was withheld. `None`
-    // for a classic job.
+    // once the job has gone.
     pub(in crate::pipeline) fn graph_shortfall(
         &self,
         job_id: JobId,
@@ -421,7 +433,7 @@ impl Pipeline {
     }
 
     // The status a graph job with nothing left to wait for ends in. `None`
-    // for a classic job, which always completes.
+    // once the job has gone.
     pub(in crate::pipeline) fn graph_terminal_status(&self, job_id: JobId) -> Option<JobStatus> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
         let status = delivery.status(failure.as_ref().map(|failure| failure.message.as_str()));

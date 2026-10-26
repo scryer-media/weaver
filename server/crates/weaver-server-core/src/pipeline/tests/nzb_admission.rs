@@ -22,15 +22,6 @@ fn handle(pipeline: &Pipeline) -> SchedulerHandle {
 
 #[tokio::test]
 async fn paused_reprocess_initialization_waits_for_resume_admission() {
-    for engine in [
-        crate::pipeline::graph::Engine::Classic,
-        crate::pipeline::graph::Engine::Graph,
-    ] {
-        paused_reprocess_waits_for_admission(engine).await;
-    }
-}
-
-async fn paused_reprocess_waits_for_admission(engine: crate::pipeline::graph::Engine) {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
     let handle = handle(&pipeline);
@@ -48,7 +39,6 @@ async fn paused_reprocess_waits_for_admission(engine: crate::pipeline::graph::En
             .find(|row| row.id == JobId(2))
             .unwrap();
         let prepared = row.admission.as_mut().unwrap();
-        prepared.engine = engine;
         prepared.restart = Some(crate::pipeline::queue::RestartAdmission {
             reprocess: true,
             working_dir: prepared.working_dir.clone(),
@@ -60,12 +50,9 @@ async fn paused_reprocess_waits_for_admission(engine: crate::pipeline::graph::En
     pipeline.apply_queue_intents().await;
     assert!(pipeline.nzb_reprocess_pending.contains(&JobId(2)));
     assert!(!pipeline.nzb_admitted.contains(&JobId(2)));
-    // Graph reprocessing refetches articles without a placement checkpoint;
-    // classic reprocessing trusts files already on disk. Neither may run yet.
-    assert_eq!(
-        pipeline.jobs[&JobId(2)].download_queue.is_empty(),
-        engine == crate::pipeline::graph::Engine::Classic
-    );
+    // Reprocessing refetches articles without a placement checkpoint, and
+    // none of them may run yet.
+    assert!(!pipeline.jobs[&JobId(2)].download_queue.is_empty());
     assert!(
         pipeline
             .graph_jobs
@@ -80,25 +67,6 @@ async fn paused_reprocess_waits_for_admission(engine: crate::pipeline::graph::En
     pipeline.apply_queue_intents().await;
     assert!(pipeline.nzb_admitted.contains(&JobId(2)));
     assert!(!pipeline.nzb_reprocess_pending.contains(&JobId(2)));
-}
-
-#[tokio::test]
-async fn paused_unadmitted_jobs_cannot_launch_health_probes() {
-    let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    let handle = handle(&pipeline);
-    enqueue(&mut pipeline, 1).await;
-    handle.pause_job(JobId(1)).await.unwrap();
-    pipeline.apply_queue_intents().await;
-    pipeline.apply_queue_intents().await;
-    assert!(!pipeline.nzb_admitted.contains(&JobId(1)));
-    assert!(!pipeline.activate_health_probes(JobId(1)));
-    assert!(!pipeline.jobs[&JobId(1)].health_probing);
-    assert_eq!(pipeline.jobs[&JobId(1)].health_probe_round, 0);
-    pipeline.jobs.get_mut(&JobId(1)).unwrap().failed_bytes = 4096;
-    pipeline.check_health(JobId(1));
-    assert_eq!(pipeline.jobs[&JobId(1)].status, JobStatus::Paused);
-    assert!(!pipeline.jobs[&JobId(1)].health_probing);
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Zip containers under both engines: stored whole, spanned over `.z01`,
+// Zip containers: stored whole, spanned over `.z01`,
 // `.z02`, `.zip`, deflated, and enciphered under the job's password.
 
 use std::io::{Cursor, Write};
@@ -9,11 +9,10 @@ use std::io::{Cursor, Write};
 use ::zip::write::SimpleFileOptions;
 use ::zip::{AesMode, CompressionMethod, ZipWriter};
 
-use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_same, kinds, par2_set, payload, run_both,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload, run,
 };
 
 const SECRET: &str = "beacon-lantern-secret";
@@ -134,12 +133,7 @@ fn delivered(name: &str) -> String {
 }
 
 pub(super) fn assert_members(outcome: &Outcome) {
-    assert!(
-        outcome.completed(),
-        "{}: {:?}",
-        outcome.engine,
-        outcome.failure
-    );
+    assert!(outcome.completed(), "{:?}", outcome.failure);
     let expected = members();
     assert_eq!(
         outcome.files.keys().cloned().collect::<Vec<_>>(),
@@ -147,73 +141,47 @@ pub(super) fn assert_members(outcome: &Outcome) {
             .iter()
             .map(|(name, _)| delivered(name))
             .collect::<Vec<_>>(),
-        "{}: delivered names",
-        outcome.engine
+        "delivered names",
     );
     for (name, bytes) in expected {
-        assert!(
-            outcome.files[&delivered(name)] == bytes,
-            "{}: {name} bytes",
-            outcome.engine
-        );
+        assert!(outcome.files[&delivered(name)] == bytes, "{name} bytes",);
     }
 }
 
 #[tokio::test]
-async fn a_stored_zip_delivers_its_members_under_both_engines() {
+async fn a_stored_zip_delivers_its_members() {
     let scenario = Scenario::new(vec![Post::plain("lantern.zip", archive(stored()))]);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
 }
 
-// Classic opens the first file of the set as the whole zip and reads no
-// local header at the spanned offsets; graph walks the set.
 #[tokio::test]
-async fn a_stored_zip_spanned_over_z01_z02_zip_delivers_its_members_under_graph_and_fails_under_classic()
- {
+async fn a_stored_zip_spanned_over_z01_z02_zip_delivers_its_members() {
     let scenario = Scenario::new(spanned(&archive(stored()), 3));
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert!(
         graph.refetched().is_empty(),
         "graph: {:?}",
         graph.refetched()
     );
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "classic: {:?}",
-        classic.status
-    );
-    assert_eq!(
-        classic.failure_kind,
-        Some(HistoryFailureKind::Unpack),
-        "classic: failure kind"
-    );
-    assert!(
-        classic.files.is_empty(),
-        "classic: {:?}",
-        classic.files.keys()
-    );
 }
 
 #[tokio::test]
-async fn a_deflate_zip_is_extracted_under_both_engines() {
+async fn a_deflate_zip_is_extracted() {
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let scenario = Scenario::new(vec![Post::plain("lantern.zip", archive(deflated))]);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
 }
 
 #[tokio::test]
-async fn an_aes_zip_with_the_job_password_is_extracted_under_both_engines() {
+async fn an_aes_zip_with_the_job_password_is_extracted() {
     let enciphered = stored().with_aes_encryption(AesMode::Aes256, SECRET);
     let scenario =
         Scenario::new(vec![Post::plain("lantern.zip", archive(enciphered))]).password(SECRET);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
-    assert_same(&classic, &graph);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
 }
 
 pub(super) fn deflated() -> Vec<u8> {
@@ -221,18 +189,17 @@ pub(super) fn deflated() -> Vec<u8> {
 }
 
 // The deflated zip cut into articles of every size from the whole file down
-// to a byte (4 KiB is the whole file again): one outcome and one set of files
-// under both engines, and neither refetches.
+// to a byte (4 KiB is the whole file again): one outcome and one set of files,
+// and nothing is refetched.
 #[tokio::test]
-async fn a_deflate_zip_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn a_deflate_zip_delivers_alike_in_every_frame_size() {
     let mut seen = None;
     for size in [usize::MAX, 4096, 64, 1] {
         let scenario = Scenario::new(vec![Post::plain("lantern.zip", deflated())]).framed(size);
-        let (classic, graph) = run_both(&scenario).await;
-        assert_members(&classic);
+        let graph = run(&scenario).await;
         assert_members(&graph);
         assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
-        assert_same(&classic, &graph);
+        assert_fetched_once(&graph);
         let files = seen.get_or_insert_with(|| graph.files.clone());
         assert_eq!(*files, graph.files, "frames of {size} bytes");
     }
@@ -242,18 +209,17 @@ async fn a_deflate_zip_delivers_alike_in_every_frame_size_under_both_engines() {
 // entries to the engine, whose run asks for a password, fails the wrong one
 // and asks again; each candidate is offered once.
 #[tokio::test]
-async fn an_aes_zip_tries_a_wrong_candidate_once_then_the_right_one_under_both_engines() {
+async fn an_aes_zip_tries_a_wrong_candidate_once_then_the_right_one() {
     let enciphered = stored().with_aes_encryption(AesMode::Aes256, SECRET);
     let scenario = Scenario::new(vec![Post::plain("lantern.zip", archive(enciphered))])
         .global_password("cinder-wrong-guess")
         .global_password(SECRET);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert_eq!(kinds(&graph), ["zip", "zip_engine"]);
     let offered: Vec<_> = graph.graph().offered.values().copied().collect();
     assert_eq!(offered, [2], "one try for each of the two candidates");
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 // The second entry's local header.
@@ -271,35 +237,16 @@ fn second_local(bytes: &[u8]) -> usize {
 // quill.bin's deflated stream damaged with no PAR2, in 16-byte articles: the
 // fifth article past its local header's, inside its data. The engine opens
 // the archive from its records alone, closes ember.bin whole, then fails on
-// quill.bin's lost bytes: graph delivers ember.bin as written, leaves
-// quill.bin out, puts the container as posted in its place, and ends the job
-// Partial. Divergence: classic fails the job (Repair) and delivers nothing.
+// quill.bin's lost bytes: ember.bin is delivered as written, quill.bin left
+// out, the container as posted put in its place, and the job ends Partial.
 #[tokio::test]
-async fn a_deflate_zip_with_a_damaged_member_and_no_par2_delivers_the_members_it_closed_under_graph()
- {
+async fn a_deflate_zip_with_a_damaged_member_and_no_par2_delivers_the_members_it_closed() {
     let bytes = deflated();
     let damaged = (second_local(&bytes) / 16 + 4) as u32;
     let scenario = Scenario::new(vec![Post::plain("lantern.zip", bytes.clone())])
         .framed(16)
         .damaged(0, damaged);
-    let (classic, graph) = run_both(&scenario).await;
-
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "classic: {:?}",
-        classic.status
-    );
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Repair));
-    assert!(
-        classic.files.is_empty(),
-        "classic: {:?}",
-        classic.files.keys()
-    );
-    assert!(
-        classic.refetched().is_empty(),
-        "classic: {:?}",
-        classic.refetched()
-    );
+    let graph = run(&scenario).await;
 
     assert_eq!(
         graph.status,
@@ -337,16 +284,9 @@ async fn a_deflate_zip_with_a_damaged_member_and_no_par2_delivers_the_members_it
 // a leaf until `.z01` binds the store, which is then offered it. Its name
 // gives no number, so it binds as the symbolic last volume and `.z02` still
 // takes its own; the store learns the `.zip`'s disk from the end record in
-// its tail and maps. Classic opens the first file as the whole zip and
-// fails (Unpack).
+// its tail and maps.
 async fn spanned_out_of_order(scenario: Scenario) -> Outcome {
-    let (classic, graph) = run_both(&scenario).await;
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "classic: {:?}",
-        classic.status
-    );
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert!(
         graph.refetched().is_empty(),
@@ -357,7 +297,7 @@ async fn spanned_out_of_order(scenario: Scenario) -> Outcome {
 }
 
 #[tokio::test]
-async fn a_stored_zip_spanned_and_posted_last_volume_first_delivers_its_members_under_graph() {
+async fn a_stored_zip_spanned_and_posted_last_volume_first_delivers_its_members() {
     let mut volumes = spanned(&archive(stored()), 3);
     volumes.rotate_right(1);
     assert_eq!(volumes[0].name, "lantern.zip");
@@ -365,7 +305,7 @@ async fn a_stored_zip_spanned_and_posted_last_volume_first_delivers_its_members_
 }
 
 #[tokio::test]
-async fn a_stored_zip_spanned_and_posted_backwards_delivers_its_members_under_graph() {
+async fn a_stored_zip_spanned_and_posted_backwards_delivers_its_members() {
     let mut volumes = spanned(&archive(stored()), 3);
     volumes.reverse();
     spanned_out_of_order(Scenario::new(volumes)).await;
@@ -375,7 +315,7 @@ async fn a_stored_zip_spanned_and_posted_backwards_delivers_its_members_under_gr
 // `.zip` bound as the symbolic last volume, and the engine's run walks the
 // bound volumes in their order, the `.zip` after `.z02`.
 #[tokio::test]
-async fn a_deflate_zip_spanned_and_posted_last_volume_first_delivers_its_members_under_graph() {
+async fn a_deflate_zip_spanned_and_posted_last_volume_first_delivers_its_members() {
     let mut volumes = spanned(&deflated(), 3);
     volumes.rotate_right(1);
     assert_eq!(volumes[0].name, "lantern.zip");
@@ -384,7 +324,7 @@ async fn a_deflate_zip_spanned_and_posted_last_volume_first_delivers_its_members
 }
 
 #[tokio::test]
-async fn an_aes_zip_spanned_and_posted_last_volume_first_delivers_its_members_under_graph() {
+async fn an_aes_zip_spanned_and_posted_last_volume_first_delivers_its_members() {
     let enciphered = stored().with_aes_encryption(AesMode::Aes256, SECRET);
     let mut volumes = spanned(&archive(enciphered), 3);
     volumes.rotate_right(1);
@@ -398,7 +338,7 @@ async fn an_aes_zip_spanned_and_posted_last_volume_first_delivers_its_members_un
 // binding after it is the conflict: the store gives the set up to the
 // engine, which walks `.z01`, `.z02` and the `.zip` in their order.
 #[tokio::test]
-async fn a_zip_whose_last_disk_starts_at_an_entry_posted_last_volume_first_delivers_through_the_engine_under_graph()
+async fn a_zip_whose_last_disk_starts_at_an_entry_posted_last_volume_first_delivers_through_the_engine()
  {
     let single = archive(stored());
     let boundary = SPANNING_MARKER.len() + second_local(&single);
@@ -414,15 +354,13 @@ async fn a_zip_whose_last_disk_starts_at_an_entry_posted_last_volume_first_deliv
 // repairs it in the stream and the engine reads it whole, with no refetch.
 // The engine waits at the damaged article until the PAR2 set has ruled on
 // the archive, which it does only once its index is in and it covers it.
-// Classic repairs it at the end and fetches nothing twice either.
 #[tokio::test]
-async fn a_deflate_zip_damaged_beside_par2_is_repaired_with_no_refetch_under_both_engines() {
+async fn a_deflate_zip_damaged_beside_par2_is_repaired_with_no_refetch() {
     let bytes = deflated();
     let mut posts = vec![Post::plain("lantern.zip", bytes.clone())];
     posts.extend(par2_set("lantern", &[("lantern.zip", &bytes)], 2));
     let scenario = Scenario::new(posts).damaged(0, 1);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert!(kinds(&graph).contains(&"par2"), "{:?}", kinds(&graph));
     assert!(graph.reads > 0, "the repair read its slices");
@@ -430,11 +368,6 @@ async fn a_deflate_zip_damaged_beside_par2_is_repaired_with_no_refetch_under_bot
         graph.refetched().is_empty(),
         "graph: {:?}",
         graph.refetched()
-    );
-    assert!(
-        classic.refetched().is_empty(),
-        "classic: {:?}",
-        classic.refetched()
     );
 }
 
@@ -468,11 +401,11 @@ fn code_page_437(options: SimpleFileOptions) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn a_zip_naming_its_entry_in_code_page_437_delivers_it_decoded_under_graph() {
+async fn a_zip_naming_its_entry_in_code_page_437_delivers_it_decoded() {
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for options in [stored(), deflated] {
         let scenario = Scenario::new(vec![Post::plain("lantern.zip", code_page_437(options))]);
-        let (classic, graph) = run_both(&scenario).await;
+        let graph = run(&scenario).await;
         assert!(graph.completed(), "graph: {:?}", graph.failure);
         assert_eq!(
             graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -480,7 +413,7 @@ async fn a_zip_naming_its_entry_in_code_page_437_delivers_it_decoded_under_graph
             "graph: delivered names"
         );
         assert!(graph.files[&delivered("café.bin")] == members()[0].1);
-        assert_same(&classic, &graph);
+        assert_fetched_once(&graph);
     }
 }
 
@@ -493,27 +426,23 @@ fn with_empty_directory(options: SimpleFileOptions) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-// The empty directory is delivered as a directory by both engines, stored
+// The empty directory is delivered as a directory, stored
 // through the store and deflated through the engine.
 #[tokio::test]
-async fn a_zip_holding_an_empty_directory_delivers_it_under_both_engines() {
+async fn a_zip_holding_an_empty_directory_delivers_it() {
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for options in [stored(), deflated] {
         let scenario = Scenario::new(vec![Post::plain(
             "lantern.zip",
             with_empty_directory(options),
         )]);
-        let (classic, graph) = run_both(&scenario).await;
-        assert!(classic.completed(), "classic: {:?}", classic.failure);
-        let hollow = [delivered("hollow/")];
+        let graph = run(&scenario).await;
+        assert!(graph.completed(), "{:?}", graph.failure);
         assert_eq!(
-            (
-                classic.empty.iter().collect::<Vec<_>>(),
-                graph.empty.iter().collect::<Vec<_>>()
-            ),
-            (hollow.iter().collect(), hollow.iter().collect()),
-            "(classic, graph) empty directories"
+            graph.empty.iter().collect::<Vec<_>>(),
+            [&delivered("hollow/")],
+            "empty directories"
         );
-        assert_same(&classic, &graph);
+        assert_fetched_once(&graph);
     }
 }

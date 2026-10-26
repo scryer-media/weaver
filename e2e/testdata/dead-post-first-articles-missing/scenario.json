@@ -19,10 +19,5 @@
   ],
   "deleteSubjectContains": [
     ".rar"
-  ],
-  "runtimeAssertions": {
-    "healthProbe": {
-      "forbidInconclusive": true
-    }
-  }
+  ]
 }

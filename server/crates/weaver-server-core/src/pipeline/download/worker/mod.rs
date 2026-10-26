@@ -7,7 +7,6 @@ use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
-mod direct_store;
 mod eligibility;
 mod lanes;
 mod leases;
@@ -38,8 +37,6 @@ struct DownloadPipelineBacklog {
     released_results: usize,
     released_result_bytes: u64,
     pending_decodes: usize,
-    buffered_write_segments: usize,
-    buffered_write_bytes: u64,
 }
 
 const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
@@ -617,16 +614,6 @@ impl Pipeline {
             > 0;
 
         if in_flight == 0 && !has_remaining_work {
-            // No more bytes are coming for this job. A chase whose parts all
-            // finished runs on to the end; one still missing a part would park
-            // forever, so it is ended here.
-            //
-            // A health probe still in flight is in the same position: its
-            // estimate has been overtaken by the job's own terminal states, and
-            // leaving it running only holds the job in `Checking` — and the
-            // completion checkpoint with it — until the probe times out.
-            self.retire_health_probe_if_download_pipeline_drained(job_id);
-            self.settle_direct_unpack_after_download(job_id);
             self.emit_download_finished_if_active(job_id);
             self.schedule_job_completion_check(job_id);
         }
@@ -732,55 +719,23 @@ impl Pipeline {
         // but could not be placed is retried on the tick.
         self.download_dispatch_retry = !eligible.is_empty();
         if eligible.is_empty() && self.active_downloads == 0 {
-            let mut drained_parked_recovery_jobs = Vec::new();
             // Collected rather than logged in place: the warning is throttled
             // per job, and the throttle needs `&mut self` while this walk
             // borrows `job_order`.
             let mut ineligible_jobs = Vec::new();
             for (i, jid) in self.job_order.iter().enumerate() {
                 if let Some(s) = self.jobs.get(jid) {
-                    let parked_recovery = self.parked_recovery(*jid);
-                    let parked_recovery_only = s.download_queue.is_empty() && parked_recovery;
                     let status_allows_dispatch = Self::status_allows_download_dispatch(&s.status);
-                    let extraction_only_idle = parked_recovery_only
-                        && matches!(s.status, JobStatus::QueuedExtract | JobStatus::Extracting);
                     let download_pipeline_draining = s.download_queue.is_empty()
                         && status_allows_dispatch
                         && self.job_has_pending_download_pipeline_work(*jid);
-                    let should_schedule_completion = parked_recovery_only
-                        && status_allows_dispatch
-                        && !self.job_has_pending_download_pipeline_work(*jid);
-                    if extraction_only_idle {
+                    if download_pipeline_draining {
                         debug!(
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
                             queue_len = s.download_queue.len(),
                             recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
-                            status_allows_dispatch,
-                            "dispatch idle: extraction-only recovery queued"
-                        );
-                    } else if should_schedule_completion {
-                        debug!(
-                            job_id = jid.0,
-                            idx = i,
-                            status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
-                            status_allows_dispatch,
-                            "dispatch idle: parked recovery queued; scheduling completion check"
-                        );
-                        drained_parked_recovery_jobs.push(*jid);
-                    } else if download_pipeline_draining {
-                        debug!(
-                            job_id = jid.0,
-                            idx = i,
-                            status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
                         );
@@ -811,27 +766,10 @@ impl Pipeline {
                             status = ?s.status,
                             queue_len = s.download_queue.len(),
                             recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
                             status_allows_dispatch,
                             "dispatch idle: job not eligible by status"
                         );
-                    } else if parked_recovery_only && !status_allows_dispatch {
-                        // Recovery parked behind a phase that dispatches
-                        // nothing — moving the output, say — is waiting for
-                        // that phase, not stalled. The phase ends it.
-                        debug!(
-                            job_id = jid.0,
-                            idx = i,
-                            status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
-                            status_allows_dispatch,
-                            "dispatch idle: parked recovery behind a non-dispatching phase"
-                        );
-                    } else if !status_allows_dispatch
-                        || (s.download_queue.is_empty() && !parked_recovery)
-                    {
+                    } else if !status_allows_dispatch || s.download_queue.is_empty() {
                         // A job with nothing queued to fetch — its download is
                         // done and it is verifying, extracting or moving its
                         // output, or its last articles are still settling — is
@@ -844,7 +782,6 @@ impl Pipeline {
                             status = ?s.status,
                             queue_len = s.download_queue.len(),
                             recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
                             status_allows_dispatch,
                             "dispatch idle: nothing for dispatch to hand out"
                         );
@@ -855,21 +792,13 @@ impl Pipeline {
                             s.status.clone(),
                             s.download_queue.len(),
                             s.recovery_queue.len(),
-                            parked_recovery_only,
                             status_allows_dispatch,
                         ));
                     }
                 }
             }
-            for (
-                job_id,
-                idx,
-                status,
-                queue_len,
-                recovery_len,
-                parked_recovery_only,
-                status_allows_dispatch,
-            ) in ineligible_jobs
+            for (job_id, idx, status, queue_len, recovery_len, status_allows_dispatch) in
+                ineligible_jobs
             {
                 let Some(suppressed_since_last) = self
                     .dispatch_ineligible_log_throttle
@@ -883,18 +812,11 @@ impl Pipeline {
                     status = ?status,
                     queue_len,
                     recovery_len,
-                    parked_recovery_only,
                     status_allows_dispatch,
                     suppressed_since_last,
                     "dispatch stall: job not eligible"
                 );
                 crate::runtime::job_debug_ring::dump(job_id.0, "dispatch stall: job not eligible");
-            }
-            for job_id in drained_parked_recovery_jobs {
-                self.schedule_job_completion_check_if_download_pipeline_drained(
-                    job_id,
-                    "parked_recovery_idle",
-                );
             }
         }
 

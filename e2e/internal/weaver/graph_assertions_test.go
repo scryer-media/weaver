@@ -29,36 +29,13 @@ func wantVerdict(t *testing.T, err error, wantErr string) {
 	}
 }
 
-func TestEngineUnderTestReadsWeaverEngine(t *testing.T) {
-	for _, test := range []struct {
-		value string
-		want  weaverEngine
-	}{
-		{value: "", want: engineGraph},
-		{value: "classic", want: engineClassic},
-		{value: " ClAsSiC ", want: engineClassic},
-		{value: "pipeline", want: engineGraph},
-		{value: "graph", want: engineGraph},
-		{value: " GRAPH ", want: engineGraph},
-	} {
-		t.Setenv(weaverEngineEnv, test.value)
-		if got := engineUnderTest(); got != test.want {
-			t.Fatalf("WEAVER_ENGINE=%q: engine = %q, want %q", test.value, got, test.want)
-		}
-	}
-	os.Unsetenv(weaverEngineEnv)
-	if got := engineUnderTest(); got != engineGraph {
-		t.Fatalf("unset WEAVER_ENGINE: engine = %q, want graph", got)
-	}
-}
-
 func TestGraphLogEventsReadsContractFields(t *testing.T) {
 	raw := graphLog(
 		graphLine("member delivered", `job_id=7 name=CERTIFICATE/backup/id (1).bdmv from=CERTIFICATE/backup/id.bdmv depth=1 whole=true`),
 		graphLine("member delivered", `job_id=7 name="quoted \"name\".bin" from="quoted \"name\".bin" depth=0 whole=false`),
 		"\x1b[2m2026-10-18T10:00:00Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mweaver_server_core::pipeline::graph::namespace\x1b[0m\x1b[2m:\x1b[0m member delivered \x1b[3mjob_id\x1b[0m\x1b[2m=\x1b[0m7 \x1b[3mname\x1b[0m\x1b[2m=\x1b[0mcoloured.bin \x1b[3mfrom\x1b[0m\x1b[2m=\x1b[0mcoloured.bin \x1b[3mdepth\x1b[0m\x1b[2m=\x1b[0m0 \x1b[3mwhole\x1b[0m\x1b[2m=\x1b[0mtrue",
 		graphLine("member delivered", `job_id=70 name=other-job.bin from=other-job.bin depth=0 whole=true`),
-		`2026-10-18T10:00:00Z  INFO weaver_server_core::pipeline::completion: member delivered job_id=7 name=classic.bin`,
+		`2026-10-18T10:00:00Z  INFO weaver_server_core::pipeline::completion: member delivered job_id=7 name=elsewhere.bin`,
 		`2026-10-18T10:00:01Z  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=7 line=INFO weaver_server_core::pipeline::graph::status: member delivered job_id=7 name=replayed.bin`,
 	)
 	refusals := graphLogEvents(graphLine("object refused", `job_id=7 node=0 kind= member=notes.bin why=holds_breached`), 7, graphObjectRefusedMessage)
@@ -613,12 +590,10 @@ func TestGraphFileIdentityRewrite(t *testing.T) {
 	}
 }
 
-// Under graph the observer reads the log, not active_file_identities: there is
-// no database to open and no trigger to install.
+// The observer reads the graph's lines from the weaver log.
 func TestFileIdentityRewriteObserverReadsTheGraphLog(t *testing.T) {
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
-	t.Setenv(weaverEngineEnv, "graph")
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -626,11 +601,7 @@ func TestFileIdentityRewriteObserverReadsTheGraphLog(t *testing.T) {
 	if err := os.WriteFile(localWeaverLogPath(), []byte(log), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	missingDB := filepath.Join(runDir, "no-such-dir", "weaver.db")
-	if err := installFileIdentityRewriteObserver(missingDB); err != nil {
-		t.Fatalf("install under graph touched the database: %v", err)
-	}
-	observer, err := openFileIdentityRewriteObserver(missingDB)
+	observer, err := openFileIdentityRewriteObserver()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,68 +622,35 @@ func TestFileIdentityRewriteObserverReadsTheGraphLog(t *testing.T) {
 	}
 }
 
-// The engine-keyed fields take over only for the engine they name; under
-// classic every scenario reads exactly as before.
-func TestScenarioExpectationsAreEngineKeyed(t *testing.T) {
-	scenario := &Scenario{
-		ExpectedOutcome:               "extraction_failure",
-		ExpectedErrorContains:         "classic wording",
-		ExpectedOutcomeByEngine:       map[string]string{"graph": "success"},
-		ExpectedErrorContainsByEngine: map[string]string{"graph": "graph wording"},
-	}
-	t.Setenv(weaverEngineEnv, "classic")
-	if scenario.expectedOutcome() != "extraction_failure" || scenario.expectedErrorContains() != "classic wording" {
-		t.Fatalf("classic expectations = %q / %q", scenario.expectedOutcome(), scenario.expectedErrorContains())
-	}
-	os.Unsetenv(weaverEngineEnv)
-	if scenario.expectedOutcome() != "success" || scenario.expectedErrorContains() != "graph wording" {
-		t.Fatalf("graph expectations = %q / %q", scenario.expectedOutcome(), scenario.expectedErrorContains())
-	}
-	plain := &Scenario{ExpectedOutcome: "health_failure", ExpectedErrorContains: "only wording"}
-	if plain.expectedOutcome() != "health_failure" || plain.expectedErrorContains() != "only wording" {
-		t.Fatal("an engine the maps do not name falls back to the unkeyed fields")
-	}
-}
-
-func TestEngineKeyedScenarioFiles(t *testing.T) {
+func TestScenarioFileExpectations(t *testing.T) {
 	for _, test := range []struct {
-		slug         string
-		classic      string
-		classicError string
-		graph        string
-		graphError   string
+		slug    string
+		outcome string
+		error   string
 	}{
-		{slug: "dead-post-first-articles-missing", classic: "health_failure", classicError: "first articles are missing", graph: "health_failure", graphError: "first articles are missing"},
-		{slug: "dead-post-recovery-unobtainable", classic: "health_failure", classicError: "PAR2 metadata discovery exhausted", graph: "health_failure", graphError: "below critical"},
-		{slug: "rar5-colliding-member-paths", classic: "extraction_failure", graph: "success"},
+		{slug: "dead-post-first-articles-missing", outcome: "health_failure", error: "first articles are missing"},
+		{slug: "dead-post-recovery-unobtainable", outcome: "health_failure", error: "below critical"},
+		{slug: "rar5-colliding-member-paths", outcome: "success"},
+		{slug: "par2-ignorable-deficit", outcome: outcomePartialDelivery},
 	} {
 		scenario, err := loadScenario(filepath.Join(testdataDir(), test.slug))
 		if err != nil {
 			t.Fatalf("%s: %v", test.slug, err)
 		}
-		if got := scenario.expectedOutcomeFor(engineClassic); got != test.classic {
-			t.Fatalf("%s classic outcome = %q, want %q", test.slug, got, test.classic)
+		if got := scenario.expectedOutcome(); got != test.outcome {
+			t.Fatalf("%s outcome = %q, want %q", test.slug, got, test.outcome)
 		}
-		if got := scenario.expectedErrorContainsFor(engineClassic); got != test.classicError {
-			t.Fatalf("%s classic error = %q, want %q", test.slug, got, test.classicError)
-		}
-		if got := scenario.expectedOutcomeFor(engineGraph); got != test.graph {
-			t.Fatalf("%s graph outcome = %q, want %q", test.slug, got, test.graph)
-		}
-		if got := scenario.expectedErrorContainsFor(engineGraph); got != test.graphError {
-			t.Fatalf("%s graph error = %q, want %q", test.slug, got, test.graphError)
+		if got := scenario.expectedErrorContains(); got != test.error {
+			t.Fatalf("%s error = %q, want %q", test.slug, got, test.error)
 		}
 	}
 }
 
-// Under classic the assertions read the classic lines and nothing else: a log
-// holding only graph lines fails them, the classic lines pass. With
-// WEAVER_ENGINE unset the same assertions read the graph lines, and the
-// direct-store one is judged without the classic gate.
-func TestRuntimeAssertionsFollowTheEngineUnderTest(t *testing.T) {
+// The runtime assertions read the graph's lines: a log holding only lines the
+// graph never writes fails them.
+func TestRuntimeAssertionsReadTheGraphLines(t *testing.T) {
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
-	t.Setenv("WEAVER_RAR_DIRECT_STORE", "")
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -726,10 +664,6 @@ func TestRuntimeAssertionsFollowTheEngineUnderTest(t *testing.T) {
 		ExpectedSetSliceSizes:        map[string]uint64{"aa11": 65536},
 		ExpectedSetVerificationModes: map[string][]string{"aa11": {"grid"}},
 	}
-	classicLines := []string{
-		`job_id=70 recovery_set_id=aa11 slice_size=65536 verification_mode=grid PAR2 clean set verification source`,
-		`job_id=70 recovery_set_id=aa11 slice_size=65536 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-	}
 	graphRuled := graphLine("recovery set ruled", `job_id=70 node=1 kind=par2 set=a.par2 recovery_set_id=aa11 slice_size=65536 blocks_reachable=4 damaged_slices=0 outcome=clean slices_repaired=0 verification=grid`)
 	directStore := &Scenario{
 		Slug:              "graph-twin-direct-store",
@@ -738,20 +672,7 @@ func TestRuntimeAssertionsFollowTheEngineUnderTest(t *testing.T) {
 	}
 	graphImpossible := graphLine("recovery set ruled", `job_id=70 node=1 kind=par2 set=a.par2 recovery_set_id=aa11 slice_size=65536 blocks_reachable=1 damaged_slices=9 outcome=impossible slices_repaired=0 verification=`)
 
-	t.Setenv(weaverEngineEnv, "classic")
-	writeLog(graphRuled)
-	wantVerdict(t, assertPar2CleanSettlement(70, settlement), "did not observe set(s): aa11")
-	writeLog(classicLines...)
-	wantVerdict(t, assertPar2CleanSettlement(70, settlement), "")
-	// Classic judges direct-store only with its gate on.
-	writeLog(graphImpossible)
-	wantVerdict(t, assertDirectStoreScenario(70, directStore), "")
-	t.Setenv("WEAVER_RAR_DIRECT_STORE", "1")
-	wantVerdict(t, assertDirectStoreScenario(70, directStore), `did not demote with "par2_damaged"`)
-	t.Setenv("WEAVER_RAR_DIRECT_STORE", "")
-
-	os.Unsetenv(weaverEngineEnv)
-	writeLog(classicLines...)
+	writeLog(`job_id=70 recovery_set_id=aa11 slice_size=65536 verification_mode=grid PAR2 clean set verification source`)
 	wantVerdict(t, assertPar2CleanSettlement(70, settlement), "no recovery set ruled line for set(s): aa11")
 	writeLog(graphRuled)
 	wantVerdict(t, assertPar2CleanSettlement(70, settlement), "")
@@ -790,13 +711,11 @@ func TestGraphDirectStoreEngagementVerdict(t *testing.T) {
 	}
 }
 
-// Under graph the phase-level engagement check reads every job's lines from
-// the weaver log, with no direct-store gate and no metrics query.
+// The phase-level engagement check reads every job's lines from the weaver
+// log.
 func TestAssertDirectStoreEngagementReadsTheGraphLog(t *testing.T) {
 	runDir := t.TempDir()
 	t.Setenv("E2E_RUN_DIR", runDir)
-	t.Setenv("WEAVER_RAR_DIRECT_STORE", "")
-	t.Setenv(weaverEngineEnv, "graph")
 	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -807,16 +726,10 @@ func TestAssertDirectStoreEngagementReadsTheGraphLog(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// An unreachable URL: under graph the counters are never queried.
-	const noWeaver = "http://127.0.0.1:1/graphql"
 	writeLog(graphLine("object bound", `job_id=92 node=2 kind=rar_store over=archive.part1.rar depth=0`))
-	wantVerdict(t, assertDirectStoreEngagement(noWeaver, jobs), "")
+	wantVerdict(t, assertDirectStoreEngagement(jobs), "")
 	writeLog(graphLine("object bound", `job_id=91 node=2 kind=rar_engine over=archive.part1.rar depth=0`))
-	wantVerdict(t, assertDirectStoreEngagement(noWeaver, jobs), "no job of the phase bound a store object")
-
-	// Classic with its gate off stays a no-op, whatever the log holds.
-	t.Setenv(weaverEngineEnv, string(engineClassic))
-	wantVerdict(t, assertDirectStoreEngagement(noWeaver, jobs), "")
+	wantVerdict(t, assertDirectStoreEngagement(jobs), "no job of the phase bound a store object")
 }
 
 func TestFileIdentityRewriteFailureNamesItsEvidence(t *testing.T) {
@@ -826,15 +739,6 @@ func TestFileIdentityRewriteFailureNamesItsEvidence(t *testing.T) {
 		ObservedCurrentFilenames: []string{"archive.part1.rar (par2)"},
 	}
 
-	t.Setenv(weaverEngineEnv, string(engineClassic))
-	if got := empty.terminalFailureMessage("failed", ""); !strings.Contains(got, "no matching active_file_identities rows were observed") {
-		t.Fatalf("classic message = %q", got)
-	}
-	if got := seen.terminalFailureMessage("failed", ""); !strings.Contains(got, "effective file identity rows: archive.part1.rar (par2)") || strings.Contains(got, "graph") {
-		t.Fatalf("classic message = %q", got)
-	}
-
-	t.Setenv(weaverEngineEnv, "graph")
 	if got := empty.terminalFailureMessage("failed", ""); !strings.Contains(got, "no matching graph log lines") || strings.Contains(got, "active_file_identities") {
 		t.Fatalf("graph message = %q", got)
 	}

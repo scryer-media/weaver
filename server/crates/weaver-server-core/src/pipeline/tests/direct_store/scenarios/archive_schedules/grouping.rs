@@ -5,23 +5,17 @@
 //
 // A cell is a container, the names its volumes are posted under, and what
 // else the post carries that could group or order them. [`rule`] states, for
-// every cell, whether a single job can present it at all and, if it can,
-// what each extraction profile must make of it: the volume set direct store
-// admits by name alone, and whether the job extracts direct, streams through
-// chase, extracts after download, demotes for a named reason, or fails.
+// every cell, whether a single job can present it at all.
 //
-// The ruling is an exhaustive match over the axes with no fallback arm, so a
-// value added to any axis does not compile until every cell it opens has an
-// expectation. The hand-named [`Format`](super::Format) layouts are aliases
-// of cells, and take their direct-store route from here.
+// The ruling is an exhaustive match over the axes, so a value added to any
+// axis does not compile until every cell it opens is ruled.
 //
 // The cells reuse the matrix's synthetic stored-volume builders and the 7z
 // writer; nothing here is a captured post.
-use super::super::sevenz_store::schedules::{LOSES, map_slots, unrepeated_payload};
+use super::super::sevenz_store::schedules::unrepeated_payload;
 use super::super::sevenz_store::{Entry, build_7z_shaped, sevenz_job_spec, split_volumes};
 use super::*;
-use crate::pipeline::direct_store::plan::{AdmissionRefusal, DirectSetPlan};
-use crate::pipeline::tests::rar_extraction::single_member_rar4_old_numbering_set;
+use crate::pipeline::tests::single_member_rar4_old_numbering_set;
 
 // What the volumes are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,20 +30,11 @@ pub(in crate::pipeline::tests) enum Container {
     SevenZip,
     SevenZipSolid,
     // Solid compressed sets a real archiver wrote, with the data encrypted
-    // under plain headers or not: direct store refuses every member, so
-    // they extract by the fallback route.
+    // under plain headers or not.
     Rar4Solid,
     Rar4SolidEncrypted,
     Rar5Solid,
     Rar5SolidEncrypted,
-    // Codec and integrity variants the grouping cross does not vary; they
-    // exist as cells only so their hand-named formats alias to one.
-    Rar4Encrypted,
-    Rar4Unsalted,
-    Rar5KeyedChecksum,
-    Rar5UncheckedHeaders,
-    QuickOpen,
-    Blake2,
 }
 
 // The names the volumes are posted under.
@@ -103,12 +88,6 @@ pub(in crate::pipeline::tests) enum Binding {
     Sfv,
     // Nothing besides the volumes.
     Nothing,
-    // The matrix's own: a PAR2 index under the posted names, posted only
-    // when the schedule loses something. The hand-named formats' binding.
-    LegacyOnLoss,
-    // The matrix's own obfuscated binding: a PAR2 index with the real names,
-    // ahead of the volumes unless the schedule's loss puts it last.
-    LegacyReal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,49 +97,11 @@ pub(in crate::pipeline::tests) struct Cell {
     pub binding: Binding,
 }
 
-// What direct store's name-only discovery makes of the posted names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Admission {
-    // One set, admitted by name.
-    Named,
-    // No set admitted; this refusal named.
-    Refused(AdmissionRefusal),
-    // One set admitted by name, and another under a name that differs
-    // only in case refused for this.
-    Split(AdmissionRefusal),
-    // Nothing the names say forms a set.
-    Unnamed,
-}
-
-// What one extraction profile must make of a cell.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum Expect {
-    // Direct store finalizes the set from its own partials.
-    Direct,
-    // No direct set; chase streams the extraction while it downloads.
-    Streams,
-    // Direct store demotes the set for a reason this accepts; the job then
-    // extracts by the fallback route.
-    Demotes(fn(DemotionReason) -> bool),
-    // Extracted after download, with neither direct store nor chase.
-    Downloads,
-    // The job fails with an error naming this, and publishes nothing.
-    Fails(&'static str),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Expectation {
-    pub admission: Admission,
-    pub direct_store: Expect,
-    pub chase: Expect,
-    pub conventional: Expect,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Ruling {
     // No single job can present this cell, for the stated reason.
     Impossible(&'static str),
-    Possible(Expectation),
+    Possible,
 }
 
 macro_rules! any_naming {
@@ -190,41 +131,7 @@ macro_rules! any_binding {
             | Binding::Par2Posted
             | Binding::Sfv
             | Binding::Nothing
-            | Binding::LegacyOnLoss
-            | Binding::LegacyReal
     };
-}
-
-fn rar_ineligible(reason: MemberIneligibility) -> fn(DemotionReason) -> bool {
-    match reason {
-        MemberIneligibility::Blake2OnlyNoCrc32 => |reason| {
-            matches!(
-                reason,
-                DemotionReason::MemberIneligible(MemberIneligibility::Blake2OnlyNoCrc32)
-            )
-        },
-        MemberIneligibility::MalformedChain => |reason| {
-            matches!(
-                reason,
-                DemotionReason::MemberIneligible(MemberIneligibility::MalformedChain)
-            )
-        },
-        other => unreachable!("no cell demotes for {other:?}"),
-    }
-}
-
-fn sevenz_coder(reason: DemotionReason) -> bool {
-    matches!(reason, DemotionReason::SevenZip(SevenZipRefusal::Coder))
-}
-
-// The same expectation under every profile but direct store.
-const fn fallback(admission: Admission, direct_store: Expect) -> Expectation {
-    Expectation {
-        admission,
-        direct_store,
-        chase: Expect::Streams,
-        conventional: Expect::Downloads,
-    }
 }
 
 impl Container {
@@ -278,39 +185,6 @@ impl Container {
             Self::Rar5 | Self::Rar5Encrypted | Self::Rar5Solid | Self::Rar5SolidEncrypted
         )
     }
-
-    // What direct store does with a set it has admitted.
-    fn admitted(self) -> Expect {
-        match self {
-            Self::SevenZipSolid => Expect::Demotes(sevenz_coder),
-            Self::Rar4Solid
-            | Self::Rar4SolidEncrypted
-            | Self::Rar5Solid
-            | Self::Rar5SolidEncrypted => Expect::Demotes(|reason| {
-                matches!(
-                    reason,
-                    DemotionReason::MemberIneligible(
-                        MemberIneligibility::Compressed
-                            | MemberIneligibility::Solid
-                            | MemberIneligibility::Encrypted
-                    )
-                )
-            }),
-            Self::Rar5UncheckedHeaders => Expect::Demotes(|reason| {
-                matches!(reason, DemotionReason::HeaderEncryptedRefused(_))
-            }),
-            Self::Blake2 => Expect::Demotes(rar_ineligible(MemberIneligibility::Blake2OnlyNoCrc32)),
-            Self::Rar4
-            | Self::Rar5
-            | Self::Rar5Encrypted
-            | Self::Rar5EncryptedHeaders
-            | Self::SevenZip
-            | Self::Rar4Encrypted
-            | Self::Rar4Unsalted
-            | Self::Rar5KeyedChecksum
-            | Self::QuickOpen => Expect::Direct,
-        }
-    }
 }
 
 // Every cell's ruling. See the module documentation.
@@ -320,78 +194,7 @@ pub(super) fn rule(cell: Cell) -> Ruling {
         naming,
         binding,
     } = cell;
-    match container {
-        Container::Rar4Encrypted
-        | Container::Rar4Unsalted
-        | Container::Rar5KeyedChecksum
-        | Container::Rar5UncheckedHeaders
-        | Container::QuickOpen
-        | Container::Blake2 => match (naming, binding) {
-            (Naming::Conventional, Binding::LegacyOnLoss) => {
-                Ruling::Possible(fallback(Admission::Named, container.admitted()))
-            }
-            (Naming::ConventionalFour, Binding::LegacyOnLoss)
-                if container == Container::Rar4Encrypted =>
-            {
-                Ruling::Possible(fallback(Admission::Named, container.admitted()))
-            }
-            (any_naming!(), any_binding!()) => {
-                Ruling::Impossible("a codec or integrity variant the grouping cross does not vary")
-            }
-        },
-        Container::Rar4
-        | Container::Rar5
-        | Container::Rar5Encrypted
-        | Container::Rar5EncryptedHeaders
-        | Container::SevenZip
-        | Container::SevenZipSolid
-        | Container::Rar4Solid
-        | Container::Rar4SolidEncrypted
-        | Container::Rar5Solid
-        | Container::Rar5SolidEncrypted => crossed(cell),
-    }
-}
-
-fn crossed(cell: Cell) -> Ruling {
-    let Cell {
-        container,
-        naming,
-        binding,
-    } = cell;
     let sevenz = container.is_sevenz();
-    // Whether a PAR2 index naming the real volumes is in hand before any
-    // volume byte lands: the roster that admits a set no name or header does.
-    let roster = matches!(binding, Binding::Par2RealFirst | Binding::LegacyReal);
-    // A set nothing names: its own headers admit it, or an index in time
-    // does, or nothing does and it extracts once downloaded.
-    let unnamed = |single: bool| {
-        if container.headers_chain() || (sevenz && single) || roster {
-            container.admitted()
-        } else {
-            Expect::Streams
-        }
-    };
-    // A 7z continuation volume carries no header of its own, so with no
-    // real-name index nothing but the name orders it.
-    let real = binding.names_real();
-    let unordered = Expectation {
-        admission: Admission::Unnamed,
-        direct_store: Expect::Fails(UNORDERED_7Z),
-        chase: Expect::Fails(UNORDERED_7Z),
-        conventional: Expect::Fails(UNORDERED_7Z),
-    };
-    // Names discovery refuses: the volumes' own headers or an index in time
-    // admit the set, else it extracts by the fallback route.
-    let by_roster = |admission| {
-        fallback(
-            admission,
-            if roster || container.headers_chain() {
-                container.admitted()
-            } else {
-                Expect::Streams
-            },
-        )
-    };
     match (naming, binding) {
         (Naming::OldStyle | Naming::HexSwappedRar, any_binding!()) if sevenz => {
             Ruling::Impossible("a RAR naming")
@@ -409,155 +212,15 @@ fn crossed(cell: Cell) -> Ruling {
             | Naming::Single
             | Naming::MixedCase
             | Naming::OldStyle,
-            Binding::Par2Posted | Binding::LegacyReal,
+            Binding::Par2Posted,
         ) => Ruling::Impossible(
             "the posted names are the real ones, so describing them is the Par2Real binding",
         ),
         (
             Naming::Reposted | Naming::HexReposted,
-            Binding::Par2RealFirst | Binding::Par2RealLast | Binding::Sfv | Binding::LegacyReal,
+            Binding::Par2RealFirst | Binding::Par2RealLast | Binding::Sfv,
         ) => Ruling::Impossible("a real-name listing names each volume once, not each copy"),
-        (
-            Naming::Conventional
-            | Naming::ConventionalFour
-            | Naming::Single
-            | Naming::MixedCase
-            | Naming::OldStyle,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss,
-        ) => Ruling::Possible(fallback(Admission::Named, container.admitted())),
-        (
-            Naming::HexBare | Naming::HexMisnumbered | Naming::HexScattered,
-            Binding::Par2Posted | Binding::Sfv | Binding::Nothing | Binding::LegacyOnLoss,
-        ) if sevenz && !real => Ruling::Possible(unordered),
-        (
-            Naming::HexBare | Naming::HexMisnumbered | Naming::HexScattered,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Par2Posted
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss
-            | Binding::LegacyReal,
-        ) => Ruling::Possible(fallback(Admission::Unnamed, unnamed(false))),
-        (
-            Naming::HexSingle,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Par2Posted
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss
-            | Binding::LegacyReal,
-        ) => Ruling::Possible(fallback(Admission::Unnamed, unnamed(true))),
-        // A solid set refuses its member from the first header it reads,
-        // which may come before the chain is seen to run backwards.
-        (Naming::HexSwappedRar, any_binding!()) if container.is_solid_rar() => {
-            Ruling::Possible(fallback(
-                Admission::Named,
-                Expect::Demotes(|reason| {
-                    matches!(
-                        reason,
-                        DemotionReason::MemberIneligible(
-                            MemberIneligibility::Compressed
-                                | MemberIneligibility::Solid
-                                | MemberIneligibility::Encrypted
-                                | MemberIneligibility::MalformedChain
-                        )
-                    )
-                }),
-            ))
-        }
-        // Names that admit a set whose headers then chain the other way
-        // round: direct store demotes it as malformed.
-        (
-            Naming::HexSwappedRar,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Par2Posted
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss
-            | Binding::LegacyReal,
-        ) => Ruling::Possible(fallback(
-            Admission::Named,
-            Expect::Demotes(rar_ineligible(MemberIneligibility::MalformedChain)),
-        )),
-        // The missing part is reported, never renumbered around.
-        (
-            Naming::HexNumberedGap,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Par2Posted
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss
-            | Binding::LegacyReal,
-        ) => Ruling::Possible(Expectation {
-            admission: Admission::Unnamed,
-            direct_store: Expect::Fails(MISSING_PART),
-            chase: Expect::Fails(MISSING_PART),
-            conventional: Expect::Fails(MISSING_PART),
-        }),
-        (
-            Naming::FirstVolumeHex,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Par2Posted
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss
-            | Binding::LegacyReal,
-        ) => Ruling::Possible(by_roster(Admission::Refused(AdmissionRefusal::VolumeGap))),
-        // Each volume posted twice under two numberings: refused, and
-        // extracted once the copies are down.
-        (Naming::Reposted, Binding::Par2Posted | Binding::Nothing | Binding::LegacyOnLoss) => {
-            Ruling::Possible(Expectation {
-                admission: Admission::Refused(AdmissionRefusal::DuplicateVolume),
-                direct_store: Expect::Downloads,
-                chase: Expect::Downloads,
-                conventional: Expect::Downloads,
-            })
-        }
-        (Naming::HexReposted, Binding::Par2Posted | Binding::Nothing | Binding::LegacyOnLoss)
-            if sevenz =>
-        {
-            Ruling::Possible(unordered)
-        }
-        (Naming::HexReposted, Binding::Par2Posted | Binding::Nothing | Binding::LegacyOnLoss) => {
-            Ruling::Possible(fallback(Admission::Unnamed, unnamed(false)))
-        }
-        (
-            Naming::BareFirstPart,
-            Binding::Par2RealFirst
-            | Binding::Par2RealLast
-            | Binding::Par2Posted
-            | Binding::Sfv
-            | Binding::Nothing
-            | Binding::LegacyOnLoss
-            | Binding::LegacyReal,
-        ) => Ruling::Possible(by_roster(Admission::Refused(
-            AdmissionRefusal::MixedSevenZipShape,
-        ))),
-    }
-}
-
-// What a job missing a volume says about it.
-const MISSING_PART: &str = "missing";
-
-// What a job whose 7z continuation volumes nothing orders says.
-const UNORDERED_7Z: &str = "failed to read 7z archive";
-
-impl Expectation {
-    fn of(self, profile: ExtractionProfile) -> Expect {
-        match profile {
-            ExtractionProfile::DirectStore => self.direct_store,
-            ExtractionProfile::Chase => self.chase,
-            ExtractionProfile::Conventional => self.conventional,
-        }
+        (any_naming!(), any_binding!()) => Ruling::Possible,
     }
 }
 
@@ -661,15 +324,13 @@ pub(super) struct Fixture {
     pub real: Vec<String>,
     pub spec: JobSpec,
     pub expected: Vec<(&'static str, Vec<u8>)>,
-    // Loss masks that leave a 7z set without its map.
-    unmapped: fn(u8) -> bool,
 }
 
 impl Fixture {
     pub(super) fn build(cell: Cell) -> Self {
         let (count, posted) = cell.naming.layout();
         let payload = unrepeated_payload(13, 70_001);
-        let (mut written, expected, unmapped) = if cell.container.is_sevenz() {
+        let (mut written, expected) = if cell.container.is_sevenz() {
             let (archive, expected) = if cell.container == Container::SevenZipSolid {
                 let archive = include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
@@ -698,12 +359,7 @@ impl Fixture {
                 );
                 (archive, vec![("feature.mkv", payload)])
             };
-            let unmapped = if posted.len() == count {
-                LOSES[usize::from(map_slots(&archive, count, 4 / count))]
-            } else {
-                LOSES[0]
-            };
-            (split_volumes(&archive, count), expected, unmapped)
+            (split_volumes(&archive, count), expected)
         } else if let Some(format) = cell.container.solid_format(count) {
             // The volumes go under the real names a stored set has; every
             // naming renames posted files and leaves the members alone.
@@ -728,7 +384,7 @@ impl Fixture {
                 .into_iter()
                 .map(|(name, bytes)| (&*name.leak(), bytes))
                 .collect();
-            (written, expected, LOSES[0])
+            (written, expected)
         } else {
             let name = "nested/feature.mkv";
             let mut written = match cell.container {
@@ -757,7 +413,7 @@ impl Fixture {
             if count == 1 {
                 written[0].0 = "silver.horizon.rar".to_string();
             }
-            (written, vec![(name, payload)], LOSES[0])
+            (written, vec![(name, payload)])
         };
         // An old-style set's real names are `.rar`, then `.r00` onwards.
         if cell.naming == Naming::OldStyle {
@@ -795,30 +451,7 @@ impl Fixture {
             real,
             spec,
             expected,
-            unmapped,
         }
-    }
-
-    fn admission(&self) -> Admission {
-        let (plans, refused) = DirectSetPlan::discover(
-            &self.spec,
-            Path::new("/grouping/work"),
-            Path::new("/grouping/output"),
-        );
-        match (plans.len(), refused.as_slice()) {
-            (1, []) => Admission::Named,
-            (0, [(_, refusal)]) => Admission::Refused(*refusal),
-            (0, []) => Admission::Unnamed,
-            (1, [(_, refusal)]) => Admission::Split(*refusal),
-            _ => panic!(
-                "discovery admitted {} sets and refused {refused:?}",
-                plans.len()
-            ),
-        }
-    }
-
-    pub(super) fn wanted(&self) -> Vec<&'static str> {
-        self.expected.iter().map(|(name, _)| *name).collect()
     }
 
     // Whether `mask` loses an article no other posted copy of its volume
@@ -848,29 +481,12 @@ impl Fixture {
             None => interruption,
         }
     }
-
-    fn identity_prefix_slots(&self) -> u8 {
-        let articles = 4 / self.volumes.len();
-        let mut mask = 0;
-        for (file, (_, bytes)) in self.volumes.iter().enumerate() {
-            for article in 0..articles {
-                let (start, _) = article_extent(bytes.len(), article as u32, articles);
-                if start < bytes.len().min(crate::pipeline::PAR2_HASH_16K_BYTES) {
-                    mask |= 1 << (file * articles + article);
-                }
-            }
-        }
-        mask
-    }
 }
 
 impl Binding {
     // Whether an index gives the volumes their real names, which place them.
     pub(super) fn names_real(self) -> bool {
-        matches!(
-            self,
-            Self::Par2RealFirst | Self::Par2RealLast | Self::LegacyReal
-        )
+        matches!(self, Self::Par2RealFirst | Self::Par2RealLast)
     }
 
     // How the schedule is driven, and the names any listing carries.
@@ -917,8 +533,6 @@ impl Binding {
                 },
                 None,
             ),
-            Self::LegacyOnLoss => (matrix, None),
-            Self::LegacyReal => (matrix, real),
         }
     }
 }
@@ -931,10 +545,7 @@ impl Cell {
     // end record.
     pub(super) fn orders_middles(self) -> bool {
         self.naming.names_place()
-            || matches!(
-                self.binding,
-                Binding::Par2RealFirst | Binding::Par2RealLast | Binding::LegacyReal
-            )
+            || matches!(self.binding, Binding::Par2RealFirst | Binding::Par2RealLast)
             || self.container.headers_chain()
     }
 
@@ -963,880 +574,6 @@ pub(super) fn recovery_layouts(
         }))
         .collect()
 }
-
-// The direct-store route a cell's expectation allows, with `unmapped` the
-// loss masks that leave its map unreadable.
-fn route(cell: Cell, expect: Expect, unmapped: fn(u8) -> bool) -> Route {
-    let (_, posted) = cell.naming.layout();
-    // Identity loss precedes codec selection, including a solid archive that
-    // would normally demote only after its map revealed an unsupported coder.
-    let unnamed_loss: fn(u8) -> bool = if cell.naming.names_place() {
-        |_| false
-    } else {
-        match posted.len() {
-            1 => |mask| mask & 0b0001 != 0,
-            2 => |mask| mask & 0b0101 != 0,
-            _ => |mask| mask != 0,
-        }
-    };
-    let shape = match expect {
-        Expect::Direct => {
-            // A set only the index's descriptions name is named in time only
-            // when the index leads.
-            let named_by_early_index = cell.binding == Binding::LegacyReal
-                && !cell.naming.names_place()
-                && !cell.container.headers_chain();
-            Route {
-                named_by_early_index,
-                ..Route::DIRECT
-            }
-        }
-        Expect::Demotes(reason) => Route::refused(reason),
-        Expect::Streams | Expect::Downloads => match cell.container.admitted() {
-            // A restart can put retained metadata ahead of refetched parts,
-            // admitting a set that originally entered the conventional path.
-            Expect::Demotes(reason) => Route::refused(reason),
-            _ => Route::refused(|_| false),
-        },
-        Expect::Fails(_) => Route::refused(|_| false),
-    };
-    Route {
-        unnamed_loss,
-        unmapped_loss: unmapped,
-        ..shape
-    }
-}
-
-// The direct-store route of a hand-named format's cell.
-pub(super) fn alias_route(cell: Cell) -> Route {
-    match rule(cell) {
-        Ruling::Possible(expectation) => route(cell, expectation.direct_store, |_| false),
-        Ruling::Impossible(why) => panic!("{cell:?} aliases an impossible cell: {why}"),
-    }
-}
-
-impl Expect {
-    // Holds a clean schedule's outcome to the expectation.
-    fn assert_clean(self, outcome: &Outcome, unique: bool, context: &str) {
-        let trace = &outcome.trace;
-        match self {
-            Self::Direct => assert_eq!(outcome.finalized, 1, "{context}: {trace:?}"),
-            Self::Streams => {
-                assert_eq!(outcome.finalized, 0, "{context}: {trace:?}");
-                assert!(outcome.chase_armed > 0, "{context}: {trace:?}");
-                if unique {
-                    assert_eq!(outcome.chase_consumed, 1, "{context}: {trace:?}");
-                }
-            }
-            Self::Demotes(reason) => {
-                assert_eq!(outcome.finalized, 0, "{context}: {trace:?}");
-                assert!(
-                    !outcome.demotions.is_empty()
-                        && outcome.demotions.iter().all(|demotion| reason(*demotion)),
-                    "{context}: demotions {:?}: {trace:?}",
-                    outcome.demotions
-                );
-            }
-            Self::Downloads => {
-                assert_eq!(outcome.finalized, 0, "{context}: {trace:?}");
-                assert_eq!(outcome.chase_consumed, 0, "{context}: {trace:?}");
-            }
-            Self::Fails(_) => unreachable!("a failing cell has no clean outcome"),
-        }
-    }
-}
-
-// Runs `cases` over `cell` under `profile` and holds each to the ruling.
-async fn run_cell(cell: Cell, profile: ExtractionProfile, cases: Vec<(usize, Schedule)>) {
-    let expectation = match rule(cell) {
-        Ruling::Possible(expectation) => expectation,
-        Ruling::Impossible(why) => panic!("{cell:?} is impossible: {why}"),
-    };
-    let fixture = Fixture::build(cell);
-    assert_eq!(fixture.admission(), expectation.admission, "{cell:?}");
-    let expect = expectation.of(profile);
-    let mut route = route(cell, expect, fixture.unmapped);
-    let identity_prefix_slots = fixture.identity_prefix_slots();
-    if !cell.naming.names_place() {
-        // A small part needs more than its opening article to prove the
-        // complete PAR2 identity prefix.
-        route.unnamed_loss = LOSES[usize::from(identity_prefix_slots)];
-    }
-    let (options, described) = cell.binding.drive(&fixture);
-    let wanted = fixture.wanted();
-    // A posted listing is kept beside the members, as any loose file is.
-    let mut published = wanted.clone();
-    if options.sfv {
-        published.push("silver.horizon.sfv");
-    }
-    for (case, (order, interruption)) in cases {
-        if !profile.includes(interruption) || !cell.presents(interruption) {
-            continue;
-        }
-        for options in recovery_layouts(options, interruption) {
-            let context = format!(
-                "{cell:?} profile={profile:?} case={case} order={order:?} interruption={interruption:?} recovery={:?}",
-                options.recovery
-            );
-            eprintln!("{context}");
-            let outcome = run_schedule_with(
-                options,
-                profile,
-                fixture.spec.clone(),
-                &fixture.volumes,
-                described.as_deref(),
-                &order,
-                &wanted,
-                interruption,
-            )
-            .await;
-            let check = || {
-                // An available article from a byte-identical repost supplies the
-                // same bytes. Otherwise a listing cannot repair missing data.
-                let unrepairable = (options.recovery == RecoveryFormat::Absent
-                    || interruption.fails())
-                    && interruption.loss().is_some_and(|(mask, _)| {
-                        // Names or posted PAR2 descriptions can identify the
-                        // absent copy. Parity is unnecessary when identical
-                        // source bytes remain available in another posting.
-                        let identifiable_copy = cell.naming == Naming::Reposted
-                            || (cell.naming == Naming::HexReposted
-                                && cell.binding == Binding::Par2Posted);
-                        if !identifiable_copy {
-                            return mask != 0;
-                        }
-                        fixture.uncovered_loss(mask)
-                    });
-                if unrepairable {
-                    profile.assert_rejected(&outcome, &wanted);
-                    return;
-                }
-                // A volume the post never carried comes back only from recovery
-                // blocks. Without them the job fails; a set that names its
-                // volumes says which part it is missing.
-                let withheld = interruption.withheld().is_some();
-                // A 7z set no name or index places, with the one volume that
-                // carries its signature never posted and nothing describing
-                // it: the job holds files it has no reason to read as an
-                // archive, and completes them as posted.
-                if cell.container.is_sevenz()
-                    && matches!(
-                        cell.naming,
-                        Naming::HexBare | Naming::HexMisnumbered | Naming::HexScattered
-                    )
-                    && options.recovery == RecoveryFormat::Absent
-                    && interruption
-                        .withheld()
-                        .is_some_and(|(volume, _)| volume == 0)
-                {
-                    profile.assert_route(&outcome);
-                    assert_eq!(
-                        outcome.status,
-                        Some(JobStatus::Complete),
-                        "{context}: {:?}",
-                        outcome.trace
-                    );
-                    assert_eq!(outcome.finalized, 0, "{context}: {:?}", outcome.trace);
-                    assert!(
-                        outcome.files.values().all(Option::is_none)
-                            && wanted.iter().all(|name| !outcome.published.contains(*name)),
-                        "{context}: an unreadable set published a member {:?}: {:?}",
-                        outcome.published,
-                        outcome.trace
-                    );
-                    return;
-                }
-                if withheld
-                    && (options.recovery == RecoveryFormat::Absent
-                        || matches!(expect, Expect::Fails(_)))
-                {
-                    profile.assert_rejected(&outcome, &wanted);
-                    let Some(JobStatus::Failed { error }) = &outcome.status else {
-                        unreachable!("assert_rejected holds the job failed")
-                    };
-                    // A withheld first volume reads as a set with no start, which
-                    // is its own diagnostic.
-                    if options.recovery == RecoveryFormat::Absent
-                        && cell.naming.names_place()
-                        && interruption
-                            .withheld()
-                            .is_some_and(|(volume, _)| volume > 0)
-                    {
-                        assert!(
-                            error.contains(MISSING_PART),
-                            "{context}: {error}: {:?}",
-                            outcome.trace
-                        );
-                    }
-                    return;
-                }
-                if let Expect::Fails(why) = expect {
-                    profile.assert_rejected(&outcome, &wanted);
-                    let Some(JobStatus::Failed { error }) = &outcome.status else {
-                        unreachable!("assert_rejected holds the job failed")
-                    };
-                    // A posted-name index authenticates the misleading numbering.
-                    // After restart it can reach the bounded extraction retry;
-                    // clean recovery data still cannot establish archive order.
-                    let verified_but_unordered = why == UNORDERED_7Z
-                        && cell.binding == Binding::Par2Posted
-                        && error.contains(
-                            "clean PAR2 verification but extraction still failing after retry",
-                        );
-                    assert!(
-                        error.contains(why) || verified_but_unordered,
-                        "{context}: {error}: {:?}",
-                        outcome.trace
-                    );
-                    return;
-                }
-                assert_eq!(
-                    outcome.status,
-                    Some(JobStatus::Complete),
-                    "{context}: {:?}",
-                    outcome.trace
-                );
-                for (name, bytes) in &fixture.expected {
-                    assert_eq!(
-                        outcome.files[*name].as_deref(),
-                        Some(bytes.as_slice()),
-                        "{context}: {:?}",
-                        outcome.trace
-                    );
-                }
-                let mut route = route;
-                if interruption.loss().is_some_and(|(mask, _)| mask == 15)
-                    && !matches!(
-                        cell.naming,
-                        Naming::Conventional
-                            | Naming::ConventionalFour
-                            | Naming::Single
-                            | Naming::MixedCase
-                            | Naming::OldStyle
-                    )
-                {
-                    // Recognizable posted names retain their direct identity even
-                    // with every payload article absent. Obfuscated, reordered or
-                    // reposted names need content evidence and rebuild on disk.
-                    route.direct = false;
-                }
-                if matches!(
-                    interruption,
-                    Interruption::Restart(_) | Interruption::Crash(_)
-                ) && matches!(expect, Expect::Streams | Expect::Downloads)
-                    && matches!(cell.container.admitted(), Expect::Direct)
-                {
-                    // Retained index metadata can identify refetched parts before
-                    // their arrivals after restart. Either route remains valid;
-                    // direct admission still requires no unexpected demotion and
-                    // no refetch of durable articles below.
-                    route.direct = outcome.finalized == route.sets;
-                }
-                if cell.naming == Naming::HexSwappedRar
-                    && matches!(cell.binding, Binding::Par2RealFirst | Binding::Par2RealLast)
-                    && interruption
-                        .loss()
-                        .is_some_and(|(mask, _)| mask & identity_prefix_slots != 0)
-                {
-                    // A lost identity prefix can prevent binding before enough
-                    // header evidence survives to prove the swapped chain. Solid
-                    // members can be refused before that binding is attempted.
-                    route.shape_demotion = if cell.container.is_solid_rar() {
-                        |reason| {
-                            matches!(
-                                reason,
-                                DemotionReason::Par2Unbindable
-                                    | DemotionReason::MemberIneligible(
-                                        MemberIneligibility::Compressed
-                                            | MemberIneligibility::Solid
-                                            | MemberIneligibility::Encrypted
-                                            | MemberIneligibility::MalformedChain
-                                    )
-                            )
-                        }
-                    } else {
-                        |reason| {
-                            matches!(
-                                reason,
-                                DemotionReason::Par2Unbindable
-                                    | DemotionReason::MemberIneligible(
-                                        MemberIneligibility::MalformedChain
-                                    )
-                            )
-                        }
-                    };
-                }
-                if cell.naming == Naming::HexSwappedRar
-                    && !cell.container.is_solid_rar()
-                    && interruption.withheld().is_some()
-                {
-                    // These names number the pair the other way round from the
-                    // recovery set, so they cannot place the volume the post
-                    // left out, and with one volume of the pair the chain that
-                    // would show it runs backwards is never read. The missing
-                    // volume is damage no direct set owns, and the set goes
-                    // conventional, which its shape already sends it to.
-                    route.shape_demotion = |reason| {
-                        matches!(
-                            reason,
-                            DemotionReason::Par2Damaged
-                                | DemotionReason::MemberIneligible(
-                                    MemberIneligibility::MalformedChain
-                                )
-                        )
-                    };
-                }
-                // A volume the post never carried is held to the route of the
-                // same volume posted and then lost whole: the set rebuilds it in
-                // place, except where losing every article of that volume
-                // already leaves the set without its map or a volume without
-                // a name, and those exceptions are the loss's own.
-                let delivered = fixture.posted_loss(interruption);
-                profile.assert_delivery(&outcome, route, &published, delivered);
-                if matches!(interruption, Interruption::None) {
-                    expect.assert_clean(&outcome, order.len() == 4, &context);
-                }
-            };
-            check();
-        }
-    }
-}
-
-// A cell's campaign: every profile over the matrix's smoke schedules.
-pub(super) async fn cell_campaign(cell: Cell) {
-    for profile in PROFILES {
-        let cases = schedules().into_iter().enumerate().collect();
-        run_cell(cell, profile, cases).await;
-    }
-}
-
-// A cell's default-suite smoke: in order and reversed, under every profile.
-pub(super) async fn cell_smoke(cell: Cell) {
-    let forward = slot_arrivals(4);
-    let mut backward = forward.clone();
-    backward.reverse();
-    for profile in PROFILES {
-        let cases = vec![
-            (0, (forward.clone(), Interruption::None)),
-            (1, (backward.clone(), Interruption::None)),
-        ];
-        run_cell(cell, profile, cases).await;
-    }
-}
-
-// A split part the post never carried, between two that it did: every listed
-// file is whole, so only the hole in the numbering says the recovery set
-// has work, and it rebuilds the part rather than the job failing on it.
-#[tokio::test]
-async fn a_withheld_middle_split_part_is_rebuilt_from_recovery() {
-    let case = schedules().into_iter().nth(361).unwrap();
-    assert_eq!(
-        case.1,
-        Interruption::Withheld {
-            volume: 2,
-            index_first: false,
-        }
-    );
-    for profile in PROFILES {
-        run_cell(
-            Cell {
-                container: Container::SevenZip,
-                naming: Naming::ConventionalFour,
-                binding: Binding::Par2RealLast,
-            },
-            profile,
-            vec![(361, case.clone())],
-        )
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn repaired_swapped_rar_retires_lost_posted_volumes() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::HexSwappedRar,
-            binding: Binding::Par2RealFirst,
-        },
-        ExtractionProfile::DirectStore,
-        [240, 244, 252, 268]
-            .into_iter()
-            .map(|case| (case, schedules().into_iter().nth(case).unwrap()))
-            .collect(),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn repaired_swapped_rar_does_not_reextract_damaged_sources() {
-    for (container, profile, case) in [
-        (Container::Rar4, ExtractionProfile::Chase, 248),
-        (
-            Container::Rar5Encrypted,
-            ExtractionProfile::DirectStore,
-            266,
-        ),
-    ] {
-        run_cell(
-            Cell {
-                container,
-                naming: Naming::HexSwappedRar,
-                binding: Binding::Par2RealFirst,
-            },
-            profile,
-            vec![(case, schedules().into_iter().nth(case).unwrap())],
-        )
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn restored_opaque_repost_keeps_observed_identity() {
-    for (container, case) in [
-        (Container::Rar5, 156),
-        (Container::Rar5Encrypted, 108),
-        (Container::Rar5, 277),
-        (Container::Rar5Encrypted, 277),
-    ] {
-        run_cell(
-            Cell {
-                container,
-                naming: Naming::HexReposted,
-                binding: Binding::Nothing,
-            },
-            ExtractionProfile::DirectStore,
-            vec![(case, schedules().into_iter().nth(case).unwrap())],
-        )
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn opaque_repost_repairs_a_missing_original_article() {
-    run_cell(
-        Cell {
-            container: Container::Rar5,
-            naming: Naming::HexReposted,
-            binding: Binding::Par2Posted,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(242, schedules().into_iter().nth(242).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn opaque_repost_recovers_without_parity_when_an_identical_copy_survives() {
-    for (container, profile) in [
-        (Container::Rar5, ExtractionProfile::DirectStore),
-        (Container::Rar4, ExtractionProfile::DirectStore),
-        (Container::Rar5, ExtractionProfile::Chase),
-    ] {
-        run_cell(
-            Cell {
-                container,
-                naming: Naming::HexReposted,
-                binding: Binding::Par2Posted,
-            },
-            profile,
-            vec![(342, schedules().into_iter().nth(342).unwrap())],
-        )
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn reposted_rar_recovers_both_articles_of_one_copy() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::HexReposted,
-            binding: Binding::Par2Posted,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(244, schedules().into_iter().nth(244).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn solid_rar_restart_keeps_late_volume_refresh() {
-    run_cell(
-        Cell {
-            container: Container::Rar4Solid,
-            naming: Naming::HexScattered,
-            binding: Binding::Nothing,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(104, schedules().into_iter().nth(104).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn repaired_unposted_parts_join_header_named_archives() {
-    for container in [
-        Container::Rar4,
-        Container::Rar5EncryptedHeaders,
-        Container::SevenZipSolid,
-    ] {
-        run_cell(
-            Cell {
-                container,
-                naming: Naming::FirstVolumeHex,
-                binding: Binding::Par2Posted,
-            },
-            ExtractionProfile::DirectStore,
-            [357, 359]
-                .into_iter()
-                .map(|case| (case, schedules().into_iter().nth(case).unwrap()))
-                .collect(),
-        )
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn solid_sevenz_uses_complete_reposted_part_after_article_loss() {
-    run_cell(
-        Cell {
-            container: Container::SevenZipSolid,
-            naming: Naming::Reposted,
-            binding: Binding::Nothing,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(240, schedules().into_iter().nth(240).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn repaired_solid_sevenz_preserves_missing_part_diagnostic() {
-    run_cell(
-        Cell {
-            container: Container::SevenZipSolid,
-            naming: Naming::HexNumberedGap,
-            binding: Binding::Par2RealFirst,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(242, schedules().into_iter().nth(242).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn repaired_misnumbered_sevenz_updates_topology() {
-    run_cell(
-        Cell {
-            container: Container::SevenZip,
-            naming: Naming::HexMisnumbered,
-            binding: Binding::Par2RealLast,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(262, schedules().into_iter().nth(262).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn first_volume_hex_restart_keeps_durable_articles() {
-    run_cell(
-        Cell {
-            container: Container::Rar5,
-            naming: Naming::FirstVolumeHex,
-            binding: Binding::Nothing,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(100, schedules().into_iter().nth(100).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn encrypted_first_hex_demotion_keeps_conventional_ownership() {
-    run_cell(
-        Cell {
-            container: Container::Rar5Encrypted,
-            naming: Naming::FirstVolumeHex,
-            binding: Binding::Par2RealLast,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(119, schedules().into_iter().nth(119).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn repaired_scattered_rar_publishes_only_members() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::HexScattered,
-            binding: Binding::Par2RealFirst,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(254, schedules().into_iter().nth(254).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn first_volume_hex_sevenz_restores_part_indices() {
-    run_cell(
-        Cell {
-            container: Container::SevenZipSolid,
-            naming: Naming::FirstVolumeHex,
-            binding: Binding::Nothing,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(98, schedules().into_iter().nth(98).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn misnumbered_sevenz_reports_its_unordered_parts() {
-    run_cell(
-        Cell {
-            container: Container::SevenZip,
-            naming: Naming::HexMisnumbered,
-            binding: Binding::Nothing,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(0, schedules().into_iter().next().unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn repaired_old_style_rar_retains_direct_ownership() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::OldStyle,
-            binding: Binding::Par2RealFirst,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(248, schedules().into_iter().nth(248).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn all_lost_old_style_rar_retains_direct_ownership() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::OldStyle,
-            binding: Binding::Par2RealFirst,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(268, schedules().into_iter().nth(268).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn verified_repost_satisfies_missing_original() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::Reposted,
-            binding: Binding::Par2Posted,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(240, schedules().into_iter().nth(240).unwrap())],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn rar4_late_par2_recovers_lost_first_article() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::HexNumberedGap,
-            binding: Binding::Par2RealLast,
-        },
-        ExtractionProfile::DirectStore,
-        vec![(
-            240,
-            (
-                slot_arrivals(4),
-                Interruption::Loss {
-                    mask: 1,
-                    index_first: false,
-                },
-            ),
-        )],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn sfv_cannot_repair_an_unavailable_first_article() {
-    for (container, naming) in [
-        (Container::SevenZip, Naming::HexScattered),
-        (Container::SevenZip, Naming::HexMisnumbered),
-        (Container::Rar4, Naming::HexNumberedGap),
-    ] {
-        for profile in PROFILES {
-            run_cell(
-                Cell {
-                    container,
-                    naming,
-                    binding: Binding::Sfv,
-                },
-                profile,
-                vec![(
-                    0,
-                    (
-                        slot_arrivals(4),
-                        Interruption::Loss {
-                            mask: 1,
-                            index_first: false,
-                        },
-                    ),
-                )],
-            )
-            .await;
-        }
-    }
-}
-
-#[tokio::test]
-async fn solid_bare_first_part_keeps_repair_and_restart_fallbacks() {
-    for binding in [Binding::Par2RealFirst, Binding::Par2RealLast] {
-        for profile in PROFILES {
-            run_cell(
-                Cell {
-                    container: Container::SevenZipSolid,
-                    naming: Naming::BareFirstPart,
-                    binding,
-                },
-                profile,
-                vec![
-                    (
-                        240,
-                        (
-                            slot_arrivals(4),
-                            Interruption::Loss {
-                                mask: 1,
-                                index_first: false,
-                            },
-                        ),
-                    ),
-                    (0, (slot_arrivals(4), Interruption::Restart(2))),
-                ],
-            )
-            .await;
-        }
-    }
-}
-
-#[tokio::test]
-async fn reposted_rar4_restores_both_volume_identities() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::HexReposted,
-            binding: Binding::Nothing,
-        },
-        ExtractionProfile::Conventional,
-        vec![(
-            104,
-            (
-                vec![(0, 0), (0, 1), (1, 1), (1, 0)],
-                Interruption::Restart(2),
-            ),
-        )],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn retained_index_can_admit_misnumbered_rar_after_restart() {
-    run_cell(
-        Cell {
-            container: Container::Rar4,
-            naming: Naming::HexMisnumbered,
-            binding: Binding::Par2RealLast,
-        },
-        ExtractionProfile::DirectStore,
-        vec![
-            (
-                110,
-                (
-                    vec![(0, 0), (1, 0), (0, 1), (1, 1)],
-                    Interruption::Restart(2),
-                ),
-            ),
-            (
-                277,
-                (vec![(0, 0), (1, 0), (0, 1), (1, 1)], Interruption::Crash(2)),
-            ),
-        ],
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn renamed_par2_sources_repair_missing_identity_prefixes() {
-    for (container, naming, binding, mask) in [
-        (Container::Rar4, Naming::HexBare, Binding::Par2RealLast, 1),
-        (
-            Container::SevenZipSolid,
-            Naming::HexBare,
-            Binding::Par2RealFirst,
-            2,
-        ),
-        (
-            Container::SevenZipSolid,
-            Naming::HexMisnumbered,
-            Binding::Par2RealFirst,
-            2,
-        ),
-        (
-            Container::SevenZipSolid,
-            Naming::HexBare,
-            Binding::Par2RealFirst,
-            8,
-        ),
-        (
-            Container::SevenZipSolid,
-            Naming::HexMisnumbered,
-            Binding::Par2RealFirst,
-            8,
-        ),
-    ] {
-        run_cell(
-            Cell {
-                container,
-                naming,
-                binding,
-            },
-            ExtractionProfile::DirectStore,
-            vec![(
-                0,
-                (
-                    slot_arrivals(4),
-                    Interruption::Loss {
-                        mask,
-                        index_first: false,
-                    },
-                ),
-            )],
-        )
-        .await;
-    }
-}
-
-const PROFILES: [ExtractionProfile; 3] = [
-    ExtractionProfile::DirectStore,
-    ExtractionProfile::Chase,
-    ExtractionProfile::Conventional,
-];
 
 pub(super) const CONTAINERS: [Container; 10] = [
     Container::Rar4,
@@ -1869,8 +606,7 @@ pub(super) const NAMINGS: [Naming; 15] = [
     Naming::BareFirstPart,
 ];
 
-// The bindings the grouping cross varies. The two legacy bindings belong to
-// the hand-named formats, whose own campaigns run them.
+// The bindings the grouping cross varies.
 pub(super) const BINDINGS: [Binding; 5] = [
     Binding::Par2RealFirst,
     Binding::Par2RealLast,
@@ -1890,7 +626,7 @@ pub(super) fn possible_cells() -> Vec<Cell> {
                     naming,
                     binding,
                 };
-                if matches!(rule(cell), Ruling::Possible(_)) {
+                if matches!(rule(cell), Ruling::Possible) {
                     cells.push(cell);
                 }
             }
@@ -1898,68 +634,6 @@ pub(super) fn possible_cells() -> Vec<Cell> {
     }
     cells
 }
-
-// Emits one ignored campaign test per listed cell under
-// `archive_schedules::combined_grouping`, inside the archive matrix's
-// filter, and one default-suite smoke per listed cell of a `smoke` container
-// under `archive_schedules::grouping_smoke`, outside it.
-macro_rules! grouping_cells {
-    ($($tag:ident $c:ident $C:ident {
-        $($n:ident $N:ident [$($b:ident $B:ident)*])*
-    })*) => {
-        // Every cell the generator emits a campaign for.
-        const GENERATED_CELLS: &[grouping::Cell] = &[$($($(grouping::Cell {
-            container: grouping::Container::$C,
-            naming: grouping::Naming::$N,
-            binding: grouping::Binding::$B,
-        },)*)*)*];
-        mod combined_grouping {
-            $(mod $c {
-                $(mod $n {
-                    use super::super::super::grouping::*;
-                    $(
-                        #[tokio::test]
-                        #[ignore = "opt-in archive matrix; run with the archive-matrix Nextest profile and --run-ignored all"]
-                        async fn $b() {
-                            cell_campaign(Cell {
-                                container: Container::$C,
-                                naming: Naming::$N,
-                                binding: Binding::$B,
-                            })
-                            .await;
-                        }
-                    )*
-                })*
-            })*
-        }
-        mod grouping_smoke {
-            use super::grouping::grouping_cells;
-            $(grouping_cells!(@smoke $tag $c $C { $($n $N [$($b $B)*])* });)*
-        }
-    };
-    (@smoke smoke $c:ident $C:ident {
-        $($n:ident $N:ident [$($b:ident $B:ident)*])*
-    }) => {
-        mod $c {
-            $(mod $n {
-                use super::super::super::grouping::*;
-                $(
-                    #[tokio::test]
-                    async fn $b() {
-                        cell_smoke(Cell {
-                            container: Container::$C,
-                            naming: Naming::$N,
-                            binding: Binding::$B,
-                        })
-                        .await;
-                    }
-                )*
-            })*
-        }
-    };
-    (@smoke campaign $($rest:tt)*) => {};
-}
-pub(super) use grouping_cells;
 
 // Prints the generator's list for the possible cells, in the macro's form.
 fn generator_listing() -> String {

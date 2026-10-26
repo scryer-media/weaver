@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The pipeline's hooks into a graph job. The download and decode paths call
-// these when the job has a graph runtime and know nothing more about it; a
-// classic job has no runtime, so every hook is a lookup that finds nothing.
+// these and know nothing more about the job; a job that has gone has no
+// runtime, so every hook is a lookup that finds nothing for it.
 //
 // The root works in volumes and ordinals; the queues work in segment ids.
 // This file is where the two meet, and the only place the root's classes
@@ -21,7 +21,6 @@ use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobState;
 use crate::pipeline::download::queue::DownloadWork;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
@@ -32,30 +31,16 @@ use crate::pipeline::{DecodedChunk, Pipeline};
 const WINDOW_PRIORITY: u32 = 3;
 
 impl Pipeline {
-    // The engine the job was stamped with: a graph job is one with a graph
-    // runtime, which admission and restore give it from the stamp.
-    pub(in crate::pipeline) fn job_engine(&self, job_id: JobId) -> Engine {
-        if self.graph_jobs.contains_key(&job_id) {
-            Engine::Graph
-        } else {
-            Engine::Classic
-        }
-    }
-
-    // Give a job admitted or restored under `engine` its graph runtime. The
-    // job's state must already be in place: what its queues hold says which
-    // articles this run still has to fetch.
-    pub(crate) fn admit_graph_job(&mut self, job_id: JobId, engine: Engine) {
+    // Give a job admitted, or restored with no checkpoint, its graph
+    // runtime. The job's state must already be in place: what its queues
+    // hold says which articles this run still has to fetch.
+    pub(crate) fn admit_graph_job(&mut self, job_id: JobId) {
         // Read before the job is borrowed, in the order they are tried.
-        let passwords: Vec<String> = if engine == Engine::Graph {
-            self.archive_password_candidates_for_job(job_id)
-                .candidates
-                .iter()
-                .map(|candidate| candidate.value().to_owned())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let passwords: Vec<String> = self
+            .archive_password_candidates_for_job(job_id)
+            .iter()
+            .map(|candidate| candidate.value().to_owned())
+            .collect();
         let slots = self.graph_slot_limit();
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -89,9 +74,7 @@ impl Pipeline {
             caps,
             nesting: limits::NESTING,
         };
-        let Some(mut graph) = GraphJob::for_engine(engine, job_id.0, &files, storage) else {
-            return;
-        };
+        let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
         state.download_queue.extend_segment_ids(&mut queued);
         state.recovery_queue.extend_segment_ids(&mut queued);
@@ -158,8 +141,8 @@ impl Pipeline {
     // Whether the root is waiting on an article of a graph job, which is
     // the whole of whether the queue fetches it as completion work: every
     // path that rebuilds or requeues the article asks this, so a retry on
-    // another server keeps the class the root gave it. `None` for a classic
-    // job.
+    // another server keeps the class the root gave it. `None` once the job
+    // has gone.
     pub(in crate::pipeline) fn graph_article_waited_on(
         &self,
         segment_id: SegmentId,
@@ -197,7 +180,8 @@ impl Pipeline {
     }
 
     // Whether the root holds an article of a graph job parked: an object
-    // deferred it and nothing has wanted it since. `None` for a classic job.
+    // deferred it and nothing has wanted it since. `None` once the job has
+    // gone.
     pub(in crate::pipeline) fn graph_article_parked(&self, segment_id: SegmentId) -> Option<bool> {
         let graph = self.graph_jobs.get(&segment_id.file_id.job_id)?;
         Some(
@@ -265,7 +249,7 @@ impl Pipeline {
     // How many runs a graph job may hold now: the extraction concurrency the
     // tuner allows at this moment, the limit the repair slots follow too.
     pub(in crate::pipeline) fn graph_slot_limit(&self) -> usize {
-        limits::budgets(&self.direct_store.settings(), &self.tuner).1
+        limits::slots(&self.tuner)
     }
 
     fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
