@@ -937,6 +937,9 @@ impl ManagedTorrent {
 
                     spawn_fatal_errors_receiver(t, rx, token);
                     if let Some(peer_rx) = peer_rx {
+                        if let (Some(before), Some(now)) = (&g.trackers, &peer_rx.trackers) {
+                            now.follow(before);
+                        }
                         spawn_peer_adder(&live, peer_rx.peers);
                         g.trackers = peer_rx.trackers;
                     }

@@ -1231,6 +1231,43 @@ impl TrackerStatus {
         known
     }
 
+    /// The table of a run that follows `before`'s: each tracker both list
+    /// keeps the last answer `before` had from it, announces and scrapes
+    /// alike, until this run has one of its own. A resumed torrent's
+    /// trackers read as they last answered while `started` is on its way.
+    pub(crate) fn follow(&self, before: &TrackerStatus) {
+        let announces = before.announces();
+        self.0.announces.send_if_modified(|rows| {
+            let mut modified = false;
+            for row in rows.iter_mut().filter(|row| row.last.is_none()) {
+                if let Some(last) = announces
+                    .iter()
+                    .find(|kept| kept.url == row.url)
+                    .and_then(|kept| kept.last.clone())
+                {
+                    row.last = Some(last);
+                    modified = true;
+                }
+            }
+            modified
+        });
+        let scrapes = before.scrapes();
+        self.0.scrapes.send_if_modified(|rows| {
+            let mut modified = false;
+            for row in rows.iter_mut().filter(|row| row.last.is_none()) {
+                if let Some(last) = scrapes
+                    .iter()
+                    .find(|kept| kept.url == row.url)
+                    .and_then(|kept| kept.last.clone())
+                {
+                    row.last = Some(last);
+                    modified = true;
+                }
+            }
+            modified
+        });
+    }
+
     fn runs(&self) -> Vec<Arc<TrackerComms>> {
         let mut runs = self.0.runs.lock();
         runs.retain(|run| run.strong_count() > 0);

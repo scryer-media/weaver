@@ -606,7 +606,8 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
     assert_eq!(answered[0].next_announce, None);
     assert_eq!(answered[0].fails, 0);
 
-    // Second live run: a new table for the new task.
+    // Second live run: a new table for the new task, each row keeping the
+    // last answer until this run has one.
     session.unpause(&handle).await?;
     let second = handle.tracker_status().context("a live run has a table")?;
     let (_conn, event) = read_announce(&tracker).await?;
@@ -616,21 +617,101 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         vec![TrackerAnnounce {
             url: url.clone(),
             in_flight: true,
+            last: answered[0].last.clone(),
             ..Default::default()
         }]
     );
     assert_eq!(first.announces(), answered);
 
-    // Paused mid-announce: nothing stays in flight.
+    // Paused mid-announce: nothing stays in flight, and the last answer
+    // stands.
     session.pause(&handle).await?;
     second.subscribe().wait_for(|a| !a[0].in_flight).await?;
     assert_eq!(
         handle.tracker_announces(),
         vec![TrackerAnnounce {
             url,
+            last: answered[0].last.clone(),
             ..Default::default()
         }]
     );
+    Ok(())
+}
+
+// A resumed torrent's tracker reads as it last answered, the `stopped`
+// answer of the pause, while `started` is on its way, and takes the
+// `started` answer once it lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_resumed_tracker_keeps_its_last_answer_until_started_answers() -> anyhow::Result<()>
+{
+    setup_test_logging();
+    let t = TestTorrent::new("test_resumed_tracker_row", 4096, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_resumed_tracker_row_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url.clone()]),
+                paused: true,
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    handle.wait_until_initialized().await?;
+    let seeders = |a: &TrackerAnnounce, n: u32| {
+        a.last
+            .as_ref()
+            .is_some_and(|l| l.result.as_ref().is_ok_and(|ok| ok.seeders == Some(n)))
+    };
+
+    session.unpause(&handle).await?;
+    let first = handle.tracker_status().context("a live run has a table")?;
+    let (conn, event) = read_announce(&tracker).await?;
+    assert_eq!(event.as_deref(), Some("started"));
+    respond(conn, "d8:completei3e8:intervali1800e5:peers0:e").await?;
+    first.subscribe().wait_for(|a| seeders(&a[0], 3)).await?;
+
+    // Paused: `stopped` is answered, and the row reads that answer.
+    session.pause(&handle).await?;
+    let (conn, event) = read_announce(&tracker).await?;
+    assert_eq!(event.as_deref(), Some("stopped"));
+    respond(conn, "d8:completei7e8:intervali1800e5:peers0:e").await?;
+    first
+        .subscribe()
+        .wait_for(|a| !a[0].in_flight && seeders(&a[0], 7))
+        .await?;
+    let stopped = handle.tracker_announces()[0].last.clone();
+
+    // Resumed: while `started` waits for its answer, the row is updating
+    // and still reads the `stopped` answer.
+    session.unpause(&handle).await?;
+    let second = handle.tracker_status().context("a live run has a table")?;
+    let (conn, event) = read_announce(&tracker).await?;
+    assert_eq!(event.as_deref(), Some("started"));
+    let row = second
+        .subscribe()
+        .wait_for(|a| a[0].in_flight)
+        .await?
+        .clone();
+    assert_eq!(row[0].last, stopped);
+
+    // The `started` answer replaces it.
+    respond(conn, "d8:completei9e8:intervali1800e5:peers0:e").await?;
+    second
+        .subscribe()
+        .wait_for(|a| !a[0].in_flight && seeders(&a[0], 9))
+        .await?;
+
+    session.pause(&handle).await?;
+    let (conn, event) = read_announce(&tracker).await?;
+    assert_eq!(event.as_deref(), Some("stopped"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
     Ok(())
 }
 
