@@ -496,22 +496,23 @@ mod tests {
                 .iter()
                 .find(|leg| leg.consumer == consumer.key() && leg.position == 0)
                 .unwrap();
-            (leg.live, leg.open, leg.bytes_per_second)
+            (leg.live, leg.open, leg.opening, leg.bytes_per_second)
         };
-        assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0));
+        assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0, 0));
 
         runtime.hold_torrent_traffic([(
             (consumer, 0),
             super::super::SessionTraffic {
                 open: 63,
+                opening: 5,
                 bytes_per_second: 31_000_000,
             },
         )]);
-        assert_eq!(leg(&snapshot(&runtime)), (true, 63, 31_000_000));
+        assert_eq!(leg(&snapshot(&runtime)), (true, 63, 5, 31_000_000));
 
         // The sessions let the leg go: it holds nothing.
         runtime.hold_torrent_traffic([]);
-        assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0));
+        assert_eq!(leg(&snapshot(&runtime)), (false, 0, 0, 0));
     }
 
     // A torrent session that dials its peers through its leg counts the
@@ -597,7 +598,7 @@ mod tests {
                 (consumer, 0),
                 super::super::SessionTraffic {
                     open: established,
-                    bytes_per_second: 0,
+                    ..Default::default()
                 },
             )]);
             let metrics = snapshot(&runtime);

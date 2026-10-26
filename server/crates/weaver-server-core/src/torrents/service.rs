@@ -873,7 +873,9 @@ struct Live {
     // The operator's level for each file, as stored.
     levels: Vec<FilePriority>,
     speeds: (u64, u64),
-    peers: (u32, u32),
+    // Its established peers, the seeders among them, and the peers still
+    // in their handshake.
+    peers: (u32, u32, u32),
     // The directory claimed for a move, while the move waits or is under
     // way; the job does the moving.
     moving: Option<PathBuf>,
@@ -973,7 +975,7 @@ impl Live {
             paused_by: None,
             levels: Vec::new(),
             speeds: (0, 0),
-            peers: (0, 0),
+            peers: (0, 0, 0),
             moving: None,
             file_have: Vec::new(),
             kept_pieces: 0,
@@ -1157,7 +1159,7 @@ impl Live {
                 timed: self.timed,
                 moved: (0, 0),
                 speeds: (0, 0),
-                peers: (0, 0),
+                peers: (0, 0, 0),
             };
         };
         let stats = attached.handle.stats();
@@ -1207,10 +1209,11 @@ impl Live {
             speeds: live.map_or((0, 0), |live| {
                 (live.download_speed.as_bytes(), live.upload_speed.as_bytes())
             }),
-            peers: live.map_or((0, 0), |live| {
+            peers: live.map_or((0, 0, 0), |live| {
                 (
                     live.snapshot.peer_stats.live,
                     live.snapshot.peer_stats.live_seeders,
+                    live.snapshot.peer_stats.connecting,
                 )
             }),
         }
@@ -1248,7 +1251,7 @@ struct Reading {
     // The bytes received and sent on the wire since the last kept reading.
     moved: (u64, u64),
     speeds: (u64, u64),
-    peers: (u32, u32),
+    peers: (u32, u32, u32),
 }
 
 // Bytes a torrent received and threw away since it was added in this
@@ -3976,8 +3979,9 @@ impl TorrentService {
                 landings.extend(self.queue_resume(torrent, now, at_once));
             }
             // What the sessions hold on the legs they run on: their
-            // established peers on every leg, and the bytes they receive on
-            // their own sockets, which no route sees.
+            // established peers on every leg, and the peers in their
+            // handshake and the bytes they receive on their own sockets,
+            // which no route sees.
             let mut legs = std::collections::HashMap::<_, SessionTraffic>::new();
             for torrent in live.values() {
                 let Some(leg) = torrent

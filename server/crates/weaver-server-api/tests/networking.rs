@@ -575,6 +575,61 @@ async fn route_save_rejects_missing_consumers_without_persisting() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// The default torrent route's first leg in the flow, as (open, opening,
+// state, bytes per second).
+async fn default_torrent_leg(h: &TestHarness) -> (u64, u64, String, u64) {
+    let response = h
+        .execute("{ networkFlow { legs { consumer position open opening state bytesPerSecond } } }")
+        .await;
+    assert_no_errors(&response);
+    let legs = response_data(&response)["networkFlow"]["legs"].clone();
+    let leg = legs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|leg| leg["consumer"] == "torrent:default" && leg["position"] == 0)
+        .unwrap_or_else(|| panic!("no default torrent leg in {legs}"))
+        .clone();
+    (
+        leg["open"].as_u64().unwrap(),
+        leg["opening"].as_u64().unwrap(),
+        leg["state"].as_str().unwrap().to_owned(),
+        leg["bytesPerSecond"].as_u64().unwrap(),
+    )
+}
+
+// A torrent session on its leg's own sockets dials nothing through the
+// route, which has no live counterpart; the leg still shows the session's
+// established peers as open, its handshakes as opening, and its bytes, and
+// is up while it holds them.
+#[tokio::test]
+async fn a_torrent_leg_on_its_own_sockets_shows_the_sessions_peers_in_the_flow() {
+    use weaver_server_core::proxies::{Consumer, SessionTraffic, TorrentScope};
+    let h = harness().await;
+    let runtime = h.handle.proxy_runtime().unwrap();
+    let consumer = Consumer::Torrent(TorrentScope::Default);
+    assert_eq!(consumer.key(), "torrent:default");
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+
+    runtime.network.hold_torrent_traffic([(
+        (consumer, 0),
+        SessionTraffic {
+            open: 3,
+            opening: 2,
+            bytes_per_second: 4_000_000,
+        },
+    )]);
+    assert_eq!(
+        default_torrent_leg(&h).await,
+        (3, 2, "UP".into(), 4_000_000)
+    );
+
+    // The session lets the leg go: it is idle again.
+    runtime.network.hold_torrent_traffic([]);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+    runtime.stop_all().await;
+}
+
 // A tracker rule that routes its torrents itself is listed by its host
 // pattern and takes a route of one leg, never two; turned off, it is no
 // consumer, and a rule that is gone takes no route.

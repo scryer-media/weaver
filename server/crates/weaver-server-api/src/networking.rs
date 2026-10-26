@@ -1062,23 +1062,12 @@ pub struct NetworkPoolMemberFlow {
 }
 pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     let mut legs = Vec::new();
-    let sessions = runtime.network.torrent_traffic();
     for route in runtime.network.live_routes() {
         let definitions = route.legs.read().expect("route legs");
         for allocation in route.weighted.allocations() {
             let Some(leg) = definitions.get(allocation.position) else {
                 continue;
             };
-            let (open, opening) = sessions
-                .get(&(route.consumer.key(), allocation.position))
-                .map_or((allocation.open, allocation.opening), |traffic| {
-                    let (open, opening) = traffic
-                        .connections(u64::from(allocation.open), u64::from(allocation.opening));
-                    (
-                        u16::try_from(open).unwrap_or(u16::MAX),
-                        u16::try_from(opening).unwrap_or(u16::MAX),
-                    )
-                });
             let rung_states: Vec<String> =
                 leg.rung_states().into_iter().map(str::to_owned).collect();
             // A leg counts two failed dials before it cools, but its ladder
@@ -1104,14 +1093,9 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 egress_id: leg.definition.egress_id,
                 weight: leg.definition.weight,
                 target: allocation.target,
-                open,
-                opening,
-                state: if state == "UP" && open == 0 && opening == 0 {
-                    "IDLE"
-                } else {
-                    state
-                }
-                .into(),
+                open: allocation.open,
+                opening: allocation.opening,
+                state: state.into(),
                 reason: reason.or_else(|| leg.warning.clone()),
                 path: RouteLegGql::from(leg.definition.clone()).path,
                 pinned_address: leg
@@ -1149,7 +1133,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     // them, and an egress they depend on may already be missing.
     for leg in runtime.network.dormant_legs() {
         let (state, reason) = match leg.health {
-            core::LegHealthState::Up | core::LegHealthState::Probing => ("IDLE", None),
+            core::LegHealthState::Up | core::LegHealthState::Probing => ("UP", None),
             core::LegHealthState::Down(reason) => ("DOWN", Some(reason)),
             core::LegHealthState::Blocked(reason) => ("BLOCKED", Some(reason)),
         };
@@ -1172,6 +1156,21 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
             rung_states: Vec::new(),
             failing_hops: Vec::new(),
         });
+    }
+    // A leg torrent sessions run on carries what they hold on it, whether
+    // they dial through its route or on sockets of their own. A leg that is
+    // up with nothing open or opening is idle.
+    let sessions = runtime.network.torrent_traffic();
+    for leg in &mut legs {
+        if let Some(traffic) = sessions.get(&(leg.consumer.clone(), leg.position as usize)) {
+            let (open, opening) = traffic.connections(u64::from(leg.open), u64::from(leg.opening));
+            leg.open = u16::try_from(open).unwrap_or(u16::MAX);
+            leg.opening = u16::try_from(opening).unwrap_or(u16::MAX);
+            leg.bytes_per_second += traffic.bytes_per_second;
+        }
+        if leg.state == "UP" && leg.open == 0 && leg.opening == 0 {
+            leg.state = "IDLE".into();
+        }
     }
     let mut pools: Vec<_> = runtime
         .network
