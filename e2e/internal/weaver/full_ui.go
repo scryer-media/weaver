@@ -78,6 +78,13 @@ var fullPhaseDefinitions = []fullPhaseDefinition{
 	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
 	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
 	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
+	// The TLS suite submits five canonical fixtures over the NNTP container's
+	// TLS listener, so it seeds the functional corpus they come from.
+	{name: "TLS NNTP", command: "tls-test", slug: "tls-nntp", seedProfile: "functional", datastore: weaverDatastoreSQLite},
+	// Adaptive dispatch drives one large-segment fixture through injected
+	// latency; the TCP chaos profile is the smallest corpus that carries it.
+	{name: "Adaptive Dispatch", command: "adaptive-dispatch", slug: "adaptive-dispatch", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
+	{name: "Adversarial Archives", command: "adversarial", slug: "adversarial", seedProfile: "adversarial", datastore: weaverDatastoreSQLite},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},
 	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
 	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
@@ -1122,7 +1129,7 @@ const (
 	defaultFullPhaseJobs = 4
 	// A full run's release gate shares the engine with the other phases, so
 	// it runs narrower than a standalone gate unless the operator sets a width.
-	fullRunReleaseGateJobs = 4
+	fullRunReleaseGateJobs = 6
 )
 
 // fullPhaseJobs is how many phases of a full run execute at once, set with
