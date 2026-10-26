@@ -294,6 +294,8 @@ impl RssService {
             forced: false,
             unpack: None,
             metadata,
+            upload_limit: None,
+            download_limit: None,
         };
         match torrents.add(request).await {
             Ok(job_id) => Ok(job_id.0),

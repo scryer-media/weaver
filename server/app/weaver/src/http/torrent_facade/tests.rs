@@ -1888,6 +1888,62 @@ async fn a_torrents_rate_limits_are_set_and_read_back() {
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
 }
 
+// An add's upLimit and dlLimit are the added torrent's own limits from the
+// start, kept on its row; 0 and any negative number are no limit, and a
+// limit that is not a number refuses the add.
+#[tokio::test]
+async fn an_adds_rate_limits_are_the_torrents_own() {
+    let rig = rig().await;
+    let added = rig
+        .add_file(
+            &metainfo("one.mkv", 3000, false),
+            &[("upLimit", "65536"), ("dlLimit", "1048576")],
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    rig.add_file(
+        &metainfo("two.mkv", 3000, false),
+        &[("upLimit", "0"), ("dlLimit", "-1")],
+    )
+    .await;
+    let refused = rig
+        .add_file(&metainfo("three.mkv", 3000, false), &[("upLimit", "fast")])
+        .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+    let rows = rig.torrents().await;
+    assert_eq!(rows.len(), 2);
+    let limits = |name: &str| {
+        let row = rows.iter().find(|row| row["name"] == name).unwrap();
+        (row["up_limit"].clone(), row["dl_limit"].clone())
+    };
+    assert_eq!(limits("one.mkv"), (json!(65_536), json!(1_048_576)));
+    assert_eq!(limits("two.mkv"), (json!(0), json!(0)));
+
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    let stored: Vec<_> = torrents
+        .torrents(None)
+        .await
+        .iter()
+        .map(|view| {
+            let record = rig
+                .context
+                .inner
+                .db
+                .get_torrent(view.job_id)
+                .unwrap()
+                .unwrap();
+            (
+                view.name.clone(),
+                record.upload_limit,
+                record.download_limit,
+            )
+        })
+        .collect();
+    assert!(stored.contains(&("one.mkv".into(), Some(65_536), Some(1_048_576))));
+    assert!(stored.contains(&("two.mkv".into(), None, None)));
+}
+
 // A torrent held closed has no reading the client knows: its field and its
 // entry are left out, never read as no limit.
 #[tokio::test]

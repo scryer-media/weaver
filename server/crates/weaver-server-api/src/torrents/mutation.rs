@@ -83,6 +83,8 @@ impl TorrentsMutation {
                 forced: input.forced,
                 unpack: input.unpack,
                 metadata: Vec::new(),
+                upload_limit: None,
+                download_limit: None,
             },
         )
         .await?;
