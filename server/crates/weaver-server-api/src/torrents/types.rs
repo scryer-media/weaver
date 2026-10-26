@@ -284,6 +284,7 @@ pub enum TorrentRouteReasonGql {
     SessionStateUnreadable,
     SessionBuildFailed,
     BlocklistFailed,
+    SessionLimit,
 }
 
 impl From<TorrentRouteReason> for TorrentRouteReasonGql {
@@ -309,6 +310,7 @@ impl From<TorrentRouteReason> for TorrentRouteReasonGql {
             TorrentRouteReason::SessionStateUnreadable => Self::SessionStateUnreadable,
             TorrentRouteReason::SessionBuildFailed => Self::SessionBuildFailed,
             TorrentRouteReason::BlocklistFailed => Self::BlocklistFailed,
+            TorrentRouteReason::SessionLimit => Self::SessionLimit,
         }
     }
 }
@@ -498,8 +500,11 @@ pub struct Torrent {
     /// Which hashes verify its pieces, once its metainfo is in hand.
     pub version: Option<TorrentVersionGql>,
     pub state: TorrentStateGql,
-    /// Why the torrent is in its state, when there is a reason to give.
+    /// Why the torrent is in its state, when there is a reason to give and
+    /// its route does not hold it.
     pub detail: Option<String>,
+    /// Why its route holds it, while its state comes from that hold.
+    pub route_reason: Option<TorrentRouteReasonGql>,
     pub category: Option<String>,
     pub private: bool,
     pub forced: bool,
@@ -594,6 +599,7 @@ impl From<TorrentView> for Torrent {
             version: view.version.map(Into::into),
             state: view.state.into(),
             detail: view.detail,
+            route_reason: view.route_reason.map(Into::into),
             category: view.category,
             private: view.private,
             forced: view.forced,

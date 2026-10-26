@@ -21,10 +21,6 @@ use crate::torrents::{
     TrackerStatus,
 };
 
-pub const ROUTE_DOWN_SEEDING: &str = "Not seeding: route down";
-pub const ROUTE_DOWN_FETCHING: &str = "Not downloading: route down";
-pub const SESSION_LIMIT_SEEDING: &str = "Not seeding: session limit reached";
-pub const SESSION_LIMIT_FETCHING: &str = "Not downloading: session limit reached";
 pub const DISK_FULL: &str = "Waiting: disk full";
 pub const GOAL_MET: &str = "Seeding goal met";
 pub const OFF: &str = "torrents are off";
@@ -120,19 +116,42 @@ impl Held {
         }
     }
 
-    fn detail(&self, seeding: bool) -> String {
-        let lead = if seeding {
-            "Not seeding"
-        } else {
-            "Not downloading"
-        };
+    fn reason(&self) -> TorrentRouteReason {
         match self {
-            _ if self.off() => OFF.to_owned(),
-            Self::RouteDown(reason) if reason.message().is_empty() => format!("{lead}: route down"),
-            Self::RouteDown(reason) => format!("{lead}: route down ({})", reason.message()),
-            Self::SessionLimit => format!("{lead}: session limit reached"),
-            Self::Session(error) => format!("{lead}: {}", error.message()),
+            Self::RouteDown(failure) | Self::Session(failure) => failure.reason,
+            Self::SessionLimit => TorrentRouteReason::SessionLimit,
         }
+    }
+}
+
+/// Why a torrent is in its state: in words, or, while its route holds it,
+/// by the route's reason.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Why {
+    Said(String),
+    Route(TorrentRouteReason),
+}
+
+impl Why {
+    /// The words, and the route's reason, whichever this is.
+    pub fn split(why: Option<Self>) -> (Option<String>, Option<TorrentRouteReason>) {
+        match why {
+            Some(Self::Said(text)) => (Some(text), None),
+            Some(Self::Route(reason)) => (None, Some(reason)),
+            None => (None, None),
+        }
+    }
+}
+
+impl From<&str> for Why {
+    fn from(text: &str) -> Self {
+        Self::Said(text.to_owned())
+    }
+}
+
+impl From<String> for Why {
+    fn from(text: String) -> Self {
+        Self::Said(text)
     }
 }
 
@@ -164,8 +183,8 @@ impl Observed {
 }
 
 /// The state and the reason behind it, when there is one to give.
-pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
-    let detail = |text: &str| Some(text.to_owned());
+pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
+    let detail = |text: &str| Some(text.into());
     // A move shows first: the torrent's files are on their way, whatever
     // else the engine is doing with them (qBittorrent
     // `TorrentImpl::updateState` decides Moving before Checking).
@@ -179,7 +198,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
                 .failed
                 .clone()
                 .or_else(|| seen.seeding().then(|| GOAL_MET.to_owned()));
-            return (TorrentState::Stopped, why);
+            return (TorrentState::Stopped, why.map(Why::Said));
         }
         TorrentIntent::Resumed => {}
     }
@@ -195,12 +214,12 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         return (TorrentState::Queued, detail(origin.reason()));
     }
     if let Some(held) = &seen.held {
-        return (held.state(), Some(held.detail(seen.seeding())));
+        return (held.state(), Some(Why::Route(held.reason())));
     }
     if !seen.has_metadata {
         return (
             TorrentState::FetchingMetadata,
-            seen.fetch.map(|phase| phase.to_string()),
+            seen.fetch.map(|phase| phase.to_string().into()),
         );
     }
     if seen.queued {
@@ -219,7 +238,7 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<String>) {
         Engine::Live { .. } => (TorrentState::Downloading, None),
         Engine::Paused { .. } => (TorrentState::Paused, None),
         Engine::NeedsCertificate => (TorrentState::NeedsCertificate, None),
-        Engine::Error(error) => (TorrentState::Stopped, Some(error.clone())),
+        Engine::Error(error) => (TorrentState::Stopped, Some(error.as_str().into())),
     }
 }
 
@@ -294,6 +313,19 @@ pub fn goal_left(
 /// Seconds left at the download speed, while there is a speed.
 pub fn eta_seconds(left_bytes: u64, bytes_per_second: u64) -> Option<u64> {
     (bytes_per_second > 0 && left_bytes > 0).then(|| left_bytes.div_ceil(bytes_per_second))
+}
+
+/// The seconds a torrent has been active: the whole seconds its counter
+/// holds and the part of a second run past them, a second begun counting
+/// whole. Its averages run over these same seconds, so its first second
+/// reads every byte moved in it as its rate.
+pub fn active_seconds(whole_seconds: u64, part_ms: u64) -> u64 {
+    whole_seconds.saturating_add(part_ms.div_ceil(1000))
+}
+
+/// Bytes over the seconds active; 0 before any time is active.
+pub fn average_bps(bytes: u64, active_seconds: u64) -> u64 {
+    bytes.checked_div(active_seconds).unwrap_or(0)
 }
 
 /// A torrent as the download queue sees it, in the order it was added.
@@ -540,7 +572,7 @@ mod tests {
                     fetch: Some(phase),
                     ..seen(Engine::Absent)
                 }),
-                (TorrentState::FetchingMetadata, Some(detail.to_owned()))
+                (TorrentState::FetchingMetadata, Some(detail.into()))
             );
         }
     }
@@ -641,7 +673,7 @@ mod tests {
                 complete: true,
                 ..seen(Engine::Checking)
             }),
-            (TorrentState::Stopped, Some(GOAL_MET.to_owned()))
+            (TorrentState::Stopped, Some(GOAL_MET.into()))
         );
         for held in [
             Observed {
@@ -686,7 +718,7 @@ mod tests {
                 held: Some(Held::RouteDown(RouteFailure::leg_down(String::new()))),
                 ..seen(Engine::Paused { finished: true })
             }),
-            (TorrentState::Queued, Some("speed test".to_owned()))
+            (TorrentState::Queued, Some("speed test".into()))
         );
         assert_eq!(
             project(&Observed {
@@ -702,7 +734,10 @@ mod tests {
                 held: Some(Held::RouteDown(RouteFailure::leg_down(String::new()))),
                 ..seen(Engine::Absent)
             }),
-            (TorrentState::Stalled, Some(ROUTE_DOWN_SEEDING.into()))
+            (
+                TorrentState::Stalled,
+                Some(Why::Route(TorrentRouteReason::LegDown))
+            )
         );
         assert_eq!(
             project(&Observed {
@@ -713,7 +748,7 @@ mod tests {
             }),
             (
                 TorrentState::Stalled,
-                Some(format!("{ROUTE_DOWN_FETCHING} (tunnel gone)"))
+                Some(Why::Route(TorrentRouteReason::LegDown))
             )
         );
         // A full disk: the session fetches nothing and keeps seeding.
@@ -803,7 +838,7 @@ mod tests {
         };
         assert_eq!(
             project(&stopped(Engine::Paused { finished: true })),
-            (TorrentState::Stopped, Some(GOAL_MET.to_owned()))
+            (TorrentState::Stopped, Some(GOAL_MET.into()))
         );
         assert_eq!(
             project(&stopped(Engine::Paused { finished: false })),
@@ -830,7 +865,10 @@ mod tests {
                 held: Some(Held::SessionLimit),
                 ..seen(Engine::Absent)
             }),
-            (TorrentState::Stalled, Some(SESSION_LIMIT_FETCHING.into()))
+            (
+                TorrentState::Stalled,
+                Some(Why::Route(TorrentRouteReason::SessionLimit))
+            )
         );
         assert_eq!(
             project(&Observed {
@@ -838,7 +876,10 @@ mod tests {
                 held: Some(Held::SessionLimit),
                 ..seen(Engine::Absent)
             }),
-            (TorrentState::Stalled, Some(SESSION_LIMIT_SEEDING.into()))
+            (
+                TorrentState::Stalled,
+                Some(Why::Route(TorrentRouteReason::SessionLimit))
+            )
         );
         assert_eq!(
             project(&Observed {
@@ -850,7 +891,7 @@ mod tests {
             }),
             (
                 TorrentState::Stalled,
-                Some("Not downloading: no listening port".into())
+                Some(Why::Route(TorrentRouteReason::ListenPortUnavailable))
             )
         );
         assert_eq!(
@@ -859,8 +900,34 @@ mod tests {
                 held: Some(Held::RouteDown(TorrentRouteReason::TorrentsDisabled.into())),
                 ..seen(Engine::Absent)
             }),
-            (TorrentState::Stopped, Some(OFF.into()))
+            (
+                TorrentState::Stopped,
+                Some(Why::Route(TorrentRouteReason::TorrentsDisabled))
+            )
         );
+    }
+
+    // The seconds active and the average over them come from one
+    // quantity: the bytes over the seconds is the average, a second begun
+    // counts whole, and the first second's bytes are its rate.
+    #[test]
+    fn the_average_is_the_bytes_over_the_seconds_active() {
+        for (whole, part_ms, bytes, seconds, average) in [
+            (0, 0, 0, 0, 0),
+            (0, 1, 16_384, 1, 16_384),
+            (0, 500, 16_384, 1, 16_384),
+            (1, 0, 16_384, 1, 16_384),
+            (4, 0, 262_144, 4, 65_536),
+            (4, 943, 262_144, 5, 52_428),
+            (10, 999, 1_000_000, 11, 90_909),
+        ] {
+            let active = active_seconds(whole, part_ms);
+            let bps = average_bps(bytes, active);
+            assert_eq!((active, bps), (seconds, average), "{whole} s {part_ms} ms");
+            if active > 0 {
+                assert_eq!(bytes / active, bps);
+            }
+        }
     }
 
     fn policy(ratio: Option<f32>, seed: Option<u32>, mode: SeedingGoalMode) -> SeedingPolicy {

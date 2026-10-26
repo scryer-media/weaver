@@ -1840,6 +1840,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_STATE_UNREADABLE": "会话状态无法读取",
   "next.torrents.routeReason.SESSION_BUILD_FAILED": "会话开启失败",
   "next.torrents.routeReason.BLOCKLIST_FAILED": "屏蔽列表加载失败",
+  "next.torrents.routeReason.SESSION_LIMIT": "已达会话上限",
   "next.torrents.routesEmpty": "没有路由。",
   "next.seeding.ratioGoal": "分享率目标",
   "next.seeding.seedTimeGoal": "做种时长目标",

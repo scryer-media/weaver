@@ -37,7 +37,7 @@ import { GridRow } from "@/next/components/rows";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 import { useNextData } from "@/next/data/next-data";
 import { LimitControl } from "@/next/features/networking/limits";
-import { informationFields, transferFields, type TorrentField } from "@/next/features/torrents/general";
+import { informationFields, transferFields, transferNote, type TorrentField } from "@/next/features/torrents/general";
 import { countLabel } from "@/next/i18n/labels";
 import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
@@ -612,7 +612,7 @@ export function TorrentDetail({
 
   return (
     <>
-      <DetailBlock id="transfer" title={t("next.torrent.transfer")} note={torrent.detail ?? undefined}>
+      <DetailBlock id="transfer" title={t("next.torrent.transfer")} note={transferNote(t, torrent)}>
         <GeneralGrid fields={transferFields(t, torrent)} />
       </DetailBlock>
 

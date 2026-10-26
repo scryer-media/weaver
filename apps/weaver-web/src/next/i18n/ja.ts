@@ -1840,6 +1840,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_STATE_UNREADABLE": "セッション状態を読み取れません",
   "next.torrents.routeReason.SESSION_BUILD_FAILED": "セッションを開けませんでした",
   "next.torrents.routeReason.BLOCKLIST_FAILED": "ブロックリストを読み込めませんでした",
+  "next.torrents.routeReason.SESSION_LIMIT": "セッション数の上限に到達",
   "next.torrents.routesEmpty": "ルートはありません。",
   "next.seeding.ratioGoal": "比率の目標",
   "next.seeding.seedTimeGoal": "シード時間の目標",

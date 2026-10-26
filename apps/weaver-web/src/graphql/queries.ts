@@ -1583,6 +1583,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       infohashV2
       state
       detail
+      routeReason
       category
       private
       forced

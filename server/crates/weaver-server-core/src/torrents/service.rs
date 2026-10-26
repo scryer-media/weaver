@@ -4,7 +4,7 @@
 //! The torrent client: torrents become graph jobs fed by a session on their
 //! route, are read back as one state with its reason, and leave as history.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -488,6 +488,8 @@ pub struct TorrentView {
     pub source: TorrentSource,
     pub state: TorrentState,
     pub detail: Option<String>,
+    /// Why its route holds it, while the state comes from that hold.
+    pub route_reason: Option<TorrentRouteReason>,
     /// Who holds it stopped, while a hold does.
     pub paused_by: Option<HoldOrigin>,
     pub category: Option<String>,
@@ -4305,7 +4307,8 @@ impl TorrentService {
         // The session as it is now, not as the last tick found it: the
         // state and every figure from one reading of it.
         let reading = torrent.reading(now);
-        let (state, detail) = status::project(&torrent.observed(reading.engine));
+        let (state, why) = status::project(&torrent.observed(reading.engine));
+        let (detail, route_reason) = status::Why::split(why);
         let counters = &reading.counters;
         let record = &torrent.record;
         let total = torrent.total;
@@ -4319,15 +4322,10 @@ impl TorrentService {
         let rule = torrent.rule(&rules);
         let policy = settings.policy(record, rule);
         let swarm = status::swarm(&torrent.announces(), now);
-        // Over the time the torrent has run to this reading, the part of a
-        // second included: its first second reads a rate, not 0.
-        let active_ms =
-            u128::from(counters.active_duration_s) * 1000 + u128::from(reading.timed.active_ms);
-        let average = |bytes: u64| {
-            (u128::from(bytes) * 1000)
-                .checked_div(active_ms)
-                .map_or(0, |bps| u64::try_from(bps).unwrap_or(u64::MAX))
-        };
+        // The time the torrent has run to this reading, the part of a
+        // second included, and its averages over that same time.
+        let active_seconds =
+            status::active_seconds(counters.active_duration_s, reading.timed.active_ms);
         TorrentView {
             job_id: record.job_id,
             name: record.name.clone(),
@@ -4340,6 +4338,7 @@ impl TorrentService {
             source: record.source,
             state,
             detail,
+            route_reason,
             paused_by: torrent.paused_by,
             category: settings
                 .category(record.category_id)
@@ -4372,9 +4371,9 @@ impl TorrentService {
             swarm_seeds: swarm.seeds,
             swarm_leechers: swarm.leechers,
             reannounce_seconds: swarm.reannounce_seconds,
-            active_seconds: counters.active_duration_s,
-            download_avg_bps: average(counters.downloaded_bytes),
-            upload_avg_bps: average(counters.uploaded_bytes),
+            active_seconds,
+            download_avg_bps: status::average_bps(counters.downloaded_bytes, active_seconds),
+            upload_avg_bps: status::average_bps(counters.uploaded_bytes, active_seconds),
             wasted_bytes: wasted(&reading.seen),
             last_seen_complete_ms: counters.last_seen_complete_ms,
             pieces: torrent.pieces(),
@@ -4405,6 +4404,11 @@ impl TorrentService {
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
+        let listed = self
+            .inner
+            .db
+            .list_torrent_trackers(job_id)
+            .unwrap_or_default();
         let (mut view, announces) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
@@ -4412,42 +4416,58 @@ impl TorrentService {
             view.files = torrent.files();
             (view, torrent.announces())
         };
-        let names = self
-            .inner
-            .sessions
-            .routes()
-            .plan(view.scope)
-            .ok()
-            .and_then(|plan| plan.names);
-        view.trackers = status::trackers(
-            self.inner
-                .db
-                .list_torrent_trackers(job_id)
-                .unwrap_or_default(),
-            &announces,
-            names,
-        );
+        self.track(&mut view, listed, &announces, &mut HashMap::new());
         Some(view)
     }
 
-    /// Every torrent, or a category's, in the order they were added.
+    /// Every torrent, or a category's, in the order they were added, each
+    /// with its trackers.
     pub async fn torrents(&self, category: Option<&str>) -> Vec<TorrentView> {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let live = self.inner.live.lock().await;
-        let mut views: Vec<TorrentView> = live
-            .values()
-            .map(|torrent| self.view(&settings, torrent, now))
-            .filter(|view| {
-                category.is_none_or(|name| {
-                    view.category
-                        .as_deref()
-                        .is_some_and(|category| category.eq_ignore_ascii_case(name))
+        let mut listed = self.inner.db.torrent_trackers_by_job().unwrap_or_default();
+        let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>)> = {
+            let live = self.inner.live.lock().await;
+            live.values()
+                .map(|torrent| (self.view(&settings, torrent, now), torrent.announces()))
+                .filter(|(view, _)| {
+                    category.is_none_or(|name| {
+                        view.category
+                            .as_deref()
+                            .is_some_and(|category| category.eq_ignore_ascii_case(name))
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
+        let mut names = HashMap::new();
+        for (view, announces) in &mut views {
+            let listed = listed.remove(&view.job_id).unwrap_or_default();
+            self.track(view, listed, announces, &mut names);
+        }
+        let mut views: Vec<TorrentView> = views.into_iter().map(|(view, _)| view).collect();
         views.sort_by_key(|view| (view.added_at_ms, view.job_id));
         views
+    }
+
+    // A view's trackers: those listed for it, as its run announces to
+    // them, with who resolves their names on its route. `names` holds each
+    // scope's planned once.
+    fn track(
+        &self,
+        view: &mut TorrentView,
+        listed: Vec<TrackerEntry>,
+        announces: &[TrackerAnnounce],
+        names: &mut HashMap<TorrentScope, Option<ResolvedBy>>,
+    ) {
+        let names = *names.entry(view.scope).or_insert_with(|| {
+            self.inner
+                .sessions
+                .routes()
+                .plan(view.scope)
+                .ok()
+                .and_then(|plan| plan.names)
+        });
+        view.trackers = status::trackers(listed, announces, names);
     }
 
     /// The torrents as queue items.
