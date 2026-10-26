@@ -55,6 +55,8 @@ mod full_file_names;
 mod hardware_profile;
 mod idle;
 mod nzb_admission;
+mod par2;
+mod par2_completion;
 #[cfg(unix)]
 mod post_processing_completion;
 mod post_processing_pause;

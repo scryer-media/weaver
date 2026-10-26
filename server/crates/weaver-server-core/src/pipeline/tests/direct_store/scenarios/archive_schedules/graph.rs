@@ -418,7 +418,7 @@ impl Run<'_> {
 // What an orchestrator turn does after an article: the runs' mail is heard,
 // every completion check a step scheduled runs, and the runtime queues
 // settle.
-async fn turn(pipeline: &mut Pipeline) {
+pub(super) async fn turn(pipeline: &mut Pipeline) {
     pipeline.hear_graph_runs();
     while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
         pipeline.check_job_completion(queued).await;
@@ -427,7 +427,7 @@ async fn turn(pipeline: &mut Pipeline) {
 }
 
 // What a gate round can change: when none of it moved, nothing will.
-fn fingerprint(pipeline: &Pipeline) -> String {
+pub(super) fn fingerprint(pipeline: &Pipeline) -> String {
     let queued = pipeline.jobs.get(&JOB).map(|state| {
         (
             state.download_queue.len(),
@@ -445,7 +445,7 @@ fn fingerprint(pipeline: &Pipeline) -> String {
 // A new pipeline over `root` with the job restored from the rows the last
 // one left, exactly as startup recovery restores it, and whether it was: a
 // job the last one had finished is not.
-async fn restore(
+pub(super) async fn restore(
     root: &tempfile::TempDir,
     spec: &JobSpec,
     trace: &mut Vec<String>,

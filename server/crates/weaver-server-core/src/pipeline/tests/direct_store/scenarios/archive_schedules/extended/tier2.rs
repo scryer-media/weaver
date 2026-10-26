@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Tier two of the archive matrix: articles that arrive wrong, recovery sets
+// as posters author them, uuencode, and the wider shapes of real posts.
+//
+// Every family crosses its axes into cells, runs each cell as a graph job,
+// and samples the matrix's schedules by a fixed stride. Every run must
+// publish the expected files byte for byte, deliver the members it can
+// whole and end partial, or end in a named failure that publishes none of
+// them. No resolved defect bypasses its verdict.
+//
+// Campaigns and family smokes alike run only from the manually dispatched
+// extended workflow: the default suite excludes the whole archive matrix.
+use super::*;
+use std::ops::Range;
+
+mod breadth;
+mod damage;
+mod fixtures;
+mod par2_realism;
+mod par3_breadth;
+mod post;
+mod recovery;
+mod run;
+mod uu;
+
+use post::Post;
+use recovery::Geometry;
+use run::Verdict;
+
+// The password every encrypted tier-two fixture is written under.
+pub(super) const PASSWORD: &str = "lantern-quay";
+
+// Which pool of schedules a family samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pool {
+    // The matrix's smoke schedules: every case family once.
+    Smoke,
+    // The archive matrix's combined cases.
+    Combined,
+}
+
+impl Pool {
+    // The pool's cases, built once per process.
+    fn all(self) -> &'static [(usize, Schedule)] {
+        static POOLS: [std::sync::OnceLock<Vec<(usize, Schedule)>>; 2] =
+            [const { std::sync::OnceLock::new() }; 2];
+        POOLS[self as usize].get_or_init(|| {
+            let cases: Vec<(usize, Schedule)> = match self {
+                Self::Smoke => schedules().into_iter().enumerate().collect(),
+                Self::Combined => combined_schedule_cases(),
+            };
+            // A withheld volume is a cell of the breadth family, not a
+            // schedule every family samples: the runner posts what the
+            // cell's post holds.
+            cases
+                .into_iter()
+                .filter(|(_, (_, interruption))| interruption.withheld().is_none())
+                .collect()
+        })
+    }
+
+    // `per` of the pool's cases, by a fixed stride from an offset that
+    // turns with `rotation`, so neighbouring cells see different schedules
+    // and every schedule is reached across the cells.
+    pub(super) fn sampled(self, per: usize, rotation: usize) -> Vec<(usize, Schedule)> {
+        let all = self.all();
+        let n = all.len();
+        if n <= per {
+            return all.to_vec();
+        }
+        let spacing = n / per;
+        (0..per)
+            .map(|k| all[(k * n / per + rotation % spacing) % n].clone())
+            .collect()
+    }
+
+    // How many cases [`Self::sampled`] yields.
+    pub(super) fn count(self, per: usize) -> usize {
+        self.all().len().min(per)
+    }
+}
+
+// One cell of a tier-two family.
+pub(super) trait Cell: Copy + std::fmt::Debug {
+    // The post for a schedule's loss mask and whether it is starved.
+    fn post(self, interruption: Interruption) -> Built;
+    // Whether the cell's recovery set is PAR2: a defect there blocks a
+    // release.
+    fn par2(self) -> bool;
+
+    fn case_weight(self) -> usize {
+        1
+    }
+}
+
+// A post and the recovery geometry its oracle counts in.
+pub(super) struct Built {
+    pub post: Post,
+    pub geometry: Option<Geometry>,
+    // A ruling that overrides the oracle, for a cell whose outcome follows
+    // from what it is rather than from what it loses.
+    pub ruling: Option<Verdict>,
+}
+
+// Run one cell, enforcing every case's verdict directly.
+pub(super) async fn run_cell<C: Cell>(cell: C, cases: Vec<(usize, Schedule)>) {
+    let mut built: BTreeMap<(u8, bool), Built> = BTreeMap::new();
+    for (case, (order, interruption)) in cases {
+        let key = (
+            interruption.loss().map_or(0, |(mask, _)| mask),
+            interruption.fails(),
+        );
+        let fixture = built.entry(key).or_insert_with(|| cell.post(interruption));
+        let lost = run::lost_articles(&fixture.post, interruption);
+        let verdict = fixture.ruling.unwrap_or_else(|| {
+            recovery::verdict(&fixture.post, fixture.geometry, &lost, interruption.fails())
+        });
+        let context = format!(
+            "{cell:?} case={case} order={order:?} interruption={interruption:?} verdict={verdict:?} par2={}",
+            cell.par2()
+        );
+        eprintln!("{context}");
+        let ran = run::run(&fixture.post, &order, interruption).await;
+        ran.assert(
+            &fixture.post,
+            verdict,
+            fixture.geometry.is_some() && interruption.fails(),
+            &context,
+        );
+    }
+}
+
+// A cell's smoke: every data group in order and then reversed, with
+// nothing lost.
+pub(super) async fn smoke<C: Cell>(cell: C) {
+    let forward = slot_arrivals(4);
+    let mut backward = forward.clone();
+    backward.reverse();
+    run_cell(
+        cell,
+        vec![
+            (0, (forward, Interruption::None)),
+            (1, (backward, Interruption::None)),
+        ],
+    )
+    .await;
+}
+
+// A cell's smoke under a loss: the first and last groups each lose their
+// middle article, in order and reversed.
+pub(super) async fn loss_smoke<C: Cell>(cell: C) {
+    let forward = slot_arrivals(4);
+    let mut backward = forward.clone();
+    backward.reverse();
+    run_cell(
+        cell,
+        vec![
+            (
+                0,
+                (
+                    forward,
+                    Interruption::Loss {
+                        mask: 0b1001,
+                        index_first: true,
+                    },
+                ),
+            ),
+            (
+                1,
+                (
+                    backward,
+                    Interruption::Loss {
+                        mask: 0b1001,
+                        index_first: false,
+                    },
+                ),
+            ),
+        ],
+    )
+    .await;
+}
+
+// One family's work: its cell units with the cases each runs,
+// laid end to end and cut into contiguous shards so a shard rebuilds as few
+// fixtures as it can.
+pub(super) struct Family<C> {
+    pub units: Vec<(C, Pool, usize, usize)>,
+}
+
+impl<C: Cell> Family<C> {
+    pub(super) fn total(&self) -> usize {
+        self.units
+            .iter()
+            .map(|&(_, pool, per, _)| pool.count(per))
+            .sum()
+    }
+
+    // Runs shard `shard` of `shards`.
+    //
+    // `WEAVER_TIER2_CASE=<n>` (or `<start>..<end>`) runs those of the
+    // family's case indices that fall in the shard.
+    pub(super) async fn shard(&self, shard: usize, shards: usize) {
+        assert!(shard < shards);
+        let total: usize = self
+            .units
+            .iter()
+            .map(|&(cell, pool, per, _)| pool.count(per) * cell.case_weight())
+            .sum();
+        let range = shard * total / shards..(shard + 1) * total / shards;
+        let replay = std::env::var("WEAVER_TIER2_CASE").ok().map(|selection| {
+            match selection.split_once("..") {
+                Some((start, end)) => {
+                    start.parse::<usize>().unwrap()..end.parse::<usize>().unwrap()
+                }
+                None => {
+                    let case = selection.parse::<usize>().unwrap();
+                    case..case + 1
+                }
+            }
+        });
+        let mut at = 0;
+        let mut weighted_at = 0;
+        for &(cell, pool, per, rotation) in &self.units {
+            let count = pool.count(per);
+            let unit = at..at + count;
+            at += count;
+            let weight = cell.case_weight();
+            assert!(weight > 0);
+            let weighted_start = weighted_at;
+            weighted_at += count * weight;
+            if weighted_at <= range.start || weighted_start >= range.end {
+                continue;
+            }
+            let cases: Vec<_> = pool
+                .sampled(per, rotation)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(k, (_, schedule))| {
+                    // The run names cases by family index so the printed
+                    // number is the one the replay switch takes.
+                    let index = unit.start + k;
+                    (range.contains(&(weighted_start + k * weight))
+                        && replay.as_ref().is_none_or(|replay| replay.contains(&index)))
+                    .then_some((index, schedule))
+                })
+                .collect();
+            if !cases.is_empty() {
+                run_cell(cell, cases).await;
+            }
+        }
+    }
+}
+
+// Emits `shards` ignored campaign tests for a family, as nested modules of
+// hundreds, tens and units, so shard `h d s` runs shard `100h + 10d + s`.
+macro_rules! tier2_shards {
+    ($family:path, $shards:expr; $($h:ident $hv:literal)+) => {
+        const _: () = assert!(100 * [$($hv),+].len() == $shards);
+        $(mod $h {
+            use super::*;
+            tier2_shards!(@tens $family, $shards, $hv);
+        })+
+    };
+    (@tens $family:path, $shards:expr, $hv:literal) => {
+        tier2_shards!(@ten $family, $shards, $hv; d0 0 d1 1 d2 2 d3 3 d4 4 d5 5 d6 6 d7 7 d8 8 d9 9);
+    };
+    (@ten $family:path, $shards:expr, $hv:literal; $($d:ident $dv:literal)+) => {
+        $(mod $d {
+            use super::*;
+            tier2_shards!(@units $family, $shards, $hv, $dv; s0 0 s1 1 s2 2 s3 3 s4 4 s5 5 s6 6 s7 7 s8 8 s9 9);
+        })+
+    };
+    (@units $family:path, $shards:expr, $hv:literal, $dv:literal; $($s:ident $sv:literal)+) => {
+        $(
+            #[tokio::test]
+            #[ignore = "opt-in extended archive matrix; run with the archive-matrix-extended Nextest profile and --run-ignored all"]
+            async fn $s() {
+                $family().shard($hv * 100 + $dv * 10 + $sv, $shards).await;
+            }
+        )+
+    };
+}
+pub(super) use tier2_shards;
+
+// Every family's scenario count, as its enumerator yields it.
+#[test]
+fn tier2_sizing() {
+    let damage = damage::family().total();
+    let par2 = par2_realism::family().total();
+    let par3 = par3_breadth::family().total();
+    let uu = uu::family().total();
+    let breadth = breadth::totals();
+    assert_eq!(damage, damage::TOTAL, "damage");
+    assert_eq!(par2, par2_realism::TOTAL, "PAR2 realism");
+    assert_eq!(par3, par3_breadth::TOTAL, "PAR3 breadth");
+    assert_eq!(uu, uu::TOTAL, "uuencode");
+    let total = damage + par2 + par3 + uu + breadth.iter().map(|(_, count)| count).sum::<usize>();
+    eprintln!("damage={damage} par2={par2} par3={par3} uu={uu} {breadth:?} total={total}");
+    assert_eq!(total, TOTAL);
+}
+
+// Tier two's scenarios across every family.
+const TOTAL: usize =
+    damage::TOTAL + par2_realism::TOTAL + par3_breadth::TOTAL + uu::TOTAL + breadth::TOTAL;
