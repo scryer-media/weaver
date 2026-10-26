@@ -127,7 +127,11 @@ use self::{
             snapshot::{PeerStatsFilter, PeerStatsSnapshot},
         },
     },
-    peers::{IncomingRefused, PeerStates, holepunch::is_local},
+    peers::{
+        IncomingRefused, PeerStates,
+        holepunch::is_local,
+        stats::{AggregatePeerStats, AggregatePeerStatsAtomic},
+    },
     stats::{atomic::AtomicStats, snapshot::StatsSnapshot},
     web_seed::{SeedLink, WEB_SEED_TICK, WebSeedConnection},
 };
@@ -216,6 +220,27 @@ pub enum AddIncomingPeerResult {
     Banned,
 }
 
+/// What a torrent's running run holds now, read without the torrent's lock:
+/// its peers by state and the rate it receives at. The counters are the
+/// run's own, moved by each peer's change of state; the torrent lets go of
+/// them as the run ends.
+pub struct RunGauges {
+    peers: Arc<AggregatePeerStatsAtomic>,
+    download: Arc<SpeedEstimator>,
+}
+
+impl RunGauges {
+    /// The run's peers by state now.
+    pub fn peers(&self) -> AggregatePeerStats {
+        self.peers.snapshot()
+    }
+
+    /// The bytes a second the run receives, over its rate window.
+    pub fn download_bps(&self) -> u64 {
+        self.download.bps()
+    }
+}
+
 pub struct TorrentStateLive {
     peers: PeerStates,
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -256,7 +281,7 @@ pub struct TorrentStateLive {
     // seed).
     seed_at_start: bool,
 
-    down_speed_estimator: SpeedEstimator,
+    down_speed_estimator: Arc<SpeedEstimator>,
     up_speed_estimator: SpeedEstimator,
     cancellation_token: CancellationToken,
 
@@ -357,7 +382,7 @@ impl TorrentStateLive {
         // The torrent's rates average over the same window its connections'
         // rates do: sampled every tick, a default estimator spans under half
         // a second and reads 0 between the bursts of a slow upload.
-        let down_speed_estimator = rate_estimator();
+        let down_speed_estimator = Arc::new(rate_estimator());
         let up_speed_estimator = rate_estimator();
 
         let have_bytes = paused.chunk_tracker.get_hns().have_bytes;
@@ -419,6 +444,10 @@ impl TorrentStateLive {
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
             utp: session.utp,
         });
+        state.shared.run.store(Some(Arc::new(RunGauges {
+            peers: state.peers.stats.clone(),
+            download: state.down_speed_estimator.clone(),
+        })));
         // The list a pause left is held to the filter as it is now. Under the
         // torrent's lock, as a filter change reads `live()` under it: the
         // change finds this run, or this run finds the change.
@@ -1347,6 +1376,9 @@ impl TorrentStateLive {
 
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {
         self.cancellation_token.cancel();
+        // The run ends here: its torrent holds nothing from now on, whatever
+        // its closing connections still count.
+        self.shared.run.store(None);
 
         // The peer list is read before the state lock: a dying peer holds
         // its own entry while it takes the state lock, so the state lock

@@ -381,6 +381,9 @@ pub struct ManagedTorrentShared {
     /// An SSL torrent's CA and our identity under it; `None` for any other
     /// torrent.
     pub(crate) ssl: Option<Arc<crate::ssl::SslTorrent>>,
+
+    /// The gauges of the torrent's running run; none between runs.
+    pub(crate) run: ArcSwapOption<RunGauges>,
 }
 
 /// What one live run of a torrent left as it ended, as its tracker
@@ -775,6 +778,12 @@ impl ManagedTorrent {
     }
 
     /// Get the live state if the torrent is live.
+    /// The gauges of the torrent's running run, read without its lock; none
+    /// while it does not run.
+    pub fn gauges(&self) -> Option<Arc<RunGauges>> {
+        self.shared.run.load_full()
+    }
+
     pub fn live(&self) -> Option<Arc<TorrentStateLive>> {
         let g = self.locked.read();
         match &g.state {

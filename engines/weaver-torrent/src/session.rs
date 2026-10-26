@@ -2725,6 +2725,7 @@ impl Session {
                 moved: parking_lot::Mutex::new(opts.totals),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
                 ssl,
+                run: Default::default(),
             });
 
             let initializing = Arc::new(TorrentStateInitializing::new(

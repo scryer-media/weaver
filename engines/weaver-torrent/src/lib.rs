@@ -100,6 +100,7 @@ pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState, TorrentTotals,
     initializing::Checkpoint,
+    live::RunGauges,
     live::peer::info::{PeerFlags, PeerInfo},
     live::peers::ResumePeers,
 };

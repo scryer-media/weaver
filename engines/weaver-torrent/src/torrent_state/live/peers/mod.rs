@@ -83,7 +83,8 @@ fn erase_rank(peer: &Peer) -> EraseRank {
 pub(crate) struct PeerStates {
     pub session_stats: Arc<AggregatePeerStatsAtomic>,
 
-    pub stats: AggregatePeerStatsAtomic,
+    // The run's own counters, which its torrent's gauges read too.
+    pub stats: Arc<AggregatePeerStatsAtomic>,
     pub states: DashMap<PeerHandle, Peer>,
 
     // How many live peers have each piece, kept with the bitfields above.
@@ -599,7 +600,7 @@ impl PeerStates {
             return Admitted::Refused;
         }
         self.count_in(peer.get_state());
-        for counter in [&*self.session_stats, &self.stats] {
+        for counter in [&*self.session_stats, &*self.stats] {
             atomic_inc(&counter.seen);
         }
         let counters = peer.stats.counters.clone();
@@ -933,7 +934,7 @@ impl PeerStates {
     /// Counts a peer in `state` into the torrent and session peer stats and,
     /// when it is live, its bitfield into the piece availability.
     pub(super) fn count_in(&self, state: &PeerState) {
-        for counter in [&*self.session_stats, &self.stats] {
+        for counter in [&*self.session_stats, &*self.stats] {
             counter.inc(state);
         }
         if let PeerState::Live(live) = state {
@@ -945,7 +946,7 @@ impl PeerStates {
     /// Every way a connection ends passes here once, through
     /// [`Peer::set_state`] or the peer leaving the list.
     pub(super) fn count_out(&self, state: &PeerState) {
-        for counter in [&*self.session_stats, &self.stats] {
+        for counter in [&*self.session_stats, &*self.stats] {
             counter.dec(state);
         }
         if let PeerState::Live(live) = state {
@@ -2025,6 +2026,37 @@ mod tests {
         assert_eq!(state_of(&peers, connecting), Some("connecting"));
         assert_eq!(next.stats().queued, 2);
         assert_eq!(next.stats().connecting, 0);
+    }
+
+    // A peer counts as connecting from the moment its dial begins until the
+    // dial ends, in the run's counts and the session's alike: each dial
+    // that fails leaves both, and a run that ends leaves none behind.
+    #[test]
+    fn a_dial_counts_as_connecting_until_it_ends() {
+        let session: Arc<AggregatePeerStatsAtomic> = Default::default();
+        let peers =
+            PeerStates::founded_on(PeerList::default(), session.clone(), TOTAL_PIECES as u32);
+        let t0 = Instant::now();
+        let dialled = [peer_addr(1), peer_addr(2)];
+        for addr in dialled {
+            peers.add_peer(addr, PeerSourceFlag::Tracker);
+        }
+        let connecting = || (peers.stats().connecting, session.snapshot().connecting);
+        assert_eq!(connecting(), (0, 0));
+        for _ in dialled {
+            assert!(peers.connect_next(t0).is_some());
+        }
+        assert_eq!(connecting(), (2, 2));
+
+        peers
+            .with_peer_mut(dialled[0], "test", |peer| {
+                peers.connection_closed(peer, t0, true, false);
+            })
+            .unwrap();
+        assert_eq!(connecting(), (1, 1));
+
+        drop(peers);
+        assert_eq!(session.snapshot().connecting, 0);
     }
 
     // libtorrent `torrent::do_pause` closes every connection with
