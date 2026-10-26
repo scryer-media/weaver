@@ -201,6 +201,8 @@ fn request(source: AddSource) -> AddRequest {
         forced: false,
         unpack: None,
         metadata: Vec::new(),
+        upload_limit: None,
+        download_limit: None,
     }
 }
 
@@ -3692,6 +3694,36 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     rig.service.stop().await;
 }
 
+// A magnet claims its directory only once its metainfo is in hand: paused
+// and then removed while it is fetched, it leaves no directory behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnet_removed_before_its_metainfo_leaves_no_directory() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let complete = rig.dir.path().join("complete");
+    let left = || {
+        std::fs::read_dir(&complete)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+    let job_id = fetching_from(&rig.service, &"fc".repeat(20), port).await;
+    let mut updates = rig.service.updates(Some(job_id), Duration::from_millis(10));
+    started_and_answered(&listener, &mut updates).await;
+    assert_eq!(left(), 0);
+
+    rig.service.pause(job_id).await.unwrap();
+    let (stream, event) = heard_event(&listener).await;
+    assert_eq!(event.as_deref(), Some("stopped"));
+    answer_no_peers(stream).await;
+    rig.service.remove(job_id, false, false).await.unwrap();
+    assert!(rig.service.torrent(job_id).await.is_none());
+    assert_eq!(left(), 0);
+    rig.service.stop().await;
+}
+
 // A magnet whose route changes while its metainfo is fetched ends that
 // fetch, which its old session lets go with `stopped`, and fetches again on
 // the new route's session.
@@ -5262,6 +5294,115 @@ async fn tracker_edits_outlive_a_restart() {
     again.stop().await;
 }
 
+// A tracker edit picks the rule the torrent's trackers now match, and a
+// restart reads that rule, not the one its first trackers matched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_rule_a_tracker_edit_picks_is_the_one_a_restart_reads() {
+    let a = "http://a.invalid/announce";
+    let b = "http://b.invalid/announce";
+    let rig = rig(set_clock());
+    let rule = rig
+        .db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "b.invalid".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
+                ssl: None,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(&plain("ruled", 5), a)))
+        })
+        .await
+        .unwrap();
+    let rule_of = async |service: &TorrentService| service.inner.live.lock().await[&job_id].rule_id;
+    assert_eq!(rule_of(&rig.service).await, None);
+
+    rig.service
+        .replace_trackers(job_id, vec![(0, b.into())])
+        .await
+        .unwrap();
+    assert_eq!(rule_of(&rig.service).await, Some(rule.id));
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert_eq!(rule_of(&again).await, Some(rule.id));
+    again.stop().await;
+}
+
+// A tracker edit that lands after the attach read the list and before the
+// session took the torrent reaches the session: the torrent runs on the
+// edited list, not the one the attach read. The attach is polled by hand on
+// a runtime with no other worker, so the edit lands at that one point, while
+// the attach waits for its route's session.
+#[tokio::test(flavor = "current_thread")]
+async fn a_tracker_edit_racing_an_attach_reaches_the_session() {
+    use std::task::Poll;
+
+    let a = "http://a.invalid/announce";
+    let b = "http://b.invalid/announce";
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(&plain("raced", 6), a)))
+        })
+        .await
+        .unwrap();
+    {
+        let mut live = rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&job_id).unwrap();
+        rig.service.detach(torrent).await;
+        torrent.route = None;
+    }
+    // Its route's session goes with it, so the attach waits for a new one.
+    rig.service.drop_idle_sessions().await;
+
+    let mut attach = std::pin::pin!(rig.service.attach(job_id, None));
+    let first = std::future::poll_fn(|cx| Poll::Ready(attach.as_mut().poll(cx))).await;
+    assert!(first.is_pending(), "the session took the torrent at once");
+    assert!(
+        rig.service.inner.live.lock().await[&job_id]
+            .attached
+            .is_none(),
+        "the attach finished before the edit"
+    );
+    rig.service
+        .replace_trackers(job_id, vec![(0, b.into())])
+        .await
+        .unwrap();
+    attach.await;
+
+    assert_eq!(
+        handle_of(&rig.service, job_id)
+            .await
+            .shared()
+            .tracker_tiers(),
+        [vec![weaver_torrent::tracker::Tracker::operator(
+            weaver_torrent::Url::parse(b).unwrap(),
+        )]]
+    );
+    rig.service.stop().await;
+}
+
 // A reannounce reaches the tracker now, long before the interval it set
 // is up, for every tracker or for the one named.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6002,6 +6143,59 @@ async fn a_torrent_moved_off_a_spent_leg_sends_no_stopped_over_it() {
     while let Ok(heard) = announces.try_recv() {
         assert_eq!(heard.event, None, "the tracker heard more: {heard:?}");
     }
+}
+
+// A torrent whose leg is revoked under its session, as saving its proxy's
+// profile again revokes it, moves to a session on the leg its route has now:
+// the tracker hears the new session's `started` as the same torrent, and no
+// `stopped` from the old session, which the revocation withheld, until the
+// torrent is removed. The old leg's sockets still reach the tracker, so a
+// `stopped` the old session sent would be heard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_moved_off_a_revoked_leg_sends_no_stopped_over_it() {
+    let (url, mut announces) = heard_tracker(&[]).await;
+    let rig = rig(set_clock());
+    let (db, network) = on_network(&rig.routes);
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("revoked", 10)))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+    let started = next_event(&mut announces).await;
+    assert_eq!(started.event.as_deref(), Some("started"));
+    started_accepted(&rig.service, job_id).await;
+    let before = session_of(&rig.service, job_id).await;
+
+    save_again(&db, &network).await;
+    rig.service.follow_routes().await;
+    let again = next_event(&mut announces).await;
+    assert_eq!(again.event.as_deref(), Some("started"));
+    assert_eq!(again.identity(), started.identity());
+    assert!(!Arc::ptr_eq(
+        &session_of(&rig.service, job_id).await,
+        &before
+    ));
+    started_accepted(&rig.service, job_id).await;
+    before.cancellation_token().cancelled().await;
+
+    // The one `stopped` the tracker hears is the new session's, at the
+    // remove.
+    rig.service.remove(job_id, false, false).await.unwrap();
+    let stopped = next_event(&mut announces).await;
+    assert_eq!(stopped.event.as_deref(), Some("stopped"));
+    assert_eq!(stopped.identity(), started.identity());
+    rig.service.stop().await;
+    while let Ok(heard) = announces.try_recv() {
+        assert_eq!(heard.event, None, "the tracker heard more: {heard:?}");
+    }
+    network.shutdown().await;
 }
 
 // A torrent removed and added again is a new torrent to its trackers: a new

@@ -1506,6 +1506,8 @@ async fn add_torrent(
             forced: false,
             unpack,
             metadata: Vec::new(),
+            upload_limit: None,
+            download_limit: None,
         },
     )
     .await?;

@@ -1489,6 +1489,71 @@ async fn a_torrent_run_needs_a_torrent_route_and_torrents_on() {
     }
 }
 
+// A run on a torrent route runs on a route a torrent may take, one leg with
+// one exit, or not at all: a route with a second leg is refused even when
+// the run's overrides take its first leg down and leave the second, and so
+// is a ladder that falls back to the egress, each for the reason a saved
+// torrent route would be.
+#[tokio::test]
+async fn a_torrent_routes_run_keeps_to_one_leg_with_one_exit() {
+    use crate::proxies::{NetworkRefusal, Rung, TorrentRouteFault};
+
+    let rig = rig().await;
+    torrents_on(&rig).await;
+    let direct = direct_on(rig.loopback).legs.remove(0);
+    let two_legs = Route {
+        legs: vec![direct.clone(), direct.clone()],
+        failover: Failover::Redistribute,
+    };
+    let falls_back = Route {
+        legs: vec![RouteLeg {
+            path: LegPath::Ladder {
+                rungs: vec![Rung::Proxy { id: 1 }],
+                direct_fallback: true,
+            },
+            ..direct
+        }],
+        failover: Failover::Redistribute,
+    };
+    let cases = [
+        (
+            two_legs.clone(),
+            PathOverride::default(),
+            TorrentRouteFault::Legs,
+        ),
+        (
+            two_legs,
+            PathOverride {
+                down_legs: vec![0],
+                ..PathOverride::default()
+            },
+            TorrentRouteFault::Legs,
+        ),
+        (
+            falls_back,
+            PathOverride::default(),
+            TorrentRouteFault::DirectFallback,
+        ),
+    ];
+    for kind in [
+        torrent_request(rig.loopback).kind,
+        bandwidth_request("https://127.0.0.1:1/".into()).kind,
+    ] {
+        for (route, overrides, fault) in cases.clone() {
+            let request = SpeedTestRequest {
+                route: Some(route),
+                overrides,
+                kind: kind.clone(),
+                ..torrent_request(rig.loopback)
+            };
+            assert_eq!(
+                rig.service.start(request).await.unwrap_err(),
+                SpeedTestError::Refused(NetworkRefusal::TorrentRouteExit(fault))
+            );
+        }
+    }
+}
+
 // The whole torrent is pulled from the seeder, every block counted on the
 // leg, and the pieces it held then go to the leecher the tracker sends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

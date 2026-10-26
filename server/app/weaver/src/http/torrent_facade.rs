@@ -1369,6 +1369,11 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .flag("stopped")
         .or_else(|| params.flag("paused"))
         .unwrap_or(false);
+    let (upload_limit, download_limit) =
+        match (add_limit(&params, "upLimit"), add_limit(&params, "dlLimit")) {
+            (Ok(upload), Ok(download)) => (upload, download),
+            (Err(response), _) | (_, Err(response)) => return response,
+        };
     let mut added = 0usize;
     let mut refusal: Option<Response> = None;
     for source in sources {
@@ -1380,6 +1385,8 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
             forced: false,
             unpack: None,
             metadata: Vec::new(),
+            upload_limit,
+            download_limit,
         };
         match torrents.add(request).await {
             Ok(_) => added += 1,
@@ -1615,17 +1622,37 @@ enum Direction {
     Download,
 }
 
+// A limit in bytes a second as the client names it under `key`: its 0 and
+// any negative number are no limit.
+fn rate_limit_of(params: &Params, key: &str) -> Option<Result<Option<u64>, Response>> {
+    params
+        .get(key)
+        .map(|limit| match limit.trim().parse::<i64>() {
+            Ok(limit) => Ok(u64::try_from(limit).ok().filter(|limit| *limit > 0)),
+            Err(_) => Err(text(
+                StatusCode::BAD_REQUEST,
+                format!("{key} is not a number"),
+            )),
+        })
+}
+
+// A limit an added torrent takes, none when the client names none.
+fn add_limit(params: &Params, key: &str) -> Result<Option<u64>, Response> {
+    rate_limit_of(params, key).unwrap_or(Ok(None))
+}
+
 // Sets one limit on each torrent `hashes` names; the other is left as it
-// is. The client's 0 and any negative number are no limit.
+// is.
 async fn set_rate_limit(
     ctx: &TorrentFacadeContext,
     params: &Params,
     direction: Direction,
 ) -> Response {
-    let Some(Ok(limit)) = params.get("limit").map(|limit| limit.trim().parse::<i64>()) else {
-        return text(StatusCode::BAD_REQUEST, "limit is not a number");
+    let limit = match rate_limit_of(params, "limit") {
+        Some(Ok(limit)) => Some(limit),
+        Some(Err(response)) => return response,
+        None => return text(StatusCode::BAD_REQUEST, "limit is not a number"),
     };
-    let limit = Some(u64::try_from(limit).ok().filter(|limit| *limit > 0));
     let (upload, download) = match direction {
         Direction::Upload => (limit, None),
         Direction::Download => (None, limit),
