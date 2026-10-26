@@ -24,10 +24,10 @@ pub(crate) const END64_LEN: u64 = 56;
 // The end record and the longest comment it can carry.
 pub(crate) const TAIL: u64 = END_LEN + u16::MAX as u64;
 
-const ZIP64: u16 = 0x0001;
+pub(crate) const ZIP64: u16 = 0x0001;
 const AES: u16 = 0x9901;
 const AES_METHOD: u16 = 99;
-const UTF8: u16 = 1 << 11;
+const UNICODE_PATH: u16 = 0x7075;
 const ENCRYPTED: u16 = 1;
 const DESCRIPTOR: u16 = 1 << 3;
 const UNIX: u8 = 3;
@@ -137,6 +137,25 @@ pub(crate) enum Shape {
     Other,
 }
 
+// What an entry is by its Unix mode, when it has one, and else by its name:
+// a directory's ends with a slash.
+pub(crate) fn shape(name: &str, mode: Option<u32>) -> Shape {
+    match mode.map(|mode| mode & KIND) {
+        Some(DIRECTORY) => Shape::Directory,
+        Some(kind) if kind != 0 && kind != FILE => Shape::Other,
+        _ if name.ends_with(['/', '\\']) => Shape::Directory,
+        _ => Shape::File,
+    }
+}
+
+// The name a member takes: a directory's with a trailing slash.
+pub(crate) fn member_name(mut name: String, shape: Shape) -> String {
+    if shape == Shape::Directory && !name.ends_with(['/', '\\']) {
+        name.push('/');
+    }
+    name
+}
+
 // An entry as the central directory, or a local header, describes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Header {
@@ -176,6 +195,20 @@ pub(crate) struct Central {
     // whether each is the 8- or 4-byte zip64 field rather than the narrow one.
     pub(crate) disk_at: (usize, bool),
     pub(crate) offset_at: (usize, bool),
+    // Where the entry runs in the directory's bytes.
+    pub(crate) span: std::ops::Range<usize>,
+    // Where a zip64 offset goes when the narrow field holds the offset now.
+    pub(crate) grow: Grow,
+}
+
+// The place a zip64 offset takes in an entry that has none: inside its zip64
+// field, after the sizes the field holds and ahead of its disk, or, when the
+// entry has no zip64 field, a field of its own at the end of its extra field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Grow {
+    // Where the entry's zip64 field starts, its id and length first.
+    pub(crate) field: Option<usize>,
+    pub(crate) at: usize,
 }
 
 // Every entry of a central directory that holds exactly `entries` of them
@@ -215,19 +248,15 @@ fn central(bytes: &[u8], at: usize) -> Option<(Central, usize)> {
     let mut wide = Wide::new(extra, extra_at);
     let length = wide.take(u64::from(length), length == u32::MAX)?;
     let compressed = wide.take(u64::from(compressed), compressed == u32::MAX)?;
+    let grow = wide.grow(extra_at + extra_len);
     let offset_at = wide.at(42 + at, offset == u32::MAX);
     let offset = wide.take(u64::from(offset), offset == u32::MAX)?;
     let disk_at = wide.at(34 + at, disk == u16::MAX);
     let disk = wide.take_disk(u32::from(disk), disk == u16::MAX)?;
 
     let mode = (made_by == UNIX).then_some(external >> 16);
-    let name = decode(name, flags);
-    let shape = match mode.map(|mode| mode & KIND) {
-        Some(DIRECTORY) => Shape::Directory,
-        Some(kind) if kind != 0 && kind != FILE => Shape::Other,
-        _ if name.ends_with(['/', '\\']) => Shape::Directory,
-        _ => Shape::File,
-    };
+    let name = decode(name, extra);
+    let shape = shape(&name, mode);
     Some((
         Central {
             header: Header {
@@ -244,6 +273,8 @@ fn central(bytes: &[u8], at: usize) -> Option<(Central, usize)> {
             offset,
             disk_at,
             offset_at,
+            span: at..next,
+            grow,
         },
         next,
     ))
@@ -274,7 +305,7 @@ pub(crate) fn local(bytes: &[u8]) -> Option<Header> {
     let mut sizes = Wide::new(extra, extra_at);
     let length = sizes.take(u64::from(length), wide)?;
     let compressed = sizes.take(u64::from(compressed), wide)?;
-    let name = decode(name, flags);
+    let name = decode(name, extra);
     let shape = if name.ends_with(['/', '\\']) {
         Shape::Directory
     } else {
@@ -309,29 +340,71 @@ pub(crate) fn next(bytes: &[u8]) -> Option<Next> {
     })
 }
 
-// A name as the header gives it: UTF-8 when the header says so or the bytes
-// are, otherwise read byte for byte.
-fn decode(name: &[u8], flags: u16) -> String {
+// A name as the zip reader names it, so the store and the engine name every
+// entry alike. A Unicode path field whose checksum matches the header's name
+// bytes and whose text is UTF-8 stands in for those bytes, the last such
+// field winning. The bytes then read as UTF-8 when they are, and as code
+// page 437 otherwise, whatever the header's UTF-8 flag says.
+fn decode(name: &[u8], extra: &[u8]) -> String {
+    let checksum = crate::grid::crc32(name);
+    let name = fields(extra)
+        .filter(|(kind, _, _)| *kind == UNICODE_PATH)
+        .filter_map(|(_, _, body)| {
+            let said = u32::from_le_bytes(body.get(1..5)?.try_into().ok()?);
+            let path = body.get(5..)?;
+            (said == checksum && std::str::from_utf8(path).is_ok()).then_some(path)
+        })
+        .last()
+        .unwrap_or(name);
     match std::str::from_utf8(name) {
         Ok(text) => text.to_owned(),
-        Err(_) if flags & UTF8 != 0 => String::from_utf8_lossy(name).into_owned(),
-        Err(_) => name.iter().map(|byte| char::from(*byte)).collect(),
+        Err(_) => name.iter().map(|byte| cp437(*byte)).collect(),
     }
 }
 
+// A byte of code page 437: ASCII below 0x80, the table's character above.
+fn cp437(byte: u8) -> char {
+    match byte.checked_sub(0x80) {
+        Some(high) => CP437[usize::from(high)],
+        None => char::from(byte),
+    }
+}
+
+// Code page 437 from 0x80 to 0xFF, sixteen to a row.
+const CP437: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', //
+    'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', //
+    'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', //
+    '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐', //
+    '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', //
+    '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀', //
+    '\u{3b1}', '\u{df}', '\u{393}', '\u{3c0}', '\u{3a3}', '\u{3c3}', '\u{b5}', '\u{3c4}', //
+    '\u{3a6}', '\u{398}', '\u{3a9}', '\u{3b4}', '\u{221e}', '\u{3c6}', '\u{3b5}',
+    '\u{2229}', //
+    '\u{2261}', '\u{b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{f7}',
+    '\u{2248}', //
+    '\u{b0}', '\u{2219}', '\u{b7}', '\u{221a}', '\u{207f}', '\u{b2}', '\u{25a0}', '\u{a0}', //
+];
+
 // The body of an extra field by its id, and where it starts.
 fn field(extra: &[u8], id: u16) -> Option<(usize, &[u8])> {
+    fields(extra)
+        .find(|(kind, _, _)| *kind == id)
+        .map(|(_, at, body)| (at, body))
+}
+
+// Each extra field in order: its id, where its body starts, and its body.
+// The walk ends at the first field that does not fit.
+fn fields(extra: &[u8]) -> impl Iterator<Item = (u16, usize, &[u8])> {
     let mut at = 0;
-    while at + 4 <= extra.len() {
+    std::iter::from_fn(move || {
         let kind = u16_at(extra, at)?;
         let len = u16_at(extra, at + 2)? as usize;
         let body = extra.get(at + 4..at + 4 + len)?;
-        if kind == id {
-            return Some((at + 4, body));
-        }
-        at += 4 + len;
-    }
-    None
+        let start = at + 4;
+        at = start + len;
+        Some((kind, start, body))
+    })
 }
 
 // The zip64 extra field, read in its fixed order: each saturated field of
@@ -358,6 +431,20 @@ impl<'a> Wide<'a> {
         match (saturated, self.body) {
             (true, Some((start, _))) => (self.base + start + self.cursor, true),
             _ => (narrow, false),
+        }
+    }
+
+    // Where the next field would go, were it added to the zip64 field.
+    fn grow(&self, extra_end: usize) -> Grow {
+        match self.body {
+            Some((start, _)) => Grow {
+                field: Some(self.base + start - 4),
+                at: self.base + start + self.cursor,
+            },
+            None => Grow {
+                field: None,
+                at: extra_end,
+            },
         }
     }
 

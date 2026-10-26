@@ -80,19 +80,27 @@ struct Walk<'s, 'a> {
 
 impl Walk<'_, '_> {
     fn entry(&mut self, entry: &ArchiveEntry, read: &mut dyn EntryRead) -> Result<bool, Error> {
-        // The namespace has no directories, and no links or devices: a
-        // directory is implied by the paths of the members inside it, and
-        // the others are not file bodies, so none is a member and the files
-        // around them stand. sevenz-turbo drains what is left unread.
-        if !is_file_body(entry) {
+        // A directory is a member with nothing in it, named with a trailing
+        // slash as the store names it. Links and devices are not file
+        // bodies, so none is a member and the files around them stand.
+        // sevenz-turbo drains what is left unread.
+        let mut name = entry.name().to_owned();
+        let length = if is_directory(entry) {
+            if !name.ends_with(['/', '\\']) {
+                name.push('/');
+            }
+            0
+        } else if is_file_body(entry) {
+            entry.size()
+        } else {
             return Ok(true);
-        }
+        };
         let member = MemberId(self.next);
         self.next += 1;
         self.say(Emit::Member {
             member,
-            name: entry.name().to_owned(),
-            length: Some(entry.size()),
+            name,
+            length: Some(length),
         })?;
         self.open = Some(member);
         let mut out = Out {
@@ -124,6 +132,10 @@ impl Walk<'_, '_> {
 
 fn stopped() -> Error {
     Error::Other(Cow::Borrowed("the owner stopped the run"))
+}
+
+fn is_directory(entry: &ArchiveEntry) -> bool {
+    entry.is_directory() && !entry.is_anti_item() && !entry.is_symlink()
 }
 
 fn is_file_body(entry: &ArchiveEntry) -> bool {

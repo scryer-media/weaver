@@ -296,3 +296,45 @@ async fn an_xz_damaged_at_its_front_beside_a_par2_set_covering_nothing_ends_with
         Some(&Claim::Damaged)
     );
 }
+
+// A tar holding an empty directory ahead of a member.
+fn tar_with_empty_directory(member: &[u8]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut directory = tar::Header::new_gnu();
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_size(0);
+    directory.set_mode(0o755);
+    directory.set_cksum();
+    builder
+        .append_data(&mut directory, "hollow/", std::io::empty())
+        .unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(member.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "ember.bin", member)
+        .unwrap();
+    builder.into_inner().unwrap()
+}
+
+#[tokio::test]
+async fn a_tar_holding_an_empty_directory_delivers_it_under_both_engines() {
+    let member = members()[0].1.clone();
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.tar",
+        tar_with_empty_directory(&member),
+    )]);
+    let (classic, graph) = run_both(&scenario).await;
+    assert!(classic.completed(), "classic: {:?}", classic.failure);
+    let hollow = [delivered("hollow/")];
+    assert_eq!(
+        (
+            classic.empty.iter().collect::<Vec<_>>(),
+            graph.empty.iter().collect::<Vec<_>>()
+        ),
+        (hollow.iter().collect(), hollow.iter().collect()),
+        "(classic, graph) empty directories"
+    );
+    assert_same(&classic, &graph);
+}

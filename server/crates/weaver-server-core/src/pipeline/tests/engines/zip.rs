@@ -437,3 +437,83 @@ async fn a_deflate_zip_damaged_beside_par2_is_repaired_with_no_refetch_under_bot
         classic.refetched()
     );
 }
+
+// A zip from before names could be flagged UTF-8: its entry named in code
+// page 437, where 0x82 is é. The name is written as ASCII and its bytes are
+// then swapped in the local header and the directory, so no flag is set.
+fn code_page_437(options: SimpleFileOptions) -> Vec<u8> {
+    const PLACEHOLDER: &[u8] = b"cafX.bin";
+    const NAME: &[u8] = b"caf\x82.bin";
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(std::str::from_utf8(PLACEHOLDER).unwrap(), options)
+        .unwrap();
+    writer.write_all(&members()[0].1).unwrap();
+    let mut bytes = writer.finish().unwrap().into_inner();
+    let places: Vec<usize> = bytes
+        .windows(PLACEHOLDER.len())
+        .enumerate()
+        .filter(|(_, window)| *window == PLACEHOLDER)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        places.len(),
+        2,
+        "the local header's name and the directory's"
+    );
+    for at in places {
+        bytes[at..at + NAME.len()].copy_from_slice(NAME);
+    }
+    bytes
+}
+
+#[tokio::test]
+async fn a_zip_naming_its_entry_in_code_page_437_delivers_it_decoded_under_graph() {
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for options in [stored(), deflated] {
+        let scenario = Scenario::new(vec![Post::plain("lantern.zip", code_page_437(options))]);
+        let (classic, graph) = run_both(&scenario).await;
+        assert!(graph.completed(), "graph: {:?}", graph.failure);
+        assert_eq!(
+            graph.files.keys().cloned().collect::<Vec<_>>(),
+            [delivered("café.bin")],
+            "graph: delivered names"
+        );
+        assert!(graph.files[&delivered("café.bin")] == members()[0].1);
+        assert_same(&classic, &graph);
+    }
+}
+
+// A zip holding an empty directory beside a member.
+fn with_empty_directory(options: SimpleFileOptions) -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.add_directory("hollow/", stored()).unwrap();
+    writer.start_file("ember.bin", options).unwrap();
+    writer.write_all(&members()[0].1).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// The empty directory is delivered as a directory by both engines, stored
+// through the store and deflated through the engine.
+#[tokio::test]
+async fn a_zip_holding_an_empty_directory_delivers_it_under_both_engines() {
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for options in [stored(), deflated] {
+        let scenario = Scenario::new(vec![Post::plain(
+            "lantern.zip",
+            with_empty_directory(options),
+        )]);
+        let (classic, graph) = run_both(&scenario).await;
+        assert!(classic.completed(), "classic: {:?}", classic.failure);
+        let hollow = [delivered("hollow/")];
+        assert_eq!(
+            (
+                classic.empty.iter().collect::<Vec<_>>(),
+                graph.empty.iter().collect::<Vec<_>>()
+            ),
+            (hollow.iter().collect(), hollow.iter().collect()),
+            "(classic, graph) empty directories"
+        );
+        assert_same(&classic, &graph);
+    }
+}

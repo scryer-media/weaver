@@ -507,6 +507,9 @@ pub(super) struct Outcome {
     pub(super) failure: Option<String>,
     pub(super) failure_kind: Option<HistoryFailureKind>,
     pub(super) files: BTreeMap<String, Vec<u8>>,
+    // Every directory delivered with nothing in it, by its path and a
+    // trailing slash.
+    pub(super) empty: BTreeSet<String>,
     pub(super) claims: BTreeMap<String, Claim>,
     pub(super) requests: BTreeMap<(u32, u32), usize>,
     // Every article in the order it was asked for.
@@ -849,6 +852,8 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         .and_then(|state| state.failure_kind);
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
+    let mut empty = BTreeSet::new();
+    collect_empty(&complete_dir, &complete_dir, &mut empty);
     let claims = scenario
         .posts
         .iter()
@@ -864,6 +869,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         failure,
         failure_kind,
         files,
+        empty,
         claims,
         requests,
         order,
@@ -1313,5 +1319,33 @@ pub(super) fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<
                 .into_owned();
             files.insert(name, std::fs::read(&path).unwrap());
         }
+    }
+}
+
+// The delivered directories that hold nothing, the marker aside. The working
+// directories a run keeps beside the output, named with a leading
+// `.weaver-`, are not delivered, and classic leaves them empty when it is
+// done with them.
+fn collect_empty(root: &Path, dir: &Path, empty: &mut BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut held = false;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".weaver-"))
+        {
+            continue;
+        }
+        held = true;
+        if path.is_dir() {
+            collect_empty(root, &path, empty);
+        }
+    }
+    if !held && dir != root {
+        let name = dir.strip_prefix(root).unwrap().to_string_lossy();
+        empty.insert(format!("{name}/"));
     }
 }

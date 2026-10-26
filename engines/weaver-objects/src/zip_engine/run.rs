@@ -17,6 +17,7 @@ use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 use super::image::{Image, Unopened};
 use crate::engine::Joined;
 use crate::verdict;
+use crate::zip::records::{self, Shape};
 
 pub(super) struct Run {
     password: Option<String>,
@@ -83,21 +84,26 @@ impl Walk<'_, '_> {
                 None => archive.by_index(index),
             };
             let mut file = file.map_err(|error| Some(verdict::zip(&error)))?;
-            // The namespace has no directories, and no links or devices: a
-            // directory is implied by the paths of the members inside it, and
-            // the others are not file bodies.
-            if !is_file_body(file.is_dir(), file.unix_mode()) {
-                continue;
-            }
+            let name = file
+                .name()
+                .map_err(|error| Some(verdict::zip(&error)))?
+                .into_owned();
+            // A directory is a member with nothing in it, named as the store
+            // names it. Links and devices are not file bodies, so none is a
+            // member and the files around them stand.
+            let shape = records::shape(&name, file.unix_mode());
+            let length = match shape {
+                Shape::File => file.size(),
+                Shape::Directory => 0,
+                Shape::Other => continue,
+            };
+            let name = records::member_name(name, shape);
             let member = MemberId(self.next);
             self.next += 1;
             self.say(Emit::Member {
                 member,
-                name: file
-                    .name()
-                    .map_err(|error| Some(verdict::zip(&error)))?
-                    .into_owned(),
-                length: Some(file.size()),
+                name,
+                length: Some(length),
             })?;
             self.open = Some(member);
             let encrypted = file.encrypted();
@@ -121,12 +127,6 @@ impl Walk<'_, '_> {
     fn say(&mut self, emit: Emit) -> Result<(), Option<Emit>> {
         (self.sink)(emit).then_some(()).ok_or(None)
     }
-}
-
-fn is_file_body(directory: bool, mode: Option<u32>) -> bool {
-    const KIND: u32 = 0o170_000;
-    const FILE: u32 = 0o100_000;
-    !directory && mode.is_none_or(|mode| matches!(mode & KIND, 0 | FILE))
 }
 
 // The decoder's output, handed to the sink as it is written.

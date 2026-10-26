@@ -426,3 +426,60 @@ fn the_store_is_built_for_its_kind() {
     assert_eq!(object.kind(), Kind::Zip);
     assert!(!object.reads_in_order());
 }
+
+// A stored local header for an empty entry named by `name`'s raw bytes, with
+// `extra` as its extra field.
+fn local_named(name: &[u8], flags: u16, extra: &[u8]) -> Vec<u8> {
+    let mut header = records::LOCAL.to_le_bytes().to_vec();
+    header.extend(20u16.to_le_bytes());
+    header.extend(flags.to_le_bytes());
+    header.extend([0u8; 18]);
+    header.extend((name.len() as u16).to_le_bytes());
+    header.extend((extra.len() as u16).to_le_bytes());
+    header.extend(name);
+    header.extend(extra);
+    header
+}
+
+// A Unicode path field naming `path` for a header whose name bytes have
+// `checksum`.
+fn unicode_path(checksum: u32, path: &str) -> Vec<u8> {
+    let mut field = 0x7075u16.to_le_bytes().to_vec();
+    field.extend((5 + path.len() as u16).to_le_bytes());
+    field.push(1);
+    field.extend(checksum.to_le_bytes());
+    field.extend(path.as_bytes());
+    field
+}
+
+#[test]
+fn a_name_that_is_not_utf8_reads_as_code_page_437_whatever_its_flag() {
+    let name = |bytes: &[u8], flags, extra: &[u8]| {
+        records::local(&local_named(bytes, flags, extra))
+            .unwrap()
+            .name
+    };
+    assert_eq!(name(b"caf\x82.txt", 0, &[]), "café.txt");
+    assert_eq!(name(b"\x80\x9b\xe1\xff", 0, &[]), "Ç¢ß\u{a0}");
+    assert_eq!(
+        name("café.txt".as_bytes(), 0, &[]),
+        "café.txt",
+        "valid UTF-8 without the flag stays UTF-8"
+    );
+    assert_eq!(
+        name(b"caf\x82.txt", 1 << 11, &[]),
+        "café.txt",
+        "the UTF-8 flag does not change how a name reads"
+    );
+    let checksum = crate::grid::crc32(b"cafe.txt");
+    assert_eq!(
+        name(b"cafe.txt", 0, &unicode_path(checksum, "café.txt")),
+        "café.txt",
+        "a Unicode path whose checksum matches the name stands in for it"
+    );
+    assert_eq!(
+        name(b"cafe.txt", 0, &unicode_path(!checksum, "café.txt")),
+        "cafe.txt",
+        "a Unicode path whose checksum does not match is ignored"
+    );
+}

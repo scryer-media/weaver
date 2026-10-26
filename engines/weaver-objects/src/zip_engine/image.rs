@@ -20,7 +20,9 @@ use ::zip::result::ZipResult;
 use weaver_graph::Why;
 
 use crate::engine::Joined;
-use crate::zip::records::{self, END, END_LEN, END64, END64_LEN, End, LOCATOR, LOCATOR_LEN, TAIL};
+use crate::zip::records::{
+    self, END, END_LEN, END64, END64_LEN, End, Grow, LOCATOR, LOCATOR_LEN, TAIL,
+};
 
 // Why the set is not an image: the owner failed a read, which it already
 // knows, or the shape is one no image is made of.
@@ -103,7 +105,7 @@ impl Image {
             Some(directory) => {
                 let mut bytes = vec![0u8; end.size as usize];
                 joined.read_exact(directory, &mut bytes)?;
-                rewrite(&mut bytes, &end, directory, &base).map(|rest| (directory, rest))
+                rewrite(&bytes, &end, directory, &base).map(|rest| (directory, rest))
             }
             None => None,
         };
@@ -217,24 +219,33 @@ fn seek(position: u64, len: u64, to: SeekFrom) -> io::Result<u64> {
 }
 
 // The directory on disk zero at its place in the whole, followed by the
-// records that end it. `None` when an entry's place does not fit its field.
-fn rewrite(
-    directory: &mut [u8],
+// records that end it. An entry whose place in the whole no longer fits its
+// narrow field gets it in its zip64 field. `None` when an entry cannot.
+pub(super) fn rewrite(
+    directory: &[u8],
     end: &End,
     start: u64,
     base: &dyn Fn(u32) -> Option<u64>,
 ) -> Option<Vec<u8>> {
     let entries = records::directory(directory, end.entries)?;
+    let mut rest = Vec::with_capacity(directory.len());
     for entry in &entries {
         let offset = base(entry.disk)?.checked_add(entry.offset)?;
-        put(directory, entry.offset_at, offset, 4)?;
-        put(directory, entry.disk_at, 0, 2)?;
+        let mut bytes = directory.get(entry.span.clone())?.to_vec();
+        let within = |(at, wide): (usize, bool)| (at - entry.span.start, wide);
+        put(&mut bytes, within(entry.disk_at), 0, 2)?;
+        let (at, wide) = within(entry.offset_at);
+        if wide || offset < u64::from(u32::MAX) {
+            put(&mut bytes, (at, wide), offset, 4)?;
+        } else {
+            widen(&mut bytes, entry.grow, entry.span.start, offset)?;
+        }
+        rest.extend(bytes);
     }
-    let size = directory.len() as u64;
+    let size = rest.len() as u64;
     let wide = end.entries >= u64::from(u16::MAX)
         || size >= u64::from(u32::MAX)
         || start >= u64::from(u32::MAX);
-    let mut rest = directory.to_vec();
     if wide {
         let at = start + size;
         rest.extend(END64.to_le_bytes());
@@ -286,6 +297,34 @@ fn put(directory: &mut [u8], (at, wide): (usize, bool), value: u64, narrow: usiz
     directory
         .get_mut(at..at + width)?
         .copy_from_slice(&value.to_le_bytes()[..width]);
+    Some(())
+}
+
+// An entry's offset moved into its zip64 field, at the place the field's
+// order gives it, with the narrow field's all-ones mark saying so. An entry
+// with no zip64 field gains one at the end of its extra field. `entry` is
+// where the entry's bytes start in the directory `grow` was read from.
+fn widen(bytes: &mut Vec<u8>, grow: Grow, entry: usize, offset: u64) -> Option<()> {
+    const EXTRA_LEN: usize = 30;
+    const OFFSET: usize = 42;
+    let mut added = Vec::with_capacity(12);
+    match grow.field {
+        Some(field) => {
+            let len = field - entry + 2;
+            let grown = records::u16_at(bytes, len)?.checked_add(8)?;
+            bytes[len..len + 2].copy_from_slice(&grown.to_le_bytes());
+        }
+        None => {
+            added.extend(records::ZIP64.to_le_bytes());
+            added.extend(8u16.to_le_bytes());
+        }
+    }
+    added.extend(offset.to_le_bytes());
+    let extra = records::u16_at(bytes, EXTRA_LEN)?.checked_add(added.len() as u16)?;
+    bytes[EXTRA_LEN..EXTRA_LEN + 2].copy_from_slice(&extra.to_le_bytes());
+    bytes[OFFSET..OFFSET + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let at = grow.at - entry;
+    bytes.splice(at..at, added);
     Some(())
 }
 

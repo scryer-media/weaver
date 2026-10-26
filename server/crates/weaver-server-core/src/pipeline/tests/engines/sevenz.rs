@@ -889,3 +889,58 @@ async fn a_large_aes_stored_7z_offered_a_wrong_password_first_delivers_under_gra
     assert!(graph.files[&delivered("lantern.bin")] == file, "bytes");
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
+
+// A 7z coded by `method` holding an empty directory beside a member.
+fn with_empty_directory(method: EncoderConfiguration) -> Vec<u8> {
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![method]);
+    writer
+        .push_archive_entry::<Cursor<Vec<u8>>>(ArchiveEntry::new_directory("hollow"), None)
+        .unwrap();
+    let (name, bytes) = members().remove(0);
+    let mut entry = ArchiveEntry::new_file(name);
+    entry.size = bytes.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(Cursor::new(bytes)))
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// The empty directory is delivered as a directory by both engines, stored
+// through the store and LZMA2 through the engine. Classic fetches a
+// compressed set holding a directory a second time before it delivers it,
+// so that set compares the trees and the graph's fetches alone.
+#[tokio::test]
+async fn a_7z_holding_an_empty_directory_delivers_it_under_both_engines() {
+    let methods: [(EncoderConfiguration, bool); 2] = [
+        (EncoderConfiguration::new(EncoderMethod::COPY), false),
+        (Lzma2Options::from_level(1).into(), true),
+    ];
+    for (method, classic_refetches) in methods {
+        let scenario = Scenario::new(vec![Post::plain(
+            "lantern.7z",
+            with_empty_directory(method),
+        )]);
+        let (classic, graph) = run_both(&scenario).await;
+        assert!(classic.completed(), "classic: {:?}", classic.failure);
+        let hollow = [delivered("hollow/")];
+        assert_eq!(
+            (
+                classic.empty.iter().collect::<Vec<_>>(),
+                graph.empty.iter().collect::<Vec<_>>()
+            ),
+            (hollow.iter().collect(), hollow.iter().collect()),
+            "(classic, graph) empty directories"
+        );
+        if !classic_refetches {
+            assert_same(&classic, &graph);
+            continue;
+        }
+        assert!(graph.completed(), "graph: {:?}", graph.failure);
+        assert!(
+            graph.refetched().is_empty(),
+            "graph asked for an article twice"
+        );
+        assert_eq!(classic.files, graph.files, "delivered files");
+    }
+}

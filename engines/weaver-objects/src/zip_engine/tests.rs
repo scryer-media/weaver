@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use ::zip::write::SimpleFileOptions;
-use ::zip::{AesMode, CompressionMethod, ZipWriter};
+use ::zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
 use weaver_graph::{
     ByteRange, Emit, Engine, Kind, MemberId, Object, ObjectId, Placement, VolumeIndex, Volumes, Why,
 };
@@ -57,12 +57,14 @@ fn encrypted() -> Vec<u8> {
 
 fn plain_said() -> Vec<Said> {
     vec![
-        Said::Member(0, "notes.txt".into(), Some(NOTES.len() as u64)),
-        Said::Bytes(0, NOTES.to_vec()),
+        Said::Member(0, "deep/".into(), Some(0)),
         Said::Closed(0),
-        Said::Member(1, "deep/second.bin".into(), Some(second().len() as u64)),
-        Said::Bytes(1, second()),
+        Said::Member(1, "notes.txt".into(), Some(NOTES.len() as u64)),
+        Said::Bytes(1, NOTES.to_vec()),
         Said::Closed(1),
+        Said::Member(2, "deep/second.bin".into(), Some(second().len() as u64)),
+        Said::Bytes(2, second()),
+        Said::Closed(2),
     ]
 }
 
@@ -194,7 +196,7 @@ fn said(emits: &[Emit]) -> Vec<Said> {
     out
 }
 
-fn run_over(engine: &mut ZipEngine, gate: Arc<Gate>) -> Vec<Said> {
+fn run_over(engine: &mut ZipEngine, gate: Arc<dyn Volumes>) -> Vec<Said> {
     let mut emits = Vec::new();
     let mut sink = |emit| {
         emits.push(emit);
@@ -302,15 +304,23 @@ fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
     let mut engine = named(&["locked.zip"]);
     assert_eq!(
         run(&mut engine, vec![encrypted()]),
-        vec![Said::NeedsPassword],
-        "an encrypted member with no password is never announced"
+        vec![
+            Said::Member(0, "deep/".into(), Some(0)),
+            Said::Closed(0),
+            Said::NeedsPassword,
+        ],
+        "an encrypted member with no password is never announced, though the directory before it is"
     );
 
     let mut out = Vec::new();
     engine.offer_password("not-the-password", &mut out);
     let wrong = run(&mut engine, vec![encrypted()]);
     assert_eq!(wrong.last(), Some(&Said::NeedsPassword));
-    assert!(!wrong.iter().any(|said| matches!(said, Said::Closed(_))));
+    assert!(
+        !wrong
+            .iter()
+            .any(|said| matches!(said, Said::Closed(id) if *id > 0))
+    );
 
     engine.offer_password(PASSWORD, &mut out);
     assert!(out.is_empty());
@@ -328,9 +338,9 @@ fn a_member_whose_checksum_fails_is_retracted_and_refused() {
     let said = run(&mut ZipEngine::new(), vec![archive]);
     assert_eq!(
         said[said.len() - 2..],
-        [Said::Retract(0), Said::Refuse(Why::Unrepairable)]
+        [Said::Retract(1), Said::Refuse(Why::Unrepairable)]
     );
-    assert!(!said.contains(&Said::Closed(0)));
+    assert!(!said.contains(&Said::Closed(1)));
 }
 
 #[test]
@@ -444,4 +454,273 @@ fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
     let mut extents = Vec::new();
     object.extent(MemberId(0), ByteRange::new(0, 4), &mut extents);
     assert!(extents.is_empty());
+}
+
+// Volumes of any length that hold their bytes only where a piece is put and
+// zeros everywhere else, so a set can run past what a narrow field holds
+// without its bytes in memory.
+struct Sparse {
+    volumes: Vec<(u64, Vec<(u64, Vec<u8>)>)>,
+}
+
+impl Volumes for Sparse {
+    fn next(&self, after: Option<VolumeIndex>) -> std::io::Result<Option<VolumeIndex>> {
+        let next = after.map_or(0, |after| after.0 as usize + 1);
+        Ok((next < self.volumes.len()).then_some(VolumeIndex(next as u32)))
+    }
+
+    fn len(&self, volume: VolumeIndex) -> Option<u64> {
+        Some(self.volumes[volume.0 as usize].0)
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        let (len, pieces) = &self.volumes[volume.0 as usize];
+        let read = into.len().min(len.saturating_sub(offset) as usize);
+        let into = &mut into[..read];
+        into.fill(0);
+        let wanted = offset..offset + read as u64;
+        for (at, bytes) in pieces {
+            let start = wanted.start.max(*at);
+            let end = wanted.end.min(at + bytes.len() as u64);
+            if start < end {
+                into[(start - offset) as usize..(end - offset) as usize]
+                    .copy_from_slice(&bytes[(start - at) as usize..(end - at) as usize]);
+            }
+        }
+        Ok(read)
+    }
+}
+
+// Past what a narrow field holds: the first volume runs this far.
+const FAR: u64 = (1 << 32) + 4_096;
+
+// Two stored members, the second marked large so its directory entry has a
+// zip64 field for its sizes when `large`.
+fn far_archive(large: bool) -> Vec<u8> {
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("near.txt", stored).unwrap();
+    writer.write_all(NOTES).unwrap();
+    writer
+        .start_file("far.bin", stored.large_file(large))
+        .unwrap();
+    writer.write_all(&second()).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+fn far_said() -> Vec<Said> {
+    vec![
+        Said::Member(0, "near.txt".into(), Some(NOTES.len() as u64)),
+        Said::Bytes(0, NOTES.to_vec()),
+        Said::Closed(0),
+        Said::Member(1, "far.bin".into(), Some(second().len() as u64)),
+        Said::Bytes(1, second()),
+        Said::Closed(1),
+    ]
+}
+
+// The archive spanned over two volumes, the first `FAR` long: its first
+// `before` entries, then zeros to its end; the second the other entries,
+// the directory and the end record. Each entry's offset is within its disk,
+// so it fits its narrow field, and only the joined image's does not.
+fn far_set(single: &[u8], before: usize) -> Sparse {
+    const MARKER: [u8; 4] = [0x50, 0x4b, 0x07, 0x08];
+    let end = records::find_end(single).unwrap();
+    let mut directory = single[end.offset as usize..(end.offset + end.size) as usize].to_vec();
+    let entries = records::directory(&directory, end.entries).unwrap();
+    let split = entries.get(before).map_or(end.offset, |entry| entry.offset) as usize;
+    for entry in &entries {
+        let (disk, offset) = match entry.offset < split as u64 {
+            true => (0u16, entry.offset as u32 + MARKER.len() as u32),
+            false => (1, (entry.offset - split as u64) as u32),
+        };
+        directory[entry.disk_at.0..entry.disk_at.0 + 2].copy_from_slice(&disk.to_le_bytes());
+        directory[entry.offset_at.0..entry.offset_at.0 + 4].copy_from_slice(&offset.to_le_bytes());
+    }
+    let mut first = MARKER.to_vec();
+    first.extend_from_slice(&single[..split]);
+    let mut last = single[split..end.offset as usize].to_vec();
+    let offset = last.len() as u32;
+    last.extend_from_slice(&directory);
+    last.extend(records::END.to_le_bytes());
+    last.extend(1u16.to_le_bytes());
+    last.extend(1u16.to_le_bytes());
+    last.extend((end.entries as u16).to_le_bytes());
+    last.extend((end.entries as u16).to_le_bytes());
+    last.extend((end.size as u32).to_le_bytes());
+    last.extend(offset.to_le_bytes());
+    last.extend(0u16.to_le_bytes());
+    Sparse {
+        volumes: vec![
+            (FAR, vec![(0, first)]),
+            (last.len() as u64, vec![(0, last)]),
+        ],
+    }
+}
+
+fn run_far(set: Sparse) -> Vec<Said> {
+    run_over(&mut named(&["far.z01", "far.zip"]), Arc::new(set))
+}
+
+// The rewritten directory, as the store's own reader reads it, for a set
+// whose image opens.
+fn rewritten(set: Sparse) -> Vec<records::Central> {
+    let image = match super::image::Image::open(crate::engine::Joined::new(Arc::new(set))) {
+        Ok(image) => image,
+        Err(_) => panic!("the set opens as an image"),
+    };
+    use std::io::{Read as _, Seek as _};
+    let mut image = image;
+    let len = image.seek(io::SeekFrom::End(0)).unwrap();
+    let tail = len - 1_024.min(len);
+    image.seek(io::SeekFrom::Start(tail)).unwrap();
+    let mut whole = Vec::new();
+    image.read_to_end(&mut whole).unwrap();
+    let end = records::find_end(&whole).unwrap();
+    assert!(
+        end.wide,
+        "a directory past a narrow field is ended by zip64 records"
+    );
+    let at = end.at as usize;
+    let (disk, record) = records::locator(&whole[at - records::LOCATOR_LEN as usize..at]).unwrap();
+    assert_eq!(disk, 0);
+    let record = (record - tail) as usize;
+    let end = records::end64(&whole[record..], end).unwrap();
+    assert_eq!((end.this_disk, end.directory_disk), (0, 0));
+    let directory = (end.offset - tail) as usize;
+    assert_eq!(directory + end.size as usize, record);
+    records::directory(&whole[directory..record], end.entries).unwrap()
+}
+
+#[test]
+fn a_spanned_set_whose_directory_starts_past_a_narrow_field_is_ended_by_zip64_records() {
+    assert_eq!(run_far(far_set(&far_archive(false), 2)), far_said());
+    let entries = rewritten(far_set(&far_archive(false), 2));
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.offset_at.1)
+            .collect::<Vec<_>>(),
+        [false, false],
+        "entries that fit their narrow fields keep them"
+    );
+}
+
+#[test]
+fn a_spanned_entry_whose_place_is_past_a_narrow_field_gains_a_zip64_offset() {
+    for large in [false, true] {
+        assert_eq!(
+            run_far(far_set(&far_archive(large), 1)),
+            far_said(),
+            "large: {large}"
+        );
+        let entries = rewritten(far_set(&far_archive(large), 1));
+        assert_eq!(entries[0].offset, 4);
+        assert!(!entries[0].offset_at.1);
+        assert_eq!(entries[1].offset, FAR, "large: {large}");
+        assert!(entries[1].offset_at.1, "large: {large}");
+        assert_eq!(entries[1].disk, 0);
+        assert_eq!(entries[1].header.length, second().len() as u64);
+        assert_eq!(entries[1].header.compressed, second().len() as u64);
+    }
+}
+
+#[test]
+fn a_directory_of_more_entries_than_a_narrow_count_is_ended_by_zip64_records() {
+    const ENTRIES: u64 = 1 << 16;
+    let mut directory = Vec::new();
+    for index in 0..ENTRIES {
+        let name = format!("{index:05x}");
+        directory.extend(records::CENTRAL.to_le_bytes());
+        directory.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        directory.extend([0u8; 12]);
+        directory.extend((name.len() as u16).to_le_bytes());
+        directory.extend([0u8; 12]);
+        directory.extend(0u32.to_le_bytes());
+        directory.extend(name.as_bytes());
+    }
+    let end = records::End {
+        at: 0,
+        this_disk: 0,
+        directory_disk: 0,
+        entries: ENTRIES,
+        size: directory.len() as u64,
+        offset: 0,
+        wide: true,
+    };
+    let rest =
+        super::image::rewrite(&directory, &end, 0, &|disk| (disk == 0).then_some(0)).unwrap();
+    let archive = ZipArchive::with_config(
+        ::zip::read::Config {
+            archive_offset: ::zip::read::ArchiveOffset::Known(0),
+        },
+        Cursor::new(rest),
+    )
+    .unwrap();
+    assert_eq!(archive.len() as u64, ENTRIES);
+    let name = |index: u64| archive.name_for_index(index as usize).unwrap().unwrap();
+    assert_eq!(name(0), "00000");
+    assert_eq!(name(ENTRIES - 1), "0ffff");
+}
+
+// A zip of one empty stored entry named by `name`'s raw bytes in both of its
+// headers, each flagged UTF-8 or not as `flagged` says.
+fn raw_named(name: &[u8], flagged: bool) -> Vec<u8> {
+    const UTF8: u16 = 1 << 11;
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    writer
+        .start_file("n".repeat(name.len()).as_str(), stored)
+        .unwrap();
+    let mut archive = writer.finish().unwrap().into_inner();
+    for (signature, flags_at, name_at) in [(records::LOCAL, 6, 30), (records::CENTRAL, 8, 46)] {
+        let at = archive
+            .windows(4)
+            .position(|window| window == signature.to_le_bytes())
+            .unwrap();
+        let flags = records::u16_at(&archive, at + flags_at).unwrap();
+        let flags = if flagged { flags | UTF8 } else { flags & !UTF8 };
+        archive[at + flags_at..at + flags_at + 2].copy_from_slice(&flags.to_le_bytes());
+        archive[at + name_at..at + name_at + name.len()].copy_from_slice(name);
+    }
+    archive
+}
+
+#[test]
+fn the_store_and_the_engine_name_an_entry_alike_whatever_its_bytes_and_flag() {
+    let cases: [(&[u8], bool); 4] = [
+        ("café.txt".as_bytes(), false),
+        (b"caf\x82.txt", false),
+        ("café.txt".as_bytes(), true),
+        (b"caf\x82.txt", true),
+    ];
+    for (name, flagged) in cases {
+        let archive = raw_named(name, flagged);
+        let engine = run(&mut ZipEngine::new(), vec![archive.clone()])
+            .into_iter()
+            .find_map(|said| match said {
+                Said::Member(_, name, _) => Some(name),
+                _ => None,
+            });
+        let find = |signature: u32| {
+            archive
+                .windows(4)
+                .position(|window| window == signature.to_le_bytes())
+                .unwrap()
+        };
+        let (central, end) = (find(records::CENTRAL), find(records::END));
+        let store = records::directory(&archive[central..end], 1).unwrap()[0]
+            .header
+            .name
+            .clone();
+        let local = records::local(&archive).unwrap().name;
+        let case = format!("{name:x?} flagged {flagged}");
+        assert_eq!(
+            engine.as_deref(),
+            Some(store.as_str()),
+            "{case}: engine and store"
+        );
+        assert_eq!(local, store, "{case}: local and central headers");
+        assert_eq!(store, "café.txt", "{case}");
+    }
 }

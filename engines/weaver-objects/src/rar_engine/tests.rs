@@ -95,6 +95,18 @@ mod rar5 {
         ]
         .concat()
     }
+
+    // A directory's header: the directory flag, and no data.
+    pub fn directory(name: &str) -> Vec<u8> {
+        let mut body = vint(0x0001);
+        body.extend(vint(0));
+        body.extend(vint(0o755));
+        body.extend(vint(0));
+        body.extend(vint(1));
+        body.extend(vint(name.len() as u64));
+        body.extend_from_slice(name.as_bytes());
+        header(2, 0, None, &body)
+    }
 }
 
 const NOTES: &[u8] = b"the first member, stored";
@@ -312,6 +324,33 @@ fn a_store_archive_extracts_its_members_by_name_and_closes_them() {
             Said::Closed(0),
             Said::Member(1, "deep/second.bin".into(), Some(64)),
             Said::Bytes(1, second()),
+            Said::Closed(1),
+        ]
+    );
+}
+
+#[test]
+fn a_directory_is_a_member_with_nothing_in_it_named_with_a_trailing_slash() {
+    let archive = [
+        rar5::start(None),
+        rar5::directory("hollow"),
+        rar5::file(
+            "notes.txt",
+            0,
+            NOTES,
+            NOTES.len() as u64,
+            Some(crc32(NOTES)),
+        ),
+        rar5::end(false),
+    ]
+    .concat();
+    assert_eq!(
+        run(&mut RarEngine::new(), vec![archive]),
+        vec![
+            Said::Member(0, "hollow/".into(), Some(0)),
+            Said::Closed(0),
+            Said::Member(1, "notes.txt".into(), Some(NOTES.len() as u64)),
+            Said::Bytes(1, NOTES.to_vec()),
             Said::Closed(1),
         ]
     );
