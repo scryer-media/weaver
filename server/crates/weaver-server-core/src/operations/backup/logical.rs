@@ -20,7 +20,7 @@ use super::catalog::{
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
-    egress_quotas_v53, networking_bandwidth_v69, proxy_resolver_v64, script_concurrency_v58,
+    egress_quotas_v53, networking_bandwidth_v75, proxy_resolver_v64, script_concurrency_v58,
     script_instances_v55, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
@@ -1017,7 +1017,7 @@ async fn move_older_bandwidth_cap(
     {
         return Ok(());
     }
-    networking_bandwidth_v69::move_older_cap(conn).await
+    networking_bandwidth_v75::move_older_cap(conn).await
 }
 
 // A bundle written before there were script instances carries the wiring
@@ -1076,8 +1076,8 @@ async fn move_older_bandwidth_limits(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
 ) -> Result<(), StateError> {
-    if source_schema_version < networking_bandwidth_v69::SCHEMA_VERSION {
-        networking_bandwidth_v69::move_bandwidth_to_networking(conn).await?;
+    if source_schema_version < networking_bandwidth_v75::SCHEMA_VERSION {
+        networking_bandwidth_v75::move_bandwidth_to_networking(conn).await?;
     }
     Ok(())
 }
@@ -1090,9 +1090,9 @@ fn upgrade_older_row(
     row: &mut JsonMap<String, JsonValue>,
 ) {
     if table == "egress_interfaces"
-        && source_schema_version < networking_bandwidth_v69::SCHEMA_VERSION
+        && source_schema_version < networking_bandwidth_v75::SCHEMA_VERSION
     {
-        networking_bandwidth_v69::upgrade_egress_row(row);
+        networking_bandwidth_v75::upgrade_egress_row(row);
     }
 }
 
@@ -2331,7 +2331,7 @@ mod logical_reader_tests {
             &row_path,
             &metadata,
             true,
-            networking_bandwidth_v69::SCHEMA_VERSION,
+            networking_bandwidth_v75::SCHEMA_VERSION,
         )
         .await
         .unwrap_err();
@@ -2347,7 +2347,7 @@ mod logical_reader_tests {
             &row_path,
             &metadata,
             true,
-            networking_bandwidth_v69::SCHEMA_VERSION,
+            networking_bandwidth_v75::SCHEMA_VERSION,
         )
         .await
         .unwrap();

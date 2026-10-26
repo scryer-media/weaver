@@ -730,486 +730,503 @@ scope = "upgrade_only"
 
 [[migration]]
 version = 65
-description = "every job is stamped with the engine that runs it"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0065_job_engine_stamp/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0065_job_engine_stamp/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 66
-description = "a graph job's tree is checkpointed as rows a restart rebuilds it from"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0066_graph_checkpoint/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0066_graph_checkpoint/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 67
-description = "a graph checkpoint keeps which given-up members were buried"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0067_graph_member_buried/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0067_graph_member_buried/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 68
-description = "torrent jobs, their files, trackers and seeding ledger; category seeding and torrent routing; history protocol"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0068_torrents/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0068_torrents/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 69
-description = "bandwidth limits move into networking: a global row, per-egress rates in both directions, and upload quotas"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0069_networking_bandwidth/schema.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0069_networking_bandwidth/schema.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration.steps]]
-kind = "rust"
-hook_id = "move_bandwidth_to_networking_v69"
-scope = "upgrade_only"
-
-[[migration]]
-version = 70
-description = "the global download limit can be split between usenet and torrents"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0070_bandwidth_split/schema.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0070_bandwidth_split/schema.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 71
-description = "a graph checkpoint keeps each sealed part of a node's facts as its own row"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0071_graph_facts_parts/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0071_graph_facts_parts/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 72
-description = "tracker rules set seeding goals and the schedule's pause by announce host"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0072_tracker_rules/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0072_tracker_rules/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 73
-description = "a torrent tracker row keeps only its place in the announce list"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0073_torrent_trackers_listing/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0073_torrent_trackers_listing/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 74
-description = "a category, a tracker rule or a torrent may say whether its archives are extracted"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0074_unpack_overrides/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0074_unpack_overrides/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 75
-description = "a torrent's ledger keeps its verified bytes, its active time and when a complete copy was last seen"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0075_torrent_ledger_transfer/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0075_torrent_ledger_transfer/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 76
-description = "a tracker rule may name the client its torrents name themselves as"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0076_tracker_rule_client/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0076_tracker_rule_client/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 77
-description = "a torrent's job keeps the attributes it was added with"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0077_torrent_metadata/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0077_torrent_metadata/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 78
-description = "a torrent's v2 hash is unique wherever it is known"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0078_torrent_infohash_v2/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0078_torrent_infohash_v2/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 79
-description = "a tracker rule may route its torrents through their own consumer"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0079_tracker_rule_route/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0079_tracker_rule_route/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 80
-description = "a torrent keeps its peers and bans across a restart"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0080_torrent_peers/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0080_torrent_peers/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 81
-description = "the hosts torrents announce to are kept after the torrents"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0081_tracker_hosts/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0081_tracker_hosts/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration.steps]]
-kind = "rust"
-hook_id = "fill_tracker_hosts_v81"
-scope = "upgrade_only"
-
-[[migration]]
-version = 82
-description = "a torrent keeps its own upload and download limits"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0082_torrent_rate_limits/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0082_torrent_rate_limits/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 83
-description = "a torrent keeps its file levels as one value and its sequential and first-and-last toggles; its file rows go"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0083_torrent_file_priority/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0083_torrent_file_priority/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 84
-description = "a graph checkpoint keeps which member each further posting of one was folded into, and no longer records members carrying recovery data nothing reads"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0084_graph_member_copy_of/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0084_graph_member_copy_of/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 85
-description = "a torrent keeps only what its next start needs; its peers and bans move to its ledger row"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0085_torrent_lean_resume/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0085_torrent_lean_resume/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 86
-description = "a tracker rule sets its torrents' peer discovery, encryption, upload cap and forced start"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0086_tracker_rule_privacy/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0086_tracker_rule_privacy/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 87
-description = "a tracker rule holds the identity its SSL torrents present"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0087_tracker_rule_ssl/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0087_tracker_rule_ssl/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 88
-description = "a torrent's tracker records whether the torrent or the operator named it"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0088_tracker_named_by/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0088_tracker_named_by/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 89
-description = "no mapped torrent port is kept outside the session that maps it"
-checksum_algo = "blake3"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0089_forget_saved_mapped_ports/sqlite.sql"
-engine = "sqlite"
-scope = "all"
-
-[[migration.steps]]
-kind = "sql"
-file = "migrations/0089_forget_saved_mapped_ports/postgres.sql"
-engine = "postgres"
-scope = "all"
-
-[[migration]]
-version = 90
 description = "a file's restart checkpoint is its written coverage"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0090_file_coverage_checkpoint/sqlite.sql"
+file = "migrations/0065_file_coverage_checkpoint/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0090_file_coverage_checkpoint/postgres.sql"
+file = "migrations/0065_file_coverage_checkpoint/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
-version = 91
+version = 66
+description = "every job is stamped with the engine that runs it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0066_job_engine_stamp/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0066_job_engine_stamp/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 67
+description = "a graph job's tree is checkpointed as rows a restart rebuilds it from"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0067_graph_checkpoint/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0067_graph_checkpoint/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 68
+description = "a graph checkpoint keeps which given-up members were buried"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_graph_member_buried/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_graph_member_buried/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 69
+description = "a graph checkpoint keeps each sealed part of a node's facts as its own row"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_graph_facts_parts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_graph_facts_parts/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 70
+description = "a graph checkpoint keeps which member each further posting of one was folded into"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0070_graph_member_copy_of/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0070_graph_member_copy_of/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 71
+description = "a graph checkpoint no longer records members carrying recovery data nothing reads"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0071_graph_member_unusable_dropped/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0071_graph_member_unusable_dropped/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 72
 description = "a graph checkpoint records where each hold paged to scratch lies in its scratch file"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0091_graph_holds_scratch_offset/sqlite.sql"
+file = "migrations/0072_graph_holds_scratch_offset/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0091_graph_holds_scratch_offset/postgres.sql"
+file = "migrations/0072_graph_holds_scratch_offset/postgres.sql"
 engine = "postgres"
 scope = "all"
 
 [[migration]]
-version = 92
+version = 73
 description = "durable NZB concurrency admission"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0092_nzb_admission/sqlite.sql"
+file = "migrations/0073_nzb_admission/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0092_nzb_admission/postgres.sql"
+file = "migrations/0073_nzb_admission/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 74
+description = "torrent jobs, their files, trackers and seeding ledger; category seeding and torrent routing; history protocol"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0074_torrents/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0074_torrents/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 75
+description = "bandwidth limits move into networking: a global row, per-egress rates in both directions, and upload quotas"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0075_networking_bandwidth/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0075_networking_bandwidth/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_bandwidth_to_networking_v75"
+scope = "upgrade_only"
+
+[[migration]]
+version = 76
+description = "the global download limit can be split between usenet and torrents"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_bandwidth_split/schema.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_bandwidth_split/schema.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 77
+description = "tracker rules set seeding goals and the schedule's pause by announce host"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_tracker_rules/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_tracker_rules/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 78
+description = "a torrent tracker row keeps only its place in the announce list"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_torrent_trackers_listing/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_torrent_trackers_listing/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 79
+description = "a category, a tracker rule or a torrent may say whether its archives are extracted"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_unpack_overrides/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_unpack_overrides/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 80
+description = "a torrent's ledger keeps its verified bytes, its active time and when a complete copy was last seen"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0080_torrent_ledger_transfer/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0080_torrent_ledger_transfer/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 81
+description = "a tracker rule may name the client its torrents name themselves as"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_tracker_rule_client/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_tracker_rule_client/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 82
+description = "a torrent's job keeps the attributes it was added with"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_torrent_metadata/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_torrent_metadata/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 83
+description = "a torrent's v2 hash is unique wherever it is known"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_torrent_infohash_v2/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_torrent_infohash_v2/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 84
+description = "a tracker rule may route its torrents through their own consumer"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_tracker_rule_route/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_tracker_rule_route/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 85
+description = "a torrent keeps its peers and bans across a restart"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0085_torrent_peers/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0085_torrent_peers/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 86
+description = "the hosts torrents announce to are kept after the torrents"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_tracker_hosts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_tracker_hosts/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_tracker_hosts_v86"
+scope = "upgrade_only"
+
+[[migration]]
+version = 87
+description = "a torrent keeps its own upload and download limits"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_torrent_rate_limits/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_torrent_rate_limits/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 88
+description = "a torrent keeps its file levels as one value and its sequential and first-and-last toggles; its file rows go"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_torrent_file_priority/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_torrent_file_priority/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 89
+description = "a torrent keeps only what its next start needs; its peers and bans move to its ledger row"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_torrent_lean_resume/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_torrent_lean_resume/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 90
+description = "a tracker rule sets its torrents' peer discovery, encryption, upload cap and forced start"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_tracker_rule_privacy/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0090_tracker_rule_privacy/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 91
+description = "a tracker rule holds the identity its SSL torrents present"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_tracker_rule_ssl/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0091_tracker_rule_ssl/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 92
+description = "a torrent's tracker records whether the torrent or the operator named it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0092_tracker_named_by/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0092_tracker_named_by/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 93
+description = "no mapped torrent port is kept outside the session that maps it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0093_forget_saved_mapped_ports/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0093_forget_saved_mapped_ports/postgres.sql"
 engine = "postgres"
 scope = "all"

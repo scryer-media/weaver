@@ -365,7 +365,7 @@ async fn legacy_migration_grandfathers_started_work_but_not_paused_or_untouched_
     .await
     .unwrap();
     sqlx::raw_sql(include_str!(
-        "../../db/migrations/0092_nzb_admission/sqlite.sql"
+        "../../db/migrations/0073_nzb_admission/sqlite.sql"
     ))
     .execute(&pool)
     .await

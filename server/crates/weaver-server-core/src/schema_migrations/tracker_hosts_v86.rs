@@ -10,7 +10,7 @@ use crate::StateError;
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 use crate::settings::model::tracker_host;
 
-pub(crate) const HOOK_ID: &str = "fill_tracker_hosts_v81";
+pub(crate) const HOOK_ID: &str = "fill_tracker_hosts_v86";
 
 // Run the step on a connection that is already inside the transaction it
 // belongs to.
