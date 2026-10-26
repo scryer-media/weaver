@@ -158,6 +158,8 @@ impl OwnedLaneProbeHandle {
         &self,
         message_ids: &[String],
         server: Option<usize>,
+        guard: Option<ProbeGuard>,
+        pool: Option<Arc<weaver_nntp::pool::NntpPool>>,
     ) -> Option<LaneProbeOutcome> {
         if message_ids.is_empty() {
             return Some(LaneProbeOutcome {
@@ -203,7 +205,13 @@ impl OwnedLaneProbeHandle {
 
         let request: Arc<[String]> = Arc::from(message_ids.to_vec());
         if let Some(outcome) = self
-            .ask_lanes(&candidates, &request, message_ids.len())
+            .ask_lanes(
+                &candidates,
+                &request,
+                message_ids.len(),
+                guard.clone(),
+                pool.clone(),
+            )
             .await
         {
             return Some(outcome);
@@ -216,7 +224,7 @@ impl OwnedLaneProbeHandle {
         // lane to come free finds nothing queued for it and takes the probe.
         // Bounded by the same pickup timeout, and released whatever happens.
         let _yield = self.hold_dispatch_for_starved_probe();
-        self.ask_lanes(&candidates, &request, message_ids.len())
+        self.ask_lanes(&candidates, &request, message_ids.len(), guard, pool)
             .await
     }
 
@@ -229,6 +237,8 @@ impl OwnedLaneProbeHandle {
         candidates: &[(usize, std_mpsc::Sender<OwnedLanePoolCommand>, Duration)],
         request: &Arc<[String]>,
         batch_len: usize,
+        guard: Option<ProbeGuard>,
+        pool: Option<Arc<weaver_nntp::pool::NntpPool>>,
     ) -> Option<LaneProbeOutcome> {
         // A `JoinSet` rather than detached tasks: dropping it aborts whatever
         // is still outstanding, which is what tells a worker that has not
@@ -239,7 +249,17 @@ impl OwnedLaneProbeHandle {
             let batch = Arc::clone(request);
             let sender = sender.clone();
             let (server, pickup) = (*server, *pickup);
-            asking.spawn(async move { (server, Self::ask_lane(sender, batch, pickup).await) });
+            let guard = guard.clone();
+            let expected_socket = ProbeSocket {
+                server,
+                pool: pool.clone(),
+            };
+            asking.spawn(async move {
+                (
+                    server,
+                    Self::ask_lane(sender, expected_socket, batch, pickup, guard).await,
+                )
+            });
         }
 
         let mut exists = vec![false; batch_len];
@@ -302,14 +322,18 @@ impl OwnedLaneProbeHandle {
     // takes, and a busy lane's drain comes before them.
     async fn ask_lane(
         sender: std_mpsc::Sender<OwnedLanePoolCommand>,
+        expected_socket: ProbeSocket,
         message_ids: Arc<[String]>,
         pickup: Duration,
+        guard: Option<ProbeGuard>,
     ) -> Option<weaver_nntp::client::ProbeBatchResult> {
         let (picked_up_tx, picked_up_rx) = oneshot::channel();
         let (reply_tx, reply_rx) = oneshot::channel();
         sender
             .send(OwnedLanePoolCommand::Probe {
+                expected_socket,
                 message_ids,
+                guard,
                 picked_up: picked_up_tx,
                 reply: reply_tx,
             })
@@ -365,6 +389,7 @@ impl OwnedLaneProbeHandle {
         &self,
         nntp: &weaver_nntp::NntpClient,
         message_ids: &[String],
+        exclude: &[usize],
         state: &crate::jobs::handle::SharedPipelineState,
         generation: u64,
     ) -> weaver_nntp::client::ProbeBatchResult {
@@ -373,14 +398,17 @@ impl OwnedLaneProbeHandle {
         let nntp =
             nntp.with_work_guard(move |_| job_work_is_current(&guard_state, job_id, generation));
         let borrowed: Vec<_> = message_ids.iter().map(String::as_str).collect();
-        nntp.confirm_exists_for_probe_using(&borrowed, &[], |server, batch| async move {
+        let pool = nntp.pool();
+        nntp.confirm_exists_for_probe_using(&borrowed, exclude, |server, batch, guard| async move {
             if !job_work_is_current(state, JobId(self.job_id), generation) {
                 return Some(weaver_nntp::client::ProbeBatchResult {
                     exists: vec![false; batch.len()],
                     inconclusive: true,
                 });
             }
-            let outcome = self.probe_server(&batch, Some(server)).await?;
+            let outcome = self
+                .probe_server(&batch, Some(server), Some(guard), Some(Arc::clone(pool)))
+                .await?;
             (outcome.result.inconclusive || outcome.servers_settled.contains(&server))
                 .then_some(outcome.result)
         })
@@ -393,7 +421,7 @@ impl OwnedLaneProbeHandle {
 
     #[cfg(test)]
     async fn probe(&self, message_ids: &[String]) -> Option<LaneProbeOutcome> {
-        self.probe_server(message_ids, None).await
+        self.probe_server(message_ids, None, None, None).await
     }
 }
 
@@ -433,6 +461,25 @@ struct OwnedLaneRun {
     initial_lease: DownloadBatchLease,
 }
 
+type ProbeGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+
+struct ProbeSocket {
+    server: usize,
+    // Production probes bind to the configuration that selected the server.
+    // Transport-only tests may omit the pool identity.
+    pool: Option<Arc<weaver_nntp::pool::NntpPool>>,
+}
+
+impl ProbeSocket {
+    fn matches(&self, server: usize, nntp: &weaver_nntp::NntpClient) -> bool {
+        self.server == server
+            && self
+                .pool
+                .as_ref()
+                .is_none_or(|pool| Arc::ptr_eq(pool, nntp.pool()))
+    }
+}
+
 enum OwnedLanePoolCommand {
     Run(Box<OwnedLaneRun>),
     Reset,
@@ -440,7 +487,9 @@ enum OwnedLanePoolCommand {
     // Answer an existence probe on this worker's cached connection. The reply
     // is `None` when the worker has no cached lane to answer with.
     Probe {
+        expected_socket: ProbeSocket,
         message_ids: Arc<[String]>,
+        guard: Option<ProbeGuard>,
         // Signalled the moment the worker takes the request up. A caller
         // that has stopped listening by then has moved on, and the request
         // is dropped rather than answered into the void.
@@ -453,8 +502,16 @@ enum OwnedLanePoolCommand {
 // channel its verdict is owed on once the lane's ring has drained.
 type PendingProbe = (
     Arc<[String]>,
+    Option<ProbeGuard>,
     oneshot::Sender<Option<weaver_nntp::client::ProbeBatchResult>>,
 );
+
+fn obsolete_probe(batch_len: usize) -> weaver_nntp::client::ProbeBatchResult {
+    weaver_nntp::client::ProbeBatchResult {
+        exists: vec![false; batch_len],
+        inconclusive: true,
+    }
+}
 
 struct CachedOwnedLane {
     nntp: Arc<weaver_nntp::NntpClient>,
@@ -803,13 +860,25 @@ fn answer_idle_command(
             park_cached_lane(cached_lane);
         }
         OwnedLanePoolCommand::Probe {
+            expected_socket,
             message_ids,
+            guard,
             picked_up,
             reply,
         } => {
             if picked_up.send(()).is_err() {
                 // The caller gave up waiting for pickup while this worker was
                 // on a lease; nobody wants the answer now.
+                return None;
+            }
+            if cached_lane.as_ref().is_none_or(|cached| {
+                !expected_socket.matches(cached.lane.server_id().0, &cached.nntp)
+            }) {
+                let _ = reply.send(None);
+                return None;
+            }
+            if guard.as_ref().is_some_and(|guard| !guard()) {
+                let _ = reply.send(Some(obsolete_probe(message_ids.len())));
                 return None;
             }
             // The lane keeps its cached connection and its idle marker across
@@ -1006,6 +1075,9 @@ enum LaneStop {
     EgressQuota,
     RecoveryYield,
     Quarantined,
+    // Work reserved earlier is no longer eligible. Drain issued requests,
+    // return the unissued tail, and retain the healthy socket for other work.
+    ReservationObsolete,
     // The result or refill channel is gone; the orchestrator is shutting down.
     Error,
 }
@@ -1015,6 +1087,7 @@ fn lane_stop_park(stop: Option<LaneStop>) -> Option<(LaneParkReason, bool)> {
         LaneStop::ConnectionLost | LaneStop::Error => (LaneParkReason::Error, false),
         LaneStop::RecoveryYield => (LaneParkReason::ProbeYield, true),
         LaneStop::Quarantined => (LaneParkReason::Capacity, false),
+        LaneStop::ReservationObsolete => (LaneParkReason::Capacity, true),
         LaneStop::PolicyBlocked => (
             LaneParkReason::ServerQuota,
             keep_cached_lane_after_park(LaneParkReason::ServerQuota),
@@ -1334,12 +1407,20 @@ fn run_owned_blocking_download_lane(
             while let Ok(command) = link.commands.try_recv() {
                 match command {
                     OwnedLanePoolCommand::Probe {
+                        expected_socket,
                         message_ids,
+                        guard,
                         picked_up,
                         reply,
                     } => {
                         if picked_up.send(()).is_ok() {
-                            probes.push_back((message_ids, reply));
+                            if !expected_socket.matches(server_idx, &nntp) {
+                                let _ = reply.send(None);
+                            } else if guard.as_ref().is_some_and(|guard| !guard()) {
+                                let _ = reply.send(Some(obsolete_probe(message_ids.len())));
+                            } else {
+                                probes.push_back((message_ids, guard, reply));
+                            }
                         }
                     }
                     other => deferred.push(other),
@@ -1351,7 +1432,11 @@ fn run_owned_blocking_download_lane(
         // their transfer. Then the socket is exactly where a STAT expects it,
         // the batch runs on it, and issuing resumes. No dial, no permit.
         if !probes.is_empty() && stop.is_none() && lane.ring_outstanding() == 0 {
-            while let Some((message_ids, reply)) = probes.pop_front() {
+            while let Some((message_ids, guard, reply)) = probes.pop_front() {
+                if guard.as_ref().is_some_and(|guard| !guard()) {
+                    let _ = reply.send(Some(obsolete_probe(message_ids.len())));
+                    continue;
+                }
                 let answer = lane.probe_exists(&message_ids);
                 let _ = reply.send(Some(answer));
                 if !lane.is_healthy() {
@@ -1414,9 +1499,27 @@ fn run_owned_blocking_download_lane(
                 stop = Some(LaneStop::Quarantined);
                 break;
             }
-            let Some((work, work_context)) = pending.pop_front() else {
+            let Some((work, work_context)) = pending.front() else {
                 break;
             };
+            // A refill can wait behind an in-flight response after the actor
+            // granted it. Its grant is not permission to issue after pause,
+            // cancellation, a provider edit, or higher-priority recovery.
+            if !job_work_is_current(&state, work_context.job_id, work_context.runtime_generation)
+                || !matches!(
+                    nntp.pool().blocking_provider_policy().eligibility(
+                        server_idx,
+                        &work.exclude_servers,
+                        &work_context.retention_excludes,
+                        Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
+                    ),
+                    weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+                )
+            {
+                stop = Some(LaneStop::ReservationObsolete);
+                break;
+            }
+            let (work, work_context) = pending.pop_front().expect("pending front was inspected");
             let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
             let wire_form = work.message_id.wire_form();
             let outcome = lane.ring_issue(&wire_form, estimate, work_context.depth());
@@ -2113,6 +2216,7 @@ mod tests {
                     message_ids,
                     picked_up,
                     reply,
+                    ..
                 }) = receiver.recv()
                 else {
                     return;
@@ -2973,7 +3077,12 @@ mod probe_tests {
             assert!(
                 sender
                     .send(OwnedLanePoolCommand::Probe {
+                        expected_socket: ProbeSocket {
+                            server: 0,
+                            pool: None
+                        },
                         message_ids: Arc::from([]),
+                        guard: None,
                         picked_up,
                         reply,
                     })

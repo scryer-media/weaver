@@ -277,3 +277,51 @@ async fn ordinary_outages_do_not_unlock_a_cached_backfill_socket() {
     );
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn queued_probe_guard_rechecks_recovery_before_using_a_cached_fallback() {
+    let fixture = Providers::new().await;
+    let now = Instant::now();
+    let pool = Arc::clone(fixture.client.pool());
+    {
+        let mut health = pool.health().lock().await;
+        health.set_reenable_clock(now);
+        health.record_cooldown(0, crate::health::CooldownReason::Transport);
+    }
+    let result = fixture
+        .client
+        .confirm_exists_for_probe_using(
+            &["<queued-probe@example.invalid>"],
+            &[],
+            |server, batch, guard| {
+                let pool = Arc::clone(&pool);
+                async move {
+                    assert_eq!(server, 1);
+                    assert!(guard());
+                    pool.health()
+                        .lock()
+                        .await
+                        .set_reenable_clock(now + Duration::from_secs(3600));
+                    assert!(
+                        !guard(),
+                        "a recovered primary invalidates unissued fallback work"
+                    );
+                    Some(ProbeBatchResult {
+                        exists: vec![false; batch.len()],
+                        inconclusive: true,
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.inconclusive);
+    assert!(fixture.commands.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .dials
+            .iter()
+            .all(|count| count.load(Ordering::SeqCst) == 0)
+    );
+    fixture.close().await;
+}

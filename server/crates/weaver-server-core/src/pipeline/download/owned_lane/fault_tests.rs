@@ -4,6 +4,136 @@
 use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_tail_and_granted_refill_are_returned_when_the_job_becomes_ineligible() {
+    for transition in ["pause", "generation", "admission", "global_pause"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            write.write_all(b"200 ready\r\n").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            let mut release = Some(release_rx);
+            let mut bodies = 0;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line == "CAPABILITIES" {
+                    write
+                        .write_all(b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                        .await
+                        .unwrap();
+                } else if line.starts_with("BODY ") {
+                    bodies += 1;
+                    if let Some(release) = release.take() {
+                        release.await.unwrap();
+                    }
+                    write.write_all(b"430 absent\r\n").await.unwrap();
+                } else if line == "QUIT" {
+                    break;
+                } else {
+                    write.write_all(b"500 unsupported\r\n").await.unwrap();
+                }
+            }
+            bodies
+        });
+        let nntp = Arc::new(weaver_nntp::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig::single(
+                weaver_nntp::ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port,
+                    tls: false,
+                    ..Default::default()
+                },
+                1,
+            ),
+        ));
+        let state = test_admitted_state(JobId(42));
+        let worker_state = state.clone();
+        let (event_tx, mut events) = mpsc::channel(16);
+        let (refill_tx, mut refills) = mpsc::channel(16);
+        let (parked_tx, mut parks) = mpsc::channel(16);
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut cached = None;
+            run_owned_blocking_download_lane(
+                &mut cached,
+                OwnedLaneRun {
+                    nntp,
+                    state: worker_state,
+                    event_tx,
+                    refill_tx,
+                    parked_tx,
+                    initial_lease: test_lease(
+                        JobId(42),
+                        0,
+                        vec![],
+                        (0..3).map(|i| tail_work(i, 0)).collect(),
+                    ),
+                },
+                None,
+            );
+        });
+        let request = refills
+            .recv()
+            .await
+            .expect("issued BODY requests its next lease");
+        let mut next = test_lease(JobId(42), 0, vec![], vec![tail_work(3, 0)]);
+        next.completion_critical = true;
+        assert!(
+            request
+                .response_tx
+                .send(DownloadLaneRefillResponse {
+                    lease: Some(next),
+                    park_reason: LaneParkReason::NoWork,
+                })
+                .is_ok()
+        );
+        state.queue.write(|inner| {
+            match transition {
+                "pause" => inner.jobs[0].intents.paused = Some(true),
+                "generation" => inner.globals.nntp_generation += 1,
+                "admission" => inner.jobs[0].report.nzb_admitted = false,
+                "global_pause" => inner.globals.paused = true,
+                _ => unreachable!(),
+            }
+            crate::pipeline::queue::Change::changed(())
+        });
+        release_tx.send(()).unwrap();
+        let mut returned = Vec::new();
+        let mut completed = 0;
+        loop {
+            tokio::select! {
+                Some(event) = events.recv() => {
+                    let OwnedDownloadLaneEvent::BatchComplete { results, unrequested_works, ack, .. } = event else {
+                        panic!("the initial lease has already issued its BODY");
+                    };
+                    completed += results.len();
+                    returned.extend(unrequested_works.into_iter().map(|work| work.segment_id.segment_number));
+                    if let Some(ack) = ack { ack.send(()).unwrap(); }
+                }
+                Some(park) = parks.recv() => {
+                    assert_eq!(park.reason, LaneParkReason::Capacity);
+                    assert!(park.completion_critical, "the refill booking must be released");
+                    break;
+                }
+            }
+        }
+        worker.await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            1,
+            "{transition} must prevent new BODY commands"
+        );
+        returned.sort_unstable();
+        assert_eq!(
+            returned,
+            vec![1, 2, 3],
+            "{transition} returns reservations once"
+        );
+        assert_eq!(completed, 1, "the already-issued BODY still completes");
+    }
+}
+
 // A refill has been booked by the actor, but the socket dies before the
 // worker can adopt its answer. The final park must release the new booking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -240,15 +370,36 @@ async fn a_parking_lane_returns_its_tail_before_waiting_on_its_refill() {
 // server's, not an inconclusive shrug, and the lease still parks normally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
+    busy_probe_after_drain(false, 0, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_invalidated_after_pickup_never_reaches_the_cached_socket() {
+    busy_probe_after_drain(true, 0, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_for_another_provider_never_reaches_the_busy_socket() {
+    busy_probe_after_drain(false, 1, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_for_a_new_configuration_never_reaches_the_old_socket() {
+    busy_probe_after_drain(false, 0, true).await;
+}
+
+async fn busy_probe_after_drain(invalidate: bool, expected_server: usize, changed_pool: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let order: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (bodies_seen_tx, bodies_seen_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel::<()>();
+    let (drain_tx, drain_rx) = oneshot::channel::<()>();
     let server_order = Arc::clone(&order);
     let server = tokio::spawn(async move {
         let mut bodies_seen_tx = Some(bodies_seen_tx);
         let mut release_rx = Some(release_rx);
+        let mut drain_rx = Some(drain_rx);
         let mut held: Vec<String> = Vec::new();
         let (socket, _) = listener.accept().await.unwrap();
         let (reader, mut writer) = socket.into_split();
@@ -266,6 +417,9 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
                 if held.len() == 3 {
                     bodies_seen_tx.take().unwrap().send(()).unwrap();
                     release_rx.take().unwrap().await.unwrap();
+                    writer.write_all(b"430 no such article\r\n").await.unwrap();
+                    held.remove(0);
+                    drain_rx.take().unwrap().await.unwrap();
                     for _ in held.drain(..) {
                         writer.write_all(b"430 no such article\r\n").await.unwrap();
                     }
@@ -339,6 +493,16 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
     });
     let (picked_up_tx, picked_up_rx) = oneshot::channel();
     let (reply_tx, reply_rx) = oneshot::channel();
+    let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let guard_allowed = Arc::clone(&allowed);
+    let expected_pool = if changed_pool {
+        let replacement = weaver_nntp::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig::single(weaver_nntp::ServerConfig::default(), 1),
+        );
+        Arc::clone(replacement.pool())
+    } else {
+        Arc::clone(nntp.pool())
+    };
     async {
         bodies_seen_rx.await.expect("three BODYs pipelined before any answer");
         assert_eq!(
@@ -348,19 +512,27 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
         );
         commands_tx
             .send(OwnedLanePoolCommand::Probe {
+                expected_socket: ProbeSocket { server: expected_server, pool: Some(expected_pool) },
                 message_ids: Arc::from(["<probe@silver.horizon>".to_string()]),
+                guard: Some(Arc::new(move || guard_allowed.load(Ordering::SeqCst))),
                 picked_up: picked_up_tx,
                 reply: reply_tx,
             })
             .unwrap();
         release_tx.send(()).unwrap();
         picked_up_rx.await.expect("the busy worker takes the probe up");
+        allowed.store(!invalidate, Ordering::SeqCst);
+        drain_tx.send(()).unwrap();
         let answer = reply_rx
             .await
-            .expect("the worker answers rather than dropping the probe")
-            .expect("the answer comes from the lane, not a decline");
-        assert_eq!(answer.exists, vec![true]);
-        assert!(!answer.inconclusive);
+            .expect("the worker answers rather than dropping the probe");
+        if expected_server != 0 || changed_pool {
+            assert!(answer.is_none(), "a different provider or configuration cannot answer this probe");
+        } else {
+            let answer = answer.expect("the matching lane answers the probe");
+            assert_eq!(answer.exists, vec![!invalidate]);
+            assert_eq!(answer.inconclusive, invalidate);
+        }
 
         let mut results = 0;
         loop {
@@ -391,6 +563,10 @@ async fn a_probe_on_a_busy_lane_is_answered_after_the_ring_drains() {
     server.await.unwrap();
 
     let order = order.lock().unwrap();
+    if invalidate || expected_server != 0 || changed_pool {
+        assert_eq!(*order, vec!["BODY", "BODY", "BODY"]);
+        return;
+    }
     let last_body = order.iter().rposition(|command| command == "BODY").unwrap();
     let first_stat = order
         .iter()

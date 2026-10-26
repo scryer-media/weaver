@@ -71,6 +71,10 @@ pub struct NntpClient {
     soft_timeout: Duration,
 }
 
+// A queued probe rechecks the same article eligibility and caller lifecycle
+// at its socket owner before issuing commands.
+pub type ProbeWorkGuard = Arc<dyn Fn() -> bool + Send + Sync>;
+
 // How many yielding `try_lock` attempts an owned-lane server selection makes
 // on the shared health mutex before reporting contention. The critical
 // sections behind that mutex are microseconds long, so a handful of retries
@@ -1339,7 +1343,7 @@ impl NntpClient {
         message_ids: &[&str],
         exclude: &[usize],
     ) -> Option<ProbeBatchResult> {
-        self.confirm_exists_for_probe_using(message_ids, exclude, |_, _| async { None })
+        self.confirm_exists_for_probe_using(message_ids, exclude, |_, _, _| async { None })
             .await
     }
 
@@ -1352,7 +1356,7 @@ impl NntpClient {
         mut cached: F,
     ) -> Option<ProbeBatchResult>
     where
-        F: FnMut(usize, Vec<String>) -> Fut,
+        F: FnMut(usize, Vec<String>, ProbeWorkGuard) -> Fut,
         Fut: Future<Output = Option<ProbeBatchResult>>,
     {
         let order = self.article_server_order(exclude, &[]).await;
@@ -1379,23 +1383,28 @@ impl NntpClient {
                 .iter()
                 .map(|&i| message_ids[i].to_string())
                 .collect();
-            let result = match cached(server, batch.clone()).await {
+            let pool = Arc::clone(&self.pool);
+            let excluded = exclude.to_vec();
+            let attempted: Vec<_> = selected.iter().map(|&i| missing[i].clone()).collect();
+            let caller_guard = self.work_guard.clone();
+            let guard: ProbeWorkGuard = Arc::new(move || {
+                caller_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard(ServerId(server)))
+                    && pool.try_provider_policy().is_some_and(|policy| {
+                        attempted.iter().all(|missing| {
+                            matches!(
+                                policy.eligibility(server, missing, &excluded, 1),
+                                crate::provider_policy::ArticleEligibility::Eligible(_)
+                            )
+                        })
+                    })
+            });
+            let result = match cached(server, batch.clone(), Arc::clone(&guard)).await {
                 Some(result) => result,
                 None => {
                     let borrowed: Vec<_> = batch.iter().map(String::as_str).collect();
-                    let pool = Arc::clone(&self.pool);
-                    let excluded = exclude.to_vec();
-                    let attempted: Vec<_> = selected.iter().map(|&i| missing[i].clone()).collect();
-                    let client = self.with_work_guard(move |chosen| {
-                        pool.try_provider_policy().is_some_and(|policy| {
-                            attempted.iter().all(|missing| {
-                                matches!(
-                                    policy.eligibility(chosen.0, missing, &excluded, 1),
-                                    crate::provider_policy::ArticleEligibility::Eligible(_)
-                                )
-                            })
-                        })
-                    });
+                    let client = self.with_work_guard(move |_| guard());
                     client.confirm_probe_on_server(server, &borrowed).await
                 }
             };

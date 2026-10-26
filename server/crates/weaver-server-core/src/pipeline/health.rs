@@ -1714,6 +1714,7 @@ impl Pipeline {
             .collect();
 
         let probe_count = probes.len();
+        let retention_excludes = self.job_retention_excludes(job_id);
         let nntp = Arc::clone(&self.nntp);
         let probe_tx = self.probe_result_tx.clone();
         // The probe rides the download lanes rather than competing with them.
@@ -1755,7 +1756,13 @@ impl Pipeline {
                 // async client is the fallback for whatever they cannot settle
                 // — a server with no lane of its own, or a lane that faulted.
                 let results = owned_lane_probe
-                    .confirm_exists_for_probe(&nntp, batch, &probe_state, probe_generation)
+                    .confirm_exists_for_probe(
+                        &nntp,
+                        batch,
+                        &retention_excludes,
+                        &probe_state,
+                        probe_generation,
+                    )
                     .await;
                 if results.inconclusive {
                     // One batch that could not settle is a hole in the sample,
