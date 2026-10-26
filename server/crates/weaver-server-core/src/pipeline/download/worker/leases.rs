@@ -418,7 +418,7 @@ impl Pipeline {
             provider_policy: self
                 .download_pass_provider_policy
                 .clone()
-                .or_else(|| self.nntp.pool().try_provider_policy()),
+                .or_else(|| Some(self.nntp.pool().provider_policy())),
             hint_alternatives: self.rotation_hint_alternatives(job_id),
             retention_excludes,
             bootstrap_files,

@@ -23,7 +23,8 @@ pub(in crate::pipeline) use refill::HeldDownloadRefill;
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 
 enum DispatchAttempt {
-    Dispatched,
+    // A lease for this job went to a worker.
+    Dispatched(JobId),
     NoWork,
     StopAll,
 }
@@ -416,11 +417,153 @@ impl Pipeline {
             if let Some(owner) = self.download_lane_owners.get_mut(&lane_id) {
                 owner.server_idx = Some(server_idx);
             }
+            let job_id = lease.job_id;
             self.spawn_download_batch(lease);
             *sent_this_pass.entry(server_idx).or_default() += 1;
-            return DispatchAttempt::Dispatched;
+            return DispatchAttempt::Dispatched(job_id);
         }
         DispatchAttempt::NoWork
+    }
+
+    // Open the connections a barred job is about to need, while it is barred.
+    //
+    // A job whose first wave is held behind a barrier, the recovery index
+    // bootstrap being the standing case, may only lease the barrier's own
+    // work, so dispatch cuts one batch and stops. Nothing in the barrier
+    // requires the connections to wait: without this, the moment payload
+    // leases go out, each lane pays a TCP, TLS, greeting and authentication
+    // exchange before its first BODY, one after another, on a job that has
+    // been waiting on exactly those bytes.
+    //
+    // The warm is the job's share and no more. It never exceeds the free
+    // connections, the job's even split of the connection capacity across
+    // admitted NZBs, or the payload articles it has queued, since a warm
+    // connection no lease will claim is a socket held open for nothing.
+    //
+    // A warm only ever fills a seat no demanded work has claimed. The pass's
+    // own seat ledger says which: a server's seats at pass start, less what
+    // the pass handed out there, less the idle connections holding seats now.
+    // A lease handed to a worker has claimed its seat whether or not the
+    // worker has dialed yet. Each warm is held to one such seat, and is
+    // entered in the same ledger so a second barred job cannot claim it too.
+    //
+    // A warm lane is idle, not active: it is counted in no connection gauge,
+    // and if the barrier never lifts it parks with the rest of the pool. Each
+    // warm runs on its own worker thread, so nothing already leased waits on
+    // one.
+    fn warm_idle_download_lanes_for_barrier(
+        &mut self,
+        job_id: JobId,
+        sent_this_pass: &mut HashMap<usize, usize>,
+        headroom_at_pass_start: &mut HashMap<usize, usize>,
+    ) {
+        let capacity = self
+            .effective_download_connection_capacity(self.tuner.params().max_concurrent_downloads);
+        let free = capacity.saturating_sub(self.active_download_connections);
+        if free == 0 {
+            return;
+        }
+        // Only while the job is actually holding work back. Ordinary dispatch
+        // needs no help: it leases into every free connection itself.
+        if self.recovery_metadata_bootstrap_files(job_id).is_none() {
+            return;
+        }
+        let share = capacity.div_ceil(self.nzb_admitted.len().max(1));
+        // Sized for a payload article. A job with no payload queued has
+        // nothing for a warm connection to carry.
+        let Some((queued, byte_estimate)) = self.jobs.get(&job_id).and_then(|state| {
+            state
+                .download_queue
+                .peek_in_class(false)
+                .map(|work| (state.download_queue.len_in_class(false), work.byte_estimate))
+        }) else {
+            return;
+        };
+        let limit = free.min(share).min(queued);
+        if limit == 0 {
+            return;
+        }
+        let exclude_servers = self.effective_exclude_servers(job_id, &[]);
+        // The servers a lease for this job could be routed to, best first.
+        // Provider policy is asked again at the dial.
+        let Some(order) = self.nntp.blocking_body_server_order(&exclude_servers) else {
+            return;
+        };
+        let order: Vec<usize> = order.into_iter().map(|server| server.0).collect();
+        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
+        for server in self
+            .owned_download_lane_pool
+            .idle_lane_servers()
+            .into_iter()
+            .flatten()
+        {
+            *idle_by_server.entry(server).or_default() += 1;
+        }
+        for server in &order {
+            let idle = idle_by_server.get(server).copied().unwrap_or(0);
+            let (available, _) = self.nntp.pool().server_load(*server);
+            headroom_at_pass_start
+                .entry(*server)
+                .or_insert(idle + available);
+        }
+        let seats = Self::unclaimed_warm_seats(
+            &order,
+            headroom_at_pass_start,
+            sent_this_pass,
+            &idle_by_server,
+            limit,
+        );
+        let exclude_servers: Arc<[usize]> = Arc::from(exclude_servers);
+        let mut warmed = 0;
+        for (server, count) in seats {
+            let asked = self.owned_download_lane_pool.warm(
+                &self.nntp,
+                Arc::clone(&exclude_servers),
+                Self::bandwidth_reservation_estimate(byte_estimate),
+                weaver_nntp::pool::ServerId(server),
+                count,
+            );
+            *sent_this_pass.entry(server).or_default() += asked;
+            warmed += asked;
+        }
+        if warmed > 0 {
+            debug!(
+                job_id = job_id.0,
+                lanes = warmed,
+                "warming idle download lanes behind a job barrier"
+            );
+        }
+    }
+
+    // How many warms each server in `order` may take, at most `limit` in
+    // all: its seats at pass start, less what the pass has handed out there,
+    // less the idle connections holding seats now.
+    fn unclaimed_warm_seats(
+        order: &[usize],
+        headroom_at_pass_start: &HashMap<usize, usize>,
+        sent_this_pass: &HashMap<usize, usize>,
+        idle_by_server: &HashMap<usize, usize>,
+        limit: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut remaining = limit;
+        let mut seats = Vec::new();
+        for server in order {
+            if remaining == 0 {
+                break;
+            }
+            let unclaimed = headroom_at_pass_start
+                .get(server)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(sent_this_pass.get(server).copied().unwrap_or(0))
+                .saturating_sub(idle_by_server.get(server).copied().unwrap_or(0));
+            let count = unclaimed.min(remaining);
+            if count > 0 {
+                seats.push((*server, count));
+                remaining -= count;
+            }
+        }
+        seats
     }
 
     fn mark_download_pass_started(&mut self, job_id: JobId) {
@@ -507,7 +650,7 @@ impl Pipeline {
     // One dispatch pass at `now`, the instant the pass's timers and the stall
     // watchdog measure against.
     pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
-        self.download_pass_provider_policy = self.nntp.pool().try_provider_policy();
+        self.download_pass_provider_policy = Some(self.nntp.pool().provider_policy());
         self.dispatch_download_pass(now);
         self.download_pass_provider_policy = None;
         self.report_changed_dispatch_holds();
@@ -777,6 +920,7 @@ impl Pipeline {
         let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
         let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
         let mut ranked_this_pass: Option<Vec<usize>> = None;
+        let mut leased_jobs: Vec<JobId> = Vec::new();
         while self.active_download_connections < max
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
@@ -790,10 +934,24 @@ impl Pipeline {
             // Handouts outside a dispatch attempt rank the servers themselves.
             self.download_pass_fill_servers = None;
             match attempt {
-                DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
+                DispatchAttempt::Dispatched(job_id) => {
+                    dispatch_budget = dispatch_budget.saturating_sub(1);
+                    if !leased_jobs.contains(&job_id) {
+                        leased_jobs.push(job_id);
+                    }
+                }
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => return,
             }
+        }
+        // Warms come after the pass, once every lease it cut has claimed its
+        // seat, so a warm can only take a seat the pass left unclaimed.
+        for job_id in leased_jobs {
+            self.warm_idle_download_lanes_for_barrier(
+                job_id,
+                &mut sent_this_pass,
+                &mut headroom_at_pass_start,
+            );
         }
         if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
             if self.watch_download_dispatch_stall(now, pressure, max, eligible_count) {
@@ -807,6 +965,44 @@ impl Pipeline {
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);
         self.update_queue_metrics();
+    }
+}
+
+#[cfg(test)]
+mod warm_seat_tests {
+    use super::*;
+
+    // A pass that hands a lease to a server's last seat leaves that server
+    // nothing to warm; the warm goes to the next server with a free seat.
+    #[test]
+    fn a_lease_on_the_last_seat_leaves_no_warm_for_that_server() {
+        let order = [0, 1];
+        let headroom = HashMap::from([(0, 1), (1, 2)]);
+        let sent = HashMap::from([(0, 1)]);
+        let idle = HashMap::new();
+
+        let seats = Pipeline::unclaimed_warm_seats(&order, &headroom, &sent, &idle, 8);
+
+        assert_eq!(seats, vec![(1, 2)], "no warm is sent to server 0");
+    }
+
+    // A lease served by an idle connection used the seat that connection
+    // held, so the server's permits are still free to warm.
+    #[test]
+    fn idle_connections_hold_their_seats_until_a_lease_takes_them() {
+        let order = [0];
+        let headroom = HashMap::from([(0, 3)]);
+        let idle = HashMap::from([(0, 1)]);
+
+        assert_eq!(
+            Pipeline::unclaimed_warm_seats(&order, &headroom, &HashMap::new(), &idle, 8),
+            vec![(0, 2)]
+        );
+        assert_eq!(
+            Pipeline::unclaimed_warm_seats(&order, &headroom, &HashMap::new(), &idle, 1),
+            vec![(0, 1)],
+            "never more than the job's share"
+        );
     }
 }
 

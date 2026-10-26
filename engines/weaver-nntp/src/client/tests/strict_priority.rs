@@ -145,7 +145,7 @@ async fn obsolete_work_cannot_dial_or_take_a_socket_after_waiting_for_capacity()
         client
             .acquire_before_deadline(ServerId(0), &mut deadline)
             .await,
-        Err(NntpError::AcquireTimeout(0))
+        Err(NntpError::WorkObsolete)
     ));
     assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 0);
 
@@ -167,10 +167,45 @@ async fn obsolete_work_cannot_dial_or_take_a_socket_after_waiting_for_capacity()
     .await;
     allowed.store(false, Ordering::SeqCst);
     drop(held.pop());
-    assert!(matches!(waiting.await, Err(NntpError::AcquireTimeout(0))));
+    assert!(matches!(waiting.await, Err(NntpError::WorkObsolete)));
     assert_eq!(fixture.dials[0].load(Ordering::SeqCst), 16);
     assert!(fixture.commands.lock().unwrap().is_empty());
     drop(held);
+    fixture.close().await;
+}
+
+// A guard that turns the work away is neither a wait nor a server fault:
+// the article leaves no attempt behind and no server's health moves.
+#[tokio::test]
+async fn obsolete_work_leaves_no_attempt_and_no_health_mark() {
+    let fixture = Providers::new().await;
+    let client = fixture.client.with_work_guard(|_| false);
+    let trace = client
+        .fetch_body_with_groups_prefer_excluding_traced(
+            "<obsolete@example.invalid>",
+            &["alt.binaries.test".to_string()],
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(trace.result, Err(NntpError::WorkObsolete)),
+        "{:?}",
+        trace.result
+    );
+    assert!(trace.attempts.is_empty(), "{:?}", trace.attempts);
+    {
+        let health = fixture.client.pool.health().lock().await;
+        for idx in 0..3 {
+            assert_eq!(health.server(idx).failure_count, 0);
+            assert!(health.server(idx).is_available());
+        }
+    }
+    assert!(
+        fixture
+            .dials
+            .iter()
+            .all(|count| count.load(Ordering::SeqCst) == 0)
+    );
     fixture.close().await;
 }
 
@@ -218,6 +253,70 @@ async fn fresh_connect_failures_preserve_established_connection_health() {
             0
         );
         assert_eq!(client.pool.socket_budget_snapshot(0).physical, 1);
+    })
+    .await
+    .unwrap();
+}
+
+// An idle cached socket proves nothing about the server now: when every
+// new dial is refused, health still sees each failure and quarantines the
+// server at its threshold.
+#[tokio::test]
+async fn refused_dials_reach_health_past_an_idle_cached_socket() {
+    let client = Arc::new(NntpClient::new(NntpClientConfig::single(
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 1,
+            tls: false,
+            ..Default::default()
+        },
+        16,
+    )));
+    let threshold = crate::health::HealthConfig::default().disable_threshold as usize;
+    let cached = client
+        .pool
+        .try_acquire_blocking_permit(ServerId(0))
+        .unwrap();
+    cached.socket_slot.idle(
+        crate::socket_budget::SocketPhase::OwnedIdle,
+        Arc::new(|_| {}),
+    );
+    let pending: Vec<_> = (0..threshold)
+        .map(|_| {
+            client
+                .pool
+                .try_acquire_blocking_permit(ServerId(0))
+                .unwrap()
+        })
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        for permit in pending {
+            let ticket = Arc::clone(&permit.health_lease);
+            drop(permit);
+            client.record_blocking_connect_failure(
+                0,
+                crate::pool::FreshConnectAdmission::Open,
+                &NntpError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+                &ticket.0,
+            );
+        }
+        let mut health = client.pool.health().blocking_lock();
+        assert!(
+            matches!(
+                health.server(0).state(),
+                crate::health::ServerState::Disabled {
+                    reason: crate::health::DisableReason::ConsecutiveFailures,
+                    ..
+                }
+            ),
+            "{:?}",
+            health.server(0).state()
+        );
+        assert!(!health.is_available(0));
+        drop(health);
+        assert!(!client.pool.is_over_limit(ServerId(0)));
+        assert!(!client.pool.provider_policy().servers[0].available);
+        drop(cached);
     })
     .await
     .unwrap();

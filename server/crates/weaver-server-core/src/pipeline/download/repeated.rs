@@ -568,12 +568,15 @@ impl Pipeline {
                 let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
                 let guarded = nntp.with_work_guard(move |server| {
                     super::owned_lane::job_work_is_current(&guard_state, job_id, generation)
-                        && guard_pool.try_provider_policy().is_some_and(|policy| {
-                            matches!(
-                                policy.eligibility(server.0, &guard_excludes, &[], estimate),
-                                weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
-                            )
-                        })
+                        && matches!(
+                            guard_pool.provider_policy().eligibility(
+                                server.0,
+                                &guard_excludes,
+                                &[],
+                                estimate
+                            ),
+                            weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+                        )
                 });
                 let reply = cache
                     .fetch_guarded(&work, &excludes, &guarded, lease.runtime_generation, || {
@@ -581,7 +584,8 @@ impl Pipeline {
                             &state,
                             lease.job_id,
                             lease.runtime_generation,
-                        ) && nntp.pool().try_provider_policy().is_some_and(|policy| {
+                        ) && {
+                            let policy = nntp.pool().provider_policy();
                             (0..nntp.pool().server_count()).any(|server| {
                                 !lease.dial_exclude_servers.contains(&server)
                                     && matches!(
@@ -598,7 +602,7 @@ impl Pipeline {
                                         )
                                     )
                             })
-                        })
+                        }
                     })
                     .await;
                 let _ = tx

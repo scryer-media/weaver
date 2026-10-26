@@ -255,7 +255,7 @@ impl Pipeline {
             }
         }
 
-        let provider_policy = self.nntp.pool().try_provider_policy();
+        let provider_policy = Some(self.nntp.pool().provider_policy());
         let mut jobs: Vec<JobPipelineDiagnostics> = self
             .jobs
             .iter()

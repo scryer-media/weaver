@@ -95,6 +95,8 @@ pub struct NntpPool {
     shutdown: CancellationToken,
     max_idle_age: Duration,
     health: Arc<Mutex<HealthTracker>>,
+    // The health tracker's availability, read without its lock.
+    availability: Arc<crate::health::AvailabilityBoard>,
     recovery_gates: Vec<Arc<crate::recovery::RecoveryGate>>,
     // Per-server timestamp of the last failed connection attempt.
     last_connect_failure: Vec<Arc<Mutex<Option<Instant>>>>,
@@ -454,6 +456,7 @@ impl NntpPool {
         let recovery_gates = (0..server_count)
             .map(|idx| Arc::clone(&health.server(idx).recovery))
             .collect();
+        let availability = health.availability();
         let health = Arc::new(Mutex::new(health));
 
         NntpPool {
@@ -471,6 +474,7 @@ impl NntpPool {
             shutdown,
             max_idle_age: config.max_idle_age,
             health,
+            availability,
             recovery_gates,
             last_connect_failure,
             reconnect_delay: config.reconnect_delay,
@@ -597,7 +601,7 @@ impl NntpPool {
                     };
                     if let Err(error) = &result {
                         let provider_evidence = !matches!(error, NntpError::Route(route) if route.is_path_evidence() || !route.is_evidence());
-                        if provider_evidence && !matches!(error, NntpError::TooManyConnections | NntpError::ServerOverLimit { .. } | NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::AcquireTimeout(_)) {
+                        if provider_evidence && !pool.dial_declined_over_limit(idx, error) && !matches!(error, NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::AcquireTimeout(_)) {
                             let auth = matches!(error, NntpError::AuthenticationFailed | NntpError::AuthenticationRejected | NntpError::AuthenticationRequired | NntpError::AccessDenied);
                             pool.health.lock().await.record_connection_outcome(idx, &health_lease.0, false, auth);
                             pool.retire_quarantined_idle(idx);
@@ -842,7 +846,7 @@ impl NntpPool {
         // Try to get a healthy idle connection, with stale-check loop.
         let conn = loop {
             if guard.is_some_and(|guard| !guard(ServerId(idx))) {
-                return Err(NntpError::AcquireTimeout(0));
+                return Err(NntpError::WorkObsolete);
             }
             // Subscribe before inspecting the cache and physical capacity.
             let mut changed = self.socket_budgets[idx].subscribe();
@@ -903,7 +907,7 @@ impl NntpPool {
                     }
 
                     if guard.is_some_and(|guard| !guard(ServerId(idx))) {
-                        return Err(NntpError::AcquireTimeout(0));
+                        return Err(NntpError::WorkObsolete);
                     }
                     debug!(server = idx, "creating new connection");
                     let health_lease = self.recovery_gates[idx]
@@ -960,11 +964,10 @@ impl NntpPool {
                             }
                             let provider_evidence = !matches!(&e, NntpError::Route(error) if error.is_path_evidence() || !error.is_evidence());
                             if provider_evidence
+                                && !self.dial_declined_over_limit(idx, &e)
                                 && !matches!(
                                     e,
-                                    NntpError::TooManyConnections
-                                        | NntpError::ServerOverLimit { .. }
-                                        | NntpError::PoolExhausted
+                                    NntpError::PoolExhausted
                                         | NntpError::PoolShutdown
                                         | NntpError::AcquireTimeout(_)
                                 )
@@ -976,15 +979,13 @@ impl NntpPool {
                                         | NntpError::AuthenticationRequired
                                         | NntpError::AccessDenied
                                 );
-                                if auth || !self.has_established_sockets(idx) {
-                                    self.health.lock().await.record_connection_outcome(
-                                        idx,
-                                        &health_lease.0,
-                                        false,
-                                        auth,
-                                    );
-                                    self.retire_quarantined_idle(idx);
-                                }
+                                self.health.lock().await.record_connection_outcome(
+                                    idx,
+                                    &health_lease.0,
+                                    false,
+                                    auth,
+                                );
+                                self.retire_quarantined_idle(idx);
                             }
                             // Record the failure timestamp.
                             let mut last_failure = self.last_connect_failure[idx].lock().await;
@@ -1313,7 +1314,9 @@ impl NntpPool {
         result: &Result<T>,
     ) {
         match result {
-            Err(NntpError::TooManyConnections) => self.note_provider_over_limit(server),
+            Err(error) if self.dial_declined_over_limit(server.0, error) => {
+                self.note_provider_over_limit(server)
+            }
             Ok(_) => self.note_provider_admitted(server, admission),
             Err(_) => self.release_over_limit_probe(server, admission),
         }
@@ -1467,29 +1470,12 @@ impl NntpPool {
         );
     }
 
-    pub async fn provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
-        let mut health = self.health.lock().await;
-        self.sample_provider_policy(&mut health)
-    }
-
-    // Native lane workers can wait for the short health critical section;
-    // contention is not a reason to surrender reserved article work.
-    pub fn blocking_provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
-        self.sample_provider_policy(&mut self.health.blocking_lock())
-    }
-
-    // Contention is a retry, never permission to choose a lower group.
-    pub fn try_provider_policy(&self) -> Option<crate::provider_policy::ProviderPolicy> {
-        let mut health = self.health.try_lock().ok()?;
-        Some(self.sample_provider_policy(&mut health))
-    }
-
-    fn sample_provider_policy(
-        &self,
-        health: &mut HealthTracker,
-    ) -> crate::provider_policy::ProviderPolicy {
+    // Every server's standing for article eligibility, as of now. Takes no
+    // lock: health availability comes from the tracker's published board,
+    // and credentials, routes and quotas are lock-free reads of their own,
+    // so a sample never waits and never fails for contention.
+    pub fn provider_policy(&self) -> crate::provider_policy::ProviderPolicy {
         use crate::provider_policy::{ProviderGroup, ProviderPolicy, ProviderState};
-        health.check_reenable_all();
         ProviderPolicy {
             servers: (0..self.configs.len())
                 .map(|idx| {
@@ -1511,7 +1497,7 @@ impl NntpPool {
                             backfill: self.backfill[idx],
                             priority: self.server_groups()[idx],
                         },
-                        available: health.is_available(idx) && self.route_available(idx),
+                        available: self.availability.is_available(idx) && self.route_available(idx),
                         refuses_credentials: self.refuses_credentials(idx),
                         quota_remaining,
                     }
@@ -1533,14 +1519,8 @@ impl NntpPool {
         let now = Instant::now();
         let mut health = self.health.lock().await;
         health.check_reenable_all();
-        // Same ordering-side gate the try-order uses: an auth-disabled fill
-        // server counts as exhausted so the lane-unavailable arm sees
-        // backfill as eligible instead of waiting on a deadline that only the
-        // operator can resolve.
-        let excludes = (0..self.configs.len())
-            .filter(|idx| is_excluded(*idx))
-            .collect::<Vec<_>>();
-        let backfill_unlocked = self.fill_servers_exhausted_or_auth_disabled(&excludes);
+        let backfill_unlocked =
+            crate::provider_policy::backfill_unlocked(self.backfill.iter().copied(), is_excluded);
         let mut retry_after = None;
         for server_idx in 0..self.configs.len() {
             if is_excluded(server_idx)
@@ -1572,13 +1552,12 @@ impl NntpPool {
     }
 
     // Whether every fill (non-backfill) server is in `exclude` — the gate
-    // that makes backfill servers reachable for a request.
+    // that makes backfill servers reachable for a request
+    // ([`crate::provider_policy::backfill_unlocked`]).
     pub fn fill_servers_exhausted(&self, exclude: &[usize]) -> bool {
-        self.backfill
-            .iter()
-            .enumerate()
-            .filter(|(_, backfill)| !**backfill)
-            .all(|(idx, _)| exclude.contains(&idx))
+        crate::provider_policy::backfill_unlocked(self.backfill.iter().copied(), |idx| {
+            exclude.contains(&idx)
+        })
     }
 
     // Whether this server refuses this pool's credentials: health disabled it
@@ -1593,37 +1572,6 @@ impl NntpPool {
         self.recovery_gates
             .get(idx)
             .is_some_and(|gate| gate.refuses_credentials())
-    }
-
-    // The ordering-side backfill gate: every fill server is either excluded
-    // for this request or refusing this pool's credentials
-    // ([`Self::refuses_credentials`]), a condition that will not heal on its
-    // own.
-    //
-    // A fill server with bad credentials re-disables on every probe, so it
-    // never produces the 430 that would exclude it and otherwise pins an
-    // article forever: the try-order skips the disabled server, the
-    // remaining fill servers already 430'd, and backfill stays locked because
-    // the disabled server is not in `exclude`. Counting an auth-disabled
-    // server here lets the article spill to backfill instead of requeueing
-    // against a deadline that only the operator can resolve.
-    //
-    // Every other health state deliberately does *not* count. `CoolingDown`
-    // is a 5–10 s transport or capacity blip, and a `ConsecutiveFailures` /
-    // `FailureRatio` disable is an outage that heals by itself; in both cases
-    // waiting is far cheaper than spilling the whole queue onto a paid
-    // backfill account. Note
-    // this is an *ordering* gate only — a server disabled for any of those
-    // reasons must never enter a request's exclude set, or exhaustion booking
-    // would declare the segment missing before it came back. A credentials
-    // refusal is the exception: it is the server's answer for the article,
-    // and exhaustion still counts every backfill server before booking.
-    pub fn fill_servers_exhausted_or_auth_disabled(&self, exclude: &[usize]) -> bool {
-        self.backfill
-            .iter()
-            .enumerate()
-            .filter(|(_, backfill)| !**backfill)
-            .all(|(idx, _)| exclude.contains(&idx) || self.refuses_credentials(idx))
     }
 
     // Access the health tracker for observability.
@@ -1684,9 +1632,7 @@ impl NntpPool {
         let recent_failure = self.last_connect_failure[idx]
             .try_lock()
             .map_err(|_| NntpError::PoolExhausted)?;
-        if !self.is_over_limit(server)
-            && recent_failure.is_some_and(|at| at.elapsed() < self.reconnect_delay)
-        {
+        if recent_failure.is_some_and(|at| at.elapsed() < self.reconnect_delay) {
             return Err(NntpError::ServerRecovering);
         }
         drop(recent_failure);
@@ -1723,9 +1669,36 @@ impl NntpPool {
         })
     }
 
-    pub(crate) fn has_established_sockets(&self, idx: usize) -> bool {
-        let sockets = self.socket_budgets[idx].snapshot();
-        sockets.physical > sockets.dialing + sockets.closing
+    // Whether a failed fresh dial is the provider declining one more socket
+    // rather than the server failing. Every failed dial is one or the other:
+    // a decline arms the over-limit holdoff, anything else is the server's
+    // health.
+    //
+    // A decline is the provider's explicit over-limit reply, or a dial the
+    // server accepted and then dropped (closed, reset, a failed handshake)
+    // while it is serving work on sockets it already holds: a provider at
+    // its connection limit often turns the extra socket away that way. A
+    // refused, unreachable or timed-out dial is the server down, whatever
+    // sockets it holds, and so is a dropped dial when no socket is busy:
+    // an idle cached socket says nothing about the server now.
+    pub(crate) fn dial_declined_over_limit(&self, idx: usize, error: &NntpError) -> bool {
+        let dropped = match error {
+            NntpError::TooManyConnections | NntpError::ServerOverLimit { .. } => return true,
+            NntpError::ConnectionClosed | NntpError::Tls(_) => true,
+            NntpError::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
+            ),
+            _ => false,
+        };
+        dropped && {
+            let sockets = self.socket_budgets[idx].snapshot();
+            sockets.physical
+                > sockets.dialing + sockets.closing + sockets.async_idle + sockets.owned_idle
+        }
     }
 
     pub(crate) fn note_blocking_connect_failure(&self, idx: usize) {
@@ -2846,12 +2819,11 @@ mod tests {
         ));
     }
 
-    // An auth-disabled fill server must make backfill reachable, or an
-    // article the other fill servers do not have is pinned out of backfill
-    // for as long as the bad credentials last. A short cooldown and a
-    // consecutive-failure outage disable must not: both heal on their own.
+    // Backfill fills only articles the fill servers do not have. A fill
+    // server refusing this pool's credentials, a short cooldown and a
+    // consecutive-failure outage all leave the backfill tier closed.
     #[tokio::test]
-    async fn body_availability_unlocks_backfill_only_for_auth_disabled_fill_servers() {
+    async fn body_availability_never_unlocks_backfill_for_an_unavailable_fill_server() {
         let fill_plus_backfill = || {
             let mut config = test_pool_config(1);
             config.servers.push(ServerPoolConfig {
@@ -2868,19 +2840,18 @@ mod tests {
         };
         let disabled = NntpPool::new(fill_plus_backfill());
         disabled.health().lock().await.record_failure(0, true);
+        assert!(
+            matches!(
+                disabled.body_server_availability(&[], &[], 0).await,
+                BodyServerAvailability::WaitingUntil(_)
+            ),
+            "a fill server refusing credentials must not open backfill"
+        );
+        assert!(!disabled.fill_servers_exhausted(&[]));
         assert_eq!(
-            disabled.body_server_availability(&[], &[], 0).await,
+            disabled.body_server_availability(&[0], &[], 0).await,
             BodyServerAvailability::Eligible,
-            "the healthy backfill server must be visible past a disabled fill tier"
-        );
-        assert!(
-            disabled.fill_servers_exhausted_or_auth_disabled(&[]),
-            "the ordering gate itself must agree"
-        );
-        assert!(
-            !disabled.fill_servers_exhausted(&[]),
-            "the exclude-only gate must stay untouched: disabled servers are \
-             never put into a request exclude set"
+            "an article the fill server does not have still reaches backfill"
         );
 
         let cooling = NntpPool::new(fill_plus_backfill());
@@ -2897,7 +2868,7 @@ mod tests {
             "a 5-10s cooldown must wait, not spill onto backfill"
         );
         assert!(
-            !cooling.fill_servers_exhausted_or_auth_disabled(&[]),
+            !cooling.fill_servers_exhausted(&[]),
             "CoolingDown must not open the backfill gate"
         );
 
@@ -2926,7 +2897,7 @@ mod tests {
             "an outage disable heals on its own and must wait, not spill onto backfill"
         );
         assert!(
-            !outage.fill_servers_exhausted_or_auth_disabled(&[]),
+            !outage.fill_servers_exhausted(&[]),
             "ConsecutiveFailures must not open the backfill gate"
         );
     }

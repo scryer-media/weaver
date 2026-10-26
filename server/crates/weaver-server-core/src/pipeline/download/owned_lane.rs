@@ -484,6 +484,20 @@ enum OwnedLanePoolCommand {
     Run(Box<OwnedLaneRun>),
     Reset,
     RecallSocket(u64),
+    // Open the connection a lease for a barred job would ask for, before the
+    // lease exists.
+    //
+    // A job whose first wave is held to a barrier, the recovery index
+    // bootstrap being the standing case, leases one batch and leaves every
+    // other worker with nothing to dial for. The handshakes are then paid one
+    // after the other as the barrier lifts, and the first payload BODY of
+    // each lane waits out a TCP, TLS, greeting and authentication exchange
+    // that had nothing to wait for. Warming turns those into a connection the
+    // lane is already holding when its first lease arrives.
+    //
+    // A warm lane is an idle lane: it is not counted as an active download
+    // connection anywhere, and if no lease ever comes it parks with the rest.
+    Warm(Box<OwnedLaneWarm>),
     // Answer an existence probe on this worker's cached connection. The reply
     // is `None` when the worker has no cached lane to answer with.
     Probe {
@@ -516,6 +530,16 @@ fn obsolete_probe(batch_len: usize) -> weaver_nntp::client::ProbeBatchResult {
 struct CachedOwnedLane {
     nntp: Arc<weaver_nntp::NntpClient>,
     lane: weaver_nntp::blocking::BlockingBodyLane,
+}
+
+// What a warm dial needs: the article exclusions and size a lease for this
+// job would carry, so the dial makes the server choice that lease would, and
+// the one server whose unclaimed seat it may fill.
+pub(crate) struct OwnedLaneWarm {
+    nntp: Arc<weaver_nntp::NntpClient>,
+    exclude_servers: Arc<[usize]>,
+    byte_estimate: u64,
+    seat: weaver_nntp::pool::ServerId,
 }
 
 fn lock_pool(
@@ -603,6 +627,20 @@ impl OwnedLanePoolShared {
         if let Some(worker) = self.workers.get_mut(index) {
             worker.idle = None;
         }
+    }
+
+    // Idle workers with no connection, in pool order: the ones a warm can
+    // give a head start without disturbing anything.
+    fn idle_workers_without_a_lane(
+        &self,
+        limit: usize,
+    ) -> Vec<std_mpsc::Sender<OwnedLanePoolCommand>> {
+        self.workers
+            .iter()
+            .filter(|worker| worker.idle.as_ref().is_some_and(|idle| idle.lane.is_none()))
+            .take(limit)
+            .map(|worker| worker.sender.clone())
+            .collect()
     }
 }
 
@@ -728,10 +766,43 @@ impl OwnedDownloadLanePool {
                 OwnedLanePoolCommand::Run(run) => run.initial_lease,
                 OwnedLanePoolCommand::Reset
                 | OwnedLanePoolCommand::RecallSocket(_)
+                | OwnedLanePoolCommand::Warm(_)
                 | OwnedLanePoolCommand::Probe { .. } => {
                     unreachable!("only a Run command is sent from submit")
                 }
             })
+    }
+
+    // Ask up to `limit` connectionless idle workers to dial `seat` now.
+    //
+    // Returns how many were asked. Each dials on its own worker thread, so
+    // the handshakes overlap each other and nothing already leased waits on
+    // them; a worker whose dial is refused simply stays without a connection.
+    pub(crate) fn warm(
+        &self,
+        nntp: &Arc<weaver_nntp::NntpClient>,
+        exclude_servers: Arc<[usize]>,
+        byte_estimate: u64,
+        seat: weaver_nntp::pool::ServerId,
+        limit: usize,
+    ) -> usize {
+        if limit == 0 {
+            return 0;
+        }
+        let senders = lock_pool(&self.shared).idle_workers_without_a_lane(limit);
+        let mut asked = 0;
+        for sender in senders {
+            let warm = Box::new(OwnedLaneWarm {
+                nntp: Arc::clone(nntp),
+                exclude_servers: Arc::clone(&exclude_servers),
+                byte_estimate,
+                seat,
+            });
+            if sender.send(OwnedLanePoolCommand::Warm(warm)).is_ok() {
+                asked += 1;
+            }
+        }
+        asked
     }
 }
 
@@ -859,6 +930,11 @@ fn answer_idle_command(
             lock_pool(shared).note_idle_lane(index, None);
             park_cached_lane(cached_lane);
         }
+        OwnedLanePoolCommand::Warm(warm) => {
+            warm_cached_lane(cached_lane, *warm);
+            lock_pool(shared)
+                .note_idle_lane(index, cached_lane.as_ref().map(IdleOwnedLane::from_cached));
+        }
         OwnedLanePoolCommand::Probe {
             expected_socket,
             message_ids,
@@ -980,6 +1056,36 @@ fn cached_lane_matches_selection(
         return cached_quota_blocked || selection.quota_blocked.is_none();
     }
     false
+}
+
+// Open the connection a lease for this job would have asked for, so the lease
+// itself does not have to.
+//
+// The dial is the blocking lane acquisition a lease makes, with the same
+// exclusions, held to the one seat the dispatcher found unclaimed. Provider
+// policy still decides whether that seat may be used: a backfill server or a
+// level past the article's eligible group is refused, and a server held in
+// recovery admits no dial that no work is waiting on.
+fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWarm) {
+    if cached_lane.is_some() {
+        return;
+    }
+    let OwnedLaneWarm {
+        nntp,
+        exclude_servers,
+        byte_estimate,
+        seat,
+    } = warm;
+    match nntp.try_warm_blocking_body_lane(&[], &exclude_servers, byte_estimate, seat) {
+        Ok(lane) => {
+            *cached_lane = Some(CachedOwnedLane { nntp, lane });
+        }
+        Err(error) => {
+            // A refused warm costs nothing: the worker is simply still
+            // without a connection, exactly as it was.
+            debug!(error = %error, "owned lane warm dial declined");
+        }
+    }
 }
 
 fn park_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) {
@@ -1240,7 +1346,7 @@ fn lease_is_current(
     if !job_work_is_current(state, lease.job_id, lease.runtime_generation) {
         return false;
     }
-    let policy = nntp.pool().blocking_provider_policy();
+    let policy = nntp.pool().provider_policy();
     (0..nntp.pool().server_count()).any(|server| {
         !lease.dial_exclude_servers.contains(&server)
             && lease.works.iter().all(|work| {
@@ -1507,7 +1613,7 @@ fn run_owned_blocking_download_lane(
             // cancellation, a provider edit, or higher-priority recovery.
             if !job_work_is_current(&state, work_context.job_id, work_context.runtime_generation)
                 || !matches!(
-                    nntp.pool().blocking_provider_policy().eligibility(
+                    nntp.pool().provider_policy().eligibility(
                         server_idx,
                         &work.exclude_servers,
                         &work_context.retention_excludes,
@@ -3016,28 +3122,155 @@ mod routing_tests {
         assert!(pool.reset().is_empty(), "leases are returned only once");
     }
 
-    // A cached connection is published so the next eligible lease reuses it.
+    // Only workers with nothing to lose are warmed: a worker already holding
+    // a connection has nothing to gain, and a busy one is not there to ask.
     #[test]
-    fn a_cached_connection_is_published_as_an_idle_lane() {
+    fn warming_targets_idle_workers_without_a_connection() {
         let nntp = test_client();
-        let mut shared = shared_with(vec![idle_with(None)]);
-        let run = test_run(&nntp, Vec::new());
+        let shared = shared_with(vec![
+            None,
+            idle_with(Some(idle_lane(&nntp, 0))),
+            idle_with(None),
+            idle_with(None),
+        ]);
 
-        // Nothing to route to yet: the worker has no connection, so it is only
-        // the fallback choice.
-        assert!(
-            shared.workers[0]
-                .idle
-                .as_ref()
-                .is_some_and(|idle| idle.lane.is_none())
+        assert_eq!(shared.idle_workers_without_a_lane(8).len(), 2);
+        assert_eq!(
+            shared.idle_workers_without_a_lane(1).len(),
+            1,
+            "never more than the job's share of the free connections"
+        );
+        assert!(shared.idle_workers_without_a_lane(0).is_empty());
+    }
+
+    // A server that greets, answers CAPABILITIES with nothing beyond a
+    // reader, and refuses everything else, until its client hangs up.
+    fn greeting_server() -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut writer = socket.try_clone().unwrap();
+            writer.write_all(b"200 fixture ready\r\n").unwrap();
+            for line in std::io::BufReader::new(socket).lines() {
+                let Ok(line) = line else { break };
+                let reply: &[u8] = if line == "CAPABILITIES" {
+                    b"101 Capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"
+                } else {
+                    b"500 unsupported\r\n"
+                };
+                if writer.write_all(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        (port, server)
+    }
+
+    fn warm_for(nntp: &Arc<weaver_nntp::NntpClient>, seat: usize) -> OwnedLaneWarm {
+        OwnedLaneWarm {
+            nntp: Arc::clone(nntp),
+            exclude_servers: Arc::from(Vec::new()),
+            byte_estimate: 750_000,
+            seat: weaver_nntp::pool::ServerId(seat),
+        }
+    }
+
+    // A warm lane is an idle lane: it is published exactly like one a park
+    // kept, so the next lease for that job is routed straight to it.
+    #[test]
+    fn a_warm_connection_is_published_as_an_idle_lane() {
+        let (port, server) = greeting_server();
+        let nntp = Arc::new(weaver_nntp::client::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig::single(
+                weaver_nntp::ServerConfig {
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    tls: false,
+                    ..Default::default()
+                },
+                4,
+            ),
+        ));
+        let shared = Arc::new(std::sync::Mutex::new(shared_with(vec![idle_with(None)])));
+        let run = test_run(&nntp, Vec::new());
+        let mut cached = None;
+
+        let started = answer_idle_command(
+            0,
+            &shared,
+            &mut cached,
+            OwnedLanePoolCommand::Warm(Box::new(warm_for(&nntp, 0))),
         );
 
-        shared.note_idle_lane(0, Some(idle_lane(&nntp, 0)));
-
+        assert!(started.is_none(), "a warm starts no run");
+        assert!(
+            cached.is_some(),
+            "the worker now holds the warmed connection"
+        );
+        assert!(
+            lock_pool(&shared).workers[0]
+                .idle
+                .as_ref()
+                .and_then(|idle| idle.lane.as_ref())
+                .is_some_and(|lane| lane.server.0 == 0),
+            "the warmed connection is published on the worker's idle slot"
+        );
         assert_eq!(
-            shared.claim_worker_for(&run),
+            lock_pool(&shared).claim_worker_for(&run),
             Some(0),
-            "the warmed connection is now the one this lease is routed to"
+            "the warmed connection is the one this lease is routed to"
+        );
+
+        drop(cached);
+        server.join().unwrap();
+    }
+
+    // A warm makes the server choice a lease would make. A fill server that
+    // cannot be reached is not a reason to open the backfill tier, so a warm
+    // with only a backfill server answering stays without a connection, even
+    // when the seat it is handed is on the backfill server.
+    #[test]
+    fn a_warm_never_dials_a_backfill_server() {
+        let backfill = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        backfill.set_nonblocking(true).unwrap();
+        let server = |port: u16, backfill: bool| weaver_nntp::pool::ServerPoolConfig {
+            max_connections: 4,
+            backfill,
+            ..weaver_nntp::pool::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls: false,
+                ..Default::default()
+            })
+        };
+        let nntp = Arc::new(weaver_nntp::client::NntpClient::new(
+            weaver_nntp::client::NntpClientConfig {
+                servers: vec![
+                    // Nothing listens on port 1: every dial is refused.
+                    server(1, false),
+                    server(backfill.local_addr().unwrap().port(), true),
+                ],
+                ..weaver_nntp::client::NntpClientConfig::single(
+                    weaver_nntp::ServerConfig::default(),
+                    1,
+                )
+            },
+        ));
+        let mut cached = None;
+
+        warm_cached_lane(&mut cached, warm_for(&nntp, 0));
+        warm_cached_lane(&mut cached, warm_for(&nntp, 1));
+
+        assert!(cached.is_none(), "no fill server answered the warm");
+        // A dial completes its TCP handshake into the listener's backlog
+        // before it returns, so a dial to the backfill server would be
+        // waiting here.
+        assert_eq!(
+            backfill.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the warm never dialed the backfill server"
         );
     }
 
