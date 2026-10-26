@@ -354,7 +354,7 @@ pub fn snapshot(runtime: &NetworkRuntime) -> NetworkMetricsSnapshot {
     for leg in &mut legs {
         if let Some(traffic) = sessions.get(&(leg.consumer.clone(), leg.position)) {
             leg.live = true;
-            leg.open += traffic.open;
+            (leg.open, leg.opening) = traffic.connections(leg.open, leg.opening);
             leg.bytes_per_second += traffic.bytes_per_second;
         }
     }
@@ -560,6 +560,61 @@ mod tests {
             .unwrap();
         assert_eq!((row.live, row.open), (true, 1));
         assert!(row.bytes_per_second > 0);
+        runtime.shutdown().await;
+    }
+
+    // A connection a torrent session dials through its leg is open on the
+    // leg once its peer is established; until then, in its handshake, it is
+    // still being set up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_torrent_leg_counts_open_only_its_established_peers() {
+        use crate::torrents::net::{LegKind, LegSockets};
+        use weaver_torrent::SocketFactory;
+
+        let runtime = NetworkRuntime::new(
+            crate::Database::open_in_memory().unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let scope = super::super::TorrentScope::Default;
+        let consumer = super::super::Consumer::Torrent(scope);
+        let timeout = std::time::Duration::from_secs(30);
+        let leg = runtime.torrent_leg(scope, 0, 8, timeout).unwrap();
+        let sockets = LegSockets::new(leg.dialer(), &LegKind::Ladder);
+        let peers = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut dialed, mut accepted) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            dialed.push(
+                sockets
+                    .connect_tcp(peers.local_addr().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            accepted.push(peers.accept().await.unwrap());
+        }
+        let row = |established: u64| {
+            runtime.hold_torrent_traffic([(
+                (consumer, 0),
+                super::super::SessionTraffic {
+                    open: established,
+                    bytes_per_second: 0,
+                },
+            )]);
+            let metrics = snapshot(&runtime);
+            let row = metrics
+                .legs
+                .iter()
+                .find(|leg| leg.consumer == consumer.key() && leg.position == 0)
+                .unwrap();
+            (row.open, row.opening)
+        };
+
+        // Three connections, every one in its handshake.
+        assert_eq!(row(0), (0, 3));
+        // One peer is established.
+        assert_eq!(row(1), (1, 2));
+        assert_eq!(row(3), (3, 0));
+        drop((dialed, accepted));
         runtime.shutdown().await;
     }
 

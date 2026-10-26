@@ -126,13 +126,24 @@ impl TunnelProvider for TorrentProvider {
         "torrent route".into()
     }
 }
-/// What torrent sessions hold on a leg they run on their own sockets, which
-/// no route carries: their peer connections, and the bytes per second they
-/// receive.
+/// What torrent sessions hold on a leg: `open`, their peers' established
+/// connections, whatever sockets carry them; `bytes_per_second`, what they
+/// receive on sockets of their own, which no route carries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionTraffic {
     pub open: u64,
     pub bytes_per_second: u64,
+}
+
+impl SessionTraffic {
+    /// The leg's connections, `(open, opening)`, from what its route
+    /// counts: the open ones are the sessions' established peer
+    /// connections, and every other connection the route carries (a peer
+    /// still in its handshake, a tracker's or a web seed's request) is
+    /// still being set up.
+    pub fn connections(&self, open: u64, opening: u64) -> (u64, u64) {
+        (self.open, opening + open.saturating_sub(self.open))
+    }
 }
 
 impl NetworkRuntime {
@@ -153,9 +164,8 @@ impl NetworkRuntime {
         }
     }
 
-    /// What torrent sessions hold now on the legs they run on their own
-    /// sockets, by consumer and leg position, in place of what they held
-    /// before.
+    /// What torrent sessions hold now on the legs they run on, by consumer
+    /// and leg position, in place of what they held before.
     pub fn hold_torrent_traffic(
         &self,
         legs: impl IntoIterator<Item = ((Consumer, usize), SessionTraffic)>,
@@ -170,7 +180,7 @@ impl NetworkRuntime {
             .unwrap_or_else(PoisonError::into_inner) = legs;
     }
 
-    pub(crate) fn torrent_traffic(&self) -> HashMap<(String, usize), SessionTraffic> {
+    pub fn torrent_traffic(&self) -> HashMap<(String, usize), SessionTraffic> {
         self.torrent_legs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

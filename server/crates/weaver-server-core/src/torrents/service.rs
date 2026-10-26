@@ -3917,15 +3917,15 @@ impl TorrentService {
                 // order they were read.
                 landings.extend(self.queue_resume(torrent, now, at_once));
             }
-            // What the sessions hold on the legs they run on their own
-            // sockets, which no route sees.
+            // What the sessions hold on the legs they run on: their
+            // established peers on every leg, and the bytes they receive on
+            // their own sockets, which no route sees.
             let mut legs = std::collections::HashMap::<_, SessionTraffic>::new();
             for torrent in live.values() {
                 let Some(leg) = torrent
                     .attached
                     .as_ref()
                     .and_then(|attached| attached.leg.as_ref())
-                    .filter(|leg| leg.own_sockets)
                 else {
                     continue;
                 };
@@ -3933,7 +3933,9 @@ impl TorrentService {
                     .entry((Consumer::Torrent(leg.scope), leg.position))
                     .or_default();
                 traffic.open += u64::from(torrent.peers.0);
-                traffic.bytes_per_second += torrent.speeds.0;
+                if leg.own_sockets {
+                    traffic.bytes_per_second += torrent.speeds.0;
+                }
             }
             if let Some(proxies) = self.queue().and_then(|queue| queue.proxy_runtime()) {
                 proxies.network.hold_torrent_traffic(legs);

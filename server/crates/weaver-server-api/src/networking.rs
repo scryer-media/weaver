@@ -1062,12 +1062,23 @@ pub struct NetworkPoolMemberFlow {
 }
 pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     let mut legs = Vec::new();
+    let sessions = runtime.network.torrent_traffic();
     for route in runtime.network.live_routes() {
         let definitions = route.legs.read().expect("route legs");
         for allocation in route.weighted.allocations() {
             let Some(leg) = definitions.get(allocation.position) else {
                 continue;
             };
+            let (open, opening) = sessions
+                .get(&(route.consumer.key(), allocation.position))
+                .map_or((allocation.open, allocation.opening), |traffic| {
+                    let (open, opening) = traffic
+                        .connections(u64::from(allocation.open), u64::from(allocation.opening));
+                    (
+                        u16::try_from(open).unwrap_or(u16::MAX),
+                        u16::try_from(opening).unwrap_or(u16::MAX),
+                    )
+                });
             let rung_states: Vec<String> =
                 leg.rung_states().into_iter().map(str::to_owned).collect();
             // A leg counts two failed dials before it cools, but its ladder
@@ -1093,9 +1104,9 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 egress_id: leg.definition.egress_id,
                 weight: leg.definition.weight,
                 target: allocation.target,
-                open: allocation.open,
-                opening: allocation.opening,
-                state: if state == "UP" && allocation.open == 0 && allocation.opening == 0 {
+                open,
+                opening,
+                state: if state == "UP" && open == 0 && opening == 0 {
                     "IDLE"
                 } else {
                     state
