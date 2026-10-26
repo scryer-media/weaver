@@ -47,6 +47,552 @@
       }
     },
     {
+      "path": "testdata/adv-par2-lie-file-hash/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-file-hash/lie-payload.par2",
+      "size": 1076,
+      "blake3": "8557a60c55678dfe166c2d4a041961c9b40e22443572a57087a17801887de00e",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-file-hash/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "073cfdf81ee1d036a25282b519118268679d15bdddfb4f2e87a2eaac3a4c9b25",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-hash16k/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-hash16k/lie-payload.par2",
+      "size": 1076,
+      "blake3": "d7f0def3366a0c171d9ca7f642c8797780bf0e7acdd8e4d39a6b92227a4b3c52",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-hash16k/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "27cc801847e6ac53904d58dad6b8f87b7399a38ada0943385614e41aa0525838",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-length-long/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-length-long/lie-payload.par2",
+      "size": 1076,
+      "blake3": "ffed19d5ea2687e89f48a87b8a8073ddf433a0ce109da5bbfb8f3316b822de07",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-length-long/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "915a005a0a507d91d136055a61534ee6f5248a1da8846470d461802f996f1314",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-length-short/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-length-short/lie-payload.par2",
+      "size": 1076,
+      "blake3": "af0811a564b0c23f0103082cd3fa05d7d534583504563d0f98944c102ee53821",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-length-short/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "996dd0c9e45927948aad1778a9d4e4f5fd72fc1d55fe9a341f77f812cc3da489",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-name-case/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-name-case/lie-payload.par2",
+      "size": 1076,
+      "blake3": "ac511c2c138f657a80d58ceadb3ac748ce6252e3b32ea6686211163556e18594",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-name-case/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "816b94d9dbf074389e146b3eefd0e13cac0869e2e3d36326ae233dd4be664fe1",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-name-other/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-name-other/lie-payload.par2",
+      "size": 1076,
+      "blake3": "c7f1d6df8cdaa4fe48f22d2125d38aecdf2b9ffed7f8140cc5d4d8dc1d4b6785",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-name-other/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "147ca5739c7fdde3acb35bae5ac5d988f463c57a4fee72926621227191879bf7",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-slice-hash/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-slice-hash/lie-payload.par2",
+      "size": 1076,
+      "blake3": "9ec9c904f5dc6c60edc6266eb073432d8969804b0f97e44a0ce92ae5f1b8b423",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-slice-hash/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "ae5d6be5dea95ac41005526bcfd5c12f945c496501bfcf59f3c031c8c998f380",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-slice-size/lie-payload.bin",
+      "size": 2109497,
+      "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-slice-size/lie-payload.par2",
+      "size": 1076,
+      "blake3": "fe63676ce1f6947f4cc56059841ef7a99d70c46688e659ebc6fea5f67d3565c9",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-par2-lie-slice-size/lie-payload.vol0+8.par2",
+      "size": 528812,
+      "blake3": "59d63fa45818bbfcbc06af9537854e19a5f6985cf3ece18848ba74f44eb46777",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-tar-links/links.tar",
+      "size": 5120,
+      "blake3": "db34f1d427144e031e8e4172233871c9213ab07c497e08e343372881d5cea066",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-tar-traversal/traversal.tar",
+      "size": 7168,
+      "blake3": "065cb9c82a95e200d760db518105c0ea21c18050c5f71d0e511f6948cb7e74f3",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-bomb-member/bomb.zip",
+      "size": 260258,
+      "blake3": "c2e5c28b34fc044ed67f2a3c7132255f37c146b3830e2ce0b615c17b30cc56d1",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-bomb-reserve/reserve.zip",
+      "size": 3121488,
+      "blake3": "f7cef60bd57c0e2da788fe0e86009095af90b8d97883b7fe6a433b55fe5a8d8a",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-declared-huge/declared.zip",
+      "size": 159,
+      "blake3": "daaa702f1b3fd8af454b3176d12e904ea772fc89c772e560c08d6a82fd3721cd",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-directory-disagrees/disagree.zip",
+      "size": 165,
+      "blake3": "47153fa1792a698d77d65fb594a516d556c0450ec4450a085e99ea6ea3d729ef",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-duplicate-names/duplicates.zip",
+      "size": 279,
+      "blake3": "a280d663b58ee0586ba91187b5fc3bfd5dc4359525d9e07a3c3e7844e0f730f4",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-entries-over-cap/entries.zip",
+      "size": 243022,
+      "blake3": "8e05b62ee6d15f3c31b28fb6b7958560e347fdee296fae943834bf379c74e281",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-hostile-names/names.zip",
+      "size": 15057,
+      "blake3": "1f573583bbcdf86a19127a0ed83076b23ea7396889d15fdbca34e7f706a45ea1",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-many-members/many.zip",
+      "size": 4860022,
+      "blake3": "7e91562ec261356bf0785915eb6f7affca431d55d095eaa2830648960b3824c2",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-nest-17/nest.zip",
+      "size": 2092,
+      "blake3": "aeeee2315d429c86fa6e98fb22509999883932afbe20d13f3c2100c2a43610c2",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-overlapping-headers/overlap.zip",
+      "size": 219,
+      "blake3": "26ab922194b142ac1b58240e65f0df83985542deb020839806db97c1b47ad8b0",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-traversal/traversal.zip",
+      "size": 1105,
+      "blake3": "265c8f4876399e05fc3b10c29f66845c36586ffdaced06948bcb00f3cdc3c33d",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-truncated-directory/truncated-directory.zip",
+      "size": 144,
+      "blake3": "e4a9c595ca000aabfde90795b71cee07462f7a9c80a3bee87afd2c57848781b7",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zip-truncated-local/truncated-local.zip",
+      "size": 20,
+      "blake3": "5c476b0b94f912e8bdbfec238133fcf911825dc56e4c4c4991be6bdd11536134",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
       "path": "testdata/brotli-single/test-media.mkv.br",
       "size": 5243361,
       "blake3": "14f931cdc49cc6736d9027acf2f29a599c0529c4fd8e9976ebd1fe886a9a1f6f",

@@ -1,0 +1,20 @@
+{
+  "slug": "adv-zip-named-par2",
+  "title": "E2E.Adversarial.Zip.Named.Par2.2026-TESTGRP",
+  "description": "zip-unencrypted's archive posted under a .par2 name. The graph opens it by content and delivers sample.mkv.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "zip-unencrypted/archive.zip::adversarial.par2"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputs": [
+      "sample.mkv"
+    ],
+    "forbiddenOutputs": [
+      "adversarial.par2"
+    ]
+  }
+}

@@ -134,6 +134,13 @@ var ScenarioOnly = map[string]string{
 	"single-mkv-sparse-nzb":                    "stages single-mkv's payload under a sparse NZB numbering",
 	"extensionless-payload-named-by-content":   "stages single-mkv's payload under a name with no extension",
 	"stat-health-probe":                        "stages two direct MKVs; the same articles are deleted from each by the harness",
+	"adv-rar-named-mkv":                        "stages rar5-single's archive under a .mkv name",
+	"adv-7z-named-rar":                         "stages single-7z's archive under a .rar name",
+	"adv-exe-carrying-rar":                     "stages rar5-single's archive under a .exe name",
+	"adv-zip-named-par2":                       "stages zip-unencrypted's archive under a .par2 name",
+	"adv-password-rar5":                        "stages rar5-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"adv-password-7z":                          "stages 7z-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"adv-password-zip":                         "stages zip-encrypted's archive; the lane submits it with no password and with a wrong one",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.
@@ -1581,6 +1588,7 @@ func Recipes() []Recipe {
 	recipes = append(recipes, DirectStoreRecipes()...)
 	recipes = append(recipes, PAR3Recipes()...)
 	recipes = append(recipes, SpeedTestRecipes()...)
+	recipes = append(recipes, AdversarialRecipes()...)
 	return recipes
 }
 

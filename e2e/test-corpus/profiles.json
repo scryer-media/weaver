@@ -224,6 +224,22 @@
         "**/scenario.json"
       ]
     },
+    "adversarial": {
+      "description": "What the adversarial lane seeds: adversarialFixtureSlugs, every scenario carrying an adversarial object, the fixtures they stage as assets, and the cleanup job.",
+      "include": [
+        "testdata/7z-encrypted/archive.7z",
+        "testdata/adv-*/**",
+        "testdata/rar5-encrypted/archive.rar",
+        "testdata/rar5-single/archive.rar",
+        "testdata/single-7z/archive.7z",
+        "testdata/single-mkv/**",
+        "testdata/zip-encrypted/archive.zip",
+        "testdata/zip-unencrypted/archive.zip"
+      ],
+      "exclude": [
+        "**/scenario.json"
+      ]
+    },
     "release-gate": {
       "description": "Everything the release gate can seed: the union of the four seed profiles its phases run. The product-behavior phases declare no fixtures of their own.",
       "include": [
