@@ -391,7 +391,7 @@ pub fn tracker_view(tier: u32, announce: &TrackerAnnounce) -> TorrentTracker {
         seeders: accepted.and_then(|accepted| accepted.seeders),
         leechers: accepted.and_then(|accepted| accepted.leechers),
         downloaded: accepted.and_then(|accepted| accepted.downloaded),
-        peers: accepted.map(|accepted| accepted.peers),
+        peers: accepted.map(|accepted| u32::try_from(accepted.peers.len()).unwrap_or(u32::MAX)),
         fails: u32::from(announce.fails),
         resolved_by: None,
     }
@@ -1089,7 +1089,10 @@ mod tests {
             seeders: Some(3),
             leechers: Some(5),
             downloaded: Some(8),
-            peers: 2,
+            peers: vec![
+                std::net::SocketAddr::from(([10, 0, 0, 1], 6881)),
+                std::net::SocketAddr::from(([10, 0, 0, 2], 6881)),
+            ],
             warning: None,
         }
     }

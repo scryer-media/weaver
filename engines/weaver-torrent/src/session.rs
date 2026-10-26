@@ -1147,29 +1147,36 @@ pub(crate) const fn trackers_only(private: bool, added_trackers_only: bool) -> b
 
 /// Where a magnet's metadata fetch asks for peers. Until its metadata says
 /// whether it is private, it asks its own trackers alone, and goes on to
-/// the DHT and local discovery only once they named no peer.
+/// the DHT and local discovery only once they named no peer that may still
+/// serve it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchPhase {
-    /// Its own trackers, until one names a peer, one answers, or every one
-    /// fails.
+    /// Its own trackers, until one answers or every one fails, and then
+    /// until every peer they named was found unable to serve the metadata.
     Trackers,
-    /// Its trackers, the DHT and local discovery: no tracker named a peer.
+    /// Its trackers, the DHT and local discovery: no tracker named a peer
+    /// that may still serve the metadata.
     Discovery,
-    /// No tracker named a peer, and there is no discovery to go on to.
+    /// No tracker named a peer that may still serve the metadata, and there
+    /// is no discovery to go on to.
     Waiting,
 }
 
 impl FetchPhase {
-    /// The phase of a fetch whose trackers stand at `table`, with discovery
-    /// to go on to or not. The trackers are done without a peer once one
-    /// answered and none named a peer, or once every one failed; a fetch
-    /// with no tracker is done at once.
-    fn of(table: &[TrackerAnnounce], discovery: bool) -> Self {
+    /// The phase of a fetch whose trackers stand at `table`, `unable` being
+    /// the peers the fetch found unable to serve the metadata, with
+    /// discovery to go on to or not. The trackers are done once one
+    /// answered or every one failed, and settled once every peer an answer
+    /// named is unable; a fetch with no tracker is done at once.
+    fn of(table: &[TrackerAnnounce], unable: &HashSet<SocketAddr>, discovery: bool) -> Self {
         let results = || table.iter().map(|t| t.last.as_ref().map(|l| &l.result));
-        let named_peer = results().any(|r| matches!(r, Some(Ok(ok)) if ok.peers > 0));
+        let may_serve = results()
+            .filter_map(|r| r?.as_ref().ok())
+            .flat_map(|ok| &ok.peers)
+            .any(|peer| !unable.contains(peer));
         let done = results().any(|r| matches!(r, Some(Ok(_))))
             || results().all(|r| matches!(r, Some(Err(_))));
-        match (done && !named_peer, discovery) {
+        match (done && !may_serve, discovery) {
             (false, _) => Self::Trackers,
             (true, true) => Self::Discovery,
             (true, false) => Self::Waiting,
@@ -1196,28 +1203,37 @@ pub struct MetadataFetch {
     pub phase: tokio::sync::watch::Receiver<FetchPhase>,
 }
 
-/// Follows a fetch's announce table into `phase`: returns once the fetch
-/// goes on to discovery, and never while it does not.
+/// Follows a fetch's announce table, and the peers it found unable, into
+/// `phase`: returns once the fetch goes on to discovery, and never while it
+/// does not.
 async fn follow_fetch(
     mut table: Option<tokio::sync::watch::Receiver<Vec<TrackerAnnounce>>>,
+    mut unable: tokio::sync::watch::Receiver<HashSet<SocketAddr>>,
     discovery: bool,
     phase: tokio::sync::watch::Sender<FetchPhase>,
 ) {
     loop {
-        let now = match &mut table {
-            Some(table) => FetchPhase::of(&table.borrow_and_update(), discovery),
-            None => FetchPhase::of(&[], discovery),
+        let now = {
+            let unable = unable.borrow_and_update();
+            match &mut table {
+                Some(table) => FetchPhase::of(&table.borrow_and_update(), &unable, discovery),
+                None => FetchPhase::of(&[], &unable, discovery),
+            }
         };
         phase.send_if_modified(|was| std::mem::replace(was, now) != now);
         if now == FetchPhase::Discovery {
             return;
         }
-        let moved = match &mut table {
-            Some(table) => table.changed().await.is_ok(),
-            None => false,
+        let table_moved = async {
+            match &mut table {
+                Some(table) => table.changed().await.map_err(drop),
+                None => Err(()),
+            }
         };
-        if !moved {
-            std::future::pending::<()>().await;
+        tokio::select! {
+            Ok(()) = table_moved => {}
+            Ok(()) = unable.changed() => {}
+            else => std::future::pending::<()>().await,
         }
     }
 }
@@ -2490,11 +2506,13 @@ impl Session {
                 });
                 let fetched = handover.as_ref().map(TrackerHandover::task);
                 let table = fetched.as_ref().map(|task| task.status.clone());
+                let (unable_tx, unable) = tokio::sync::watch::channel(HashSet::new());
                 let (phase_tx, phase) = tokio::sync::watch::channel(FetchPhase::of(
                     &table
                         .as_ref()
                         .map(TrackerStatus::announces)
                         .unwrap_or_default(),
+                    &unable.borrow(),
                     discovery,
                 ));
                 if let Some(tx) = opts.metadata_fetch.take() {
@@ -2506,12 +2524,13 @@ impl Session {
                 let asked_first =
                     make_peer_rx(info_hashes, &identity, true, fetched).map(|source| source.peers);
                 // The DHT and local discovery, once the trackers named no
-                // peer.
+                // peer that may still serve the metadata.
                 let then = {
                     let session = self.clone();
                     let dht_announce = dht_announce.subscribe();
                     async move {
-                        follow_fetch(table.map(|t| t.subscribe()), discovery, phase_tx).await;
+                        follow_fetch(table.map(|t| t.subscribe()), unable, discovery, phase_tx)
+                            .await;
                         session
                             .discovery_peers(info_hashes, false, dht_announce, None)
                             .unwrap_or_else(|| futures::stream::empty().boxed())
@@ -2529,6 +2548,7 @@ impl Session {
                         &identity,
                         peers,
                         peer_list,
+                        &unable_tx,
                         &tracker_tiers,
                         opts.peer_opts,
                     )
@@ -3236,6 +3256,7 @@ impl Session {
         identity: &Identity,
         peer_rx: PeerStream,
         peer_list: PeerList,
+        unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
         tracker_tiers: &[Vec<Tracker>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
@@ -3244,6 +3265,7 @@ impl Session {
             info_hashes,
             peer_list,
             peer_rx,
+            unable,
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             identity.version.clone(),
@@ -5292,11 +5314,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fetch_goes_on_from_its_trackers_once_they_named_no_peer() {
+    fn a_fetch_goes_on_from_its_trackers_once_they_named_no_peer_that_may_serve() {
         use super::FetchPhase::{self, Discovery, Trackers, Waiting};
         use crate::{AnnounceError, AnnounceErrorKind, AnnounceOk, LastAnnounce, TrackerAnnounce};
 
-        let answered = |peers| TrackerAnnounce {
+        let peer = |port| std::net::SocketAddr::from(([10, 0, 0, 1], port));
+        let answered = |ports: &[u16]| TrackerAnnounce {
             last: Some(LastAnnounce {
                 at: std::time::SystemTime::UNIX_EPOCH,
                 result: Ok(AnnounceOk {
@@ -5305,7 +5328,7 @@ mod tests {
                     seeders: None,
                     leechers: None,
                     downloaded: None,
-                    peers,
+                    peers: ports.iter().copied().map(peer).collect(),
                     warning: None,
                 }),
             }),
@@ -5323,22 +5346,54 @@ mod tests {
         };
         let unasked = TrackerAnnounce::default;
 
-        for (table, discovery, phase) in [
-            (vec![], true, Discovery),
-            (vec![], false, Waiting),
-            (vec![unasked()], true, Trackers),
-            (vec![failed(), unasked()], true, Trackers),
-            (vec![failed(), failed()], true, Discovery),
-            (vec![failed(), failed()], false, Waiting),
-            (vec![answered(0)], true, Discovery),
-            (vec![answered(0), unasked()], false, Waiting),
-            (vec![answered(1)], true, Trackers),
-            (vec![failed(), answered(2)], false, Trackers),
+        let none = std::collections::HashSet::new;
+        let unable = |ports: &[u16]| {
+            ports
+                .iter()
+                .copied()
+                .map(peer)
+                .collect::<std::collections::HashSet<_>>()
+        };
+        for (table, unable, discovery, phase) in [
+            (vec![], none(), true, Discovery),
+            (vec![], none(), false, Waiting),
+            (vec![unasked()], none(), true, Trackers),
+            (vec![failed(), unasked()], none(), true, Trackers),
+            (vec![failed(), failed()], none(), true, Discovery),
+            (vec![failed(), failed()], none(), false, Waiting),
+            (vec![answered(&[])], none(), true, Discovery),
+            (vec![answered(&[]), unasked()], none(), false, Waiting),
+            (vec![answered(&[1])], none(), true, Trackers),
+            (vec![failed(), answered(&[1, 2])], none(), false, Trackers),
+            // Every peer the answers named was found unable: settled.
+            (vec![answered(&[1])], unable(&[1]), true, Discovery),
+            (
+                vec![answered(&[1]), unasked()],
+                unable(&[1]),
+                false,
+                Waiting,
+            ),
+            (
+                vec![answered(&[1]), answered(&[2])],
+                unable(&[1, 2]),
+                true,
+                Discovery,
+            ),
+            // One named peer may still serve it.
+            (vec![answered(&[1, 2])], unable(&[1]), true, Trackers),
+            (
+                vec![answered(&[1]), answered(&[2])],
+                unable(&[1]),
+                true,
+                Trackers,
+            ),
+            // A peer found unable that no answer named settles nothing.
+            (vec![unasked()], unable(&[1]), true, Trackers),
         ] {
             assert_eq!(
-                FetchPhase::of(&table, discovery),
+                FetchPhase::of(&table, &unable, discovery),
                 phase,
-                "{table:?}, discovery {discovery}"
+                "{table:?}, unable {unable:?}, discovery {discovery}"
             );
         }
     }

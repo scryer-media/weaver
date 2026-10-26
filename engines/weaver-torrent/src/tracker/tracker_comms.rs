@@ -804,7 +804,7 @@ pub struct AnnounceOk {
     /// Downloads the tracker has seen finish (`downloaded`, or a scrape's).
     pub downloaded: Option<u32>,
     /// Peers the answer named.
-    pub peers: u32,
+    pub peers: Vec<SocketAddr>,
     /// The tracker's `warning message` (libtorrent `announce_entry::message`).
     pub warning: Option<String>,
 }
@@ -1928,7 +1928,7 @@ impl TrackerComms {
                     seeders: announced.seeders,
                     leechers: announced.leechers,
                     downloaded: announced.downloaded,
-                    peers: u32::try_from(announced.peers.len()).unwrap_or(u32::MAX),
+                    peers: announced.peers.clone(),
                     warning: announced.warning,
                 };
                 (Ok(ok), announced.peers)
@@ -3383,7 +3383,7 @@ mod tests {
 
     /// An announce asks for 200 peers, compact; an answer naming many of
     /// both families hands every one on, in the order named, and the
-    /// tracker's row counts them all with the swarm it gave.
+    /// tracker's row names them all with the swarm it gave.
     #[tokio::test]
     async fn an_answer_hands_on_every_peer_it_names_of_both_families() {
         let (listener, url) = http_listener().await;
@@ -3441,7 +3441,7 @@ mod tests {
                 seeders: Some(7),
                 leechers: Some(12),
                 downloaded: None,
-                peers: 160,
+                peers: expected,
                 warning: None,
             })
         );
@@ -3590,7 +3590,7 @@ mod tests {
                 seeders: Some(3),
                 leechers: Some(5),
                 downloaded: None,
-                peers: 0,
+                peers: Vec::new(),
                 warning: None,
             })
         );
@@ -4585,7 +4585,7 @@ mod tests {
                 seeders: Some(3),
                 leechers: Some(5),
                 downloaded: None,
-                peers: 0,
+                peers: Vec::new(),
                 warning: None,
             })
         );

@@ -48,6 +48,7 @@ pub async fn read_metainfo_from_peer_receiver<
     info_hashes: InfoHashes,
     peers: PeerList,
     addrs_stream: A,
+    unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
@@ -84,7 +85,7 @@ pub async fn read_metainfo_from_peer_receiver<
         }
     };
 
-    match first_answer(peers, addrs_stream, read_info_guarded).await {
+    match first_answer(peers, addrs_stream, unable, read_info_guarded).await {
         (Some((info, info_bytes)), rx, seen, peers) => ReadMetainfoResult::Found {
             info,
             info_bytes,
@@ -105,11 +106,13 @@ pub async fn read_metainfo_from_peer_receiver<
 /// a connection that failed: it is asked again when the list's reconnect
 /// time for it comes, until it has failed too often, and sooner when a
 /// tracker names it again (`peer_list`). `ask` is handed the list, so the
-/// connection keeps the peer's memory there. None once the stream has ended
-/// and no peer is left to ask.
+/// connection keeps the peer's memory there. Each peer that did not answer,
+/// or that the list did not take, joins `unable`. None once the stream has
+/// ended and no peer is left to ask.
 async fn first_answer<A, T, F, Fut>(
     list: PeerList,
     mut addrs: A,
+    unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
     ask: F,
 ) -> (Option<T>, A, HashSet<SocketAddr>, PeerList)
 where
@@ -124,9 +127,13 @@ where
             .allowing_multiple_connections_per_ip(true),
     );
     let mut seen = HashSet::<SocketAddr>::new();
+    let found_unable = |addr| unable.send_if_modified(|unable| unable.insert(addr));
     let mut name = |addr, source| {
         seen.insert(addr);
         peers.add_peer(addr, source);
+        if peers.with_peer(addr, |_| ()).is_none() {
+            found_unable(addr);
+        }
     };
 
     let mut asking = FuturesUnordered::new();
@@ -151,6 +158,7 @@ where
                     peers.with_peer_mut(addr, "metadata_failed", |peer| {
                         peers.connection_closed(peer, Instant::now(), true, false)
                     });
+                    found_unable(addr);
                 }
             },
             next_addr = addrs.next(), if !addrs_completed => match next_addr {
@@ -218,6 +226,11 @@ mod tests {
         SocketAddr::from(([10, 0, 0, 1], port))
     }
 
+    /// Where a fetch records the peers it found unable.
+    fn unable() -> tokio::sync::watch::Sender<HashSet<SocketAddr>> {
+        tokio::sync::watch::Sender::new(HashSet::new())
+    }
+
     /// A list with `addrs` on it, as a torrent is added with.
     fn listing(addrs: impl IntoIterator<Item = SocketAddr>) -> PeerList {
         PeerList::resumed(addrs, [])
@@ -226,8 +239,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_peer_that_sent_no_metadata_is_asked_again_once_its_reconnect_time_comes() {
         let (asked, ask) = asker(1);
-        let (found, _, _, _) =
-            first_answer(listing([addr(1)]), futures::stream::pending(), ask).await;
+        let (found, _, _, _) = first_answer(
+            listing([addr(1)]),
+            futures::stream::pending(),
+            &unable(),
+            ask,
+        )
+        .await;
 
         assert_eq!(found, Some(addr(1)));
         let asked = asked.lock().unwrap();
@@ -237,11 +255,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_peer_that_sent_no_metadata_or_was_refused_by_the_list_is_found_unable() {
+        let (_, ask) = asker(1);
+        let banned = SocketAddr::from(([10, 0, 0, 9], 1));
+        let unable = unable();
+        let mut found_unable = unable.subscribe();
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        tx.unbounded_send((banned, PeerSourceFlag::Tracker))
+            .unwrap();
+        let list = PeerList::resumed([addr(1)], [banned.ip()]);
+        let (found, _, _, _) = first_answer(list, rx, &unable, ask).await;
+
+        assert_eq!(found, Some(addr(1)));
+        assert_eq!(
+            *found_unable.borrow_and_update(),
+            HashSet::from([banned, addr(1)])
+        );
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_peer_named_while_another_failed_is_asked_at_once() {
         let (asked, ask) = asker(1);
         let (tx, rx) = futures::channel::mpsc::unbounded();
         tx.unbounded_send((addr(2), PeerSourceFlag::Dht)).unwrap();
-        let (found, _, seen, _) = first_answer(listing([addr(1)]), rx, ask).await;
+        let (found, _, seen, _) = first_answer(listing([addr(1)]), rx, &unable(), ask).await;
 
         assert_eq!(seen, HashSet::from([addr(2)]));
         let asked = asked.lock().unwrap();
@@ -261,8 +299,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_metadata_once_every_peer_failed_too_often_and_no_more_are_named() {
         let (asked, ask) = asker(usize::MAX);
-        let (found, _, _, _) =
-            first_answer(listing([addr(1), addr(2)]), futures::stream::empty(), ask).await;
+        let (found, _, _, _) = first_answer(
+            listing([addr(1), addr(2)]),
+            futures::stream::empty(),
+            &unable(),
+            ask,
+        )
+        .await;
 
         assert_eq!(found, None);
         let asked = asked.lock().unwrap();
@@ -290,8 +333,13 @@ mod tests {
                 std::future::pending().await
             }
         };
-        let (found, _, _, list) =
-            first_answer(listing([answers, asking]), futures::stream::pending(), ask).await;
+        let (found, _, _, list) = first_answer(
+            listing([answers, asking]),
+            futures::stream::pending(),
+            &unable(),
+            ask,
+        )
+        .await;
         assert_eq!(found, Some(answers));
 
         let next = PeerStates::founded_on(list, Default::default(), 0);
@@ -322,6 +370,7 @@ mod tests {
             },
             PeerList::default(),
             peer_rx,
+            &unable(),
             None,
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
             crate::client_name_and_version().to_owned(),

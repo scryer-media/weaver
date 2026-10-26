@@ -428,6 +428,7 @@ async fn two_peers_send_the_metadata_between_them() {
         hashes,
         PeerList::resumed([addr(1), addr(2)], []),
         futures::stream::pending(),
+        &tokio::sync::watch::Sender::new(Default::default()),
         None,
         connector,
         "test".to_owned(),
@@ -480,11 +481,13 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
         peer.send_piece(&metadata, piece).await;
         peer
     };
+    let unable = tokio::sync::watch::Sender::new(Default::default());
     let fetch = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
         hashes,
         PeerList::resumed([addr(1)], []),
         futures::stream::pending(),
+        &unable,
         None,
         connector.clone(),
         "test".to_owned(),
