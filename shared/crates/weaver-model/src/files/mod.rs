@@ -3,10 +3,12 @@
 
 mod archive_name;
 mod classify;
+mod ext;
 mod sanitize;
 
 pub use archive_name::archive_base_name;
 pub use classify::FileRole;
+pub use ext::{FileExt, file_ext, is_executable_name};
 pub(crate) use sanitize::role_filename_view;
 pub use sanitize::{
     DOWNLOAD_FILENAME_MAX_BYTES, allocate_unique_download_filename,
