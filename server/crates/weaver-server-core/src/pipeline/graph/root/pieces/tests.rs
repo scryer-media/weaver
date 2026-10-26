@@ -1016,3 +1016,60 @@ fn pieces_before_a_files_front_restore_from_its_file() {
     assert!(job.have().all());
     assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), bytes);
 }
+
+// A torrent fetched out of order restores with every piece its checkpoint
+// holds, and nothing the files hold past it: a piece that verified after
+// the checkpoint was written waits to be fetched again, and is not missing
+// from disk, since its file reaches it. The restore reads back only the
+// front a file no object reads, whatever the pieces.
+#[test]
+fn a_restore_holds_the_checkpoints_pieces_and_none_verified_after_it() {
+    let layout = Arc::new(PieceLayout::new(PIECE, vec![file("a.bin", PIECE * 64)]).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = torrent_job(&layout, dir.path());
+    let bytes = torrent_bytes(&layout);
+    // Every other piece, so each is a run of its own.
+    let scattered: Vec<u32> = (0..64).step_by(2).collect();
+    for &piece in &scattered[..24] {
+        job.verified(
+            shares_of(&layout, &bytes, piece),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
+    for &piece in &scattered[24..] {
+        job.verified(
+            shares_of(&layout, &bytes, piece),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    assert_eq!(job.have().count_ones(), 32);
+
+    let restored =
+        GraphJob::restore_torrent(&snapshot, Arc::clone(&layout), 1, storage(dir.path()), 1)
+            .unwrap();
+    assert!(restored.refetched.is_empty());
+    assert_eq!(
+        restored.job.have().iter_ones().collect::<Vec<_>>(),
+        scattered[..24]
+            .iter()
+            .map(|&piece| piece as usize)
+            .collect::<Vec<_>>()
+    );
+    assert!(restored.read <= FIRST_BYTES as u64);
+    assert_eq!(
+        restored
+            .job
+            .namespace()
+            .get(MemberId(0))
+            .unwrap()
+            .coverage
+            .runs()
+            .count(),
+        24
+    );
+}

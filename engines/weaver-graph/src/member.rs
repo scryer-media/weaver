@@ -90,7 +90,7 @@ impl Coverage {
             return true;
         }
         let mut cursor = range.start;
-        for run in self.runs.range(..range.end).map(|(_, run)| run) {
+        for run in self.near(range) {
             if run.range.end <= cursor {
                 continue;
             }
@@ -132,9 +132,24 @@ impl Coverage {
     }
 
     pub fn overlapping(&self, range: ByteRange) -> impl Iterator<Item = &Run> {
-        self.runs
-            .values()
+        self.near(range)
             .filter(move |run| run.range.intersect(range).is_some())
+    }
+
+    // The runs that can meet `range`, in offset order: the one it starts
+    // inside, if any, and those that start before it ends. Runs are disjoint
+    // and keyed by their start, so no earlier run reaches it, and a lookup
+    // costs the runs it meets, not every run before it.
+    fn near(&self, range: ByteRange) -> impl Iterator<Item = &Run> {
+        let from = self
+            .runs
+            .range(..=range.start)
+            .next_back()
+            .filter(|(_, run)| run.range.end > range.start)
+            .map_or(range.start, |(start, _)| *start);
+        self.runs
+            .range(from..range.end.max(from))
+            .map(|(_, run)| run)
     }
 
     // Record that `range` arrived with `provenance`, replacing any earlier
@@ -174,9 +189,8 @@ impl Coverage {
     // Remove `range` from every run it overlaps, keeping the parts outside it.
     fn cut(&mut self, range: ByteRange) {
         let touched: Vec<Run> = self
-            .runs
-            .range(..range.end)
-            .map(|(_, run)| *run)
+            .near(range)
+            .copied()
             .filter(|run| run.range.end > range.start)
             .collect();
         for run in touched {
@@ -764,6 +778,37 @@ mod tests {
         );
         let (_, taken) = namespace.arrive(member, ByteRange::new(5, 25), Provenance::Fresh);
         assert_eq!(taken, vec![ByteRange::new(5, 25)]);
+    }
+
+    // A lookup meets only the runs that can touch its range, however many
+    // runs come before it: the one it starts inside, and those starting
+    // before it ends. A member fetched out of order has thousands of runs,
+    // and a restore looks each of them up.
+    #[test]
+    fn a_lookup_meets_only_the_runs_near_its_range() {
+        let mut coverage = Coverage::new();
+        for run in 0..10_000u64 {
+            coverage.write(ByteRange::new(run * 10, run * 10 + 5), Provenance::Fresh);
+        }
+        let met = |range: ByteRange| {
+            coverage
+                .near(range)
+                .map(|run| (run.range.start, run.range.end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(met(ByteRange::new(50_002, 50_004)), vec![(50_000, 50_005)]);
+        assert_eq!(met(ByteRange::new(50_007, 50_009)), Vec::new());
+        assert_eq!(
+            met(ByteRange::new(50_003, 50_012)),
+            vec![(50_000, 50_005), (50_010, 50_015)]
+        );
+        assert_eq!(met(ByteRange::new(50_005, 50_010)), Vec::new());
+        assert!(coverage.covered(ByteRange::new(99_990, 99_995)));
+        assert!(!coverage.covered(ByteRange::new(99_990, 99_996)));
+        assert_eq!(coverage.overlapping(ByteRange::new(4, 11)).count(), 2);
+        coverage.erase(ByteRange::new(99_992, 99_993));
+        assert_eq!(coverage.runs().count(), 10_001);
+        assert!(!coverage.covered(ByteRange::new(99_990, 99_995)));
     }
 
     #[test]
