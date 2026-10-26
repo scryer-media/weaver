@@ -1,0 +1,12 @@
+{
+  "slug": "zip-cp437-empty-dirs",
+  "title": "E2E.Test.ZIP.CP437.Empty.Dirs.2026.1080p-TESTGRP",
+  "description": "A deflated zip with four directory records, two of them empty, one name recorded in code page 437 and one valid UTF-8 name, both with the UTF-8 flag off. Every name decodes as the entry declares it and the directories are delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "Extras/Café.txt": "6c781e9d50fa735c3d716562c32278df230c9ee0e234f5258cd6e3a756a215ab",
+    "Feature.mkv": "0442377c94a6107cc036e4ddf734b5b64663210ea1052d34edeab9db77f71c94",
+    "Subs/Ñandú.srt": "4a51b5d6fe82c4b6d738322367925a11b17e84c65d2c9bb726ea62c1e6c31dc2"
+  }
+}

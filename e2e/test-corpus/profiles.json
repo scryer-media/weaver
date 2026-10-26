@@ -166,6 +166,8 @@
         "testdata/uu-preamble-tail/**",
         "testdata/uu-release/**",
         "testdata/zip-corrupted/**",
+        "testdata/zip-cp437-empty-dirs/**",
+        "testdata/zip-deflate-lost-article/**",
         "testdata/zip-encrypted/**",
         "testdata/zip-unencrypted/**",
         "testdata/xz-text/**",
@@ -213,12 +215,14 @@
       "description": "What the restart suite seeds: restartFixtureSlugs.",
       "include": [
         "testdata/direct-store-par2-alias-restart/**",
+        "testdata/direct-store-rar4-encrypted/**",
         "testdata/direct-unpack-repair-unvouched/**",
         "testdata/par2-heavy-damage/**",
         "testdata/par2-heavy-damage-a/**",
         "testdata/par2-small-repair/**",
         "testdata/rar5-multi-member/**",
-        "testdata/single-mkv/**"
+        "testdata/single-mkv/**",
+        "testdata/zip-cp437-empty-dirs/**"
       ],
       "exclude": [
         "**/scenario.json"
@@ -391,6 +395,8 @@
         "testdata/uu-preamble-tail/**",
         "testdata/uu-release/**",
         "testdata/zip-corrupted/**",
+        "testdata/zip-cp437-empty-dirs/**",
+        "testdata/zip-deflate-lost-article/**",
         "testdata/zip-encrypted/**",
         "testdata/zip-unencrypted/**",
         "testdata/xz-text/**",
