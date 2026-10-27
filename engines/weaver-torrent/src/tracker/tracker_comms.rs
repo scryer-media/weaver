@@ -56,9 +56,10 @@ pub struct TrackerComms {
     udp_client: UdpTrackerClient,
     // The trackers under this hash and what announcing to them has done.
     list: Mutex<TrackerList>,
-    // The `tracker id` each HTTP tracker last gave, sent back on every later
-    // announce to it.
-    tracker_ids: Mutex<HashMap<Url, Vec<u8>>>,
+    // The corrupt and redundant bytes the torrent had counted when each
+    // HTTP tracker was last sent `started`: its announces report what grew
+    // since.
+    started_at: Mutex<HashMap<Url, (u64, u64)>>,
     status: TrackerStatus,
     // Wakes the announce loop when the list changed under it: trackers
     // replaced or an announce forced.
@@ -79,9 +80,9 @@ pub enum TrackerCommsStatsState {
     Live,
 }
 
-/// The counters an announce reports (BEP 3), all for the current run: the
-/// tracker task of a run sends `started` first, so "since `started`" and
-/// "during this run" are the same span.
+/// What an announce reports of the torrent (BEP 3). Its corrupt and
+/// redundant bytes are the torrent's own counts: an HTTP announce reports
+/// what they grew by since that tracker last heard `started`.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TrackerCommsStats {
     /// Payload bytes sent to peers during this run.
@@ -90,12 +91,10 @@ pub struct TrackerCommsStats {
     /// check. Pieces the torrent already had when the run began are not
     /// counted, and neither is a piece that failed its check.
     pub downloaded_bytes: u64,
-    /// Bytes of the pieces downloaded during this run that failed their
-    /// hash check (libtorrent `torrent::m_total_failed_bytes`).
+    /// Bytes of the pieces downloaded that failed their hash check.
     pub corrupt_bytes: u64,
-    /// Bytes of the blocks received during this run and not used: a copy
-    /// of a block already had, or one no longer asked of the peer
-    /// (libtorrent `torrent::m_total_redundant_bytes`).
+    /// Bytes of the blocks received and not used: a copy of a block already
+    /// had, or one no longer asked of the peer.
     pub redundant_bytes: u64,
     /// Bytes of the whole torrent not yet had, whichever files are selected,
     /// so 0 only for a seed. None while the torrent's size is unknown (a
@@ -108,6 +107,9 @@ pub struct TrackerCommsStats {
     /// seed when it started never sends it, and neither does one that has
     /// only its selected files.
     pub completed_during_run: bool,
+    /// The encryption the torrent's peer connections are made under, which
+    /// an HTTP announce tells the tracker.
+    pub encryption: crate::EncryptionPolicy,
 }
 
 impl TrackerCommsStats {
@@ -1716,7 +1718,7 @@ impl TrackerComms {
                     reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
                     list: Mutex::new(TrackerList::new(&tiers, Instant::now())),
-                    tracker_ids: Default::default(),
+                    started_at: Default::default(),
                     status: status.clone(),
                     poke: tokio::sync::Notify::new(),
                     stopped: stopped.clone(),
@@ -1789,7 +1791,7 @@ impl TrackerComms {
             reachable: self.reachable.clone(),
             udp_client: self.udp_client.clone(),
             list: Mutex::new(TrackerList::new(tiers, Instant::now())),
-            tracker_ids: Default::default(),
+            started_at: Default::default(),
             status: self.status.clone(),
             poke: tokio::sync::Notify::new(),
             stopped: self.stopped.clone(),
@@ -2003,6 +2005,27 @@ impl TrackerComms {
         .map_err(without_url)
     }
 
+    /// The corrupt and redundant bytes counted since `tracker` last heard
+    /// `started`; an announce that is `started` begins the count again. A
+    /// tracker that heard no `started` from this run hears none counted.
+    fn since_started(
+        &self,
+        tracker: &Url,
+        event: Option<TrackerRequestEvent>,
+        stats: &TrackerCommsStats,
+    ) -> (u64, u64) {
+        let now = (stats.corrupt_bytes, stats.redundant_bytes);
+        let mut started_at = self.started_at.lock();
+        if event == Some(TrackerRequestEvent::Started) {
+            started_at.insert(tracker.clone(), now);
+        }
+        let (corrupt, redundant) = started_at.get(tracker).copied().unwrap_or(now);
+        (
+            now.0.saturating_sub(corrupt),
+            now.1.saturating_sub(redundant),
+        )
+    }
+
     async fn announce_http(
         &self,
         tracker: &SupportedTracker,
@@ -2010,7 +2033,8 @@ impl TrackerComms {
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
         let tracker_url = &tracker.url;
-        let trackerid = self.tracker_ids.lock().get(tracker_url).cloned();
+        let trackerid = self.identity.tracker_ids.get(tracker_url);
+        let (corrupt, redundant) = self.since_started(tracker_url, event, stats);
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
@@ -2018,14 +2042,15 @@ impl TrackerComms {
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
             left: stats.announced_left(),
-            corrupt: stats.corrupt_bytes,
-            redundant: stats.redundant_bytes,
+            corrupt,
+            redundant,
             compact: true,
             no_peer_id: false,
             event,
             numwant: numwant(event),
             key: Some(self.identity.tracker_key),
             trackerid: trackerid.as_deref(),
+            encryption: stats.encryption,
         };
 
         let answer = tracker_comms_http::get(
@@ -2041,9 +2066,7 @@ impl TrackerComms {
         .await?;
         let response = read_answer(&answer.body)?;
         if let Some(id) = &response.tracker_id {
-            self.tracker_ids
-                .lock()
-                .insert(tracker_url.clone(), id.as_ref().to_vec());
+            self.identity.tracker_ids.set(tracker_url, id.as_ref());
         }
 
         Ok(Announced {
@@ -2374,6 +2397,7 @@ mod tests {
             left_bytes: Some(left),
             torrent_state: TrackerCommsStatsState::Live,
             completed_during_run,
+            encryption: crate::EncryptionPolicy::Disabled,
         }
     }
 
@@ -3005,6 +3029,7 @@ mod tests {
             tracker_key: 0x5eed,
             version: "Test 1.0".into(),
             user_agent: "Test/1.0".into(),
+            tracker_ids: Default::default(),
         }
     }
 
@@ -3102,11 +3127,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_http_announce_reports_the_bytes_that_failed_their_hash_and_the_bytes_we_did_not_need()
+    async fn an_http_announce_reports_the_bytes_that_failed_their_hash_and_the_bytes_we_did_not_need_since_started()
      {
-        // libtorrent torrent::build_tracker_request sends
-        // m_total_failed_bytes as `corrupt` and m_total_redundant_bytes as
-        // `redundant`, read per announce (http_tracker_connection::start).
+        // The torrent had already counted some of each when the run began:
+        // `started` reports none, and a later announce what grew since.
         let (listener, url) = http_listener().await;
         let stats = Arc::new(ManualStats {
             stats: Mutex::new(TrackerCommsStats {
@@ -3140,8 +3164,9 @@ mod tests {
             _ = peers.next() => panic!("the tracker sent no peers"),
             q = next_announce(&listener) => q,
         };
-        assert_eq!(query_param(&first, "corrupt"), Some("16384"));
-        assert_eq!(query_param(&first, "redundant"), Some("5"));
+        assert_eq!(query_param(&first, "event"), Some("started"));
+        assert_eq!(query_param(&first, "corrupt"), Some("0"));
+        assert_eq!(query_param(&first, "redundant"), Some("0"));
         *stats.stats.lock() = TrackerCommsStats {
             corrupt_bytes: 32768,
             redundant_bytes: 21,
@@ -3152,8 +3177,8 @@ mod tests {
             _ = peers.next() => panic!("the tracker sent no peers"),
             q = next_announce(&listener) => q,
         };
-        assert_eq!(query_param(&second, "corrupt"), Some("32768"));
-        assert_eq!(query_param(&second, "redundant"), Some("21"));
+        assert_eq!(query_param(&second, "corrupt"), Some("16384"));
+        assert_eq!(query_param(&second, "redundant"), Some("16"));
         drop(peers);
         token.cancel();
     }

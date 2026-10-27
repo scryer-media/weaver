@@ -1247,7 +1247,7 @@ async fn test_a_fetch_with_no_tracker_and_no_discovery_waits() -> anyhow::Result
 
 /// `torrent` marked private (BEP 27): its info dictionary, the last key of
 /// the metainfo, ends with `pieces`, which `private` sorts after.
-fn made_private(torrent: &[u8]) -> anyhow::Result<bytes::Bytes> {
+pub(crate) fn made_private(torrent: &[u8]) -> anyhow::Result<bytes::Bytes> {
     let body = torrent
         .strip_suffix(b"ee")
         .context("the info dictionary closes the metainfo")?;
@@ -1374,5 +1374,147 @@ async fn test_a_private_torrent_found_on_the_dht_takes_peers_from_its_trackers_a
     assert!(handle.takes_peers_from_trackers_only());
     server.abort();
     session.cancellation_token().cancel();
+    Ok(())
+}
+
+// An announce tells the tracker the encryption the torrent's connections
+// are made under: on a session that prefers it, a torrent that takes the
+// session's policy says `supportcrypto`, one that requires it says
+// `requirecrypto` too, and one that never encrypts says neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_an_announce_says_the_encryption_the_torrent_connects_under() -> anyhow::Result<()> {
+    use crate::{EncryptionPolicy, PeerConnectionOptions};
+    setup_test_logging();
+    let out = TempDir::with_prefix("test_announce_crypto_out")?;
+    let session = Session::new_with_opts(
+        out.path().into(),
+        SessionOptions {
+            encryption: EncryptionPolicy::Prefer,
+            ..tracker_session_opts()?
+        },
+    )
+    .await?;
+    for (name, policy, support, require) in [
+        ("announce_crypto_session", None, Some("1"), None),
+        (
+            "announce_crypto_require",
+            Some(EncryptionPolicy::Require),
+            Some("1"),
+            Some("1"),
+        ),
+        (
+            "announce_crypto_disabled",
+            Some(EncryptionPolicy::Disabled),
+            None,
+            None,
+        ),
+    ] {
+        let t = TestTorrent::new(name, 4096, 1024).await?;
+        let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = format!("http://{}/announce", tracker.local_addr()?);
+        session
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    trackers: Some(vec![url]),
+                    peer_opts: Some(PeerConnectionOptions {
+                        encryption: policy,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        let (conn, query) = read_announce_query(&tracker).await?;
+        assert_eq!(param(&query, "event"), Some("started"), "{name}");
+        assert_eq!(param(&query, "supportcrypto"), support, "{name}");
+        assert_eq!(param(&query, "requirecrypto"), require, "{name}");
+        respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    }
+    session.cancellation_token().cancel();
+    Ok(())
+}
+
+// The `tracker id` a tracker gave is the torrent's to send back for as long
+// as its identity is kept: the `started` of a resumed run carries it, and so
+// does the `started` of the torrent added to another session under the same
+// identity, as a session reopening adds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_tracker_id_outlives_the_run_and_the_session() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_tracker_id_kept", 4096, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let add = || {
+        Some(AddTorrentOptions {
+            storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+            trackers: Some(vec![url.clone()]),
+            paused: true,
+            ..Default::default()
+        })
+    };
+    let out = TempDir::with_prefix("test_tracker_id_kept_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(AddTorrent::from_bytes(t.torrent.clone()), add())
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    handle.wait_until_initialized().await?;
+
+    session.unpause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "trackerid"), None);
+    respond(conn, "d8:intervali1800e5:peers0:10:tracker id3:t-1e").await?;
+    let status = handle.tracker_status().context("a live run has a table")?;
+    status.subscribe().wait_for(|a| a[0].last.is_some()).await?;
+
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "trackerid"), Some("t-1"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    status.subscribe().wait_for(|a| !a[0].in_flight).await?;
+
+    // A resumed run: a new tracker task.
+    session.unpause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "trackerid"), Some("t-1"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    let status = handle.tracker_status().context("a live run has a table")?;
+    status
+        .subscribe()
+        .wait_for(|a| a[0].last.is_some() && !a[0].in_flight)
+        .await?;
+    let identity = handle.shared().identity();
+    session.pause(&handle).await?;
+    let (conn, _) = read_announce_query(&tracker).await?;
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    status.subscribe().wait_for(|a| !a[0].in_flight).await?;
+
+    // Another session, the torrent added under the identity it had.
+    let out2 = TempDir::with_prefix("test_tracker_id_kept_out2")?;
+    let reopened = Session::new_with_opts(out2.path().into(), tracker_session_opts()?).await?;
+    let again = reopened
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                identity: Some(identity),
+                paused: false,
+                ..add().unwrap()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "trackerid"), Some("t-1"));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    let status = again.tracker_status().context("a live run has a table")?;
+    status.subscribe().wait_for(|a| a[0].last.is_some()).await?;
     Ok(())
 }

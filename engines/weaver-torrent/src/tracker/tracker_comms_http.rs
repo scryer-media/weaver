@@ -5,6 +5,7 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+use crate::EncryptionPolicy;
 use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
 use crate::core::net::{HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public};
@@ -54,6 +55,10 @@ pub struct TrackerRequest<'a> {
     pub key: Option<u32>,
     /// The `tracker id` this tracker gave in an earlier answer.
     pub trackerid: Option<&'a [u8]>,
+    /// The encryption our connections are made under: a policy that
+    /// encrypts says `supportcrypto`, and one that only encrypts says
+    /// `requirecrypto` too.
+    pub encryption: EncryptionPolicy,
 }
 
 #[derive(Deserialize, Debug)]
@@ -290,6 +295,11 @@ impl TrackerRequest<'_> {
         write!(s, "&compact={}", if self.compact { 1 } else { 0 }).unwrap();
         write!(s, "&no_peer_id={}", if self.no_peer_id { 1 } else { 0 }).unwrap();
         write!(s, "&numwant={}", self.numwant).unwrap();
+        match self.encryption {
+            EncryptionPolicy::Disabled => {}
+            EncryptionPolicy::Prefer => s.push_str("&supportcrypto=1"),
+            EncryptionPolicy::Require => s.push_str("&supportcrypto=1&requirecrypto=1"),
+        }
         if let Some(key) = &self.key {
             write!(s, "&key={key}").unwrap();
         }
@@ -753,6 +763,7 @@ mod tests {
             numwant: 50,
             key: None,
             trackerid: None,
+            encryption: EncryptionPolicy::Disabled,
         };
         dbg!(request.as_querystring());
     }
@@ -779,6 +790,7 @@ mod tests {
                 numwant: 50,
                 key: None,
                 trackerid: None,
+                encryption: EncryptionPolicy::Disabled,
             };
             let e: String =
                 id.0.iter()
@@ -895,6 +907,7 @@ mod tests {
             numwant: 200,
             key: None,
             trackerid: id,
+            encryption: EncryptionPolicy::Disabled,
         };
         assert!(
             request

@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::{collections::HashMap, sync::Arc};
+
+use parking_lot::Mutex;
+use url::Url;
+
 use crate::core::{hash_id::Id20, peer_id::generate_azereus_style};
 use crate::crate_version;
 
 /// How a torrent names itself to its peers and trackers. A torrent keeps one
 /// for as long as it is kept: every run, session and tracker task of it goes
-/// by the same peer id and tracker key.
+/// by the same peer id and tracker key, and sends each tracker back the
+/// `tracker id` it last gave.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// Its peer id in handshakes and announces.
@@ -18,6 +24,44 @@ pub struct Identity {
     pub version: String,
     /// The User-Agent of its HTTP announces and web-seed requests.
     pub user_agent: String,
+    /// What each HTTP tracker gave it to be known by.
+    pub tracker_ids: TrackerIds,
+}
+
+/// The `tracker id` each HTTP tracker last gave a torrent, sent back on every
+/// later announce to it. Every copy of an identity holds the same one, so it
+/// lasts as long as the identity is kept: across pauses, tracker tasks and
+/// sessions, not past the process. It is what the torrent was told, not who
+/// it is: two identities compare equal whatever theirs hold.
+#[derive(Clone, Default)]
+pub struct TrackerIds(Arc<Mutex<HashMap<Url, Vec<u8>>>>);
+
+impl TrackerIds {
+    /// The id `tracker` last gave, if any.
+    pub(crate) fn get(&self, tracker: &Url) -> Option<Vec<u8>> {
+        self.0.lock().get(tracker).cloned()
+    }
+
+    /// `tracker` gave `id`: it is sent back from now on.
+    pub(crate) fn set(&self, tracker: &Url, id: &[u8]) {
+        self.0.lock().insert(tracker.clone(), id.to_vec());
+    }
+}
+
+impl PartialEq for TrackerIds {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TrackerIds {}
+
+impl std::fmt::Debug for TrackerIds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("TrackerIds")
+            .field(&self.0.lock().len())
+            .finish()
+    }
 }
 
 impl Identity {
@@ -31,6 +75,7 @@ impl Identity {
             tracker_key: rand::random(),
             version: self.version.clone(),
             user_agent: self.user_agent.clone(),
+            tracker_ids: TrackerIds::default(),
         }
     }
 }
@@ -43,6 +88,7 @@ impl Default for Identity {
             tracker_key: rand::random(),
             version: crate::client_name_and_version().to_owned(),
             user_agent: crate::client_name_and_version().to_owned(),
+            tracker_ids: TrackerIds::default(),
         }
     }
 }
@@ -58,6 +104,7 @@ mod tests {
             tracker_key: 1,
             version: "qBittorrent/5.2.3".into(),
             user_agent: "qBittorrent/5.2.3".into(),
+            tracker_ids: TrackerIds::default(),
         };
         let same = identity.same_client();
         assert_eq!(&same.peer_id.0[..8], b"-qB5230-");

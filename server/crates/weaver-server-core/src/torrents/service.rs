@@ -264,7 +264,7 @@ fn client_of(rule: Option<&TrackerRule>) -> ClientIdentity {
 
 // How a torrent that is `own` under `rule` names itself to peers and
 // trackers: as its client, under its own peer id and tracker key.
-fn identity_of(rule: Option<&TrackerRule>, own: TorrentIdentity) -> Identity {
+fn identity_of(rule: Option<&TrackerRule>, own: &TorrentIdentity) -> Identity {
     client_of(rule).identity_of(own)
 }
 
@@ -2673,7 +2673,7 @@ impl TorrentService {
                     None,
                 );
                 let mut torrent = self.insert(record, &trackers)?;
-                let identity = identity_of(torrent.rule(&rules), torrent.identity);
+                let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
@@ -3021,7 +3021,7 @@ impl TorrentService {
             (
                 torrent.record.clone(),
                 torrent.rule(&rules),
-                torrent.identity,
+                torrent.identity.clone(),
             )
         }) else {
             return;
@@ -3061,7 +3061,7 @@ impl TorrentService {
             plan,
             uri,
             Some(tiers),
-            identity_of(rule, own),
+            identity_of(rule, &own),
             PeerTerms::of(rule),
         )
         .await;
@@ -3130,7 +3130,7 @@ impl TorrentService {
                         .is_some(),
                 ratelimits,
                 job.with(|job| initial_have(job)),
-                identity_of(rule, torrent.identity),
+                identity_of(rule, &torrent.identity),
                 torrent.seen,
                 PeerTerms::of(rule),
                 certificate_of(rule),

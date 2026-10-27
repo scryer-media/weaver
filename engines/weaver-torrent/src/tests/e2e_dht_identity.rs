@@ -116,6 +116,7 @@ async fn test_a_session_names_its_client_to_the_dht() -> anyhow::Result<()> {
                 tracker_key: 1,
                 version: "qBittorrent/5.2.3".into(),
                 user_agent: "qBittorrent/5.2.3".into(),
+                tracker_ids: Default::default(),
             },
             *b"-qB5230-",
             b"1:v4:qB\x05\x02".to_vec(),

@@ -2721,6 +2721,7 @@ impl Session {
                 magnet_name: name,
                 client_name_and_version: identity.version.clone(),
                 user_agent: identity.user_agent.clone(),
+                tracker_ids: identity.tracker_ids.clone(),
                 last_run: Default::default(),
                 moved: parking_lot::Mutex::new(opts.totals),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
@@ -3459,6 +3460,17 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             // one, whatever was wanted when it began: a torrent added as a
             // seed sends none (`torrent::files_checked` presets `m_complete_sent`).
             completed_during_run: left_bytes == Some(0) && live.is_some_and(|l| !l.seed_at_start()),
+            // The policy the torrent's connections are made under, as the
+            // connector reads it for each one.
+            encryption: self
+                .session
+                .upgrade()
+                .map_or(Default::default(), |session| {
+                    mt.shared()
+                        .options
+                        .peer_opts
+                        .encryption_under(session.connector.encryption())
+                }),
         }
     }
 

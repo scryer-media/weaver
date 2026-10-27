@@ -3,8 +3,8 @@
 
 //! How a client names itself to peers and trackers.
 
-use weaver_torrent::Identity;
 use weaver_torrent::core::Id20;
+use weaver_torrent::{Identity, TrackerIds};
 
 /// A client's Azureus-style peer-id prefix, the User-Agent of its HTTP
 /// announces and the `v` of its extended handshake.
@@ -78,21 +78,23 @@ impl ClientIdentity {
 
     /// This client under a fresh peer id and tracker key.
     pub fn identity(&self) -> Identity {
-        self.identity_of(TorrentIdentity::fresh())
+        self.identity_of(&TorrentIdentity::fresh())
     }
 
     /// This client as the torrent `own` is: its peer id carries this
-    /// client's prefix before the torrent's own bytes.
-    pub fn identity_of(&self, own: TorrentIdentity) -> Identity {
+    /// client's prefix before the torrent's own bytes, and it sends each
+    /// tracker back the id that tracker gave `own`.
+    pub fn identity_of(&self, own: &TorrentIdentity) -> Identity {
         Identity {
             peer_id: self.peer_id_of(own),
             tracker_key: own.tracker_key,
             version: self.version.to_owned(),
             user_agent: self.user_agent.to_owned(),
+            tracker_ids: own.tracker_ids.clone(),
         }
     }
 
-    fn peer_id_of(&self, own: TorrentIdentity) -> Id20 {
+    fn peer_id_of(&self, own: &TorrentIdentity) -> Id20 {
         let mut id = [0u8; 20];
         id[..8].copy_from_slice(&self.prefix);
         id[8..].copy_from_slice(&own.peer_id);
@@ -101,13 +103,15 @@ impl ClientIdentity {
 }
 
 /// Who a torrent is to its peers and trackers for as long as it is kept in
-/// this process: the bytes of its peer id after the client's prefix, and its
-/// tracker key. A pause, a session reopening or a route change keeps it; a
-/// restart or a remove and add again makes another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// this process: the bytes of its peer id after the client's prefix, its
+/// tracker key, and the `tracker id` each tracker gave it. A pause, a
+/// session reopening or a route change keeps it; a restart or a remove and
+/// add again makes another.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorrentIdentity {
     peer_id: [u8; 12],
     tracker_key: u32,
+    tracker_ids: TrackerIds,
 }
 
 impl TorrentIdentity {
@@ -118,6 +122,7 @@ impl TorrentIdentity {
         Self {
             peer_id: peer_id.try_into().expect("twelve bytes"),
             tracker_key: u32::from_le_bytes(key.try_into().expect("four bytes")),
+            tracker_ids: TrackerIds::default(),
         }
     }
 }

@@ -114,7 +114,7 @@ pub use crate::core::magnet::*;
 pub use crate::core::net::{HttpClients, HttpTarget, NamedBy, for_target};
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;
-pub use crate::identity::Identity;
+pub use crate::identity::{Identity, TrackerIds};
 
 #[cfg(test)]
 mod tests;

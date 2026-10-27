@@ -366,6 +366,8 @@ pub struct ManagedTorrentShared {
     // handshake and the User-Agent of its HTTP announces.
     pub(crate) client_name_and_version: String,
     pub(crate) user_agent: String,
+    /// The `tracker id` each tracker gave, kept with the identity.
+    pub(crate) tracker_ids: crate::TrackerIds,
 
     /// What the most recent live run left, recorded as the run ends, so a
     /// `stopped` tracker announce made after it ended reports it.
@@ -411,6 +413,7 @@ impl ManagedTorrentShared {
             tracker_key: self.tracker_key,
             version: self.client_name_and_version.clone(),
             user_agent: self.user_agent.clone(),
+            tracker_ids: self.tracker_ids.clone(),
         }
     }
 }
