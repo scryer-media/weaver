@@ -30,6 +30,7 @@ const MAIN_BODY_CAP: u64 = 12 + 32_768 * 16;
 const FILE_DESC_BODY_CAP: u64 = 56 + 100_000;
 const IFSC_BODY_CAP: u64 = 16 + 32_768 * 20;
 const CREATOR_BODY_CAP: u64 = 100_000;
+const UNICODE_FILENAME_BODY_CAP: u64 = 16 + 2 * 100_000;
 // Bytes ahead of the front a volume may hold. Past it, deliveries are not
 // walked; the payloads are still on disk and a repair reads them back.
 const HOLD_CAP: usize = 8 * 1024 * 1024;
@@ -447,6 +448,7 @@ fn body_cap(packet_type: PacketType) -> Option<u64> {
         PacketType::FileDescription => Some(FILE_DESC_BODY_CAP),
         PacketType::InputFileSliceChecksum => Some(IFSC_BODY_CAP),
         PacketType::Creator => Some(CREATOR_BODY_CAP),
+        PacketType::UnicodeFilename => Some(UNICODE_FILENAME_BODY_CAP),
         PacketType::RecoverySlice | PacketType::Unknown(_) => None,
     }
 }
@@ -488,9 +490,12 @@ impl Meter {
                 Packet::Main(main) => (main.recovery_file_ids.len()
                     + main.non_recovery_file_ids.len())
                 .saturating_mul(16),
-                Packet::FileDescription(file) => {
-                    file.filename.len().saturating_add(file.par2_name.len())
-                }
+                Packet::FileDescription(file) => file
+                    .filename
+                    .len()
+                    .saturating_add(file.par2_name.len())
+                    .saturating_add(file.par2_name_bytes.len()),
+                Packet::UnicodeFilename(name) => name.name.len().saturating_mul(5),
                 Packet::InputFileSliceChecksum(ifsc) => ifsc
                     .checksums
                     .len()

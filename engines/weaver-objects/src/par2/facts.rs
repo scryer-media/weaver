@@ -18,7 +18,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use par2_rs::packet::{CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket};
+use par2_rs::packet::{
+    CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket, UnicodeFilenamePacket,
+};
 use par2_rs::{FileId, Packet, RecoverySetId, SliceChecksum};
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
@@ -71,7 +73,8 @@ pub(super) struct SetFacts {
 }
 
 // The metadata packets the walk keeps, field for field, so the set's index
-// is rebuilt by par2-rs from the same packets.
+// is rebuilt by par2-rs from the same packets. A new field goes last with a
+// default, so facts written before it still decode.
 #[derive(Serialize, Deserialize)]
 enum PacketFacts {
     Main {
@@ -87,12 +90,23 @@ enum PacketFacts {
         length: u64,
         name: String,
         par2_name: String,
+        // The name as the packet carried it, which its file ID hashes.
+        // Facts written before it was kept hold only the decoded name, whose
+        // UTF-8 bytes stand in for it.
+        #[serde(default)]
+        par2_name_bytes: Option<Vec<u8>>,
     },
     Checksums {
         file: [u8; 16],
         slices: Vec<(u32, [u8; 16])>,
     },
     Creator(String),
+    // A file's name as its Unicode Filename packet spells it, which the set
+    // takes in place of the File Description's.
+    Name {
+        file: [u8; 16],
+        name: String,
+    },
 }
 
 // A set's metadata packets, as the set keeps them. They encode as their
@@ -138,6 +152,7 @@ impl PacketFacts {
                 length: file.file_length,
                 name: file.filename.clone(),
                 par2_name: file.par2_name.clone(),
+                par2_name_bytes: Some(file.par2_name_bytes.clone()),
             },
             Packet::InputFileSliceChecksum(ifsc) => Self::Checksums {
                 file: *ifsc.file_id.as_bytes(),
@@ -148,6 +163,10 @@ impl PacketFacts {
                     .collect(),
             },
             Packet::Creator(creator) => Self::Creator(creator.creator_id.clone()),
+            Packet::UnicodeFilename(name) => Self::Name {
+                file: *name.file_id.as_bytes(),
+                name: name.name.clone(),
+            },
             Packet::RecoverySlice(_) | Packet::Unknown { .. } => return None,
         })
     }
@@ -172,12 +191,14 @@ impl PacketFacts {
                 length,
                 name,
                 par2_name,
+                par2_name_bytes,
             } => Packet::FileDescription(FileDescriptionPacket {
                 file_id: FileId::from_bytes(file),
                 hash_full,
                 hash_16k,
                 file_length: length,
                 filename: name,
+                par2_name_bytes: par2_name_bytes.unwrap_or_else(|| par2_name.as_bytes().to_vec()),
                 par2_name,
             }),
             Self::Checksums { file, slices } => Packet::InputFileSliceChecksum(IfscPacket {
@@ -188,6 +209,10 @@ impl PacketFacts {
                     .collect(),
             }),
             Self::Creator(creator_id) => Packet::Creator(CreatorPacket { creator_id }),
+            Self::Name { file, name } => Packet::UnicodeFilename(UnicodeFilenamePacket {
+                file_id: FileId::from_bytes(file),
+                name,
+            }),
         }
     }
 }

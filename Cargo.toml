@@ -117,7 +117,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.10.13", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.11.0", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -162,7 +162,7 @@ par3-rs = { version = "=0.8.1", default-features = false }
 # router clones a member's key where it hands one on.
 # 0.14.1, with par2-rs 0.10.13, hashes through crc-turbo and drops crc-fast and
 # the `RARPAR_CRC32_VPCLMUL` override; `CRC_TURBO_TIER` pins the tier instead.
-unrar-rs = { version = "0.14.1", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { version = "0.14.2", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
