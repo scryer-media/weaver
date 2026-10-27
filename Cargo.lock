@@ -6046,6 +6046,8 @@ dependencies = [
  "rmp-serde",
  "serde",
  "thiserror 2.0.21",
+ "unicase",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -6089,6 +6091,7 @@ name = "weaver-nzb"
 version = "0.16.5"
 dependencies = [
  "blake3",
+ "html-escape",
  "quick-xml",
  "serde",
  "serde_json",

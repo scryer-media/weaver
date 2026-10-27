@@ -16,3 +16,5 @@ crc-turbo = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+unicase = { version = "2.9.0", default-features = false }
+unicode-normalization = { workspace = true }

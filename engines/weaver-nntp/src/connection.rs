@@ -509,8 +509,12 @@ impl NntpConnection {
 
         match greeting.code.raw() {
             200 | 201 => {} // posting allowed / no posting — both fine for readers
-            400 => return Err(NntpError::ServiceUnavailable),
-            502 => return Err(NntpError::from_status(greeting.code, &greeting.message)),
+            400 | 502 => {
+                return Err(NntpError::from_login_status(
+                    greeting.code,
+                    &greeting.message,
+                ));
+            }
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
@@ -674,7 +678,10 @@ impl NntpConnection {
                 // Password required — continue.
             }
             _ => {
-                return Err(NntpError::from_status(user_resp.code, &user_resp.message));
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
             }
         }
 
@@ -687,9 +694,10 @@ impl NntpConnection {
                 debug!("authentication successful");
                 Ok(())
             }
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
         }
     }
 
