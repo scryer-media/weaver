@@ -1327,9 +1327,7 @@ impl NntpPool {
         result: &Result<T>,
     ) {
         match result {
-            Err(error) if dial_declined_over_limit(error) => {
-                self.note_provider_over_limit(server)
-            }
+            Err(error) if dial_declined_over_limit(error) => self.note_provider_over_limit(server),
             Ok(_) => self.note_provider_admitted(server, admission),
             Err(_) => self.release_over_limit_probe(server, admission),
         }
@@ -2865,7 +2863,10 @@ mod tests {
             !matches!(next, NntpError::ServerOverLimit { .. }),
             "{next:?}"
         );
-        assert!(!started.elapsed().is_zero(), "must wait the reconnect delay");
+        assert!(
+            !started.elapsed().is_zero(),
+            "must wait the reconnect delay"
+        );
         assert_eq!(route.dials.load(Ordering::Acquire), 4);
         assert!(!pool.is_over_limit(ServerId(0)));
         assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);

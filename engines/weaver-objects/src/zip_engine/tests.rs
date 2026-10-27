@@ -465,11 +465,14 @@ fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
     assert!(extents.is_empty());
 }
 
+// A piece put into a sparse volume: its offset and its bytes.
+type Piece = (u64, Vec<u8>);
+
 // Volumes of any length that hold their bytes only where a piece is put and
 // zeros everywhere else, so a set can run past what a narrow field holds
 // without its bytes in memory.
 struct Sparse {
-    volumes: Vec<(u64, Vec<(u64, Vec<u8>)>)>,
+    volumes: Vec<(u64, Vec<Piece>)>,
 }
 
 impl Volumes for Sparse {

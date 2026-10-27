@@ -277,7 +277,8 @@ pub(crate) fn failure(
 pub(crate) fn ruled_short(job: &GraphJob) -> Option<Failure> {
     let summary = RootJob::recovery_summary(job);
     let outcomes = summary.outcomes();
-    let failure = failure(&summary, &outcomes, job).filter(|failure| failure.rejection.is_none())?;
+    let failure =
+        failure(&summary, &outcomes, job).filter(|failure| failure.rejection.is_none())?;
     let at_root = summary
         .sets
         .iter()

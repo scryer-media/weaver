@@ -3357,10 +3357,13 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     for info in targets {
         let job_id = info.job_id;
         let db = ctx.db.clone();
-        let persisted = tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(job_id))
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?;
+        let persisted =
+            tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(job_id))
+                .await
+                .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
+                .map_err(|error| {
+                    RpcError::invalid_parameter(format!("listfiles failed: {error}"))
+                })?;
         let Some((_, Some(nzb_zstd))) = persisted else {
             continue;
         };

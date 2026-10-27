@@ -10,9 +10,7 @@ fn gap_kind(state: SegmentTerminalState) -> GapKind {
         SegmentTerminalState::RetriesExhausted
         | SegmentTerminalState::DecodeExhausted
         | SegmentTerminalState::Unservable
-        | SegmentTerminalState::Abandoned => {
-            GapKind::Failed
-        }
+        | SegmentTerminalState::Abandoned => GapKind::Failed,
     }
 }
 

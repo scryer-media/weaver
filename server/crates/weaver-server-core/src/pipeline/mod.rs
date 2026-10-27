@@ -753,10 +753,6 @@ pub(super) struct PendingDecodeWork {
 
 // Native outcomes share the existing repair completion queue. Dispatch occurs
 // once per operation; block reads and native evidence stay format-specific.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "keep the existing PAR2 result inline without adding a per-operation allocation"
-)]
 #[derive(Debug)]
 pub(super) struct MoveToCompleteResult {
     pub(super) moved_entries: u32,

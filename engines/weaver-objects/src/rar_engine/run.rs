@@ -26,6 +26,10 @@ use weaver_graph::{
     Budget, ByteRange, Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why,
 };
 
+// One member's slot when members decode side by side: empty until its
+// worker is done, then its bytes or the error that stopped it.
+type Decoded = Mutex<Option<Result<Vec<u8>, RarError>>>;
+
 pub(super) struct Run {
     password: Option<String>,
 }
@@ -230,8 +234,7 @@ impl Walk<'_, '_> {
                     .unwrap_or(0)
             })
             .collect();
-        let decoded: Vec<Mutex<Option<Result<Vec<u8>, RarError>>>> =
-            (0..lengths.len()).map(|_| Mutex::new(None)).collect();
+        let decoded: Vec<Decoded> = (0..lengths.len()).map(|_| Mutex::new(None)).collect();
         let workers = self.budget.threads().min(lengths.len());
         // The walk's headers, read once, one copy for each worker.
         let headers: Mutex<Vec<CachedArchiveHeaders>> =

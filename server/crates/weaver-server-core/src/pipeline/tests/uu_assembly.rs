@@ -24,10 +24,7 @@ async fn submit_uu_segment(
         file_id,
         segment_number,
         data,
-        crate::pipeline::UuSegmentFacts {
-            damaged: damaged,
-            ended: ended,
-        },
+        crate::pipeline::UuSegmentFacts { damaged, ended },
         "silver-horizon.bin",
     )
     .await;

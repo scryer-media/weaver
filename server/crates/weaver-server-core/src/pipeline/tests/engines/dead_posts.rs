@@ -61,7 +61,12 @@ async fn the_sample_is_the_payloads_first_articles_and_not_its_recoverys() {
     let graph = run(&scenario).await;
     // The sample rules the post dead; the one file whose first article came
     // is still fetched and arrives whole, so the job is partial.
-    assert_eq!(graph.status, Some(crate::jobs::model::JobStatus::Partial), "{:?}", graph.failure);
+    assert_eq!(
+        graph.status,
+        Some(crate::jobs::model::JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
     assert_eq!(graph.claims.get("lantern11.bin"), Some(&Claim::Complete));
 }
 
@@ -300,7 +305,11 @@ async fn a_post_taken_down_fails_on_the_feeds_health_before_the_graph_rules() {
     assert!(failure.contains("below critical 85.0%"), "{failure}");
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Health));
     // No recovery object ruled: the feed gave the post up.
-    assert!(graph.graph().outcomes.is_empty(), "{:?}", graph.graph().outcomes);
+    assert!(
+        graph.graph().outcomes.is_empty(),
+        "{:?}",
+        graph.graph().outcomes
+    );
 }
 
 // The feed's vocabulary yields to the graph's: a post alive above its
@@ -311,7 +320,11 @@ async fn a_post_taken_down_fails_on_the_feeds_health_before_the_graph_rules() {
 async fn a_par2_set_refused_one_range_past_its_blocks_fails_in_its_own_words() {
     let bytes = payload(200 * ARTICLE, 7);
     let mut posts = vec![Post::plain("lantern.bin", bytes.clone())];
-    posts.extend(par2_set("lantern", &[("lantern.bin", bytes.as_slice())], 40));
+    posts.extend(par2_set(
+        "lantern",
+        &[("lantern.bin", bytes.as_slice())],
+        40,
+    ));
     let scenario = (1..=41).fold(Scenario::new(posts).leased(), |scenario, ordinal| {
         scenario.lost(0, ordinal)
     });
@@ -343,7 +356,10 @@ async fn a_rev_set_refused_three_volumes_with_one_rev_rules_impossible() {
     });
     let graph = run(&scenario).await;
     let failure = graph.failure.as_deref().unwrap_or_default();
-    assert!(failure.contains("not repairable: 3 damaged slices, only 1 recovery blocks reachable"), "{failure}");
+    assert!(
+        failure.contains("not repairable: 3 damaged slices, only 1 recovery blocks reachable"),
+        "{failure}"
+    );
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
 }
 
@@ -357,7 +373,10 @@ async fn a_post_with_no_recovery_whose_every_article_is_refused_fails() {
     });
     let graph = run(&scenario).await;
     assert!(
-        matches!(graph.status, Some(crate::jobs::model::JobStatus::Failed { .. })),
+        matches!(
+            graph.status,
+            Some(crate::jobs::model::JobStatus::Failed { .. })
+        ),
         "{:?} {:?}",
         graph.status,
         graph.failure
@@ -377,7 +396,10 @@ async fn a_whole_volume_no_object_opened_is_not_a_usable_file() {
     });
     let graph = run(&scenario).await;
     assert!(
-        matches!(graph.status, Some(crate::jobs::model::JobStatus::Failed { .. })),
+        matches!(
+            graph.status,
+            Some(crate::jobs::model::JobStatus::Failed { .. })
+        ),
         "{:?} {:?}",
         graph.status,
         graph.failure
@@ -395,7 +417,10 @@ async fn a_nested_par2_set_ruled_impossible_leaves_the_whole_file_partial() {
     let quill = payload(8 * ARTICLE + 3, 62);
     let archive = par2_in_store(
         "inner",
-        &[("ember.bin", ember.as_slice()), ("quill.bin", quill.as_slice())],
+        &[
+            ("ember.bin", ember.as_slice()),
+            ("quill.bin", quill.as_slice()),
+        ],
         1,
     );
     let inside = super::deep::articles_inside(&archive.bytes, &quill);
@@ -417,16 +442,17 @@ async fn a_nested_par2_set_ruled_impossible_leaves_the_whole_file_partial() {
             .find(|(path, _)| path.rsplit('/').next() == Some(name))
             .map(|(_, bytes)| bytes.clone())
     };
-    assert_eq!(delivered("ember.bin"), Some(ember), "{:?}", graph.files.keys());
+    assert_eq!(
+        delivered("ember.bin"),
+        Some(ember),
+        "{:?}",
+        graph.files.keys()
+    );
     assert!(
-        graph
-            .graph()
-            .rulings
-            .iter()
-            .any(|(_, ruling)| matches!(
-                ruling,
-                Some(weaver_graph::recovery::RepairOutcome::Impossible { .. })
-            )),
+        graph.graph().rulings.iter().any(|(_, ruling)| matches!(
+            ruling,
+            Some(weaver_graph::recovery::RepairOutcome::Impossible { .. })
+        )),
         "{:?}",
         graph.graph().rulings
     );
@@ -441,7 +467,10 @@ async fn a_nested_par2_set_rebuilds_a_refused_article_inside_a_stored_rar() {
     let quill = payload(8 * ARTICLE + 3, 62);
     let archive = par2_in_store(
         "inner",
-        &[("ember.bin", ember.as_slice()), ("quill.bin", quill.as_slice())],
+        &[
+            ("ember.bin", ember.as_slice()),
+            ("quill.bin", quill.as_slice()),
+        ],
         8,
     );
     let inside = super::deep::articles_inside(&archive.bytes, &quill);

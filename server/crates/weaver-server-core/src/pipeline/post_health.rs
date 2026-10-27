@@ -275,7 +275,9 @@ pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
 // share, and an article still to come can only add to it, so a sample that
 // reaches the share with articles outstanding has the verdict the complete
 // sample would have. A sample short of the share says nothing yet.
-pub(crate) fn first_article_verdict(heads: impl IntoIterator<Item = bool>) -> Option<(usize, usize)> {
+pub(crate) fn first_article_verdict(
+    heads: impl IntoIterator<Item = bool>,
+) -> Option<(usize, usize)> {
     let mut total = 0;
     let mut lost = 0;
     for gone in heads {
@@ -480,7 +482,10 @@ impl Pipeline {
         let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));
         if let Some((missing, total)) = first_article_verdict(payload.clone().map(|head| head.2)) {
             let bytes = |file: &FileSpec| -> u64 {
-                file.segments.iter().map(|segment| u64::from(segment.bytes)).sum()
+                file.segments
+                    .iter()
+                    .map(|segment| u64::from(segment.bytes))
+                    .sum()
             };
             let lost: u64 = payload
                 .filter(|(_, _, gone)| *gone)
@@ -495,7 +500,12 @@ impl Pipeline {
                 return Some(first_article_verdict_error(missing, total));
             }
         }
-        let probe = self.post_probes.states.get(&job_id).copied().unwrap_or_default();
+        let probe = self
+            .post_probes
+            .states
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
         let total = spec.total_bytes;
         let lost = self.missing_bytes(job_id);
         let failed = probe.decided(lost);
@@ -539,7 +549,12 @@ impl Pipeline {
         if self.post_probes.out(job_id) || self.post_probes.dead.contains_key(&job_id) {
             return;
         }
-        let probe = self.post_probes.states.get(&job_id).copied().unwrap_or_default();
+        let probe = self
+            .post_probes
+            .states
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
         let failing_files = self.failing_files(job_id, &state.spec);
         let decided = probe.decided(self.missing_bytes(job_id));
         let health = health_milli(total, decided);
@@ -581,7 +596,13 @@ impl Pipeline {
             failed_bytes = decided,
             "health probe armed: STAT sampling"
         );
-        tokio::spawn(sample(stat, job_id, round, probes, self.post_probes.sender()));
+        tokio::spawn(sample(
+            stat,
+            job_id,
+            round,
+            probes,
+            self.post_probes.sender(),
+        ));
     }
 
     // What a round said. Only the round the job waits on is heard: a job
@@ -617,13 +638,12 @@ impl Pipeline {
             return;
         };
         probe.out = None;
-        if !update.inconclusive {
-            if let Some(projected) = projected(tracked, update.total, update.missed)
-                && projected > probe.projected
-            {
-                probe.projected = projected;
-                probe.sampled = Some((update.missed, update.total));
-            }
+        if !update.inconclusive
+            && let Some(projected) = projected(tracked, update.total, update.missed)
+            && projected > probe.projected
+        {
+            probe.projected = projected;
+            probe.sampled = Some((update.missed, update.total));
         }
         probe.next_failed_bytes = next_failed_bytes(
             probe.decided(failed),

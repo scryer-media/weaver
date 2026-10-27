@@ -10,7 +10,6 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use ::zip::ZipArchive;
 use bytes::Bytes;
 use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 

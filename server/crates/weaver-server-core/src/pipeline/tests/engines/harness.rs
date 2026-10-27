@@ -160,9 +160,11 @@ pub(in crate::pipeline::tests) fn par2_in_store(
         .map(|(name, bytes)| (*name, bytes.to_vec()))
         .collect();
     let set = par2_set(base, files, blocks);
-    members.extend(set.iter().map(|post| (post.name.as_str(), post.bytes.clone())));
-    let mut volumes =
-        crate::pipeline::tests::direct_store::multi_member_store_set(&members, 1);
+    members.extend(
+        set.iter()
+            .map(|post| (post.name.as_str(), post.bytes.clone())),
+    );
+    let mut volumes = crate::pipeline::tests::direct_store::multi_member_store_set(&members, 1);
     let (name, bytes) = volumes.remove(0);
     Post::plain(&name, bytes)
 }
@@ -1013,7 +1015,15 @@ pub(in crate::pipeline::tests) async fn serve_work(
         work.segment_id.file_id.file_index,
         work.segment_id.segment_number,
     );
-    serve_from(pipeline, JOB, scenario, article, &work.exclude_servers, None).await;
+    serve_from(
+        pipeline,
+        JOB,
+        scenario,
+        article,
+        &work.exclude_servers,
+        None,
+    )
+    .await;
 }
 
 // One article as the scenario's server answers it.

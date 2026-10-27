@@ -457,10 +457,7 @@ async fn par3_crash_refetch_reassesses_changed_source() {
         },
         vec![(
             516269,
-            (
-                vec![(0, 0), (0, 1), (1, 0), (1, 1)],
-                Interruption::Crash(1),
-            ),
+            (vec![(0, 0), (0, 1), (1, 0), (1, 1)], Interruption::Crash(1)),
         )],
     )
     .await;

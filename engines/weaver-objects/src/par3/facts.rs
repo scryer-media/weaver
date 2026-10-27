@@ -18,7 +18,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::{ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError};
+use weaver_graph::{
+    ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError,
+};
 
 use super::{MAX_CARRIERS, Par3, Ruling, Settled, Unnamed, Volume};
 
