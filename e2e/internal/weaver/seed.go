@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -176,7 +178,7 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 			return fmt.Errorf("resolve nyuu nzb path for %s: %w", scenario.Slug, err)
 		}
 
-		if err := runNyuuPost(stageDirInNyuu, files, scenario, "127.0.0.1", "119", nzbPathInNyuu); err != nil {
+		if err := runNyuuPost(stageDirInNyuu, files, scenario, "127.0.0.1", "119", nzbPathInNyuu, nzbPath, nntpHost(), nntpPort()); err != nil {
 			return fmt.Errorf("nyuu failed for %s: %w", scenario.Slug, err)
 		}
 	}
@@ -403,7 +405,7 @@ func seedScenarioBackupOverride(absDir string, scenario *Scenario) error {
 	}
 
 	logSeed("posting backup override (%d file(s))...", len(files))
-	if err := runNyuuPost(stageDirInNyuu, files, scenario, nyuuBackupHost(), nyuuBackupPort(), nzbPathInNyuu); err != nil {
+	if err := runNyuuPost(stageDirInNyuu, files, scenario, nyuuBackupHost(), nyuuBackupPort(), nzbPathInNyuu, nzbPath, nntpHost(), backupNntpPort()); err != nil {
 		return fmt.Errorf("post backup override for %s: %w", scenario.Slug, err)
 	}
 
@@ -493,6 +495,9 @@ func runNyuuPost(
 	host string,
 	port string,
 	nzbPathInNyuu string,
+	nzbHostPath string,
+	statHost string,
+	statPort string,
 ) error {
 	nyuuArgs := append(
 		dockerComposeArgs(
@@ -539,7 +544,84 @@ func runNyuuPost(
 
 	cmd := containerengine.Command(nyuuArgs...)
 	cmd.Dir = e2eDir()
-	return runExternalCommand(cmd, "nyuu post")
+	return reconcileNyuuPost(
+		runExternalCommand(cmd, "nyuu post"),
+		nzbHostPath,
+		func(messageIDs []string) ([]string, error) {
+			return missingArticleIDsAt(statHost, statPort, messageIDs)
+		},
+		log.Printf,
+	)
+}
+
+// nyuuErrorCount reads the "with N error(s)" count from Nyuu's final line.
+var nyuuErrorCount = regexp.MustCompile(`with (\d+) error\(s\)`)
+
+// nyuuPlannedCount reads how many articles Nyuu meant to post from its first
+// line, "Uploading N article(s) from …".
+var nyuuPlannedCount = regexp.MustCompile(`Uploading (\d+) article\(s\)`)
+
+// reconcileNyuuPost is the seed-completeness rule: a post is complete when
+// every article its NZB names is on the server. Nyuu's exit status is not the
+// rule. A post whose first attempt timed out after the server stored it gets
+// "441 Duplicate article" on the retry and Nyuu counts that as an error, yet
+// the article is there. So a nonzero exit is checked against the server: STAT
+// every segment the NZB names, and the fixture fails only on an absent one.
+// An exit of zero is accepted as before.
+func reconcileNyuuPost(
+	nyuuErr error,
+	nzbHostPath string,
+	missingOnServer func(messageIDs []string) ([]string, error),
+	logf func(format string, args ...interface{}),
+) error {
+	if nyuuErr == nil {
+		return nil
+	}
+	nzbData, err := os.ReadFile(nzbHostPath)
+	if err != nil {
+		return fmt.Errorf("%w (read NZB to check the server: %v)", nyuuErr, err)
+	}
+	messageIDs, err := extractAllMessageIDsFromNZB(nzbData)
+	if err != nil {
+		return fmt.Errorf("%w (parse NZB to check the server: %v)", nyuuErr, err)
+	}
+	if len(messageIDs) == 0 {
+		return fmt.Errorf("%w (NZB %s names no articles)", nyuuErr, nzbHostPath)
+	}
+	if m := nyuuPlannedCount.FindStringSubmatch(nyuuErr.Error()); m != nil {
+		if planned, convErr := strconv.Atoi(m[1]); convErr == nil && len(messageIDs) < planned {
+			return fmt.Errorf(
+				"%w (NZB names %d articles but nyuu meant to post %d)",
+				nyuuErr,
+				len(messageIDs),
+				planned,
+			)
+		}
+	}
+	missing, err := missingOnServer(messageIDs)
+	if err != nil {
+		return fmt.Errorf("%w (STAT check: %v)", nyuuErr, err)
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf(
+			"%w (%d of %d articles missing on the server: %s)",
+			nyuuErr,
+			len(missing),
+			len(messageIDs),
+			strings.Join(missing, ", "),
+		)
+	}
+	errorCount := "some"
+	if m := nyuuErrorCount.FindStringSubmatch(nyuuErr.Error()); m != nil {
+		errorCount = m[1]
+	}
+	logf(
+		"nyuu reported %s error(s) and all %d articles of %s are on the server; seed complete",
+		errorCount,
+		len(messageIDs),
+		filepath.Base(nzbHostPath),
+	)
+	return nil
 }
 
 // --- seed-all ---
