@@ -5,7 +5,14 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::core::hash_id::Id20;
 use anyhow::bail;
@@ -129,7 +136,26 @@ pub(crate) struct StreamConnector {
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
     socket_factory: Option<Arc<dyn SocketFactory>>,
-    encryption: EncryptionPolicy,
+    // The session's encryption, as `policy_code` writes it: a change of the
+    // settings moves it while the session runs.
+    encryption: AtomicU8,
+}
+
+// An encryption policy as one byte, and back.
+const fn policy_code(policy: EncryptionPolicy) -> u8 {
+    match policy {
+        EncryptionPolicy::Disabled => 0,
+        EncryptionPolicy::Prefer => 1,
+        EncryptionPolicy::Require => 2,
+    }
+}
+
+const fn policy_of(code: u8) -> EncryptionPolicy {
+    match code {
+        1 => EncryptionPolicy::Prefer,
+        2 => EncryptionPolicy::Require,
+        _ => EncryptionPolicy::Disabled,
+    }
 }
 
 impl StreamConnector {
@@ -145,14 +171,21 @@ impl StreamConnector {
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
             socket_factory: config.socket_factory,
-            encryption: config.encryption,
+            encryption: AtomicU8::new(policy_code(config.encryption)),
         })
     }
 
     /// The session's encryption, which a connection is made under unless
     /// its torrent names its own.
     pub fn encryption(&self) -> EncryptionPolicy {
+        policy_of(self.encryption.load(Ordering::Relaxed))
+    }
+
+    /// Make every connection from here on under `policy`, and say so in
+    /// every announce: a connection already made keeps what it negotiated.
+    pub fn set_encryption(&self, policy: EncryptionPolicy) {
         self.encryption
+            .store(policy_code(policy), Ordering::Relaxed);
     }
 
     /// Connect to a peer over `transports` and send it our BitTorrent
@@ -590,6 +623,28 @@ mod tests {
         let (connector, _dialed) = dialing(EncryptionPolicy::Disabled).await;
         assert!(!send_handshake(&connector, asked).await.unwrap());
         assert_eq!(connector.stats().encryption.snapshot().plaintext, 1);
+    }
+
+    // A policy set while the connector runs holds for the next connection
+    // it makes: plaintext under the old one, the encrypted handshake under
+    // the new.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_connection_is_made_under_the_encryption_set_last() {
+        let (connector, mut dialed) = dialing(EncryptionPolicy::Disabled).await;
+        assert!(!send_handshake(&connector, || false).await.unwrap());
+        let _plain = dialed.recv().await.unwrap();
+
+        connector.set_encryption(EncryptionPolicy::Require);
+        assert_eq!(connector.encryption(), EncryptionPolicy::Require);
+        let refuse = async {
+            let (_, theirs) = dialed.recv().await.unwrap();
+            drop(theirs);
+        };
+        let asked = || panic!("asked which handshake");
+        let (sent, ()) = tokio::join!(send_handshake(&connector, asked), refuse);
+        assert!(matches!(sent, Err(Error::Mse(_))), "{sent:?}");
+        let stats = connector.stats().encryption.snapshot();
+        assert_eq!((stats.plaintext, stats.attempts), (1, 1), "{stats:?}");
     }
 
     // libtorrent `bt_peer_connection::on_connected` runs once the transport

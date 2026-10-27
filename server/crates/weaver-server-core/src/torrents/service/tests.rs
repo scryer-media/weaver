@@ -3697,6 +3697,12 @@ async fn a_stop_before_a_recheck_found_every_piece_checks_every_piece_on_the_nex
 
 // The next announce the tracker on `listener` hears, unanswered.
 async fn heard_announce(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    heard_request(listener).await.0
+}
+
+// The next announce the tracker on `listener` hears, unanswered, and its
+// request.
+async fn heard_request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
     use tokio::io::AsyncReadExt;
 
     let (mut stream, _) = listener.accept().await.unwrap();
@@ -3707,7 +3713,7 @@ async fn heard_announce(listener: &tokio::net::TcpListener) -> tokio::net::TcpSt
         assert!(read > 0, "the announce ended before its request was read");
         request.extend_from_slice(&buf[..read]);
     }
-    stream
+    (stream, String::from_utf8_lossy(&request).into_owned())
 }
 
 // The torrent's trackers once its session's announce table says `done`.
@@ -5812,6 +5818,76 @@ async fn a_reannounce_reaches_the_tracker_now() {
     rig.service.stop().await;
 }
 
+// The encryption setting reaches the open session when it changes: the
+// next announce says it, and every connection from then on is made under
+// it, with no reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_encryption_setting_reaches_the_open_session_and_its_next_announce() {
+    use crate::settings::TorrentEncryption;
+    use tokio::io::AsyncWriteExt;
+    use weaver_torrent::EncryptionPolicy;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("crypt", 4))))
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    let body = b"d8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let answer = [head.as_bytes(), body].concat();
+    let flags = |request: &str| {
+        let line = request.lines().next().unwrap().to_owned();
+        (
+            line.contains("&supportcrypto=1"),
+            line.contains("&requirecrypto=1"),
+        )
+    };
+
+    let (mut started, request) = heard_request(&listener).await;
+    assert_eq!(flags(&request), (true, false));
+    started.write_all(&answer).await.unwrap();
+    let session = session_of(&rig.service, job_id).await;
+    assert_eq!(session.encryption(), EncryptionPolicy::Prefer);
+
+    for (setting, policy, said) in [
+        (
+            TorrentEncryption::Require,
+            EncryptionPolicy::Require,
+            (true, true),
+        ),
+        (
+            TorrentEncryption::Prefer,
+            EncryptionPolicy::Prefer,
+            (true, false),
+        ),
+    ] {
+        let mut settings = rig.service.settings();
+        settings.torrent.encryption = setting;
+        rig.service.set_settings(settings).await;
+        rig.service.inner.sessions.settled().await;
+        rig.service.reannounce(job_id).await.unwrap();
+        let (mut again, request) = heard_request(&listener).await;
+        assert_eq!(flags(&request), said);
+        again.write_all(&answer).await.unwrap();
+        // The policy each connection is made under as it is made.
+        assert_eq!(session.encryption(), policy);
+    }
+    assert!(Arc::ptr_eq(
+        &session,
+        &session_of(&rig.service, job_id).await
+    ));
+    rig.service.stop().await;
+}
+
 // A torrent of two files where only the second is fetched: the first's
 // front is never in hand, while its last bytes come in the piece that
 // starts the second, so they are verified before anything says what the
@@ -6863,7 +6939,15 @@ async fn turning_torrents_off_publishes_their_routes_closed() {
     let published = &metrics.published;
     let job = published.job(job_id).unwrap();
     assert_eq!(job.torrent.route, route);
-    assert_eq!(job.session, Some(&SessionSeries::held(&route)));
+    // A held route carries its name and that it is not open, nothing more:
+    // no figure of the closed session, no listener, no DHT.
+    let held = SessionSeries {
+        route: route.clone(),
+        open: false,
+        ..SessionSeries::default()
+    };
+    assert_eq!(job.session, Some(&held));
+    assert_eq!(SessionSeries::held(&route), held);
     assert_eq!(
         published
             .sessions
@@ -6874,5 +6958,54 @@ async fn turning_torrents_off_publishes_their_routes_closed() {
         "{:?}",
         published.sessions
     );
+
+    // Turned on again, the first publish that shows the torrent back in
+    // its session shows the session open.
+    let mut watch = rig.service.inner.published.subscribe();
+    let mut settings = rig.service.settings();
+    settings.torrent.enabled = true;
+    rig.service.set_settings(settings).await;
+    let back = watch
+        .wait_for(|published| {
+            published.job(job_id).is_some_and(|job| {
+                !matches!(
+                    job.torrent.state,
+                    TorrentState::Stopped | TorrentState::Queued
+                )
+            })
+        })
+        .await
+        .unwrap();
+    let job = back.job(job_id).unwrap();
+    assert!(job.session.is_some_and(|session| session.open), "{job:?}");
+    drop(back);
+    rig.service.stop().await;
+}
+
+// A torrent put in its route's session is published in an open session by
+// any publish from then on, not only once the tick has read the sessions:
+// an action's publish can come between the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_given_its_session_is_published_in_it_open() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("given", 4))))
+        .await
+        .unwrap();
+    rig.service.follow_routes().await;
+    rig.service.publish().await;
+    let metrics = rig.service.metrics();
+    let job = metrics.published.job(job_id).unwrap();
+    assert!(
+        !matches!(
+            job.torrent.state,
+            TorrentState::Stopped | TorrentState::Queued
+        ),
+        "{job:?}"
+    );
+    assert!(job.session.is_some_and(|session| session.open), "{job:?}");
     rig.service.stop().await;
 }

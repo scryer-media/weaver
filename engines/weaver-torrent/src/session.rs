@@ -2007,6 +2007,19 @@ impl Session {
         self.connection_slots.set_speed(limits.connection_speed);
     }
 
+    /// The encryption the session's connections are made under now, unless
+    /// a torrent names its own.
+    pub fn encryption(&self) -> crate::mse::EncryptionPolicy {
+        self.connector.encryption()
+    }
+
+    /// Make the session's connections under `policy` from now on, and
+    /// announce it from the next announce: the connections already made
+    /// keep what they negotiated.
+    pub fn set_encryption(&self, policy: crate::mse::EncryptionPolicy) {
+        self.connector.set_encryption(policy);
+    }
+
     /// The IP filter the session holds to now.
     pub fn ip_filter(&self) -> IpFilter {
         self.ip_filter.read().clone()

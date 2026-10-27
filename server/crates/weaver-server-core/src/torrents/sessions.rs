@@ -807,8 +807,9 @@ impl Sessions {
         &self.rates
     }
 
-    /// The torrent settings. The open sessions take the limits and the IP
-    /// filter at once (libtorrent `session_impl::set_ip_filter`), the filter
+    /// The torrent settings. The open sessions take the limits, the
+    /// encryption and the IP filter at once (libtorrent
+    /// `session_impl::set_ip_filter`), the filter
     /// once the blocklist it names has loaded; a blocklist that does not
     /// load holds them closed. The transports, the DHT's bootstrap nodes,
     /// the stopped announce timeout and connections per address are a
@@ -1213,11 +1214,16 @@ impl Sessions {
     }
 
     /// Each route's session as the exporter reads it: from its counters
-    /// while it runs, and as held while it does not.
-    pub(crate) async fn metrics(&self) -> Vec<crate::torrents::metrics::SessionSeries> {
+    /// while it runs, and as held while it does not. Kept in `read` under
+    /// the sessions' lock, so of two readings the later kept is the later
+    /// taken.
+    pub(crate) async fn read_into(
+        &self,
+        read: &Mutex<Vec<crate::torrents::metrics::SessionSeries>>,
+    ) {
         use crate::torrents::metrics::SessionSeries;
         let slots = self.slots.lock().await;
-        slots
+        let sessions = slots
             .iter()
             .map(|(key, slot)| match (slot, slot.held()) {
                 (Slot::Open { session, port, .. }, None) => {
@@ -1225,7 +1231,8 @@ impl Sessions {
                 }
                 _ => SessionSeries::held(key.as_str()),
             })
-            .collect()
+            .collect();
+        *read.lock().unwrap_or_else(PoisonError::into_inner) = sessions;
     }
 
     pub async fn stop_all(&self) {
@@ -1291,10 +1298,12 @@ impl Configured {
         Some(filter_over(torrent, blocked))
     }
 
-    // Every open session holds to the settings' limits and, once the
-    // blocklist they name is loaded, to their IP filter; whether it is.
+    // Every open session holds to the settings' limits and encryption and,
+    // once the blocklist they name is loaded, to their IP filter; whether it
+    // is.
     fn lay_over(&mut self) -> bool {
         let limits = session_limits(&self.torrent);
+        let encryption = encryption_policy(self.torrent.encryption);
         let torrent = self.torrent.clone();
         let filter = self.filter_of(&torrent);
         self.open.retain(|session| {
@@ -1302,6 +1311,9 @@ impl Configured {
                 let open = !session.cancellation_token().is_cancelled();
                 if open && session.limits() != limits {
                     session.set_limits(limits);
+                }
+                if open {
+                    session.set_encryption(encryption);
                 }
                 if let Some(filter) = filter.as_ref().filter(|_| open) {
                     session.set_ip_filter(filter.clone());

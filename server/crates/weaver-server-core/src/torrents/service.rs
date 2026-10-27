@@ -1891,14 +1891,26 @@ impl TorrentService {
     }
 
     // Each route's session as it stands, for the exporter: read by the tick,
-    // and wherever sessions open or close outside it.
+    // wherever sessions open or close outside it, and as a torrent is given
+    // its session.
     async fn read_sessions(&self) {
-        let sessions = self.inner.sessions.metrics().await;
-        *self
-            .inner
-            .sessions_read
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = sessions;
+        self.inner
+            .sessions
+            .read_into(&self.inner.sessions_read)
+            .await;
+    }
+
+    // `plan`'s route's open session, opened for `opener` when it is not, and
+    // read before a torrent runs in it: no publish shows a torrent running
+    // on a route whose session it reads as held.
+    async fn open_session(
+        &self,
+        plan: &RoutePlan,
+        opener: &Identity,
+    ) -> Result<Arc<Session>, SessionError> {
+        let session = self.inner.sessions.session(plan, opener).await?;
+        self.read_sessions().await;
+        Ok(session)
     }
 
     /// The torrents and their sessions as last published, with the
@@ -2884,7 +2896,7 @@ impl TorrentService {
         identity: Identity,
         terms: PeerTerms,
     ) {
-        let session = match self.inner.sessions.session(&plan, &identity).await {
+        let session = match self.open_session(&plan, &identity).await {
             Ok(session) => session,
             Err(error) => {
                 self.fetch_ended(job_id).await;
@@ -3201,7 +3213,7 @@ impl TorrentService {
                 return;
             }
         };
-        let session = match self.inner.sessions.session(&plan, &identity).await {
+        let session = match self.open_session(&plan, &identity).await {
             Ok(session) => session,
             Err(error) => {
                 self.held(job_id, Some(plan.key), held_by(error)).await;

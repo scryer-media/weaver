@@ -2650,23 +2650,26 @@ pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics) {
     }
 }
 
-// Each route's session, one family at a time.
-fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
-    for session in sessions {
+// Each route's session, one family at a time: for every route whether its
+// session runs, and the figures of those that run. A held route says only
+// that it holds none.
+fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
+    for session in routes {
         out.sample(
             &f::TORRENT_SESSION_OPEN,
             &[("route", session.route.as_str())],
             u8::from(session.open),
         );
     }
-    for session in sessions {
+    let sessions = || routes.iter().filter(|session| session.open);
+    for session in sessions() {
         out.sample(
             &f::TORRENT_SESSION_LISTENING,
             &[("route", session.route.as_str())],
             u8::from(session.listen_port.is_some()),
         );
     }
-    for session in sessions {
+    for session in sessions() {
         if let Some(port) = session.listen_port {
             out.sample(
                 &f::TORRENT_SESSION_LISTEN_PORT,
@@ -2675,14 +2678,14 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             );
         }
     }
-    for session in sessions {
+    for session in sessions() {
         out.sample(
             &f::TORRENT_SESSION_EXTERNAL_ADDRESSES,
             &[("route", session.route.as_str())],
             session.external_addresses,
         );
     }
-    for session in sessions {
+    for session in sessions() {
         out.sample(
             &f::TORRENT_SESSION_UPTIME,
             &[("route", session.route.as_str())],
@@ -2701,7 +2704,7 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             |s: &SessionSeries| s.sent_protocol_bytes,
         ),
     ] {
-        for session in sessions {
+        for session in sessions() {
             let route = session.route.as_str();
             out.sample(
                 family,
@@ -2715,7 +2718,7 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             );
         }
     }
-    for session in sessions {
+    for session in sessions() {
         let route = session.route.as_str();
         out.sample(
             &f::TORRENT_SESSION_BLOCKED,
@@ -2728,7 +2731,7 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             session.blocked_outgoing,
         );
     }
-    for session in sessions {
+    for session in sessions() {
         for (state, count) in &session.peers {
             out.sample(
                 &f::TORRENT_SESSION_PEERS,
@@ -2737,7 +2740,7 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             );
         }
     }
-    for session in sessions {
+    for session in sessions() {
         for (transport, family, [attempts, _, _]) in &session.connects {
             out.sample(
                 &f::TORRENT_SESSION_CONNECT_ATTEMPTS,
@@ -2750,7 +2753,7 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             );
         }
     }
-    for session in sessions {
+    for session in sessions() {
         for (transport, family, [_, successes, errors]) in &session.connects {
             for (result, count) in [("succeeded", successes), ("failed", errors)] {
                 out.sample(
@@ -2766,7 +2769,7 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             }
         }
     }
-    for session in sessions {
+    for session in sessions() {
         if let Some((v4, v6, _)) = session.dht {
             let route = session.route.as_str();
             out.sample(
@@ -2781,7 +2784,7 @@ fn render_torrent_sessions(out: &mut Encoder, sessions: &[SessionSeries]) {
             );
         }
     }
-    for session in sessions {
+    for session in sessions() {
         if let Some((_, _, outstanding)) = session.dht {
             out.sample(
                 &f::TORRENT_DHT_OUTSTANDING,

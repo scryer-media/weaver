@@ -1096,7 +1096,6 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_session_open{{{ROUTE}}} 1"),
         format!("weaver_torrent_session_open{{{HELD}}} 0"),
         format!("weaver_torrent_session_listening{{{ROUTE}}} 1"),
-        format!("weaver_torrent_session_listening{{{HELD}}} 0"),
         format!("weaver_torrent_session_listen_port{{{ROUTE}}} 6881"),
         format!("weaver_torrent_session_external_addresses{{{ROUTE}}} 1"),
         format!("weaver_torrent_session_uptime_seconds{{{ROUTE}}} 1200"),
@@ -1163,6 +1162,17 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
             "torrent exposition carries {absent:?}:\n{rendered}"
         );
     }
+
+    // A held route says it holds no session, and nothing else.
+    let held: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.contains(HELD))
+        .collect();
+    assert_eq!(
+        held,
+        [format!("weaver_torrent_session_open{{{HELD}}} 0")],
+        "{rendered}"
+    );
 
     // One 0/1 sample per value of each state family, exactly one of them 1.
     for (family, labels, values) in [

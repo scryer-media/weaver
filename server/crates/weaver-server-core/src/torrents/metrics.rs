@@ -372,7 +372,8 @@ pub fn trackers(
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SessionSeries {
     pub route: String,
-    /// Its session runs; the rest is zero while it does not.
+    /// Its session runs; the rest is zero, and goes unrendered, while it
+    /// does not.
     pub open: bool,
     pub listen_port: Option<u16>,
     pub external_addresses: usize,
