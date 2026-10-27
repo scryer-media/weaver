@@ -542,3 +542,74 @@ fn recovery_blocks_ahead_of_their_matrix_wait_until_it_arrives_or_is_lost() {
         }
     ));
 }
+
+// With the index gone, no volume head describes a set: the object waits and
+// asks for the whole of one volume, which carries the description ahead of
+// its blocks, and once that volume is in it rules.
+#[test]
+fn an_undescribed_set_asks_for_one_volume_and_rules_once_it_is_in() {
+    const HEAD: usize = 64;
+    let one = payload(51, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+    let volumes: Vec<_> = files.iter().filter(|(name, _)| name.contains(".vol")).collect();
+    assert!(!volumes.is_empty());
+    let mut job = Job::new(Par3::new(OWN), OWN);
+    let mut named = Vec::new();
+    for (name, bytes) in &volumes {
+        let volume = job.name(name, bytes);
+        deliver(&mut job, volume, bytes, ByteRange::new(0, HEAD as u64));
+        named.push((volume, bytes));
+    }
+    job.member("one.bin", &one);
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    let mut out = Vec::new();
+    Recovery::wants(&job.object, &mut out);
+    let asked: Vec<&Seek> = out
+        .iter()
+        .filter(|seek| {
+            seek.purpose == weaver_graph::Purpose::Recovery && seek.when == weaver_graph::When::Now
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "{out:?}");
+    let volume = asked[0].volume;
+    assert_eq!(asked[0].weight, weaver_graph::Weight::FIRST);
+    let bytes = named
+        .iter()
+        .find(|(at, _)| *at == volume)
+        .map(|(_, bytes)| *bytes)
+        .expect("the asked volume is one of the set's");
+    deliver(&mut job, volume, bytes, ByteRange::new(HEAD as u64, bytes.len() as u64));
+    job.object.volume_closed(volume, &mut Vec::new());
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+}
+
+// A member with a hole read through what arrived: the hole leaves unknown
+// only the block it falls in, so one recovery block rebuilds it.
+#[test]
+fn a_hole_in_a_member_leaves_unknown_only_the_block_it_touches() {
+    let one = payload(52, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 1);
+    let mut job = job(&files);
+    let mut wrong = one.clone();
+    let hole = ByteRange::new(5000, 5100);
+    wrong[hole.start as usize..hole.end as usize].fill(0);
+    let first = job.member("one.bin", &wrong);
+    job.store.holes.insert(first, vec![hole]);
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&first] == one);
+}

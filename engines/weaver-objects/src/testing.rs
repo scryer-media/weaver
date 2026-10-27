@@ -214,6 +214,9 @@ pub(crate) fn segments(
 pub(crate) struct Store {
     pub(crate) members: BTreeMap<MemberId, Vec<u8>>,
     pub(crate) volumes: BTreeMap<VolumeIndex, Vec<u8>>,
+    // Ranges of members that never arrived, in offset order: a read across
+    // one fails, as the namespace's would, and a repair over one fills it.
+    pub(crate) holes: BTreeMap<MemberId, Vec<ByteRange>>,
     pub(crate) reads: usize,
     pub(crate) volume_reads: usize,
     pub(crate) writes: usize,
@@ -225,6 +228,10 @@ impl MemberAccess for Store {
         let Some(bytes) = self.members.get(&member) else {
             return false;
         };
+        let holes = self.holes.get(&member).map_or(&[][..], Vec::as_slice);
+        if holes.iter().any(|hole| hole.intersect(range).is_some()) {
+            return false;
+        }
         match bytes.get(range.start as usize..range.end as usize) {
             Some(piece) => {
                 into.extend_from_slice(piece);
@@ -236,6 +243,10 @@ impl MemberAccess for Store {
 
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
         self.writes += 1;
+        let written = ByteRange::at(offset, bytes.len() as u64);
+        if let Some(holes) = self.holes.get_mut(&member) {
+            holes.retain(|hole| hole.intersect(written).is_none());
+        }
         if let Some(found) = self.members.get_mut(&member) {
             let start = offset as usize;
             if found.len() < start + bytes.len() {
@@ -247,6 +258,22 @@ impl MemberAccess for Store {
 
     fn length(&self, member: MemberId) -> Option<u64> {
         self.members.get(&member).map(|bytes| bytes.len() as u64)
+    }
+
+    fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+        let mut start = range.start;
+        for hole in self.holes.get(&member).map_or(&[][..], Vec::as_slice) {
+            let Some(cut) = hole.intersect(range) else {
+                continue;
+            };
+            if cut.start > start {
+                out.push(ByteRange::new(start, cut.start));
+            }
+            start = start.max(cut.end);
+        }
+        if start < range.end {
+            out.push(ByteRange::new(start, range.end));
+        }
     }
 
     fn read_volume(&mut self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
