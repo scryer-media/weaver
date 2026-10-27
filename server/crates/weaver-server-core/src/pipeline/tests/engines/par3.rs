@@ -297,6 +297,26 @@ async fn a_damaged_obfuscated_member_under_par3_is_repaired_and_renamed() {
     assert!(claims_all(&view.claims, Claim::Complete));
 }
 
+// A hex name that ends in a piece number reads as a piece of a split set
+// until the set names the member: then nothing holds it as a piece, and it
+// is repaired and delivered under the name the set gives it.
+#[tokio::test]
+async fn an_obfuscated_member_named_like_a_split_piece_is_repaired_and_renamed() {
+    let lantern = payload(4 * ARTICLE, 74);
+    let described = [("lantern.mkv", lantern.as_slice())];
+    let mut posts = vec![Post::plain(
+        "51273aad56a8b904e96928935278a627.201",
+        lantern.clone(),
+    )];
+    posts.extend(par3_set("lantern", &described, 2));
+    let graph = run(&Scenario::new(posts).damaged(0, 1)).await;
+    assert_delivers(&graph, &[("lantern.mkv", &lantern[..])]);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+}
+
 // As beside PAR2: the volume is repaired in the stream and the member
 // delivered.
 #[tokio::test]

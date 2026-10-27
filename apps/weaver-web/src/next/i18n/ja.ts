@@ -522,7 +522,7 @@ export const nextJa: LocaleDictionary = {
   "next.logs.filter.label": "ログレベル",
   "next.logs.filter.preset.default": "既定",
   "next.logs.filter.preset.download": "ダウンロードのデバッグ",
-  "next.logs.filter.preset.directStore": "ダイレクトストアのデバッグ",
+  "next.logs.filter.preset.graphEngine": "グラフエンジンのデバッグ",
   "next.logs.filter.preset.everything": "すべてデバッグ",
   "next.logs.filter.preset.custom": "カスタム",
   "next.logs.filter.directives": "フィルター指定",

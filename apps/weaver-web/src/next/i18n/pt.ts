@@ -522,7 +522,7 @@ export const nextPt: LocaleDictionary = {
   "next.logs.filter.label": "Nível de log",
   "next.logs.filter.preset.default": "Padrão",
   "next.logs.filter.preset.download": "Depuração de downloads",
-  "next.logs.filter.preset.directStore": "Depuração do direct-store",
+  "next.logs.filter.preset.graphEngine": "Depuração do motor de grafos",
   "next.logs.filter.preset.everything": "Depurar tudo",
   "next.logs.filter.preset.custom": "Personalizado",
   "next.logs.filter.directives": "Diretivas de filtro",

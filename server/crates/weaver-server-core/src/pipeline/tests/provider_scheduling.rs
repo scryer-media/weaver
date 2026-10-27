@@ -243,3 +243,124 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
         while servers.join_next().await.is_some() {}
     }
 }
+
+// A fill server whose quota cannot take one more article turns the article
+// away at dispatch, and the lower-priority server that takes it instead does
+// not clear the refusal: the refusing server reads blocked for as long as its
+// allowance stays short of an article.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_out_of_quota_reads_blocked_while_a_lower_priority_server_takes_its_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let transfers = weaver_nntp::transfer::ServerTransferRegistry::new();
+    let primary = transfers.configure(
+        weaver_nntp::transfer::StableServerId(1),
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 4096,
+                generation: 1,
+                retry_at: None,
+            }),
+        },
+    );
+    let (commands, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let mut servers = tokio::task::JoinSet::new();
+    let mut configs = Vec::new();
+    for server in 0..2usize {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            tls: false,
+            ..Default::default()
+        });
+        config.group = server as u32;
+        config.max_connections = 1;
+        config.stable_id = weaver_nntp::transfer::StableServerId(server as u32 + 1);
+        if server == 0 {
+            config.transfer_control = Some(Arc::clone(&primary));
+        }
+        configs.push(config);
+        let commands = commands.clone();
+        servers.spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let commands = commands.clone();
+                connections.spawn(async move {
+                    let (read, mut write) = socket.into_split();
+                    write.write_all(b"200 fixture ready\r\n").await.unwrap();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(command)) = lines.next_line().await {
+                        if command == "CAPABILITIES" {
+                            write
+                                .write_all(b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n")
+                                .await
+                                .unwrap();
+                        } else if command.starts_with("GROUP ") {
+                            write
+                                .write_all(b"211 1 1 1 alt.binaries.test\r\n")
+                                .await
+                                .unwrap();
+                        } else if command.starts_with("BODY ") {
+                            let _ = commands.send((server, command));
+                            write.write_all(b"430 fixture absent\r\n").await.unwrap();
+                        } else if command == "QUIT" {
+                            break;
+                        } else {
+                            write.write_all(b"500 unsupported\r\n").await.unwrap();
+                        }
+                    }
+                });
+            }
+        });
+    }
+    pipeline.nntp = Arc::new(weaver_nntp::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig {
+            servers: configs,
+            max_idle_age: Duration::from_mins(5),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(3600),
+        },
+    ));
+    pipeline.tuner.set_connection_limit(2);
+    pipeline.owned_download_lane_pool.resize(2);
+    let spec = segmented_job_spec("quota-fallback", "payload.bin", &[65536; 3]);
+    pipeline
+        .add_job(
+            JobId(1),
+            spec,
+            PathBuf::from("quota-fallback.nzb"),
+            sample_nzb_zstd(),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!primary.snapshot().quota_blocked);
+
+    pipeline.dispatch_downloads();
+    let (server, command) = loop {
+        tokio::select! {
+            command = observed.recv() => break command.unwrap(),
+            event = pipeline.owned_download_lane_event_rx.recv() => {
+                let event = event.unwrap();
+                let mut results = VecDeque::new();
+                pipeline.handle_owned_download_lane_event(event, &mut results);
+                pipeline.dispatch_downloads();
+            }
+            Some(request) = pipeline.download_refill_rx.recv() => {
+                let _ = request.response_tx.send(DownloadLaneRefillResponse {
+                    lease: None,
+                    park_reason: LaneParkReason::NoWork,
+                });
+            }
+        }
+    };
+    assert_eq!(server, 1, "the out-of-quota server sent {command}");
+    assert!(
+        primary.snapshot().quota_blocked,
+        "the server that turned the article away must read blocked"
+    );
+    servers.abort_all();
+}

@@ -522,7 +522,7 @@ export const nextIt: LocaleDictionary = {
   "next.logs.filter.label": "Livello di log",
   "next.logs.filter.preset.default": "Predefinito",
   "next.logs.filter.preset.download": "Debug download",
-  "next.logs.filter.preset.directStore": "Debug direct-store",
+  "next.logs.filter.preset.graphEngine": "Debug motore a grafo",
   "next.logs.filter.preset.everything": "Debug completo",
   "next.logs.filter.preset.custom": "Personalizzato",
   "next.logs.filter.directives": "Direttive del filtro",

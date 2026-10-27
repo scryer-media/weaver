@@ -100,6 +100,20 @@ impl RunVolumes {
         self.lost.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    // Whether every volume the run reads is in: no volume can join, and
+    // each bound one has closed.
+    pub(crate) fn all_in(&self) -> bool {
+        let state = self.shelf.lock();
+        state.complete
+            && !state.deciding
+            && state.volumes.iter().all(|volume| {
+                state
+                    .kept
+                    .get(volume)
+                    .is_some_and(|kept| kept.closed.is_some())
+            })
+    }
+
     // Whether the run may still speak: nothing has stopped it.
     pub(crate) fn current(&self) -> bool {
         !self.stopped() && self.shelf.generation() == self.generation

@@ -251,7 +251,6 @@ impl Pipeline {
             nzb_reprocess_pending: HashSet::new(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
-            archive_password_winners: HashMap::new(),
             job_order: Vec::new(),
             active_downloads: 0,
             active_download_connections: 0,
@@ -595,6 +594,12 @@ impl Pipeline {
                 job_id,
                 finalization_pending,
             });
+        }
+    }
+
+    pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
+        if self.jobs_finalizing_download.remove(&job_id) {
+            self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
         }
     }
 

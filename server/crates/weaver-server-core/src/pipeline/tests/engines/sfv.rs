@@ -2,8 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // SFV listings: a listing that agrees, one that names a
-// file the job does not carry, one that disagrees, and one whose names differ
-// from the members' only in case.
+// file the job does not carry, one that disagrees, one whose names differ
+// from the members' only in case, one that leaves a file unnamed, two that
+// contradict each other, and one naming a file the post lost.
 
 use super::harness::{ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, payload, run};
 use crate::history::HistoryFailureKind;
@@ -121,4 +122,72 @@ async fn an_sfv_naming_a_member_in_another_case_binds_and_verifies_it() {
     ]);
     let graph = run(&scenario).await;
     assert_failed_as_repair(&graph, "lantern.bin", "lantern.sfv");
+}
+
+// A payload file no listing names is left as posted, and the job completes.
+#[tokio::test]
+async fn a_file_the_listing_does_not_name_completes_unchecked() {
+    let lantern = payload(3 * ARTICLE, 30);
+    let beacon = payload(2 * ARTICLE, 31);
+    let scenario = Scenario::new(vec![
+        Post::plain("lantern.bin", lantern.clone()),
+        Post::plain("beacon.bin", beacon.clone()),
+        listing("lantern.sfv", &[("lantern.bin", crc(&lantern))]),
+    ]);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.graph().claims["beacon.bin"], Claim::Complete);
+    assert_eq!(graph.files["lantern beacon/beacon.bin"], beacon);
+}
+
+// Two listings that disagree about one name are a contradiction, not
+// evidence: that file is not failed on either, and the name they agree on
+// is still checked.
+#[tokio::test]
+async fn listings_that_disagree_about_a_name_fail_neither_way() {
+    let lantern = payload(3 * ARTICLE, 33);
+    let beacon = payload(2 * ARTICLE, 34);
+    let scenario = Scenario::new(vec![
+        Post::plain("lantern.bin", lantern.clone()),
+        Post::plain("beacon.bin", beacon.clone()),
+        listing(
+            "lantern.sfv",
+            &[("lantern.bin", crc(&lantern)), ("beacon.bin", crc(&beacon))],
+        ),
+        listing("lantern.extra.sfv", &[("lantern.bin", 0x0bad_f00d)]),
+    ]);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.graph().claims["beacon.bin"], Claim::Complete);
+}
+
+// A file the listing names whose every article is lost is the one file not
+// delivered whole: the job ends Partial, the namespace marking that file.
+#[tokio::test]
+async fn a_listed_file_whose_articles_are_all_lost_ends_partial_marking_it() {
+    let lantern = payload(2 * ARTICLE, 35);
+    let beacon = payload(2 * ARTICLE, 36);
+    let scenario = Scenario::new(vec![
+        Post::plain("lantern.bin", lantern.clone()),
+        Post::plain("beacon.bin", beacon.clone()),
+        listing(
+            "lantern.sfv",
+            &[("lantern.bin", crc(&lantern)), ("beacon.bin", crc(&beacon))],
+        ),
+    ])
+    .lost(1, 0)
+    .lost(1, 1);
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    let view = graph.graph();
+    assert_eq!(view.claims["lantern.bin"], Claim::Complete);
+    assert_eq!(view.claims["beacon.bin"], Claim::Damaged);
 }

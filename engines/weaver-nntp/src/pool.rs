@@ -1557,6 +1557,23 @@ impl NntpPool {
         })
     }
 
+    // The same gate for an article that carries its own failure exclusions
+    // and its job's retention exclusions apart.
+    pub fn backfill_open_for(
+        &self,
+        failure_excludes: &[usize],
+        retention_excludes: &[usize],
+    ) -> bool {
+        crate::provider_policy::backfill_unlocked(self.backfill.iter().copied(), |idx| {
+            failure_excludes.contains(&idx) || retention_excludes.contains(&idx)
+        })
+    }
+
+    // Whether pool server `idx` is a backfill server.
+    pub fn is_backfill(&self, idx: usize) -> bool {
+        self.backfill.get(idx).copied().unwrap_or(false)
+    }
+
     // Whether this server refuses this pool's credentials: health disabled it
     // for `DisableReason::AuthFailure` and that disable still runs. This is
     // the one answer to "may this server serve an article" beyond the

@@ -6,8 +6,8 @@
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
-    ARTICLE, Claim, Post, Scenario, assert_fetched_once, one_block_article, par2_set, payload,
-    repair_and_terminal_events, run,
+    ARTICLE, Claim, Post, Scenario, assert_fetched_once, one_block_article, par2_set, par2_volumes,
+    payload, repair_and_terminal_events, run, try_run,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
@@ -357,4 +357,73 @@ async fn an_entirely_lost_payload_under_par2_is_rebuilt() {
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 2 })]
     );
+}
+
+// Every article of the index damaged, a payload article lost, and two
+// intact recovery volumes: each volume carries the set's file descriptions
+// beside its blocks, so the set is founded from them and rebuilds the file.
+#[tokio::test]
+async fn a_damaged_index_leaves_the_set_to_its_volumes() {
+    let data = payload(6 * ARTICLE, 41);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &data)], 4, 2));
+    let index = posts[1].bytes.len().div_ceil(ARTICLE) as u32;
+    let mut scenario = Scenario::new(posts).lost(0, 2);
+    for ordinal in 0..index {
+        scenario = scenario.damaged(1, ordinal);
+    }
+    let graph = try_run(&scenario).await.expect("the job settles");
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+}
+
+// The index damaged and each recovery volume lost past its first article:
+// the set is known from the blocks at the volumes' heads, but no packet that
+// says what it describes is left, so it checked nothing. Every payload byte
+// arrived, so the job completes.
+#[tokio::test]
+async fn a_set_with_no_description_left_checks_nothing() {
+    let data = payload(6 * ARTICLE, 47);
+    let scenario = undescribed(data.clone(), false);
+    let graph = try_run(&scenario).await.expect("the job settles");
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+}
+
+// The same with a payload article lost: nothing can rebuild it, so the job
+// fails for the short file rather than waiting on a description.
+#[tokio::test]
+async fn a_set_with_no_description_left_fails_the_short_file() {
+    let scenario = undescribed(payload(6 * ARTICLE, 43), true);
+    let graph = try_run(&scenario).await.expect("the job settles");
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some("no file was delivered whole; 1 short: lantern.bin")
+    );
+}
+
+fn undescribed(data: Vec<u8>, lose_payload: bool) -> Scenario {
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &data)], 4, 2));
+    let articles: Vec<u32> = posts
+        .iter()
+        .map(|post| post.bytes.len().div_ceil(ARTICLE) as u32)
+        .collect();
+    let mut scenario = Scenario::new(posts);
+    if lose_payload {
+        scenario = scenario.lost(0, 2);
+    }
+    for ordinal in 0..articles[1] {
+        scenario = scenario.damaged(1, ordinal);
+    }
+    for (file, count) in articles.iter().enumerate().skip(2) {
+        for ordinal in 1..*count {
+            scenario = scenario.lost(file as u32, ordinal);
+        }
+    }
+    scenario
 }

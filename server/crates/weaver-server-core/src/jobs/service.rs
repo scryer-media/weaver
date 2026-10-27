@@ -581,10 +581,6 @@ impl Pipeline {
         let started = std::time::Instant::now();
         let stage_start = started;
         self.queue_scripts_completed.remove(&job_id);
-        if restart.is_some() {
-            self.archive_password_winners
-                .retain(|(id, _), _| *id != job_id);
-        }
         let reprocess = restart.as_ref().is_some_and(|restart| restart.reprocess);
         // A reprocess fetches again every article: it has no checkpoint to say
         // where any was placed.
@@ -1295,6 +1291,13 @@ impl Pipeline {
             .is_some_and(|state| matches!(state.status, JobStatus::Extracting))
         {
             self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+        }
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| matches!(state.status, JobStatus::Verifying))
+        {
+            self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
         }
 
         let (queued_repair_at_epoch_ms, queued_extract_at_epoch_ms) = self

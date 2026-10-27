@@ -229,8 +229,19 @@ impl Delivery {
 
     // What was withheld, worded by why its object refused it: the names
     // one reason withheld, then the reason, for each reason in the order
-    // the walk met it. `None` when nothing was.
+    // the walk met it. A password withheld something, and the error opens
+    // with the marker integrations read a password failure by. `None` when
+    // nothing was.
     pub(crate) fn withheld_error(&self) -> Option<String> {
+        let marker = if self
+            .withheld
+            .iter()
+            .any(|(_, why)| matches!(why, Why::Encrypted | Why::EncryptedHeader))
+        {
+            crate::pipeline::extraction::error::PASSWORD_REQUIRED_MARKER
+        } else {
+            ""
+        };
         let mut reasons: Vec<(&str, Vec<&str>)> = Vec::new();
         for (name, why) in &self.withheld {
             let reason = withheld_because(*why);
@@ -240,11 +251,12 @@ impl Delivery {
             }
         }
         (!reasons.is_empty()).then(|| {
-            reasons
+            let reasons = reasons
                 .iter()
                 .map(|(reason, names)| format!("{} {reason}", names.join(", ")))
                 .collect::<Vec<_>>()
-                .join("; ")
+                .join("; ");
+            format!("{marker}{reasons}")
         })
     }
 

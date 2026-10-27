@@ -3273,3 +3273,205 @@ async fn a_job_the_dispatcher_holds_off_every_lane_reports_why_on_the_queue() {
         Some("no_server")
     );
 }
+
+#[tokio::test]
+async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20013);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Pool Capacity Guard", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
+    pipeline.active_download_passes.insert(job_id);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: segment_id.file_id.job_id,
+            runtime_generation: 0,
+            segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::CapacityUnavailable,
+                "no connections available",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: vec![0],
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    assert_eq!(
+        pipeline
+            .download_wait_by_job
+            .get(&job_id)
+            .map(|wait| wait.reason),
+        Some("provider connection capacity unavailable")
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("generation wake should requeue parked infrastructure work");
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
+    assert_eq!(retry.exclude_servers, vec![0]);
+    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20014);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Lane Acquire Guard", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.download_queue = DownloadQueue::new();
+        state.recovery_queue = DownloadQueue::new();
+    }
+
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
+    pipeline.active_download_passes.insert(job_id);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: segment_id.file_id.job_id,
+            runtime_generation: 0,
+            segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::LaneUnavailable,
+                "failed to acquire BODY lane",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 1,
+            exclude_servers: vec![0, 1],
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .download_wait_by_job
+            .get(&job_id)
+            .map(|wait| wait.reason),
+        Some("no eligible NNTP server")
+    );
+
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("generation wake should requeue parked pre-BODY work without retry charge");
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES + 1);
+    assert_eq!(retry.exclude_servers, vec![0, 1]);
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
+}

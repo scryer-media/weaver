@@ -80,6 +80,7 @@ impl Pipeline {
             caps: self.graph_caps(&files),
             nesting: super::limits::NESTING,
             hardware: self.graph_hardware.clone(),
+            metrics: Some(Arc::clone(&self.metrics)),
         };
         let limit = storage.slots;
         let Restored {

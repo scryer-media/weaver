@@ -575,6 +575,12 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) events: Vec<PipelineEvent>,
     // The extraction refusals the run counted, in the metric's reason order.
     pub(in crate::pipeline::tests) rejections: [u64; 9],
+    // The pipeline's metrics as the run left them.
+    pub(in crate::pipeline::tests) metrics: crate::operations::metrics::MetricsSnapshot,
+    // The password the job's history says an archive opened with.
+    pub(in crate::pipeline::tests) validated_password: Option<String>,
+    // The metadata the job's history row keeps, as stored.
+    pub(in crate::pipeline::tests) history_metadata: Option<String>,
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
@@ -795,6 +801,13 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
     drop(heard);
     let events = kept.await.expect("every event the run sent is kept");
     let rejections = pipeline.metrics.extraction_rejections();
+    let metrics = pipeline.metrics.raw_snapshot();
+    let validated_password = pipeline.db.validated_archive_password(JOB.0).unwrap();
+    let history_metadata = pipeline
+        .db
+        .get_job_history(JOB.0)
+        .unwrap()
+        .and_then(|row| row.metadata);
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         status,
@@ -809,6 +822,9 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         graph,
         events,
         rejections,
+        metrics,
+        validated_password,
+        history_metadata,
     })
 }
 

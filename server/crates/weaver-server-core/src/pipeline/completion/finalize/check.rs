@@ -207,6 +207,15 @@ impl Pipeline {
             self.deferred_post_processing.insert(job_id);
             return;
         }
+        // A part parked behind an ordinal that has settled is written before
+        // completion is weighed, or the job would be judged with that part
+        // neither placed nor given up.
+        self.release_settled_unanchored_runs().await;
+        // A download whose finalization was left open closes it once nothing
+        // it owes is left, before the graph moves the job on.
+        if !self.job_has_pending_download_pipeline_work(job_id) {
+            self.emit_download_pipeline_drained_if_pending(job_id);
+        }
         crate::pipeline::graph::status::advance(self, job_id).await;
     }
 }

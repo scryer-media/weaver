@@ -890,3 +890,342 @@ async fn pause_clears_stale_completion_rechecks() {
         Some(JobStatus::Paused)
     );
 }
+
+#[tokio::test]
+async fn job_completed_event_publishes_after_history_archive_commits() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30040);
+    // A job with no article left to account for.
+    let spec = JobSpec {
+        files: Vec::new(),
+        ..standalone_job_spec(
+            "Durable Completion Event",
+            &[("durable-completion.mkv".to_string(), 123)],
+        )
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    let release = hold_database_writer(&pipeline);
+    pipeline.complete_job_after_terminal_post_processing(job_id);
+
+    assert!(
+        !drain_job_events(&mut events, job_id)
+            .iter()
+            .any(|event| matches!(event, PipelineEvent::JobCompleted { .. })),
+        "completion must not be announced while the history archive is still queued"
+    );
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+
+    drop(release);
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobCompleted { job_id: id } if *id == job_id),
+    )
+    .await;
+
+    // The facade refuses history lookups for jobs the scheduler still lists as
+    // live, so the finished snapshot has to be published by the time the event
+    // is observable.
+    assert!(
+        pipeline
+            .shared_state
+            .list_jobs()
+            .iter()
+            .all(|info| info.job_id != job_id || is_terminal_status(&info.status)),
+        "completed job must be published as finished before its terminal event"
+    );
+
+    // Deliberately no flush_write_queue: a subscriber that reacts to the
+    // terminal event must find the row through the same reads the history
+    // facade uses.
+    let archived = pipeline.db.get_job_history(job_id.0).unwrap();
+    assert_eq!(
+        archived.map(|row| row.status),
+        Some("complete".to_string()),
+        "history row must be readable as soon as the completion event is observed"
+    );
+    let listed = pipeline
+        .db
+        .list_job_history(&crate::HistoryFilter::default())
+        .unwrap();
+    assert!(listed.iter().any(|row| row.job_id == job_id.0));
+}
+
+#[tokio::test]
+async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31207);
+    let spec = standalone_job_spec(
+        "Restore staged extraction",
+        &[("sample.bin".to_string(), 100)],
+    );
+    let working_dir = temp_dir.path().join("restore-staged-extraction");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+    let staging_dir = pipeline.deterministic_extraction_staging_dir(job_id);
+    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.staging_dir.clone()),
+        Some(staging_dir)
+    );
+}
+
+#[tokio::test]
+async fn restore_job_normalizes_persisted_checking_to_queued_when_work_remains() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30092);
+    let spec = standalone_job_spec(
+        "Restore Checking Pending",
+        &[
+            ("probe-a.bin".to_string(), 100),
+            ("probe-b.bin".to_string(), 100),
+        ],
+    );
+    let working_dir = temp_dir.path().join("restore-checking-pending");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status: JobStatus::Checking,
+            download_state: Some(crate::jobs::model::DownloadState::Checking),
+            post_state: Some(crate::jobs::model::PostState::Idle),
+            run_state: Some(crate::jobs::model::RunState::Active),
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(matches!(
+        state.download_state,
+        crate::jobs::model::DownloadState::Queued
+    ));
+}
+
+#[tokio::test]
+async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_remains() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30093);
+    let spec = standalone_job_spec(
+        "Restore Checking Complete",
+        &[
+            ("probe-a.bin".to_string(), 100),
+            ("probe-b.bin".to_string(), 100),
+        ],
+    );
+    // A job with no article left to fetch.
+    let spec = JobSpec {
+        files: Vec::new(),
+        ..spec
+    };
+    let working_dir = temp_dir.path().join("restore-checking-complete");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status: JobStatus::Checking,
+            download_state: Some(crate::jobs::model::DownloadState::Checking),
+            post_state: Some(crate::jobs::model::PostState::Idle),
+            run_state: Some(crate::jobs::model::RunState::Active),
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert!(matches!(
+        state.download_state,
+        crate::jobs::model::DownloadState::Complete
+    ));
+}
+
+#[tokio::test]
+async fn restore_queued_postprocessing_schedules_completion_check() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(31201);
+    let spec = standalone_job_spec("Restore queued repair", &[("sample.bin".to_string(), 100)]);
+    let working_dir = temp_dir.path().join("restore-queued-repair");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status: JobStatus::QueuedRepair,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pipeline
+            .pending_completion_checks
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![job_id]
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::QueuedRepair)
+    );
+}
+
+#[tokio::test]
+async fn restore_job_reemits_open_download_finalization_and_drains_it() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(30094);
+    let spec = standalone_job_spec(
+        "Restore Finalizing Download",
+        &[("payload.bin".to_string(), 100)],
+    );
+    // A job with no article left to fetch.
+    let spec = JobSpec {
+        files: Vec::new(),
+        ..spec
+    };
+    let working_dir = temp_dir.path().join("restore-finalizing-download");
+    tokio::fs::create_dir_all(&working_dir).await.unwrap();
+
+    pipeline
+        .db
+        .insert_job_events(&[
+            crate::JobEvent {
+                job_id: job_id.0,
+                timestamp: 1,
+                kind: "JobCreated".to_string(),
+                message: "created".to_string(),
+                file_id: None,
+            },
+            crate::JobEvent {
+                job_id: job_id.0,
+                timestamp: 2,
+                kind: "DownloadFinished".to_string(),
+                message: "download finished".to_string(),
+                file_id: Some(
+                    crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER.to_string(),
+                ),
+            },
+        ])
+        .unwrap();
+
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status: JobStatus::Downloading,
+            download_state: Some(crate::jobs::model::DownloadState::Complete),
+            post_state: Some(crate::jobs::model::PostState::Idle),
+            run_state: Some(crate::jobs::model::RunState::Active),
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+
+    assert!(pipeline.jobs_finalizing_download.contains(&job_id));
+
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(
+        drained_events.iter().any(|event| {
+            matches!(
+                event,
+                PipelineEvent::DownloadFinished {
+                    finalization_pending: true,
+                    ..
+                }
+            )
+        }),
+        "events: {drained_events:?}"
+    );
+    let finish_idx = drained_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                PipelineEvent::DownloadFinished {
+                    finalization_pending: true,
+                    ..
+                }
+            )
+        })
+        .expect("restored download finished event");
+    let drained_idx = drained_events
+        .iter()
+        .position(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+        .expect("download pipeline drained event");
+    assert!(finish_idx < drained_idx, "events: {drained_events:?}");
+    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
+}

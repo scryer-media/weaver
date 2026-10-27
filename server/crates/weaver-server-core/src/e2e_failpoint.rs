@@ -9,6 +9,16 @@ pub const STATUS_ENTER_VERIFYING: &str = "status.enter_verifying";
 pub const STATUS_ENTER_REPAIRING: &str = "status.enter_repairing";
 pub const STATUS_ENTER_QUEUED_REPAIR: &str = "status.enter_queued_repair";
 pub const STATUS_ENTER_QUEUED_EXTRACT: &str = "status.enter_queued_extract";
+// A graph job is extracting: an engine run, on its blocking thread, still
+// producing members once every volume it reads is in. Held there, it stops
+// that one run and nothing else.
+pub const STATUS_ENTER_EXTRACTING: &str = "status.enter_extracting";
+
+// An engine run over an object's volumes, on its blocking thread, as it
+// finds each member.
+pub const EXTRACT_MEMBER_START: &str = "extract.member_start";
+// A recovery set's repair, on its blocking thread, before it reads anything.
+pub const REPAIR_TASK_START: &str = "repair.task_start";
 
 // After a recovery set's repair has ruled and before the job's delivery
 // moves anything, off the pipeline's loop, so a held job stands still while the
@@ -150,6 +160,28 @@ pub fn maybe_delay(name: &str) {
         "tripping e2e delay hook"
     );
     std::thread::sleep(std::time::Duration::from_millis(configured.millis));
+}
+
+// Whether a delay, a hold or a failpoint names `name` and has yet to fire,
+// for a hook whose own condition costs something to read.
+pub fn armed(name: &str) -> bool {
+    let unfired =
+        |configured: &str, fired: &AtomicBool| configured == name && !fired.load(Ordering::SeqCst);
+    configured_delay()
+        .as_ref()
+        .is_some_and(|configured| unfired(&configured.name, &configured.fired))
+        || configured_shutdown_hold()
+            .as_ref()
+            .is_some_and(|configured| unfired(&configured.name, &configured.fired))
+        || configured_failpoint()
+            .as_ref()
+            .is_some_and(|configured| unfired(&configured.name, &configured.fired))
+}
+
+// The delay or hold, then the failpoint, that `name` names.
+pub fn fire(name: &str) {
+    maybe_delay(name);
+    maybe_trip(name);
 }
 
 pub fn maybe_trip(name: &str) {

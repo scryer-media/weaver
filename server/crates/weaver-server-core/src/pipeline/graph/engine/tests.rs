@@ -195,6 +195,26 @@ fn a_read_of_bytes_nothing_will_bring_fails_as_lost() {
     assert!(volumes.lost());
 }
 
+// Every volume a run reads is in once no volume can join and each bound one
+// has closed: until then a member it finds may still wait on bytes.
+#[test]
+fn a_run_has_all_its_volumes_once_none_can_join_and_each_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_envelopes, shelf) = shelved(dir.path());
+    let volumes = reader(&shelf);
+    close(&shelf, 0, 10, false);
+    assert!(!volumes.all_in(), "another volume can still join");
+    shelf.update(|state| {
+        state.volumes.insert(1);
+        state.complete = true;
+    });
+    assert!(!volumes.all_in(), "the second volume is still open");
+    close(&shelf, 1, 4, false);
+    assert!(volumes.all_in());
+    shelf.update(|state| state.deciding = true);
+    assert!(!volumes.all_in(), "a member beside them is still deciding");
+}
+
 #[test]
 fn a_volume_that_never_joined_is_lost_once_no_more_can_join() {
     let dir = tempfile::tempdir().unwrap();

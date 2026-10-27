@@ -60,6 +60,11 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
     // only, never consulted by the answer.
     skipped: std::cell::Cell<u64>,
     refused_by: std::cell::Cell<BlockedBy>,
+    // The estimate of the first article the server's quota turned away.
+    // The scheduler, not the dial, is where a server short of an article's
+    // estimate is skipped, so the scan that met it tells the server's quota,
+    // which latches its blocked signal.
+    quota_short: std::cell::Cell<Option<u64>>,
 }
 
 // What [`Pipeline::servable_work_filter`] found for one job and one server.
@@ -95,14 +100,21 @@ impl ServableWorkFilter<'_> {
             return Some(SchedulerBlockClause::ServerExclusion);
         }
         use weaver_nntp::provider_policy::ArticleEligibility;
+        let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
         match self.provider_policy.eligibility(
             self.server_idx,
             &work.exclude_servers,
             &self.retention_excludes,
-            Pipeline::bandwidth_reservation_estimate(work.byte_estimate),
+            estimate,
         ) {
             ArticleEligibility::Eligible(_) => {}
             ArticleEligibility::BackfillProtected => return Some(SchedulerBlockClause::Backfill),
+            ArticleEligibility::OutOfQuota => {
+                if self.quota_short.get().is_none() {
+                    self.quota_short.set(Some(estimate));
+                }
+                return Some(SchedulerBlockClause::ProviderPriority);
+            }
             _ => return Some(SchedulerBlockClause::ProviderPriority),
         }
         if self
@@ -159,6 +171,14 @@ impl ServableWorkFilter<'_> {
     // The clauses that refused them.
     pub(in crate::pipeline::download) fn refused_by(&self) -> BlockedBy {
         self.refused_by.get()
+    }
+
+    // The server this filter scans for, and the estimate of the first
+    // article its quota turned away, if one was.
+    pub(in crate::pipeline::download) fn quota_short(&self) -> Option<(usize, u64)> {
+        self.quota_short
+            .get()
+            .map(|estimate| (self.server_idx, estimate))
     }
 
     // Charge an article the handout has just taken, so every later article
@@ -283,6 +303,7 @@ impl Pipeline {
             checkpoint_blocked: std::cell::Cell::new(false),
             skipped: std::cell::Cell::new(0),
             refused_by: std::cell::Cell::new(BlockedBy::default()),
+            quota_short: std::cell::Cell::new(None),
         })
     }
 

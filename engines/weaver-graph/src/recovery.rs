@@ -120,6 +120,14 @@ pub trait Recovery {
     // Whether this object describes the member, by id, name or content.
     fn covers(&self, member: MemberId) -> bool;
 
+    // Whether the object has yet to learn what some set of it describes:
+    // its own volumes may still say, once something asks for them. The
+    // owner asks it to rule once the namespace holds every other member,
+    // and the ruling says whether it waits on a volume or checked nothing.
+    fn undescribed(&self) -> bool {
+        false
+    }
+
     // Whether this object's own volumes are part of the release. Recovery
     // data is spent by the job and left out; a listing is kept beside what
     // it lists.

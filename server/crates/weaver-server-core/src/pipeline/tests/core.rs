@@ -1231,3 +1231,135 @@ async fn repeated_article_case(uuencode: bool) {
         "cached placements must not count as new network transfers"
     );
 }
+
+#[tokio::test]
+async fn failed_final_move_marks_job_failed_instead_of_complete() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10068);
+    let job_name = "Silver Horizon Broken Final Move";
+    let spec = JobSpec {
+        name: job_name.to_string(),
+        password: None,
+        files: vec![],
+        total_bytes: 0,
+        category: None,
+        metadata: vec![],
+    };
+    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    // Nothing is left to deliver from when the move runs.
+    std::fs::remove_dir_all(&working_dir).unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(matches!(status, JobStatus::Failed { .. }), "{status:?}");
+    let JobStatus::Failed { error } = &status else {
+        unreachable!();
+    };
+    assert!(error.contains("no delivery source exists"), "{error}");
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname(job_name))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20009);
+    let filename = "sparse.bin";
+    let payload_size = 128u32;
+    let total_size = payload_size as u64 * 3;
+    let spec = JobSpec {
+        name: "Sparse Segment Ordinals".to_string(),
+        password: None,
+        total_bytes: total_size,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: filename.to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![
+                segment_spec! {
+                    ordinal: 0,
+                    article_number: 1,
+                    bytes: payload_size,
+                    message_id: "sparse-0@example.com".to_string(),
+                },
+                segment_spec! {
+                    ordinal: 1,
+                    article_number: 4,
+                    bytes: payload_size,
+                    message_id: "sparse-1@example.com".to_string(),
+                },
+                segment_spec! {
+                    ordinal: 2,
+                    article_number: 6,
+                    bytes: payload_size,
+                    message_id: "sparse-2@example.com".to_string(),
+                },
+            ],
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for _ in 0..3u32 {
+        // Each article is fetched as dispatch hands it out.
+        let work = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .download_queue
+            .pop()
+            .unwrap();
+        let segment_number = work.segment_id.segment_number;
+        let payload = vec![segment_number as u8 + 1; payload_size as usize];
+        let raw = encode_article_part(
+            filename,
+            &payload,
+            segment_number + 1,
+            3,
+            segment_number as u64 * payload_size as u64 + 1,
+            total_size,
+        );
+
+        pipeline.active_downloads += 1;
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id,
+                runtime_generation: 0,
+                segment_id: work.segment_id,
+                data: Ok(DownloadPayload::Raw(raw)),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: None,
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: Vec::new(),
+                release_connection_slot: true,
+            })
+            .await;
+    }
+
+    drain_decode_results(&mut pipeline, 3).await;
+    // The graph job's runs and its completion check settle it.
+    hear_graph_mail(&mut pipeline, job_id).await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        3
+    );
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
+}

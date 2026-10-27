@@ -529,7 +529,7 @@ export const nextEn: LocaleDictionary = {
   "next.logs.filter.label": "Log level",
   "next.logs.filter.preset.default": "Default",
   "next.logs.filter.preset.download": "Download debug",
-  "next.logs.filter.preset.directStore": "Direct-store debug",
+  "next.logs.filter.preset.graphEngine": "Graph engine debug",
   "next.logs.filter.preset.everything": "Everything debug",
   "next.logs.filter.preset.custom": "Custom",
   "next.logs.filter.directives": "Filter directives",

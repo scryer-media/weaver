@@ -447,6 +447,14 @@ impl Pipeline {
     }
 
     fn note_scan_skips(&self, filter: &ServableWorkFilter<'_>) {
+        if let Some((server_idx, estimate)) = filter.quota_short()
+            && let Some(quota) = self
+                .nntp
+                .pool()
+                .server_transfer_control(weaver_nntp::pool::ServerId(server_idx))
+        {
+            quota.quota_rejection_for_dispatch(estimate);
+        }
         let skipped = filter.skipped();
         if skipped != 0 {
             self.metrics

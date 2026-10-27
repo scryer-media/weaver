@@ -175,7 +175,7 @@ fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
     assert_eq!(
         graph.failure,
         Some(format!(
-            "{} needs a password and none was given",
+            "WEAVER_PASSWORD_REQUIRED: {} needs a password and none was given",
             names.join(", ")
         )),
         "{:?}",

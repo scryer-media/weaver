@@ -80,9 +80,15 @@ impl SetState {
         if !self.hashes.insert(hash) {
             return;
         }
+        let described = self.usable().is_some();
         self.packets.change(|packets| packets.0.push(packet));
         self.index = index_of(&self.packets.get().0, output_limit);
         self.whole = whole_of(self.index.as_ref());
+        // A ruling made with no description was on nothing: the set rules
+        // again on what it now describes.
+        if !described && self.usable().is_some() {
+            self.last = None;
+        }
     }
 
     // A set as a checkpoint recorded it: the index is rebuilt from its
