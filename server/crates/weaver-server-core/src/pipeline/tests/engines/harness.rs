@@ -31,20 +31,20 @@ use crate::pipeline::{
     YencLayoutAssertions,
 };
 
-pub(in crate::pipeline::tests) const ARTICLE: usize = 64;
+pub(in crate::pipeline) const ARTICLE: usize = 64;
 
 // Every run is its own pipeline, so one id serves every scenario.
 pub(in crate::pipeline::tests) const JOB: JobId = JobId(93_001);
 const JOB_NAME: &str = "lantern beacon";
 
-pub(in crate::pipeline::tests) struct Post {
-    pub(in crate::pipeline::tests) name: String,
-    pub(in crate::pipeline::tests) role: FileRole,
-    pub(in crate::pipeline::tests) bytes: Vec<u8>,
+pub(in crate::pipeline) struct Post {
+    pub(in crate::pipeline) name: String,
+    pub(in crate::pipeline) role: FileRole,
+    pub(in crate::pipeline) bytes: Vec<u8>,
 }
 
 impl Post {
-    pub(in crate::pipeline::tests) fn plain(name: &str, bytes: Vec<u8>) -> Self {
+    pub(in crate::pipeline) fn plain(name: &str, bytes: Vec<u8>) -> Self {
         Self {
             name: name.to_string(),
             role: FileRole::from_filename(name),
@@ -52,7 +52,7 @@ impl Post {
         }
     }
 
-    fn articles(&self, size: usize) -> impl Iterator<Item = &[u8]> {
+    pub(in crate::pipeline) fn articles(&self, size: usize) -> impl Iterator<Item = &[u8]> {
         self.bytes.chunks(size)
     }
 }
@@ -60,7 +60,7 @@ impl Post {
 // `len` bytes of a seeded xorshift: no period runs through them, so no two
 // blocks are alike and a compressing level cannot fold them, and the same
 // seed gives the same bytes every run.
-pub(in crate::pipeline::tests) fn payload(len: usize, seed: u8) -> Vec<u8> {
+pub(in crate::pipeline) fn payload(len: usize, seed: u8) -> Vec<u8> {
     let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(seed);
     (0..len)
         .map(|_| {
@@ -74,11 +74,7 @@ pub(in crate::pipeline::tests) fn payload(len: usize, seed: u8) -> Vec<u8> {
 
 // An index and one volume of `blocks` recovery blocks over `files`, the
 // index first.
-pub(in crate::pipeline::tests) fn par2_set(
-    base: &str,
-    files: &[(&str, &[u8])],
-    blocks: u32,
-) -> Vec<Post> {
+pub(in crate::pipeline) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<Post> {
     let posts = par2_volumes(base, files, blocks, 1);
     assert_eq!(posts.len(), 2, "an index and one volume");
     posts
@@ -86,7 +82,7 @@ pub(in crate::pipeline::tests) fn par2_set(
 
 // An index and `volumes` volumes sharing `blocks` recovery blocks, as the
 // creator spreads them, the index first and the volumes in block order.
-pub(in crate::pipeline::tests) fn par2_volumes(
+pub(in crate::pipeline) fn par2_volumes(
     base: &str,
     files: &[(&str, &[u8])],
     blocks: u32,
@@ -511,35 +507,43 @@ impl Scenario {
 
     pub(in crate::pipeline::tests) fn spec(&self) -> JobSpec {
         JobSpec {
-            name: JOB_NAME.to_string(),
             password: self.password.clone(),
-            total_bytes: self.posts.iter().map(|post| post.bytes.len() as u64).sum(),
-            category: None,
-            metadata: vec![],
-            files: self
-                .posts
-                .iter()
-                .enumerate()
-                .map(|(index, post)| FileSpec {
-                    filename: post.name.clone(),
-                    role: post.role.clone(),
-                    groups: vec!["alt.binaries.test".to_string()],
-                    posted_at_epoch: None,
-                    segments: post
-                        .articles(self.article)
-                        .enumerate()
-                        .map(|(ordinal, article)| SegmentSpec {
-                            ordinal: ordinal as u32,
-                            article_number: ordinal as u32,
-                            bytes: article.len() as u32,
-                            message_ids: crate::jobs::MessageIds::new(vec![format!(
-                                "lantern-{index}-{ordinal}@example.com"
-                            )]),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            ..spec(JOB_NAME, &self.posts, self.article)
         }
+    }
+}
+
+// The job `posts` make posted under `name`, each cut into articles of
+// `article` bytes.
+pub(in crate::pipeline) fn spec(name: &str, posts: &[Post], article: usize) -> JobSpec {
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: posts.iter().map(|post| post.bytes.len() as u64).sum(),
+        category: None,
+        metadata: vec![],
+        files: posts
+            .iter()
+            .enumerate()
+            .map(|(index, post)| FileSpec {
+                filename: post.name.clone(),
+                role: post.role.clone(),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: post
+                    .articles(article)
+                    .enumerate()
+                    .map(|(ordinal, bytes)| SegmentSpec {
+                        ordinal: ordinal as u32,
+                        article_number: ordinal as u32,
+                        bytes: bytes.len() as u32,
+                        message_ids: crate::jobs::MessageIds::new(vec![format!(
+                            "lantern-{index}-{ordinal}@example.com"
+                        )]),
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

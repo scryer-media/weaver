@@ -1488,6 +1488,7 @@ pub(in crate::pipeline) fn credit_transfer(
     data: &Result<DownloadPayload, DownloadError>,
 ) {
     let (wire, decoded) = match data {
+        #[cfg(test)]
         Ok(DownloadPayload::Raw(raw)) => (raw.len() as u64, 0),
         Ok(DownloadPayload::Decoded(decoded)) => {
             (decoded.raw_size, decoded.data.len_bytes() as u64)

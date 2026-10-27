@@ -509,7 +509,7 @@ pub(super) struct DownloadLaneObservation {
 }
 
 pub(super) enum DownloadPayload {
-    #[allow(dead_code)]
+    #[cfg(test)]
     Raw(Bytes),
     Decoded(DecodeResult),
 }

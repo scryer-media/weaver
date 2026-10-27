@@ -108,6 +108,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
+weaver-graph = { path = "../../../engines/weaver-graph", features = ["test-support"] }
 weaver-objects = { path = "../../../engines/weaver-objects", features = ["test-support"] }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
 serde_json = { workspace = true }

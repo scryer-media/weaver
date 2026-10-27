@@ -75,7 +75,7 @@ mod delivery;
 mod depth;
 mod embedded;
 mod encrypted_hex;
-pub(in crate::pipeline::tests) mod harness;
+pub(in crate::pipeline) mod harness;
 mod lifecycle;
 mod lines;
 mod nesting;

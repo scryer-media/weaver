@@ -487,3 +487,32 @@ async fn a_nested_par2_set_rebuilds_a_refused_article_inside_a_stored_rar() {
     assert_eq!(delivered("ember.bin"), Some(ember));
     assert_eq!(delivered("quill.bin"), Some(quill));
 }
+
+// A job whose root is done has nothing downloading for the feed's health
+// probe to rule on, so the feed forgets its probe as the job leaves the root,
+// while the job itself is still in the pipeline.
+#[tokio::test]
+async fn the_feed_forgets_its_probe_when_the_job_leaves_the_root() {
+    use crate::pipeline::graph::root::phase::RootPhase;
+    use crate::pipeline::tests::{hear_graph_mail, retire_pipeline_database};
+
+    let post = Post::plain("lantern.bin", payload(4 * ARTICLE, 7));
+    let articles = post.bytes.len().div_ceil(ARTICLE) as u32;
+    let scenario = Scenario::new(vec![post]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    pipeline.post_probes.states.insert(
+        JOB,
+        crate::pipeline::post_health::ProbeState {
+            rounds: 1,
+            ..Default::default()
+        },
+    );
+    for ordinal in 0..articles {
+        serve(&mut pipeline, &scenario, (0, ordinal)).await;
+        hear_graph_mail(&mut pipeline, JOB).await;
+    }
+    assert_eq!(pipeline.graph_jobs[&JOB].phase(), RootPhase::Done);
+    assert!(pipeline.jobs.contains_key(&JOB));
+    assert!(!pipeline.post_probes.states.contains_key(&JOB));
+    retire_pipeline_database(pipeline).await;
+}

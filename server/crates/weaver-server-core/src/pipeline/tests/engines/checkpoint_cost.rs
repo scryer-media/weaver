@@ -21,9 +21,7 @@ fn covered(articles: usize) -> Scenario {
 async fn tally(articles: usize) -> Tally {
     let outcome = run(&covered(articles)).await;
     assert!(outcome.completed(), "{:?}", outcome.failure);
-    let tally = outcome.graph().checkpoints;
-    eprintln!("{articles} articles: {tally:?}");
-    tally
+    outcome.graph().checkpoints
 }
 
 #[tokio::test]

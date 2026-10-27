@@ -482,6 +482,7 @@ impl RepeatedArticles {
                     _memory: Some(reservation),
                 }));
             }
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(_)) => unreachable!("fused BODY fetch returns decoded data"),
         }
         reply

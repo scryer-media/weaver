@@ -52,7 +52,7 @@ mod core;
 mod decode_stage;
 mod direct_store;
 mod download_dispatch;
-mod engines;
+pub(in crate::pipeline) mod engines;
 mod full_file_names;
 mod hardware_profile;
 mod idle;
@@ -1255,6 +1255,18 @@ fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
                 }],
             })
             .collect(),
+    }
+}
+
+// Article `segment_number` of file `file_index` in job `job_id`.
+pub(in crate::pipeline) fn segment_id(
+    job_id: JobId,
+    file_index: u32,
+    segment_number: u32,
+) -> SegmentId {
+    SegmentId {
+        file_id: NzbFileId { job_id, file_index },
+        segment_number,
     }
 }
 
