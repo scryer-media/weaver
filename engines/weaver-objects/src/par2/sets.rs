@@ -260,11 +260,14 @@ pub(super) struct Volume {
     pub(super) walked_blocks: u64,
     // The sets whose packets the walk has found in it.
     pub(super) sets: BTreeSet<[u8; 16]>,
+    // The name it was bound under, which a later volume of the set continues.
+    pub(super) name: Option<String>,
 }
 
 impl Volume {
     pub(super) fn name(&mut self, name: &str) {
         self.named_blocks = recovery_volume::named_blocks(name, ".par2");
+        self.name = Some(name.to_owned());
     }
 
     // Whether the volume can bring the set blocks: it carries the set's

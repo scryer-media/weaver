@@ -249,6 +249,11 @@ impl GraphJob {
         &self.tree
     }
 
+    #[cfg(test)]
+    pub(crate) fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {
+        self.tree.namespace_mut(node)
+    }
+
     pub(crate) fn writer(&self) -> &NamespaceWriter {
         &self.writer
     }

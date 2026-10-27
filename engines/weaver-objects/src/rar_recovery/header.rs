@@ -35,6 +35,9 @@ pub(super) struct Header {
     // Each data volume's size, as a RAR5 volume's table gives it. A RAR3
     // volume is the width of the widest data volume.
     pub(super) sizes: Vec<u64>,
+    // Whether the last size is the last volume's own: a RAR5 table's is,
+    // while a RAR3 last volume falls short of the width.
+    pub(super) last_described: bool,
 }
 
 pub(super) enum Read {
@@ -96,6 +99,7 @@ fn body(raw: &[u8]) -> Option<Header> {
         data_count: u32::try_from(data_count).ok()?,
         rec_count: u32::try_from(rec_count).ok()?,
         sizes,
+        last_described: true,
     })
 }
 
@@ -129,6 +133,7 @@ pub(super) fn rar3(footer: &[u8; RAR3_FOOTER], length: u64) -> Option<Header> {
         data_count,
         rec_count,
         sizes: vec![width; data_count as usize],
+        last_described: false,
     })
 }
 

@@ -16,8 +16,8 @@
 //
 //   tar 263   the ustar magic at 257 and its terminator; until then any
 //             member might be a tar
-//   7z 32     the signature header, whose major version must be one this reads
-//             and whose start header must match its CRC
+//   7z 32     the signature header, whose start header must match its CRC;
+//             a major version the store cannot read is the store's to refuse
 //   PAR2 64   the first packet header, whose length must be a packet's
 //   bzip2 4   `BZh` and a block-size level
 //   RAR5 8, RAR4 7, RAR5 recovery 8, PAR3 8, xz 6, zip 4, zstd 4, gzip 2   the signature
@@ -43,7 +43,9 @@ pub enum Sniff {
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
     // A name never outvotes bytes that might still turn out to be a signature.
     match signed(first_bytes, length) {
-        Sniff::Leaf => named(name).map_or(Sniff::Leaf, Sniff::Object),
+        Sniff::Leaf => named(name)
+            .or_else(|| sevenz_by_name(name, first_bytes))
+            .map_or(Sniff::Leaf, Sniff::Object),
         verdict => verdict,
     }
 }
@@ -180,17 +182,17 @@ const SIGNATURES: &[Signature] = &[
     signature(Kind::RarRecovery, b"Rar!\x1aRev"),
 ];
 
-// A major version this build does not know places its fields elsewhere, and
-// a start header whose CRC fails is bytes that only open like a 7z.
+// A start header whose CRC fails is bytes that only open like a 7z. One that
+// matches is a 7z whatever its major version: a version the store cannot
+// read is a 7z it refuses, not a file of its own.
 fn sevenz_header_looks_valid(header: &[u8], _known_file_len: Option<u64>) -> bool {
     let stated_crc = header
         .get(8..12)
         .and_then(|bytes| bytes.try_into().ok())
         .map(u32::from_le_bytes);
-    header.get(6) == Some(&0)
-        && header
-            .get(12..)
-            .is_some_and(|start_header| stated_crc == Some(crc32(start_header)))
+    header
+        .get(12..)
+        .is_some_and(|start_header| stated_crc == Some(crc32(start_header)))
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -280,6 +282,16 @@ const NAMED: &[(Kind, &[&str])] = &[
     (Kind::Zip, &[".zip"]),
     (Kind::RarRecovery, &[".rev"]),
 ];
+
+// A 7z posted under its own name whose start header fails its CRC is still
+// the store's: its signature header is whole and opens with the magic, and
+// the store refuses it as the damaged container it is.
+fn sevenz_by_name(name: &str, first_bytes: &[u8]) -> Option<Kind> {
+    (has_extension(trimmed(name), ".7z")
+        && first_bytes.len() >= SEVEN_Z_SIGNATURE_HEADER_LEN
+        && first_bytes.starts_with(&SEVEN_Z_SIGNATURE))
+    .then_some(Kind::SevenZipStore)
+}
 
 // Posted names often trail quotes, underscores or dots past the extension.
 fn trimmed(name: &str) -> &str {
@@ -432,17 +444,18 @@ mod tests {
     }
 
     #[test]
-    fn sevenz_start_header_failing_its_crc_is_leaf() {
+    fn sevenz_start_header_failing_its_crc_is_the_store_by_its_name() {
         let mut head = seven_z();
         head[20] ^= 0x01;
-        assert_eq!(sniff("a.7z", &head, Some(32)), Sniff::Leaf);
+        assert_eq!(sniff("a.7z", &head, Some(32)), object(Kind::SevenZipStore));
+        assert_eq!(sniff("a.bin", &head, Some(32)), Sniff::Leaf);
     }
 
     #[test]
-    fn sevenz_of_an_unknown_major_version_is_leaf() {
+    fn sevenz_of_an_unknown_major_version_is_the_store() {
         let mut head = seven_z();
         head[6] = 1;
-        assert_eq!(sniff("a.7z", &head, Some(32)), Sniff::Leaf);
+        assert_eq!(sniff("a.7z", &head, Some(32)), object(Kind::SevenZipStore));
     }
 
     #[test]

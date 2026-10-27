@@ -1235,6 +1235,14 @@ impl Tree {
         let member = found.namespace.announce(name, length);
         found.undecided.insert(member);
         self.place(node, member, effects);
+        // An object of the namespace may place the member by its name alone,
+        // before any of its bytes: it is offered now with no prefix, by the
+        // one offer, and asked again when its bytes come if none takes it. A
+        // lent object cannot be asked, so the bytes ask it later.
+        let siblings = self.bound_below(node);
+        if !siblings.is_empty() && !siblings.iter().any(|sibling| self.lent(*sibling)) {
+            self.offer(node, member, &[], &siblings, effects);
+        }
         member
     }
 
@@ -3461,6 +3469,18 @@ mod tests {
         );
     }
 
+    // A volume announced beside a bound object is offered to it at once, by
+    // its name, before any of its bytes arrive.
+    #[test]
+    fn an_announced_volume_is_offered_to_the_object_before_its_bytes() {
+        let (mut tree, _, child, _) = bound_tree();
+        let second = tree.announce_root("show.r00", None, &mut Vec::new());
+        assert_eq!(
+            tree.child_of(NodeId::ROOT, second),
+            Some((child, VolumeIndex(1)))
+        );
+    }
+
     #[test]
     fn a_sibling_the_object_claims_becomes_its_next_volume() {
         let (mut tree, _, child, _) = bound_tree();
@@ -4145,41 +4165,28 @@ mod tests {
         )));
     }
 
+    // Volumes named out of order are each held at announce, by name, before
+    // any of their bytes: the one named ahead leaves no gap, and a seek into
+    // it goes up to the source for that member's bytes.
     #[test]
-    fn a_volume_claimed_before_the_one_ahead_of_it_leaves_a_gap_until_that_one_comes() {
+    fn a_volume_named_ahead_is_held_before_its_bytes_come() {
         let (mut tree, first, child, _) = bound_tree();
         let third = tree.announce_root("show.r01", None, &mut Vec::new());
         let second = tree.announce_root("show.r00", None, &mut Vec::new());
-        let deliver = |tree: &mut Tree, member| {
-            tree.deliver(
-                NodeId::ROOT,
-                member,
-                Posted {
-                    offset: 0,
-                    bytes: Bytes::from_static(b"w"),
-                    provenance: Provenance::Fresh,
-                },
-                &mut Build,
-                &mut Vec::new(),
-            )
-        };
-        deliver(&mut tree, third);
-        let volumes = |tree: &Tree| {
-            let (_, volumes) = tree.volumes(child).unwrap();
-            volumes.iter().map(|(v, m)| (v.0, *m)).collect::<Vec<_>>()
-        };
-        assert_eq!(volumes(&tree), vec![(0, first), (2, third)]);
+        let (_, volumes) = tree.volumes(child).unwrap();
+        let volumes: Vec<_> = volumes.iter().map(|(v, m)| (v.0, *m)).collect();
+        assert_eq!(volumes, vec![(0, first), (1, second), (2, third)]);
         let seek = Seek::data(
             VolumeIndex(1),
             ByteRange::new(0, 10),
             crate::seek::Weight(1),
         );
+        let mut root = Root(Vec::new());
+        assert_eq!(tree.lift(child, seek, &mut root), Pull::Moved(1));
         assert_eq!(
-            tree.lift(child, seek, &mut Root(Vec::new())),
-            Pull::Unseekable
+            root.0.iter().map(|seek| seek.volume).collect::<Vec<_>>(),
+            vec![VolumeIndex(second.0)]
         );
-        deliver(&mut tree, second);
-        assert_eq!(volumes(&tree), vec![(0, first), (1, second), (2, third)]);
     }
 
     #[test]
@@ -4518,9 +4525,16 @@ mod tests {
     // A pretend store whose first volume is `show.rar`, which holds
     // `linked.bin` where its links put it, provisionally: the first free
     // place after the first, and `stated.r00` at the place it states, 1.
-    #[derive(Default)]
+    // A full one takes nothing back from what it parsed of a volume it gave
+    // up, so the volume waits, given back, to be offered again.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
     struct Yielder {
         held: BTreeMap<VolumeIndex, String>,
+        full: bool,
+    }
+
+    impl crate::facts::Durable for Yielder {
+        const VERSION: u16 = 1;
     }
 
     impl Yielder {
@@ -4585,9 +4599,15 @@ mod tests {
                 .map(|name| Box::new(name) as Carried)
         }
         fn reclaim(&mut self, _: &str, carried: &Carried) -> Option<VolumeIndex> {
+            if self.full {
+                return None;
+            }
             (carried.downcast_ref::<String>()? == "linked.bin")
                 .then(|| self.free())
                 .flatten()
+        }
+        fn facts(&self) -> crate::facts::Facts {
+            crate::facts::Facts::of(Kind::RarStore, self)
         }
     }
 
@@ -4673,6 +4693,87 @@ mod tests {
             volume: VolumeIndex(1),
         }));
         assert!(!tree.given_back(NodeId::ROOT, linked));
+    }
+
+    // A store that takes back nothing it gave up, built as found or as its
+    // facts restore it.
+    struct FullBuild;
+    impl Builder for FullBuild {
+        fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
+            (kind == Kind::RarStore).then(|| {
+                Box::new(Yielder {
+                    full: true,
+                    ..Yielder::default()
+                }) as Box<dyn Object>
+            })
+        }
+        fn read(
+            &self,
+            _: &Tree,
+            _: NodeId,
+            _: VolumeIndex,
+            _: &Placement,
+            _: &mut Vec<u8>,
+        ) -> bool {
+            false
+        }
+    }
+
+    impl crate::facts::Restore for FullBuild {
+        fn restore(
+            &self,
+            facts: &crate::facts::Facts,
+        ) -> Result<Box<dyn Object>, crate::facts::RestoreError> {
+            Ok(Box::new(facts.read::<Yielder>(Kind::RarStore)?))
+        }
+    }
+
+    // A member given back with its parse waits to be offered again, and
+    // the parse is not in the records: a tree rebuilt from them holds it
+    // undecided, so its front, coming again, offers it again and it joins
+    // the store as it would have live.
+    #[test]
+    fn a_member_given_back_comes_back_undecided_and_is_offered_again() {
+        let mut build = FullBuild;
+        let mut tree = Tree::new();
+        let mut effects = Vec::new();
+        let deliver = |tree: &mut Tree, member, bytes: &'static [u8], build: &mut FullBuild| {
+            tree.deliver(
+                NodeId::ROOT,
+                member,
+                Posted {
+                    offset: 0,
+                    bytes: Bytes::from_static(bytes),
+                    provenance: Provenance::Fresh,
+                },
+                build,
+                &mut Vec::new(),
+            );
+        };
+        let first = tree.announce_root("show.rar", None, &mut effects);
+        deliver(&mut tree, first, SIGNATURE, &mut build);
+        let store = tree.child_of(NodeId::ROOT, first).expect("bound").0;
+        let linked = tree.announce_root("linked.bin", None, &mut effects);
+        deliver(&mut tree, linked, b"held", &mut build);
+        let stated = tree.announce_root("stated.r00", None, &mut effects);
+        deliver(&mut tree, stated, b"stat", &mut build);
+        assert_eq!(tree.child_of(NodeId::ROOT, linked), None);
+        assert!(tree.given_back(NodeId::ROOT, linked));
+
+        let record = tree.records();
+        let parked = record.nodes[0]
+            .members
+            .iter()
+            .find(|member| member.member == linked)
+            .expect("recorded");
+        assert!(parked.undecided);
+
+        let mut rebuilt = Tree::rebuild(&record, &FullBuild).expect("rebuilds");
+        deliver(&mut rebuilt, linked, b"held", &mut build);
+        assert_eq!(
+            rebuilt.child_of(NodeId::ROOT, linked),
+            Some((store, VolumeIndex(2)))
+        );
     }
 
     // A pretend store that holds every byte as envelope and, on `GIVE`,

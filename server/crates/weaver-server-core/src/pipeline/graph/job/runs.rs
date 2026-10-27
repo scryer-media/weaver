@@ -222,8 +222,23 @@ impl GraphJob {
                     changed |= !state.kept.contains_key(&volume.0);
                     let kept = shelf.kept(state, volume.0)?;
                     changed |= kept.closed != closed || kept.settled != settled;
+                    // A volume that closed again at another length moves
+                    // every byte after it: a run that read it, or read on
+                    // past it, built on the wrong offsets and starts over,
+                    // as it does when repaired bytes land behind it. One
+                    // that reopens, as a restore reopens a volume to
+                    // refetch it, has moved nothing yet.
+                    let moved = kept.closed.zip(closed).is_some_and(|(was, now)| was != now);
                     kept.closed = closed;
                     kept.settled = settled;
+                    if moved
+                        && state
+                            .kept
+                            .range(volume.0..)
+                            .any(|(_, kept)| kept.reached > 0)
+                    {
+                        state.generation += 1;
+                    }
                 }
                 Ok(changed)
             })

@@ -95,6 +95,8 @@ struct Volume {
     closed: bool,
     // The recovery blocks the volume's name says it carries.
     named_blocks: Option<u64>,
+    // The name it was bound under, which a later volume of the set continues.
+    name: Option<String>,
 }
 
 impl Volume {
@@ -277,6 +279,9 @@ impl Par3 {
         self.volumes
             .iter()
             .map(|volume| match volume.named_blocks {
+                // Claimed by its name and nothing of it read yet: what it
+                // brings is not known.
+                _ if !volume.closed && volume.arrived.runs().next().is_none() => None,
                 Some(blocks) => Some(blocks),
                 None if volume.closed && !volume.shows_recovery() => Some(0),
                 None => None,
@@ -311,9 +316,10 @@ impl Par3 {
         undescribed.then(|| self.describer()).flatten()
     }
 
-    // The volume that may describe the sets while damage shows: the first
-    // still open, an index before any volume and then the fewest blocks
-    // first.
+    // The volume that may describe the sets while damage shows: every
+    // volume of a set carries its description ahead of its blocks, so the
+    // first still open, an index before any volume and then the one that
+    // names the fewest blocks. `None` once none is left to read.
     fn describer(&self) -> Option<usize> {
         if !self.undescribed_damage() {
             return None;
@@ -552,14 +558,24 @@ impl Object for Par3 {
 
     // Every PAR3 file is a volume of the one object, numbered as it comes,
     // up to the carrier limit.
+    // By the magic its bytes open with, or, before any bytes, by a name
+    // that continues the set's: the stem of a volume already held, then a
+    // `.vol` name ending in `.par3`.
     fn claim(
         &mut self,
-        _name: &str,
+        name: &str,
         first_bytes: &[u8],
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
-            && self.volumes.len() < MAX_CARRIERS)
+        let ours = if first_bytes.is_empty() {
+            self.volumes
+                .iter()
+                .filter_map(|volume| volume.name.as_deref())
+                .any(|held| recovery_volume::same_set(held, name, ".par3"))
+        } else {
+            first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
+        };
+        (ours && self.volumes.len() < MAX_CARRIERS)
             .then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
@@ -569,7 +585,9 @@ impl Object for Par3 {
     // the verdict would depend on whether a volume's front decided before
     // or after the damage arrived.
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
-        self.volume(volume).named_blocks = recovery_volume::named_blocks(name, ".par3");
+        let found = self.volume(volume);
+        found.named_blocks = recovery_volume::named_blocks(name, ".par3");
+        found.name = Some(name.to_owned());
         if matches!(
             self.last,
             Some(
@@ -654,6 +672,37 @@ impl Recovery for Par3 {
             }
             bound.insert(path, member);
         }
+        // A member the set repaired whose good bytes reach past its
+        // description is recognised: they arrived shifted along, and the
+        // rebuilt file takes the described path and length. One longer than
+        // its description with no good bytes past it takes the described
+        // length and keeps its name: what lies past was booked for articles
+        // that never came.
+        let repaired = matches!(
+            self.last,
+            Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
+        );
+        for (path, member) in bound.iter().filter(|_| repaired) {
+            let Some(size) = files()
+                .find(|file| file.path() == path)
+                .map(|file| file.size())
+            else {
+                continue;
+            };
+            let shifted = namespace.get(*member).is_some_and(|record| {
+                record
+                    .coverage
+                    .overlapping(ByteRange::new(size, u64::MAX))
+                    .any(|run| run.provenance.is_verified())
+            });
+            if shifted {
+                if namespace.recognise(*member, path, size).is_some() {
+                    renamed.push(*member);
+                }
+            } else {
+                namespace.trim_booked(*member, size);
+            }
+        }
         if learned || bound != self.bound {
             self.last = None;
         }
@@ -685,6 +734,12 @@ impl Recovery for Par3 {
         }
     }
 
+    // No front read so far describes a file: the description is in a volume
+    // the root has only sampled the head of.
+    fn undescribed(&self) -> bool {
+        self.described.is_empty()
+    }
+
     fn covers(&self, member: MemberId) -> bool {
         self.bound.values().any(|bound| *bound == member)
     }
@@ -708,7 +763,8 @@ impl Recovery for Par3 {
 
     // While the last repair waits on damaged blocks, every open volume is
     // wanted now. While it read no set whole and damage shows, the one
-    // volume that may describe them is. Otherwise every volume whose head
+    // volume that may describe them is, all of it, then the next once that
+    // one is read through without one. Otherwise every volume whose head
     // shows it carries recovery is deferred: the rest waits until a repair
     // is short. Nothing of the deferral is kept: the same fronts say it
     // again on every round.
@@ -774,8 +830,9 @@ impl Recovery for Par3 {
             }
         }
         let sets = sets(packets);
-        // With no set read whole, one waits on a volume that may describe
-        // it while damage shows; otherwise nothing was checked.
+        // With no set described by anything read, the object waits on a
+        // volume that may carry a description while damage shows; with no
+        // damage, or none left open, it checked nothing.
         if sets.is_empty() {
             self.needed = 0;
             self.ruled.clear();

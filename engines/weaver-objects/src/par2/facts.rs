@@ -299,6 +299,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
             sets: volume.sets,
+            name: None,
         })
         .collect();
     for set in kept.sets {

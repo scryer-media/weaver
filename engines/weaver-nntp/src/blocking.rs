@@ -1260,8 +1260,12 @@ impl BlockingNntpConnection {
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
         match greeting.code.raw() {
             200 | 201 => {}
-            400 => return Err(NntpError::ServiceUnavailable),
-            502 => return Err(NntpError::from_status(greeting.code, &greeting.message)),
+            400 | 502 => {
+                return Err(NntpError::from_login_status(
+                    greeting.code,
+                    &greeting.message,
+                ));
+            }
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
@@ -1419,15 +1423,21 @@ impl BlockingNntpConnection {
         match user_resp.code.raw() {
             281 => return Ok(()),
             381 => {}
-            _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            _ => {
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
+            }
         }
 
         let pass_resp = self.send_command(&Command::AuthInfoPass(password.to_string()))?;
         match pass_resp.code.raw() {
             281 => Ok(()),
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
         }
     }
 
@@ -1444,7 +1454,12 @@ impl BlockingNntpConnection {
         match user_resp.code.raw() {
             281 => return Ok(()),
             381 => {}
-            _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            _ => {
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
+            }
         }
 
         let pass_resp = self.send_command_with_active_budget(
@@ -1453,9 +1468,10 @@ impl BlockingNntpConnection {
         )?;
         match pass_resp.code.raw() {
             281 => Ok(()),
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
         }
     }
 

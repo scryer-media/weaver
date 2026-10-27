@@ -94,7 +94,12 @@ impl Tree {
                         .retired()
                         .get(&(node, member.id))
                         .is_some_and(Option::is_none),
-                    undecided: found.undecided.contains(&member.id),
+                    // A member given back with its parse waits to be
+                    // offered again, and the parse lives only in memory:
+                    // a restore offers it again from its front, as it does
+                    // a member whose owner was never decided.
+                    undecided: found.undecided.contains(&member.id)
+                        || self.given.contains_key(&(node, member.id)),
                     copy_of: namespace.copy_of(member.id),
                 })
                 .collect(),

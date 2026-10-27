@@ -299,10 +299,10 @@ fn a_repaired_member_longer_than_described_is_recognised_at_its_length() {
 }
 
 // A member none of whose bytes came, booked at more than the described
-// length for the articles it lost, is rebuilt and keeps its length: what was
-// booked never arrived, so nothing lies past the description to cut.
+// length for the articles it lost, is rebuilt at the described length and
+// takes it: what was booked never arrived, and keeps its name.
 #[test]
-fn a_repaired_member_booked_longer_than_described_is_not_recognised() {
+fn a_repaired_member_booked_longer_than_described_takes_the_described_length() {
     let data = payload(13, 5000);
     let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 12, 1));
     let booked = data.len() as u64 + 300;
@@ -317,7 +317,9 @@ fn a_repaired_member_booked_longer_than_described_is_not_recognised() {
         "{outcome:?}"
     );
     assert!(bind(&mut job).is_empty());
-    assert_eq!(job.namespace.get(member).unwrap().length, Some(booked));
+    let record = job.namespace.get(member).unwrap();
+    assert_eq!(record.name, "payload.bin");
+    assert_eq!(record.length, Some(data.len() as u64));
 }
 
 #[test]

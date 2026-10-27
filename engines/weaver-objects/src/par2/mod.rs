@@ -163,10 +163,13 @@ impl Par2 {
     // volumes are named to bring. `None` while an open volume that may
     // serve it does not say how many it carries.
     fn reach(&self, key: &[u8; 16]) -> Option<u64> {
-        let unknown = self
-            .volumes
-            .iter()
-            .any(|volume| !volume.closed && volume.serves(key) && volume.named_blocks.is_none());
+        let unknown = self.volumes.iter().any(|volume| {
+            // Claimed by its name and nothing of it read yet: what it
+            // brings is not known.
+            !volume.closed
+                && volume.serves(key)
+                && (volume.named_blocks.is_none() || volume.arrived.runs().next().is_none())
+        });
         (!unknown).then(|| self.sets[key].recovery.len() as u64 + self.coming(key))
     }
 
@@ -445,14 +448,24 @@ impl Object for Par2 {
     }
 
     // Every PAR2 file is a volume of the one object, numbered as it comes.
+    // By the magic its bytes open with, or, before any bytes, by a name
+    // that continues the set's: the stem of a volume already held, then a
+    // `.vol` name ending in `.par2`.
     fn claim(
         &mut self,
-        _name: &str,
+        name: &str,
         first_bytes: &[u8],
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice()))
-            .then_some(VolumeIndex(self.volumes.len() as u32))
+        let ours = if first_bytes.is_empty() {
+            self.volumes
+                .iter()
+                .filter_map(|volume| volume.name.as_deref())
+                .any(|held| crate::recovery_volume::same_set(held, name, ".par2"))
+        } else {
+            first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
+        };
+        ours.then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
@@ -499,9 +512,12 @@ impl Recovery for Par2 {
         // the description's length when it holds damage and reached less: a
         // member posted without positions closes at the length its articles
         // reached, short of what a lost one took, and the file the set
-        // rebuilds is the length the set describes. A member longer than its
-        // description keeps its length: its posting carries more than the
-        // described file.
+        // rebuilds is the length the set describes. So does one the set
+        // repaired that is longer than its description with no good bytes
+        // past it: the length was booked for articles that never came, and
+        // the rebuilt file is the length the set describes. A member longer
+        // than its description by bytes that arrived keeps its length: its
+        // posting carries more than the described file.
         for state in self.sets.values() {
             let Some(index) = state.usable() else {
                 continue;
@@ -534,13 +550,15 @@ impl Recovery for Par2 {
                 let Some(record) = namespace.get(*member) else {
                     continue;
                 };
-                if record
+                let short = record
                     .length
                     .is_some_and(|length| length < description.length)
-                    && !record.coverage.is_clean()
-                {
+                    && !record.coverage.is_clean();
+                if short {
                     let name = record.name.clone();
                     namespace.recognise(*member, &name, description.length);
+                } else if repaired {
+                    namespace.trim_booked(*member, description.length);
                 }
             }
         }
