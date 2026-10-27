@@ -537,53 +537,6 @@ impl ArticleMap {
             .collect()
     }
 
-    // Each volume's first article, and whether every server failed it.
-    pub(crate) fn heads(&self) -> impl Iterator<Item = (VolumeIndex, bool)> + '_ {
-        self.volumes
-            .iter()
-            .zip(0u32..)
-            .filter_map(|(found, index)| {
-                let first = found.articles.first()?;
-                Some((
-                    VolumeIndex(index),
-                    matches!(first.state, State::Lost { .. }),
-                ))
-            })
-    }
-
-    // Every volume's first article came or was lost: each file the post
-    // names was sampled, and an object that joins its volumes by their
-    // first bytes has seen every one it will.
-    pub(crate) fn sampled(&self) -> bool {
-        self.volumes.iter().all(|found| {
-            found
-                .articles
-                .first()
-                .is_none_or(|first| !matches!(first.state, State::Waiting))
-        })
-    }
-
-    // The volumes at least one article of which every server failed.
-    pub(crate) fn failing(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
-        self.volumes
-            .iter()
-            .zip(0u32..)
-            .filter_map(|(found, index)| {
-                found
-                    .articles
-                    .iter()
-                    .any(|article| matches!(article.state, State::Lost { .. }))
-                    .then_some(VolumeIndex(index))
-            })
-    }
-
-    // The volume's encoded bytes as the post declares them.
-    pub(crate) fn encoded_len(&self, volume: VolumeIndex) -> u64 {
-        self.volumes
-            .get(volume.0 as usize)
-            .map_or(0, |found| found.encoded_len)
-    }
-
     pub(crate) fn volume_waiting(&self, volume: VolumeIndex) -> bool {
         self.volumes
             .get(volume.0 as usize)

@@ -133,29 +133,6 @@ impl ArticleRoot {
         answers
     }
 
-    // The first-article sample of the payload: each volume's first article
-    // and whether every server failed it, but for the files the post names
-    // recovery data.
-    pub(crate) fn payload_heads(&self) -> impl Iterator<Item = (VolumeIndex, bool)> + '_ {
-        self.map
-            .heads()
-            .filter(|(volume, _)| !self.declares_recovery(*volume))
-    }
-
-    // Whether the post names any file recovery data, PAR2 or PAR3.
-    pub(crate) fn declares_any_recovery(&self) -> bool {
-        self.posted
-            .iter()
-            .any(|name| sample::declared_recovery(name))
-    }
-
-    // Whether the post names the volume's file recovery data.
-    pub(crate) fn declares_recovery(&self, volume: VolumeIndex) -> bool {
-        self.posted
-            .get(volume.0 as usize)
-            .is_some_and(|name| sample::declared_recovery(name))
-    }
-
     // The member of the volume is proven whole: its checksums are dropped.
     pub(crate) fn seal(&mut self, volume: VolumeIndex) {
         self.checksums.seal(volume);

@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::{Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError};
+use weaver_graph::{ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError};
 
 use super::{MAX_CARRIERS, Par3, Ruling, Settled, Unnamed, Volume};
 
@@ -33,6 +33,7 @@ pub(super) struct Par3Facts {
     needed: u64,
     last: Option<Ruling>,
     settled: BTreeMap<String, Settled>,
+    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -43,7 +44,8 @@ pub(super) struct VolumeFacts {
 
 impl Durable for Par3Facts {
     // 2: a repair that came up short kept with the volumes closed then.
-    const VERSION: u16 = 2;
+    // 3: the ranges of members the parent refused.
+    const VERSION: u16 = 3;
 
     fn impossible(&self) -> Option<&'static str> {
         if self.volumes.len() > MAX_CARRIERS {
@@ -81,6 +83,7 @@ pub(super) fn of(par3: &Par3) -> Facts {
         needed: par3.needed,
         last: par3.last,
         settled: par3.settled.clone(),
+        refusals: par3.refusals.clone(),
     };
     Facts::of(Kind::Par3, &facts)
 }
@@ -105,6 +108,9 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
     par3.needed = kept.needed;
     par3.last = kept.last;
     par3.settled = kept.settled;
+    // The blocks they touch are counted again at the next bind, once the
+    // replayed fronts describe the sets.
+    par3.refusals = kept.refusals;
     Ok(par3)
 }
 

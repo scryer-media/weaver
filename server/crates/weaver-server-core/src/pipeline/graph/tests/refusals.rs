@@ -231,6 +231,7 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
         |_| false,
         |_, _| false,
         |_, _| None,
+        |_, _| false,
     );
     assert_eq!(
         delivery,

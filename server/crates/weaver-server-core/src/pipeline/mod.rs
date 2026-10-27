@@ -13,6 +13,7 @@ mod health;
 mod infrastructure_retry;
 mod nzb_admission;
 mod orchestrator;
+mod post_health;
 mod progress;
 pub mod queue;
 mod server_attribution;
@@ -1238,6 +1239,11 @@ pub(in crate::pipeline) enum SegmentTerminalState {
     RetriesExhausted,
     // Bodies arrived but no attempt decoded into the declared placement.
     DecodeExhausted,
+    // No server may fetch the article: one that would refuses the
+    // credentials. The servers never said the article is gone.
+    Unservable,
+    // The feed stopped asking for the article once it gave the post up.
+    Abandoned,
 }
 
 // What the settlement concluded a delivered job actually delivered.
@@ -1292,7 +1298,7 @@ pub struct Pipeline {
     pub(super) graph_runs: graph::engine::RunMail,
     // Each graph job's health probe, and where its rounds say what they
     // found.
-    pub(super) graph_probes: graph::probe::Probes,
+    pub(super) post_probes: post_health::Probes,
     pub(crate) nzb_admitted: HashSet<JobId>,
     pub(crate) nzb_seen: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,

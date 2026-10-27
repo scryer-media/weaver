@@ -869,8 +869,8 @@ async fn only_an_article_the_root_holds_in_hand_or_lost_is_settled() {
     let spec = spec(
         "lantern settled",
         vec![
-            ("lantern.bin".to_string(), FileRole::Standalone, 2),
-            ("lantern.dat".to_string(), FileRole::Standalone, 2),
+            ("lantern.bin".to_string(), FileRole::Standalone, 6),
+            ("lantern.dat".to_string(), FileRole::Standalone, 6),
         ],
     );
     insert_active_job(&mut pipeline, job_id, spec).await;

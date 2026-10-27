@@ -499,7 +499,7 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         JobStatus::Complete
     );
     assert_eq!(
-        delivery(&["ember.bin"], &[], &["ember.dat"]).status(Some(error)),
+        delivery(&["ember.bin"], &[], &["ember.dat"]).status(Some(&failed(error))),
         JobStatus::Partial
     );
     assert_eq!(
@@ -520,13 +520,13 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         }
     );
     assert_eq!(
-        delivery(&[], &[], &["ember.dat"]).status(Some(error)),
+        delivery(&[], &[], &["ember.dat"]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
         }
     );
     assert_eq!(
-        delivery(&[], &["ember.dat"], &[]).status(Some(error)),
+        delivery(&[], &["ember.dat"], &[]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
         }
@@ -578,7 +578,7 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
     // A recovery object's failure is the one that left the job short.
     let error = "PAR2 recovery failed for 1 set(s)";
     assert_eq!(
-        withheld(&[], &[("lantern.rar", Why::Encrypted)]).status(Some(error)),
+        withheld(&[], &[("lantern.rar", Why::Encrypted)]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
         }
@@ -656,4 +656,13 @@ async fn a_graph_census_keeps_a_damaged_member_and_refuses_an_empty_delivery() {
         "1 payload file(s) were never delivered and no verification, repair or discard \
          accounts for them (64 declared bytes): ember.bin"
     );
+}
+
+// A recovery failure as the rulings word it, naming no object.
+fn failed(message: &str) -> super::Failure {
+    super::Failure {
+        objects: Vec::new(),
+        message: message.to_owned(),
+        rejection: None,
+    }
 }

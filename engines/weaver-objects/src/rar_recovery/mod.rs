@@ -136,6 +136,9 @@ pub struct RarRecovery {
     whole: BTreeSet<u32>,
     // What the last repair came to, for the members bound then.
     last: Option<Ruling>,
+    // Members of the namespace a range of which the parent refused: a data
+    // volume among them is missing for good.
+    refused: BTreeSet<MemberId>,
 }
 
 // The verdict a repair reached, or that it came up short of recovery
@@ -148,7 +151,8 @@ enum Ruling {
 
 impl Durable for RarRecovery {
     // 2: a repair that came up short kept with the volumes it needs.
-    const VERSION: u16 = 2;
+    // 3: the members the parent refused a range of.
+    const VERSION: u16 = 3;
 }
 
 impl RarRecovery {
@@ -162,6 +166,7 @@ impl RarRecovery {
             reference: None,
             whole: BTreeSet::new(),
             last: None,
+            refused: BTreeSet::new(),
         }
     }
 
@@ -206,6 +211,24 @@ impl RarRecovery {
 
     fn coming(&self) -> bool {
         self.revs.iter().any(|rev| !rev.closed)
+    }
+
+    // The set's ruling on what was refused: a data volume a range of which
+    // will never come needs a recovery volume of its own, so the set is
+    // impossible once those outnumber the recovery volumes in hand and
+    // still to come whole.
+    fn refused_short(&self) -> Option<RepairOutcome> {
+        let damaged = self
+            .bound
+            .values()
+            .filter(|member| self.refused.contains(member))
+            .count() as u64;
+        let reachable = self
+            .revs
+            .iter()
+            .filter(|rev| rev.usable() || (!rev.closed && !rev.lost))
+            .count() as u64;
+        (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
     }
 
     // The set staged for unrar-rs: every data volume whose member has a
@@ -506,7 +529,16 @@ impl Recovery for RarRecovery {
         }
     }
 
+    // Kept for every member of the namespace, bound or not: a bind later
+    // counts what was refused before.
+    fn refused(&mut self, member: MemberId, _range: ByteRange) {
+        self.refused.insert(member);
+    }
+
     fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
+        if let Some(short) = self.refused_short() {
+            return short;
+        }
         let outcome = self.rule(access);
         self.last = Some(match outcome {
             RepairOutcome::Waiting => Ruling::Short {
@@ -521,6 +553,9 @@ impl Recovery for RarRecovery {
     // unlost; a wait is over once as many are as it needs, or none more
     // can come.
     fn outcome(&self) -> Option<RepairOutcome> {
+        if let Some(short) = self.refused_short() {
+            return Some(short);
+        }
         match self.last? {
             Ruling::Reached(outcome) => Some(outcome),
             Ruling::Short { needed } => {

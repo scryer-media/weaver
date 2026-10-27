@@ -4,7 +4,7 @@
   "description": "The same dead posting with recovery advertised: four RAR volumes and five PAR2 sidecars, every article deleted from both servers. The NZB advertises fifteen recovery blocks, but none of them can be fetched, so the job fails once every article is booked missing instead of waiting on recovery that cannot arrive.",
   "category": "2000",
   "expected_outcome": "health_failure",
-  "expectedErrorContains": "no file was delivered whole",
+  "expectedErrorContains": "below critical",
   "fixtureAssets": [
     "par2-multivolume/archive.part1.rar",
     "par2-multivolume/archive.part2.rar",

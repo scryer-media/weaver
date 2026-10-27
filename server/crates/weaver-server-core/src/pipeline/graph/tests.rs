@@ -805,9 +805,9 @@ async fn a_job_leaving_the_root_drops_its_health_probe() {
     let job_id = JobId(92_011);
     let (mut pipeline, _, _, posts) =
         echo_volume_with_a_wrong_article(&temp_dir, job_id, false).await;
-    pipeline.graph_probes.states.insert(
+    pipeline.post_probes.states.insert(
         job_id,
-        crate::pipeline::graph::probe::ProbeState {
+        crate::pipeline::post_health::ProbeState {
             rounds: 1,
             ..Default::default()
         },
@@ -816,7 +816,7 @@ async fn a_job_leaving_the_root_drops_its_health_probe() {
     drain_runs(&mut pipeline, job_id).await;
     assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
     assert!(pipeline.jobs.contains_key(&job_id));
-    assert!(!pipeline.graph_probes.states.contains_key(&job_id));
+    assert!(!pipeline.post_probes.states.contains_key(&job_id));
     retire_pipeline_database(pipeline).await;
 }
 

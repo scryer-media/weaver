@@ -628,8 +628,8 @@ func TestScenarioFileExpectations(t *testing.T) {
 		outcome string
 		error   string
 	}{
-		{slug: "dead-post-first-articles-missing", outcome: "health_failure", error: "no file was delivered whole"},
-		{slug: "dead-post-recovery-unobtainable", outcome: "health_failure", error: "no file was delivered whole"},
+		{slug: "dead-post-first-articles-missing", outcome: "health_failure", error: "first articles are missing"},
+		{slug: "dead-post-recovery-unobtainable", outcome: "health_failure", error: "below critical"},
 		{slug: "rar5-colliding-member-paths", outcome: "success"},
 		{slug: "par2-ignorable-deficit", outcome: outcomePartialDelivery},
 	} {

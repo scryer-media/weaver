@@ -73,6 +73,18 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
     match step {
         Step::Wait => {}
         Step::Deliver => match pipeline.graph_terminal_status(job_id) {
+            Some(JobStatus::Failed { error })
+                if pipeline.post_probes.dead.get(&job_id) == Some(&error) =>
+            {
+                // Nothing came whole of a post the feed gave up: it failed
+                // at its download, in the feed's words.
+                metrics::failed("post_dead");
+                pipeline
+                    .pipeline_failure_stages
+                    .entry(job_id)
+                    .or_insert(PipelineFailureStage::Download);
+                pipeline.fail_job_on_health(job_id, error);
+            }
             Some(JobStatus::Failed { error }) => {
                 // The stage that left the delivery short is the one that
                 // broke, whatever the root showed.
@@ -186,6 +198,19 @@ impl Pipeline {
         true
     }
 
+    // A graph job its rulings settle before its download ends fails now,
+    // in the words of the sets that could not rebuild what they cover, at
+    // the repair stage. True when it failed.
+    pub(in crate::pipeline) fn fail_graph_job_ruled_short(&mut self, job_id: JobId) -> bool {
+        let Some(failure) = self.graph_jobs.get(&job_id).and_then(super::ruled_short) else {
+            return false;
+        };
+        metrics::failed("repair_impossible");
+        self.transition_postprocessing_status(job_id, JobStatus::Repairing, None);
+        self.fail_job(job_id, failure.message);
+        true
+    }
+
     // What the job spent is not part of the release and is removed once it
     // delivers, before the move: recovery data, bound or named so, and the
     // volumes an object consumed to make what it hands over, such as the
@@ -267,10 +292,14 @@ impl Pipeline {
                     member,
                     par2_damage_ignorable(&member.output_name, &ignore),
                 );
+                // An article the feed stopped asking for was never lost.
                 row.lost_articles = self
                     .segment_terminal_states
-                    .keys()
-                    .filter(|segment| segment.file_id == file_id)
+                    .iter()
+                    .filter(|(segment, state)| {
+                        segment.file_id == file_id
+                            && **state != crate::pipeline::SegmentTerminalState::Abandoned
+                    })
                     .count();
                 row.lost_bytes = self.file_terminal_failed_bytes(file_id);
                 row.declared_bytes = file.segments.iter().map(|s| u64::from(s.bytes)).sum();
@@ -410,7 +439,15 @@ impl Pipeline {
         let state = self.jobs.get(&job_id)?;
         let summary = RootJob::recovery_summary(job);
         let outcomes = summary.outcomes();
-        let failure = failure(&summary, &outcomes, job);
+        // The rulings' own failure, or else the feed's words when it gave
+        // the post up.
+        let failure = failure(&summary, &outcomes, job).or_else(|| {
+            self.post_probes.dead.get(&job_id).map(|words| Failure {
+                objects: Vec::new(),
+                message: words.clone(),
+                rejection: None,
+            })
+        });
         let ignore = self.par2_ignore_extensions();
         // Root members are numbered as the posted files they are; one past
         // them is a file a recovery object announced, which is payload.
@@ -445,6 +482,14 @@ impl Pipeline {
             |name| par2_damage_ignorable(name, &ignore),
             unrepaired,
             |node, member| job.writer().refused(node, member),
+            // Read by the name the member is delivered under, so a file a
+            // recovery set renamed to what it is counts as that.
+            |node, member| {
+                node == NodeId::ROOT
+                    && job.tree().namespace(node).and_then(|ns| ns.get(member)).is_some_and(
+                        |member| crate::pipeline::post_health::names_a_piece(&member.output_name),
+                    )
+            },
         );
         Some((delivery, failure))
     }
@@ -487,7 +532,7 @@ impl Pipeline {
     // once the job has gone.
     pub(in crate::pipeline) fn graph_terminal_status(&self, job_id: JobId) -> Option<JobStatus> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
-        let status = delivery.status(failure.as_ref().map(|failure| failure.message.as_str()));
+        let status = delivery.status(failure.as_ref());
         if status == JobStatus::Partial {
             info!(
                 job_id = job_id.0,
@@ -523,7 +568,7 @@ impl Pipeline {
         metrics::phase(phase);
         let stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
         if phase == RootPhase::Done {
-            self.graph_probes.states.remove(&job_id);
+            self.post_probes.states.remove(&job_id);
             log_set_rulings(job_id, graph);
             let summary = RootJob::recovery_summary(&*graph);
             let outcomes = summary.outcomes();

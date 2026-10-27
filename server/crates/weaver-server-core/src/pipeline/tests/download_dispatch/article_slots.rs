@@ -25,7 +25,7 @@ fn slot_segment(job_id: JobId) -> SegmentId {
 async fn slot_pipeline(temp_dir: &tempfile::TempDir, job_id: JobId, ids: &[&str]) -> Pipeline {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
-    let mut spec = segmented_job_spec("Article Slot", FILENAME, &[128, 128]);
+    let mut spec = segmented_job_spec("Article Slot", FILENAME, &[128; 10]);
     spec.files[0].segments[0].message_ids =
         crate::jobs::MessageIds::new(ids.iter().map(|id| id.to_string()).collect());
     insert_active_job(&mut pipeline, job_id, spec).await;

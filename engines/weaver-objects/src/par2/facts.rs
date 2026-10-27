@@ -42,6 +42,7 @@ pub(super) struct Par2Facts {
     lengths: BTreeMap<MemberId, u64>,
     meter: Meter,
     refused: bool,
+    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
     output_limit: u64,
     memory_limit: usize,
 }
@@ -197,7 +198,8 @@ impl Durable for Par2Facts {
     // shelved by chunk of blocks.
     // 4: no outcome of the object's own, it is its sets' last repairs; a
     // sealed value encodes as nothing, numbered by its owner's walk.
-    const VERSION: u16 = 4;
+    // 5: the ranges of members the parent refused.
+    const VERSION: u16 = 5;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         for set in &self.sets {
@@ -276,6 +278,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
         lengths: par2.lengths.clone(),
         meter: par2.meter.clone(),
         refused: par2.refused,
+        refusals: par2.refusals.clone(),
         output_limit: par2.output_limit,
         memory_limit: par2.memory_limit,
     };
@@ -316,6 +319,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
     par2.lengths = kept.lengths;
     par2.meter = kept.meter;
     par2.refused = kept.refused;
+    par2.refusals = kept.refusals;
     par2.output_limit = kept.output_limit;
     par2.memory_limit = kept.memory_limit;
     for key in par2.ordered() {

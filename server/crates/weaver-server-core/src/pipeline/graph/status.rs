@@ -267,6 +267,40 @@ pub(crate) fn failure(
     })
 }
 
+// The failure that settles a job before its download ends: a set of the
+// root ruled it cannot rebuild what it covers, every member of the root has
+// said what it is, and no payload member of the root can still come whole.
+// One can while it holds no damage, or while a set of the root that covers
+// it has not ruled impossible. A set below the root that rules impossible
+// settles nothing here: the subtree it covers is short, and what else the
+// job delivers whole is read once the job is done.
+pub(crate) fn ruled_short(job: &GraphJob) -> Option<Failure> {
+    let summary = RootJob::recovery_summary(job);
+    let outcomes = summary.outcomes();
+    let failure = failure(&summary, &outcomes, job).filter(|failure| failure.rejection.is_none())?;
+    let at_root = summary
+        .sets
+        .iter()
+        .any(|set| set.namespace == NodeId::ROOT && failure.objects.contains(&set.node));
+    if !at_root || !job.identified() {
+        return None;
+    }
+    let tree = job.tree();
+    let writer = job.writer();
+    let sets = tree.recovery_nodes(NodeId::ROOT);
+    let may_come_whole = job
+        .namespace()
+        .members()
+        .filter(|member| !writer.carries_recovery(tree, NodeId::ROOT, member.id))
+        .any(|member| {
+            member.coverage.damaged_ranges().next().is_none()
+                || writer
+                    .covering(tree, &sets, member.id)
+                    .any(|set| !failure.objects.contains(&set))
+        });
+    (!may_come_whole).then_some(failure)
+}
+
 fn label(kind: Kind) -> String {
     kind.to_string().to_ascii_uppercase()
 }
