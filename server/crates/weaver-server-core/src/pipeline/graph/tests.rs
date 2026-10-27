@@ -599,6 +599,40 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A plain file arrives damaged beside the recovery the post carried for
+// it, which never yielded a set: none of its packets came, so nothing
+// ruled on the damage. What is short is short because that recovery could
+// not be used, so the shortfall is the repair's, for PAR2 and PAR3 alike.
+#[tokio::test]
+async fn a_short_file_beside_recovery_that_never_ruled_is_the_repair_stage() {
+    for (job_id, recovery) in [
+        (JobId(92_031), "lantern.par2"),
+        (JobId(92_032), "lantern.par3"),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let posts = vec![
+            Post::plain("lantern.dat", payload(2 * ARTICLE, 13)),
+            Post::plain(recovery, payload(ARTICLE, 14)),
+        ];
+        let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+        decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+        decode(&mut pipeline, job_id, &posts, 0, 1, false).await;
+
+        let delivery = pipeline.graph_delivery(job_id).unwrap();
+        assert_eq!(
+            delivery.unrepaired,
+            vec!["lantern.dat".to_string()],
+            "{recovery}"
+        );
+        assert_eq!(
+            pipeline.graph_shortfall(job_id).map(|(stage, _)| stage),
+            Some(crate::post_processing::model::PipelineFailureStage::Repair),
+            "{recovery}"
+        );
+        retire_pipeline_database(pipeline).await;
+    }
+}
+
 // An echo volume beside a PAR2 set, its second article arriving as `wrong`
 // with `intact` the checksum's verdict on it. The index and the volume's
 // first article come first, so the set can reach its blocks; the rest of

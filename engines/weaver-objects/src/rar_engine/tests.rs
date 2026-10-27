@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::io;
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -668,6 +669,59 @@ fn a_member_whose_checksum_fails_is_retracted_and_its_volume_damaged() {
         [Said::Retract(0), Said::Damaged(0, 0, length)]
     );
     assert!(!said.contains(&Said::Closed(0)));
+}
+
+// A volume still growing has no length, so a checksum failure on it can say
+// damage only over what the run read of it, and says exactly that.
+#[test]
+fn a_checksum_failure_on_a_growing_volume_damages_the_bytes_the_run_read() {
+    struct Growing {
+        bytes: Vec<u8>,
+        reached: AtomicU64,
+    }
+    impl Volumes for Growing {
+        fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+            Ok(after.is_none().then_some(VolumeIndex(0)))
+        }
+        fn len(&self, _: VolumeIndex) -> Option<u64> {
+            None
+        }
+        fn read_at(&self, _: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+            let start = (offset as usize).min(self.bytes.len());
+            let read = into.len().min(self.bytes.len() - start);
+            into[..read].copy_from_slice(&self.bytes[start..start + read]);
+            self.reached
+                .fetch_max(offset + read as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(read)
+        }
+    }
+    let mut bytes = one_volume();
+    let at = bytes
+        .windows(NOTES.len())
+        .position(|window| window == NOTES)
+        .unwrap();
+    bytes[at + 3] ^= 0x20;
+    let growing = Arc::new(Growing {
+        bytes,
+        reached: AtomicU64::new(0),
+    });
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    RarEngine::new().start().run(
+        Arc::clone(&growing) as Arc<dyn Volumes>,
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    let read = growing.reached.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(read > at as u64, "the run read past the failing bytes");
+    let said = said(&emits);
+    assert_eq!(
+        said[said.len() - 2..],
+        [Said::Retract(0), Said::Damaged(0, 0, read)]
+    );
 }
 
 #[test]

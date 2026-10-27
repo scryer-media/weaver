@@ -39,7 +39,7 @@ use weaver_graph::{
 };
 
 use crate::par2::combine;
-use crate::recovery_volume;
+use crate::recovery_volume::{self, Refusal, Shown};
 
 // How much of each volume's front is kept to read the index from. An index
 // file is metadata only; a recovery volume repeats it ahead of its blocks.
@@ -77,11 +77,15 @@ impl Settled {
 
 // What the last repair came to: the verdict it reached, or that it came up
 // short with so many volumes closed. A repair spends recovery by reading the
-// volumes back, so what it waits for is in hand once another closes.
+// volumes back, so what it waits for is in hand once another closes. One
+// that read no set whole found what describes the files in bytes not yet
+// read: it waits, as a short one does, on the volume that may describe them
+// while damage shows, and otherwise checked nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Ruling {
     Reached(RepairOutcome),
     Short { closed: usize },
+    Undescribed { closed: usize, waiting: bool },
 }
 
 #[derive(Debug, Default)]
@@ -182,10 +186,10 @@ pub struct Par3 {
     settled: BTreeMap<String, Settled>,
     // The repair's decoder allowance when the owner grants it none.
     memory_limit: u64,
-    // Ranges of members of the namespace that will never come, as the
-    // parent refused them, and the whole blocks of bound files they touch,
-    // counted again whenever either changes.
-    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
+    // The namespace's damage as the object was shown it, and the whole
+    // blocks of bound files its refusals touch, counted again whenever
+    // either changes.
+    shown: Shown,
     refused_blocks: u64,
 }
 
@@ -203,7 +207,7 @@ impl Par3 {
             ruled: Vec::new(),
             settled: BTreeMap::new(),
             memory_limit: REPAIR_MEMORY_LIMIT,
-            refusals: BTreeMap::new(),
+            shown: Shown::default(),
             refused_blocks: 0,
         }
     }
@@ -248,7 +252,7 @@ impl Par3 {
                 let Some(ranges) = self
                     .bound
                     .get(file.path())
-                    .and_then(|member| self.refusals.get(member))
+                    .and_then(|member| self.shown.refusals.get(member))
                 else {
                     continue;
                 };
@@ -289,6 +293,45 @@ impl Par3 {
         }
         let reachable = self.reach()?;
         (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
+    }
+
+    // Whether the namespace shows damage the sets not yet read may cover: a
+    // member, none of the object's own volumes, held damaged or refused,
+    // that no described file is bound to. Only then is a volume read for
+    // the descriptions: on a whole post the object checks nothing and
+    // costs nothing.
+    fn undescribed_damage(&self) -> bool {
+        self.shown.undescribed(|member| self.covers(member))
+    }
+
+    // The volume to read for the descriptions while no set was read whole
+    // and damage shows. `None` otherwise.
+    fn describing(&self) -> Option<usize> {
+        let undescribed = matches!(self.last, Some(Ruling::Undescribed { .. }));
+        undescribed.then(|| self.describer()).flatten()
+    }
+
+    // The volume that may describe the sets while damage shows: the first
+    // still open, an index before any volume and then the fewest blocks
+    // first.
+    fn describer(&self) -> Option<usize> {
+        if !self.undescribed_damage() {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..self.volumes.len()).collect();
+        order.sort_by_key(|index| (self.volumes[*index].named_blocks, *index));
+        order.into_iter().find(|index| !self.volumes[*index].closed)
+    }
+
+    // Damage the namespace shows for the first time makes an object that
+    // read no set, and ruled it checked nothing, due again: on what it saw
+    // then, no volume was worth reading for the sets; now one is.
+    // An impossible verdict stands: damage only grows, so what the object
+    // could not rebuild it still cannot.
+    fn damage_shown(&mut self) {
+        if let Some(Ruling::Undescribed { waiting: false, .. }) = self.last {
+            self.last = None;
+        }
     }
 
     fn closed(&self) -> usize {
@@ -520,15 +563,19 @@ impl Object for Par3 {
             .then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
-    // An impossible verdict counted the blocks of the volumes bound then; a
-    // volume bound since may bring more, so the object is tried again.
-    // Without this the verdict would depend on whether a volume's front
-    // decided before or after the damage arrived.
+    // An impossible verdict counted the blocks of the volumes bound then,
+    // and an unread one the packets they could bring; a volume bound since
+    // may bring more of either, so the object is tried again. Without this
+    // the verdict would depend on whether a volume's front decided before
+    // or after the damage arrived.
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         self.volume(volume).named_blocks = recovery_volume::named_blocks(name, ".par3");
         if matches!(
             self.last,
-            Some(Ruling::Reached(RepairOutcome::Impossible { .. }))
+            Some(
+                Ruling::Reached(RepairOutcome::Impossible { .. } | RepairOutcome::Unread)
+                    | Ruling::Undescribed { .. }
+            )
         ) {
             self.last = None;
         }
@@ -548,6 +595,9 @@ impl Recovery for Par3 {
     // for a member no described name answers to, which takes the described
     // name.
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
+        if self.shown.bind(namespace, self.id) {
+            self.damage_shown();
+        }
         let sets = self.front_sets();
         let files = || sets.iter().flat_map(Par3Set::files);
         let answers =
@@ -644,11 +694,11 @@ impl Recovery for Par3 {
     // Kept for every member of the namespace, bound or not: a bind later
     // counts what was refused before.
     fn refused(&mut self, member: MemberId, range: ByteRange) {
-        let ranges = self.refusals.entry(member).or_default();
-        if ranges.contains(&range) {
-            return;
+        match self.shown.refused(member, range) {
+            Refusal::Known => return,
+            Refusal::Own => {}
+            Refusal::Damage => self.damage_shown(),
         }
-        ranges.push(range);
         let sets = self.front_sets();
         self.count_refused(&sets);
     }
@@ -657,12 +707,25 @@ impl Recovery for Par3 {
     fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
 
     // While the last repair waits on damaged blocks, every open volume is
-    // wanted now. Otherwise every volume whose head shows it carries
-    // recovery is deferred: the rest waits until a repair is short. Nothing
-    // of the deferral is kept: the same fronts say it again on every round.
+    // wanted now. While it read no set whole and damage shows, the one
+    // volume that may describe them is. Otherwise every volume whose head
+    // shows it carries recovery is deferred: the rest waits until a repair
+    // is short. Nothing of the deferral is kept: the same fronts say it
+    // again on every round.
     fn wants(&self, out: &mut Vec<Seek>) {
+        let describing = self.describing();
         for (index, volume) in self.volumes.iter().enumerate() {
             if volume.closed {
+                continue;
+            }
+            if describing == Some(index) {
+                recovery_volume::gaps(&volume.arrived, |range| {
+                    out.push(Seek::recovery(
+                        VolumeIndex(index as u32),
+                        range,
+                        Weight::FIRST,
+                    ))
+                });
                 continue;
             }
             if self.needed == 0 {
@@ -711,6 +774,21 @@ impl Recovery for Par3 {
             }
         }
         let sets = sets(packets);
+        // With no set read whole, one waits on a volume that may describe
+        // it while damage shows; otherwise nothing was checked.
+        if sets.is_empty() {
+            self.needed = 0;
+            self.ruled.clear();
+            let waiting = self.describer().is_some();
+            self.last = Some(Ruling::Undescribed {
+                closed: self.closed(),
+                waiting,
+            });
+            return match waiting {
+                true => RepairOutcome::Waiting,
+                false => RepairOutcome::Unread,
+            };
+        }
         self.identify(&sets, access);
         let coming = self.coming();
         let mut outcome = RepairOutcome::Unread;
@@ -787,7 +865,12 @@ impl Recovery for Par3 {
         }
         match self.last? {
             Ruling::Reached(outcome) => Some(outcome),
-            Ruling::Short { closed } => (self.closed() == closed).then_some(RepairOutcome::Waiting),
+            Ruling::Short { closed }
+            | Ruling::Undescribed {
+                closed,
+                waiting: true,
+            } => (self.closed() == closed).then_some(RepairOutcome::Waiting),
+            Ruling::Undescribed { waiting: false, .. } => Some(RepairOutcome::Unread),
         }
     }
 

@@ -36,6 +36,7 @@ use self::repair::{SetRepair, repair_set};
 use self::sets::{Location, SetState, Volume};
 use self::walker::{Found, Meter};
 use crate::grid::{Grid, WHOLE};
+use crate::recovery_volume::{Refusal, Shown};
 
 // One job holds no more recovery sets than an NZB holds files.
 const MAX_PAR2_RECOVERY_SETS: usize = 100_000;
@@ -58,9 +59,9 @@ pub struct Par2 {
     meter: Meter,
     // A job past the packet or set limits keeps none of its sets.
     refused: bool,
-    // Ranges of members of the namespace that will never come, as the
-    // parent refused them. A set counts those of the members it binds.
-    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
+    // The namespace's damage as the object was shown it: a set counts the
+    // refusals of the members it binds.
+    shown: Shown,
     // The namespace asked for a ruling before any set was found: a volume
     // is read for one.
     seeking: bool,
@@ -86,7 +87,7 @@ impl Par2 {
             evidence: BTreeMap::new(),
             meter: Meter::default(),
             refused: false,
-            refusals: BTreeMap::new(),
+            shown: Shown::default(),
             seeking: false,
             output_limit: MAX_JOB_BYTES,
             memory_limit: REPAIR_MEMORY_LIMIT,
@@ -144,7 +145,7 @@ impl Par2 {
             .iter()
             .filter_map(|(file, member)| {
                 let length = index.file_description(file)?.length;
-                Some((length, self.refusals.get(member)?))
+                Some((length, self.shown.refusals.get(member)?))
             })
             .map(|(length, ranges)| {
                 ranges
@@ -194,6 +195,30 @@ impl Par2 {
             .map(|index| index.slice_size)
     }
 
+    // Whether the namespace shows damage a set that has not read its
+    // descriptions may cover: a member, none of the object's own volumes,
+    // held damaged or refused, that no set with its descriptions binds.
+    // Only then is a volume read for them: on a whole post the set checks
+    // nothing and costs nothing.
+    fn undescribed_damage(&self) -> bool {
+        self.shown.undescribed(|member| {
+            self.sets
+                .values()
+                .any(|state| state.usable().is_some() && state.bound(member).is_some())
+        })
+    }
+
+    // Damage the namespace shows for the first time makes a set that ruled
+    // it checked nothing for want of its descriptions due again: on what
+    // it saw then, no volume was worth reading for them; now one is.
+    fn damage_shown(&mut self) {
+        for state in self.sets.values_mut() {
+            if state.usable().is_none() {
+                state.damage_shown();
+            }
+        }
+    }
+
     // Damaged slices the evidence shows, per set.
     fn damaged_seen(&self) -> BTreeMap<[u8; 16], u64> {
         let mut seen = BTreeMap::new();
@@ -235,7 +260,7 @@ impl Par2 {
     fn waits(&self, key: &[u8; 16], needed: u64) -> bool {
         let state = &self.sets[key];
         if state.usable().is_none() {
-            return self.describing(Some(key)).is_some();
+            return self.describing(Some(key)).is_some() && self.undescribed_damage();
         }
         (state.recovery.len() as u64) < needed && self.coming(key) > 0
     }
@@ -448,6 +473,9 @@ impl Object for Par2 {
 
 impl Recovery for Par2 {
     fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
+        if self.shown.bind(namespace, self.id) {
+            self.damage_shown();
+        }
         let (keys, indexes): (Vec<[u8; 16]>, Vec<&Par2FileSet>) = self
             .ordered()
             .into_iter()
@@ -607,9 +635,8 @@ impl Recovery for Par2 {
     // Kept for every member of the namespace, bound or not: a set bound to
     // it later counts what was refused before.
     fn refused(&mut self, member: MemberId, range: ByteRange) {
-        let ranges = self.refusals.entry(member).or_default();
-        if !ranges.contains(&range) {
-            ranges.push(range);
+        if self.shown.refused(member, range) == Refusal::Damage {
+            self.damage_shown();
         }
     }
 
@@ -638,9 +665,10 @@ impl Recovery for Par2 {
     // its head told what it is, and the rest waits until a shortfall wants
     // it. Nothing of the deferral is kept: the same walk says it again on
     // every round, after a restart too. A set asked to rule before it has a
-    // description, or an object asked before it found any set, waits on one
-    // volume that may carry a description, and asks for it, then the next
-    // once that one is read through without it.
+    // description, once the namespace shows damage it may cover, or an
+    // object asked before it found any set, waits on one volume that may
+    // carry a description, and asks for it, then the next once that one is
+    // read through without it.
     fn wants(&self, out: &mut Vec<Seek>) {
         let seen = self.damaged_seen();
         let packet = self.smallest_packet();
@@ -658,6 +686,7 @@ impl Recovery for Par2 {
             let state = &self.sets[&key];
             if state.usable().is_none() {
                 if state.short_of().is_some()
+                    && self.undescribed_damage()
                     && let Some(index) = self.describing(Some(&key))
                     && !asked[index]
                 {
@@ -708,6 +737,7 @@ impl Recovery for Par2 {
                 RepairOutcome::Unread
             };
         }
+        let damage = self.undescribed_damage();
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
             if let Some(short) = self.refused_short(&key) {
@@ -722,11 +752,12 @@ impl Recovery for Par2 {
             let result = match state.concluded() {
                 Some(concluded) => concluded,
                 // A set with no description waits on a volume that may carry
-                // one; with none left to read, it checked nothing.
+                // one while damage shows; with none left to read, or nothing
+                // damaged, it checked nothing.
                 None if state.usable().is_none() => {
                     let last = match describing {
-                        Some(_) => SetRepair::waiting(),
-                        None => SetRepair::unread(),
+                        Some(_) if damage => SetRepair::waiting(),
+                        _ => SetRepair::unread(),
                     };
                     state.last = Some(last);
                     last.outcome

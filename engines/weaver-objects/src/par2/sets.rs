@@ -198,16 +198,30 @@ impl SetState {
         self.members.insert(file, member);
     }
 
-    // An impossible verdict counted the blocks of the volumes bound then; a
-    // volume bound since may bring more, so the set is tried again. Without
+    // Damage shown since an unread verdict may be what the descriptions
+    // the set has not read cover, so the set is tried again. An impossible
+    // verdict stands: damage only grows, so what the set could not rebuild
+    // it still cannot.
+    pub(super) fn damage_shown(&mut self) {
+        if self
+            .last
+            .is_some_and(|last| last.outcome == RepairOutcome::Unread)
+        {
+            self.last = None;
+        }
+    }
+
+    // An impossible verdict counted the blocks of the volumes bound then,
+    // and an unread one the descriptions they could bring; a volume bound
+    // since may bring more of either, so the set is tried again. Without
     // this the verdict would depend on whether a volume's front decided
     // before or after the damage arrived.
     pub(super) fn reopen(&mut self) {
-        let impossible = matches!(
+        let stale = matches!(
             self.last.map(|last| last.outcome),
-            Some(RepairOutcome::Impossible { .. })
+            Some(RepairOutcome::Impossible { .. } | RepairOutcome::Unread)
         );
-        if impossible {
+        if stale {
             self.last = None;
         }
     }

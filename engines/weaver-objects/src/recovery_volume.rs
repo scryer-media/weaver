@@ -2,9 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A PAR volume as a recovery object fetches it: what its name says it
-// carries, and the ranges of it still to come.
+// carries, and the ranges of it still to come; and what the object has been
+// shown of its namespace's damage.
 
-use weaver_graph::{ByteRange, Coverage};
+use std::collections::{BTreeMap, BTreeSet};
+
+use weaver_graph::{ByteRange, Coverage, MemberId, Namespace, ObjectId};
 
 // The recovery blocks a volume's name says it carries, as every PAR creator
 // names a volume: `<stem>.vol<start>+<count>` and the format's `extension`,
@@ -28,6 +31,74 @@ pub(crate) fn gaps(arrived: &Coverage, mut each: impl FnMut(ByteRange)) {
         cursor = run.range.end;
     }
     each(ByteRange::new(cursor, u64::MAX));
+}
+
+// What a recovery object has been shown of its namespace's damage: the
+// ranges the parent refused, kept for every member bound or not so a set
+// bound later counts them; and, as the last bind saw the namespace, the
+// members that are the object's own volumes and every other member holding
+// damage.
+#[derive(Debug, Default)]
+pub(crate) struct Shown {
+    pub(crate) refusals: BTreeMap<MemberId, Vec<ByteRange>>,
+    own: BTreeSet<MemberId>,
+    damaged: BTreeSet<MemberId>,
+}
+
+// What a refusal adds to what the object was shown.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    // Kept already.
+    Known,
+    // New, on one of the object's own volumes.
+    Own,
+    // New, on a member the object's sets may cover.
+    Damage,
+}
+
+impl Shown {
+    // The namespace as object `id`'s bind sees it: whether it shows damage
+    // it did not before.
+    pub(crate) fn bind(&mut self, namespace: &Namespace, id: ObjectId) -> bool {
+        let (own, others): (Vec<_>, Vec<_>) = namespace
+            .members()
+            .partition(|member| member.bound_to == Some(id));
+        self.own = own.iter().map(|member| member.id).collect();
+        let damaged: BTreeSet<MemberId> = others
+            .iter()
+            .filter(|member| !member.coverage.is_clean())
+            .map(|member| member.id)
+            .collect();
+        let newly = !damaged.is_subset(&self.damaged);
+        self.damaged = damaged;
+        newly
+    }
+
+    pub(crate) fn refused(&mut self, member: MemberId, range: ByteRange) -> Refusal {
+        let ranges = self.refusals.entry(member).or_default();
+        if ranges.contains(&range) {
+            return Refusal::Known;
+        }
+        ranges.push(range);
+        match self.own.contains(&member) {
+            true => Refusal::Own,
+            false => Refusal::Damage,
+        }
+    }
+
+    // Whether the namespace shows damage `covers` leaves out: a member,
+    // none of the object's own volumes, held damaged or refused.
+    pub(crate) fn undescribed(&self, covers: impl Fn(MemberId) -> bool) -> bool {
+        let refused = self
+            .refusals
+            .iter()
+            .filter(|(member, ranges)| !ranges.is_empty() && !self.own.contains(member))
+            .map(|(member, _)| member);
+        self.damaged
+            .iter()
+            .chain(refused)
+            .any(|member| !covers(*member))
+    }
 }
 
 #[cfg(test)]
