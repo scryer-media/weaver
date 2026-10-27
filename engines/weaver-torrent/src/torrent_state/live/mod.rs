@@ -78,7 +78,7 @@ use crate::core::{
     torrent_metainfo::ValidatedTorrentMetaV1Info,
 };
 use crate::peer_protocol::{
-    Handshake, MY_EXTENDED_UT_HOLEPUNCH, Message, Piece, Request,
+    Handshake, MY_EXTENDED_UT_HOLEPUNCH, Message, PartialBlock, Piece, Request,
     extended::{
         ExtendedMessage,
         handshake::ExtendedHandshake,
@@ -1145,8 +1145,9 @@ impl TorrentStateLive {
         self.stats.redundant_bytes.load(Ordering::Relaxed)
     }
 
-    /// A block of `len` bytes arrived that is not used: it was not asked of
-    /// the peer any more, or another copy came first (libtorrent
+    /// `len` bytes of a block arrived that are not used: the block was never
+    /// asked of the peer, we had it, another copy came first, or the
+    /// connection ended before the rest of it arrived (libtorrent
     /// `torrent::add_redundant_bytes`, from `peer_connection::incoming_piece`).
     fn add_redundant_bytes(&self, len: u64) {
         self.stats.redundant_bytes.fetch_add(len, Ordering::Relaxed);
@@ -2254,6 +2255,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         };
         for counter in [peer, torrent, session] {
             counter.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// The part of a block of the torrent that arrived is not used.
+    fn on_partial_block(&self, block: PartialBlock) {
+        let lengths = &self.state.lengths;
+        let names_a_block = lengths
+            .validate_piece_index(block.index)
+            .and_then(|index| lengths.chunk_info_from_received_data(index, block.begin, block.len))
+            .is_some();
+        if names_a_block {
+            self.state.add_redundant_bytes(block.received.into());
         }
     }
 
@@ -3590,11 +3603,15 @@ impl PeerHandler {
                         trace!(?piece, "peer sent a block after we cancelled it");
                         Ok(())
                     }
-                    RemoveInflightRequestResult::Unexpected => anyhow::bail!(
-                        "peer sent us a piece we did not ask. Inflight requests: {:?}. Got: {:?}",
-                        h.inflight_requests_debug(),
-                        piece,
-                    ),
+                    RemoveInflightRequestResult::Unexpected => {
+                        // A block never asked for is not used.
+                        self.state.add_redundant_bytes(piece.len() as u64);
+                        anyhow::bail!(
+                            "peer sent us a piece we did not ask. Inflight requests: {:?}. Got: {:?}",
+                            h.inflight_requests_debug(),
+                            piece,
+                        )
+                    }
                 }
             })
             .context("peer not found")??;
