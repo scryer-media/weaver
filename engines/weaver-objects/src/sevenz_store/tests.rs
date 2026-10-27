@@ -267,6 +267,27 @@ fn a_piece_a_recovery_set_names_takes_the_place_its_number_gives() {
     assert!(!out.contains(&Emit::Refuse(Why::OrderUnknown)), "{out:?}");
 }
 
+// A uuencoded piece says no length until it ends, so neither the first
+// piece's length nor a later piece's own is known while they arrive: a
+// piece numbered from the first piece's name still takes the place its
+// number gives, before the first piece has closed.
+#[test]
+fn a_numbered_piece_of_unknown_length_takes_its_place_before_the_first_closes() {
+    let bytes = archive(copy(), false);
+    let volumes = split(&bytes, 4);
+    let mut object = store();
+    let (name, piece) = &volumes[0];
+    object.bound(VolumeIndex(0), name, &piece[..32], None);
+    for volume in [2, 1, 3] {
+        let (name, piece) = &volumes[volume];
+        assert_eq!(
+            object.claim(name, &piece[..32], None),
+            Some(VolumeIndex(volume as u32))
+        );
+        object.bound(VolumeIndex(volume as u32), name, &piece[..32], None);
+    }
+}
+
 #[test]
 fn directories_and_empty_files_are_members_that_close_at_once() {
     let alpha = payload(4, 700);
@@ -476,6 +497,19 @@ fn an_end_header_declared_past_any_byte_holds_nothing_until_bytes_arrive() {
     let mut owner = Owner::single(store(), bytes);
     owner.whole(4096);
     assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+}
+
+// A 7z of a major version this store cannot read is refused for that, not
+// handed to an engine as bytes no format names: it stays the container it
+// is.
+#[test]
+fn a_major_version_the_store_cannot_read_is_refused_unsupported() {
+    let mut bytes = archive(copy(), false);
+    bytes[6] = 1;
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::Refuse(Why::Unsupported)));
+    assert!(!has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
 }
 
 #[test]

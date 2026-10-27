@@ -585,6 +585,58 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
     );
 }
 
+// A 7z whose start header fails its CRC is still the store's by its name,
+// and the store refuses it for a reason that does not disclaim it: alone it
+// fails the job, and beside a whole file of its own it leaves the job
+// partial. The same bytes under a name that claims no kind are a file.
+#[test]
+fn a_broken_7z_is_refused_and_no_usable_file() {
+    let read = |names: &[&str]| {
+        let mut objects = weaver_objects::Objects::default();
+        let mut tree = weaver_graph::Tree::new();
+        let mut effects = Vec::new();
+        let mut bytes = vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+        bytes.resize(600, b'q');
+        let bytes = bytes::Bytes::from(bytes);
+        for name in names {
+            let member = tree.announce_root(name, Some(600), &mut effects);
+            let arrival = weaver_graph::Posted {
+                offset: 0,
+                bytes: bytes.clone(),
+                provenance: Provenance::Fresh,
+            };
+            tree.deliver(NodeId::ROOT, member, arrival, &mut objects, &mut effects);
+            tree.close(NodeId::ROOT, member, &mut objects, &mut effects);
+        }
+        let bound: Vec<NodeId> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                weaver_graph::Effect::Bound { child, .. } => Some(*child),
+                _ => None,
+            })
+            .collect();
+        for node in bound {
+            tree.quiet(node, &mut objects, &mut effects);
+        }
+        Delivery::read(
+            &tree,
+            |_| true,
+            |_| false,
+            |_, _| false,
+            |_, _| None,
+            |_, _| false,
+        )
+    };
+    let alone = read(&["lantern.7z"]);
+    assert_eq!(alone.damaged, vec!["lantern.7z".to_string()]);
+    assert!(matches!(alone.status(None), JobStatus::Failed { .. }));
+    let beside = read(&["lantern.7z", "lantern.mkv"]);
+    assert_eq!(beside.whole, vec!["lantern.mkv".to_string()]);
+    assert_eq!(beside.status(None), JobStatus::Partial);
+    let unnamed = read(&["lantern.bin"]);
+    assert_eq!(unnamed.whole, vec!["lantern.bin".to_string()]);
+}
+
 #[tokio::test]
 async fn a_job_with_a_listing_moves_to_complete() {
     let temp_dir = tempfile::tempdir().unwrap();

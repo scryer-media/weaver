@@ -347,9 +347,11 @@ impl SevenZipStore {
     // it is. The first piece is the one signed piece: a front whose
     // signature measures the container the first piece measured is that
     // piece posted again. A piece numbered from the first piece's name is
-    // at that number; one with no number is at each free place its length
-    // fits, and a piece as long as the first fits every free place but
-    // the last.
+    // at that number: its name is all that places it, so neither its own
+    // length nor the first piece's need be known yet, as a uuencoded
+    // piece's is not until it ends. One with no number is at each free
+    // place its length fits, and a piece as long as the first fits every
+    // free place but the last.
     fn placed(&self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Option<Placed> {
         if matches!(signed(first_bytes, length), Sniff::Object(_)) {
             let again = matches!(
@@ -358,16 +360,17 @@ impl SevenZipStore {
             );
             return again.then_some(Placed::At(VolumeIndex(0)));
         }
-        let first = *self.lengths.get(&VolumeIndex(0))?;
-        let (total, length, names) = (self.measured?, length?, &self.names);
-        Geometry::new(first, total)?;
+        let names = &self.names;
         let numbered = split::parse(names.get(&VolumeIndex(0))?)
             .and_then(|first| split::parse(name)?.index_from(&first))
             .map(VolumeIndex);
         if let Some(numbered) = numbered {
             return Some(Placed::At(numbered));
         }
-        fits(first, total, length, |at| !names.contains_key(&at))
+        let first = *self.lengths.get(&VolumeIndex(0))?;
+        let total = self.measured?;
+        Geometry::new(first, total)?;
+        fits(first, total, length?, |at| !names.contains_key(&at))
     }
 
     // One past every volume held.
@@ -459,6 +462,12 @@ impl SevenZipStore {
         match header::signature(bytes) {
             Signature::Foreign => {
                 self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+                false
+            }
+            // A 7z this object cannot read is still a 7z: it is refused,
+            // and stays the container it is.
+            Signature::Unreadable => {
+                self.give_up(Emit::Refuse(Why::Unsupported), out);
                 false
             }
             Signature::Damaged => {

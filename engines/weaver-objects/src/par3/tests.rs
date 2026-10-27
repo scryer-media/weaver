@@ -77,6 +77,61 @@ fn par3_repairs_one_damaged_member() {
     assert!(job.store.members[&second] == two);
 }
 
+// A member none of whose bytes came, booked at more than the described
+// length for the articles it lost, is rebuilt at the described length and
+// takes it, keeping its name.
+#[test]
+fn a_repaired_member_booked_longer_than_described_takes_the_described_length() {
+    let data = payload(5, 2000);
+    let files = par3_set("set", &[("one.bin", &data)], BLOCK, 3);
+    let mut job = job(&files);
+    let booked = data.len() as u64 + 300;
+    let member = job.namespace.announce("one.bin", Some(booked));
+    job.store.members.insert(member, Vec::new());
+    bind(&mut job);
+    assert!(job.object.covers(member));
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    bind(&mut job);
+    let record = job.namespace.get(member).unwrap();
+    assert_eq!(record.name, "one.bin");
+    assert_eq!(record.length, Some(data.len() as u64));
+}
+
+// A member that arrived with its bytes shifted along by three, so three
+// longer than described, is rebuilt, and the bind after recognises it at
+// the described length.
+#[test]
+fn a_repaired_member_longer_than_described_is_recognised_at_its_length() {
+    let data = payload(6, 3000);
+    let files = par3_set("set", &[("one.bin", &data)], BLOCK, 3);
+    let mut job = job(&files);
+    let mut shifted = vec![0x9b, 0x7d, 0x1f];
+    shifted.extend_from_slice(&data);
+    let member = job.member("one.bin", &shifted);
+    bind(&mut job);
+    assert!(job.object.covers(member));
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    let mut renamed = Vec::new();
+    job.object.bind(&mut job.namespace, &mut renamed);
+    assert_eq!(renamed, vec![member]);
+    let record = job.namespace.get(member).unwrap();
+    assert_eq!(record.name, "one.bin");
+    assert_eq!(record.length, Some(data.len() as u64));
+    assert!(record.is_complete());
+}
+
 // A set short of recovery waits while its volume's bytes arrive, and is due
 // again in the step the volume closes, its blocks in hand: no repair between.
 #[test]

@@ -191,6 +191,26 @@ impl RarRecovery {
         found
     }
 
+    // Each data volume's size as the set's header describes it, by index: a
+    // RAR5 table gives every one, and a RAR3 footer every one but the last,
+    // which falls short of the width the others share.
+    fn described_sizes(&self) -> Vec<(u32, u64)> {
+        let Some(header) = self.header() else {
+            return Vec::new();
+        };
+        let described = header
+            .sizes
+            .len()
+            .saturating_sub(usize::from(!header.last_described));
+        header
+            .sizes
+            .into_iter()
+            .take(described)
+            .enumerate()
+            .map(|(index, size)| (index as u32, size))
+            .collect()
+    }
+
     // Every data volume of the set, by index: as many as the header counts,
     // or as the names reach.
     fn slots(&self) -> u32 {
@@ -427,6 +447,24 @@ impl Recovery for RarRecovery {
             if let std::collections::btree_map::Entry::Vacant(slot) = bound.entry(volume.index()) {
                 slot.insert(member.id);
                 names.insert(member.id, member.name.clone());
+            }
+        }
+        // A volume the set repaired that is longer than its table gives, with
+        // no good bytes past that size, takes the table's size: what lies
+        // past was booked for articles that never came, and the rebuilt
+        // volume is the size the table gives.
+        let repaired = matches!(
+            self.last,
+            Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
+        );
+        let sizes = if repaired {
+            self.described_sizes()
+        } else {
+            Vec::new()
+        };
+        for (index, size) in sizes {
+            if let Some(member) = bound.get(&index) {
+                namespace.trim_booked(*member, size);
             }
         }
         let whole: BTreeSet<u32> = bound

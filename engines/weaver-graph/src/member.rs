@@ -550,6 +550,26 @@ impl Namespace {
         Some(found)
     }
 
+    // A recovery object repaired the member and describes it as `size`
+    // long, but it is booked longer, with no verified byte past that size:
+    // what lies past was booked for articles that never came, and the
+    // member keeps its name and takes the described size. True when it did.
+    pub fn trim_booked(&mut self, member: MemberId, size: u64) -> bool {
+        let Some(found) = self.members.get(&member) else {
+            return false;
+        };
+        let booked = found.length.is_some_and(|length| length > size)
+            && !found
+                .coverage
+                .overlapping(ByteRange::new(size, u64::MAX))
+                .any(|run| run.provenance.is_verified());
+        if booked {
+            let name = found.name.clone();
+            self.recognise(member, &name, size);
+        }
+        booked
+    }
+
     // The member starts over: its bytes are forgotten and it is unbound. Its
     // output name is kept, so what comes back lands where it was.
     pub fn retract(&mut self, member: MemberId) {

@@ -237,6 +237,48 @@ fn a_set_rules_on_how_many_volumes_are_missing_against_its_recovery_volumes() {
     assert_eq!(verdicts, vec![SliceVerdict::Intact]);
 }
 
+// A data volume none of whose bytes came, booked longer than the size the
+// RAR5 table gives, takes the table's size once the set has repaired it,
+// and keeps its name. Before the repair it keeps what was booked.
+#[test]
+fn a_repaired_volume_booked_longer_than_its_table_size_takes_that_size() {
+    let mut job = job();
+    rev(&mut job, "lantern.part1.rev", &rev5(2, 1, 2, &[300, 250]));
+    data(&mut job, "lantern.part01.rar");
+    let lost = job.namespace.announce("lantern.part02.rar", Some(400));
+    job.namespace.get_mut(lost).expect("announced").closed = true;
+    bind(&mut job);
+    assert_eq!(job.namespace.get(lost).unwrap().length, Some(400));
+    job.object.last = Some(Ruling::Reached(RepairOutcome::Repaired { slices: 1 }));
+    bind(&mut job);
+    let record = job.namespace.get(lost).unwrap();
+    assert_eq!(record.name, "lantern.part02.rar");
+    assert_eq!(record.length, Some(250));
+}
+
+// A RAR3 footer describes every data volume but the last as the recovery
+// volume's width: a repaired volume booked longer takes that width, while
+// the last, which falls short of the width, keeps what was booked.
+#[test]
+fn a_repaired_rar3_volume_booked_longer_than_the_width_takes_it_but_the_last() {
+    let mut job = job();
+    rev(&mut job, "lantern.part1.rev", &rev3(3, 300));
+    data(&mut job, "lantern.part01.rar");
+    let booked = |job: &mut Job<RarRecovery>, name: &str| {
+        let member = job.namespace.announce(name, Some(400));
+        job.namespace.get_mut(member).expect("announced").closed = true;
+        member
+    };
+    let middle = booked(&mut job, "lantern.part02.rar");
+    let last = booked(&mut job, "lantern.part03.rar");
+    job.object.last = Some(Ruling::Reached(RepairOutcome::Repaired { slices: 2 }));
+    bind(&mut job);
+    let record = job.namespace.get(middle).unwrap();
+    assert_eq!(record.name, "lantern.part02.rar");
+    assert_eq!(record.length, Some(300));
+    assert_eq!(job.namespace.get(last).unwrap().length, Some(400));
+}
+
 // A set short of recovery volumes waits while the one it needs arrives, and
 // is due again in the step that one closes: no repair between.
 #[test]
