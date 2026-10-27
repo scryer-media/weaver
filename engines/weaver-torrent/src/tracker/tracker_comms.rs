@@ -135,6 +135,15 @@ pub trait TorrentStatsProvider: Send + Sync {
     fn wait_until_completed(&self) -> BoxFuture<'_, ()> {
         futures::future::pending().boxed()
     }
+
+    /// Resolves once every connection of the run that just ended has
+    /// closed and counted what it dropped, so a `stopped` announce reports
+    /// it (libtorrent `torrent::do_pause` disconnects every peer before
+    /// `stop_announcing`). Asked as the run's announcing stops. The default
+    /// resolves at once.
+    fn run_ended(&self) -> BoxFuture<'static, ()> {
+        futures::future::ready(()).boxed()
+    }
 }
 
 impl TorrentStatsProvider for () {
@@ -1464,6 +1473,9 @@ impl TrackerTask {
 #[derive(Clone)]
 pub struct StoppedAnnounces {
     timeout: Duration,
+    // How long a `stopped` announce waits for its run's connections to
+    // close and count what they cut, before its own `timeout` starts.
+    run_end: Duration,
     // Set once the address these announces would leave from may no longer
     // carry them: from then on they take no time, so none is sent.
     withheld: Arc<std::sync::atomic::AtomicBool>,
@@ -1481,10 +1493,17 @@ impl StoppedAnnounces {
     /// `settings_pack::stop_tracker_timeout`).
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// How long a `stopped` announce waits by default for its run's
+    /// connections to close. They close as soon as the run is cancelled;
+    /// this only bounds one that does not, and the announce then goes with
+    /// the counters as they are and its own bound whole.
+    pub const RUN_END_TIMEOUT: Duration = Duration::from_secs(2);
+
     /// `timeout` bounds each `stopped` announce; zero sends none.
     pub fn new(timeout: Duration) -> Self {
         Self {
             timeout,
+            run_end: Self::RUN_END_TIMEOUT,
             withheld: Default::default(),
             running: Arc::new(tokio::sync::watch::channel(0).0),
         }
@@ -1496,6 +1515,22 @@ impl StoppedAnnounces {
             return Duration::ZERO;
         }
         self.timeout
+    }
+
+    /// `run_end` bounds the wait for a run's connections to close before
+    /// its `stopped` announce, apart from the announce's own bound.
+    pub fn run_end_within(mut self, run_end: Duration) -> Self {
+        self.run_end = run_end;
+        self
+    }
+
+    /// The most a `stopped` announce takes from its run's end: the wait for
+    /// the run's connections, then the announce; zero once withheld.
+    pub fn whole(&self) -> Duration {
+        match self.timeout() {
+            Duration::ZERO => Duration::ZERO,
+            timeout => self.run_end + timeout,
+        }
     }
 
     /// Sends no `stopped` announce from now on, through any clone.
@@ -1807,9 +1842,11 @@ impl TrackerComms {
     }
 
     /// Sends `stopped` to `trackers`, which accepted `started`, with the
-    /// counters as they are, each recorded in the table as any announce is,
-    /// within the stopped announces' bound; none when that bound is zero.
-    /// `running` is held until they end.
+    /// counters as they are once the run's connections closed, each
+    /// recorded in the table as any announce is, within the stopped
+    /// announces' bound; none when that bound is zero. The wait for the
+    /// connections has its own bound, so a run slow to end still leaves the
+    /// announces theirs whole. `running` is held until they end.
     fn send_stopped(self: &Arc<Self>, trackers: Vec<SupportedTracker>, running: RunningGuard) {
         let timeout = self.stopped.timeout();
         if timeout.is_zero() || trackers.is_empty() {
@@ -1820,10 +1857,17 @@ impl TrackerComms {
             return;
         };
         let comms = self.clone();
+        let run_end = self.stopped.run_end;
+        let ended = comms.stats.run_ended();
         let span = debug_span!(parent: None, "tracker_stopped", info_hash = ?comms.info_hash);
         runtime.spawn(
             async move {
                 let _running = running;
+                // The counters once the run's connections have counted what
+                // they dropped; within their bound, as they are if not.
+                if tokio::time::timeout(run_end, ended).await.is_err() {
+                    debug!(?run_end, "the run's connections did not close in time");
+                }
                 let stats = comms.stats.get();
                 let announces = trackers.into_iter().map(|tracker| {
                     comms.announce_recorded(tracker, Some(TrackerRequestEvent::Stopped), stats)
@@ -2996,6 +3040,152 @@ mod tests {
             }
             .boxed()
         }
+    }
+
+    /// A bound on the stopped announces far past any exchange a test runs.
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    /// [`ManualStats`] whose run ends once the test opens `ended`; `waiting`
+    /// turns true once a stopped announce waits for it.
+    struct EndingStats {
+        stats: Arc<ManualStats>,
+        ended: tokio::sync::watch::Sender<bool>,
+        waiting: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl super::TorrentStatsProvider for EndingStats {
+        fn get(&self) -> TrackerCommsStats {
+            super::TorrentStatsProvider::get(&self.stats)
+        }
+
+        fn run_ended(&self) -> BoxFuture<'static, ()> {
+            let mut rx = self.ended.subscribe();
+            let waiting = self.waiting.clone();
+            async move {
+                waiting.send_replace(true);
+                let _ = rx.wait_for(|e| *e).await;
+            }
+            .boxed()
+        }
+    }
+
+    // libtorrent `torrent::do_pause` disconnects every connection, each
+    // counting the block it was cut in as redundant, before
+    // `stop_announcing` builds `stopped`: the stopped announce reports what
+    // the run's closing connections counted after its announcing stopped.
+    #[tokio::test]
+    async fn a_stopped_announce_reports_what_the_runs_closing_connections_counted() {
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(live(0, 90, false)),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let (ended, _) = tokio::sync::watch::channel(false);
+        let (waiting, mut stopping) = tokio::sync::watch::channel(false);
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        // Bounds far past the exchange, so nothing here races them.
+        let stopped = StoppedAnnounces::new(DAY).run_end_within(DAY);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            op(vec![vec![url]]),
+            Box::new(EndingStats {
+                stats: stats.clone(),
+                ended: ended.clone(),
+                waiting,
+            }),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_vote(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        )
+        .peers;
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+
+        // The run ends: announcing stops first, then a closing connection
+        // counts the 8192 bytes of the block it was cut in.
+        drop(peers);
+        stopping.wait_for(|w| *w).await.unwrap();
+        *stats.stats.lock() = TrackerCommsStats {
+            redundant_bytes: 8192,
+            torrent_state: TrackerCommsStatsState::Paused,
+            ..live(0, 90, false)
+        };
+        ended.send_replace(true);
+        let q = next_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        assert_eq!(query_param(&q, "redundant"), Some("8192"));
+
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    // The wait for a run's connections has its own bound apart from the
+    // announce's: a run that never ends is waited for no longer than that,
+    // and `stopped` still goes out, with the counters as they are, within
+    // its own bound whole.
+    #[tokio::test]
+    async fn a_run_slow_to_end_still_leaves_the_stopped_announce_its_bound() {
+        let (listener, url) = http_listener().await;
+        let stats = Arc::new(ManualStats {
+            stats: Mutex::new(live(0, 90, false)),
+            completed: tokio::sync::watch::channel(false).0,
+        });
+        let (ended, _) = tokio::sync::watch::channel(false);
+        let (waiting, _) = tokio::sync::watch::channel(false);
+        let token = CancellationToken::new();
+        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let stopped = StoppedAnnounces::new(DAY).run_end_within(Duration::ZERO);
+        assert_eq!(stopped.whole(), DAY);
+        let mut peers = TrackerComms::start_with_tiers(
+            v1_hash(),
+            identity(),
+            op(vec![vec![url]]),
+            Box::new(EndingStats {
+                stats: stats.clone(),
+                ended,
+                waiting,
+            }),
+            None,
+            tokio::sync::watch::channel(Some(6881)).1,
+            no_vote(),
+            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            reach_all(),
+            udp_client,
+            stopped.clone(),
+        )
+        .peers;
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+
+        drop(peers);
+        let q = next_announce(&listener).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        assert_eq!(query_param(&q, "redundant"), Some("0"));
+
+        stopped.wait_idle().await;
+        token.cancel();
     }
 
     /// The query string of the next HTTP request, answered with an empty peer list.

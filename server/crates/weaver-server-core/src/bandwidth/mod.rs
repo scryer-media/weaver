@@ -15,8 +15,8 @@ pub mod service;
 
 pub use caps::QuotaWeekday;
 pub use limits::{
-    BandwidthSplit, Direction, QuotaState, RateLimits, SplitRates, SplitState, SplitUse,
-    TorrentRates, effective_rate, share_out, split_rates,
+    BandwidthSplit, Direction, QuotaState, RateLimits, SPLIT_TICK, SplitRates, SplitState,
+    SplitTick, SplitUse, TorrentRates, effective_rate, lower, per_second, share_out, split_rates,
 };
 pub use model::{
     PruneFiles, QuotaTarget, ScheduleAction, ScheduleEntry, ScheduleTrack, SpeedLimitChange,

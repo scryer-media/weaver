@@ -2305,19 +2305,32 @@ async fn a_failed_piece_counts_as_corrupt_and_a_block_already_had_as_redundant()
     );
 }
 
-// A block the peer was never asked for is not used: its bytes count as
-// redundant, and none as downloaded.
+// libtorrent `peer_connection::start_receive_piece` queues a block never
+// asked for as not wanted, and `incoming_piece` writes it unless the piece
+// picker already holds it, counting it redundant then; the peer is kept
+// either way. A block the piece lacks is used; the same block again is
+// redundant.
 #[tokio::test]
-async fn a_block_never_asked_for_counts_as_redundant() {
-    let h = Harness::new("unasked_block_redundant").await;
+async fn a_block_never_asked_for_is_used_when_lacked_and_redundant_when_held() {
+    let h = Harness::new("unasked_block").await;
     let (peer, _rx) = h.peer("127.0.0.1:6881");
-    let block = vec![0u8; CHUNK_SIZE as usize];
+    let block = &h.content[..CHUNK_SIZE as usize];
 
-    peer.on_received_piece(Piece::from_data(0, 0, &block[..]))
+    peer.on_received_piece(Piece::from_data(0, 0, block))
         .await
-        .unwrap_err();
+        .unwrap();
+    assert!(!h.missing_chunks(0).contains(&0));
+    assert_eq!(h.get_redundant_bytes(), 0);
+    assert_eq!(
+        h.stats.fetched_bytes.load(Ordering::Relaxed),
+        u64::from(CHUNK_SIZE)
+    );
+
+    peer.on_received_piece(Piece::from_data(0, 0, block))
+        .await
+        .unwrap();
     assert_eq!(h.get_redundant_bytes(), u64::from(CHUNK_SIZE));
-    assert_eq!(h.stats.fetched_bytes.load(Ordering::Relaxed), 0);
+    assert!(h.peers.with_live(peer.addr, |_| ()).is_some());
 }
 
 // A connection that ends part way through a block drops the bytes of it
@@ -2388,6 +2401,49 @@ async fn a_block_cut_short_by_a_pause_counts_as_redundant_once() {
 
     assert_eq!(h.shared.moved.lock().redundant_bytes, RECEIVED as u64);
     assert_eq!(h.get_redundant_bytes(), 0);
+}
+
+// libtorrent `torrent::do_pause` disconnects every connection, each counting
+// what it drops (`peer_connection::disconnect`), before `stop_announcing`
+// builds `stopped`. The run's end names its tasks before anything ends, and
+// once they have ended the cut block is counted: what a stopped announce
+// waits for.
+#[tokio::test]
+async fn the_end_of_a_run_waits_for_its_connections_to_count_the_block_they_were_cut_in() {
+    use tokio::io::AsyncWriteExt;
+    const RECEIVED: usize = 1000;
+
+    let h = Harness::new("partial_block_ending_run").await;
+    let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+    let (reader, writer, mut taken) = crate::peer_info_reader::tests::watched_halves(ours);
+    let checked = CheckedIncomingConnection {
+        kind: ConnectionKind::Tcp,
+        addr: sock("192.0.2.1:6881"),
+        reader,
+        writer,
+        read_buf: crate::read_buf::ReadBuf::new(),
+        handshake: Handshake::new(h.shared.info_hash, Id20::new([7; 20])),
+        encryption: crate::mse::Encryption::None,
+        meter: Default::default(),
+    };
+    let slot = h._session.connection_slots.try_accept().unwrap();
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+
+    let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
+    frame.push(7);
+    frame.extend(0u32.to_be_bytes());
+    frame.extend(0u32.to_be_bytes());
+    frame.extend(vec![0xab; RECEIVED]);
+    theirs.write_all(&frame).await.unwrap();
+    taken.wait_for(|n| *n == frame.len()).await.unwrap();
+
+    assert!(h.shared.ending_run.lock().is_none());
+    let _paused = h.live.pause().unwrap();
+    let ending = h.shared.ending_run.lock().clone().expect("the run's tasks");
+    ending.wait().await;
+    assert_eq!(h.shared.moved.lock().redundant_bytes, RECEIVED as u64);
+    drop(theirs);
 }
 
 #[tokio::test]

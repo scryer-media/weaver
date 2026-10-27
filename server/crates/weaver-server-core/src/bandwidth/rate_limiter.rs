@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 // Token bucket rate limiter for bandwidth throttling.
 //
 // Tokens represent bytes. The bucket refills at `rate` bytes/sec up to a
-// capacity of 1 second of bandwidth. Consuming more tokens than available
-// drives the balance negative — callers should wait before consuming more.
+// capacity of a quarter second of bandwidth, so a side of the bandwidth
+// split that moved less than its rate has little banked to spike past it
+// with. Consuming more tokens than available drives the balance negative —
+// callers should wait before consuming more.
 //
 // A rate of `None` is no limit. A rate of `Some(0)` lets nothing through:
 // the bucket never refills and callers always wait.
@@ -22,9 +24,17 @@ pub struct TokenBucket {
 // change that reopens it wakes its caller first.
 const CLOSED_WAIT: Duration = Duration::from_secs(3600);
 
+// The share of a second of its rate a bucket holds.
+const CAPACITY_SECS: f64 = 0.25;
+
+// What a bucket at `rate` holds at most.
+fn capacity(rate: Option<u64>) -> f64 {
+    rate.unwrap_or(0) as f64 * CAPACITY_SECS
+}
+
 impl TokenBucket {
     pub fn new(rate: Option<u64>) -> Self {
-        let capacity = rate.unwrap_or(0) as f64;
+        let capacity = capacity(rate);
         Self {
             tokens: capacity,
             rate,
@@ -109,7 +119,7 @@ impl TokenBucket {
     pub fn set_rate(&mut self, rate: Option<u64>) {
         self.refill();
         self.rate = rate;
-        self.capacity = rate.unwrap_or(0) as f64;
+        self.capacity = capacity(rate);
         // Clamp existing tokens to new capacity (if capacity decreased).
         if rate.is_some() {
             self.tokens = self.tokens.min(self.capacity);

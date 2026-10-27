@@ -89,6 +89,49 @@ impl SocketFactory for Dialed {
     }
 }
 
+/// [`Dialed`], with how many bytes our end of each dialed stream has read,
+/// as [`watched_halves`] counts them.
+pub(crate) struct WatchedDials(
+    pub(crate)  mpsc::UnboundedSender<(
+        SocketAddr,
+        DuplexStream,
+        tokio::sync::watch::Receiver<usize>,
+    )>,
+);
+
+impl SocketFactory for WatchedDials {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(async move {
+            let (ours, theirs) = tokio::io::duplex(1 << 20);
+            let (read, write, taken) = watched_halves(ours);
+            self.0
+                .send((addr, theirs, taken))
+                .map_err(|_| io::Error::from(io::ErrorKind::ConnectionRefused))?;
+            Ok((read, write))
+        })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async {
+            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+        })
+    }
+}
+
 pub(crate) fn halves(stream: DuplexStream) -> (BoxAsyncReadVectored, BoxAsyncWrite) {
     let (read, write) = tokio::io::split(stream);
     (Box::new(read.into_vectored_compat()), Box::new(write))
@@ -200,6 +243,8 @@ pub(crate) struct MockPeer {
     read: BoxAsyncReadVectored,
     write: BoxAsyncWrite,
     buf: ReadBuf,
+    // Bytes written to us so far.
+    pub(crate) sent: usize,
 }
 
 impl MockPeer {
@@ -212,15 +257,46 @@ impl MockPeer {
         let len = Handshake::new(hashes.v1.unwrap(), Id20::new([9; 20]))
             .serialize_unchecked_len(&mut out);
         write.write_all(&out[..len]).await.unwrap();
-        Self { read, write, buf }
+        Self {
+            read,
+            write,
+            buf,
+            sent: len,
+        }
     }
 
-    pub(super) async fn send(&mut self, msg: Message<'_>) {
+    pub(crate) async fn send(&mut self, msg: Message<'_>) {
         let mut out = vec![0u8; 1 << 15];
         let len = msg
             .serialize(&mut out, &PeerExtendedMessageIds::my)
             .unwrap();
-        self.write.write_all(&out[..len]).await.unwrap();
+        self.write_raw(&out[..len]).await;
+    }
+
+    /// Writes `bytes` to us as they are, a message's part say.
+    pub(crate) async fn write_raw(&mut self, bytes: &[u8]) {
+        self.write.write_all(bytes).await.unwrap();
+        self.sent += bytes.len();
+    }
+
+    /// The next block we ask for; other messages pass. None once we hang
+    /// up.
+    pub(crate) async fn next_block_request(&mut self) -> Option<crate::peer_protocol::Request> {
+        loop {
+            let msg = self
+                .buf
+                .read_message(
+                    &mut self.read,
+                    NO_TIMEOUT,
+                    None,
+                    &mut crate::read_buf::Unlimited,
+                )
+                .await
+                .ok()?;
+            if let Message::Request(request) = msg {
+                return Some(request);
+            }
+        }
     }
 
     pub(crate) async fn send_extended_handshake(&mut self, metadata_size: u32) {

@@ -24,7 +24,7 @@ struct Torrents {
 }
 
 impl TorrentRate for Torrents {
-    fn download_bps(&self) -> u64 {
+    fn sample(&self) -> u64 {
         self.used.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -95,11 +95,19 @@ async fn schedule(pipeline: &mut Pipeline, action: ScheduleAction) {
     pipeline.apply_queue_intents().await;
 }
 
+// One split tick on the mocked clock: the split measures what each side
+// moved over it and puts the shares that follow in force.
+async fn tick(pipeline: &mut Pipeline) {
+    pipeline.measure_split();
+    tokio::time::advance(crate::bandwidth::SPLIT_TICK).await;
+    pipeline.refresh_periodic_snapshot();
+}
+
 fn rates(pipeline: &Pipeline, torrents: &Torrents) -> (Option<u64>, Option<u64>) {
     (pipeline.rate_limiter.rate(), torrents.given())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_split_shares_the_download_limit_between_usenet_and_torrents() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -124,16 +132,19 @@ async fn the_split_shares_the_download_limit_between_usenet_and_torrents() {
         }
     );
 
-    // Torrents want more while usenet is idle: the bandwidth tick hands them
-    // the whole limit, and usenet keeps its share to wake into.
+    // Torrents press their share while usenet is idle: the split's tick
+    // hands them the whole limit but the hundredth usenet keeps to wake into.
     torrents
         .used
         .store(20 * MB, std::sync::atomic::Ordering::Relaxed);
-    pipeline.refresh_periodic_snapshot();
-    assert_eq!(rates(&pipeline, &torrents), (Some(80 * MB), Some(100 * MB)));
+    tick(&mut pipeline).await;
+    assert_eq!(rates(&pipeline, &torrents), (Some(MB), Some(99 * MB)));
 
-    // A split rule takes over the operator's, and lifting it goes back.
+    // Both idle: the next tick hands the shares back. A split rule takes
+    // over the operator's, and lifting it goes back.
     torrents.used.store(0, std::sync::atomic::Ordering::Relaxed);
+    tick(&mut pipeline).await;
+    assert_eq!(rates(&pipeline, &torrents), (Some(80 * MB), Some(20 * MB)));
     schedule(
         &mut pipeline,
         ScheduleAction::BandwidthSplit {
@@ -259,7 +270,7 @@ async fn the_whole_upload_limit_is_the_torrents() {
     assert_eq!(torrents.rates().upload, None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_published_split_settles_back_to_the_shares_once_both_sides_idle() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, torrents) = seated(&temp_dir).await;
@@ -270,27 +281,82 @@ async fn the_published_split_settles_back_to_the_shares_once_both_sides_idle() {
     set_bandwidth(&mut pipeline, bandwidth(Some(100 * MB), Some(80))).await;
     assert_eq!(pipeline.shared_state.bandwidth_split().rates, shares);
 
-    // Torrents busy while usenet idles: they are lent the whole limit.
+    // Torrents busy while usenet idles: they are lent the whole limit but
+    // usenet's probe.
     torrents.downloading(20 * MB);
-    pipeline.refresh_periodic_snapshot();
+    tick(&mut pipeline).await;
     assert_eq!(
         pipeline.shared_state.bandwidth_split().rates.torrent,
-        Some(100 * MB)
+        Some(99 * MB)
     );
-    torrents.downloading(100 * MB);
+    torrents.downloading(99 * MB);
+    tick(&mut pipeline).await;
+    assert_eq!(
+        pipeline.shared_state.bandwidth_split().rates.torrent,
+        Some(99 * MB)
+    );
+    // Between two of the split's ticks the shares hold.
     pipeline.refresh_periodic_snapshot();
     assert_eq!(
         pipeline.shared_state.bandwidth_split().rates.torrent,
-        Some(100 * MB)
+        Some(99 * MB)
     );
 
     // Both idle: the next tick hands the lent limit back.
     torrents.downloading(0);
-    pipeline.refresh_periodic_snapshot();
+    tick(&mut pipeline).await;
     assert_eq!(pipeline.shared_state.bandwidth_split().rates, shares);
     assert_eq!(torrents.given(), Some(20 * MB));
-    pipeline.refresh_periodic_snapshot();
+    tick(&mut pipeline).await;
     assert_eq!(pipeline.shared_state.bandwidth_split().rates, shares);
+}
+
+// Start the split's measurement afresh: what each side moves from now on
+// is the next tick's.
+fn baseline(pipeline: &mut Pipeline) {
+    pipeline.split_sampled = None;
+    pipeline.measure_split();
+}
+
+#[tokio::test(start_paused = true)]
+async fn usenet_is_measured_off_the_wire_at_each_tick() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, torrents) = seated(&temp_dir).await;
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(
+            Database::open_in_memory().unwrap(),
+            &[],
+        )
+        .unwrap(),
+    );
+    pipeline
+        .shared_state
+        .set_server_transfer_policy(Arc::clone(&policy));
+    let server = policy
+        .transfer_registry()
+        .control(weaver_nntp::transfer::StableServerId(1));
+    set_bandwidth(&mut pipeline, bandwidth(Some(100 * MB), Some(50))).await;
+    assert_eq!(rates(&pipeline, &torrents), (Some(50 * MB), Some(50 * MB)));
+
+    // Usenet reads its whole share off the wire over the tick, torrents
+    // nothing: usenet has the limit but the torrents' probe.
+    baseline(&mut pipeline);
+    for _ in 0..50 {
+        server.pace_read_without_wait(MB as usize);
+    }
+    tokio::time::advance(crate::bandwidth::SPLIT_TICK).await;
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(rates(&pipeline, &torrents), (Some(99 * MB), Some(MB)));
+
+    // An article still in flight at the tick's end is counted read by read:
+    // no article finished in the tick, and usenet still presses its rate.
+    for _ in 0..95 {
+        server.pace_read_without_wait(MB as usize);
+    }
+    tokio::time::advance(crate::bandwidth::SPLIT_TICK).await;
+    pipeline.refresh_periodic_snapshot();
+    assert_eq!(pipeline.shared_state.queue.counters.bandwidth.total(), 0);
+    assert_eq!(rates(&pipeline, &torrents), (Some(99 * MB), Some(MB)));
 }
 
 // What a hold set stops: usenet downloads, torrent downloads, seeding.

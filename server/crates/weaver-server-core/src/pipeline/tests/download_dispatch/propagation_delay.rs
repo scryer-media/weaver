@@ -2394,7 +2394,8 @@ async fn download_done_refunds_rate_limit_estimate_to_actual_raw_bytes() {
         segment_number: 0,
     };
 
-    pipeline.rate_limiter.set_rate(Some(1_000));
+    // A bucket of 4000 B/s holds a quarter second of it: 1000.
+    pipeline.rate_limiter.set_rate(Some(4_000));
     pipeline.rate_limiter.refund(1_000);
     pipeline.rate_limiter.consume(1_500);
     pipeline.rate_limit_reservations.insert(segment_id, 1_500);
@@ -2433,7 +2434,8 @@ async fn download_done_charges_rate_limit_for_raw_bytes_above_estimate() {
         segment_number: 0,
     };
 
-    pipeline.rate_limiter.set_rate(Some(1_000));
+    // A bucket of 4000 B/s holds a quarter second of it: 1000.
+    pipeline.rate_limiter.set_rate(Some(4_000));
     pipeline.rate_limiter.refund(1_000);
     pipeline.rate_limiter.consume(500);
     pipeline.rate_limit_reservations.insert(segment_id, 500);

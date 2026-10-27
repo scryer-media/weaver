@@ -808,14 +808,15 @@ impl Sessions {
     }
 
     /// The torrent settings. The open sessions take the limits, the
-    /// encryption and the IP filter at once (libtorrent
-    /// `session_impl::set_ip_filter`), the filter
-    /// once the blocklist it names has loaded; a blocklist that does not
-    /// load holds them closed. The transports, the DHT's bootstrap nodes,
-    /// the stopped announce timeout and connections per address are a
-    /// session's from when it opens, so each takes them when its route next
-    /// opens. A session whose ports, port mapping or directory they change
-    /// is `outdated` until it opens again.
+    /// encryption, connections per address (libtorrent
+    /// `allow_multiple_connections_per_ip`, read afresh at each judgment)
+    /// and the IP filter at once (libtorrent `session_impl::set_ip_filter`),
+    /// the filter once the blocklist it names has loaded; a blocklist that
+    /// does not load holds them closed. The transports, the DHT's bootstrap
+    /// nodes and the stopped announce timeout are a session's from when it
+    /// opens, so each takes them when its route next opens. A session whose
+    /// ports, port mapping or directory they change is `outdated` until it
+    /// opens again.
     pub fn set_config(&self, config: TorrentConfig) {
         let mut configured = self.configured();
         configured.torrent = config;
@@ -1298,9 +1299,9 @@ impl Configured {
         Some(filter_over(torrent, blocked))
     }
 
-    // Every open session holds to the settings' limits and encryption and,
-    // once the blocklist they name is loaded, to their IP filter; whether it
-    // is.
+    // Every open session holds to the settings' limits, encryption and
+    // connections per address and, once the blocklist they name is loaded,
+    // to their IP filter; whether it is.
     fn lay_over(&mut self) -> bool {
         let limits = session_limits(&self.torrent);
         let encryption = encryption_policy(self.torrent.encryption);
@@ -1314,6 +1315,9 @@ impl Configured {
                 }
                 if open {
                     session.set_encryption(encryption);
+                    session.set_allow_multiple_connections_per_ip(
+                        torrent.allow_multiple_connections_per_ip,
+                    );
                 }
                 if let Some(filter) = filter.as_ref().filter(|_| open) {
                     session.set_ip_filter(filter.clone());

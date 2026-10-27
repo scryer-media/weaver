@@ -443,6 +443,10 @@ impl Pipeline {
             scheduled_bandwidth: None,
             scheduled_split: None,
             rate_limiter: TokenBucket::new(None),
+            split_sampled: None,
+            split_tick: Default::default(),
+            split_applied: Default::default(),
+            split_held: Default::default(),
             write_buf_max_pending,
             decode_backlog_budget_bytes,
             write_backlog_budget_bytes,
@@ -1132,7 +1136,7 @@ impl Pipeline {
             || self.post_download_phases > 0
     }
 
-    fn metrics_snapshot_period(live: bool) -> std::time::Duration {
+    pub(crate) fn metrics_snapshot_period(live: bool) -> std::time::Duration {
         if live {
             Self::METRICS_SNAPSHOT_INTERVAL
         } else {
@@ -1602,7 +1606,8 @@ impl Pipeline {
         self.publish_download_footprint_metrics();
         self.metrics_rates_moving = self.shared_state.metrics_snapshot().current_download_speed > 0;
         // The bandwidth tick: the usenet/torrent shares follow what each
-        // side moved at since the last one.
+        // side moved at since the split last measured.
+        self.measure_split();
         self.apply_global_rate();
     }
 

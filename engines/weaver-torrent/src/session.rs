@@ -14,7 +14,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -312,7 +312,9 @@ pub struct Session {
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub(crate) connection_slots: Arc<ConnectionSlots>,
-    pub(crate) allow_multiple_connections_per_ip: bool,
+    // Read by every torrent's peer list at each judgment; changed by
+    // `set_allow_multiple_connections_per_ip`.
+    pub(crate) allow_multiple_connections_per_ip: Arc<AtomicBool>,
     pub ratelimits: Limits,
 
     // Read wherever an address is judged; changed by `set_ip_filter`.
@@ -877,9 +879,10 @@ pub struct SessionOptions {
     pub disable_trackers: bool,
 
     /// How long the `stopped` announce a torrent sends to its trackers when it
-    /// is paused, removed or the session stops may take. Session shutdown waits
-    /// at most this long for them. Defaults to
-    /// [`StoppedAnnounces::DEFAULT_TIMEOUT`].
+    /// is paused, removed or the session stops may take, once the torrent's
+    /// connections have closed. Session shutdown waits at most this long for
+    /// them, and [`StoppedAnnounces::RUN_END_TIMEOUT`] for the connections.
+    /// Defaults to [`StoppedAnnounces::DEFAULT_TIMEOUT`].
     pub tracker_stopped_timeout: Option<Duration>,
 
     /// Enable fastresume, to restore state quickly after restart.
@@ -1567,7 +1570,9 @@ impl Session {
                 peer_limit: opts.peer_limit,
                 choker: Arc::new(Choker::new(opts.unchoke_slots_limit)),
                 disable_pex: opts.disable_pex,
-                allow_multiple_connections_per_ip: opts.allow_multiple_connections_per_ip,
+                allow_multiple_connections_per_ip: Arc::new(AtomicBool::new(
+                    opts.allow_multiple_connections_per_ip,
+                )),
                 ip_filter: RwLock::new(opts.ip_filter),
                 allowlist,
                 lsd,
@@ -2020,6 +2025,36 @@ impl Session {
         self.connector.set_encryption(policy);
     }
 
+    /// Whether peers at one address may each hold a connection to a torrent
+    /// now.
+    pub fn allows_multiple_connections_per_ip(&self) -> bool {
+        self.allow_multiple_connections_per_ip
+            .load(Ordering::Relaxed)
+    }
+
+    /// Let peers at one address each hold a connection to a torrent, or
+    /// not, from now on (libtorrent `allow_multiple_connections_per_ip`,
+    /// which `apply_settings` changes with no callback: each
+    /// `torrent::get_peer_list_state` reads it afresh). Every torrent's
+    /// connect loop looks again, so a peer the gate held back is dialed
+    /// without waiting for the connection at its address to close; the
+    /// connections already made stay.
+    pub fn set_allow_multiple_connections_per_ip(&self, allow: bool) {
+        if self
+            .allow_multiple_connections_per_ip
+            .swap(allow, Ordering::Relaxed)
+            == allow
+        {
+            return;
+        }
+        let torrents: Vec<_> = self.db.read().torrents.values().cloned().collect();
+        for torrent in torrents {
+            if let Some(live) = torrent.live() {
+                live.connections_per_ip_changed();
+            }
+        }
+    }
+
     /// The IP filter the session holds to now.
     pub fn ip_filter(&self) -> IpFilter {
         self.ip_filter.read().clone()
@@ -2154,10 +2189,10 @@ impl Session {
         let stopped = &self.stopped_announces;
         info!(
             ?listen,
-            timeout = ?stopped.timeout(),
+            timeout = ?stopped.whole(),
             "stopping the session: waiting on its trackers' stopped announces"
         );
-        if tokio::time::timeout(stopped.timeout(), stopped.wait_idle())
+        if tokio::time::timeout(stopped.whole(), stopped.wait_idle())
             .await
             .is_err()
         {
@@ -2755,6 +2790,7 @@ impl Session {
                 user_agent: identity.user_agent.clone(),
                 tracker_ids: identity.tracker_ids.clone(),
                 last_run: Default::default(),
+                ending_run: Default::default(),
                 moved: parking_lot::Mutex::new(opts.totals),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
                 ssl,
@@ -3516,6 +3552,29 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
                         .encryption_under(session.connector.encryption())
                 }),
         }
+    }
+
+    fn run_ended(&self) -> BoxFuture<'static, ()> {
+        let torrent = self.torrent().cloned();
+        let ending = torrent
+            .as_ref()
+            .and_then(|t| t.shared().ending_run.lock().clone());
+        async move {
+            let (Some(torrent), Some(tasks)) = (torrent, ending) else {
+                return;
+            };
+            tasks.wait().await;
+            // The run's tasks have all ended: the torrent forgets them,
+            // unless a later run's end has named its own since.
+            let mut ending = torrent.shared().ending_run.lock();
+            if ending
+                .as_ref()
+                .is_some_and(|named| tokio_util::task::TaskTracker::ptr_eq(named, &tasks))
+            {
+                *ending = None;
+            }
+        }
+        .boxed()
     }
 
     fn wait_until_completed(&self) -> BoxFuture<'_, ()> {

@@ -3068,6 +3068,18 @@ pub struct Pipeline {
     pub(super) scheduled_split: Option<crate::bandwidth::BandwidthSplit>,
     // Effective bandwidth rate limiter.
     pub(super) rate_limiter: TokenBucket,
+    // When the usenet/torrent split last measured, and the usenet bytes
+    // counted by then.
+    pub(super) split_sampled: Option<(tokio::time::Instant, u64)>,
+    // What the split measured over its last tick, which the shares follow
+    // until the next.
+    pub(super) split_tick: crate::bandwidth::SplitTick,
+    // The split's rates in force.
+    pub(super) split_applied: crate::bandwidth::SplitRates,
+    // The lowest rate each side was held to since the split last measured:
+    // what a side measured against it pressed, a change of the cap within
+    // the tick included.
+    pub(super) split_held: crate::bandwidth::SplitRates,
     // Max pending segments per write reorder buffer (memory-adaptive).
     pub(super) write_buf_max_pending: usize,
     // Max in-memory raw article bytes queued or active for decode.

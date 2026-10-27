@@ -32,9 +32,9 @@ fn limited_waits_after_exhaustion() {
 #[test]
 fn refill_over_time() {
     let mut bucket = TokenBucket::new(Some(10_000));
-    // Consume more than capacity to go clearly negative.
+    // Consume 1000 more than the 2500 capacity to go clearly negative.
     freeze_refill(&mut bucket);
-    bucket.consume(11_000);
+    bucket.consume(3_500);
     freeze_refill(&mut bucket);
     assert!(bucket.should_wait());
 
@@ -52,9 +52,10 @@ fn refill_over_time() {
 #[test]
 fn time_until_ready() {
     let mut bucket = TokenBucket::new(Some(1_000));
-    // Consume 1500 to create exactly a 500 token deficit.
+    // The bucket holds a quarter second, 250; consume 750 to create
+    // exactly a 500 token deficit.
     freeze_refill(&mut bucket);
-    bucket.consume(1_500);
+    bucket.consume(750);
     freeze_refill(&mut bucket);
     let wait = bucket.time_until_ready();
     // Deficit is 500 tokens at 1000/sec = 0.5s
@@ -94,9 +95,9 @@ fn set_rate_to_none_unlimited() {
 #[test]
 fn negative_balance_recovery() {
     let mut bucket = TokenBucket::new(Some(1_000));
-    // Consume 2x capacity — deficit of 1000 tokens.
+    // Consume 250 over capacity and 1000 more — deficit of 1000 tokens.
     freeze_refill(&mut bucket);
-    bucket.consume(2_000);
+    bucket.consume(1_250);
 
     freeze_refill(&mut bucket);
     let wait = bucket.time_until_ready();
@@ -108,7 +109,7 @@ fn negative_balance_recovery() {
 fn refund_reduces_wait_without_exceeding_capacity() {
     let mut bucket = TokenBucket::new(Some(1_000));
     freeze_refill(&mut bucket);
-    bucket.consume(1_500);
+    bucket.consume(750);
     freeze_refill(&mut bucket);
     assert!(bucket.should_wait());
 
@@ -120,7 +121,7 @@ fn refund_reduces_wait_without_exceeding_capacity() {
     freeze_refill(&mut bucket);
     bucket.refund(10_000);
     freeze_refill(&mut bucket);
-    bucket.consume(1_001);
+    bucket.consume(251);
     freeze_refill(&mut bucket);
     assert!(bucket.should_wait());
 }
@@ -134,10 +135,10 @@ fn refund_reduces_wait_without_exceeding_capacity() {
 fn a_global_speed_limit_holds_downloads_an_egress_or_provider_would_let_through() {
     let mut global = TokenBucket::new(Some(1_000));
     // Two bodies that a 4000 B/s provider behind an 8000 B/s egress would
-    // read in half a second.
+    // read in half a second, against the quarter second the bucket holds.
     for _ in 0..2 {
         freeze_refill(&mut global);
-        global.consume(1_000);
+        global.consume(625);
     }
     freeze_refill(&mut global);
     assert!(global.should_wait());
@@ -176,4 +177,18 @@ fn a_zero_rate_lets_nothing_through() {
     assert!(!bucket.should_wait());
     bucket.set_rate(Some(0));
     assert!(bucket.should_wait());
+}
+
+// A bucket holds a quarter second of its rate however long it idles, and a
+// cut clamps what it holds to a quarter second of the new rate at once.
+#[test]
+fn a_bucket_holds_a_quarter_second_of_its_rate() {
+    let mut bucket = TokenBucket::new(Some(4_000));
+    bucket.last_refill = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("instant a minute in the past");
+    assert!(!bucket.should_wait());
+    assert_eq!(bucket.tokens, 1_000.0);
+    bucket.set_rate(Some(1_000));
+    assert_eq!(bucket.tokens, 250.0);
 }

@@ -91,7 +91,7 @@ use anyhow::Context;
 use futures::FutureExt;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc::unbounded_channel, watch};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 
 use crate::{
@@ -288,6 +288,10 @@ pub struct TorrentStateLive {
     down_speed_estimator: Arc<SpeedEstimator>,
     up_speed_estimator: SpeedEstimator,
     cancellation_token: CancellationToken,
+    // Every task of the run, its connections' among them: once each has
+    // ended after the run's end, every byte a closing connection drops has
+    // been counted.
+    tasks: TaskTracker,
 
     session_stats: Arc<SessionStats>,
 
@@ -406,7 +410,9 @@ impl TorrentStateLive {
                 session_stats.peers.clone(),
                 lengths.total_pieces(),
             )
-            .allowing_multiple_connections_per_ip(session.allow_multiple_connections_per_ip),
+            .allowing_multiple_connections_per_ip(Arc::clone(
+                &session.allow_multiple_connections_per_ip,
+            )),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 fatal_errors_tx: Some(fatal_errors_tx),
@@ -430,6 +436,7 @@ impl TorrentStateLive {
             down_speed_estimator,
             up_speed_estimator,
             cancellation_token,
+            tasks: TaskTracker::new(),
             session_stats,
             streams: paused.streams,
             per_piece_locks: (0..lengths.total_pieces())
@@ -677,7 +684,12 @@ impl TorrentStateLive {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        spawn_with_cancel(
+            span,
+            name,
+            self.cancellation_token.clone(),
+            self.tasks.track_future(fut),
+        );
     }
 
     pub fn down_speed_estimator(&self) -> &SpeedEstimator {
@@ -1032,6 +1044,12 @@ impl TorrentStateLive {
     /// `peer_list::apply_ip_filter` and `apply_port_filter`).
     pub(crate) fn refilter(&self) {
         self.peers.refuse(|addr| self.refuses(addr));
+    }
+
+    /// The session's `allow_multiple_connections_per_ip` changed: the
+    /// connect loop looks again at the peers it held back.
+    pub(crate) fn connections_per_ip_changed(&self) {
+        self.peers.connections_per_ip_changed();
     }
 
     // Whether we may open a connection to `addr`, a peer or a web seed: a
@@ -1395,6 +1413,14 @@ impl TorrentStateLive {
     }
 
     pub fn pause(&self) -> anyhow::Result<TorrentStatePaused> {
+        // What a `stopped` announce of this run waits for before it reads
+        // the counters, named before anything ends so no announce the end
+        // sets off can miss it: libtorrent's `torrent::do_pause` disconnects
+        // every connection, each counting the block it was cut in
+        // (`peer_connection::disconnect`), before `stop_announcing` builds
+        // `stopped`.
+        self.tasks.close();
+        *self.shared.ending_run.lock() = Some(self.tasks.clone());
         self.cancellation_token.cancel();
         // The run ends here: its torrent holds nothing from now on, whatever
         // its closing connections still count.
@@ -3621,30 +3647,31 @@ impl PeerHandler {
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
         self.counters.fetched_chunks.fetch_add(1, Ordering::Relaxed);
 
-        // A block we had stopped waiting for is data all the same: whether
-        // it is written is the piece tracker's call (libtorrent
-        // `peer_connection::incoming_piece`).
+        // A block we had stopped waiting for, or never asked for, is data
+        // all the same: whether it is written is the piece tracker's call,
+        // which writes a block the piece lacks and counts one it holds as
+        // redundant, and the peer is kept either way (libtorrent
+        // `peer_connection::start_receive_piece` queues an unrequested
+        // block as not wanted, and `incoming_piece` writes it unless the
+        // picker holds it, then counting it redundant).
         self.state
             .peers
             .with_live_mut(self.addr, "inflight_requests.remove", |h| {
                 match h.remove_inflight_request(&chunk_info) {
-                    RemoveInflightRequestResult::Expected => Ok(()),
+                    RemoveInflightRequestResult::Expected => {}
                     RemoveInflightRequestResult::LateCanceled => {
                         trace!(?piece, "peer sent a block after we cancelled it");
-                        Ok(())
                     }
                     RemoveInflightRequestResult::Unexpected => {
-                        // A block never asked for is not used.
-                        self.state.add_redundant_bytes(piece.len() as u64);
-                        anyhow::bail!(
-                            "peer sent us a piece we did not ask. Inflight requests: {:?}. Got: {:?}",
-                            h.inflight_requests_debug(),
-                            piece,
-                        )
+                        debug!(
+                            ?piece,
+                            inflight = ?h.inflight_requests_debug(),
+                            "peer sent a block we did not ask for"
+                        );
                     }
                 }
             })
-            .context("peer not found")??;
+            .context("peer not found")?;
 
         // This one is used to calculate download speed.
         self.state

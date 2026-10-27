@@ -373,6 +373,11 @@ pub struct ManagedTorrentShared {
     /// `stopped` tracker announce made after it ended reports it.
     pub(crate) last_run: parking_lot::Mutex<Option<RunCounters>>,
 
+    /// The tasks of the most recent live run to end, named as it ends: a
+    /// `stopped` announce of that run waits for them, so what its closing
+    /// connections dropped is in the counters it reports.
+    pub(crate) ending_run: parking_lot::Mutex<Option<tokio_util::task::TaskTracker>>,
+
     /// What the torrent moved before its running run: the totals it was
     /// added with, and every run of it that ended since.
     pub(crate) moved: parking_lot::Mutex<TorrentTotals>,

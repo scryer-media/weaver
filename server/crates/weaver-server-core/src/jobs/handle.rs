@@ -936,8 +936,9 @@ impl HoldSet {
 
 // The torrent side of the global limits.
 pub trait TorrentRate: Send + Sync {
-    // What torrents downloaded at over the last second, in bytes per second.
-    fn download_bps(&self) -> u64;
+    // Measure the torrents: what they received at since they were last
+    // measured, in bytes per second. Their sessions' shares follow it.
+    fn sample(&self) -> u64;
     // Put the torrents' download and upload rates in force.
     fn set_rates(&self, rates: crate::bandwidth::TorrentRates);
 }

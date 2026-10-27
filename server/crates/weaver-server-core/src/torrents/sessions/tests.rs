@@ -724,6 +724,40 @@ async fn a_route_listens_for_ssl_peers_while_turned_on() {
     sessions.stop_all().await;
 }
 
+// Connections per address take effect on the open session, as libtorrent's
+// `apply_settings` does: the same session, not one opened again.
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_per_address_reach_the_open_session_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.route(TorrentScope::Default, 1);
+    loopback_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(!session.allows_multiple_connections_per_ip());
+
+    sessions.set_config(TorrentConfig {
+        allow_multiple_connections_per_ip: true,
+        ..any_port()
+    });
+    sessions.settled().await;
+    assert!(session.allows_multiple_connections_per_ip());
+    assert!(sessions.outdated().await.is_empty());
+    let again = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(Arc::ptr_eq(&session, &again));
+
+    sessions.set_config(any_port());
+    sessions.settled().await;
+    assert!(!session.allows_multiple_connections_per_ip());
+    sessions.stop_all().await;
+}
+
 // The next announce the tracker on `listener` hears, unanswered, and its
 // request line.
 async fn heard_announce(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String) {
@@ -1672,7 +1706,7 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
         .await
         .unwrap();
     assert_eq!((rate(&one), rate(&two)), (Some(500_000), Some(500_000)));
-    assert_eq!(sessions.rates().download_bps(), 0);
+    assert_eq!(sessions.rates().sample(), 0);
 
     // Nothing closes the sessions.
     sessions.rates().set(crate::bandwidth::TorrentRates {

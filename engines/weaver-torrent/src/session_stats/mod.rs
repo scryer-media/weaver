@@ -80,6 +80,19 @@ impl Session {
         )
     }
 
+    /// The bytes the session has received and sent, in that order, over
+    /// every connection of every torrent: block payload and protocol alike,
+    /// what its rate limits are paid in. Read relaxed, never locked.
+    pub fn transferred(&self) -> (u64, u64) {
+        let counters = &self.stats.counters;
+        (
+            counters.fetched_bytes.load(Ordering::Relaxed)
+                + counters.fetched_protocol_bytes.load(Ordering::Relaxed),
+            counters.uploaded_bytes.load(Ordering::Relaxed)
+                + counters.uploaded_protocol_bytes.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn stats_snapshot(&self) -> SessionStatsSnapshot {
         SessionStatsSnapshot::from((&*self.stats, self.connector.stats().snapshot()))
     }

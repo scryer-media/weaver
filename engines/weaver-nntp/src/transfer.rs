@@ -236,6 +236,8 @@ pub struct ServerTransferRegistry {
     // holder given the same id follows the registry-wide setting; dropping
     // every control at once with [`Self::clear`] keeps them.
     quota_metering_overrides: RwLock<HashMap<StableServerId, bool>>,
+    // BODY bytes every holder received, counted as they come off the wire.
+    received: Arc<AtomicU64>,
 }
 
 impl Default for ServerTransferRegistry {
@@ -257,6 +259,7 @@ impl ServerTransferRegistry {
             capacity: Arc::new(RegistryCapacitySignal::default()),
             quota_metering: AtomicBool::new(true),
             quota_metering_overrides: RwLock::new(HashMap::new()),
+            received: Arc::default(),
         }
     }
 
@@ -270,11 +273,19 @@ impl ServerTransferRegistry {
             capacity: Arc::clone(&self.capacity),
             quota_metering: AtomicBool::new(true),
             quota_metering_overrides: RwLock::new(HashMap::new()),
+            received: Arc::default(),
         }
     }
 
     pub fn scope(&self) -> TransferScope {
         self.scope
+    }
+
+    // BODY bytes every holder of this registry received since it was made,
+    // counted read by read as they come off the wire, not per finished
+    // article. A sibling counts its own.
+    pub fn received_bytes(&self) -> u64 {
+        self.received.load(Ordering::Relaxed)
     }
 
     // Monotonic revision for capacity changes in any registered server.
@@ -304,10 +315,11 @@ impl ServerTransferRegistry {
         }
 
         let capacity = Arc::clone(&self.capacity);
+        let received = Arc::clone(&self.received);
         let scope = self.scope;
         let mut controls = self.controls.write().expect("transfer registry poisoned");
         Arc::clone(controls.entry(id).or_insert_with(|| {
-            let control = ServerTransferControl::new(id, scope, capacity);
+            let control = ServerTransferControl::new(id, scope, capacity, received);
             control
                 .quota_metering
                 .store(self.quota_metering_of(id), Ordering::Release);
@@ -466,6 +478,8 @@ pub struct ServerTransferControl {
     blocking_changed: Condvar,
     capacity_changed: watch::Sender<u64>,
     registry_capacity: Arc<RegistryCapacitySignal>,
+    // The registry's count of BODY bytes received over all its holders.
+    registry_received: Arc<AtomicU64>,
     lifetime_body_bytes: AtomicU64,
     throttle_wait_nanos: AtomicU64,
     quota_epoch: AtomicU64,
@@ -545,6 +559,7 @@ impl ServerTransferControl {
         id: StableServerId,
         scope: TransferScope,
         registry_capacity: Arc<RegistryCapacitySignal>,
+        registry_received: Arc<AtomicU64>,
     ) -> Self {
         let (capacity_changed, _) = watch::channel(1);
         Self {
@@ -565,6 +580,7 @@ impl ServerTransferControl {
             blocking_changed: Condvar::new(),
             capacity_changed,
             registry_capacity,
+            registry_received,
             lifetime_body_bytes: AtomicU64::new(0),
             throttle_wait_nanos: AtomicU64::new(0),
             quota_epoch: AtomicU64::new(0),
@@ -959,6 +975,7 @@ impl ServerTransferControl {
     fn record_lifetime_bytes(&self, bytes: u64) {
         if bytes != 0 {
             self.lifetime_body_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.registry_received.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
@@ -1511,6 +1528,7 @@ mod tests {
 
         let snapshot = control.snapshot();
         assert_eq!(snapshot.lifetime_body_bytes, 600);
+        assert_eq!(registry.received_bytes(), 600);
         assert_eq!(snapshot.quota_used_bytes, 600);
         assert_eq!(snapshot.quota_reserved_bytes, 0);
         assert_eq!(snapshot.quota_remaining_bytes, 400);
@@ -1648,6 +1666,40 @@ mod tests {
         assert_eq!(snapshot.quota_reserved_bytes, 700);
         assert!(control.try_reserve(301).is_err());
         assert!(control.try_reserve(300).is_ok());
+    }
+
+    // The registry counts BODY bytes read by read as they arrive, over all
+    // its holders: a lifetime total restored from storage is no read, and a
+    // sibling counts its own.
+    #[test]
+    fn the_registry_counts_body_bytes_as_they_arrive() {
+        let registry = ServerTransferRegistry::new();
+        let egresses = registry.sibling(TransferScope::Egress);
+        registry.restore(
+            StableServerId(1),
+            ServerTransferConfig::default(),
+            ServerTransferInitialState {
+                lifetime_body_bytes: 8_000,
+                quota_used_bytes: 0,
+            },
+        );
+        assert_eq!(registry.received_bytes(), 0);
+        registry
+            .control(StableServerId(1))
+            .pace_read_without_wait(300);
+        assert_eq!(registry.received_bytes(), 300);
+        registry
+            .control(StableServerId(2))
+            .record_received_bytes(200);
+        registry
+            .control(StableServerId(1))
+            .pace_read_without_wait(100);
+        assert_eq!(registry.received_bytes(), 600);
+        egresses
+            .control(StableServerId(1))
+            .pace_read_without_wait(50);
+        assert_eq!(registry.received_bytes(), 600);
+        assert_eq!(egresses.received_bytes(), 50);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     AddTorrent, AddTorrentOptions, ConnectionOptions, Session, SessionOptions,
-    peer_info_reader::tests::{Dialed, MockPeer},
+    peer_info_reader::tests::{Dialed, MockPeer, WatchedDials},
     storage::StorageFactory,
     tests::{
         e2e_tracker_announces::tracker_session_opts,
@@ -38,6 +38,9 @@ type Heard = (String, Option<String>);
 struct Tracker {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    // The query of every request heard, in order, each recorded before it
+    // is heard.
+    queries: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl Tracker {
@@ -45,9 +48,11 @@ impl Tracker {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
+        let queries = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (tx, rx) = mpsc::unbounded_channel();
         {
             let stop = stop.clone();
+            let queries = queries.clone();
             tokio::task::spawn_blocking(move || {
                 for conn in listener.incoming() {
                     if stop.load(Ordering::SeqCst) {
@@ -55,11 +60,19 @@ impl Tracker {
                     }
                     let Ok(conn) = conn else { continue };
                     let tx = tx.clone();
-                    std::thread::spawn(move || serve(conn, peer, &tx));
+                    let queries = queries.clone();
+                    std::thread::spawn(move || serve(conn, peer, &tx, &queries));
                 }
             });
         }
-        (Self { addr, stop }, rx)
+        (
+            Self {
+                addr,
+                stop,
+                queries,
+            },
+            rx,
+        )
     }
 
     fn url(&self) -> String {
@@ -74,7 +87,12 @@ impl Drop for Tracker {
     }
 }
 
-fn serve(mut conn: TcpStream, peer: Option<SocketAddr>, heard: &mpsc::UnboundedSender<Heard>) {
+fn serve(
+    mut conn: TcpStream,
+    peer: Option<SocketAddr>,
+    heard: &mpsc::UnboundedSender<Heard>,
+    queries: &parking_lot::Mutex<Vec<String>>,
+) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -99,6 +117,7 @@ fn serve(mut conn: TcpStream, peer: Option<SocketAddr>, heard: &mpsc::UnboundedS
         _ => body.extend_from_slice(b"0:"),
     }
     body.push(b'e');
+    queries.lock().push(query.to_owned());
     let _ = heard.send((path.to_owned(), event));
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -263,6 +282,81 @@ async fn test_a_resumed_torrent_dials_the_peer_it_let_go_at_once() -> anyhow::Re
     let (dialed, _stream) = dials.recv().await.context("no dial")?;
     assert_eq!(dialed, peer_addr);
     assert_eq!(tokio::time::Instant::now(), resumed_at);
+    drop(tracker);
+    session.stop().await;
+    Ok(())
+}
+
+// The whole chain on the mocked clock: a pause cuts the one connection in
+// the middle of a block, names the run's tasks before anything ends, and the
+// `stopped` announce waits for the connection to close and count the part
+// of the block it received as redundant before it reads the counters, as
+// libtorrent's `torrent::do_pause` disconnects every connection, each
+// counting the block it was cut in (`peer_connection::disconnect`), before
+// `stop_announcing` builds `stopped`. Once the run's tasks have ended the
+// torrent forgets them.
+#[tokio::test(start_paused = true)]
+async fn test_a_pause_reports_the_block_it_cut_in_the_stopped_announce() -> anyhow::Result<()> {
+    use crate::buffers::ByteBuf;
+    use crate::peer_protocol::Message;
+    const RECEIVED: usize = 500;
+
+    let peer_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 6881));
+    let (tracker, mut heard) = Tracker::start(Some(peer_addr));
+    let (tx, mut dials) = mpsc::unbounded_channel();
+    let out = TempDir::with_prefix("pause_cut_block_out")?;
+    let session = Session::new_with_opts(
+        out.path().into(),
+        SessionOptions {
+            socket_factory: Some(Arc::new(WatchedDials(tx))),
+            connect: Some(ConnectionOptions {
+                enable_tcp: true,
+                peer_opts: None,
+            }),
+            ..tracker_session_opts()?
+        },
+    )
+    .await?;
+    let torrent = TestTorrent::new("pause_cut_block", 4096, 1024).await?;
+    let torrent = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![tracker.url()]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert_eq!(next(&mut heard).await?, announce(Some("started")));
+    let (dialed, stream, mut taken) = dials.recv().await.context("no dial")?;
+    assert_eq!(dialed, peer_addr);
+    let mut peer = MockPeer::greet(stream, torrent.shared().info_hashes).await;
+
+    // The peer has every piece and unchokes us; we ask it for a block, and
+    // it sends that block's header and part of its data.
+    peer.send(Message::Bitfield(ByteBuf(&[0xf0]))).await;
+    peer.send(Message::Unchoke).await;
+    let request = peer.next_block_request().await.context("no request")?;
+    let mut frame = (9 + request.length).to_be_bytes().to_vec();
+    frame.push(7);
+    frame.extend(request.index.to_be_bytes());
+    frame.extend(request.begin.to_be_bytes());
+    frame.extend(vec![0xab; RECEIVED]);
+    peer.write_raw(&frame).await;
+    let sent = peer.sent;
+    taken.wait_for(|n| *n == sent).await?;
+
+    session.pause(&torrent).await?;
+    assert_eq!(next(&mut heard).await?, announce(Some("stopped")));
+    let stopped = tracker.queries.lock().last().cloned().context("no query")?;
+    assert_eq!(
+        super::e2e_tracker_announces::param(&stopped, "redundant"),
+        Some(RECEIVED.to_string().as_str())
+    );
+    assert!(torrent.shared().ending_run.lock().is_none());
     drop(tracker);
     session.stop().await;
     Ok(())

@@ -5,6 +5,7 @@
 //! sessions.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use tokio::time::Instant;
 
 use weaver_torrent::Session;
 use weaver_torrent::limits::LimitKind;
@@ -22,26 +23,66 @@ pub struct SessionRates {
 #[derive(Default)]
 struct State {
     rates: TorrentRates,
-    sessions: Vec<Weak<Session>>,
+    sessions: Vec<Held>,
+}
+
+// An open session and what the split knows of it.
+struct Held {
+    session: Weak<Session>,
+    // When it was last measured, and what it had received and sent by then.
+    seen_at: Instant,
+    seen: (u64, u64),
+    // What it received and sent at between its last two measurements, in
+    // bytes per second.
+    used: (u64, u64),
+    // The lowest rates it was held to between them, the lowest since, and
+    // the rates it is held to now.
+    given: TorrentRates,
+    held: TorrentRates,
+    applied: TorrentRates,
 }
 
 impl SessionRates {
     /// Put the torrents' rates in force on a session that just opened.
     pub fn add(&self, session: &Arc<Session>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.sessions.push(Arc::downgrade(session));
+        state.sessions.push(Held {
+            session: Arc::downgrade(session),
+            seen_at: Instant::now(),
+            seen: session.transferred(),
+            used: (0, 0),
+            given: TorrentRates::default(),
+            held: TorrentRates::default(),
+            applied: TorrentRates::default(),
+        });
         state.lay_over();
     }
 
-    /// What the open sessions downloaded at over the last second, in bytes
-    /// per second.
-    pub fn download_bps(&self) -> u64 {
+    /// Measure each open session: what it received and sent since it was
+    /// last measured, over the time between. Returns what the open sessions
+    /// received at, in bytes per second. The rates laid over the sessions
+    /// from here on follow these measurements.
+    pub fn sample(&self) -> u64 {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state
-            .open()
-            .iter()
-            .map(|session| moved(session).download)
-            .sum()
+        let now = Instant::now();
+        state.retain_open();
+        let mut received = 0;
+        for held in &mut state.sessions {
+            let Some(session) = held.session.upgrade() else {
+                continue;
+            };
+            let moved = session.transferred();
+            let elapsed = now - held.seen_at;
+            held.used = (
+                crate::bandwidth::per_second(moved.0.saturating_sub(held.seen.0), elapsed),
+                crate::bandwidth::per_second(moved.1.saturating_sub(held.seen.1), elapsed),
+            );
+            held.seen = moved;
+            held.seen_at = now;
+            held.given = std::mem::replace(&mut held.held, held.applied);
+            received += held.used.0;
+        }
+        received
     }
 
     /// Put `rates` in force across the open sessions. `None` is no limit.
@@ -53,53 +94,54 @@ impl SessionRates {
 }
 
 impl State {
-    // The sessions still open. A closed session stops its tasks, the one that
-    // measures its speed among them, so what it last moved at stays frozen
-    // while anything, a closing tracker announce say, still holds it.
-    fn open(&mut self) -> Vec<Arc<Session>> {
-        self.sessions.retain(|session| {
-            session
+    // Keep the sessions still open. A closed session stops its tasks, so
+    // what it moved stays frozen while anything, a closing tracker announce
+    // say, still holds it: it takes no share.
+    fn retain_open(&mut self) {
+        self.sessions.retain(|held| {
+            held.session
                 .upgrade()
                 .is_some_and(|session| !session.cancellation_token().is_cancelled())
         });
-        self.sessions.iter().filter_map(Weak::upgrade).collect()
     }
 
     fn lay_over(&mut self) {
-        let sessions = self.open();
-        let used: Vec<Moved> = sessions.iter().map(|session| moved(session)).collect();
+        self.retain_open();
+        let held = &self.sessions;
         let download = session_rates(
             self.rates.download,
-            &used.iter().map(|used| used.download).collect::<Vec<_>>(),
+            &held
+                .iter()
+                .map(|held| held.given.download)
+                .collect::<Vec<_>>(),
+            &held.iter().map(|held| held.used.0).collect::<Vec<_>>(),
         );
         let upload = session_rates(
             self.rates.upload,
-            &used.iter().map(|used| used.upload).collect::<Vec<_>>(),
+            &held
+                .iter()
+                .map(|held| held.given.upload)
+                .collect::<Vec<_>>(),
+            &held.iter().map(|held| held.used.1).collect::<Vec<_>>(),
         );
-        for ((session, download), upload) in sessions.iter().zip(download).zip(upload) {
-            apply_torrent_rates(session, TorrentRates { download, upload });
+        for ((held, download), upload) in self.sessions.iter_mut().zip(download).zip(upload) {
+            let rates = TorrentRates { download, upload };
+            held.applied = rates;
+            held.held = TorrentRates {
+                download: crate::bandwidth::lower(held.held.download, download),
+                upload: crate::bandwidth::lower(held.held.upload, upload),
+            };
+            if let Some(session) = held.session.upgrade() {
+                apply_torrent_rates(&session, rates);
+            }
         }
     }
 }
 
-// What a session moved at over the last second, in bytes per second.
-struct Moved {
-    download: u64,
-    upload: u64,
-}
-
-fn moved(session: &Session) -> Moved {
-    let stats = session.stats_snapshot();
-    Moved {
-        download: stats.download_speed.as_bytes(),
-        upload: stats.upload_speed.as_bytes(),
-    }
-}
-
-/// Each session's share of `rate`, given what each moved at. The sessions
-/// start from equal shares; one that leaves its share unused lends it to
-/// those that want more.
-pub fn session_rates(rate: Option<u64>, used: &[u64]) -> Vec<Option<u64>> {
+/// Each session's share of `rate`, given the rate each was held to and what
+/// each moved at over the last tick. The sessions start from equal shares;
+/// one that leaves its share unused lends it to those that press theirs.
+pub fn session_rates(rate: Option<u64>, given: &[Option<u64>], used: &[u64]) -> Vec<Option<u64>> {
     let Some(rate) = rate else {
         return vec![None; used.len()];
     };
@@ -110,7 +152,7 @@ pub fn session_rates(rate: Option<u64>, used: &[u64]) -> Vec<Option<u64>> {
     let shares: Vec<u64> = (0..count)
         .map(|index| rate / count + u64::from(index < rate % count))
         .collect();
-    crate::bandwidth::share_out(rate, &shares, used)
+    crate::bandwidth::share_out(rate, &shares, given, used)
         .into_iter()
         .map(Some)
         .collect()
@@ -150,18 +192,27 @@ mod tests {
     #[test]
     fn idle_sessions_each_hold_an_equal_share() {
         assert_eq!(
-            session_rates(Some(10), &[0, 0, 0]),
+            session_rates(Some(10), &[None; 3], &[0, 0, 0]),
             vec![Some(4), Some(3), Some(3)]
         );
-        assert_eq!(session_rates(None, &[0, 0]), vec![None, None]);
-        assert!(session_rates(Some(10), &[]).is_empty());
+        assert_eq!(session_rates(None, &[None; 2], &[0, 0]), vec![None, None]);
+        assert!(session_rates(Some(10), &[], &[]).is_empty());
     }
 
     #[test]
-    fn a_busy_session_borrows_what_an_idle_one_leaves() {
-        let rates = session_rates(Some(1_000_000), &[500_000, 0]);
-        assert_eq!(rates, vec![Some(1_000_000), Some(500_000)]);
-        let rates = session_rates(Some(1_000_000), &[500_000, 500_000]);
+    fn a_busy_session_takes_what_an_idle_one_leaves_at_once() {
+        // The busy one presses its share; the idle one keeps a hundredth of
+        // the rate to press when it wakes.
+        let rates = session_rates(Some(1_000_000), &[None, None], &[500_000, 0]);
+        assert_eq!(rates, vec![Some(990_000), Some(10_000)]);
+        let rates = session_rates(Some(1_000_000), &[None, None], &[500_000, 500_000]);
+        assert_eq!(rates, vec![Some(500_000), Some(500_000)]);
+        // The idle one wakes and presses its probe: its share the tick after.
+        let rates = session_rates(
+            Some(1_000_000),
+            &[Some(990_000), Some(10_000)],
+            &[990_000, 10_000],
+        );
         assert_eq!(rates, vec![Some(500_000), Some(500_000)]);
     }
 
@@ -237,7 +288,7 @@ mod tests {
         rates.set(both(Some(800_000), Some(300_000)));
         assert_eq!(limits(&one), (Some(800_000), Some(300_000)));
         assert_eq!(limits(&two), (Some(500_000), Some(200_000)));
-        assert_eq!(rates.download_bps(), 0);
+        assert_eq!(rates.sample(), 0);
 
         one.stop().await;
     }

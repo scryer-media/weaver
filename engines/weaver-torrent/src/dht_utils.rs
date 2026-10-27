@@ -123,8 +123,9 @@ where
     // No metadata yet, so no pieces to count availability over. Each answer
     // comes over a connection of its own, wherever its peer is.
     let peers = Arc::new(
-        PeerStates::founded_on(list, Default::default(), 0)
-            .allowing_multiple_connections_per_ip(true),
+        PeerStates::founded_on(list, Default::default(), 0).allowing_multiple_connections_per_ip(
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ),
     );
     let mut seen = HashSet::<SocketAddr>::new();
     let found_unable = |addr| unable.send_if_modified(|unable| unable.insert(addr));

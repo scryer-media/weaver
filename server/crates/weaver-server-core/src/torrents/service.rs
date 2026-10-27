@@ -4926,10 +4926,10 @@ impl TorrentService {
 struct Seat(Weak<Inner>);
 
 impl TorrentRate for Seat {
-    fn download_bps(&self) -> u64 {
+    fn sample(&self) -> u64 {
         self.0
             .upgrade()
-            .map_or(0, |inner| inner.sessions.rates().download_bps())
+            .map_or(0, |inner| inner.sessions.rates().sample())
     }
 
     fn set_rates(&self, rates: crate::bandwidth::TorrentRates) {

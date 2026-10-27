@@ -11,7 +11,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -111,8 +111,10 @@ pub(crate) struct PeerStates {
     // against no `max_peerlist_size`.
     web_seeds: AtomicUsize,
     // Whether peers at one address may each have a connection (libtorrent
-    // `allow_multiple_connections_per_ip`, off by default).
-    allow_multiple_connections_per_ip: bool,
+    // `allow_multiple_connections_per_ip`, off by default). The session's
+    // setting, read at each judgment as libtorrent reads it into each
+    // `torrent::get_peer_list_state`, so a change holds at once.
+    allow_multiple_connections_per_ip: Arc<AtomicBool>,
     // What the peers sent of the pieces that failed. A record names a peer
     // on the list: it leaves with the peer (libtorrent `torrent::peers_erased`
     // tells `smart_ban_plugin::on_erase_peers`), goes with the list
@@ -328,7 +330,7 @@ impl PeerStates {
             candidates_changed: Notify::new(),
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
-            allow_multiple_connections_per_ip: false,
+            allow_multiple_connections_per_ip: Default::default(),
             smart_ban: Mutex::new(list.smart_ban),
         };
         for mut peer in list.peers {
@@ -338,11 +340,18 @@ impl PeerStates {
         peers
     }
 
-    /// The list, letting peers at one address each have a connection when
-    /// `allow`.
-    pub fn allowing_multiple_connections_per_ip(mut self, allow: bool) -> Self {
+    /// The list, letting peers at one address each have a connection while
+    /// `allow` holds: a setting it reads at each judgment, so a change to it
+    /// holds from the next.
+    pub fn allowing_multiple_connections_per_ip(mut self, allow: Arc<AtomicBool>) -> Self {
         self.allow_multiple_connections_per_ip = allow;
         self
+    }
+
+    /// Whether the peers a connection at their address held back may be
+    /// dialed changed: the connect loop looks again.
+    pub fn connections_per_ip_changed(&self) {
+        self.candidates_changed.notify_one();
     }
 
     /// Every connection on the list closes at `closed_at` as the run ends
@@ -647,7 +656,10 @@ impl PeerStates {
     // whether we made it. None when peers at one address may each have one:
     // no connection then stands in another's way.
     fn connections(&self) -> Vec<(SocketAddr, bool)> {
-        if self.allow_multiple_connections_per_ip {
+        if self
+            .allow_multiple_connections_per_ip
+            .load(Ordering::Relaxed)
+        {
             return Vec::new();
         }
         self.states
@@ -2471,11 +2483,41 @@ mod tests {
         );
     }
 
+    // libtorrent reads `allow_multiple_connections_per_ip` into each
+    // `torrent::get_peer_list_state`, so turning it on lets a peer the gate
+    // held back be dialed at once, the connection at its address still
+    // open; the connect loop is woken to look again.
+    #[test]
+    fn turning_multiple_connections_per_ip_on_dials_the_held_peer_at_once() {
+        use futures::FutureExt;
+
+        let allow = Arc::new(AtomicBool::new(false));
+        let peers = make_peer_states().allowing_multiple_connections_per_ip(Arc::clone(&allow));
+        let t0 = Instant::now();
+        let a = peer_addr(1);
+        let held = at_port(a, 6882);
+        peers.add_peer(a, PeerSourceFlag::Tracker);
+        peers.add_peer(held, PeerSourceFlag::Tracker);
+        let (first, ..) = peers.connect_next(t0).unwrap();
+        assert!(first == a || first == held);
+        assert!(peers.connect_next(t0).is_none());
+        // Drain the wake the dial left.
+        let _ = peers.candidates_changed().now_or_never();
+
+        allow.store(true, Ordering::Relaxed);
+        peers.connections_per_ip_changed();
+        assert!(peers.candidates_changed().now_or_never().is_some());
+        let (second, ..) = peers.connect_next(t0).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second.ip(), a.ip());
+    }
+
     // libtorrent `allow_multiple_connections_per_ip`: when it is on, peers
     // at one address each have a connection.
     #[test]
     fn a_list_allowing_multiple_connections_per_ip_dials_each_peer() {
-        let peers = make_peer_states().allowing_multiple_connections_per_ip(true);
+        let peers = make_peer_states()
+            .allowing_multiple_connections_per_ip(Arc::new(AtomicBool::new(true)));
         let t0 = Instant::now();
         let a = peer_addr(1);
         peers.add_peer(a, PeerSourceFlag::Tracker);

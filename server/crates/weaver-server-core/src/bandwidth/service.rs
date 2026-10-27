@@ -449,23 +449,63 @@ impl Pipeline {
         self.scheduled_split.or(self.configured_bandwidth.split)
     }
 
+    // The split's tick: once `SPLIT_TICK` has passed since it last
+    // measured, measure what usenet and torrents each moved since, from
+    // their byte counters, against the lowest rate each was held to in
+    // between. The shares follow the measurement until the next. Usenet's
+    // counter is the servers' registry's, which counts BODY bytes read by
+    // read as they come off the wire, so a tick sees an article in flight
+    // and not only the ones finished in it.
+    //
+    // The pipeline ticks every `IDLE_SNAPSHOT_INTERVAL` while idle, so the
+    // tick is taken once `SPLIT_TICK` less half an interval has passed: a
+    // pipeline tick a moment early does not put the split's off a whole
+    // interval.
+    pub(crate) fn measure_split(&mut self) {
+        let now = tokio::time::Instant::now();
+        let usenet = self
+            .shared_state
+            .server_transfer_policy()
+            .map_or(0, |policy| policy.transfer_registry().received_bytes());
+        let torrents = self.shared_state.torrent_rate();
+        let Some((then, before)) = self.split_sampled else {
+            self.split_sampled = Some((now, usenet));
+            if let Some(torrents) = torrents {
+                torrents.sample();
+            }
+            return;
+        };
+        let elapsed = now - then;
+        let early = Self::metrics_snapshot_period(self.pipeline_is_live()) / 2;
+        if elapsed + early < crate::bandwidth::SPLIT_TICK {
+            return;
+        }
+        self.split_tick = crate::bandwidth::SplitTick {
+            given: std::mem::replace(&mut self.split_held, self.split_applied),
+            used: crate::bandwidth::SplitUse {
+                usenet: crate::bandwidth::per_second(usenet.saturating_sub(before), elapsed),
+                torrent: torrents.map_or(0, |torrents| torrents.sample()),
+            },
+        };
+        self.split_sampled = Some((now, usenet));
+    }
+
     // Put the global rates in force: the download rate shared between
     // usenet and torrents by the split in force from what each moved at over
-    // the last tick, and the upload rate, all of it the torrents' since usenet
-    // uploads nothing. Run on every change to a limit or the split and on the
-    // bandwidth tick, so the shares follow throughput.
+    // the split's last tick, and the upload rate, all of it the torrents'
+    // since usenet uploads nothing. Run on every change to a limit or the
+    // split and on the bandwidth tick; between two of the split's ticks it
+    // puts the same shares in force.
     pub(crate) fn apply_global_rate(&mut self) {
         let cap = self.global_rate(crate::bandwidth::Direction::Download);
         let split = self.split_in_force();
         let torrents = self.shared_state.torrent_rate();
         let rates = match &torrents {
-            Some(torrents) => crate::bandwidth::split_rates(
+            Some(_) => crate::bandwidth::split_rates(
                 cap,
                 split,
-                crate::bandwidth::SplitUse {
-                    usenet: self.shared_state.metrics_snapshot().current_download_speed,
-                    torrent: torrents.download_bps(),
-                },
+                self.split_tick.given,
+                self.split_tick.used,
             ),
             // With no torrent side there is nothing to share: usenet is held
             // to the limit itself.
@@ -474,6 +514,8 @@ impl Pipeline {
                 torrent: None,
             },
         };
+        self.split_applied = rates;
+        self.split_held = self.split_held.lower(rates);
         if self.rate_limiter.rate() != rates.usenet {
             self.rate_limiter.set_rate(rates.usenet);
         }
