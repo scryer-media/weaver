@@ -664,5 +664,6 @@ fn failed(message: &str) -> super::Failure {
         objects: Vec::new(),
         message: message.to_owned(),
         rejection: None,
+        from_feed: false,
     }
 }

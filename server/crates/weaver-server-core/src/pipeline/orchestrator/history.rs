@@ -9,8 +9,7 @@ impl Pipeline {
         self.added_script_holds.remove(&job_id);
         self.jobs.remove(&job_id);
         self.forget_graph_repair(job_id);
-        self.post_probes.states.remove(&job_id);
-        self.post_probes.dead.remove(&job_id);
+        self.post_probes.forget(job_id);
         if let Some(graph) = self.graph_jobs.get(&job_id) {
             graph.request_stop();
             if !graph.awaits_mail() {

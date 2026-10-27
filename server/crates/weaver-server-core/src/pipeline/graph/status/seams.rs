@@ -73,9 +73,7 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
     match step {
         Step::Wait => {}
         Step::Deliver => match pipeline.graph_terminal_status(job_id) {
-            Some(JobStatus::Failed { error })
-                if pipeline.post_probes.dead.get(&job_id) == Some(&error) =>
-            {
+            Some(JobStatus::Failed { error }) if pipeline.graph_failure_from_feed(job_id) => {
                 // Nothing came whole of a post the feed gave up: it failed
                 // at its download, in the feed's words.
                 metrics::failed("post_dead");
@@ -88,17 +86,8 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
             Some(JobStatus::Failed { error }) => {
                 // The stage that left the delivery short is the one that
                 // broke, whatever the root showed.
-                let stalled = match pipeline.graph_shortfall(job_id).map(|(stage, _)| stage) {
-                    Some(PipelineFailureStage::Repair) => {
-                        metrics::failed("repair_impossible");
-                        JobStatus::Repairing
-                    }
-                    _ => {
-                        metrics::failed("nothing_whole");
-                        JobStatus::Extracting
-                    }
-                };
-                pipeline.transition_postprocessing_status(job_id, stalled, None);
+                let stage = pipeline.graph_shortfall(job_id).map(|(stage, _)| stage);
+                pipeline.enter_short_stage(job_id, stage);
                 if pipeline.graph_failure_is_health(job_id) {
                     pipeline.fail_job_on_health(job_id, error);
                 } else {
@@ -205,10 +194,26 @@ impl Pipeline {
         let Some(failure) = self.graph_jobs.get(&job_id).and_then(super::ruled_short) else {
             return false;
         };
-        metrics::failed("repair_impossible");
-        self.transition_postprocessing_status(job_id, JobStatus::Repairing, None);
+        self.enter_short_stage(job_id, Some(PipelineFailureStage::Repair));
         self.fail_job(job_id, failure.message);
         true
+    }
+
+    // A graph job that comes short fails at the stage that left it so: at
+    // repair when a recovery set could not rebuild what it covers, and
+    // otherwise at extraction, where nothing came whole.
+    fn enter_short_stage(&mut self, job_id: JobId, stage: Option<PipelineFailureStage>) {
+        let stalled = match stage {
+            Some(PipelineFailureStage::Repair) => {
+                metrics::failed("repair_impossible");
+                JobStatus::Repairing
+            }
+            _ => {
+                metrics::failed("nothing_whole");
+                JobStatus::Extracting
+            }
+        };
+        self.transition_postprocessing_status(job_id, stalled, None);
     }
 
     // What the job spent is not part of the release and is removed once it
@@ -442,11 +447,11 @@ impl Pipeline {
         // The rulings' own failure, or else the feed's words when it gave
         // the post up.
         let failure = failure(&summary, &outcomes, job).or_else(|| {
-            self.post_probes.dead.get(&job_id).map(|words| Failure {
-                objects: Vec::new(),
-                message: words.clone(),
-                rejection: None,
-            })
+            self.post_probes
+                .dead
+                .get(&job_id)
+                .cloned()
+                .map(Failure::post_given_up)
         });
         let ignore = self.par2_ignore_extensions();
         // Root members are numbered as the posted files they are; one past
@@ -511,6 +516,14 @@ impl Pipeline {
             })
     }
 
+    // Whether a graph job's failure is the feed's: no set failed and the
+    // feed gave the post up.
+    fn graph_failure_from_feed(&self, job_id: JobId) -> bool {
+        self.graph_ruling(job_id)
+            .and_then(|(_, failure)| failure)
+            .is_some_and(|failure| failure.from_feed)
+    }
+
     pub(in crate::pipeline) fn graph_delivery(&self, job_id: JobId) -> Option<Delivery> {
         self.graph_ruling(job_id).map(|(delivery, _)| delivery)
     }
@@ -572,7 +585,7 @@ impl Pipeline {
         metrics::phase(phase);
         let stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
         if phase == RootPhase::Done {
-            self.post_probes.states.remove(&job_id);
+            self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
             let summary = RootJob::recovery_summary(&*graph);
             let outcomes = summary.outcomes();

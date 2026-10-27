@@ -67,13 +67,31 @@ async fn until_refused_unrepairable(pipeline: &mut Pipeline, volumes: u32) {
         }
         assert!(
             job(pipeline).runs().live(),
-            "no run is out and nothing was refused: {:?}",
-            job_status_for_assert(pipeline, JOB)
+            "no run is out and nothing was refused: {:?}; refused {:?}; awaits mail {}; runs {:?}",
+            job_status_for_assert(pipeline, JOB),
+            (0..volumes)
+                .map(|volume| writer.refused(NodeId::ROOT, MemberId(volume)))
+                .collect::<Vec<_>>(),
+            job(pipeline).awaits_mail(),
+            job(pipeline).runs()
         );
         let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
         pipeline.graph_run_said(said);
         pump_pipeline_runtime_queues(pipeline).await;
     }
+}
+
+// Serve one article as a download lane would: taken off the job's queues as
+// it is fetched, so what is still queued is what the job still owes.
+async fn serve_queued(pipeline: &mut Pipeline, scenario: &Scenario, (file, ordinal): (u32, u32)) {
+    if let Some(state) = pipeline.jobs.get_mut(&JOB) {
+        let this = |work: &crate::pipeline::download::queue::DownloadWork| {
+            work.segment_id.file_id.file_index == file && work.segment_id.segment_number == ordinal
+        };
+        state.download_queue.extract_matching(this);
+        state.recovery_queue.extract_matching(this);
+    }
+    serve(pipeline, scenario, (file, ordinal)).await;
 }
 
 // Run the completion gate and hear every run until the job finishes.
@@ -131,16 +149,12 @@ async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again() 
     );
     let scenario = Scenario::new(posts).framed(FRAME);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
 
-    // The archive alone: the engine refuses it before any set is in.
+    // The archive alone: the engine refuses it before any set is in. The
+    // set's articles stay queued, so the completion gate sees the job still
+    // owes them and does not end it on the archive alone.
     for ordinal in 0..archive {
-        serve(&mut pipeline, &scenario, (0, ordinal)).await;
+        serve_queued(&mut pipeline, &scenario, (0, ordinal)).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
     }
     until_refused_unrepairable(&mut pipeline, 1).await;
@@ -155,7 +169,7 @@ async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again() 
         .map(|ordinal| (1, ordinal))
         .chain((0..volume).map(|ordinal| (2, ordinal)));
     for article in set {
-        serve(&mut pipeline, &scenario, article).await;
+        serve_queued(&mut pipeline, &scenario, article).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
     }
     hear_graph_mail(&mut pipeline, JOB).await;
@@ -189,7 +203,7 @@ pub(super) async fn serve_posts(
     for file in files {
         let post = &scenario.posts[file as usize];
         for ordinal in 0..post.bytes.len().div_ceil(scenario.article) as u32 {
-            serve(pipeline, scenario, (file, ordinal)).await;
+            serve_queued(pipeline, scenario, (file, ordinal)).await;
             pump_pipeline_runtime_queues(pipeline).await;
         }
     }
@@ -295,12 +309,6 @@ fn four_volumes_zeroed() -> Vec<Post> {
 async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_again() {
     let scenario = Scenario::new(four_volumes_zeroed()).framed(SLICE);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
 
     serve_posts(&mut pipeline, &scenario, 0..4).await;
     until_refused_unrepairable(&mut pipeline, 4).await;
@@ -353,12 +361,6 @@ async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_re
     posts.extend(set);
     let scenario = Scenario::new(posts).password(sevenz::SECRET);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
 
     serve_posts(&mut pipeline, &scenario, 0..3).await;
     until_no_run(&mut pipeline).await;
@@ -408,20 +410,14 @@ async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_de
     let count = posts.len() as u32;
     let scenario = Scenario::new(posts);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
 
     serve_posts(&mut pipeline, &scenario, 1..count).await;
     let last = articles_of(&scenario, 0);
     for ordinal in std::iter::once(0).chain(2..last) {
-        serve(&mut pipeline, &scenario, (0, ordinal)).await;
+        serve_queued(&mut pipeline, &scenario, (0, ordinal)).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
     }
-    serve(&mut pipeline, &scenario, (0, 1)).await;
+    serve_queued(&mut pipeline, &scenario, (0, 1)).await;
     pump_pipeline_runtime_queues(&mut pipeline).await;
     let repaired = runs_before_the_repair(&mut pipeline).await;
     assert_eq!(
@@ -488,12 +484,6 @@ async fn a_member_delivered_whole_before_its_archive_was_refused_is_made_over_on
     posts.extend(par2_volumes("mixed", &[("mixed.rar", &original)], 2, 1));
     let scenario = Scenario::new(posts).framed(FRAME);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
 
     serve_posts(&mut pipeline, &scenario, 0..1).await;
     until_refused_unrepairable(&mut pipeline, 1).await;
