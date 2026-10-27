@@ -286,6 +286,8 @@ pub struct Session {
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
     stopped_announces: StoppedAnnounces,
+    // Rung as an announce table or a metadata fetch's phase changes.
+    trackers_changed: Option<Arc<Notify>>,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -995,6 +997,10 @@ pub struct SessionOptions {
     /// Where the session also sends each report its port mappers make, as
     /// they make it.
     pub port_map_events: Option<PortMapEvents>,
+
+    /// Rung as any announce table of the session changes, and as a magnet's
+    /// metadata fetch moves to another phase.
+    pub trackers_changed: Option<Arc<Notify>>,
 }
 
 impl Default for SessionOptions {
@@ -1034,6 +1040,7 @@ impl Default for SessionOptions {
             encryption: crate::mse::EncryptionPolicy::Disabled,
             allow_multiple_connections_per_ip: false,
             port_map_events: None,
+            trackers_changed: None,
         }
     }
 }
@@ -1211,6 +1218,7 @@ async fn follow_fetch(
     mut unable: tokio::sync::watch::Receiver<HashSet<SocketAddr>>,
     discovery: bool,
     phase: tokio::sync::watch::Sender<FetchPhase>,
+    changed: Option<Arc<Notify>>,
 ) {
     loop {
         let now = {
@@ -1220,7 +1228,11 @@ async fn follow_fetch(
                 None => FetchPhase::of(&[], &unable, discovery),
             }
         };
-        phase.send_if_modified(|was| std::mem::replace(was, now) != now);
+        if phase.send_if_modified(|was| std::mem::replace(was, now) != now)
+            && let Some(changed) = &changed
+        {
+            changed.notify_one();
+        }
         if now == FetchPhase::Discovery {
             return;
         }
@@ -1547,6 +1559,7 @@ impl Session {
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
+                trackers_changed: opts.trackers_changed.clone(),
                 stopped_announces: StoppedAnnounces::new(
                     opts.tracker_stopped_timeout
                         .unwrap_or(StoppedAnnounces::DEFAULT_TIMEOUT),
@@ -2529,8 +2542,14 @@ impl Session {
                     let session = self.clone();
                     let dht_announce = dht_announce.subscribe();
                     async move {
-                        follow_fetch(table.map(|t| t.subscribe()), unable, discovery, phase_tx)
-                            .await;
+                        follow_fetch(
+                            table.map(|t| t.subscribe()),
+                            unable,
+                            discovery,
+                            phase_tx,
+                            session.trackers_changed.clone(),
+                        )
+                        .await;
                         session
                             .discovery_peers(info_hashes, false, dht_announce, None)
                             .unwrap_or_else(|| futures::stream::empty().boxed())
@@ -2986,7 +3005,7 @@ impl Session {
             session: Arc::downgrade(self),
             torrent: Default::default(),
         };
-        Some(TrackerComms::start_with_tiers(
+        let task = TrackerComms::start_with_tiers(
             info_hashes,
             identity.clone(),
             self.announce_tiers(tracker_tiers, trackers_only),
@@ -3007,7 +3026,19 @@ impl Session {
             self.reachable(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
-        ))
+        );
+        // The table rings the session's watcher at each change, until the
+        // table is gone.
+        if let Some(changed) = &self.trackers_changed {
+            let mut table = task.status.subscribe();
+            let changed = Arc::clone(changed);
+            tokio::spawn(async move {
+                while table.changed().await.is_ok() {
+                    changed.notify_one();
+                }
+            });
+        }
+        Some(task)
     }
 
     // Get a peer stream from both DHT and trackers, under every hash the
