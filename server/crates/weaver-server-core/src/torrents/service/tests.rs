@@ -6676,3 +6676,203 @@ async fn the_metrics_carry_what_the_tick_read() {
     );
     rig.service.stop().await;
 }
+
+// The figures the service publishes for `job_id`, once `holds` says they
+// hold of them.
+async fn published_once(
+    service: &TorrentService,
+    job_id: JobId,
+    holds: impl Fn(&TorrentSeries) -> bool,
+) -> TorrentSeries {
+    let mut published = service.inner.published.subscribe();
+    let published = published
+        .wait_for(|published| published.job(job_id).is_some_and(|job| holds(job.torrent)))
+        .await
+        .unwrap();
+    published.job(job_id).unwrap().torrent.clone()
+}
+
+// A magnet's fetch is published as it runs, with no tick: its phase while
+// its tracker holds the announce, and the phase the tracker's answer moves
+// it to, one phase at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetching_magnets_phase_is_published_as_it_moves() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = fetching_from(&rig.service, &"fd".repeat(20), port).await;
+
+    let (started, event) = heard_event(&listener).await;
+    assert_eq!(event.as_deref(), Some("started"));
+    let fetching = published_once(&rig.service, job_id, |torrent| torrent.fetch.is_some()).await;
+    assert_eq!(fetching.state, TorrentState::FetchingMetadata);
+    assert_eq!(fetching.fetch, Some(weaver_torrent::FetchPhase::Trackers));
+
+    answer_no_peers(started).await;
+    let moved = published_once(&rig.service, job_id, |torrent| {
+        torrent
+            .fetch
+            .is_some_and(|phase| phase != weaver_torrent::FetchPhase::Trackers)
+    })
+    .await;
+    let phase = {
+        let live = rig.service.inner.live.lock().await;
+        let fetch = live[&job_id].fetching.as_ref().unwrap();
+        *fetch.phase.borrow()
+    };
+    assert_eq!(moved.fetch, Some(phase));
+    assert_eq!(moved.state, TorrentState::FetchingMetadata);
+    drop(listener);
+    rig.service.stop().await;
+}
+
+// A tracker's answer is published as it lands, with no tick: the exporter
+// reads the tracker as the view does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trackers_answer_is_published_as_it_lands() {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/announce",
+        listener.local_addr().unwrap().port()
+    );
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(plain("answered", 3)))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    rig.service.resume(job_id).await.unwrap();
+
+    let (mut started, event) = heard_event(&listener).await;
+    assert_eq!(event.as_deref(), Some("started"));
+    let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    started
+        .write_all(&[head.as_bytes(), body].concat())
+        .await
+        .unwrap();
+    let answered = published_once(&rig.service, job_id, |torrent| {
+        torrent
+            .trackers
+            .first()
+            .is_some_and(|tracker| tracker.status == TrackerStatus::Working)
+    })
+    .await;
+    let tracker = &answered.trackers[0];
+    assert_eq!((tracker.seeders, tracker.leechers), (Some(3), Some(5)));
+    assert_eq!(tracker.interval_seconds, Some(1800));
+    assert_eq!(tracker.fails, 0);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.trackers[0].status, TrackerStatus::Working);
+    assert_eq!(tracker.last_announce_ms, view.trackers[0].last_announce_ms);
+    drop(listener);
+    rig.service.stop().await;
+}
+
+// A magnet's metainfo is published as it arrives, with no tick: its size
+// is the metainfo's from then on. Its tracker holds the announce until the
+// resume has published, then names a peer that has the metainfo and none
+// of the pieces, so no piece landing publishes it instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_magnets_metainfo_is_published_as_it_arrives() {
+    use tokio::io::AsyncWriteExt;
+
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
+    let files = [("set/a.bin", data.as_slice())];
+    let shared = metainfo("set", &files, 16_384, false);
+    let seeds = tempfile::tempdir().unwrap();
+    let (seeding, _) = sharing(seeds.path(), &shared, &[]).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hash = parse(&shared).unwrap().hashes.v1.unwrap().as_string();
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = fetching_from(&rig.service, &hash, port).await;
+    let (mut started, event) = heard_event(&listener).await;
+    assert_eq!(event.as_deref(), Some("started"));
+    let mut body = b"d8:intervali1800e5:peers6:".to_vec();
+    body.extend_from_slice(&peer.ip().octets());
+    body.extend_from_slice(&peer.port().to_be_bytes());
+    body.push(b'e');
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    started
+        .write_all(&[head.as_bytes(), &body].concat())
+        .await
+        .unwrap();
+
+    let total = data.len() as u64;
+    let arrived = published_once(&rig.service, job_id, |torrent| torrent.total_bytes != 0).await;
+    assert_eq!(arrived.total_bytes, total);
+    assert_eq!(arrived.wanted_bytes, total);
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().total_bytes,
+        total
+    );
+    drop(listener);
+    rig.service.stop().await;
+    seeding.stop().await;
+}
+
+// Turning torrents off closes their sessions, and what is published says
+// so at once: the route a torrent names holds no session, and shows none
+// of the closed session's figures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_torrents_off_publishes_their_routes_closed() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("closed", 4))))
+        .await
+        .unwrap();
+    rig.service.tick().await;
+    let route = {
+        let metrics = rig.service.metrics();
+        let job = metrics.published.job(job_id).unwrap();
+        let session = job.session.unwrap();
+        assert!(session.open, "{session:?}");
+        job.torrent.route.clone()
+    };
+
+    let mut settings = rig.service.settings();
+    settings.torrent.enabled = false;
+    rig.service.set_settings(settings).await;
+    let metrics = rig.service.metrics();
+    let published = &metrics.published;
+    let job = published.job(job_id).unwrap();
+    assert_eq!(job.torrent.route, route);
+    assert_eq!(job.session, Some(&SessionSeries::held(&route)));
+    assert_eq!(
+        published
+            .sessions
+            .iter()
+            .filter(|session| session.route == route)
+            .count(),
+        1,
+        "{:?}",
+        published.sessions
+    );
+    rig.service.stop().await;
+}

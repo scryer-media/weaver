@@ -741,6 +741,9 @@ pub struct Sessions {
     // Wakes the follower of the routes when the leg under an open session
     // is revoked.
     revoked: Arc<tokio::sync::Notify>,
+    // Rung by every session as an announce table or a metadata fetch's
+    // phase changes.
+    trackers_changed: Arc<tokio::sync::Notify>,
 }
 
 impl Sessions {
@@ -758,6 +761,7 @@ impl Sessions {
             rates: SessionRates::default(),
             closing: Closing::default(),
             revoked: Arc::default(),
+            trackers_changed: Arc::default(),
         }
     }
 
@@ -765,6 +769,12 @@ impl Sessions {
     /// last asked: that session is `outdated` until its route opens again.
     pub async fn revoked(&self) {
         self.revoked.notified().await;
+    }
+
+    /// Resolves once an announce table of an open session, or the phase of
+    /// a metadata fetch on one, has changed since last asked.
+    pub async fn trackers_changed(&self) {
+        self.trackers_changed.notified().await;
     }
 
     // Once `leg` is revoked under `session`, the session may send no more,
@@ -1087,6 +1097,7 @@ impl Sessions {
             .await;
         let mut options = SessionOptions {
             port_map_events: Some(mappings.follow()),
+            trackers_changed: Some(Arc::clone(&self.trackers_changed)),
             ..session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener)
         };
         // SSL torrents' peers come to a port of the route's own beside its

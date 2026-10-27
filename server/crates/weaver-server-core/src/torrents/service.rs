@@ -1617,9 +1617,9 @@ struct Inner {
     settings_changed: Notify,
     // The torrents and their sessions as last published, for the exporter.
     published: watch::Sender<Arc<Published>>,
-    // Each route's session as the tick last read it. Only the tick reads
-    // them, under the sessions' lock it takes anyway: a publish from an
-    // action never waits on a session that is opening.
+    // Each route's session as last read. The tick reads them, and turning
+    // torrents on or off, under the sessions' lock each takes anyway: a
+    // publish from an action never waits on a session that is opening.
     sessions_read: Mutex<Vec<SessionSeries>>,
     counters: Counters,
 }
@@ -1809,6 +1809,7 @@ impl TorrentService {
     async fn turn(&self, on: bool) {
         self.read(self.inner.clock.now_ms(), true).await;
         self.inner.sessions.turn(on).await;
+        self.read_sessions().await;
         self.run(on).await;
     }
 
@@ -1880,12 +1881,24 @@ impl TorrentService {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let (views, torrents): (Vec<TorrentView>, Vec<TorrentSeries>) = listed.into_iter().unzip();
+        let sessions = with_routes_of(sessions, &torrents);
         self.inner
             .published
             .send_replace(Arc::new(Published { torrents, sessions }));
         if let Some(queue) = self.queue() {
             queue.publish_owned_jobs(job_infos(views, now));
         }
+    }
+
+    // Each route's session as it stands, for the exporter: read by the tick,
+    // and wherever sessions open or close outside it.
+    async fn read_sessions(&self) {
+        let sessions = self.inner.sessions.metrics().await;
+        *self
+            .inner
+            .sessions_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = sessions;
     }
 
     /// The torrents and their sessions as last published, with the
@@ -2007,7 +2020,21 @@ impl TorrentService {
             self.keep(task);
         }
         self.spawn_settle();
+        self.spawn_follow_trackers();
         self.restore().await
+    }
+
+    // A tracker's answer, and a fetch moving on, are published as the
+    // sessions ring them: the exporter reads them when the views do, not
+    // at the next tick.
+    fn spawn_follow_trackers(&self) {
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            loop {
+                service.inner.sessions.trackers_changed().await;
+                service.publish().await;
+            }
+        }));
     }
 
     fn spawn_settle(&self) {
@@ -2933,12 +2960,15 @@ impl TorrentService {
 
     // A magnet's metadata fetch becomes `fetch`. A fetch is the torrent's
     // only while it runs: one the pause ended still gives is not shown.
+    // Published either way: a fetch begun shows its phase, and one ended
+    // what it ended in, the metainfo it gave among it.
     async fn fetching(&self, job_id: JobId, fetch: Option<weaver_torrent::MetadataFetch>) {
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id)
             && (fetch.is_none() || matches!(torrent.resolving, Some(Resolving::Fetching(_))))
         {
             torrent.fetching = fetch;
         }
+        self.publish().await;
     }
 
     async fn resolved(
@@ -4138,12 +4168,7 @@ impl TorrentService {
         self.apply_picking().await;
         self.apply_limits().await;
         self.drop_idle_sessions().await;
-        let sessions = self.inner.sessions.metrics().await;
-        *self
-            .inner
-            .sessions_read
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = sessions;
+        self.read_sessions().await;
         self.publish().await;
         self.inner.ticks.send_modify(|ticks| *ticks += 1);
     }
@@ -4963,6 +4988,23 @@ pub fn disk_warning(volume: &Path, waiting: &[&str]) -> String {
         volume.display(),
         waiting.join(", ")
     )
+}
+
+// The sessions as read, with every route a torrent names and no session was
+// read on held: a route's series say what runs on it now, and with none
+// open, nothing runs.
+fn with_routes_of(
+    mut sessions: Vec<SessionSeries>,
+    torrents: &[TorrentSeries],
+) -> Vec<SessionSeries> {
+    for torrent in torrents {
+        let route = torrent.route.as_str();
+        if !route.is_empty() && !sessions.iter().any(|session| session.route == route) {
+            sessions.push(SessionSeries::held(route));
+        }
+    }
+    sessions.sort_by(|a, b| a.route.cmp(&b.route));
+    sessions
 }
 
 // `views` as queue items at `now_ms`.
