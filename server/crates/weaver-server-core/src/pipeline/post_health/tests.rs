@@ -218,3 +218,10 @@ async fn a_long_round_reports_progress_before_it_ends() {
     assert!(done.done);
     assert_eq!(done.total, 550);
 }
+
+#[test]
+fn a_post_at_exactly_its_critical_line_is_still_healthy() {
+    assert!(!below_critical(850, 850));
+    assert!(below_critical(849, 850));
+    assert!(!below_critical(851, 850));
+}

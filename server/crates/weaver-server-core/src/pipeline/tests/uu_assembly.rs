@@ -99,6 +99,8 @@ fn uu_job_spec(decoded_sizes: &[usize]) -> JobSpec {
             message_id: format!("uu-{index}@example.com"),
         });
     }
+    // The post's size is every part it declares.
+    spec.total_bytes = declared.iter().map(|bytes| u64::from(*bytes)).sum();
     spec
 }
 

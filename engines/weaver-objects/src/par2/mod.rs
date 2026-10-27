@@ -58,6 +58,9 @@ pub struct Par2 {
     meter: Meter,
     // A job past the packet or set limits keeps none of its sets.
     refused: bool,
+    // Ranges of members of the namespace that will never come, as the
+    // parent refused them. A set counts those of the members it binds.
+    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
     // The namespace asked for a ruling before any set was found: a volume
     // is read for one.
     seeking: bool,
@@ -83,6 +86,7 @@ impl Par2 {
             evidence: BTreeMap::new(),
             meter: Meter::default(),
             refused: false,
+            refusals: BTreeMap::new(),
             seeking: false,
             output_limit: MAX_JOB_BYTES,
             memory_limit: REPAIR_MEMORY_LIMIT,
@@ -125,6 +129,56 @@ impl Par2 {
             .filter(|volume| volume.serves(set))
             .map(|volume| volume.coming(packet))
             .sum()
+    }
+
+    // The slices of the set's members that a refused range touches: each
+    // will never come, so each needs a block of its own.
+    fn refused_slices(&self, key: &[u8; 16]) -> u64 {
+        let state = &self.sets[key];
+        let Some(index) = state.usable().filter(|index| index.slice_size > 0) else {
+            return 0;
+        };
+        let slice = index.slice_size;
+        state
+            .members()
+            .iter()
+            .filter_map(|(file, member)| {
+                let length = index.file_description(file)?.length;
+                Some((length, self.refusals.get(member)?))
+            })
+            .map(|(length, ranges)| {
+                ranges
+                    .iter()
+                    .filter_map(|range| range.intersect(ByteRange::new(0, length)))
+                    .filter(|range| !range.is_empty())
+                    .flat_map(|range| range.start / slice..=(range.end - 1) / slice)
+                    .collect::<BTreeSet<u64>>()
+                    .len() as u64
+            })
+            .sum()
+    }
+
+    // The blocks the set can still reach: those in hand and those its open
+    // volumes are named to bring. `None` while an open volume that may
+    // serve it does not say how many it carries.
+    fn reach(&self, key: &[u8; 16]) -> Option<u64> {
+        let unknown = self
+            .volumes
+            .iter()
+            .any(|volume| !volume.closed && volume.serves(key) && volume.named_blocks.is_none());
+        (!unknown).then(|| self.sets[key].recovery.len() as u64 + self.coming(key))
+    }
+
+    // The set's ruling on what was refused: impossible once the refused
+    // slices outrun every block it can still reach. Nothing waits on that,
+    // whatever its last repair said.
+    fn refused_short(&self, key: &[u8; 16]) -> Option<RepairOutcome> {
+        let damaged = self.refused_slices(key);
+        if damaged == 0 {
+            return None;
+        }
+        let reachable = self.reach(key)?;
+        (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
     }
 
     // Every grid the evidence is folded on: each known set's slices, and
@@ -550,6 +604,15 @@ impl Recovery for Par2 {
         }
     }
 
+    // Kept for every member of the namespace, bound or not: a set bound to
+    // it later counts what was refused before.
+    fn refused(&mut self, member: MemberId, range: ByteRange) {
+        let ranges = self.refusals.entry(member).or_default();
+        if !ranges.contains(&range) {
+            ranges.push(range);
+        }
+    }
+
     // A slice is proven by checksums cut at its boundaries; the whole
     // member's CRC folds from any.
     fn block_sizes(&self, out: &mut Vec<u64>) {
@@ -647,6 +710,10 @@ impl Recovery for Par2 {
         }
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
+            if let Some(short) = self.refused_short(&key) {
+                outcome = combine(outcome, short);
+                continue;
+            }
             let coming = self.coming(&key);
             let describing = self.describing(Some(&key));
             let Some(state) = self.sets.get_mut(&key) else {
@@ -693,6 +760,10 @@ impl Recovery for Par2 {
         }
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
+            if let Some(short) = self.refused_short(&key) {
+                outcome = combine(outcome, short);
+                continue;
+            }
             let last = self.sets[&key].last?;
             let ruled = match last.outcome {
                 RepairOutcome::Waiting if !self.waits(&key, last.needed) => return None,
@@ -707,13 +778,18 @@ impl Recovery for Par2 {
         for key in self.ordered() {
             let state = &self.sets[&key];
             let last = state.last;
+            let short = self.refused_short(&key);
+            let damaged = match short {
+                Some(RepairOutcome::Impossible { damaged, .. }) => damaged,
+                _ => last.map_or(0, |last| last.damaged),
+            };
             out.push(SetRuling {
                 id: par2_rs::RecoverySetId::from_bytes(key).to_string(),
                 slice_size: state.index.as_ref().map_or(0, |index| index.slice_size),
                 blocks_reachable: state.recovery.len() as u64 + self.coming(&key),
-                damaged_slices: last.map_or(0, |last| last.damaged),
-                outcome: last.map(|last| last.outcome),
-                read: last.is_some_and(|last| last.read),
+                damaged_slices: damaged,
+                outcome: short.or(last.map(|last| last.outcome)),
+                read: short.is_none() && last.is_some_and(|last| last.read),
             });
         }
     }

@@ -271,7 +271,7 @@ struct ScenarioStat {
     missing: BTreeSet<String>,
 }
 
-impl crate::pipeline::graph::probe::Stat for ScenarioStat {
+impl crate::pipeline::post_health::Stat for ScenarioStat {
     fn stat_many<'a>(
         &'a self,
         message_ids: &'a [&'a str],
@@ -287,13 +287,13 @@ impl crate::pipeline::graph::probe::Stat for ScenarioStat {
 // A health probe out for the job is heard before the next article is
 // served: its round ends before the download moves on.
 async fn hear_probe(pipeline: &mut Pipeline) {
-    while pipeline.graph_probes.out(JOB) {
+    while pipeline.post_probes.out(JOB) {
         let update = pipeline
-            .graph_probes
+            .post_probes
             .recv()
             .await
             .expect("a probe out speaks");
-        pipeline.graph_probe_heard(update);
+        pipeline.post_probe_heard(update);
     }
 }
 
@@ -390,7 +390,7 @@ impl Scenario {
         }
         // A health probe asks the scenario's server, which holds every
         // article but the ones it lost.
-        pipeline.graph_probes.stat = Some(std::sync::Arc::new(ScenarioStat {
+        pipeline.post_probes.stat = Some(std::sync::Arc::new(ScenarioStat {
             missing: self
                 .lost
                 .iter()

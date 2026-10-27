@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Dead posts fail fast: the first-article sample rules a post dead once the
-// first articles of most of its files are lost, before the rest of it is
-// fetched, unless the recovery the job can still reach covers the files the
-// sample lost. A recovery set that can no longer rebuild what the post lost
-// fails it as soon as the losses outrun every block it can still reach. A
-// post whose losses look like a release nobody uploaded is sampled by STAT,
-// and fails on what the sample projects once that is past critical.
+// Dead posts fail fast, in two vocabularies. The usenet feed rules from
+// the NZB and its servers alone: the first-article sample, then the post's
+// health against its critical line, with a STAT round's projection naming
+// what took it there. The graph rules from what its feed refused: a
+// recovery set that can no longer reach enough blocks for the ranges it was
+// refused rules impossible, and the job ends on its words.
 
 use super::harness::*;
 use crate::history::HistoryFailureKind;
@@ -21,19 +20,19 @@ fn files() -> Vec<Post> {
 
 #[tokio::test]
 async fn a_post_whose_first_articles_are_lost_fails_before_its_payload_is_fetched() {
+    // Twelve files and no recovery: the post's health crosses its critical
+    // line before the sample reaches its share, and the feed gives the post
+    // up on whichever crosses first.
     let scenario = (0..10).fold(Scenario::new(files()), |scenario, file| {
         scenario.lost(file, 0)
     });
     let graph = run(&scenario).await;
-    assert_eq!(
-        graph.failure.as_deref(),
-        Some("aborted: 10 of 12 first articles are missing, the post cannot complete")
-    );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Health));
-    // The first articles lead, and the tenth loss ends the job: nothing past
-    // them was asked for.
-    let asked: Vec<(u32, u32)> = graph.requests.keys().copied().collect();
-    assert_eq!(asked, (0..10).map(|file| (file, 0)).collect::<Vec<_>>());
+    // The feed abandons the files that lost an article and keeps fetching
+    // the others, which arrive whole.
+    assert_eq!(graph.status, Some(crate::jobs::model::JobStatus::Partial));
+    for name in ["lantern10.bin", "lantern11.bin"] {
+        assert_eq!(graph.claims.get(name), Some(&Claim::Complete), "{name}");
+    }
 }
 
 #[tokio::test]
@@ -60,27 +59,35 @@ async fn the_sample_is_the_payloads_first_articles_and_not_its_recoverys() {
         scenario.lost(file, 0)
     });
     let graph = run(&scenario).await;
-    assert_eq!(
-        graph.failure.as_deref(),
-        Some("aborted: 11 of 13 first articles are missing, the post cannot complete")
-    );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Health));
+    // The sample rules the post dead; the one file whose first article came
+    // is still fetched and arrives whole, so the job is partial.
+    assert_eq!(graph.status, Some(crate::jobs::model::JobStatus::Partial), "{:?}", graph.failure);
+    assert_eq!(graph.claims.get("lantern11.bin"), Some(&Claim::Complete));
 }
 
 #[tokio::test]
-async fn a_sample_short_of_the_share_leaves_the_post_to_its_recovery() {
-    let scenario = (0..9).fold(Scenario::new(files()), |scenario, file| {
+async fn a_sample_short_of_the_share_at_or_above_critical_leaves_the_post_to_its_recovery() {
+    // Nine of twelve files lost at their first article, short of the
+    // sample's share, beside a recovery set that keeps the post's health at
+    // or above its critical line: the feed rules nothing, and the set
+    // rebuilds what was lost.
+    let payload_files: Vec<(String, Vec<u8>)> = (0..12u8)
+        .map(|at| (format!("lantern{at:02}.bin"), payload(4 * ARTICLE, at)))
+        .collect();
+    let named: Vec<(&str, &[u8])> = payload_files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = payload_files
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    posts.extend(par2_set("lantern", &named, 24));
+    let scenario = (0..9).fold(Scenario::new(posts), |scenario, file| {
         scenario.lost(file, 0)
     });
     let graph = run(&scenario).await;
-    assert!(
-        !graph
-            .failure
-            .as_deref()
-            .is_some_and(|failure| failure.contains("first articles are missing")),
-        "{:?}",
-        graph.failure
-    );
+    assert!(graph.completed(), "{:?}", graph.failure);
     assert!(graph.requests.contains_key(&(11, 3)));
 }
 
@@ -272,4 +279,107 @@ async fn a_post_whose_only_recovery_is_par3_defers_to_it_below_critical() {
     for (name, _) in &payload_files {
         assert_eq!(graph.claims.get(name), Some(&Claim::Complete), "{name}");
     }
+}
+
+// The feed's vocabulary: a post taken down whole but for each file's first
+// article. The sample finds every head, a STAT round finds nine of ten
+// samples missing, and the post's health falls below the line a post with
+// no recovery is held to, before the payload is fetched.
+#[tokio::test]
+async fn a_post_taken_down_fails_on_the_feeds_health_before_the_graph_rules() {
+    let posts: Vec<Post> = (0..3u8)
+        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(40 * ARTICLE, at)))
+        .collect();
+    let scenario = (0..3u32)
+        .flat_map(|file| (1..40u32).map(move |ordinal| (file, ordinal)))
+        .fold(Scenario::new(posts), |scenario, (file, ordinal)| {
+            scenario.lost(file, ordinal)
+        });
+    let graph = run(&scenario).await;
+    let failure = graph.failure.as_deref().unwrap_or_default();
+    assert!(failure.contains("below critical 85.0%"), "{failure}");
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Health));
+    // No recovery object ruled: the feed gave the post up.
+    assert!(graph.graph().outcomes.is_empty(), "{:?}", graph.graph().outcomes);
+}
+
+// The feed's vocabulary yields to the graph's: a post alive above its
+// critical line whose PAR2 set of forty blocks is refused forty-one ranges.
+// The set rules impossible on the forty-first and the job fails in its
+// words, before the payload's tail is fetched.
+#[tokio::test]
+async fn a_par2_set_refused_one_range_past_its_blocks_fails_in_its_own_words() {
+    let bytes = payload(200 * ARTICLE, 7);
+    let mut posts = vec![Post::plain("lantern.bin", bytes.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", bytes.as_slice())], 40));
+    let scenario = (1..=41).fold(Scenario::new(posts).leased(), |scenario, ordinal| {
+        scenario.lost(0, ordinal)
+    });
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+             41 damaged slices, only 40 recovery blocks reachable"
+        )
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert!(!graph.requests.contains_key(&(0, 199)), "{:?}", graph.order);
+}
+
+// The graph's vocabulary: a stored RAR5 set of four volumes, three of them
+// refused an article each, beside one `.rev` volume. The `.rev` set can
+// rebuild one volume, so it rules impossible and the job fails in its words.
+#[tokio::test]
+async fn a_rev_set_refused_three_volumes_with_one_rev_rules_impossible() {
+    let body = super::rar_rev::body();
+    let volumes =
+        crate::pipeline::tests::direct_store::single_member_store_set("beacon.bin", &body, 4);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let mut posts = super::rar::posts(volumes.clone());
+    posts.extend(super::rar_rev::rar5_revs("silver.horizon", &bytes, 1));
+    let scenario = (1..4u32).fold(Scenario::new(posts), |scenario, volume| {
+        scenario.lost(volume, 1)
+    });
+    let graph = run(&scenario).await;
+    let failure = graph.failure.as_deref().unwrap_or_default();
+    assert!(failure.contains("not repairable: 3 damaged slices, only 1 recovery blocks reachable"), "{failure}");
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+}
+
+// No recovery at all, every payload article refused: nothing can rebuild
+// the file and the job fails.
+#[tokio::test]
+async fn a_post_with_no_recovery_whose_every_article_is_refused_fails() {
+    let posts = vec![Post::plain("lantern.bin", payload(4 * ARTICLE, 7))];
+    let scenario = (0..4).fold(Scenario::new(posts), |scenario, ordinal| {
+        scenario.lost(0, ordinal)
+    });
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(crate::jobs::model::JobStatus::Failed { .. })),
+        "{:?} {:?}",
+        graph.status,
+        graph.failure
+    );
+}
+
+// A whole archive volume no object opened is no usable file: its `.rar`
+// lost, the `.r01` beside it arrives whole, and the job fails, not partial.
+#[tokio::test]
+async fn a_whole_volume_no_object_opened_is_not_a_usable_file() {
+    let posts = vec![
+        Post::plain("lantern.rar", payload(4 * ARTICLE, 3)),
+        Post::plain("lantern.r01", payload(4 * ARTICLE, 4)),
+    ];
+    let scenario = (0..4).fold(Scenario::new(posts), |scenario, ordinal| {
+        scenario.lost(0, ordinal)
+    });
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(crate::jobs::model::JobStatus::Failed { .. })),
+        "{:?} {:?}",
+        graph.status,
+        graph.failure
+    );
 }

@@ -182,6 +182,11 @@ pub struct Par3 {
     settled: BTreeMap<String, Settled>,
     // The repair's decoder allowance when the owner grants it none.
     memory_limit: u64,
+    // Ranges of members of the namespace that will never come, as the
+    // parent refused them, and the whole blocks of bound files they touch,
+    // counted again whenever either changes.
+    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
+    refused_blocks: u64,
 }
 
 impl Par3 {
@@ -198,6 +203,8 @@ impl Par3 {
             ruled: Vec::new(),
             settled: BTreeMap::new(),
             memory_limit: REPAIR_MEMORY_LIMIT,
+            refusals: BTreeMap::new(),
+            refused_blocks: 0,
         }
     }
 
@@ -225,6 +232,63 @@ impl Par3 {
 
     fn coming(&self) -> bool {
         self.volumes.iter().any(|volume| !volume.closed)
+    }
+
+    // The whole blocks of the bound files a refused range touches. A
+    // file's last, partial block may be packed with another file's, so it
+    // is left out: the count never runs ahead of the blocks really lost.
+    fn count_refused(&mut self, sets: &[Par3Set]) {
+        let mut blocks = 0u64;
+        for set in sets {
+            let block = set.block_size();
+            if block == 0 {
+                continue;
+            }
+            for file in set.files() {
+                let Some(ranges) = self
+                    .bound
+                    .get(file.path())
+                    .and_then(|member| self.refusals.get(member))
+                else {
+                    continue;
+                };
+                let whole = file.size() / block;
+                let touched: std::collections::BTreeSet<u64> = ranges
+                    .iter()
+                    .filter_map(|range| range.intersect(ByteRange::new(0, whole * block)))
+                    .flat_map(|range| range.start / block..=(range.end - 1) / block)
+                    .collect();
+                blocks += touched.len() as u64;
+            }
+        }
+        self.refused_blocks = blocks;
+    }
+
+    // The blocks the volumes can still bring, by what their names say. A
+    // volume that names none carries none once it is read through without
+    // showing a recovery packet; before that it says nothing, and `None`.
+    // A loss inside a volume is not counted against it, so the reach never
+    // falls short of the blocks really there.
+    fn reach(&self) -> Option<u64> {
+        self.volumes
+            .iter()
+            .map(|volume| match volume.named_blocks {
+                Some(blocks) => Some(blocks),
+                None if volume.closed && !volume.shows_recovery() => Some(0),
+                None => None,
+            })
+            .sum()
+    }
+
+    // The object's ruling on what was refused: impossible once the refused
+    // blocks outrun what its volumes can bring.
+    fn refused_short(&self) -> Option<RepairOutcome> {
+        let damaged = self.refused_blocks;
+        if damaged == 0 {
+            return None;
+        }
+        let reachable = self.reach()?;
+        (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
     }
 
     fn closed(&self) -> usize {
@@ -544,6 +608,7 @@ impl Recovery for Par3 {
             self.last = None;
         }
         self.bound = bound;
+        self.count_refused(&sets);
     }
 
     // Every described file no member carries by name and none may yet turn
@@ -575,6 +640,18 @@ impl Recovery for Par3 {
     }
 
     fn feed(&mut self, _member: MemberId, _segments: &[Segment]) {}
+
+    // Kept for every member of the namespace, bound or not: a bind later
+    // counts what was refused before.
+    fn refused(&mut self, member: MemberId, range: ByteRange) {
+        let ranges = self.refusals.entry(member).or_default();
+        if ranges.contains(&range) {
+            return;
+        }
+        ranges.push(range);
+        let sets = self.front_sets();
+        self.count_refused(&sets);
+    }
 
     // Nothing is known before a readback.
     fn verdicts(&self, _member: MemberId, _out: &mut Vec<SliceVerdict>) {}
@@ -616,6 +693,9 @@ impl Recovery for Par3 {
         access: &mut dyn MemberAccess,
         budget: weaver_graph::Budget,
     ) -> RepairOutcome {
+        if let Some(short) = self.refused_short() {
+            return short;
+        }
         // Every readable span of every volume, read back and scanned one at
         // a time; a span that does not read back whole is left out.
         let mut packets = Vec::new();
@@ -702,6 +782,9 @@ impl Recovery for Par3 {
     }
 
     fn outcome(&self) -> Option<RepairOutcome> {
+        if let Some(short) = self.refused_short() {
+            return Some(short);
+        }
         match self.last? {
             Ruling::Reached(outcome) => Some(outcome),
             Ruling::Short { closed } => (self.closed() == closed).then_some(RepairOutcome::Waiting),

@@ -243,7 +243,7 @@ impl Pipeline {
             graph_status: Default::default(),
             graph_holds,
             graph_runs: Default::default(),
-            graph_probes: Default::default(),
+            post_probes: Default::default(),
             nzb_admitted,
             nzb_seen: HashSet::new(),
             nzb_pause_releases,
@@ -946,9 +946,9 @@ impl Pipeline {
                     Some(said) = self.graph_runs.recv() => {
                         self.graph_run_said(said);
                     }
-                    Some(update) = self.graph_probes.recv() => {
+                    Some(update) = self.post_probes.recv() => {
                         turn_timer.resume();
-                        self.graph_probe_heard(update);
+                        self.post_probe_heard(update);
                     }
                     Some(result) = self.decode_done_rx.recv() => {
                         turn_timer.resume();

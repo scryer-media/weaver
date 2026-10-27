@@ -80,6 +80,10 @@ pub(super) enum Told {
         member: MemberId,
         evidence: Vec<Segment>,
     },
+    Refused {
+        member: MemberId,
+        range: ByteRange,
+    },
 }
 
 impl Lent {
@@ -191,6 +195,15 @@ impl Tree {
         }
     }
 
+    // A range of a member the recovery object at `set` covers will never
+    // come. The object hears it through its recovery face, never as bytes.
+    pub fn refuse(&mut self, set: NodeId, member: MemberId, range: ByteRange) {
+        let waiting = Waiting::Told(Told::Refused { member, range });
+        if self.wait(set, waiting).is_some() {
+            self.with_recovery(set, |recovery, _| recovery.refused(member, range));
+        }
+    }
+
     // A range of the volume of the object at `node` will never arrive. What
     // it says is applied as if it said it in `deliver`.
     pub fn volume_lost(
@@ -275,6 +288,11 @@ impl Tree {
                 Told::Fed { member, evidence } => {
                     if let Some(recovery) = object.recovery_mut() {
                         recovery.feed(member, &evidence);
+                    }
+                }
+                Told::Refused { member, range } => {
+                    if let Some(recovery) = object.recovery_mut() {
+                        recovery.refused(member, range);
                     }
                 }
             }

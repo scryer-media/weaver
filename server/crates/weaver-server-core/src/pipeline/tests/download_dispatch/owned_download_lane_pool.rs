@@ -1162,19 +1162,14 @@ async fn a_file_whose_every_segment_dies_books_each_declared_size_exactly_once()
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20018);
     let segment_sizes = [1_000u32, 2_000, 3_000, 4_000];
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes),
-    )
-    .await;
-    {
-        // Health policy is not what is under test. A recovery set large enough
-        // to make the critical threshold zero keeps a wholly dead file in the
-        // deferral arm instead of aborting the job out from under the ledger.
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.par2_bytes = state.spec.total_bytes;
-    }
+    // Health policy is not what is under test. A sibling file ten times the
+    // dying one's size keeps the post above its critical line, so the feed
+    // never gives it up out from under the ledger.
+    let mut spec = segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes);
+    let sibling = segmented_job_spec("Silver Horizon", "silver-horizon-extra.mkv", &[10_000; 10]);
+    spec.total_bytes += sibling.total_bytes;
+    spec.files.extend(sibling.files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
 
     let segment = |segment_number| SegmentId {
         file_id: NzbFileId {

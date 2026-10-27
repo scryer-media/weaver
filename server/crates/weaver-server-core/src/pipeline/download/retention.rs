@@ -324,7 +324,14 @@ impl Pipeline {
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
-        if self.book_failed_segment(segment_id) {
+        // A server that refuses the credentials never said the article is
+        // gone, so the post's health does not count it.
+        let state = if refused_by.is_empty() {
+            SegmentTerminalState::Missing
+        } else {
+            SegmentTerminalState::Unservable
+        };
+        if self.book_terminal_segment(segment_id, state) {
             self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
         refused_by

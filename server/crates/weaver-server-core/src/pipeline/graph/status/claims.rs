@@ -12,6 +12,8 @@ use weaver_graph::{Member, MemberId, NodeId, Tree, Why};
 use crate::jobs::model::JobStatus;
 use crate::post_processing::model::PipelineFailureStage;
 
+use super::Failure;
+
 // Below this share of its length, a member has produced no delivery
 // evidence: what is on disk for it is a rounding error, not a short
 // delivery.
@@ -127,7 +129,9 @@ pub(crate) fn refused<'c>(
 // closed is. Refused, every volume of its set is delivered as it stands,
 // never whole, however clean its bytes: the object failed, not the post.
 // An object that disclaims a member (`Why::disclaims`) leaves it the
-// posted file, whole when its bytes are.
+// posted file, whole when its bytes are. A member the post names as an
+// archive volume, a split part or recovery data is never whole as a leaf:
+// only what an object unpacks from it is a usable file.
 // A member given back for a reason that withholds it (`Why::withholds`)
 // delivered nothing: its bytes are a container nothing opened, neither
 // whole nor short, and stay as they stand.
@@ -171,9 +175,11 @@ impl Delivery {
         furniture: impl Fn(&str) -> bool,
         unrepaired: impl Fn(NodeId, MemberId) -> bool,
         refused: impl Fn(NodeId, MemberId) -> Option<Why>,
+        piece: impl Fn(NodeId, MemberId) -> bool,
     ) -> Self {
         let mut walk = Walk {
             tree,
+            piece: &piece,
             furniture: &furniture,
             unrepaired: &unrepaired,
             refused: &refused,
@@ -188,15 +194,15 @@ impl Delivery {
         walk.delivery
     }
 
-    // How a job that has nothing left to wait for ends: complete when
-    // nothing it hands over is short or withheld and no recovery object
-    // failed to rebuild what it found, partial when some file is whole
-    // beside what is not, and failed when nothing is whole, for `failure`
-    // when a recovery object could not rebuild what it found, and otherwise
-    // for what was withheld. A failed rebuild is short whether or not a
-    // member carries what it could not rebuild: a file the set describes
-    // and nothing delivered is short too.
-    pub(crate) fn status(&self, failure: Option<&str>) -> JobStatus {
+    // How a job that has nothing left to wait for ends, from the rulings:
+    // complete when nothing it hands over is short or withheld and no
+    // recovery set ruled it cannot rebuild what it covers, partial when some
+    // file is whole beside what is not, and failed when nothing is whole,
+    // in the words of the sets that could not rebuild, and otherwise for
+    // what was withheld. A failed rebuild is short whether or not a member
+    // carries what it could not rebuild: a file the set describes and
+    // nothing delivered is short too.
+    pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let short =
             !(self.damaged.is_empty() && self.unrepaired.is_empty() && self.withheld.is_empty());
         if !short && failure.is_none() {
@@ -206,7 +212,7 @@ impl Delivery {
             return JobStatus::Partial;
         }
         let error = match failure
-            .map(str::to_string)
+            .map(|failure| failure.message.clone())
             .or_else(|| self.withheld_error())
         {
             Some(error) => error,
@@ -277,6 +283,9 @@ struct Walk<'t, F, R> {
     furniture: &'t F,
     unrepaired: &'t R,
     refused: &'t dyn Fn(NodeId, MemberId) -> Option<Why>,
+    // A member the post names as a piece of something else: an archive
+    // volume, a split part or recovery data, never a file the user opens.
+    piece: &'t dyn Fn(NodeId, MemberId) -> bool,
     // Every volume of a set opens the same namespace; it is read once.
     opened: BTreeSet<NodeId>,
     delivery: Delivery,
@@ -322,7 +331,10 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
             self.delivery.withheld.push((name, why));
             return;
         }
+        // A piece left as a leaf is delivered as it stands: whole bytes of
+        // a volume no object opened are no usable file.
         let whole = claim == Claim::Complete
+            && !(self.piece)(node, member.id)
             && (self.tree.refused_by(node, member.id).is_none()
                 || refused.is_some_and(Why::disclaims));
         let delivery = &mut self.delivery;

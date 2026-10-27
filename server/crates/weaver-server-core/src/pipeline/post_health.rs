@@ -1,28 +1,54 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The health probe beside a graph job's root. Once the post's losses take the
+// The usenet feed's word on whether a post is worth fetching, from the NZB
+// and the servers alone. Whatever consumes the bytes is not asked: the feed
+// keeps streaming or gives the post up on what it can see itself.
+//
+// Three things weigh a post. The first-article sample: one article per file
+// the post names as payload, the cheapest sign of whether the post is still
+// there. The post's health, the share of its bytes that has not been lost,
+// against the critical line its declared recovery sets, as NZBGet draws it:
+// a post that names no recovery is held to 85%, and the more recovery it
+// names the lower the line. And the STAT probe: once the losses take the
 // shape of a release nobody uploaded, a task asks the servers whether a
-// stride of the post's articles exists, by STAT and never by BODY, and says
-// what share of them is gone. That share, taken over the whole payload, is a
-// projected loss: the post's health is weighed against it as well as against
-// what it has lost so far, so a dead release fails before a gigabyte of
-// missing articles proves it one at a time. A projection is a health signal
-// and never a ledger entry; the job's failed bytes stay the sum of what it
-// lost. The job's status is not touched while a round is out.
+// stride of the post's articles exists, by STAT and never by BODY, and the
+// share it finds gone, taken over the whole payload, is a projected loss the
+// health is weighed against as well as against what it has lost so far, so a
+// dead release fails before a gigabyte of missing articles proves it one at
+// a time. A projection is a health signal and never a ledger entry; the
+// job's failed bytes stay the sum of what it lost. The job's status is not
+// touched while a round is out.
+//
+// The recovery a post declares is what its NZB names: PAR2 files, PAR3
+// files and RAR recovery volumes, each by its name. A RAR recovery record
+// inside a volume is invisible here; the 85% line is what leaves room for
+// it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use weaver_model::files::FileRole;
 
-use crate::jobs::ids::JobId;
-use crate::jobs::model::JobSpec;
+use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::model::{FileSpec, JobSpec};
+use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::{Pipeline, health_milli};
+use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
+
+// The fewest files a first-article verdict is worth taking. One article per
+// file is a sample, and a sample of a handful of files says very little: a
+// two-file post whose first file is missing is an ordinary damaged post, not
+// a dead one.
+pub(crate) const FIRST_ARTICLE_GATE_MIN_FILES: usize = 10;
+
+// How much of the sample has to be lost before the post is called dead, in
+// hundredths. Short of this the post's health rules.
+pub(crate) const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
 
 // The least failed bytes a clean round waits for before the next.
 pub(crate) const REARM_MIN_BYTES: u64 = 128 * 1024 * 1024;
@@ -165,6 +191,8 @@ pub(crate) struct Probes {
     sender: mpsc::Sender<ProbeUpdate>,
     receiver: mpsc::Receiver<ProbeUpdate>,
     pub(crate) states: HashMap<JobId, ProbeState>,
+    // The posts the feed gave up, in its words.
+    pub(crate) dead: HashMap<JobId, String>,
     // Who answers a round's STAT batches, when not the pipeline's own
     // client.
     pub(crate) stat: Option<Arc<dyn Stat>>,
@@ -177,6 +205,7 @@ impl Default for Probes {
             sender,
             receiver,
             states: HashMap::new(),
+            dead: HashMap::new(),
             stat: None,
         }
     }
@@ -197,6 +226,68 @@ impl Probes {
             .get(&job_id)
             .is_some_and(|state| state.out.is_some())
     }
+}
+
+// Whether the post names the file a recovery volume: PAR2 or PAR3 blocks,
+// or a RAR recovery volume. An index names the payload; it is no volume of
+// recovery blocks.
+pub(crate) fn declares_recovery(file: &FileSpec) -> bool {
+    match file.role {
+        FileRole::Par2 { is_index, .. } | FileRole::Par3 { is_index } => !is_index,
+        _ => file.filename.to_ascii_lowercase().ends_with(".rev"),
+    }
+}
+
+// Whether a file's name makes it a piece of something else: an archive
+// volume, a split part, or recovery data, classified as the feed classifies
+// the post's files. Whole or not, such a file is never one the user opens.
+pub(crate) fn names_a_piece(name: &str) -> bool {
+    let role = FileRole::from_filename(name);
+    name.to_ascii_lowercase().ends_with(".rev")
+        || matches!(
+            role,
+            FileRole::Par2 { .. }
+                | FileRole::Par3 { .. }
+                | FileRole::RarVolume { .. }
+                | FileRole::SevenZipSplit { .. }
+                | FileRole::SplitFile { .. }
+        )
+}
+
+// The bytes of every file the post names as recovery data, its indexes
+// among them: what the critical line is drawn from.
+pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
+    spec.files
+        .iter()
+        .filter(|file| {
+            matches!(file.role, FileRole::Par2 { .. } | FileRole::Par3 { .. })
+                || declares_recovery(file)
+        })
+        .flat_map(|file| file.segments.iter())
+        .map(|segment| u64::from(segment.bytes))
+        .sum()
+}
+
+// The sample's verdict, once it is certain: how many of the sampled files
+// every server failed the first article of, and how many were sampled, when
+// the lost reach the failure share of the whole sample. `heads` is whether
+// each payload file's first article is gone. Only a loss counts toward the
+// share, and an article still to come can only add to it, so a sample that
+// reaches the share with articles outstanding has the verdict the complete
+// sample would have. A sample short of the share says nothing yet.
+pub(crate) fn first_article_verdict(heads: impl IntoIterator<Item = bool>) -> Option<(usize, usize)> {
+    let mut total = 0;
+    let mut lost = 0;
+    for gone in heads {
+        total += 1;
+        lost += usize::from(gone);
+    }
+    (total >= FIRST_ARTICLE_GATE_MIN_FILES && lost * 100 >= total * FIRST_ARTICLE_GATE_MISSING_PCT)
+        .then_some((lost, total))
+}
+
+pub(crate) fn first_article_verdict_error(missing: usize, total: usize) -> String {
+    format!("aborted: {missing} of {total} first articles are missing, the post cannot complete")
 }
 
 // The message ids a round samples from: every article of every file that
@@ -329,50 +420,142 @@ pub(crate) async fn sample(
 }
 
 impl Pipeline {
+    // The first article of each file the post names: its first segment,
+    // and whether it reached a terminal state without arriving.
+    fn first_article_lost(&self, job_id: JobId, index: u32, file: &FileSpec) -> bool {
+        file.segments
+            .iter()
+            .map(|segment| segment.ordinal)
+            .min()
+            .is_some_and(|first| {
+                self.segment_terminal_states.get(&SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: index,
+                    },
+                    segment_number: first,
+                }) == Some(&SegmentTerminalState::Missing)
+            })
+    }
+
+    // The files the post names as payload that lost at least one article.
+    // A lost recovery volume is not damage to the release.
+    fn failing_files(&self, job_id: JobId, spec: &JobSpec) -> usize {
+        let failing: BTreeSet<u32> = self
+            .segment_terminal_states
+            .iter()
+            .filter(|(segment, state)| {
+                segment.file_id.job_id == job_id && **state == SegmentTerminalState::Missing
+            })
+            .map(|(segment, _)| segment.file_id.file_index)
+            .collect();
+        failing
+            .into_iter()
+            .filter(|index| {
+                spec.files.get(*index as usize).is_some_and(|file| {
+                    file.role.counts_toward_health() && !declares_recovery(file)
+                })
+            })
+            .count()
+    }
+
+    // Why the post is dead, if it is, in the feed's own words. The
+    // first-article sample rules first: past its share the post is dead,
+    // unless the recovery files whose first articles came outweigh the
+    // payload files the sample lost. Then the post's health, at the failed
+    // bytes it lost or a round projected it will, against its critical line.
+    pub(in crate::pipeline) fn post_health_verdict(&self, job_id: JobId) -> Option<String> {
+        if self.post_probes.dead.contains_key(&job_id) {
+            return None;
+        }
+        let state = self.jobs.get(&job_id)?;
+        let spec = &state.spec;
+        let heads: Vec<(u32, &FileSpec, bool)> = spec
+            .files
+            .iter()
+            .zip(0u32..)
+            .filter(|(file, _)| !file.segments.is_empty())
+            .map(|(file, index)| (index, file, self.first_article_lost(job_id, index, file)))
+            .collect();
+        let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));
+        if let Some((missing, total)) = first_article_verdict(payload.clone().map(|head| head.2)) {
+            let bytes = |file: &FileSpec| -> u64 {
+                file.segments.iter().map(|segment| u64::from(segment.bytes)).sum()
+            };
+            let lost: u64 = payload
+                .filter(|(_, _, gone)| *gone)
+                .map(|(_, file, _)| bytes(file))
+                .sum();
+            let reachable: u64 = heads
+                .iter()
+                .filter(|(_, file, gone)| declares_recovery(file) && !gone)
+                .map(|(_, file, _)| bytes(file))
+                .sum();
+            if lost > reachable {
+                return Some(first_article_verdict_error(missing, total));
+            }
+        }
+        let probe = self.post_probes.states.get(&job_id).copied().unwrap_or_default();
+        let total = spec.total_bytes;
+        let lost = self.missing_bytes(job_id);
+        let failed = probe.decided(lost);
+        let health = health_milli(total, failed);
+        let critical = Self::critical_health_milli(total, declared_recovery_bytes(spec));
+        if !below_critical(health, critical) {
+            return None;
+        }
+        let below = format!(
+            "health {:.1}% below critical {:.1}%",
+            f64::from(health) / 10.0,
+            f64::from(critical) / 10.0
+        );
+        // The probe's projection, when it is what takes the post there, is
+        // named with what the round found.
+        Some(match probe.sampled {
+            Some((missed, asked)) if probe.projected >= lost => {
+                format!("health probe: {missed} of {asked} samples missing; {below}")
+            }
+            _ => below,
+        })
+    }
+
     // Arm a round once the post's losses look like a dead release and a
     // round could still change the answer: the post is not yet healthy past
-    // doubt, its losses are not past critical by more than one byte, the
-    // recovery it can reach does not already cover them, and the losses span
-    // files or outrun what landed. A round is armed again on more failed
-    // bytes than the last one waited for, or on another file failing.
-    pub(in crate::pipeline) fn arm_graph_probe(&mut self, job_id: JobId) {
-        if !self.nzb_admitted.contains(&job_id) {
+    // doubt, its losses are not past critical by more than one byte, and
+    // the losses span files or outrun what landed. A round is armed again
+    // on more failed bytes than the last one waited for, or on another file
+    // failing.
+    pub(in crate::pipeline) fn arm_post_probe(&mut self, job_id: JobId) {
+        if !self.nzb_admitted.contains(&job_id) || !self.graph_jobs.contains_key(&job_id) {
             return;
         }
-        let (Some(graph), Some(state)) = (self.graph_jobs.get(&job_id), self.jobs.get(&job_id))
-        else {
+        let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
         let total = state.spec.total_bytes;
         if total == 0 || !RootPhase::may_replace(&state.status) {
             return;
         }
-        if self.graph_probes.out(job_id) {
+        if self.post_probes.out(job_id) || self.post_probes.dead.contains_key(&job_id) {
             return;
         }
-        let probe = self
-            .graph_probes
-            .states
-            .get(&job_id)
-            .copied()
-            .unwrap_or_default();
-        let failing_files = graph.failing_files();
-        let decided = probe.decided(self.settled_failed_bytes(job_id, total));
+        let probe = self.post_probes.states.get(&job_id).copied().unwrap_or_default();
+        let failing_files = self.failing_files(job_id, &state.spec);
+        let decided = probe.decided(self.missing_bytes(job_id));
         let health = health_milli(total, decided);
-        let critical = Self::critical_health_milli(total, state.par2_bytes);
+        let critical = Self::critical_health_milli(total, declared_recovery_bytes(&state.spec));
         let critical_failed = critical_failed_bytes(total, critical);
         let rearmed = decided >= probe.next_failed_bytes || failing_files > probe.failing_files;
         let needed = health < 980
             && rearmed
-            && (health > critical || decided <= critical_failed.saturating_add(1))
-            && !graph.recovery_covers(decided, failing_files)
+            && (!below_critical(health, critical) || decided <= critical_failed.saturating_add(1))
             && looks_like_a_dead_release(state.downloaded_bytes, failing_files, decided);
         if !needed {
             return;
         }
         let candidates = candidates(&state.spec);
         let round = probe.rounds;
-        let entry = self.graph_probes.states.entry(job_id).or_default();
+        let entry = self.post_probes.states.entry(job_id).or_default();
         entry.rounds = round.wrapping_add(1);
         entry.failing_files = failing_files;
         if candidates.is_empty() {
@@ -385,7 +568,7 @@ impl Pipeline {
             .map(|index| candidates[index].clone())
             .collect();
         let stat = self
-            .graph_probes
+            .post_probes
             .stat
             .clone()
             .unwrap_or_else(|| Arc::clone(&self.nntp) as Arc<dyn Stat>);
@@ -398,24 +581,18 @@ impl Pipeline {
             failed_bytes = decided,
             "health probe armed: STAT sampling"
         );
-        tokio::spawn(sample(
-            stat,
-            job_id,
-            round,
-            probes,
-            self.graph_probes.sender(),
-        ));
+        tokio::spawn(sample(stat, job_id, round, probes, self.post_probes.sender()));
     }
 
     // What a round said. Only the round the job waits on is heard: a job
     // that has gone or has moved past downloading forgets its probe. A done
     // round folds its projection into the post's health, sets when the next
     // round is armed, and gives the post its verdict again.
-    pub(in crate::pipeline) fn graph_probe_heard(&mut self, update: ProbeUpdate) {
+    pub(in crate::pipeline) fn post_probe_heard(&mut self, update: ProbeUpdate) {
         let job_id = update.job_id;
         if !update.done
             || self
-                .graph_probes
+                .post_probes
                 .states
                 .get(&job_id)
                 .is_none_or(|probe| probe.out != Some(update.round))
@@ -428,14 +605,15 @@ impl Pipeline {
             .filter(|state| RootPhase::may_replace(&state.status))
             .filter(|_| self.graph_jobs.contains_key(&job_id))
         else {
-            self.graph_probes.states.remove(&job_id);
+            self.post_probes.states.remove(&job_id);
             return;
         };
         let total = state.spec.total_bytes;
-        let tracked = total.saturating_sub(state.par2_bytes);
-        let critical = Self::critical_health_milli(total, state.par2_bytes);
-        let failed = self.settled_failed_bytes(job_id, total);
-        let Some(probe) = self.graph_probes.states.get_mut(&job_id) else {
+        let recovery = declared_recovery_bytes(&state.spec);
+        let tracked = total.saturating_sub(recovery);
+        let critical = Self::critical_health_milli(total, recovery);
+        let failed = self.missing_bytes(job_id);
+        let Some(probe) = self.post_probes.states.get_mut(&job_id) else {
             return;
         };
         probe.out = None;
@@ -454,65 +632,74 @@ impl Pipeline {
             update.missed,
             update.inconclusive,
         );
-        if let Some(error) = self.graph_health_verdict(job_id) {
-            self.fail_job_on_health(job_id, error);
+        if let Some(error) = self.post_health_verdict(job_id) {
+            self.stop_feeding_post(job_id, error);
         }
     }
 
-    // Why the post is dead, if it is: the first-article sample's verdict,
-    // then a recovery set short of blocks for what nothing can bring whole,
-    // then a round's projection. Each is weighed against the failed bytes
-    // the post lost or a round projected it will.
-    pub(in crate::pipeline) fn graph_health_verdict(&self, job_id: JobId) -> Option<String> {
-        let graph = self.graph_jobs.get(&job_id)?;
-        if let Some(dead) = graph.first_articles_dead() {
-            return Some(dead);
-        }
-        let state = self.jobs.get(&job_id)?;
-        let probe = self
-            .graph_probes
-            .states
-            .get(&job_id)
-            .copied()
-            .unwrap_or_default();
-        let total = state.spec.total_bytes;
-        let failed = probe.decided(self.settled_failed_bytes(job_id, total));
-        let health = health_milli(total, failed);
-        let critical = Self::critical_health_milli(total, state.par2_bytes);
-        let below = format!(
-            "health {:.1}% below critical {:.1}%",
-            f64::from(health) / 10.0,
-            f64::from(critical) / 10.0
-        );
-        // A recovery set short of blocks for what it covers fails the post
-        // in the set's own words, saying where its health stands when that
-        // is at or below critical. With none short, the post fails when its
-        // health is at or below critical and the recovery it may still
-        // obtain cannot cover its losses; a post that declares no recovery,
-        // by the PAR2 bytes its NZB lists or a PAR2 or PAR3 file it names,
-        // has none to obtain.
-        let below_critical = health <= critical;
-        let declares = state.par2_bytes > 0 || graph.declares_recovery();
-        let may_cover = |reachable| declares && graph.recovery_may_cover(failed, reachable);
-        if let Some(shortfall) = graph.shortfall() {
-            match shortfall.sets {
-                Some(sets) if below_critical => return Some(format!("{sets}; {below}")),
-                Some(sets) => return Some(sets),
-                None if below_critical && !may_cover(shortfall.reachable) => {
-                    return Some(below);
-                }
-                None => {}
-            }
-        }
-        // A round's projection is the post's verdict once the
-        // first-article sample has ruled, when it takes the post's health
-        // to or below critical and past what recovery it may still obtain
-        // can cover: what the servers no longer hold, nothing can rebuild.
-        let (missed, asked) = probe.sampled?;
-        let covered = may_cover(graph.recovery_reachable());
-        (graph.sampled() && below_critical && !covered)
-            .then(|| format!("health probe: {missed} of {asked} samples missing; {below}"))
+    // The bytes of the post the servers said are gone. An article no
+    // server may fetch, or one the feed stopped asking for, is not one.
+    fn missing_bytes(&self, job_id: JobId) -> u64 {
+        self.segment_terminal_states
+            .iter()
+            .filter(|(segment, state)| {
+                segment.file_id.job_id == job_id && **state == SegmentTerminalState::Missing
+            })
+            .map(|(segment, _)| self.health_counted_segment_bytes(*segment))
+            .sum()
     }
+
+    // The feed gives the post up. Below its recovery line nothing can
+    // rebuild a file that lost an article, so the feed stops asking for
+    // those files; the others are still fetched and may yet arrive whole.
+    // The job then ends as its rulings say, partial when a file is whole,
+    // and otherwise failed in the feed's words.
+    pub(in crate::pipeline) fn stop_feeding_post(&mut self, job_id: JobId, error: String) {
+        if self.post_probes.dead.contains_key(&job_id) {
+            return;
+        }
+        warn!(job_id = job_id.0, reason = %error, "post given up: files that lost an article are no longer fetched");
+        self.post_probes.dead.insert(job_id, error);
+        self.abandon_dead_files(job_id);
+    }
+
+    // A dead post's file with a missing article is abandoned: every article
+    // of it still queued is refused to the root. Called whenever an article
+    // of the post is lost, so a file whose first loss lands after the post
+    // was given up is abandoned then.
+    pub(in crate::pipeline) fn abandon_dead_files(&mut self, job_id: JobId) {
+        if !self.post_probes.dead.contains_key(&job_id) {
+            return;
+        }
+        let lost: BTreeSet<u32> = self
+            .segment_terminal_states
+            .iter()
+            .filter(|(segment, state)| {
+                segment.file_id.job_id == job_id && **state == SegmentTerminalState::Missing
+            })
+            .map(|(segment, _)| segment.file_id.file_index)
+            .collect();
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let lost_file = |work: &DownloadWork| lost.contains(&work.segment_id.file_id.file_index);
+        let mut abandoned = state.download_queue.extract_matching(lost_file);
+        abandoned.extend(state.recovery_queue.extract_matching(lost_file));
+        if abandoned.is_empty() {
+            return;
+        }
+        for work in abandoned {
+            self.book_terminal_segment(work.segment_id, SegmentTerminalState::Abandoned);
+        }
+        self.update_queue_metrics();
+        self.maybe_finish_download_pass(job_id);
+    }
+}
+
+// Whether a post at `health` is dead against its `critical` line. At the
+// line itself it is still healthy; only below it is it dead.
+fn below_critical(health: u32, critical: u32) -> bool {
+    health < critical
 }
 
 // The failed bytes past which the post's health is below `critical`.

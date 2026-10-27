@@ -238,7 +238,9 @@ impl NamespaceWriter {
     // for good, since nothing recovers the recovery: the set hears it now,
     // or it waits on the gap, and a walk that never passes it finds none of
     // the blocks beyond. A data object hears its losses only once the job is
-    // quiet, as a repair may still bring its bytes back.
+    // quiet, as a repair may still bring its bytes back. Every set where a
+    // range lands is told it is refused, as far as its parent will never
+    // bring it.
     pub(crate) fn lost(
         &mut self,
         tree: &mut Tree,
@@ -264,12 +266,58 @@ impl NamespaceWriter {
                 .collect();
             for marked in marked {
                 self.set_volume_lost(tree, builder, marked, &mut effects);
+                self.refuse_range(tree, node, marked);
             }
         }
         if effects.is_empty() {
             return Ok(());
         }
         self.apply_all(tree, builder, segments, effects, out)
+    }
+
+    // The parent's other answer to a seek: the range of the member will
+    // never come. Every set of the member's namespace hears it, bound to the
+    // member or not, through its recovery face and nothing else, once
+    // nothing above can bring the range back.
+    fn refuse_range(
+        &self,
+        tree: &mut Tree,
+        origin: NodeId,
+        (node, member, range): (NodeId, MemberId, ByteRange),
+    ) {
+        if !self.refused_above(tree, origin, node) {
+            return;
+        }
+        for set in tree.recovery_nodes(node) {
+            tree.refuse(set, member, range);
+        }
+    }
+
+    // Whether what was lost at `origin` is lost for good at `node`, a
+    // namespace at or below it: at `origin` it is. Below, the run above
+    // refuses what its damaged volumes cannot produce, which is everything
+    // they lost unless a set beside them that has not ruled impossible
+    // covers one: that set may yet rebuild what the run reads.
+    fn refused_above(&self, tree: &Tree, origin: NodeId, node: NodeId) -> bool {
+        let mut at = node;
+        while at != origin {
+            let Some((parent, volumes)) = tree.volumes(at) else {
+                return false;
+            };
+            let sets = tree.recovery_nodes(parent);
+            let rebuilt = volumes.values().any(|member| {
+                self.covering(tree, &sets, *member).any(|set| {
+                    tree.recovery(set).is_none_or(|recovery| {
+                        !matches!(recovery.outcome(), Some(RepairOutcome::Impossible { .. }))
+                    })
+                })
+            });
+            if rebuilt {
+                return false;
+            }
+            at = parent;
+        }
+        true
     }
 
     fn set_volume_lost(

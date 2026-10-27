@@ -7,7 +7,10 @@ use crate::jobs::support_facts::{GapKind, GapPosition};
 fn gap_kind(state: SegmentTerminalState) -> GapKind {
     match state {
         SegmentTerminalState::Missing => GapKind::Missing,
-        SegmentTerminalState::RetriesExhausted | SegmentTerminalState::DecodeExhausted => {
+        SegmentTerminalState::RetriesExhausted
+        | SegmentTerminalState::DecodeExhausted
+        | SegmentTerminalState::Unservable
+        | SegmentTerminalState::Abandoned => {
             GapKind::Failed
         }
     }

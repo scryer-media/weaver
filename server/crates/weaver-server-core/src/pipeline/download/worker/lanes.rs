@@ -307,7 +307,7 @@ impl Pipeline {
             .retain(|file_id| file_id.job_id != job_id);
     }
 
-    fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
+    pub(in crate::pipeline) fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
         self.jobs
             .get(&segment_id.file_id.job_id)
             .and_then(|state| {

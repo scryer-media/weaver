@@ -20,7 +20,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::warn;
 use weaver_graph::holds::HoldsAccountant;
-use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{
     Builder, Effect, MemberId, Namespace, NodeId, Pull, Seek, SeekUp, Tree, VolumeIndex,
 };
@@ -312,227 +311,18 @@ impl GraphJob {
             .collect()
     }
 
-    // Seam for health: why the post is dead, once the first-article sample
-    // says so. A post whose first articles are lost past the sample's share
-    // is not one that is going to complete, unless the recovery the root can
-    // still reach covers every file the sample lost, each taken as wholly
-    // lost. `None` while the sample has not ruled, or its losses are covered.
-    pub(crate) fn first_articles_dead(&self) -> Option<String> {
-        let (lost, total) = sample::first_article_verdict(self.root.payload_heads())?;
-        let lost_bytes = lost
-            .iter()
-            .map(|volume| self.root.map.encoded_len(*volume))
-            .fold(0u64, u64::saturating_add);
-        (lost_bytes > self.recovery_reachable())
-            .then(|| sample::first_article_verdict_error(lost.len(), total))
-    }
-
-    // Seam for health: what the post lost that its recovery can no longer
-    // rebuild, once every posted file was sampled and none of its payload
-    // can still come whole. A payload member can while it holds no damage,
-    // or while a recovery object covering it still reaches as many blocks
-    // as it has damaged slices. `None` while one can, or the sample is out:
-    // a recovery volume joins its set by its first bytes, so one still to
-    // come could bring the blocks a set lacks.
-    pub(crate) fn shortfall(&self) -> Option<Shortfall> {
-        use super::status::{RootJob, failure};
-        if !self.root.map.sampled() {
-            return None;
-        }
-        let objects: Vec<(NodeId, Option<RepairOutcome>)> = self
-            .tree
-            .recovery_nodes(NodeId::ROOT)
-            .into_iter()
-            .map(|node| (node, self.short(node)))
-            .collect();
-        let tree = &self.tree;
-        let whole_may_come = self
-            .namespace()
-            .members()
-            .filter(|member| {
-                !self.writer.carries_recovery(tree, NodeId::ROOT, member.id)
-                    && !self.root.declares_recovery(VolumeIndex(member.id.0))
+    // Every member of the root has said what it is: its first bytes came,
+    // or were lost, and decided who owns it. Until then a volume of a set
+    // may still join it and bring blocks the set lacks.
+    pub(crate) fn identified(&self) -> bool {
+        !self.tree.deciding(NodeId::ROOT)
+            && self.namespace().members().all(|member| {
+                member
+                    .coverage
+                    .runs()
+                    .next()
+                    .is_some_and(|run| run.range.start == 0)
             })
-            .any(|member| {
-                member.coverage.damaged_ranges().next().is_none()
-                    || objects.iter().any(|(node, short)| {
-                        short.is_none() && self.writer.covers(tree, *node, member.id)
-                    })
-            });
-        if whole_may_come {
-            return None;
-        }
-        // The sets short of blocks, in the words a ruling that came up short
-        // fails the job with.
-        let mut summary = RootJob::recovery_summary(self);
-        summary
-            .sets
-            .retain(|set| objects.iter().any(|(node, _)| *node == set.node));
-        let outcomes: Vec<RepairOutcome> = summary
-            .sets
-            .iter()
-            .map(|set| {
-                objects
-                    .iter()
-                    .find(|(node, _)| *node == set.node)
-                    .and_then(|(_, short)| *short)
-                    .unwrap_or(RepairOutcome::Waiting)
-            })
-            .collect();
-        let sets = failure(&summary, &outcomes, self)
-            .filter(|failure| failure.rejection.is_none())
-            .map(|failure| failure.message);
-        Some(Shortfall {
-            sets,
-            reachable: self.recovery_reachable(),
-        })
-    }
-
-    // The recovery object at `node` cannot rebuild the damage the root's
-    // members it covers hold: each slice a damaged range touches is one
-    // block, counted at the object's largest slice, against every block its
-    // sets reach. Both lean toward reaching: no slice is counted twice, and
-    // a block of any of its sets counts. `None` while it can, or while it
-    // knows no slice size to count at.
-    fn short(&self, node: NodeId) -> Option<RepairOutcome> {
-        let mut rulings = Vec::new();
-        self.writer.rulings(&self.tree, node, &mut rulings);
-        let slice = rulings
-            .iter()
-            .map(|ruling| ruling.slice_size)
-            .max()
-            .filter(|slice| *slice > 0)?;
-        let reachable = rulings
-            .iter()
-            .map(|ruling| ruling.blocks_reachable)
-            .fold(0u64, u64::saturating_add);
-        let mut damaged = 0u64;
-        for member in self.namespace().members() {
-            if !self.writer.covers(&self.tree, node, member.id) {
-                continue;
-            }
-            // Damaged ranges come in offset order; a slice two of them
-            // touch is counted once.
-            let mut counted: Option<u64> = None;
-            for range in member.coverage.damaged_ranges() {
-                if range.is_empty() {
-                    continue;
-                }
-                let first = (range.start / slice).max(counted.map_or(0, |last| last + 1));
-                let last = (range.end - 1) / slice;
-                if first <= last {
-                    damaged += last - first + 1;
-                    counted = Some(last);
-                }
-            }
-        }
-        (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
-    }
-
-    // Seam for the health probe: the files the post names as payload that
-    // lost at least one article. A lost recovery volume is not damage to the
-    // release.
-    pub(crate) fn failing_files(&self) -> usize {
-        self.root
-            .map
-            .failing()
-            .filter(|volume| !self.root.declares_recovery(*volume))
-            .count()
-    }
-
-    // Seam for the health probe: every posted file was sampled.
-    pub(crate) fn sampled(&self) -> bool {
-        self.root.map.sampled()
-    }
-
-    // Seam for the health probe: whether the root's recovery sets reach the
-    // blocks `failed` bytes over `failing_files` files would take, counted
-    // generously: the bytes rounded up to whole slices, and one slice more
-    // for each file, since a hole never starts on a slice boundary. No set
-    // read yet covers nothing.
-    pub(crate) fn recovery_covers(&self, failed: u64, failing_files: usize) -> bool {
-        let mut rulings = Vec::new();
-        for state in self.recovery_summary() {
-            if state.namespace == NodeId::ROOT {
-                self.writer.rulings(&self.tree, state.node, &mut rulings);
-            }
-        }
-        let Some(slice) = rulings
-            .iter()
-            .map(|ruling| ruling.slice_size)
-            .max()
-            .filter(|slice| *slice > 0)
-        else {
-            return false;
-        };
-        let needed = failed.div_ceil(slice).saturating_add(failing_files as u64);
-        let reachable = rulings
-            .iter()
-            .map(|ruling| ruling.blocks_reachable)
-            .fold(0u64, u64::saturating_add);
-        reachable >= needed
-    }
-
-    // Seam for health: whether the post names any recovery data.
-    pub(crate) fn declares_recovery(&self) -> bool {
-        self.root.declares_any_recovery()
-    }
-
-    // Seam for health: whether the recovery the post may still obtain could
-    // cover `failed` bytes, `reachable` being the recovery bytes the root can
-    // still reach. Once a set of the root's is read, its reachable blocks
-    // are the ceiling. Before, a recovery file the post names that no object
-    // has claimed may still bring one while its first article was not lost;
-    // and a post none of whose recovery has been read or named says nothing
-    // either way, so it may.
-    pub(crate) fn recovery_may_cover(&self, failed: u64, reachable: u64) -> bool {
-        let mut rulings = Vec::new();
-        for state in self.recovery_summary() {
-            if state.namespace == NodeId::ROOT {
-                self.writer.rulings(&self.tree, state.node, &mut rulings);
-            }
-        }
-        if !rulings.is_empty() {
-            return reachable > 0 && failed <= reachable;
-        }
-        let mut named = self.root.map.heads().filter(|(volume, _)| {
-            self.root.declares_recovery(*volume)
-                && self
-                    .tree
-                    .child_of(NodeId::ROOT, MemberId(volume.0))
-                    .is_none()
-        });
-        named.next().is_none() || reachable > 0
-    }
-
-    // The recovery bytes the root namespace can still reach: every set of
-    // its recovery objects, its reachable blocks at its slice size, and each
-    // file the post names recovery data that no object has claimed yet and
-    // whose first article was not lost, at its declared size.
-    pub(crate) fn recovery_reachable(&self) -> u64 {
-        let mut rulings = Vec::new();
-        for state in self.recovery_summary() {
-            if state.namespace == NodeId::ROOT {
-                self.writer.rulings(&self.tree, state.node, &mut rulings);
-            }
-        }
-        let sets = rulings
-            .iter()
-            .map(|ruling| ruling.blocks_reachable.saturating_mul(ruling.slice_size))
-            .fold(0u64, u64::saturating_add);
-        self.root
-            .map
-            .heads()
-            .filter(|(volume, lost)| {
-                !lost
-                    && self.root.declares_recovery(*volume)
-                    && self
-                        .tree
-                        .child_of(NodeId::ROOT, MemberId(volume.0))
-                        .is_none()
-            })
-            .map(|(volume, _)| self.root.map.encoded_len(volume))
-            .fold(sets, u64::saturating_add)
     }
 
     // Seam for the article decoder: the block sizes the root namespace's
@@ -886,14 +676,4 @@ impl SeekUp for Recorder<'_> {
         });
         Pull::Moved(0)
     }
-}
-
-// What the post lost past its recovery, as `GraphJob::shortfall` reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Shortfall {
-    // The recovery sets short of blocks for what they cover, worded as the
-    // job's failure; `None` when no set covers what was lost.
-    pub(crate) sets: Option<String>,
-    // Every recovery byte the root can still reach.
-    pub(crate) reachable: u64,
 }

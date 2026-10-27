@@ -27,57 +27,6 @@ use weaver_model::files::FileRole;
 use super::source::ArticleMap;
 use super::window::{Bid, Window};
 
-// The fewest files a first-article verdict is worth taking. One article per
-// file is a sample, and a sample of a handful of files says very little: a
-// two-file post whose first file is missing is an ordinary damaged post, not
-// a dead one.
-pub(crate) const FIRST_ARTICLE_GATE_MIN_FILES: usize = 10;
-
-// How much of the sample has to be lost before the post is called dead, in
-// hundredths. Short of this the recovery objects rule, because a post with
-// real recovery data behind it can survive a great deal.
-pub(crate) const FIRST_ARTICLE_GATE_MISSING_PCT: usize = 80;
-
-// The sample's verdict, once it is certain: the volumes whose first article
-// every server failed, and how many were sampled, when the lost reach the
-// failure share of the whole sample. The sample is `heads`, the first
-// articles of the payload: recovery data is what rebuilds a post's losses,
-// not what the post is. Only a loss counts toward the share, and an article
-// still to come can only add to it, so a sample that reaches the share with
-// articles outstanding has the verdict the complete sample would have. A
-// sample short of the share says nothing yet.
-pub(crate) fn first_article_verdict(
-    heads: impl IntoIterator<Item = (VolumeIndex, bool)>,
-) -> Option<(Vec<VolumeIndex>, usize)> {
-    let mut total = 0;
-    let mut lost = Vec::new();
-    for (volume, gone) in heads {
-        total += 1;
-        if gone {
-            lost.push(volume);
-        }
-    }
-    (total >= FIRST_ARTICLE_GATE_MIN_FILES
-        && lost.len() * 100 >= total * FIRST_ARTICLE_GATE_MISSING_PCT)
-        .then_some((lost, total))
-}
-
-pub(crate) fn first_article_verdict_error(missing: usize, total: usize) -> String {
-    format!("aborted: {missing} of {total} first articles are missing, the post cannot complete")
-}
-
-// Whether the post declares a file recovery data by its name: a volume of
-// recovery blocks, not an index.
-pub(crate) fn declared_recovery(name: &str) -> bool {
-    matches!(
-        FileRole::from_filename(name),
-        FileRole::Par2 {
-            is_index: false,
-            ..
-        } | FileRole::Par3 { is_index: false }
-    )
-}
-
 // Whether the post declares a file an index by its name.
 pub(crate) fn declared_index(name: &str) -> bool {
     matches!(

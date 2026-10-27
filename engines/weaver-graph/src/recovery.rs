@@ -146,6 +146,12 @@ pub trait Recovery {
     // checksums of any alignment, or takes none, names none.
     fn block_sizes(&self, _out: &mut Vec<u64>) {}
 
+    // The parent's other answer to a seek: this range of a covered member
+    // will never come. The object learns that and nothing else, no bytes
+    // and no verdict on them, and counts it against what it can still
+    // reach, so it rules short the moment the refusals outrun its blocks.
+    fn refused(&mut self, _member: MemberId, _range: ByteRange) {}
+
     // The verdict per slice of a covered member, as far as the evidence goes.
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>);
 

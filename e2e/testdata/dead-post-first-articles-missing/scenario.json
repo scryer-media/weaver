@@ -4,7 +4,7 @@
   "description": "Ten RAR volumes with every article deleted from both servers and no PAR2 to bind. Nothing arrives for any archive, so no file is delivered whole and the job fails as soon as every article is booked missing. Recovery that cannot be fetched is tested separately by dead-post-recovery-unobtainable.",
   "category": "2000",
   "expected_outcome": "health_failure",
-  "expectedErrorContains": "no file was delivered whole",
+  "expectedErrorContains": "first articles are missing",
   "fixtureAssets": [
     "par2-rar-placement-normalization-multi-swap/fixture_rar5_lz_plain.part1.rar",
     "par2-rar-placement-normalization-multi-swap/fixture_rar5_lz_plain.part2.rar",
