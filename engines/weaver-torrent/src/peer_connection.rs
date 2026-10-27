@@ -90,8 +90,18 @@ pub trait PeerConnectionHandler {
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
     fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
     /// The connection ended while the peer was sending `block`: the bytes
-    /// of it that arrived are dropped.
+    /// of it that arrived are dropped. Told once, however the connection
+    /// ended.
     fn on_partial_block(&self, _block: PartialBlock) {}
+    /// What a read asks the download limits for besides the rest of the
+    /// frame it reads: the bytes of the blocks requested of the peer and not
+    /// yet received, or what the peer sends in three quarters of a second at
+    /// its rate, whichever is more (libtorrent
+    /// `peer_connection::wanted_transfer`). A handler that requests nothing
+    /// asks for nothing more.
+    fn download_wanted(&self) -> u64 {
+        0
+    }
     /// Takes the block `chunk` the writer was handed, to send it, which
     /// makes room for the peer's next. False when a Cancel or a Choke
     /// dropped it first, and the block is not sent. A handler that queues
@@ -322,13 +332,21 @@ impl<H: PeerConnectionHandler> Drop for Quota<'_, H> {
     }
 }
 
+/// What libtorrent adds to the bytes a read wants, for the headers around
+/// them (`peer_connection::wanted_transfer`).
+pub(crate) const WANTED_SLACK: u64 = 30;
+
 impl<H: PeerConnectionHandler> ReadQuota for Quota<'_, H> {
-    // A read waits for a byte or more of quota, asking for what completes
-    // the frame (libtorrent `peer_connection::wanted_transfer`, the packet's
-    // bytes remaining), and takes what is held.
+    // A read waits for a byte or more of quota, and takes what is held. It
+    // asks for what completes the frame, or for what the handler wants
+    // besides, whichever is more (libtorrent
+    // `peer_connection::wanted_transfer`): asking a frame at a time, a
+    // connection under a limit would read a frame a round, and leave on its
+    // socket the blocks it asked for.
     async fn admit(&mut self, need: usize, room: usize) -> usize {
         while self.held() <= 0 {
-            self.pay(need as u64).await;
+            let want = (need as u64 + WANTED_SLACK).max(self.handler.download_wanted());
+            self.pay(want).await;
         }
         usize::try_from(self.held()).map_or(room, |held| held.min(room))
     }
@@ -346,6 +364,23 @@ async fn send<H: PeerConnectionHandler>(
     use tokio::io::AsyncWriteExt;
     quota.reserve(buf.len() as u64).await;
     with_timeout(what, timeout, write.write_all(buf).map_err(Error::Write)).await
+}
+
+/// The bytes received and not yet read as a message. However the connection
+/// ends, its reader or writer stopping, or its task dropped, the Piece
+/// message cut short at their front is told to the handler, once (libtorrent
+/// `peer_connection::disconnect`, `downloading_piece_progress`).
+struct Unread<'a, H: PeerConnectionHandler> {
+    handler: &'a H,
+    buf: ReadBuf,
+}
+
+impl<H: PeerConnectionHandler> Drop for Unread<'_, H> {
+    fn drop(&mut self) {
+        if let Some(block) = self.buf.partial_block() {
+            self.handler.on_partial_block(block);
+        }
+    }
 }
 
 impl<H: PeerConnectionHandler> PeerConnection<H> {
@@ -550,13 +585,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             handshake_supports_extended,
             speaks_v2,
             supports_fast,
-            mut read_buf,
+            read_buf,
             mut write_buf,
             mut read,
             mut write,
             meter,
             mut outgoing_chan,
         } = args;
+        let mut unread = Unread {
+            handler: &self.handler,
+            buf: read_buf,
+        };
 
         let rwtimeout = self.options.read_write_timeout();
 
@@ -564,7 +603,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // already: protocol bytes, and a debt each quota pays first.
         self.handler.on_protocol_bytes(
             Channel::Download,
-            meter.received().saturating_sub(read_buf.buffered() as u64),
+            meter
+                .received()
+                .saturating_sub(unread.buf.buffered() as u64),
         );
         self.handler
             .on_protocol_bytes(Channel::Upload, meter.sent());
@@ -727,7 +768,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             Ok::<_, Error>(())
         };
 
-        let reading = &mut read_buf;
+        let reading = &mut unread.buf;
         let reader = async move {
             let num_pieces = self.handler.num_pieces();
             loop {
@@ -779,7 +820,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             Ok::<_, Error>(())
         };
 
-        let ended = tokio::select! {
+        tokio::select! {
             r = reader => {
                 if let Err(e) = r.as_ref() {
                     trace!("reader finished with error: {e:#}");
@@ -796,11 +837,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 }
                 r
             }
-        };
-        if let Some(block) = read_buf.partial_block() {
-            self.handler.on_partial_block(block);
         }
-        ended
     }
 }
 
@@ -1180,6 +1217,272 @@ mod tests {
         assert!(meter.sent() > 68 + 9);
         assert_eq!(load(&ledger.paid[1]), meter.sent());
         assert_eq!(load(&ledger.protocol[1]), meter.sent());
+    }
+
+    /// Records the blocks cut short it is told of; reads under the download
+    /// `limits`, asking them for `wanted` besides the frame.
+    struct Cut {
+        partial: parking_lot::Mutex<Vec<crate::peer_protocol::PartialBlock>>,
+        limits: crate::limits::Limits,
+        wanted: u64,
+        asks: tokio::sync::watch::Sender<usize>,
+    }
+
+    impl Cut {
+        fn new(download: crate::limits::LimitKind, wanted: u64) -> Self {
+            Self {
+                partial: Default::default(),
+                limits: crate::limits::Limits::new(crate::limits::LimitsConfig {
+                    download_bps: download,
+                    ..Default::default()
+                }),
+                wanted,
+                asks: tokio::sync::watch::Sender::new(0),
+            }
+        }
+
+        fn partial(&self) -> Vec<crate::peer_protocol::PartialBlock> {
+            self.partial.lock().clone()
+        }
+    }
+
+    impl PeerConnectionHandler for &Cut {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, _: Message<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn request_bandwidth(&self, channel: Channel, bytes: u64) -> u64 {
+            if channel == Channel::Download {
+                self.asks.send_modify(|n| *n += 1);
+            }
+            self.limits.request(channel, bytes).await
+        }
+        fn return_bandwidth(&self, channel: Channel, bytes: u64) {
+            self.limits.give_back(channel, bytes);
+        }
+        fn on_partial_block(&self, block: crate::peer_protocol::PartialBlock) {
+            self.partial.lock().push(block);
+        }
+        fn download_wanted(&self) -> u64 {
+            self.wanted
+        }
+    }
+
+    const BLOCK: u32 = 16384;
+
+    /// A Piece message of block `begin / BLOCK` of piece 0, `sent` of its
+    /// bytes.
+    fn piece_frame(begin: u32, sent: usize) -> Vec<u8> {
+        let mut frame = (9 + BLOCK).to_be_bytes().to_vec();
+        frame.push(7);
+        frame.extend(0u32.to_be_bytes());
+        frame.extend(begin.to_be_bytes());
+        frame.extend(vec![0xab; sent]);
+        frame
+    }
+
+    /// An incoming connection that reads what the peer writes to `from`
+    /// and writes what we send to `to`, and how many bytes it has read.
+    fn incoming_over(
+        from: tokio::io::DuplexStream,
+        to: tokio::io::DuplexStream,
+    ) -> (
+        CheckedIncomingConnection,
+        tokio::sync::watch::Receiver<usize>,
+    ) {
+        let (reader, _, taken) = crate::peer_info_reader::tests::watched_halves(from);
+        let (_, writer) = halves(to);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer,
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter,
+        };
+        (incoming, taken)
+    }
+
+    async fn connection_for(handler: &Cut) -> PeerConnection<&Cut> {
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            handler,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        )
+    }
+
+    /// How a connection ends.
+    #[derive(Debug, Clone, Copy)]
+    enum Ending {
+        /// The peer closes: our read meets its end.
+        PeerCloses,
+        /// The peer sends nothing more: the read times out.
+        ReadTimesOut,
+        /// The peer stops reading: our next write fails.
+        WriteFails,
+        /// The torrent asks the connection to close.
+        Disconnected,
+        /// The torrent lets go of the connection's queue.
+        TorrentGone,
+        /// The connection's task is dropped: a pause, a stop, the peer's
+        /// requester ending, the torrent cancelled.
+        Dropped,
+    }
+
+    // libtorrent `peer_connection::disconnect` counts the part of a block
+    // that arrived, as `downloading_piece_progress` finds it at the front of
+    // the receive buffer, as redundant, whatever ended the connection. A
+    // connection that ends between messages counts nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_cut_short_is_told_once_however_the_connection_ends() {
+        use tokio::io::AsyncWriteExt;
+        const RECEIVED: usize = 8192;
+        let cut = crate::peer_protocol::PartialBlock {
+            index: 0,
+            begin: BLOCK,
+            len: BLOCK,
+            received: RECEIVED as u32,
+        };
+        let have = {
+            let mut wire = [0u8; 9];
+            Message::Have(0)
+                .serialize(&mut wire, &Default::default)
+                .unwrap();
+            wire.to_vec()
+        };
+        for (sent, expected) in [(piece_frame(BLOCK, RECEIVED), vec![cut]), (have, vec![])] {
+            for ending in [
+                Ending::PeerCloses,
+                Ending::ReadTimesOut,
+                Ending::WriteFails,
+                Ending::Disconnected,
+                Ending::TorrentGone,
+                Ending::Dropped,
+            ] {
+                let handler = Cut::new(crate::limits::LimitKind::Unlimited, 0);
+                let connection = connection_for(&handler).await;
+                let (from, mut peer_writes) = tokio::io::duplex(1 << 16);
+                let (to, peer_reads) = tokio::io::duplex(1 << 16);
+                let (incoming, mut taken) = incoming_over(from, to);
+                let (tx, rx) = mpsc::unbounded_channel();
+                let mut conn = Box::pin(connection.manage_peer_incoming(rx, incoming));
+
+                peer_writes.write_all(&sent).await.unwrap();
+                tokio::select! {
+                    r = &mut conn => panic!("{ending:?}: ended early: {r:?}"),
+                    r = taken.wait_for(|n| *n == sent.len()) => { r.unwrap(); }
+                }
+                let result = match ending {
+                    Ending::PeerCloses => {
+                        drop(peer_writes);
+                        Some(conn.await)
+                    }
+                    Ending::ReadTimesOut => Some(conn.await),
+                    Ending::WriteFails => {
+                        drop(peer_reads);
+                        tx.send(WriterRequest::Message(Message::Have(1))).unwrap();
+                        Some(conn.await)
+                    }
+                    Ending::Disconnected => {
+                        tx.send(WriterRequest::Disconnect(Ok(()))).unwrap();
+                        Some(conn.await)
+                    }
+                    Ending::TorrentGone => {
+                        drop(tx);
+                        Some(conn.await)
+                    }
+                    Ending::Dropped => {
+                        drop(conn);
+                        None
+                    }
+                };
+                if let Some(result) = result {
+                    let ended_as_expected = match ending {
+                        Ending::PeerCloses => matches!(result, Err(Error::PeerDisconnected)),
+                        Ending::ReadTimesOut => matches!(result, Err(Error::Timeout("reading"))),
+                        Ending::WriteFails => matches!(result, Err(Error::Write(_))),
+                        Ending::Disconnected => matches!(result, Err(Error::Disconnect)),
+                        Ending::TorrentGone => matches!(result, Err(Error::TorrentIsNotLive)),
+                        Ending::Dropped => unreachable!(),
+                    };
+                    assert!(ended_as_expected, "{ending:?}: {result:?}");
+                }
+                assert_eq!(handler.partial(), expected, "{ending:?}");
+            }
+        }
+    }
+
+    // libtorrent `peer_connection::wanted_transfer` asks the download
+    // limits for the bytes of the blocks requested and not yet received, so
+    // a round's grant takes off the socket every block the peer sent. Asking
+    // a frame at a time, a connection under a limit takes a frame a round,
+    // and a peer that sends the blocks asked for and then a cut one, and
+    // stops reading, leaves the cut block on our socket when our next write
+    // fails: none of it counts.
+    #[tokio::test(start_paused = true)]
+    async fn under_a_limit_a_round_takes_every_block_asked_for_and_a_cut_one_counts() {
+        use tokio::io::AsyncWriteExt;
+        const RECEIVED: usize = 8192;
+        let limit = crate::limits::LimitKind::Bps(std::num::NonZeroU32::new(1 << 20).unwrap());
+        let handler = Cut::new(limit, 3 * u64::from(BLOCK) + 30);
+        let connection = connection_for(&handler).await;
+        let (from, mut peer_writes) = tokio::io::duplex(1 << 18);
+        let (to, peer_reads) = tokio::io::duplex(1 << 16);
+        let (incoming, mut taken) = incoming_over(from, to);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut conn = std::pin::pin!(connection.manage_peer_incoming(rx, incoming));
+
+        // Two blocks asked for, and the third cut short.
+        let mut sent = piece_frame(0, BLOCK as usize);
+        sent.extend(piece_frame(BLOCK, BLOCK as usize));
+        sent.extend(piece_frame(2 * BLOCK, RECEIVED));
+        peer_writes.write_all(&sent).await.unwrap();
+        // Until our end has read all of it, or waits on the limits a second
+        // time with some of it left on the socket.
+        let mut asks = handler.asks.subscribe();
+        tokio::select! {
+            r = &mut conn => panic!("ended early: {r:?}"),
+            r = taken.wait_for(|n| *n == sent.len()) => { r.unwrap(); }
+            r = asks.wait_for(|n| *n >= 2) => { r.unwrap(); }
+        }
+        // The peer stops reading, and our next write fails.
+        drop(peer_reads);
+        tx.send(WriterRequest::Message(Message::Have(1))).unwrap();
+        let result = conn.await;
+        assert!(matches!(result, Err(Error::Write(_))), "{result:?}");
+        assert_eq!(*taken.borrow(), sent.len());
+        assert_eq!(
+            handler.partial(),
+            vec![crate::peer_protocol::PartialBlock {
+                index: 0,
+                begin: 2 * BLOCK,
+                len: BLOCK,
+                received: RECEIVED as u32,
+            }]
+        );
     }
 
     #[test]

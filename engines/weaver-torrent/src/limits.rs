@@ -81,7 +81,7 @@ pub struct LimitsConfig {
 /// How often the waiting requests are given quota (libtorrent
 /// `settings_pack::tick_interval`, which drives
 /// `bandwidth_manager::update_quotas`).
-const ROUND: Duration = Duration::from_millis(500);
+pub(crate) const ROUND: Duration = Duration::from_millis(500);
 
 /// The longest gap between two rounds a round fills quota for
 /// (`update_quotas` counts at most three seconds).

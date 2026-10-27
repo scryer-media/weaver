@@ -1300,6 +1300,25 @@ impl LivePeerState {
         self.inflight_requests.len()
     }
 
+    /// What a read from the peer asks the download limits for: the bytes
+    /// of the blocks requested of it and not yet received, with slack for
+    /// their headers, or half again what it sends a round at its rate,
+    /// whichever is more (libtorrent `peer_connection::wanted_transfer`,
+    /// `m_outstanding_bytes + 30` against `download_rate * 3 / 2` over a
+    /// tick).
+    pub fn download_wanted(&self) -> u64 {
+        let outstanding: u64 = self
+            .inflight_requests
+            .iter()
+            .map(|chunk| u64::from(chunk.size))
+            .sum();
+        let at_rate = u64::try_from(
+            u128::from(self.download_rate.bps()) * 3 / 2 * crate::limits::ROUND.as_millis() / 1000,
+        )
+        .unwrap_or(u64::MAX);
+        (outstanding + crate::peer_connection::WANTED_SLACK).max(at_rate)
+    }
+
     /// Whether we asked the peer for `chunk` and wait for it still.
     pub fn has_inflight_request(&self, chunk: &ChunkInfo) -> bool {
         self.inflight_requests.contains(chunk)

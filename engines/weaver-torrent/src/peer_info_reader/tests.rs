@@ -94,6 +94,45 @@ pub(crate) fn halves(stream: DuplexStream) -> (BoxAsyncReadVectored, BoxAsyncWri
     (Box::new(read.into_vectored_compat()), Box::new(write))
 }
 
+/// A stream's halves, and how many bytes the reading half has taken off the
+/// stream so far: a test waits on it for what our end has read.
+pub(crate) fn watched_halves(
+    stream: DuplexStream,
+) -> (
+    BoxAsyncReadVectored,
+    BoxAsyncWrite,
+    tokio::sync::watch::Receiver<usize>,
+) {
+    let (read, write) = tokio::io::split(stream);
+    let (taken, watch) = tokio::sync::watch::channel(0);
+    let read = Watched { inner: read, taken };
+    (
+        Box::new(read.into_vectored_compat()),
+        Box::new(write),
+        watch,
+    )
+}
+
+struct Watched<R> {
+    inner: R,
+    taken: tokio::sync::watch::Sender<usize>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Watched<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        let taken = buf.filled().len() - before;
+        this.taken.send_modify(|n| *n += taken);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 pub(super) async fn connector() -> (
     Arc<StreamConnector>,
     mpsc::UnboundedReceiver<(SocketAddr, DuplexStream)>,

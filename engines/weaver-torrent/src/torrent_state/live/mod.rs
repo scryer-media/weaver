@@ -252,6 +252,10 @@ pub struct TorrentStateLive {
     per_piece_locks: Vec<RwLock<()>>,
 
     stats: AtomicStats,
+    // The run ended and its counts went into what the torrent moved: what a
+    // connection still closing counts goes there too. Set under the lock of
+    // what the torrent moved.
+    run_counted: AtomicBool,
     lengths: Lengths,
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
@@ -413,6 +417,7 @@ impl TorrentStateLive {
                 have_bytes: AtomicU64::new(have_bytes),
                 ..Default::default()
             },
+            run_counted: AtomicBool::new(false),
             lengths,
             peer_semaphore: Arc::new(Semaphore::new(peer_limit)),
             peer_limit,
@@ -1153,6 +1158,20 @@ impl TorrentStateLive {
         self.stats.redundant_bytes.fetch_add(len, Ordering::Relaxed);
     }
 
+    /// `len` bytes of a block a closing connection was receiving are not
+    /// used. A connection closes after the run ended when the run's end
+    /// closed it: its bytes count then in what the torrent moved, as
+    /// libtorrent's `torrent::pause` closes each connection, and counts what
+    /// it drops, before the torrent stops (`peer_connection::disconnect`).
+    fn add_closing_redundant_bytes(&self, len: u64) {
+        let mut moved = self.shared.moved.lock();
+        if self.run_counted.load(Ordering::Relaxed) {
+            moved.redundant_bytes += len;
+        } else {
+            self.add_redundant_bytes(len);
+        }
+    }
+
     pub fn get_approx_have_bytes(&self) -> u64 {
         self.stats.have_bytes.load(Ordering::Relaxed)
     }
@@ -1401,8 +1420,11 @@ impl TorrentStateLive {
         *self.shared.last_run.lock() = Some(RunCounters {
             left_bytes: chunk_tracker.bytes_left(),
         });
-        let run = TorrentTotals::from(&self.stats_snapshot());
+        // Under the lock a closing connection counts under, so what it
+        // drops counts in this run or after it, once.
         let mut moved = self.shared.moved.lock();
+        self.run_counted.store(true, Ordering::Relaxed);
+        let run = TorrentTotals::from(&self.stats_snapshot());
         *moved = *moved + run;
         drop(moved);
 
@@ -2266,8 +2288,16 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .and_then(|index| lengths.chunk_info_from_received_data(index, block.begin, block.len))
             .is_some();
         if names_a_block {
-            self.state.add_redundant_bytes(block.received.into());
+            self.state
+                .add_closing_redundant_bytes(block.received.into());
         }
+    }
+
+    fn download_wanted(&self) -> u64 {
+        self.state
+            .peers
+            .with_live(self.addr, LivePeerState::download_wanted)
+            .unwrap_or(0)
     }
 
     fn on_uploaded_bytes(&self, bytes: u32) {

@@ -2347,6 +2347,49 @@ async fn a_block_cut_short_by_the_connection_ending_counts_as_redundant() {
     assert_eq!(h.stats.fetched_bytes.load(Ordering::Relaxed), 0);
 }
 
+// libtorrent `torrent::pause` closes each connection, and
+// `peer_connection::disconnect` counts the part of a block that arrived as
+// redundant, before the torrent stops: the bytes count in what the torrent
+// moved, once, though the connection's task ends after the pause.
+#[tokio::test]
+async fn a_block_cut_short_by_a_pause_counts_as_redundant_once() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const RECEIVED: usize = 1000;
+
+    let h = Harness::new("partial_block_pause").await;
+    let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+    let (reader, writer, mut taken) = crate::peer_info_reader::tests::watched_halves(ours);
+    let checked = CheckedIncomingConnection {
+        kind: ConnectionKind::Tcp,
+        addr: sock("192.0.2.1:6881"),
+        reader,
+        writer,
+        read_buf: crate::read_buf::ReadBuf::new(),
+        handshake: Handshake::new(h.shared.info_hash, Id20::new([7; 20])),
+        encryption: crate::mse::Encryption::None,
+        meter: Default::default(),
+    };
+    let slot = h._session.connection_slots.try_accept().unwrap();
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+
+    let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
+    frame.push(7);
+    frame.extend(0u32.to_be_bytes());
+    frame.extend(0u32.to_be_bytes());
+    frame.extend(vec![0xab; RECEIVED]);
+    theirs.write_all(&frame).await.unwrap();
+    taken.wait_for(|n| *n == frame.len()).await.unwrap();
+
+    let _paused = h.live.pause().unwrap();
+    // Our side closes once the connection's task has ended.
+    let mut written = Vec::new();
+    theirs.read_to_end(&mut written).await.unwrap();
+
+    assert_eq!(h.shared.moved.lock().redundant_bytes, RECEIVED as u64);
+    assert_eq!(h.get_redundant_bytes(), 0);
+}
+
 #[tokio::test]
 async fn a_peer_in_four_failed_pieces_is_banned_and_a_passed_piece_earns_a_point() {
     let h = Harness::new("trust_floor_ban").await;
