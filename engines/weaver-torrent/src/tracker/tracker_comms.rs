@@ -789,6 +789,8 @@ struct Announced {
     /// Our address as the tracker saw it, and the tracker's address the
     /// answer came from: its vote (see [`ExternalIpVote`]).
     seen_as: Option<(IpAddr, IpAddr)>,
+    /// The length of an HTTP answer's body, in bytes.
+    body_len: Option<usize>,
 }
 
 /// What a tracker answered to an announce it accepted (libtorrent
@@ -1954,6 +1956,7 @@ impl TrackerComms {
                     interval = ?announced.interval,
                     min_interval = ?announced.min_interval,
                     external_ip = announced.seen_as.is_some(),
+                    body_len = ?announced.body_len,
                     ?delay,
                     "tracker answered"
                 );
@@ -2081,6 +2084,7 @@ impl TrackerComms {
                 .as_ref()
                 .map(|m| String::from_utf8_lossy(m.as_ref()).into_owned()),
             seen_as: response.external_ip().zip(answer.from),
+            body_len: Some(answer.body.len()),
         })
     }
 
@@ -2166,6 +2170,7 @@ impl TrackerComms {
                     warning: None,
                     // A UDP answer (BEP 15) names no address of ours.
                     seen_as: None,
+                    body_len: None,
                 })
             }
             Err(e) => {

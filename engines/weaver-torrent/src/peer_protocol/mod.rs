@@ -224,6 +224,43 @@ pub fn serialize_piece_preamble(chunk: &ChunkInfo, mut buf: &mut [u8]) -> usize 
     PIECE_MESSAGE_PREAMBLE_LEN
 }
 
+/// A Piece message cut short: the block it names, and how many of its
+/// bytes arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialBlock {
+    pub index: u32,
+    pub begin: u32,
+    pub len: u32,
+    pub received: u32,
+}
+
+impl PartialBlock {
+    /// The Piece message at the front of the unread bytes `first` then
+    /// `second`, when its header arrived and some, not all, of its block
+    /// did.
+    pub fn at_front(first: &[u8], second: &[u8]) -> Option<Self> {
+        let mut header = [0u8; PIECE_MESSAGE_PREAMBLE_LEN];
+        let unread = first.len() + second.len();
+        if unread <= header.len() {
+            return None;
+        }
+        for (to, from) in header.iter_mut().zip(first.iter().chain(second)) {
+            *to = *from;
+        }
+        if header[INTEGER_LEN] != MSGID_PIECE {
+            return None;
+        }
+        let len = BE::read_u32(&header[0..4]).checked_sub((MSGID_LEN + INTEGER_LEN * 2) as u32)?;
+        let received = u32::try_from(unread - header.len()).ok()?;
+        (received < len).then_some(PartialBlock {
+            index: BE::read_u32(&header[5..9]),
+            begin: BE::read_u32(&header[9..13]),
+            len,
+            received,
+        })
+    }
+}
+
 pub struct Piece<B> {
     pub index: u32,
     pub begin: u32,
@@ -895,6 +932,43 @@ mod tests {
     const EXTENDED: &[u8] = include_bytes!("../../resources/test/extended-handshake.bin");
 
     use super::*;
+
+    // A Piece message is cut short only once its header is in and part,
+    // not all, of its block; the bytes may wrap the buffer anywhere.
+    #[test]
+    fn a_piece_message_is_cut_short_between_its_header_and_its_last_byte() {
+        let frame = |received: usize| {
+            let mut frame = (9u32 + 100).to_be_bytes().to_vec();
+            frame.push(MSGID_PIECE);
+            frame.extend(3u32.to_be_bytes());
+            frame.extend(16384u32.to_be_bytes());
+            frame.extend(vec![0xab; received]);
+            frame
+        };
+        let cut = |bytes: &[u8], expected: Option<PartialBlock>| {
+            for at in 0..=bytes.len() {
+                let found = PartialBlock::at_front(&bytes[..at], &bytes[at..]);
+                assert_eq!(found, expected, "wrapped at {at}");
+            }
+        };
+        let partial = |received| PartialBlock {
+            index: 3,
+            begin: 16384,
+            len: 100,
+            received,
+        };
+
+        cut(&frame(0), None);
+        cut(&frame(40), Some(partial(40)));
+        cut(&frame(99), Some(partial(99)));
+        cut(&frame(100), None);
+        cut(&frame(40)[..12], None);
+
+        let mut have = frame(40);
+        have[4] = MSGID_HAVE;
+        cut(&have, None);
+    }
+
     #[test]
     fn test_handshake_serialize() {
         let info_hash = Id20::new([

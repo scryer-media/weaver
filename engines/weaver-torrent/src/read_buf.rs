@@ -7,7 +7,7 @@
 
 use std::{io::IoSliceMut, time::Duration};
 
-use crate::peer_protocol::{Handshake, Message, MessageDeserializeError};
+use crate::peer_protocol::{Handshake, Message, MessageDeserializeError, PartialBlock};
 use crate::{Error, Result};
 use crate::{
     peer_connection::with_timeout, type_aliases::BoxAsyncReadVectored,
@@ -91,6 +91,13 @@ impl ReadBuf {
     /// Bytes of the messages read so far.
     pub fn consumed(&self) -> u64 {
         self.consumed
+    }
+
+    /// The Piece message being read, when part of its block arrived and
+    /// the rest did not.
+    pub fn partial_block(&self) -> Option<PartialBlock> {
+        let (first, second) = as_slices!(self);
+        PartialBlock::at_front(first, second)
     }
 
     // Read the BT handshake.

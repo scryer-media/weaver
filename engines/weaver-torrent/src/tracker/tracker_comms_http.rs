@@ -844,6 +844,41 @@ mod tests {
         assert_eq!(response.iter_peers().collect::<Vec<_>>(), vec![v4, v6]);
     }
 
+    // A compact answer naming many peers in `peers` and `peers6` gives
+    // every one, in the order named.
+    #[test]
+    fn a_compact_answer_gives_every_peer_of_both_lists() {
+        let v4: Vec<SocketAddr> = (1..=50u8)
+            .map(|i| SocketAddr::from(([10, 0, 0, i], 6000 + u16::from(i))))
+            .collect();
+        let v6: Vec<SocketAddr> = (1..=20u16)
+            .map(|i| SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i], 7000 + i)))
+            .collect();
+        let compact = |peers: &[SocketAddr]| -> Vec<u8> {
+            peers
+                .iter()
+                .flat_map(|peer| {
+                    let ip = match peer.ip() {
+                        IpAddr::V4(ip) => ip.octets().to_vec(),
+                        IpAddr::V6(ip) => ip.octets().to_vec(),
+                    };
+                    [ip, peer.port().to_be_bytes().to_vec()].concat()
+                })
+                .collect()
+        };
+        let (v4_bytes, v6_bytes) = (compact(&v4), compact(&v6));
+        let mut data = b"d8:completei1151e10:incompletei25e8:intervali1800e".to_vec();
+        data.extend(format!("5:peers{}:", v4_bytes.len()).bytes());
+        data.extend(&v4_bytes);
+        data.extend(format!("6:peers6{}:", v6_bytes.len()).bytes());
+        data.extend(&v6_bytes);
+        data.push(b'e');
+
+        let response = crate::bencode::from_bytes::<TrackerResponse>(&data).unwrap();
+        let expected: Vec<SocketAddr> = v4.iter().chain(&v6).copied().collect();
+        assert_eq!(response.iter_peers().collect::<Vec<_>>(), expected);
+    }
+
     #[test]
     fn test_parse_tracker_response_counts() {
         let data = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";

@@ -2305,6 +2305,48 @@ async fn a_failed_piece_counts_as_corrupt_and_a_block_already_had_as_redundant()
     );
 }
 
+// A block the peer was never asked for is not used: its bytes count as
+// redundant, and none as downloaded.
+#[tokio::test]
+async fn a_block_never_asked_for_counts_as_redundant() {
+    let h = Harness::new("unasked_block_redundant").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let block = vec![0u8; CHUNK_SIZE as usize];
+
+    peer.on_received_piece(Piece::from_data(0, 0, &block[..]))
+        .await
+        .unwrap_err();
+    assert_eq!(h.get_redundant_bytes(), u64::from(CHUNK_SIZE));
+    assert_eq!(h.stats.fetched_bytes.load(Ordering::Relaxed), 0);
+}
+
+// A connection that ends part way through a block drops the bytes of it
+// that arrived: they count as redundant, and none as downloaded.
+#[tokio::test]
+async fn a_block_cut_short_by_the_connection_ending_counts_as_redundant() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const RECEIVED: usize = 1000;
+
+    let h = Harness::new("partial_block_redundant").await;
+    let (checked, slot, mut theirs) = h.incoming("192.0.2.1:6881");
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+
+    let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
+    frame.push(7);
+    frame.extend(0u32.to_be_bytes());
+    frame.extend(0u32.to_be_bytes());
+    frame.extend(vec![0xab; RECEIVED]);
+    theirs.write_all(&frame).await.unwrap();
+    theirs.shutdown().await.unwrap();
+    // Our side closes once the connection has ended.
+    let mut written = Vec::new();
+    theirs.read_to_end(&mut written).await.unwrap();
+
+    assert_eq!(h.get_redundant_bytes(), RECEIVED as u64);
+    assert_eq!(h.stats.fetched_bytes.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn a_peer_in_four_failed_pieces_is_banned_and_a_passed_piece_earns_a_point() {
     let h = Harness::new("trust_floor_ban").await;

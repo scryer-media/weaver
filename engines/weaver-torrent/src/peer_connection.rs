@@ -18,7 +18,7 @@ use crate::core::{
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
-    Handshake, Hashes, Message,
+    Handshake, Hashes, Message, PartialBlock,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
@@ -89,6 +89,9 @@ pub trait PeerConnectionHandler {
     /// handshakes and every message but a piece's block (libtorrent
     /// `stat::sent_bytes`, `received_bytes`, the protocol half).
     fn on_protocol_bytes(&self, _channel: Channel, _bytes: u64) {}
+    /// The connection ended while the peer was sending `block`: the bytes
+    /// of it that arrived are dropped.
+    fn on_partial_block(&self, _block: PartialBlock) {}
     /// Takes the block `chunk` the writer was handed, to send it, which
     /// makes room for the peer's next. False when a Cancel or a Choke
     /// dropped it first, and the block is not sent. A handler that queues
@@ -724,11 +727,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             Ok::<_, Error>(())
         };
 
+        let reading = &mut read_buf;
         let reader = async move {
             let num_pieces = self.handler.num_pieces();
             loop {
-                let read_before = read_buf.consumed();
-                let message = read_buf
+                let read_before = reading.consumed();
+                let message = reading
                     .read_message(&mut read, rwtimeout, num_pieces, &mut down)
                     .await?;
                 trace!("received: {:?}", &message);
@@ -766,7 +770,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 }
                 self.handler.on_protocol_bytes(
                     Channel::Download,
-                    read_buf.consumed() - read_before - payload,
+                    reading.consumed() - read_before - payload,
                 );
             }
 
@@ -775,7 +779,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             Ok::<_, Error>(())
         };
 
-        tokio::select! {
+        let ended = tokio::select! {
             r = reader => {
                 if let Err(e) = r.as_ref() {
                     trace!("reader finished with error: {e:#}");
@@ -792,7 +796,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 }
                 r
             }
+        };
+        if let Some(block) = read_buf.partial_block() {
+            self.handler.on_partial_block(block);
         }
+        ended
     }
 }
 
