@@ -210,3 +210,60 @@ async fn test_a_paused_torrent_asks_nothing_of_its_tracker_or_peers() -> anyhow:
     session.stop().await;
     Ok(())
 }
+
+// A pause ends the run, not the peer: the torrent resumed dials the peer
+// it let go at once, before any time passes, rather than a reconnect time
+// after the pause.
+#[tokio::test(start_paused = true)]
+async fn test_a_resumed_torrent_dials_the_peer_it_let_go_at_once() -> anyhow::Result<()> {
+    let peer_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 6881));
+    let (tracker, mut heard) = Tracker::start(Some(peer_addr));
+    let (tx, mut dials) = mpsc::unbounded_channel();
+    let out = TempDir::with_prefix("resumed_dials_out")?;
+    let session = Session::new_with_opts(
+        out.path().into(),
+        SessionOptions {
+            socket_factory: Some(Arc::new(Dialed(tx))),
+            connect: Some(ConnectionOptions {
+                enable_tcp: true,
+                peer_opts: None,
+            }),
+            ..tracker_session_opts()?
+        },
+    )
+    .await?;
+    let torrent = TestTorrent::new("resumed_dials", 4096, 1024).await?;
+    let torrent = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![tracker.url()]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert_eq!(next(&mut heard).await?, announce(Some("started")));
+    let (dialed, stream) = dials.recv().await.context("no dial")?;
+    assert_eq!(dialed, peer_addr);
+    let mut peer = MockPeer::greet(stream, torrent.shared().info_hashes).await;
+    let run = torrent.live().context("the torrent is not live")?;
+    while run.stats_snapshot().peer_stats.live != 1 {
+        tokio::task::yield_now().await;
+    }
+
+    session.pause(&torrent).await?;
+    assert_eq!(next(&mut heard).await?, announce(Some("stopped")));
+    assert_eq!(peer.next_request().await, None);
+
+    let resumed_at = tokio::time::Instant::now();
+    session.unpause(&torrent).await?;
+    let (dialed, _stream) = dials.recv().await.context("no dial")?;
+    assert_eq!(dialed, peer_addr);
+    assert_eq!(tokio::time::Instant::now(), resumed_at);
+    drop(tracker);
+    session.stop().await;
+    Ok(())
+}

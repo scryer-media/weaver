@@ -421,12 +421,25 @@ impl Peer {
         failed: bool,
         finished: bool,
     ) -> bool {
-        if let Some(live) = self.get_live() {
-            self.upload_only = live.is_upload_only();
-        }
+        self.keep_what_it_showed();
         let needed = self.needed(finished);
         self.closed(closed_at, failed, needed);
         needed
+    }
+
+    /// The connection ends at `closed_at` because the run ends, not because
+    /// of the peer: what it showed of its peer is kept, and the close starts
+    /// no wait to reconnect, so the next run may connect at once, waiting
+    /// only for the failures in a row the peer had.
+    pub(crate) fn connection_let_go(&mut self, closed_at: Instant) {
+        self.keep_what_it_showed();
+        self.closed(closed_at, false, false);
+    }
+
+    fn keep_what_it_showed(&mut self) {
+        if let Some(live) = self.get_live() {
+            self.upload_only = live.is_upload_only();
+        }
     }
 
     /// How long a connection to the peer may take to open: `base`, and

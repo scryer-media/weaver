@@ -345,18 +345,15 @@ impl PeerStates {
         self
     }
 
-    /// Every connection on the list closes at `closed_at`, in no error,
-    /// while we are `finished` or not, by the one close rule
-    /// ([`Peer::connection_closing`]): what it showed of
-    /// its peer is kept and its peer's wait to reconnect starts then. A
-    /// pause runs it before taking the list (libtorrent `torrent::do_pause`
-    /// disconnects every peer with `torrent_paused`, an error too mild to
-    /// mark the peer failed, through `peer_list::connection_closed`; a peer
-    /// already idle keeps the wait it had).
-    pub fn close_all(&self, closed_at: Instant, finished: bool) {
+    /// Every connection on the list closes at `closed_at` as the run ends
+    /// ([`Peer::connection_let_go`]): what it showed of its peer is kept,
+    /// and the close starts no wait to reconnect, so the next run dials the
+    /// peer at once unless failures before it still hold it back. A peer
+    /// already idle keeps the wait it had.
+    pub fn close_all(&self, closed_at: Instant) {
         for mut e in self.states.iter_mut() {
             if e.value().connected_out().is_some() {
-                e.value_mut().connection_closing(closed_at, false, finished);
+                e.value_mut().connection_let_go(closed_at);
             }
         }
     }
@@ -2059,13 +2056,11 @@ mod tests {
         assert_eq!(session.snapshot().connecting, 0);
     }
 
-    // libtorrent `torrent::do_pause` closes every connection with
-    // `torrent_paused`, which `peer_list::connection_closed` stamps as the
-    // peer's last connection and does not count as a failure: a peer the
-    // pause disconnects waits the reconnect time from the pause, and one
-    // already idle keeps the wait it had.
+    // A pause ends the run, not the peer: a peer the pause disconnects
+    // starts no wait to reconnect, so the next run dials it at once, and a
+    // peer already idle keeps the wait it had.
     #[tokio::test(start_paused = true)]
-    async fn a_pause_starts_the_reconnect_wait_of_the_peers_it_disconnects() {
+    async fn a_pause_starts_no_reconnect_wait_for_the_peers_it_disconnects() {
         let peers = make_peer_states();
         let t0 = Instant::now();
         let idle = peer_addr(1);
@@ -2082,25 +2077,21 @@ mod tests {
         let idle_wait = peers.with_peer(idle, |p| p.reconnect_at()).unwrap();
 
         let paused_at = t0 + Duration::from_secs(10);
-        peers.close_all(paused_at, false);
+        peers.close_all(paused_at);
         let next =
             PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
-        assert_eq!(
-            reconnect_at(connecting),
-            Some(paused_at + MIN_RECONNECT_TIME)
-        );
-        assert_eq!(reconnect_at(live), Some(paused_at + MIN_RECONNECT_TIME));
+        assert_eq!(reconnect_at(connecting), Some(paused_at));
+        assert_eq!(reconnect_at(live), Some(paused_at));
         assert_eq!(reconnect_at(idle), idle_wait);
         assert_eq!(idle_wait, Some(t0 + MIN_RECONNECT_TIME * 2));
     }
 
-    // A pause of a finished torrent lets the seeds it disconnects go
-    // without the wait to reconnect, since we want nothing of them; a
-    // leecher it disconnects waits one reconnect time from the pause. A run
-    // that resumes finished does not connect to the seeds.
+    // A pause of a finished torrent lets every peer it disconnects go
+    // without the wait to reconnect, seed and leecher alike. A run that
+    // resumes finished does not connect to the seeds.
     #[tokio::test(start_paused = true)]
-    async fn a_pause_of_a_finished_torrent_starts_no_wait_for_its_seeds() {
+    async fn a_pause_of_a_finished_torrent_starts_no_wait_for_its_peers() {
         let peers = make_peer_states();
         let seed = peer_addr(1);
         let leecher = peer_addr(2);
@@ -2121,12 +2112,12 @@ mod tests {
         peers.update_bitfield(leecher, empty_bitfield()).unwrap();
 
         let paused_at = t0 + Duration::from_secs(10);
-        peers.close_all(paused_at, true);
+        peers.close_all(paused_at);
         let next =
             PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
         assert_eq!(reconnect_at(seed), Some(paused_at));
-        assert_eq!(reconnect_at(leecher), Some(paused_at + MIN_RECONNECT_TIME));
+        assert_eq!(reconnect_at(leecher), Some(paused_at));
 
         for mut peer in next.states.iter_mut() {
             peer.value_mut().finished(true, &next);
@@ -2146,7 +2137,7 @@ mod tests {
         peers.update_bitfield(seed, full_bitfield()).unwrap();
         assert_eq!(peers.with_peer(seed, |p| p.needed(true)), Some(true));
 
-        peers.close_all(Instant::now(), false);
+        peers.close_all(Instant::now());
         let next =
             PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         assert_eq!(next.with_peer(seed, |p| p.needed(true)), Some(false));

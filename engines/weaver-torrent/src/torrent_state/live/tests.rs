@@ -6317,3 +6317,60 @@ async fn only_the_end_game_fetches_a_block_already_had() {
         "{wasted} B wasted, {asked_again} requests for a block asked before"
     );
 }
+
+// A private torrent is found through its trackers only, and its metadata
+// leaves only in the torrent file: on a session that runs a DHT node, its
+// handshake offers no DHT and it sends no PORT, even to a peer that names
+// its node, and its extended handshake names neither ut_metadata nor the metadata's
+// size, nor is a request for a piece of it answered.
+#[tokio::test]
+async fn a_private_torrent_offers_no_dht_and_no_metadata() {
+    let udp = Arc::new(HeldUdp::default());
+    let opts = SessionOptions {
+        dht: Some(crate::DhtSessionConfig {
+            bootstrap_addrs: Some(Vec::new()),
+            ..Default::default()
+        }),
+        socket_factory: Some(udp.clone()),
+        ..isolated_session_opts(false)
+    };
+    let name = "private_no_dht_no_metadata";
+    let out = TempDir::with_prefix(name).unwrap();
+    let session = Session::new_with_opts(out.path().into(), opts)
+        .await
+        .unwrap();
+    let mut torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
+        .await
+        .unwrap();
+    torrent.torrent = crate::tests::e2e_tracker_announces::made_private(&torrent.torrent).unwrap();
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        ..Default::default()
+    };
+    let have = BF::from_boxed_slice(vec![0xc0].into());
+    let h = Harness::adding(session, out, torrent, crate::Checkpoint::pieces(have), add).await;
+    assert!(h.live.metadata.info.info().private);
+    assert!(h._session.get_dht().is_some());
+
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    assert_eq!((&peer).dht_port(), None);
+    (&peer)
+        .on_handshake(handshake(true), ConnectionKind::Tcp, false)
+        .unwrap();
+    (&peer)
+        .on_received_message(Message::Port(6890))
+        .await
+        .unwrap();
+    (&peer)
+        .on_received_message(Message::Extended(ExtendedMessage::UtMetadata(
+            UtMetadata::Request(0),
+        )))
+        .await
+        .unwrap();
+    assert!(rx.try_recv().is_err());
+
+    let mut hs = ExtendedHandshake::new();
+    (&peer).update_my_extended_handshake(&mut hs).unwrap();
+    assert_eq!(hs.m.ut_metadata, None);
+    assert_eq!(hs.metadata_size, None);
+}

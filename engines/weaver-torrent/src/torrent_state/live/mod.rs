@@ -1383,10 +1383,7 @@ impl TorrentStateLive {
         // The peer list is read before the state lock: a dying peer holds
         // its own entry while it takes the state lock, so the state lock
         // never waits on a peer entry.
-        self.peers.close_all(
-            tokio::time::Instant::now(),
-            self.is_finished_and_no_active_streams(),
-        );
+        self.peers.close_all(tokio::time::Instant::now());
         let peers = self.peers.idle_list();
         let mut g = self.lock_write("pause");
 
@@ -2129,19 +2126,8 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(
                 metadata_piece_id,
             ))) => {
-                if self.state.metadata.info.info().private {
-                    warn!(
-                        id = self.state.shared.id,
-                        info_hash = ?self.state.shared.info_hash,
-                        "received noncompliant ut_metadata message from {}, ignoring",
-                        self.addr
-                    );
-                } else {
-                    self.send_metadata_piece(metadata_piece_id)
-                        .with_context(|| {
-                            format!("error sending metadata piece {metadata_piece_id}")
-                        })?;
-                }
+                self.send_metadata_piece(metadata_piece_id)
+                    .with_context(|| format!("error sending metadata piece {metadata_piece_id}"))?;
             }
             Message::Extended(ExtendedMessage::UtHolepunch(msg)) => self.on_holepunch(msg),
             Message::Extended(ExtendedMessage::UploadOnly(upload_only)) => {
@@ -2426,12 +2412,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         &self,
         handshake: &mut ExtendedHandshake<ByteBuf>,
     ) -> anyhow::Result<()> {
-        let info_bytes = &self.state.metadata.info_bytes;
-        if !info_bytes.is_empty()
-            && let Ok(len) = info_bytes.len().try_into()
-        {
-            handshake.metadata_size = Some(len);
-        }
+        // The metadata we share, and the extension that shares it, only when
+        // we share it.
+        let shared = self.shared_metadata();
+        handshake.metadata_size = shared.and_then(|info| info.len().try_into().ok());
+        handshake.m.ut_metadata = handshake.m.ut_metadata.filter(|_| shared.is_some());
         handshake.m.ut_pex = handshake.m.ut_pex.filter(|_| self.state.pex);
         // The most blocks the peer may have asked us for and not been sent
         // (libtorrent `bt_peer_connection::write_extensions`).
@@ -2478,8 +2463,24 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 }
 
 impl PeerHandler {
+    /// The DHT a peer of this torrent hears of: none for a private torrent,
+    /// which is found through its trackers only. So a private torrent's
+    /// handshake offers no DHT, it sends no PORT, and a PORT from its peer
+    /// adds no node.
     fn dht(&self) -> Option<crate::dht::Dht> {
+        if self.state.metadata.info.info().private {
+            return None;
+        }
         self.state.shared.session.upgrade()?.get_dht().cloned()
+    }
+
+    /// The metadata this torrent hands its peers: none for a private
+    /// torrent, whose metadata leaves only in the torrent file, so its
+    /// extended handshake names no ut_metadata and no size, and a request
+    /// for a piece of it is not answered.
+    fn shared_metadata(&self) -> Option<&bytes::Bytes> {
+        let info = &self.state.metadata.info_bytes;
+        (!info.is_empty() && !self.state.metadata.info.info().private).then_some(info)
     }
 
     /// Sends our DHT port, once per connection (libtorrent
@@ -3875,7 +3876,10 @@ impl PeerHandler {
     }
 
     fn send_metadata_piece(&self, piece_id: u32) -> anyhow::Result<()> {
-        let data = UtMetadataData::piece_of(&self.state.metadata.info_bytes, piece_id)?;
+        let Some(info) = self.shared_metadata() else {
+            return Ok(());
+        };
+        let data = UtMetadataData::piece_of(info, piece_id)?;
         self.tx
             .send(WriterRequest::UtMetadata(UtMetadata::Data(data)))
             .context("error sending UtMetadata: channel closed")?;
