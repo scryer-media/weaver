@@ -522,7 +522,7 @@ export const nextKo: LocaleDictionary = {
   "next.logs.filter.label": "로그 수준",
   "next.logs.filter.preset.default": "기본값",
   "next.logs.filter.preset.download": "다운로드 디버그",
-  "next.logs.filter.preset.directStore": "다이렉트 스토어 디버그",
+  "next.logs.filter.preset.graphEngine": "그래프 엔진 디버그",
   "next.logs.filter.preset.everything": "전체 디버그",
   "next.logs.filter.preset.custom": "사용자 지정",
   "next.logs.filter.directives": "필터 지시문",

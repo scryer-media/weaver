@@ -136,6 +136,16 @@ struct Run {
     reserved: u64,
 }
 
+// The e2e hook for a job that is extracting, on the run's own thread: with
+// every volume the run reads in, it still has members to say or its end to
+// report, so a hold here keeps the job from finishing and stops nothing else.
+fn extracting_hook(volumes: &RunVolumes) {
+    let hook = crate::e2e_failpoint::STATUS_ENTER_EXTRACTING;
+    if crate::e2e_failpoint::armed(hook) && volumes.all_in() {
+        crate::e2e_failpoint::fire(hook);
+    }
+}
+
 // Whether a run may start on the memory it declares.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reservation {
@@ -319,8 +329,13 @@ impl Runs {
         };
         tokio::task::spawn_blocking(move || {
             let reader = Arc::clone(&volumes);
-            let mut sink =
-                |emit| volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok();
+            let mut sink = |emit: Emit| {
+                if matches!(emit, Emit::Member { .. }) {
+                    crate::e2e_failpoint::fire(crate::e2e_failpoint::EXTRACT_MEMBER_START);
+                }
+                extracting_hook(&volumes);
+                volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
+            };
             extraction.run(reader, &mut sink);
             // A run that read bytes nothing will bring, and did not read on
             // past them, built on less than its volumes hold and ends silent
@@ -329,6 +344,7 @@ impl Runs {
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
+            extracting_hook(&volumes);
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(said(Heard::Ended));

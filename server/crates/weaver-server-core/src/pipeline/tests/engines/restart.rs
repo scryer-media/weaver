@@ -383,6 +383,37 @@ async fn a_plain_file_under_par2_restarted_after_every_article_is_repaired_with_
     restart_row(Scenario::new(posts).damaged(0, 3)).await;
 }
 
+// A uuencoded article says nothing of where its bytes go: each is laid
+// after the one before it. A restart must leave the restored job placing
+// every article still to come where the uninterrupted run placed it.
+#[tokio::test]
+async fn a_uuencoded_file_restarted_after_every_article_is_laid_as_it_was() {
+    let posts = vec![Post::plain("ember.bin", payload(6 * ARTICLE + 21, 73))];
+    restart_row(Scenario::new(posts).uuencoded()).await;
+}
+
+#[tokio::test]
+async fn a_uuencoded_file_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
+    let posts = with_par2(
+        vec![Post::plain("ember.bin", payload(6 * ARTICLE + 21, 73))],
+        2,
+    );
+    restart_row(Scenario::new(posts).uuencoded().damaged(0, 3)).await;
+}
+
+// An article every server failed before a restart is passed by the restored
+// cursor as the uninterrupted run passed it. Every part behind the hole is
+// laid one article early, so the set carries enough blocks to mend them all.
+#[tokio::test]
+async fn a_uuencoded_file_under_par2_with_a_lost_article_restarted_after_every_article_is_repaired()
+{
+    let posts = with_par2(
+        vec![Post::plain("ember.bin", payload(6 * ARTICLE + 21, 73))],
+        8,
+    );
+    restart_row(Scenario::new(posts).uuencoded().lost(0, 2)).await;
+}
+
 // Every event `pipeline` sent since `sent` subscribed, kept in order.
 fn drain(
     sent: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
@@ -1310,4 +1341,239 @@ async fn a_set_missing_a_volume_restarted_after_every_article_still_fails() {
     );
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);
+}
+
+// The restore request of the job as the database holds it after a startup.
+fn request_for(
+    scenario: &Scenario,
+    working_dir: std::path::PathBuf,
+    status: JobStatus,
+) -> crate::RestoreJobRequest {
+    crate::RestoreJobRequest {
+        job_id: JOB,
+        job_hash: [0; 32],
+        spec: scenario.spec(),
+        detected_archives: Default::default(),
+        file_identities: Default::default(),
+        status,
+        download_state: None,
+        post_state: None,
+        run_state: None,
+        queued_repair_at_epoch_ms: None,
+        queued_extract_at_epoch_ms: None,
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+        working_dir,
+    }
+}
+
+// Moves the version the root's facts are written in by `by`, so a build
+// that reads only its own version cannot read them.
+async fn shift_root_facts_version(pipeline: &Pipeline, by: i64) {
+    let datastore = pipeline.db.datastore();
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_root_facts_version",
+        |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE graph_nodes SET facts_version = facts_version + {} \
+                     WHERE job_id = {} AND node_id = 0",
+                    &[
+                        crate::persistence::sql_runtime::SqlArg::I64(by),
+                        crate::persistence::sql_runtime::SqlArg::I64(JOB.0 as i64),
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
+}
+
+// A job served four of its articles and stopped, its checkpoint unreadable
+// by this build: the pipeline it stopped in, retired, and its working dir.
+async fn unreadable_checkpoint(
+    temp_dir: &tempfile::TempDir,
+    scenario: &Scenario,
+) -> std::path::PathBuf {
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    for _ in 0..4 {
+        let work = next_work(&mut pipeline, scenario).expect("the post has articles to come");
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, scenario, article).await;
+    }
+    pipeline.db.flush_write_queue().await.unwrap();
+    shift_root_facts_version(&pipeline, 1).await;
+    retire_pipeline_database(pipeline).await;
+    working_dir
+}
+
+// A checkpoint the build cannot read blocks the restore: the job stands
+// paused in the queue naming why, fetches nothing, and a resume fails while
+// the checkpoint stays unreadable. Once it reads, the resume restores the job
+// from it and the job finishes.
+#[tokio::test]
+async fn an_unreadable_checkpoint_holds_the_job_paused_until_it_reads() {
+    let body = payload(12 * ARTICLE, 77);
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", body.clone())]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let working_dir = unreadable_checkpoint(&temp_dir, &scenario).await;
+
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    pipeline
+        .restore_job(request_for(&scenario, working_dir, JobStatus::Downloading))
+        .await
+        .unwrap();
+    assert!(pipeline.blocked_restores.contains_key(&JOB));
+    assert!(!pipeline.graph_jobs.contains_key(&JOB));
+    let info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == JOB)
+        .expect("a blocked job stays in the queue");
+    assert_eq!(info.status, JobStatus::Paused);
+    assert!(
+        info.error
+            .as_deref()
+            .is_some_and(|error| error.contains("checkpoint")),
+        "{:?}",
+        info.error
+    );
+    assert!(pipeline.jobs[&JOB].download_queue.is_empty());
+    pipeline.dispatch_downloads();
+    assert_eq!(pipeline.active_downloads, 0);
+    let row = pipeline
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&JOB)
+        .unwrap();
+    assert_eq!(row.status, "paused");
+    assert!(pipeline.resume_restored_job(JOB).await.is_err());
+    assert!(pipeline.blocked_restores.contains_key(&JOB));
+
+    shift_root_facts_version(&pipeline, -1).await;
+    pipeline.resume_restored_job(JOB).await.unwrap();
+    assert!(!pipeline.blocked_restores.contains_key(&JOB));
+    assert!(pipeline.graph_jobs.contains_key(&JOB));
+    assert!(
+        pipeline
+            .list_jobs()
+            .iter()
+            .find(|job| job.job_id == JOB)
+            .unwrap()
+            .error
+            .is_none()
+    );
+    // The four articles the checkpoint settled are not fetched again.
+    assert_eq!(pipeline.jobs[&JOB].download_queue.len(), 8);
+    while let Some(work) = next_work(&mut pipeline, &scenario) {
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+    pipeline.check_job_completion(JOB).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    assert_eq!(files.into_values().collect::<Vec<_>>(), vec![body]);
+    retire_pipeline_database(pipeline).await;
+}
+
+// Cancelling a blocked job removes it and its block.
+#[tokio::test]
+async fn cancelling_a_job_blocked_on_its_checkpoint_clears_the_block() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 78))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let working_dir = unreadable_checkpoint(&temp_dir, &scenario).await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let mut request = request_for(&scenario, working_dir, JobStatus::Paused);
+    request.paused_resume_status = Some(JobStatus::Extracting);
+    pipeline.restore_job(request).await.unwrap();
+    assert!(pipeline.blocked_restores.contains_key(&JOB));
+    // A blocked job has no download done to resume into anything else.
+    assert_eq!(
+        pipeline.jobs[&JOB].paused_resume_status,
+        Some(JobStatus::Downloading)
+    );
+    crate::pipeline::tests::cancel_one_job(
+        &mut pipeline,
+        JOB,
+        crate::jobs::handle::CancellationOrigin::User,
+    )
+    .await
+    .unwrap();
+    assert!(!pipeline.blocked_restores.contains_key(&JOB));
+    assert!(!pipeline.jobs.contains_key(&JOB));
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job blocked on its checkpoint holds the status its lanes name for when
+// it resumes: a job past its download resumes into downloading, as the
+// restore cannot say what of it is done.
+#[tokio::test]
+async fn a_job_blocked_on_its_checkpoint_resumes_into_the_status_its_lanes_name() {
+    use crate::jobs::model::{DownloadState, PostState};
+    for (status, download_state, post_state, resume, persisted) in [
+        (
+            JobStatus::Extracting,
+            DownloadState::Complete,
+            PostState::Extracting,
+            JobStatus::Downloading,
+            "downloading",
+        ),
+        (
+            JobStatus::Queued,
+            DownloadState::Queued,
+            PostState::Idle,
+            JobStatus::Queued,
+            "queued",
+        ),
+    ] {
+        let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 79))]);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let working_dir = unreadable_checkpoint(&temp_dir, &scenario).await;
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        let mut request = request_for(&scenario, working_dir, status.clone());
+        request.download_state = Some(download_state);
+        request.post_state = Some(post_state);
+        pipeline.restore_job(request).await.unwrap();
+        assert!(pipeline.blocked_restores.contains_key(&JOB), "{status:?}");
+        assert_eq!(pipeline.jobs[&JOB].status, JobStatus::Paused, "{status:?}");
+        assert_eq!(
+            pipeline.jobs[&JOB].paused_resume_status,
+            Some(resume),
+            "{status:?}"
+        );
+        let row = pipeline
+            .db
+            .load_active_jobs()
+            .unwrap()
+            .remove(&JOB)
+            .unwrap();
+        assert_eq!(
+            row.paused_resume_status.as_deref(),
+            Some(persisted),
+            "{status:?}"
+        );
+        retire_pipeline_database(pipeline).await;
+    }
 }

@@ -53,7 +53,7 @@ const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60
 // every one of them. Unthrottled that is hundreds of identical lines a second
 // for as long as the phase lasts, written synchronously on the pipeline actor
 // thread, which is the same thread the stall itself needs to get work moving.
-const DISPATCH_INELIGIBLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const DISPATCH_INELIGIBLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 // How often a dispatch pass re-asks for its first server ranking while the
 // health lock is held by a lane worker, and how long it waits between asks.
 // The critical sections behind that lock are microseconds long, so the whole
@@ -106,7 +106,7 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
         self.admit_at(job_id, interval, Instant::now())
     }
 
-    fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
+    pub(crate) fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
         match self.windows.get_mut(&job_id) {
             Some(window) if now.duration_since(window.emitted_at) < interval => {
                 window.suppressed = window.suppressed.saturating_add(1);
@@ -800,10 +800,11 @@ impl Pipeline {
             for (job_id, idx, status, queue_len, recovery_len, status_allows_dispatch) in
                 ineligible_jobs
             {
-                let Some(suppressed_since_last) = self
-                    .dispatch_ineligible_log_throttle
-                    .admit(job_id, DISPATCH_INELIGIBLE_LOG_INTERVAL)
-                else {
+                let Some(suppressed_since_last) = self.dispatch_ineligible_log_throttle.admit_at(
+                    job_id,
+                    DISPATCH_INELIGIBLE_LOG_INTERVAL,
+                    now,
+                ) else {
                     continue;
                 };
                 warn!(

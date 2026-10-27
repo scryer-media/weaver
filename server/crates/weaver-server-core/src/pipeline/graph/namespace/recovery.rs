@@ -298,7 +298,9 @@ impl NamespaceWriter {
     // one that covers nothing yet rules only once a volume of its own is
     // in: a verdict on nothing would read as settled to every member beside
     // it, and a member it binds after would never be repaired before an
-    // engine reads it.
+    // engine reads it. One that has yet to learn what it describes rules
+    // once every other member is in too: nothing else will ask for the
+    // volumes that would say, and its ruling waits on them.
     fn due(&self, tree: &Tree, node: NodeId, reading: bool) -> Vec<NodeId> {
         let Some(namespace) = tree.namespace(node) else {
             return Vec::new();
@@ -312,7 +314,9 @@ impl NamespaceWriter {
             let covers = namespace.members().any(|member| recovery.covers(member.id));
             recovery.outcome().is_none()
                 && known
-                && (covers || closed_volumes(tree, set) > 0)
+                && (covers
+                    || closed_volumes(tree, set) > 0
+                    || (recovery.undescribed() && self.members_in(tree, node)))
                 && namespace
                     .members()
                     .all(|member| !recovery.covers(member.id) || member.closed)

@@ -251,6 +251,44 @@ async fn an_aes_stored_7z_with_the_job_password_delivers_its_members() {
     assert_fetched_once(&graph);
 }
 
+// The candidates are tried in their order: the job's own, then the
+// settings'. The one the archive opened with is what the history keeps,
+// sealed, and never as a public attribute or in the clear.
+#[tokio::test]
+async fn archive_password_sources_are_ordered_and_validated_password_is_private() {
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", stored(Some(SECRET)))])
+        .password("filename-key")
+        .global_password("global-key")
+        .global_password(SECRET);
+    let graph = run(&scenario).await;
+    assert_members(&graph);
+    assert_eq!(graph.validated_password.as_deref(), Some(SECRET));
+    let stored = graph
+        .history_metadata
+        .as_deref()
+        .expect("the history row keeps the job's metadata");
+    assert!(!stored.contains(SECRET), "{stored}");
+    let metadata = crate::history::attributes::parse_history_metadata(Some(stored));
+    assert!(metadata.iter().any(
+        |(key, _)| key == crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+    ));
+    assert!(
+        !crate::public_history_attributes(&metadata)
+            .iter()
+            .any(|(key, _)| key.contains("validated_archive_password"))
+    );
+}
+
+// An archive that needs no password leaves none in the history.
+#[tokio::test]
+async fn an_archive_with_no_password_keeps_none_in_the_history() {
+    let scenario =
+        Scenario::new(vec![Post::plain("lantern.7z", stored(None))]).password("filename-key");
+    let graph = run(&scenario).await;
+    assert_members(&graph);
+    assert_eq!(graph.validated_password, None);
+}
+
 // No password for an AES-stored 7z: the store gives the container back
 // withheld, since nothing opened it, so nothing is whole and the job fails
 // naming the password it needs, with no refetch.
@@ -273,7 +311,7 @@ async fn an_aes_stored_7z_without_a_password_fails_for_it() {
     assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     assert_eq!(
         graph.failure.as_deref(),
-        Some("lantern.7z needs a password and none was given")
+        Some("WEAVER_PASSWORD_REQUIRED: lantern.7z needs a password and none was given")
     );
     assert!(
         graph.refetched().is_empty(),

@@ -225,6 +225,10 @@ impl Pipeline {
     // hold the post within its retention, and must not be refusing this
     // pool's credentials. A refusal is a verdict, like the other two; a
     // quarantine for transport or capacity is a wait and keeps the server.
+    // A backfill server may serve the article only once every fill server
+    // is excluded for it or out of its retention: backfill fills what the
+    // fill servers lack, and a fill server refusing the credentials does not
+    // lack the article, so it never opens backfill.
     pub(in crate::pipeline) fn server_may_serve(
         pool: &weaver_nntp::NntpPool,
         idx: usize,
@@ -234,6 +238,8 @@ impl Pipeline {
         !failure_excludes.contains(&idx)
             && !retention_excludes.contains(&idx)
             && !pool.refuses_credentials(idx)
+            && (!pool.is_backfill(idx)
+                || pool.backfill_open_for(failure_excludes, retention_excludes))
     }
 
     // Whether an article carrying `failure_excludes` has no server left

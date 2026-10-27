@@ -522,7 +522,7 @@ export const nextZh: LocaleDictionary = {
   "next.logs.filter.label": "日志级别",
   "next.logs.filter.preset.default": "默认",
   "next.logs.filter.preset.download": "下载调试",
-  "next.logs.filter.preset.directStore": "直接存储调试",
+  "next.logs.filter.preset.graphEngine": "图引擎调试",
   "next.logs.filter.preset.everything": "全部调试",
   "next.logs.filter.preset.custom": "自定义",
   "next.logs.filter.directives": "过滤指令",

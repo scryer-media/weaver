@@ -19,7 +19,7 @@ use crate::jobs::model::JobStatus;
 use crate::operations::instrumentation::StageOutcomeKind;
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::extraction::ExtractionError;
-use crate::pipeline::graph::job::GraphJob;
+use crate::pipeline::graph::job::{GraphJob, Note};
 use crate::pipeline::graph::limits;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
@@ -90,6 +90,7 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
                 pipeline.fail_job(job_id, error);
             }
             _ => {
+                pipeline.record_validated_archive_password(job_id);
                 pipeline.log_deliveries(job_id);
                 pipeline.remove_spent_members(job_id).await;
                 // A repair ruled before this delivery: the moment the e2e
@@ -349,6 +350,39 @@ impl Pipeline {
         Ok(())
     }
 
+    // The password an archive of the job opened with, kept sealed in the
+    // job's metadata as the job delivers, so the history can say which
+    // candidate worked. Nothing is kept when no archive needed one.
+    fn record_validated_archive_password(&mut self, job_id: JobId) {
+        let Some(password) = self
+            .graph_jobs
+            .get(&job_id)
+            .and_then(GraphJob::opening_password)
+        else {
+            return;
+        };
+        let sealed = match self.db.seal_validated_archive_password(password) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                warn!(job_id = job_id.0, error = %error, "could not seal the validated archive password");
+                return;
+            }
+        };
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let key = crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY;
+        state.spec.metadata.retain(|(name, _)| name != key);
+        state.spec.metadata.push((key.to_string(), sealed));
+        let update = crate::jobs::JobUpdate {
+            metadata: crate::jobs::FieldUpdate::Set(state.spec.metadata.clone()),
+            ..Default::default()
+        };
+        if let Err(error) = self.db.update_active_job(job_id, &update) {
+            warn!(job_id = job_id.0, error = %error, "could not persist the validated archive password");
+        }
+    }
+
     // Each file the job hands over, said once, as the job delivers: the
     // tree places names until then.
     fn log_deliveries(&self, job_id: JobId) {
@@ -457,15 +491,18 @@ impl Pipeline {
     // could bring another. Each set's ruling and what the repair came to are
     // said then, once, as the phase is.
     pub(in crate::pipeline::graph) fn report_graph_phase(&mut self, job_id: JobId) {
-        let (Some(graph), Some(state)) =
-            (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))
-        else {
+        if !self.jobs.contains_key(&job_id) {
+            return;
+        }
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return;
         };
+        let before = graph.reported_phase();
         let Some(phase) = graph.phase_change() else {
             return;
         };
         metrics::phase(phase);
+        let stage = stage_events(job_id, before, phase, &RootJob::recovery_summary(&*graph));
         if phase == RootPhase::Done {
             log_set_rulings(job_id, graph);
             let summary = RootJob::recovery_summary(&*graph);
@@ -481,9 +518,18 @@ impl Pipeline {
                 });
             }
         }
-        if let Some(status) = shown_status(phase, &state.status) {
+        for event in stage {
+            self.emit_job_event(event);
+        }
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        let entered = shown_status(phase, &state.status);
+        if let Some(status) = entered.clone() {
+            let lane = state.post_state;
             state.status = status;
             state.refresh_runtime_lanes_from_status();
+            self.metrics.post_state_moved(lane, state.post_state);
         }
         if let Err(error) =
             self.db
@@ -493,5 +539,104 @@ impl Pipeline {
         {
             warn!(job_id = job_id.0, error = %error, "could not queue the root phase write");
         }
+        // The status the job entered, as the e2e hooks name it, once the
+        // phase it shows is queued for the database. Extracting is held on
+        // the engine run that does it, off this loop.
+        let hook = match entered {
+            Some(JobStatus::Verifying) => Some(crate::e2e_failpoint::STATUS_ENTER_VERIFYING),
+            Some(JobStatus::Repairing) => Some(crate::e2e_failpoint::STATUS_ENTER_REPAIRING),
+            _ => None,
+        };
+        if let Some(hook) = hook {
+            crate::e2e_failpoint::maybe_delay(hook);
+            crate::e2e_failpoint::maybe_trip(hook);
+        }
     }
+
+    // What the job's last step did, as its events: a posted file that
+    // landed is a file complete and the queue scripts' FILE_DOWNLOADED.
+    pub(in crate::pipeline::graph) fn publish_graph_notes(&mut self, job_id: JobId) {
+        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+            return;
+        };
+        for note in graph.take_notes() {
+            match note {
+                Note::Landed(volume) => {
+                    let Some(file) = self
+                        .jobs
+                        .get(&job_id)
+                        .and_then(|state| state.spec.files.get(volume.0 as usize))
+                    else {
+                        continue;
+                    };
+                    let event = PipelineEvent::FileComplete {
+                        file_id: NzbFileId {
+                            job_id,
+                            file_index: volume.0,
+                        },
+                        filename: file.filename.clone(),
+                        total_bytes: file
+                            .segments
+                            .iter()
+                            .map(|segment| u64::from(segment.bytes))
+                            .sum(),
+                    };
+                    self.raise_queue_script_event(
+                        job_id,
+                        crate::post_processing::model::QueueEvent::FileDownloaded,
+                        None,
+                    );
+                    self.emit_job_event(event);
+                }
+            }
+        }
+    }
+}
+
+// The stage events a change of the job's phase says: the stage it left
+// ends, and the one it entered starts. Verification passed when it led to
+// no repair and every set vouched; a repair failed when a set it left
+// behind could not be rebuilt.
+fn stage_events(
+    job_id: JobId,
+    before: Option<RootPhase>,
+    phase: RootPhase,
+    summary: &RecoverySummary,
+) -> Vec<PipelineEvent> {
+    let mut events = Vec::new();
+    match before {
+        Some(RootPhase::Verifying) => events.push(PipelineEvent::JobVerificationComplete {
+            job_id,
+            passed: phase != RootPhase::Repairing && summary.settled(),
+        }),
+        Some(RootPhase::Repairing) => {
+            if let Some((damaged, reachable)) =
+                summary
+                    .outcomes()
+                    .into_iter()
+                    .find_map(|outcome| match outcome {
+                        RepairOutcome::Impossible { damaged, reachable } => {
+                            Some((damaged, reachable))
+                        }
+                        _ => None,
+                    })
+            {
+                events.push(PipelineEvent::RepairFailed {
+                    job_id,
+                    error: format!(
+                        "not repairable: {damaged} damaged slices, only {reachable} recovery blocks reachable"
+                    ),
+                });
+            }
+        }
+        Some(RootPhase::Extracting) => events.push(PipelineEvent::ExtractionComplete { job_id }),
+        Some(RootPhase::Downloading | RootPhase::Done) | None => {}
+    }
+    match phase {
+        RootPhase::Verifying => events.push(PipelineEvent::JobVerificationStarted { job_id }),
+        RootPhase::Repairing => events.push(PipelineEvent::RepairStarted { job_id }),
+        RootPhase::Extracting => events.push(PipelineEvent::ExtractionReady { job_id }),
+        RootPhase::Downloading | RootPhase::Done => {}
+    }
+    events
 }

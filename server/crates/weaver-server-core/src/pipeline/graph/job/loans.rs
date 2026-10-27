@@ -126,6 +126,8 @@ impl Lender for Lending<'_> {
         });
         let mail = loans.mail.clone();
         tokio::task::spawn_blocking(move || {
+            crate::e2e_failpoint::maybe_delay(crate::e2e_failpoint::REPAIR_TASK_START);
+            crate::e2e_failpoint::maybe_trip(crate::e2e_failpoint::REPAIR_TASK_START);
             let returned = loan.run();
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.

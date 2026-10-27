@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY;
-use crate::persistence::encryption::decrypt_value;
+use crate::persistence::encryption::{decrypt_value, encrypt_value};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::{Database, StateError};
 
@@ -19,6 +19,19 @@ impl Database {
             }
             Ok(values)
         })
+    }
+
+    // The password an archive opened with, sealed under the database key
+    // for the job's metadata.
+    pub(crate) fn seal_validated_archive_password(
+        &self,
+        password: &str,
+    ) -> Result<String, StateError> {
+        let key = self
+            .encryption_key()
+            .ok_or_else(|| StateError::Conflict("encryption key required".into()))?;
+        encrypt_value(key, password)
+            .map_err(|_| StateError::Conflict("could not encrypt archive password".into()))
     }
 
     pub fn validated_archive_password(&self, job_id: u64) -> Result<Option<String>, StateError> {

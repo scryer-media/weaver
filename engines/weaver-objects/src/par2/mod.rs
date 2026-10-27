@@ -32,7 +32,7 @@ use weaver_graph::{
 
 use self::bind::bind_sets;
 use self::evidence::Evidence;
-use self::repair::repair_set;
+use self::repair::{SetRepair, repair_set};
 use self::sets::{Location, SetState, Volume};
 use self::walker::{Found, Meter};
 use crate::grid::{Grid, WHOLE};
@@ -57,6 +57,9 @@ pub struct Par2 {
     meter: Meter,
     // A job past the packet or set limits keeps none of its sets.
     refused: bool,
+    // The namespace asked for a ruling before any set was found: a volume
+    // is read for one.
+    seeking: bool,
     output_limit: u64,
     memory_limit: usize,
 }
@@ -72,6 +75,7 @@ impl Par2 {
             evidence: BTreeMap::new(),
             meter: Meter::default(),
             refused: false,
+            seeking: false,
             output_limit: MAX_JOB_BYTES,
             memory_limit: REPAIR_MEMORY_LIMIT,
         }
@@ -168,7 +172,39 @@ impl Par2 {
     // it needs are not all in hand, and its volumes may bring more.
     fn waits(&self, key: &[u8; 16], needed: u64) -> bool {
         let state = &self.sets[key];
+        if state.usable().is_none() {
+            return self.describing(Some(key)).is_some();
+        }
         (state.recovery.len() as u64) < needed && self.coming(key) > 0
+    }
+
+    // The volume to read for the description of a set that has none, or of
+    // any set when none is known: every volume of a set carries its
+    // description beside its blocks, so the first still open that may carry
+    // the set's packets, an index before any volume and then the fewest
+    // blocks first. `None` once none is left to read.
+    fn describing(&self, key: Option<&[u8; 16]>) -> Option<usize> {
+        let mut order: Vec<usize> = (0..self.volumes.len()).collect();
+        order.sort_by_key(|index| (self.volumes[*index].named_blocks, *index));
+        order.into_iter().find(|index| {
+            let volume = &self.volumes[*index];
+            !volume.closed && key.is_none_or(|key| volume.serves(key))
+        })
+    }
+
+    // Whether no volume of the object has been read through.
+    fn unread_through(&self) -> bool {
+        !self.volumes.iter().any(|volume| volume.closed)
+    }
+
+    // The volumes, those that name the fewest blocks first.
+    fn by_blocks(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.volumes.len()).collect();
+        order.sort_by_key(|index| {
+            let named = self.volumes[*index].named_blocks;
+            (named.is_none(), named, *index)
+        });
+        order
     }
 
     fn take(&mut self, volume: VolumeIndex, found: Vec<Found>) {
@@ -365,7 +401,13 @@ impl Recovery for Par2 {
         }
         // A member a set bound under a name none of its postings answers
         // to the description with, even folded, is recognised: it takes the
-        // description's name and length.
+        // description's name and length. One bound under its own name keeps
+        // it, and takes the description's length when it holds damage and
+        // reached less: a member posted without positions closes at the
+        // length its articles reached, short of what a lost one took, and
+        // the file the set rebuilds is the length the set describes. A
+        // member longer than its description keeps its length: its posting
+        // carries more than the described file.
         for state in self.sets.values() {
             let Some(index) = state.usable() else {
                 continue;
@@ -377,12 +419,25 @@ impl Recovery for Par2 {
                 let answers = namespace
                     .postings(*member)
                     .any(|record| record.name.eq_ignore_ascii_case(&description.filename));
-                if !answers
-                    && namespace
+                if !answers {
+                    if namespace
                         .recognise(*member, &description.filename, description.length)
                         .is_some()
+                    {
+                        renamed.push(*member);
+                    }
+                    continue;
+                }
+                let Some(record) = namespace.get(*member) else {
+                    continue;
+                };
+                if record
+                    .length
+                    .is_some_and(|length| length < description.length)
+                    && !record.coverage.is_clean()
                 {
-                    renamed.push(*member);
+                    let name = record.name.clone();
+                    namespace.recognise(*member, &name, description.length);
                 }
             }
         }
@@ -435,6 +490,10 @@ impl Recovery for Par2 {
                 }
             }
         }
+    }
+
+    fn undescribed(&self) -> bool {
+        self.sets.is_empty() || self.sets.values().any(|state| state.usable().is_none())
     }
 
     fn covers(&self, member: MemberId) -> bool {
@@ -494,18 +553,35 @@ impl Recovery for Par2 {
     // other volume the walk has shown carries recovery blocks is deferred:
     // its head told what it is, and the rest waits until a shortfall wants
     // it. Nothing of the deferral is kept: the same walk says it again on
-    // every round, after a restart too.
+    // every round, after a restart too. A set asked to rule before it has a
+    // description, or an object asked before it found any set, waits on one
+    // volume that may carry a description, and asks for it, then the next
+    // once that one is read through without it.
     fn wants(&self, out: &mut Vec<Seek>) {
         let seen = self.damaged_seen();
         let packet = self.smallest_packet();
-        let mut order: Vec<usize> = (0..self.volumes.len()).collect();
-        order.sort_by_key(|index| {
-            let named = self.volumes[*index].named_blocks;
-            (named.is_none(), named, *index)
-        });
+        let order = self.by_blocks();
         let mut asked = vec![false; self.volumes.len()];
+        if self.sets.is_empty()
+            && self.seeking
+            && self.unread_through()
+            && let Some(index) = self.describing(None)
+        {
+            asked[index] = true;
+            self.volumes[index].ask(VolumeIndex(index as u32), out);
+        }
         for key in self.ordered() {
             let state = &self.sets[&key];
+            if state.usable().is_none() {
+                if state.short_of().is_some()
+                    && let Some(index) = self.describing(Some(&key))
+                    && !asked[index]
+                {
+                    asked[index] = true;
+                    self.volumes[index].ask(VolumeIndex(index as u32), out);
+                }
+                continue;
+            }
             let wanted = state
                 .short_of()
                 .unwrap_or(0)
@@ -534,14 +610,33 @@ impl Recovery for Par2 {
     }
 
     fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+        if self.sets.is_empty() && self.unread_through() {
+            self.seeking = true;
+            return if self.describing(None).is_some() {
+                RepairOutcome::Waiting
+            } else {
+                RepairOutcome::Unread
+            };
+        }
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
             let coming = self.coming(&key);
+            let describing = self.describing(Some(&key));
             let Some(state) = self.sets.get_mut(&key) else {
                 continue;
             };
             let result = match state.concluded() {
                 Some(concluded) => concluded,
+                // A set with no description waits on a volume that may carry
+                // one; with none left to read, it checked nothing.
+                None if state.usable().is_none() => {
+                    let last = match describing {
+                        Some(_) => SetRepair::waiting(),
+                        None => SetRepair::unread(),
+                    };
+                    state.last = Some(last);
+                    last.outcome
+                }
                 None => {
                     let result = repair_set(state, &self.grid, coming, self.memory_limit, access);
                     state.last = Some(result);
@@ -561,8 +656,13 @@ impl Recovery for Par2 {
     // still be found in the bytes to come, and it has not ruled.
     fn outcome(&self) -> Option<RepairOutcome> {
         if self.sets.is_empty() {
-            let read_through = self.volumes.iter().any(|volume| volume.closed);
-            return read_through.then_some(RepairOutcome::Unread);
+            if !self.unread_through() {
+                return Some(RepairOutcome::Unread);
+            }
+            return self.seeking.then(|| match self.describing(None) {
+                Some(_) => RepairOutcome::Waiting,
+                None => RepairOutcome::Unread,
+            });
         }
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {

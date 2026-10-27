@@ -1194,18 +1194,16 @@ impl Pipeline {
                     };
                 let source_not_found = failure.kind == DownloadFailureKind::ArticleNotFound
                     && article_not_found_server_idx.is_some();
-                // A server refusing the credentials has answered for the
-                // article just as a 430 does: it leaves the article's
-                // candidates, and the retry goes to a server that may still
-                // serve it, if one remains.
+                // A server refusing the credentials leaves the article's
+                // candidates through the pool's refusal, not through the
+                // article's exclusions: those record servers that lack the
+                // article, and a fill server listed there would open the
+                // backfill tier to an article no fill server has missed.
                 let retry_exclude_servers = match failure.kind {
                     DownloadFailureKind::ArticleNotFound => Self::decode_retry_exclude_servers(
                         &excluded_servers,
                         article_not_found_server_idx,
                     ),
-                    DownloadFailureKind::Auth => {
-                        Self::decode_retry_exclude_servers(&excluded_servers, source_server_idx)
-                    }
                     _ => excluded_servers.clone(),
                 };
                 // A 430 from a server the article already excluded taught

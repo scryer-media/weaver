@@ -87,7 +87,8 @@ impl GraphJob {
             storage.accountant,
             storage.free_disk,
         )
-        .capped(storage.caps);
+        .capped(storage.caps)
+        .metered(storage.metrics);
         writer.restore_members(&tree);
         for ((node, member), state) in &snapshot.files {
             if tree
@@ -114,6 +115,7 @@ impl GraphJob {
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
+            notes: Vec::new(),
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
@@ -125,6 +127,9 @@ impl GraphJob {
         }
         job.repair()?;
         job.step_runs(Vec::new(), limit)?;
+        // What the restore closed again landed before the restart, and was
+        // said then.
+        job.notes.clear();
         Ok(Restored {
             settled: job.root.map.settled(),
             refetched,

@@ -137,7 +137,7 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
         }
-        self.skip_failed_uu_segment(seg_id);
+        let uu_released = self.skip_failed_uu_segment(seg_id);
         // This ordinal will not be asked for again, which is the last thing
         // assembly was waiting to know about any damaged bytes it kept: once
         // no cleaner copy can displace them, they end where the part behind
@@ -148,12 +148,10 @@ impl Pipeline {
         // placed after this one have lost their anchor for good. The run is
         // taken out of the park before any of it is booked, so each booking
         // below finds nothing further to release.
-        if self.settled_segment_anchors_successor(seg_id) {
+        if uu_released {
             self.pending_unanchored_release.push(seg_id);
         } else {
-            for dependent in self.take_unanchored_dependents(seg_id) {
-                self.give_up_unanchored(dependent);
-            }
+            self.settle_unanchored_behind(seg_id);
         }
         // The job's root marks the article's range damaged, and its objects
         // rule on the loss.
@@ -167,6 +165,20 @@ impl Pipeline {
             .get(&seg_id.file_id.job_id)
             .and_then(|state| state.assembly.file(seg_id.file_id))
             .is_some_and(|file| file.has_segment(seg_id.segment_number))
+    }
+
+    // An ordinal no further copy of is coming either still tells the
+    // articles held behind it where they start, and they are released through
+    // the ordinary commit path once the caller can run it, or it does not and
+    // they are given up.
+    pub(in crate::pipeline) fn settle_unanchored_behind(&mut self, seg_id: SegmentId) {
+        if self.settled_segment_anchors_successor(seg_id) {
+            self.pending_unanchored_release.push(seg_id);
+        } else {
+            for dependent in self.take_unanchored_dependents(seg_id) {
+                self.give_up_unanchored(dependent);
+            }
+        }
     }
 
     // Whether an ordinal that has just reached a terminal state still tells
@@ -259,17 +271,23 @@ impl Pipeline {
     // PAR2 is the authority on whether it can be recovered. Without PAR2 the
     // file is simply wrong, which is still better than a job that never
     // finishes — and the damage flag is what tells the truth about it.
-    pub(in crate::pipeline) fn skip_failed_uu_segment(&mut self, seg_id: SegmentId) {
-        let Some(uu) = self.uu_files.get_mut(&seg_id.file_id) else {
-            return;
+    //
+    // Returns whether a part parked ahead now sits at the cursor: booking
+    // cannot write it, so the caller has it released at the next seam that
+    // can.
+    pub(in crate::pipeline) fn skip_failed_uu_segment(&mut self, seg_id: SegmentId) -> bool {
+        let Some(uu) = self.uu_files.get(&seg_id.file_id) else {
+            return false;
         };
         if seg_id.segment_number != uu.next_index {
             // Only the ordinal the cursor is actually waiting on can wedge it.
-            // A later failure is handled when the cursor reaches it.
-            return;
+            // A later failure is passed when the cursor reaches it.
+            return false;
         }
-        uu.damaged = true;
-        uu.next_index = uu.next_index.saturating_add(1);
+        self.pass_given_up_uu(seg_id.file_id);
+        self.uu_files
+            .get(&seg_id.file_id)
+            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index))
     }
 
     // Drop the job's terminal states, and the ledger derived from them.

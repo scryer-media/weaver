@@ -42,6 +42,25 @@ pub(super) struct SetRepair {
 }
 
 impl SetRepair {
+    // Waiting on a description, not on blocks.
+    pub(super) fn waiting() -> Self {
+        Self {
+            outcome: RepairOutcome::Waiting,
+            damaged: 0,
+            read: false,
+            needed: 0,
+        }
+    }
+
+    pub(super) fn unread() -> Self {
+        Self {
+            outcome: RepairOutcome::Unread,
+            damaged: 0,
+            read: false,
+            needed: 0,
+        }
+    }
+
     fn clean(read: bool) -> Self {
         Self {
             outcome: RepairOutcome::Clean,

@@ -73,6 +73,7 @@ impl Pipeline {
             passwords,
             caps,
             nesting: limits::NESTING,
+            metrics: Some(Arc::clone(&self.metrics)),
         };
         let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
@@ -133,9 +134,58 @@ impl Pipeline {
                 })
                 .collect(),
         };
+        let committed = decoded.bytes.len() as u64;
         let result = graph.intake(decoded, &mut self.graph_status.repairs, limit);
+        if result.is_ok() {
+            self.metrics
+                .bytes_committed
+                .fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .segments_committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.after_graph_result(job_id, result);
         true
+    }
+
+    // Whether the root of a graph job already has the article in hand or
+    // has ruled it lost. An article the root does not hold, or a job that
+    // has gone, has settled nothing.
+    pub(in crate::pipeline) fn graph_article_settled(&self, segment_id: SegmentId) -> bool {
+        self.graph_jobs
+            .get(&segment_id.file_id.job_id)
+            .is_some_and(|graph| {
+                graph.article_settled(
+                    VolumeIndex(segment_id.file_id.file_index),
+                    segment_id.segment_number,
+                )
+            })
+    }
+
+    // Whether an article of a graph job will never arrive: every server
+    // failed it, in this run or one before a restart.
+    pub(in crate::pipeline) fn graph_article_given_up(&self, segment_id: SegmentId) -> bool {
+        self.segment_terminal_states.contains_key(&segment_id)
+            || self
+                .graph_jobs
+                .get(&segment_id.file_id.job_id)
+                .is_some_and(|graph| {
+                    graph.article_lost(
+                        VolumeIndex(segment_id.file_id.file_index),
+                        segment_id.segment_number,
+                    )
+                })
+    }
+
+    // Where the root of a graph job stands in laying a file in order, as
+    // `ordered_front` says. `None` once the job has gone. Takes the graph
+    // jobs alone, so a caller may hold another field of the pipeline.
+    pub(in crate::pipeline) fn graph_ordered_front(
+        graph_jobs: &std::collections::HashMap<JobId, GraphJob>,
+        file_id: NzbFileId,
+    ) -> Option<(u32, u64, bool)> {
+        let graph = graph_jobs.get(&file_id.job_id)?;
+        Some(graph.ordered_front(VolumeIndex(file_id.file_index)))
     }
 
     // Whether the root is waiting on an article of a graph job, which is
@@ -278,7 +328,15 @@ impl Pipeline {
         self.schedule_job_completion_check(job_id);
     }
 
-    fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {
+    pub(in crate::pipeline::graph) fn after_graph_result(
+        &mut self,
+        job_id: JobId,
+        result: Result<(), GraphError>,
+    ) {
+        // What the step landed is said whatever the step came to: a file
+        // whose download ended is said once, as it ended, before the job
+        // fails on what the step did after.
+        self.publish_graph_notes(job_id);
         // A step the job's extraction budget refused ends the job here, so
         // nothing more is fetched or decoded for it.
         if self.fail_graph_job_on_breach(job_id) {
@@ -345,6 +403,9 @@ impl Pipeline {
             Ok(moves) => apply_moves(state, &moves),
             Err(error) => warn!(job_id = job_id.0, error = %error, "graph seek round failed"),
         }
+        // What the step landed is said before the stage it moved the job to,
+        // so a file landed by the step that ends the job is said first.
+        self.publish_graph_notes(job_id);
         self.report_graph_phase(job_id);
     }
 }

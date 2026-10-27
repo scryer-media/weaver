@@ -999,6 +999,48 @@ pub(super) struct UuFileAssembly {
     pub(super) filename: Option<String>,
 }
 
+impl Pipeline {
+    // The cursor of a uuencoded file, made on its first part. A restored
+    // job's root already holds the parts laid before the restart, so the
+    // cursor starts where they end.
+    pub(in crate::pipeline) fn uu_file(&mut self, file_id: NzbFileId) -> &mut UuFileAssembly {
+        let graph_jobs = &self.graph_jobs;
+        self.uu_files.entry(file_id).or_insert_with(|| {
+            let (next_index, next_offset, damaged) =
+                Self::graph_ordered_front(graph_jobs, file_id).unwrap_or_default();
+            UuFileAssembly {
+                next_index,
+                next_offset,
+                damaged,
+                ..UuFileAssembly::default()
+            }
+        })
+    }
+
+    // Move the cursor past every ordinal from it on that will never arrive:
+    // no part of it is coming, so the parts behind it are placed one hole
+    // early and the file is damaged from there. The repair, or the file's
+    // verdict, rules on what that leaves.
+    pub(in crate::pipeline) fn pass_given_up_uu(&mut self, file_id: NzbFileId) {
+        let Some(mut next) = self.uu_files.get(&file_id).map(|uu| uu.next_index) else {
+            return;
+        };
+        let from = next;
+        while self.graph_article_given_up(SegmentId {
+            file_id,
+            segment_number: next,
+        }) {
+            next = next.saturating_add(1);
+        }
+        if next != from
+            && let Some(uu) = self.uu_files.get_mut(&file_id)
+        {
+            uu.damaged = true;
+            uu.next_index = next;
+        }
+    }
+}
+
 impl UuFileAssembly {
     // Resident bytes held for parts waiting on their prefix.
     pub(super) fn parked_memory_bytes(&self) -> usize {
@@ -1260,8 +1302,6 @@ pub struct Pipeline {
     // row records the failure kind.
     pub(super) pipeline_failure_stages:
         HashMap<JobId, crate::post_processing::model::PipelineFailureStage>,
-    // Winning archive password candidate per job/RAR set, kept process-local and redacted.
-    pub(super) archive_password_winners: HashMap<(JobId, String), ArchivePasswordCandidate>,
     // Job dispatch order (FIFO by submission). First Downloading job is active.
     pub(super) job_order: Vec<JobId>,
     // Number of in-flight article downloads (primary + recovery).

@@ -19,10 +19,10 @@ use super::restart::run_restarting;
 use super::streams::tar;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::lines::Lines;
-use crate::pipeline::tests::direct_store::multi_member_store_set;
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_store_set, header_encrypted_store_set,
 };
+use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member_store_set};
 use crate::pipeline::tests::{
     TEST_RAR5_SIG, build_test_rar_compressed_file_header, build_test_rar_directory_header,
     build_test_rar_end_header, build_test_rar_file_header, build_test_rar_file_header_with_extra,
@@ -1441,7 +1441,7 @@ async fn a_job_of_three_members_all_withheld_fails() {
         &scenario,
         Graph {
             status: Some(Status::Failed(
-                "lantern.rar, quill.rar, ember.rar needs a password and none was given",
+                "WEAVER_PASSWORD_REQUIRED: lantern.rar, quill.rar, ember.rar needs a password and none was given",
             )),
             kind: Some("Password"),
             files: vec![],
@@ -1556,6 +1556,34 @@ async fn a_partial_job_restarted_after_every_article_ends_partial_with_the_same_
     assert!(restarted.files == whole.files, "the bytes");
 }
 
+// A stored RAR set posted uuencoded beside a PAR2 set, served last article
+// first, an article of its first volume never arriving: the parts after the
+// hole arrive, and wait, before the cursor reaches the hole. The cursor
+// passes it, the parts behind it are placed one hole early, and the set
+// rebuilds the volume, so the member comes out whole.
+#[tokio::test]
+async fn a_uuencoded_volume_whose_article_is_lost_behind_parts_already_in_is_repaired() {
+    let body = noise(9 * ARTICLE + 20, 61);
+    let volumes = single_member_store_set("ember.bin", &body, 2);
+    let described: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = volumes
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    posts.extend(par2_set("ember", &described, 8));
+    let scenario = Scenario::new(posts).uuencoded().lost(0, 3).backwards();
+    let outcome = try_run(&scenario).await.expect("the job settles");
+    assert!(outcome.completed(), "{:?}", outcome.failure);
+    assert!(
+        outcome.files.get(&format!("{FOLDER}/ember.bin")) == Some(&body),
+        "{:?}",
+        outcome.files.keys()
+    );
+}
+
 // A uuencoded file whose fourth article never arrives, with nothing to
 // rebuild it. The loss is heard before the articles after it arrive, so they
 // are placed where the order puts them, one hole early, and the file is
@@ -1582,4 +1610,50 @@ async fn a_uuencoded_file_whose_middle_article_never_arrives_is_damaged_to_its_e
         },
     )
     .await;
+}
+
+// The same file served last article first: the parts after the hole
+// arrive, and wait, before the loss is heard; once the cursor reaches the
+// hole it passes it, and they are placed as when the loss came first.
+#[tokio::test]
+async fn a_uuencoded_file_whose_middle_article_is_lost_behind_parts_already_in_is_damaged_to_its_end()
+ {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", noise(7 * ARTICLE + 20, 61))])
+        .uuencoded()
+        .lost(0, 3)
+        .backwards();
+    run_expecting(
+        &scenario,
+        Graph {
+            status: Some(Status::Failed(
+                "no file was delivered whole; 1 short: ember.bin",
+            )),
+            kind: Some("Unpack"),
+            files: vec![],
+            whole: &[],
+            damaged: &["ember.bin"],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &[],
+            delivered: &[],
+        },
+    )
+    .await;
+}
+
+// The same file beside a PAR2 set: the hole is passed, the parts behind it
+// are placed, and the set rebuilds the file whole.
+#[tokio::test]
+async fn a_uuencoded_file_whose_middle_article_is_lost_behind_parts_already_in_is_repaired() {
+    let body = noise(7 * ARTICLE + 20, 61);
+    let mut posts = vec![Post::plain("ember.bin", body.clone())];
+    posts.extend(par2_set("ember", &[("ember.bin", body.as_slice())], 8));
+    let scenario = Scenario::new(posts).uuencoded().lost(0, 3).backwards();
+    let outcome = try_run(&scenario).await.expect("the job settles");
+    assert!(outcome.completed(), "{:?}", outcome.failure);
+    assert!(
+        outcome.files.get(&format!("{FOLDER}/ember.bin")) == Some(&body),
+        "{:?}",
+        outcome.files.keys()
+    );
 }

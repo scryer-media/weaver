@@ -130,6 +130,9 @@ pub(crate) struct NamespaceWriter {
     renamed: Vec<MemberId>,
     segments: Vec<Segment>,
     placements: Vec<Placement>,
+    // Where the time a member write takes on disk is published, when the
+    // job runs in a pipeline.
+    metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
 }
 
 impl NamespaceWriter {
@@ -152,6 +155,7 @@ impl NamespaceWriter {
             renamed: Vec::new(),
             segments: Vec::new(),
             placements: Vec::new(),
+            metrics: None,
         }
     }
 
@@ -159,6 +163,15 @@ impl NamespaceWriter {
     // and binding here is held to.
     pub(crate) fn capped(mut self, caps: Caps) -> Self {
         self.caps = caps;
+        self
+    }
+
+    // Publish the time each member write takes on disk.
+    pub(crate) fn metered(
+        mut self,
+        metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    ) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -1202,9 +1215,17 @@ impl NamespaceWriter {
             .max(record.length.unwrap_or(0));
         self.admit_file(tree, node, member, end)?;
         let leaf = self.leaf(node, member, &record.output_name)?;
+        let started = std::time::Instant::now();
         leaf.write(offset, bytes, record.length)?;
+        let took = started.elapsed();
         if let Some(length) = record.length.filter(|_| record.is_complete()) {
             leaf.close(length)?;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.disk_write_latency_us.store(
+                u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         Ok(())
     }

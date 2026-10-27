@@ -274,6 +274,33 @@ impl FileAssembly {
         Some(offset.saturating_add(u64::from(len)))
     }
 
+    // Record the extent a damaged copy left on disk once it stands: no further
+    // copy of the ordinal is coming. `declared_end` is the boundary its own
+    // header named, when it named a usable one.
+    pub(crate) fn note_retained_damage(
+        &mut self,
+        segment_number: u32,
+        offset: u64,
+        len: u32,
+        truncation_only: bool,
+        declared_end: Option<u64>,
+    ) {
+        self.damaged_segments.insert(segment_number, (offset, len));
+        match declared_end {
+            Some(end) => {
+                self.declared_damage_ends.insert(segment_number, end);
+            }
+            None => {
+                self.declared_damage_ends.remove(&segment_number);
+            }
+        }
+        if truncation_only {
+            self.truncation_only_damage.insert(segment_number);
+        } else {
+            self.truncation_only_damage.remove(&segment_number);
+        }
+    }
+
     pub(crate) fn segment_has_retained_damage(&self, segment_number: u32) -> bool {
         self.damaged_segments.contains_key(&segment_number)
     }

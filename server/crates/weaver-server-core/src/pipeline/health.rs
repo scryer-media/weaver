@@ -105,33 +105,29 @@ impl Pipeline {
     }
 
     fn prepare_failed_job_runtime(&mut self, job_id: JobId, error: &str, preserve_staging: bool) {
-        let (staging_dir, released_repair, released_extract) =
-            if let Some(state) = self.jobs.get_mut(&job_id) {
-                let released_repair = matches!(state.status, JobStatus::Repairing);
-                let released_extract = matches!(state.status, JobStatus::Extracting);
-                state.queued_repair_at_epoch_ms = None;
-                state.queued_extract_at_epoch_ms = None;
-                state.paused_resume_status = None;
-                state.paused_resume_download_state = None;
-                state.paused_resume_post_state = None;
-                state.set_failure(error.to_string());
-                // Clear per-job queues to free memory.
-                state.download_queue = DownloadQueue::new();
-                state.recovery_queue = DownloadQueue::new();
-                let staging_dir = if preserve_staging {
-                    None
-                } else {
-                    state.staging_dir.take()
-                };
-                (staging_dir, released_repair, released_extract)
+        let (staging_dir, released) = if let Some(state) = self.jobs.get_mut(&job_id) {
+            let released = state.post_state;
+            state.queued_repair_at_epoch_ms = None;
+            state.queued_extract_at_epoch_ms = None;
+            state.paused_resume_status = None;
+            state.paused_resume_download_state = None;
+            state.paused_resume_post_state = None;
+            state.set_failure(error.to_string());
+            // Clear per-job queues to free memory.
+            state.download_queue = DownloadQueue::new();
+            state.recovery_queue = DownloadQueue::new();
+            let staging_dir = if preserve_staging {
+                None
             } else {
-                (None, false, false)
+                state.staging_dir.take()
             };
-        if released_repair {
-            self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
-        }
-        if released_extract {
-            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
+            (staging_dir, Some(released))
+        } else {
+            (None, None)
+        };
+        if let Some(released) = released {
+            self.metrics
+                .post_state_moved(released, crate::jobs::model::PostState::Failed);
         }
         // Clean up staging directory if it was created.
         if let Some(staging) = staging_dir {

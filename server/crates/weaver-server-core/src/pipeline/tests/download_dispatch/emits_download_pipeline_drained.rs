@@ -1893,3 +1893,80 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 2);
     assert!(ack_rx.try_recv().is_ok());
 }
+
+#[tokio::test]
+async fn emits_download_pipeline_drained_once_before_later_completion_events() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut events = pipeline.event_tx.subscribe();
+    let job_id = JobId(20011);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        JobSpec {
+            name: "Drain Pending Buffers".to_string(),
+            password: None,
+            files: vec![],
+            total_bytes: 0,
+            category: None,
+            metadata: vec![],
+        },
+    )
+    .await;
+
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.pending_decode.push_back(PendingDecodeWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        },
+        raw: Bytes::from_static(b"pending"),
+        source_server_idx: None,
+        exclude_servers: Vec::new(),
+    });
+
+    pipeline.emit_download_finished_if_active(job_id);
+    assert!(pipeline.jobs_finalizing_download.contains(&job_id));
+
+    pipeline.pending_decode.clear();
+    pipeline.schedule_job_completion_check(job_id);
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(matches!(
+        drained_events.first(),
+        Some(PipelineEvent::DownloadFinished {
+            finalization_pending: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        drained_events
+            .iter()
+            .filter(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+            .count(),
+        1
+    );
+    let drained_idx = drained_events
+        .iter()
+        .position(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+        .expect("download pipeline drained event");
+    let next_stage_idx = drained_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                PipelineEvent::MoveToCompleteStarted { .. }
+                    | PipelineEvent::JobVerificationStarted { .. }
+                    | PipelineEvent::RepairStarted { .. }
+                    | PipelineEvent::ExtractionReady { .. }
+                    | PipelineEvent::JobCompleted { .. }
+            )
+        })
+        .expect("later completion event");
+    assert!(drained_idx < next_stage_idx, "events: {drained_events:?}");
+    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
+}

@@ -15,7 +15,7 @@
 
 use std::fmt;
 
-use weaver_graph::{Builder, Effect, Marked, NodeId};
+use weaver_graph::{Builder, Effect, Marked, NodeId, Why};
 
 use super::GraphJob;
 
@@ -81,6 +81,28 @@ impl Passwords {
 }
 
 impl GraphJob {
+    // The candidate that opened an object: the one last offered to a node
+    // that named its members under it and withheld none of its volumes for
+    // want of a password. Read once the job is settled, when no object is
+    // still trying an offer. `None` when no object needed a password or
+    // none opened.
+    pub(crate) fn opening_password(&self) -> Option<&str> {
+        let password =
+            |why: Option<Why>| matches!(why, Some(Why::Encrypted | Why::EncryptedHeader));
+        self.passwords.offered.iter().find_map(|(node, offered)| {
+            let candidate = self.passwords.candidates.get(offered.checked_sub(1)?)?;
+            let record = self.tree.record(*node)?;
+            let withheld = password(record.reason)
+                || record.parent.is_some_and(|parent| {
+                    record
+                        .volumes
+                        .iter()
+                        .any(|(_, member)| password(self.writer.refused(parent, *member)))
+                });
+            (!withheld && !record.members.is_empty()).then_some(candidate.as_str())
+        })
+    }
+
     // How many candidates each node has been offered, by node.
     #[cfg(test)]
     pub(crate) fn passwords_offered(&self) -> std::collections::BTreeMap<NodeId, usize> {

@@ -1,10 +1,10 @@
 {
   "slug": "dead-post-recovery-unobtainable",
   "title": "Ember.Latitude.S03E05.2026.1080p.WEB-DL.H264-DEADPOST",
-  "description": "The same dead posting with too few files to be judged on its leading articles: four RAR volumes and five PAR2 sidecars, every article deleted from both servers. The health verdict has to decide it. The NZB advertises fifteen recovery blocks, but none of them can be fetched, so the job fails below critical instead of waiting on recovery that cannot arrive.",
+  "description": "The same dead posting with recovery advertised: four RAR volumes and five PAR2 sidecars, every article deleted from both servers. The NZB advertises fifteen recovery blocks, but none of them can be fetched, so the job fails once every article is booked missing instead of waiting on recovery that cannot arrive.",
   "category": "2000",
   "expected_outcome": "health_failure",
-  "expectedErrorContains": "below critical",
+  "expectedErrorContains": "no file was delivered whole",
   "fixtureAssets": [
     "par2-multivolume/archive.part1.rar",
     "par2-multivolume/archive.part2.rar",

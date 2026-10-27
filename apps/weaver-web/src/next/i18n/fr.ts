@@ -522,7 +522,7 @@ export const nextFr: LocaleDictionary = {
   "next.logs.filter.label": "Niveau de journal",
   "next.logs.filter.preset.default": "Par défaut",
   "next.logs.filter.preset.download": "Débogage des téléchargements",
-  "next.logs.filter.preset.directStore": "Débogage direct-store",
+  "next.logs.filter.preset.graphEngine": "Débogage du moteur de graphe",
   "next.logs.filter.preset.everything": "Tout en débogage",
   "next.logs.filter.preset.custom": "Personnalisé",
   "next.logs.filter.directives": "Directives de filtre",

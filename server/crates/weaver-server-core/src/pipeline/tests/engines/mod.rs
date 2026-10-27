@@ -99,6 +99,7 @@ mod sfv;
 mod solid_hex;
 mod spent;
 mod split;
+mod stage_events;
 mod streams;
 mod unnamed_index;
 mod zip;

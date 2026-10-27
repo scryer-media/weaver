@@ -21,7 +21,7 @@ use crate::member::{Member, MemberId, Namespace};
 use crate::names::{Moved, NameLedger, Position};
 use crate::object::{Carried, Extent, Kind, Located, Object, ObjectId, Placement, Posting};
 use crate::recovery::Recovery;
-use crate::seek::{Pull, Seek, SeekUp};
+use crate::seek::{Pull, Seek, SeekUp, When};
 use crate::sniff::{Sniff, signed, sniff};
 use crate::volume::{ByteRange, VolumeIndex};
 
@@ -1292,6 +1292,9 @@ impl Tree {
         {
             object.renamed(volume, &name);
         }
+        if self.founded_by_name(child) && !self.still_claims(node, child, member, volume) {
+            return self.release_named(node, child, (volume, member), builder, effects);
+        }
         let unowned: Vec<(MemberId, Vec<u8>)> = self
             .namespace(node)
             .map(|namespace| {
@@ -1311,6 +1314,73 @@ impl Tree {
         if !self.founded_by_name(child) {
             self.take_named(node, child, effects);
         }
+    }
+
+    // Whether the object at `child`, held by names alone, still places
+    // `member` at `volume` by the name the member carries now, or that name
+    // still says the member is the object's kind.
+    fn still_claims(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        member: MemberId,
+        volume: VolumeIndex,
+    ) -> bool {
+        let Some((name, length, front)) = self.namespace(node).and_then(|namespace| {
+            namespace.get(member).map(|record| {
+                (
+                    record.name.clone(),
+                    record.length,
+                    namespace.first_bytes(member).to_vec(),
+                )
+            })
+        }) else {
+            return true;
+        };
+        let kind = self.kind(child);
+        self.nodes
+            .get_mut(&child)
+            .and_then(|found| found.object.as_mut())
+            .is_none_or(|object| object.claim(&name, &front, length) == Some(volume))
+            || kind.is_some_and(|kind| sniff(&name, &front, length) == Sniff::Object(kind))
+    }
+
+    // A name was all that held `member` as `volume` of the object at
+    // `child`, and its new name places it there no more: the volume leaves
+    // the object as one a founded sibling takes does, the member's file its
+    // own and nothing copied, and the member is asked again who owns it. An
+    // object left with no volume goes.
+    fn release_named(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        (volume, member): (VolumeIndex, MemberId),
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let mut empty = false;
+        if let Some(found) = self.nodes.get_mut(&child) {
+            if let Some(binding) = found.binding.as_mut() {
+                binding.volumes.remove(&volume);
+                binding.awaiting.remove(&volume);
+                empty = binding.volumes.is_empty();
+            }
+            if let Some(object) = found.object.as_mut() {
+                object.taken(volume);
+            }
+        }
+        if let Some(found) = self.nodes.get_mut(&node) {
+            found.children.remove(&member);
+            found.namespace.unbind(member);
+        }
+        effects.push(Effect::GivenBack {
+            node,
+            member,
+            from: child,
+            volume,
+        });
+        self.forget_empty(child, empty);
+        self.identify_again(node, member, builder, effects);
     }
 
     // The object at `node` gives volumes back, every one it named in one
@@ -2624,6 +2694,18 @@ impl Tree {
                 pulled = pulled.fold(ask.unseekable());
                 continue;
             };
+            // A window's set that covers the member it sits in rules on that
+            // member only once all of it is in, its own recovery bytes with
+            // it: deferring them would hold back the ruling that asks for
+            // them, so the deferral parks nothing.
+            if ask.when == When::Deferred
+                && self.window(at).is_some()
+                && self
+                    .recovery(at)
+                    .is_some_and(|recovery| recovery.covers(member))
+            {
+                continue;
+            }
             // A seek past the end of a window asks for nothing that is the
             // node's.
             let Some(range) = self

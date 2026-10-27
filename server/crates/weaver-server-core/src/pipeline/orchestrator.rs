@@ -15,3 +15,5 @@ mod state;
 pub(super) use commands::CancelJobsDone;
 pub(crate) use runtime::is_terminal_status;
 pub(super) use runtime::timestamp_secs;
+#[cfg(test)]
+pub(super) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};

@@ -3,6 +3,63 @@
 
 use super::*;
 
+// A job dispatch will not serve is re-visited by every dispatch pass, and
+// passes come in bursts. Reporting it once per pass wrote hundreds of
+// identical lines a second — synchronously, on the pipeline actor thread —
+// for as long as it lasted. One line a job a window is the budget.
+#[tokio::test]
+async fn an_ineligible_job_reports_at_most_once_a_window() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(41601);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Withheld Job", &many_standalone_files("withheld", 4)),
+    )
+    .await;
+
+    // Articles queued, a status that dispatches, and still nothing handed out:
+    // this is the shape the stall reports. Here the job holds no admission.
+    pipeline.nzb_admitted.remove(&job_id);
+    assert!(!pipeline.jobs[&job_id].download_queue.is_empty());
+
+    // Every pass runs at an instant the test names, so the window is the
+    // passes', not the machine's.
+    let now = std::time::Instant::now();
+    pipeline.dispatch_downloads_at(now);
+    assert_eq!(
+        pipeline
+            .dispatch_ineligible_log_throttle
+            .last_emitted_at(job_id),
+        Some(now),
+        "the first pass of a window reports the stalled job"
+    );
+
+    let window = crate::pipeline::download::DISPATCH_INELIGIBLE_LOG_INTERVAL;
+    let last_inside = now + window - std::time::Duration::from_millis(1);
+    for _ in 0..64 {
+        pipeline.dispatch_downloads_at(now);
+    }
+    pipeline.dispatch_downloads_at(last_inside);
+    assert_eq!(
+        pipeline
+            .dispatch_ineligible_log_throttle
+            .last_emitted_at(job_id),
+        Some(now),
+        "every later pass inside the window is counted, not logged again"
+    );
+
+    pipeline.dispatch_downloads_at(now + window);
+    assert_eq!(
+        pipeline
+            .dispatch_ineligible_log_throttle
+            .last_emitted_at(job_id),
+        Some(now + window),
+        "the first pass of the next window reports it again"
+    );
+}
+
 // A job whose download is over has nothing for dispatch to hand out, whether
 // it is extracting, verifying or moving its output. Reporting each one as a
 // dispatch stall — with a dump of its recent debug lines — filled the log with

@@ -33,7 +33,9 @@ const (
 )
 
 const (
-	restartExtractDelayEnv = "WEAVER_E2E_DELAY=extract.member_start=20000"
+	// An archive's engine still producing members once every volume it reads
+	// is in: the job is extracting, so it cannot terminalize.
+	restartExtractDelayEnv = "WEAVER_E2E_DELAY=status.enter_extracting=20000"
 	restartPar2AliasSet    = "a31f592e0b874d3ea8c44161b77f3049"
 )
 
@@ -2262,7 +2264,7 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 		return restartCaseResult{}, err
 	}
 
-	// The restart point is the member-extraction delay hook, not "the database
+	// The restart point is the extracting-phase delay hook, not "the database
 	// has a row and the job is not terminal yet". The case asserts that nothing
 	// is refetched after the restart, which only holds once every article is
 	// already durable; and a bare "not terminal yet" predicate matches the
@@ -2270,8 +2272,10 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 	// terminal status while the pre-crash evidence is still being captured, and
 	// the case silently turns into a check of what survives in history. Parking
 	// the process inside the extraction delay pins both ends: downloads are
-	// complete and the job provably cannot terminalize before the kill.
-	if _, err := waitForDelayHookRestartPoint(ctx, []int{jobID}, "extract.member_start", 3*time.Minute); err != nil {
+	// complete and the job provably cannot terminalize before the kill. An
+	// archive's engine starts reading while its volumes still arrive, so the
+	// hook fires once every volume it reads is in, not at the engine's start.
+	if _, err := waitForDelayHookRestartPoint(ctx, []int{jobID}, "status.enter_extracting", 3*time.Minute); err != nil {
 		return restartCaseResult{}, fmt.Errorf("wait for completed-download restart point: %w", err)
 	}
 	if err := ctx.killWeaverForRestart(); err != nil {
@@ -2504,7 +2508,7 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	preDB, err := waitForDelayHookRestartPoint(ctx, jobIDs, "extract.member_start", 2*time.Minute)
+	preDB, err := waitForDelayHookRestartPoint(ctx, jobIDs, "status.enter_extracting", 2*time.Minute)
 	if err != nil {
 		return restartCaseResult{}, fmt.Errorf("wait for extract restart point: %w", err)
 	}

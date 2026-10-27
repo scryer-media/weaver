@@ -81,6 +81,8 @@ pub(crate) struct Storage {
     pub(crate) caps: Caps,
     // How deep the job's namespaces may nest, the root's being 0.
     pub(crate) nesting: u32,
+    // Where the job's writes publish what they take, in a pipeline.
+    pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
 }
 
 pub(crate) struct GraphJob {
@@ -95,6 +97,15 @@ pub(crate) struct GraphJob {
     reported: Option<RootPhase>,
     // The checkpoint waiting for the database, if one is.
     pending: Pending,
+    // What the job did since the pipeline last asked, for its events.
+    notes: Vec<Note>,
+}
+
+// Something a step of the job did that the job's events say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Note {
+    // Every article of a posted file was fetched or lost.
+    Landed(VolumeIndex),
 }
 
 // A root member as the post lists it.
@@ -121,7 +132,8 @@ impl GraphJob {
             storage.accountant,
             storage.free_disk,
         )
-        .capped(storage.caps);
+        .capped(storage.caps)
+        .metered(storage.metrics);
         Self::new(
             files,
             Box::new(weaver_objects::Objects),
@@ -176,7 +188,18 @@ impl GraphJob {
             passwords: Passwords::default(),
             reported: None,
             pending: Pending::default(),
+            notes: Vec::new(),
         }
+    }
+
+    // What the job did since this was last asked.
+    pub(crate) fn take_notes(&mut self) -> Vec<Note> {
+        std::mem::take(&mut self.notes)
+    }
+
+    // The phase the job last reported, if it reported one.
+    pub(crate) fn reported_phase(&self) -> Option<RootPhase> {
+        self.reported
     }
 
     // The candidates offered to an object that asks for a password.
@@ -384,7 +407,19 @@ impl GraphJob {
         self.root.map.arrived_before(queued);
     }
 
-    // The class the root fetches an article under now.
+    // Whether the root holds the article or has ruled it lost.
+    pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
+        self.root.map.article_settled(volume, ordinal)
+    }
+
+    pub(crate) fn article_lost(&self, volume: VolumeIndex, ordinal: u32) -> bool {
+        self.root.map.article_lost(volume, ordinal)
+    }
+
+    pub(crate) fn ordered_front(&self, volume: VolumeIndex) -> (u32, u64, bool) {
+        self.root.map.ordered_front(volume)
+    }
+
     pub(crate) fn article_class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
         self.root.map.class(volume, ordinal)
     }
@@ -473,6 +508,7 @@ impl GraphJob {
                 &mut out,
             )?;
             self.heard(out)?;
+            self.notes.push(Note::Landed(volume));
         }
         Ok(())
     }

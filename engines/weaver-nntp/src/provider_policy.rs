@@ -25,6 +25,9 @@ pub enum ArticleEligibility {
     Eligible(ProviderGroup),
     Excluded,
     Unavailable,
+    // Up and taking this pool's credentials, but short of the article's
+    // estimate in its remaining quota.
+    OutOfQuota,
     HigherPriority(ProviderGroup),
     BackfillProtected,
 }
@@ -90,8 +93,11 @@ impl ProviderPolicy {
         let Some(state) = self.servers.get(server) else {
             return ArticleEligibility::Unavailable;
         };
-        if !state.available || state.refuses_credentials || state.quota_remaining < bytes.max(1) {
+        if !state.available || state.refuses_credentials {
             return ArticleEligibility::Unavailable;
+        }
+        if state.quota_remaining < bytes.max(1) {
+            return ArticleEligibility::OutOfQuota;
         }
         match self.eligible_group(failures, retention, bytes) {
             Some(group) if group == state.group => ArticleEligibility::Eligible(group),
@@ -246,6 +252,20 @@ mod tests {
         for state in &mut policy.servers[..8] {
             state.quota_remaining = 511;
         }
+        assert_eq!(
+            policy.eligibility(0, &[], &[], 512),
+            ArticleEligibility::OutOfQuota
+        );
+        policy.servers[1].available = false;
+        assert_eq!(
+            policy.eligibility(1, &[], &[], 512),
+            ArticleEligibility::Unavailable
+        );
+        policy.servers[2].refuses_credentials = true;
+        assert_eq!(
+            policy.eligibility(2, &[], &[], 512),
+            ArticleEligibility::Unavailable
+        );
         assert!(matches!(
             policy.eligibility(8, &[], &[], 512),
             ArticleEligibility::Eligible(_)

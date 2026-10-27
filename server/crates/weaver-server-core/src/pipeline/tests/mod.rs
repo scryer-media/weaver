@@ -44,10 +44,12 @@ macro_rules! segment_spec {
     };
 }
 
+mod archive_passwords;
 mod archive_topology;
 mod cancel_batch;
 mod control_lifecycle;
 mod core;
+mod decode_stage;
 mod direct_store;
 mod download_dispatch;
 mod engines;
@@ -64,6 +66,7 @@ mod restore_history;
 mod script_events;
 mod server_attribution;
 mod terminal_settlement;
+mod uu_assembly;
 mod yenc_compatibility;
 
 impl Pipeline {

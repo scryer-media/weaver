@@ -474,6 +474,46 @@ impl ArticleMap {
         }
     }
 
+    // Whether the article is in hand or lost for good. An article the map
+    // does not hold was never posted here, so nothing has settled it.
+    pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
+        self.volumes.get(volume.0 as usize).is_some_and(|found| {
+            found
+                .index(ordinal)
+                .is_some_and(|index| found.articles[index].state != State::Waiting)
+        })
+    }
+
+    // Whether every server failed the article.
+    pub(crate) fn article_lost(&self, volume: VolumeIndex, ordinal: u32) -> bool {
+        self.volumes.get(volume.0 as usize).is_some_and(|found| {
+            found
+                .index(ordinal)
+                .is_some_and(|index| matches!(found.articles[index].state, State::Lost { .. }))
+        })
+    }
+
+    // Where a reader laying the volume in order stands: the first article
+    // still to come, the decoded offset it is laid at, and whether an
+    // article before it was lost. An article in hand whose range this run
+    // never saw stops the walk, as nothing says where it ends.
+    pub(crate) fn ordered_front(&self, volume: VolumeIndex) -> (u32, u64, bool) {
+        let mut front = (0, 0, false);
+        let Some(found) = self.volumes.get(volume.0 as usize) else {
+            return front;
+        };
+        for article in &found.articles {
+            front.0 = article.ordinal;
+            match article.state {
+                State::Arrived(Some(range)) => front.1 = range.end,
+                State::Lost { .. } => front.2 = true,
+                State::Waiting | State::Arrived(None) => return front,
+            }
+            front.0 = article.ordinal.saturating_add(1);
+        }
+        front
+    }
+
     // The class the article is fetched under now.
     pub(crate) fn class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
         let found = self.volumes.get(volume.0 as usize)?;

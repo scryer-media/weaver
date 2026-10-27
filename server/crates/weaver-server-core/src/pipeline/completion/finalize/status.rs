@@ -228,15 +228,7 @@ impl Pipeline {
                 }
             }
         };
-        let (
-            transitioned,
-            persisted_snapshot_changed,
-            persist_runtime_to_db,
-            released_repair,
-            released_extract,
-            entered_repair,
-            entered_extract,
-        ) = {
+        let (transitioned, persisted_snapshot_changed, persist_runtime_to_db, moved) = {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return;
             };
@@ -254,18 +246,6 @@ impl Pipeline {
                 || old_download_state != new_download_state
                 || old_post_state != new_post_state
                 || old_run_state != new_run_state;
-            let released_repair =
-                matches!(old_post_state, crate::jobs::model::PostState::Repairing)
-                    && !matches!(new_post_state, crate::jobs::model::PostState::Repairing);
-            let released_extract =
-                matches!(old_post_state, crate::jobs::model::PostState::Extracting)
-                    && !matches!(new_post_state, crate::jobs::model::PostState::Extracting);
-            let entered_repair =
-                !matches!(old_post_state, crate::jobs::model::PostState::Repairing)
-                    && matches!(new_post_state, crate::jobs::model::PostState::Repairing);
-            let entered_extract =
-                !matches!(old_post_state, crate::jobs::model::PostState::Extracting)
-                    && matches!(new_post_state, crate::jobs::model::PostState::Extracting);
             let now = crate::jobs::model::epoch_ms_now();
             if let JobStatus::Failed { error } = &new_status {
                 state.failure_error = Some(error.clone());
@@ -320,25 +300,11 @@ impl Pipeline {
                 transitioned,
                 persisted_snapshot_changed,
                 persist_runtime_to_db,
-                released_repair,
-                released_extract,
-                entered_repair,
-                entered_extract,
+                (old_post_state, new_post_state),
             )
         };
 
-        if released_repair {
-            self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
-        }
-        if released_extract {
-            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-        }
-        if entered_repair {
-            self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
-        }
-        if entered_extract {
-            self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-        }
+        self.metrics.post_state_moved(moved.0, moved.1);
         if let Some(persist_status) = persist_status {
             let changed_label = if persisted_snapshot_changed {
                 "changed"

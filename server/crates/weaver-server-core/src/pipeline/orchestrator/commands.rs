@@ -495,6 +495,7 @@ impl Pipeline {
     // Drops a cancelled job's runtime state once its archive has committed.
     fn purge_cancelled_job_runtime(&mut self, job_id: JobId) -> Option<JobState> {
         let state = self.jobs.remove(&job_id)?;
+        self.metrics.post_state_left(state.post_state);
         self.retire_stalled_download_lanes(job_id);
         self.job_order.retain(|id| *id != job_id);
         self.remove_pending_completion_check(job_id);

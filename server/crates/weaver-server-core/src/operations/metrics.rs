@@ -505,6 +505,43 @@ pub struct PipelineMetrics {
 }
 
 impl PipelineMetrics {
+    // A job's post-processing lane moved: the gauges of the jobs verifying,
+    // repairing and extracting follow it, each counting the jobs in its lane.
+    pub fn post_state_moved(
+        &self,
+        from: crate::jobs::model::PostState,
+        to: crate::jobs::model::PostState,
+    ) {
+        if from == to {
+            return;
+        }
+        self.post_state_left(from);
+        if let Some(gauge) = self.post_state_gauge(to) {
+            gauge.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // A job left its post-processing lane for none: it was cancelled or
+    // removed. A gauge never counts below zero, so a lane left that was
+    // never counted cannot wrap it.
+    pub fn post_state_left(&self, from: crate::jobs::model::PostState) {
+        if let Some(gauge) = self.post_state_gauge(from) {
+            let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_sub(1)
+            });
+        }
+    }
+
+    fn post_state_gauge(&self, state: crate::jobs::model::PostState) -> Option<&AtomicUsize> {
+        use crate::jobs::model::PostState;
+        match state {
+            PostState::Verifying => Some(&self.verify_active),
+            PostState::Repairing => Some(&self.repair_active),
+            PostState::Extracting => Some(&self.extract_active),
+            _ => None,
+        }
+    }
+
     // Publish the in-flight article count; waiters on a drain wake at zero.
     pub fn set_active_downloads(&self, active: usize) {
         let previous = self.active_downloads.swap(active, Ordering::AcqRel);

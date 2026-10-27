@@ -427,6 +427,13 @@ impl Pipeline {
             self.release_settled_unanchored_runs().await;
             return;
         }
+        self.release_ready_uu_parts(file_id).await;
+    }
+
+    // Write every parked uuencode part the file's cursor has reached, each
+    // through the ordinary placement path, which moves the cursor on to the
+    // next.
+    async fn release_ready_uu_parts(&mut self, file_id: NzbFileId) {
         loop {
             let next = match self.take_next_ready_uu_segment(file_id).await {
                 Ok(next) => next,
@@ -633,10 +640,10 @@ impl Pipeline {
                     Some(0)
                 } else {
                     let predecessor = segment_id.segment_number - 1;
-                    // A part given up with damaged bytes still on disk knows
+                    // A part given up, or whose damaged copy stands, knows
                     // where it ended; assembly only needs to be told that no
                     // further copy of it is coming.
-                    let settled = self.segment_terminal_states.contains_key(&SegmentId {
+                    let settled = self.ordinal_settled(SegmentId {
                         file_id,
                         segment_number: predecessor,
                     });
@@ -729,19 +736,19 @@ impl Pipeline {
             let unresolved_replacement =
                 !part_crc_verified && held_damage.0 && !(!truncation_suspected && held_damage.1);
             let retain_damage = !crc_valid || truncation_suspected || unresolved_replacement;
+            // A late corrupt duplicate must not replace bytes the root already
+            // holds (or their placement), nor stand in for an article it has
+            // ruled lost.
+            if (!crc_valid || truncation_suspected) && self.graph_article_settled(segment_id) {
+                debug!(segment = %segment_id, "damaged copy of a settled article; dropped");
+                return;
+            }
             let mut conflict = match self
                 .jobs
                 .get_mut(&job_id)
                 .and_then(|state| state.assembly.file_mut(file_id))
             {
                 Some(file) => {
-                    // A late corrupt duplicate must not replace bytes already
-                    // committed by a good response (or their placement).
-                    if (!crc_valid || truncation_suspected)
-                        && file.has_segment(segment_id.segment_number)
-                    {
-                        return;
-                    }
                     if retain_damage {
                         None
                     } else {
@@ -857,6 +864,24 @@ impl Pipeline {
                 yenc_layout.file_size,
                 &segments,
             );
+            if retain_damage && !encoding.is_uu() {
+                // The damaged copy stands. Its extent, and the range its header
+                // named, still say where the part behind it begins.
+                if let Some(file) = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .and_then(|state| state.assembly.file_mut(file_id))
+                {
+                    file.note_retained_damage(
+                        segment_id.segment_number,
+                        file_offset,
+                        decoded_size,
+                        crc_valid && truncation_suspected,
+                        declared_part_end(expected_layout, yenc_layout),
+                    );
+                }
+                self.settle_unanchored_behind(segment_id);
+            }
             if !crc_valid {
                 self.metrics.crc_errors.fetch_add(1, Ordering::Relaxed);
             }
@@ -889,7 +914,7 @@ impl Pipeline {
     // been reasoning about, so changing identity mid-file would be the more
     // surprising answer.
     fn note_uu_filename(&mut self, file_id: NzbFileId, name: &str) {
-        let uu = self.uu_files.entry(file_id).or_default();
+        let uu = self.uu_file(file_id);
         if uu.filename.is_none() {
             uu.filename = Some(name.to_string());
         }
@@ -915,7 +940,7 @@ impl Pipeline {
             .and_then(|state| state.assembly.file(file_id))
             .and_then(|file| file.placement_of(segment_number));
 
-        let uu = self.uu_files.entry(file_id).or_default();
+        let uu = self.uu_file(file_id);
         uu.damaged |= facts.damaged;
         uu.saw_end |= facts.ended;
 
@@ -931,6 +956,7 @@ impl Pipeline {
             let offset = uu.next_offset;
             uu.next_index = uu.next_index.saturating_add(1);
             uu.next_offset = uu.next_offset.saturating_add(decoded_len as u64);
+            self.pass_given_up_uu(file_id);
             return UuPlacement::Place(offset);
         }
 
@@ -1199,7 +1225,7 @@ impl Pipeline {
         {
             return None;
         }
-        let settled = self.segment_terminal_states.contains_key(&SegmentId {
+        let settled = self.ordinal_settled(SegmentId {
             file_id,
             segment_number: predecessor,
         });
@@ -1218,6 +1244,17 @@ impl Pipeline {
         }
         self.release_write_buffered(entry.0.data.len_bytes(), 1);
         Some(entry)
+    }
+
+    // Whether no further copy of the ordinal is coming: it was given up, or
+    // its damaged copy stands.
+    fn ordinal_settled(&self, segment_id: SegmentId) -> bool {
+        self.segment_terminal_states.contains_key(&segment_id)
+            || self
+                .jobs
+                .get(&segment_id.file_id.job_id)
+                .and_then(|state| state.assembly.file(segment_id.file_id))
+                .is_some_and(|file| file.segment_has_retained_damage(segment_id.segment_number))
     }
 
     // Parked articles that were waiting on `segment_id`, which has just been
@@ -1258,6 +1295,10 @@ impl Pipeline {
     pub(crate) async fn release_settled_unanchored_runs(&mut self) {
         while let Some(settled) = self.pending_unanchored_release.pop() {
             let file_id = settled.file_id;
+            if self.uu_files.contains_key(&file_id) {
+                self.release_ready_uu_parts(file_id).await;
+                continue;
+            }
             let mut anchor = settled.segment_number;
             while let Some((result, source)) = self.take_unanchored_successor(file_id, anchor) {
                 anchor = result.segment_id.segment_number;

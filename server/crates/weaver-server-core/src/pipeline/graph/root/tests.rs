@@ -840,6 +840,108 @@ fn a_uu_root_answers_only_for_its_front() {
     assert!(root.map.take_moves().is_empty());
 }
 
+// Settled means in hand or lost for good. An article the root does not
+// hold, of a volume or an ordinal the post never listed or of a job that has
+// gone, has settled nothing, so a damaged copy of it is not dropped as late.
+#[tokio::test]
+async fn only_an_article_the_root_holds_in_hand_or_lost_is_settled() {
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    root.receive(decoded(0, 0, 0, &[7; 90], Some(270)));
+    root.map.lost(VolumeIndex(0), 1);
+    assert!(root.map.article_settled(VolumeIndex(0), 0), "in hand");
+    assert!(root.map.article_settled(VolumeIndex(0), 1), "lost");
+    assert!(
+        !root.map.article_settled(VolumeIndex(0), 2),
+        "still to come"
+    );
+    assert!(
+        !root.map.article_settled(VolumeIndex(0), 9),
+        "no such ordinal"
+    );
+    assert!(
+        !root.map.article_settled(VolumeIndex(4), 0),
+        "no such volume"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_005);
+    let spec = spec(
+        "lantern settled",
+        vec![
+            ("lantern.bin".to_string(), FileRole::Standalone, 2),
+            ("lantern.dat".to_string(), FileRole::Standalone, 2),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.book_terminal_segment(segment_id(job_id, 0, 0), SegmentTerminalState::Missing);
+    assert!(
+        pipeline.graph_article_settled(segment_id(job_id, 0, 0)),
+        "lost"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(job_id, 0, 1)),
+        "to come"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(job_id, 0, 7)),
+        "no such ordinal"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(job_id, 5, 0)),
+        "no such file"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(JobId(91_006), 0, 0)),
+        "no such job"
+    );
+}
+
+// A step that landed a file and then failed: the file is said to have
+// landed before the job fails, as one whose download ended.
+#[tokio::test]
+async fn a_file_landed_by_a_step_that_errs_is_still_said() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_007);
+    let spec = spec(
+        "lantern errs",
+        vec![
+            ("lantern.bin".to_string(), FileRole::Standalone, 1),
+            ("lantern.dat".to_string(), FileRole::Standalone, 2),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut events = pipeline.event_tx.subscribe();
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .lost(VolumeIndex(0), 0, &mut RepairSlots::default(), 1)
+        .unwrap();
+    let failed = crate::pipeline::graph::job::GraphError::Write(
+        crate::pipeline::graph::namespace::WriteError::UnknownMember {
+            node: NodeId::ROOT,
+            member: MemberId(9),
+        },
+    );
+    pipeline.after_graph_result(job_id, Err(failed));
+    let mut landed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let crate::events::model::PipelineEvent::FileComplete { filename, .. } = event {
+            landed.push(filename);
+        }
+    }
+    assert_eq!(landed, ["lantern.bin"]);
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. })),
+        "the step's error failed the job"
+    );
+}
+
 type Held = std::collections::BTreeMap<u64, Arc<[u8]>>;
 
 fn held(parts: Vec<weaver_graph::Part>) -> Held {

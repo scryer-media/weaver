@@ -546,7 +546,7 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
             .collect(),
         ..Delivery::default()
     };
-    let password = "lantern.rar needs a password and none was given";
+    let password = "WEAVER_PASSWORD_REQUIRED: lantern.rar needs a password and none was given";
     for why in [Why::Encrypted, Why::EncryptedHeader] {
         assert_eq!(
             withheld(&[], &[("lantern.rar", why)]).status(None),
@@ -567,7 +567,7 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
         .withheld_error()
         .as_deref(),
         Some(
-            "lantern.part1.rar, lantern.part2.rar needs a password and none was given; \
+            "WEAVER_PASSWORD_REQUIRED: lantern.part1.rar, lantern.part2.rar needs a password and none was given; \
              ember.7z never placed every member it named"
         )
     );
