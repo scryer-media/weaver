@@ -198,12 +198,27 @@ pub(crate) fn repaired_slices(
 // set never excuses another's. Each set is judged in the namespace it lives
 // in, at whatever depth. A breach of the job's extraction budget fails the
 // job before any of that: it carries the budget's refusal, worded as the
-// job's failure reason, and names no object.
+// job's failure reason, and names no object. When no set failed and the
+// feed gave the post up, the failure is the feed's, in its words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
     pub(crate) objects: Vec<NodeId>,
     pub(crate) message: String,
     pub(crate) rejection: Option<ExtractionFailure>,
+    // The words are the feed's: it gave the post up.
+    pub(crate) from_feed: bool,
+}
+
+impl Failure {
+    // The feed gave the post up, in these words.
+    pub(crate) fn post_given_up(words: String) -> Self {
+        Self {
+            objects: Vec::new(),
+            message: words,
+            rejection: None,
+            from_feed: true,
+        }
+    }
 }
 
 pub(crate) fn failure(
@@ -216,6 +231,7 @@ pub(crate) fn failure(
             objects: Vec::new(),
             message: rejection.job_failure_reason(),
             rejection: Some(rejection.clone()),
+            from_feed: false,
         });
     }
     let ruled: Vec<(&SetSummary, RepairOutcome)> =
@@ -264,6 +280,7 @@ pub(crate) fn failure(
         objects: failed.iter().map(|(set, _, _)| set.node).collect(),
         message,
         rejection: None,
+        from_feed: false,
     })
 }
 

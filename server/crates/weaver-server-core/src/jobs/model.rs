@@ -387,6 +387,16 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    // Whether the job is still being worked through: queued, downloading,
+    // or verifying, repairing or extracting what came. A pause, a failure or
+    // anything after that work is done belongs to whoever set it.
+    pub(crate) fn in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Downloading | Self::Verifying | Self::Repairing | Self::Extracting
+        )
+    }
+
     pub fn persisted_status(&self) -> &'static str {
         match self {
             Self::AwaitingQueueScripts => "awaiting_queue_scripts",

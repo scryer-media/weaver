@@ -3,9 +3,8 @@
 
 // Sampling and bootstrap: what the root fetches before any object asks.
 //
-// The first article of every member leads the payload. One article per member
-// is the cheapest sample of whether the post is still there, and it is the
-// member's front, which the namespace keeps (its first 16 KiB, the span a
+// The first article of every member leads the payload: it is the member's
+// front, which the namespace keeps (its first 16 KiB, the span a
 // PAR2 set identifies a file by) so the sniffer and a recovery object's name
 // match can run. The root delivers it; the namespace keeps it.
 //

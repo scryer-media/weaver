@@ -37,7 +37,6 @@ use weaver_model::files::FileRole;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec};
 use crate::pipeline::download::queue::DownloadWork;
-use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
 
 // The fewest files a first-article verdict is worth taking. One article per
@@ -225,6 +224,18 @@ impl Probes {
         self.states
             .get(&job_id)
             .is_some_and(|state| state.out.is_some())
+    }
+
+    // The job no longer downloads, so no round rules on it again: its probe
+    // goes, and the post's verdict, if the feed gave one, stays.
+    pub(crate) fn retire(&mut self, job_id: JobId) {
+        self.states.remove(&job_id);
+    }
+
+    // The job has gone: the feed keeps nothing of it.
+    pub(crate) fn forget(&mut self, job_id: JobId) {
+        self.states.remove(&job_id);
+        self.dead.remove(&job_id);
     }
 }
 
@@ -543,7 +554,7 @@ impl Pipeline {
             return;
         };
         let total = state.spec.total_bytes;
-        if total == 0 || !RootPhase::may_replace(&state.status) {
+        if total == 0 || !state.status.in_progress() {
             return;
         }
         if self.post_probes.out(job_id) || self.post_probes.dead.contains_key(&job_id) {
@@ -623,10 +634,10 @@ impl Pipeline {
         let Some(state) = self
             .jobs
             .get(&job_id)
-            .filter(|state| RootPhase::may_replace(&state.status))
+            .filter(|state| state.status.in_progress())
             .filter(|_| self.graph_jobs.contains_key(&job_id))
         else {
-            self.post_probes.states.remove(&job_id);
+            self.post_probes.retire(job_id);
             return;
         };
         let total = state.spec.total_bytes;
@@ -654,6 +665,30 @@ impl Pipeline {
         );
         if let Some(error) = self.post_health_verdict(job_id) {
             self.stop_feeding_post(job_id, error);
+        }
+    }
+
+    // Every server failed an article of the post, and the root has heard
+    // the refusal. The feed weighs the post on it: a job that failed on the
+    // loss is done with. Otherwise a post the feed already gave up loses the
+    // files that lost an article, a post the feed's word says is dead is
+    // given up, a job its rulings already leave short fails as the server
+    // decides, and a post that is none of those may be one nobody uploaded,
+    // which a probe finds out.
+    pub(in crate::pipeline) fn post_lost(&mut self, job_id: JobId) {
+        if !self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.status.in_progress())
+        {
+            return;
+        }
+        let dead = self.post_health_verdict(job_id);
+        self.abandon_dead_files(job_id);
+        if let Some(error) = dead {
+            self.stop_feeding_post(job_id, error);
+        } else if !self.fail_graph_job_ruled_short(job_id) {
+            self.arm_post_probe(job_id);
         }
     }
 

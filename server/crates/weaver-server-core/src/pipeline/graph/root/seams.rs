@@ -24,7 +24,6 @@ use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
-use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
 // The priority a window volume is raised to: ahead of every article at the
@@ -245,12 +244,8 @@ impl Pipeline {
     }
 
     // Every server failed an article of a graph job. True when the job is a
-    // graph job: its objects rule on the loss, so the caller's health
-    // arithmetic is not asked. The feed refuses the article's range to the
-    // root, and gives the post up when its own word on the post says it is
-    // dead. Otherwise the job fails when its rulings already settle it, and
-    // a post that is neither may be one nobody uploaded, which a probe finds
-    // out.
+    // graph job. The range is refused to the root, whose objects rule on
+    // the refusal, and the feed is told the post lost an article.
     pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let limit = self.graph_job_slot_limit(job_id);
@@ -263,25 +258,8 @@ impl Pipeline {
             &mut self.graph_status.repairs,
             limit,
         );
-        // The feed's verdict is weighed on the loss alone, before the job
-        // moves on from it.
-        let dead = self.post_health_verdict(job_id);
         self.after_graph_result(job_id, result);
-        // A failure empties the job's queues, so nothing more is fetched
-        // for it.
-        if !self
-            .jobs
-            .get(&job_id)
-            .is_some_and(|state| RootPhase::may_replace(&state.status))
-        {
-            return true;
-        }
-        self.abandon_dead_files(job_id);
-        if let Some(error) = dead {
-            self.stop_feeding_post(job_id, error);
-        } else if !self.fail_graph_job_ruled_short(job_id) {
-            self.arm_post_probe(job_id);
-        }
+        self.post_lost(job_id);
         true
     }
 
