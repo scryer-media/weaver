@@ -296,9 +296,11 @@ pub(super) fn repair_set(
 }
 
 // What the member's bytes prove against its description, read a piece at a
-// time. A set's blocks are judged over the described range alone, so bytes
-// a member carries past it are not read; a piece that does not read back
-// leaves the extents it holds unknown, and the reading carries on past it.
+// time, each piece by the runs of it that arrived. A set's blocks are judged
+// over the described range alone, so bytes a member carries past it are not
+// read; a hole leaves unknown only the extents it touches, and a run that
+// does not read back leaves those it holds unknown, and the reading carries
+// on past it.
 fn evidence(
     layout: &Arc<BlockLayout>,
     file: usize,
@@ -313,14 +315,17 @@ fn evidence(
     let mut verifier =
         StreamingVerifier::new(Arc::clone(layout), file, source, snapshot, options.clone()).ok()?;
     let mut bytes = Vec::new();
+    let mut runs = Vec::new();
     let mut offset = 0;
     while offset < len {
         let end = len.min(offset.saturating_add(READ));
-        bytes.clear();
-        if access.read(member, ByteRange::new(offset, end), &mut bytes)
-            && bytes.len() as u64 == end - offset
-        {
-            verifier.feed(offset, &bytes).ok()?;
+        runs.clear();
+        access.arrived(member, ByteRange::new(offset, end), &mut runs);
+        for run in &runs {
+            bytes.clear();
+            if access.read(member, *run, &mut bytes) && bytes.len() as u64 == run.len() {
+                verifier.feed(run.start, &bytes).ok()?;
+            }
         }
         offset = end;
     }

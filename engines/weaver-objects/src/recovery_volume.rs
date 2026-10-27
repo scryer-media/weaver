@@ -17,6 +17,26 @@ pub(crate) fn named_blocks(name: &str, extension: &str) -> Option<u64> {
     count.parse().ok()
 }
 
+// The stem a PAR file's name gives its set: the name less the format's
+// `extension` and any `.vol<start>+<count>`.
+fn stem<'a>(lower: &'a str, extension: &str) -> Option<&'a str> {
+    let bare = lower.strip_suffix(extension)?;
+    Some(match bare.rsplit_once(".vol") {
+        Some((stem, tail)) if tail.split_once('+').is_some_and(|(start, count)| {
+            start.parse::<u64>().is_ok() && count.parse::<u64>().is_ok()
+        }) => stem,
+        _ => bare,
+    })
+}
+
+// Whether `name` is a recovery volume of the set whose file `held` is: a
+// `.vol` name of the same stem.
+pub(crate) fn same_set(held: &str, name: &str, extension: &str) -> bool {
+    let (held, name) = (held.to_ascii_lowercase(), name.to_ascii_lowercase());
+    named_blocks(&name, extension).is_some()
+        && stem(&held, extension).is_some_and(|held| stem(&name, extension) == Some(held))
+}
+
 // Each range of a volume not yet in hand, the last open-ended: the volume's
 // length is the parent's to know, and the root clamps an open end to it.
 pub(crate) fn gaps(arrived: &Coverage, mut each: impl FnMut(ByteRange)) {

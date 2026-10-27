@@ -91,6 +91,8 @@ struct Volume {
     closed: bool,
     // The recovery blocks the volume's name says it carries.
     named_blocks: Option<u64>,
+    // The name it was bound under, which a later volume of the set continues.
+    name: Option<String>,
 }
 
 impl Volume {
@@ -273,6 +275,9 @@ impl Par3 {
         self.volumes
             .iter()
             .map(|volume| match volume.named_blocks {
+                // Claimed by its name and nothing of it read yet: what it
+                // brings is not known.
+                _ if !volume.closed && volume.arrived.runs().next().is_none() => None,
                 Some(blocks) => Some(blocks),
                 None if volume.closed && !volume.shows_recovery() => Some(0),
                 None => None,
@@ -293,6 +298,26 @@ impl Par3 {
 
     fn closed(&self) -> usize {
         self.volumes.iter().filter(|volume| volume.closed).count()
+    }
+
+    // The volume to read through for a description when none is known:
+    // every volume of a set carries its description ahead of its blocks, so
+    // the first still open, an index before any volume and then the one that
+    // names the fewest blocks. `None` once none is left to read.
+    fn describing(&self) -> Option<usize> {
+        let mut order: Vec<usize> = (0..self.volumes.len()).collect();
+        order.sort_by_key(|index| (self.volumes[*index].named_blocks, *index));
+        order
+            .into_iter()
+            .find(|index| !self.volumes[*index].closed)
+    }
+
+    // Whether the last repair found no set described and waits on a volume
+    // to say one.
+    fn seeking_description(&self) -> bool {
+        self.needed == 0
+            && self.described.is_empty()
+            && matches!(self.last, Some(Ruling::Short { .. }))
     }
 
     fn free(&self, path: &str) -> bool {
@@ -509,14 +534,24 @@ impl Object for Par3 {
 
     // Every PAR3 file is a volume of the one object, numbered as it comes,
     // up to the carrier limit.
+    // By the magic its bytes open with, or, before any bytes, by a name
+    // that continues the set's: the stem of a volume already held, then a
+    // `.vol` name ending in `.par3`.
     fn claim(
         &mut self,
-        _name: &str,
+        name: &str,
         first_bytes: &[u8],
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
-            && self.volumes.len() < MAX_CARRIERS)
+        let ours = if first_bytes.is_empty() {
+            self.volumes
+                .iter()
+                .filter_map(|volume| volume.name.as_deref())
+                .any(|held| recovery_volume::same_set(held, name, ".par3"))
+        } else {
+            first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
+        };
+        (ours && self.volumes.len() < MAX_CARRIERS)
             .then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
@@ -525,7 +560,9 @@ impl Object for Par3 {
     // Without this the verdict would depend on whether a volume's front
     // decided before or after the damage arrived.
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
-        self.volume(volume).named_blocks = recovery_volume::named_blocks(name, ".par3");
+        let found = self.volume(volume);
+        found.named_blocks = recovery_volume::named_blocks(name, ".par3");
+        found.name = Some(name.to_owned());
         if matches!(
             self.last,
             Some(Ruling::Reached(RepairOutcome::Impossible { .. }))
@@ -635,6 +672,12 @@ impl Recovery for Par3 {
         }
     }
 
+    // No front read so far describes a file: the description is in a volume
+    // the root has only sampled the head of.
+    fn undescribed(&self) -> bool {
+        self.described.is_empty()
+    }
+
     fn covers(&self, member: MemberId) -> bool {
         self.bound.values().any(|bound| *bound == member)
     }
@@ -660,9 +703,22 @@ impl Recovery for Par3 {
     // wanted now. Otherwise every volume whose head shows it carries
     // recovery is deferred: the rest waits until a repair is short. Nothing
     // of the deferral is kept: the same fronts say it again on every round.
+    // A repair that found no set described waits on one volume that may
+    // carry a description, and asks for all of it, then the next once that
+    // one is read through without one.
     fn wants(&self, out: &mut Vec<Seek>) {
+        let describing = self
+            .seeking_description()
+            .then(|| self.describing())
+            .flatten();
         for (index, volume) in self.volumes.iter().enumerate() {
             if volume.closed {
+                continue;
+            }
+            if describing == Some(index) {
+                recovery_volume::gaps(&volume.arrived, |range| {
+                    out.push(Seek::recovery(VolumeIndex(index as u32), range, Weight::FIRST))
+                });
                 continue;
             }
             if self.needed == 0 {
@@ -711,6 +767,17 @@ impl Recovery for Par3 {
             }
         }
         let sets = sets(packets);
+        // With no set described by anything read, the object waits on a
+        // volume that may carry a description; with none left open, it
+        // checked nothing.
+        if sets.is_empty() && self.describing().is_some() {
+            self.ruled.clear();
+            self.needed = 0;
+            self.last = Some(Ruling::Short {
+                closed: self.closed(),
+            });
+            return RepairOutcome::Waiting;
+        }
         self.identify(&sets, access);
         let coming = self.coming();
         let mut outcome = RepairOutcome::Unread;

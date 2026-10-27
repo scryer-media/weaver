@@ -1235,6 +1235,14 @@ impl Tree {
         let member = found.namespace.announce(name, length);
         found.undecided.insert(member);
         self.place(node, member, effects);
+        // An object of the namespace may place the member by its name alone,
+        // before any of its bytes: it is offered now with no prefix, by the
+        // one offer, and asked again when its bytes come if none takes it. A
+        // lent object cannot be asked, so the bytes ask it later.
+        let siblings = self.bound_below(node);
+        if !siblings.is_empty() && !siblings.iter().any(|sibling| self.lent(*sibling)) {
+            self.offer(node, member, &[], &siblings, effects);
+        }
         member
     }
 
@@ -3454,6 +3462,18 @@ mod tests {
         );
     }
 
+    // A volume announced beside a bound object is offered to it at once, by
+    // its name, before any of its bytes arrive.
+    #[test]
+    fn an_announced_volume_is_offered_to_the_object_before_its_bytes() {
+        let (mut tree, _, child, _) = bound_tree();
+        let second = tree.announce_root("show.r00", None, &mut Vec::new());
+        assert_eq!(
+            tree.child_of(NodeId::ROOT, second),
+            Some((child, VolumeIndex(1)))
+        );
+    }
+
     #[test]
     fn a_sibling_the_object_claims_becomes_its_next_volume() {
         let (mut tree, _, child, _) = bound_tree();
@@ -4138,41 +4158,28 @@ mod tests {
         )));
     }
 
+    // Volumes named out of order are each held at announce, by name, before
+    // any of their bytes: the one named ahead leaves no gap, and a seek into
+    // it goes up to the source for that member's bytes.
     #[test]
-    fn a_volume_claimed_before_the_one_ahead_of_it_leaves_a_gap_until_that_one_comes() {
+    fn a_volume_named_ahead_is_held_before_its_bytes_come() {
         let (mut tree, first, child, _) = bound_tree();
         let third = tree.announce_root("show.r01", None, &mut Vec::new());
         let second = tree.announce_root("show.r00", None, &mut Vec::new());
-        let deliver = |tree: &mut Tree, member| {
-            tree.deliver(
-                NodeId::ROOT,
-                member,
-                Posted {
-                    offset: 0,
-                    bytes: Bytes::from_static(b"w"),
-                    provenance: Provenance::Fresh,
-                },
-                &mut Build,
-                &mut Vec::new(),
-            )
-        };
-        deliver(&mut tree, third);
-        let volumes = |tree: &Tree| {
-            let (_, volumes) = tree.volumes(child).unwrap();
-            volumes.iter().map(|(v, m)| (v.0, *m)).collect::<Vec<_>>()
-        };
-        assert_eq!(volumes(&tree), vec![(0, first), (2, third)]);
+        let (_, volumes) = tree.volumes(child).unwrap();
+        let volumes: Vec<_> = volumes.iter().map(|(v, m)| (v.0, *m)).collect();
+        assert_eq!(volumes, vec![(0, first), (1, second), (2, third)]);
         let seek = Seek::data(
             VolumeIndex(1),
             ByteRange::new(0, 10),
             crate::seek::Weight(1),
         );
+        let mut root = Root(Vec::new());
+        assert_eq!(tree.lift(child, seek, &mut root), Pull::Moved(1));
         assert_eq!(
-            tree.lift(child, seek, &mut Root(Vec::new())),
-            Pull::Unseekable
+            root.0.iter().map(|seek| seek.volume).collect::<Vec<_>>(),
+            vec![VolumeIndex(second.0)]
         );
-        deliver(&mut tree, second);
-        assert_eq!(volumes(&tree), vec![(0, first), (1, second), (2, third)]);
     }
 
     #[test]

@@ -165,7 +165,13 @@ impl Par2 {
         let unknown = self
             .volumes
             .iter()
-            .any(|volume| !volume.closed && volume.serves(key) && volume.named_blocks.is_none());
+            .any(|volume| {
+                // Claimed by its name and nothing of it read yet: what it
+                // brings is not known.
+                !volume.closed
+                    && volume.serves(key)
+                    && (volume.named_blocks.is_none() || volume.arrived.runs().next().is_none())
+            });
         (!unknown).then(|| self.sets[key].recovery.len() as u64 + self.coming(key))
     }
 
@@ -420,14 +426,24 @@ impl Object for Par2 {
     }
 
     // Every PAR2 file is a volume of the one object, numbered as it comes.
+    // By the magic its bytes open with, or, before any bytes, by a name
+    // that continues the set's: the stem of a volume already held, then a
+    // `.vol` name ending in `.par2`.
     fn claim(
         &mut self,
-        _name: &str,
+        name: &str,
         first_bytes: &[u8],
         _length: Option<u64>,
     ) -> Option<VolumeIndex> {
-        (first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice()))
-            .then_some(VolumeIndex(self.volumes.len() as u32))
+        let ours = if first_bytes.is_empty() {
+            self.volumes
+                .iter()
+                .filter_map(|volume| volume.name.as_deref())
+                .any(|held| crate::recovery_volume::same_set(held, name, ".par2"))
+        } else {
+            first_bytes.get(..MAGIC.len()) == Some(MAGIC.as_slice())
+        };
+        ours.then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
