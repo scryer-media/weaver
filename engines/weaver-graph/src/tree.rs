@@ -2431,12 +2431,19 @@ impl Tree {
                         }
                     }
                     // A member announced again after a retraction kept its
-                    // record and its name, but not its length.
+                    // record, but not its length; the name it is announced
+                    // under now is the one its producer read from the bytes
+                    // it starts over on, so a different one renames it.
+                    let mut renamed = false;
                     if let Some(record) = self
                         .namespace_mut(node)
                         .and_then(|namespace| namespace.get_mut(member))
                     {
                         record.length = record.length.or(length);
+                        renamed = record.name != name;
+                    }
+                    if renamed {
+                        self.rename(node, member, &name, builder, effects);
                     }
                     effects.push(Effect::Announced { node, member });
                 }
@@ -4219,6 +4226,44 @@ mod tests {
             (Some(5), "inner.bin")
         );
         assert_eq!(tree.namespace(child).unwrap().len(), 1);
+    }
+
+    // A member its producer retracted and announces again under another
+    // name, read from the bytes it starts over on, takes that name.
+    #[test]
+    fn a_member_announced_again_under_another_name_is_renamed() {
+        let (mut tree, _, child, _) = bound_tree();
+        tree.emitted(
+            child,
+            vec![Emit::Retract(MemberId(0))],
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let mut effects = Vec::new();
+        tree.emitted(
+            child,
+            vec![Emit::Member {
+                member: MemberId(0),
+                name: "other.bin".into(),
+                length: Some(5),
+            }],
+            &mut Build,
+            &mut effects,
+        );
+        let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+        assert_eq!(
+            (inner.name.as_str(), inner.output_name.as_str()),
+            ("other.bin", "other.bin")
+        );
+        assert!(
+            effects.contains(&Effect::Renamed {
+                node: child,
+                member: MemberId(0),
+                old: "inner.bin".into(),
+                new: "other.bin".into(),
+            }),
+            "{effects:?}"
+        );
     }
 
     fn two_volumes() -> (Tree, MemberId, MemberId, NodeId) {

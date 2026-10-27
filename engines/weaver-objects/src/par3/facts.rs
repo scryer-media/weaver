@@ -85,7 +85,7 @@ pub(super) fn of(par3: &Par3) -> Facts {
         needed: par3.needed,
         last: par3.last,
         settled: par3.settled.clone(),
-        refusals: par3.refusals.clone(),
+        refusals: par3.shown.refusals.clone(),
     };
     Facts::of(Kind::Par3, &facts)
 }
@@ -113,7 +113,7 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
     par3.settled = kept.settled;
     // The blocks they touch are counted again at the next bind, once the
     // replayed fronts describe the sets.
-    par3.refusals = kept.refusals;
+    par3.shown.refusals = kept.refusals;
     Ok(par3)
 }
 

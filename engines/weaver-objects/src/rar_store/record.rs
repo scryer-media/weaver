@@ -43,16 +43,13 @@ impl RarStore {
             }
             // The layout cuts a member's runs at its parts, so one run lies
             // in one piece; a part the entry has not taken yet routes nothing.
-            let Some(pieces) = self.entries.get(id).map(|entry| &entry.pieces) else {
+            let Some(piece) = self
+                .entries
+                .get(id)
+                .and_then(|entry| entry.piece_of(stream))
+            else {
                 continue;
             };
-            let piece = pieces.partition_point(|piece| piece.at <= stream.start);
-            let Some(piece) = piece.checked_sub(1) else {
-                continue;
-            };
-            if stream.end > pieces[piece].at + pieces[piece].data.len() {
-                continue;
-            }
             let slice =
                 &bytes[(part.start - range.start) as usize..(part.end - range.start) as usize];
             self.check_part(id, piece, part, slice, provenance, out);

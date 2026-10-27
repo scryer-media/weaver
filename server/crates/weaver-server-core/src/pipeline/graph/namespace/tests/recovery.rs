@@ -162,6 +162,42 @@ fn a_repairs_output_waits_on_disk_past_the_memory_budget_and_lands_whole() {
     assert!(!output.exists(), "the output goes with the repair");
 }
 
+// A set that rebuilds a store's map lets the store place the body it held
+// behind it, and the set's proof of that body reaches the member: the held
+// bytes go down before the proof is read back through the map, so what came
+// marked damaged is marked repaired in the namespace below.
+#[test]
+fn a_rebuilt_map_lets_the_sets_proof_reach_the_bytes_it_held() {
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "a.7z",
+        read: body(),
+        fix: (map_at().start, MAP),
+    }));
+    let member = job.member("a.7z", Some(map_at().end));
+    job.send(member, 0, &seven_z(), Provenance::Fresh);
+    job.send(member, body().start, b"hello", Provenance::Damaged);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.close(member);
+    let set = job.set_node();
+    let mut lent = Inline::default();
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+        .expect("lent");
+    let mut build = job.build();
+    let ruled = job.run_lent(&mut build, lent);
+    assert_eq!(ruled, vec![(set, RepairOutcome::Repaired { slices: 1 })]);
+
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(job.file("inner.bin"), b"hello");
+    let (late, _) = job.tree.child_of(NodeId::ROOT, member).expect("a 7z");
+    let below = job.tree.namespace(late).expect("its namespace");
+    assert_eq!(
+        below.damaged_ranges().collect::<Vec<_>>(),
+        Vec::new(),
+        "the set proved the body it held"
+    );
+}
+
 // An output that refuses the repair's write fails the repair with that
 // refusal, and nothing it rebuilt reaches the member.
 #[test]

@@ -4,7 +4,9 @@
 mod facts;
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ByteRange, MemberId, Object, ObjectId, Provenance, Recovery, SliceVerdict};
+use weaver_graph::{
+    ByteRange, MemberId, Object, ObjectId, Provenance, Recovery, SliceVerdict, VolumeIndex,
+};
 
 use super::Par2;
 use crate::testing::{Job, par2_set, payload, segments};
@@ -102,6 +104,27 @@ fn binds_by_prefix_and_renames_through_the_namespace() {
     assert_eq!(job.namespace.get(member).unwrap().name, "payload.bin");
     // Bound now by name, it is not renamed again.
     assert!(bind(&mut job).is_empty());
+}
+
+// A member its producer started over and announced again under the name it
+// was posted with has lost the front it was known by, so nothing binds it by
+// that name; once its front arrives again it is known by its content and
+// renamed a second time.
+#[test]
+fn a_member_announced_again_under_its_posted_name_is_renamed_again_by_its_front() {
+    let data = payload(3, 40_000);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
+    let member = job.member("a8f3c1e09b", &data);
+    assert_eq!(bind(&mut job), vec![member]);
+    job.namespace.retract(member);
+    job.namespace.rename(member, "a8f3c1e09b");
+    job.namespace.get_mut(member).unwrap().length = Some(data.len() as u64);
+    assert!(bind(&mut job).is_empty());
+    assert!(!job.object.covers(member));
+    job.arrive(member, 0, &data, Provenance::Fresh);
+    assert_eq!(bind(&mut job), vec![member]);
+    assert!(job.object.covers(member));
+    assert_eq!(job.namespace.get(member).unwrap().name, "payload.bin");
 }
 
 #[test]
@@ -425,6 +448,151 @@ fn wants_asks_for_recovery_while_short() {
             .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Waiting
     );
+}
+
+// The PAR2 file with every packet of the given types left out: an index
+// posted without the descriptions, which ride in the volumes instead.
+fn without_packets(bytes: &[u8], kinds: &[&[u8; 16]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 64 <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+        if !kinds.iter().any(|kind| bytes[at + 48..at + 64] == kind[..]) {
+            out.extend_from_slice(&bytes[at..at + length]);
+        }
+        at += length;
+    }
+    out
+}
+
+const FILE_DESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
+const IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+
+// An index read through with no description in it, one recovery volume
+// named and not yet in, and the member the set protects.
+fn undescribed(seed: u64, damaged: bool) -> (Job<Par2>, VolumeIndex, MemberId) {
+    let data = payload(seed, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    let index = without_packets(&files[0].1, &[FILE_DESC, IFSC]);
+    job.volume(&files[0].0, &index, ARTICLE as usize, false);
+    let volume = job.name(&files[1].0, &files[1].1);
+    let member = if damaged {
+        damaged_member(&mut job, "payload.bin", &data, 300).0
+    } else {
+        job.member("payload.bin", &data)
+    };
+    bind(&mut job);
+    assert!(!job.object.sets.is_empty());
+    assert!(
+        job.object
+            .sets
+            .values()
+            .all(|state| state.usable().is_none())
+    );
+    (job, volume, member)
+}
+
+fn asked(job: &Job<Par2>) -> Vec<VolumeIndex> {
+    let mut seeks = Vec::new();
+    Recovery::wants(&job.object, &mut seeks);
+    seeks
+        .iter()
+        .filter(|seek| seek.purpose == weaver_graph::Purpose::Recovery)
+        .map(|seek| seek.volume)
+        .collect()
+}
+
+// A set whose index carries no description reads a volume for one only
+// once the namespace shows damage it may cover. On a whole post it checks
+// nothing and asks for nothing: no recovery byte is spent on it. Damage
+// that shows after it ruled so, a range refused or bytes held damaged,
+// makes it due again.
+#[test]
+fn an_undescribed_set_asks_for_a_volume_only_once_damage_shows() {
+    let (mut job, volume, member) = undescribed(23, false);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
+    assert!(asked(&job).is_empty());
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    Recovery::refused(&mut job.object, member, ByteRange::new(0, 700));
+    assert_eq!(job.object.outcome(), None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    assert_eq!(asked(&job), vec![volume]);
+
+    let (mut job, volume, _) = undescribed(23, true);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    let wanted = asked(&job);
+    assert!(!wanted.is_empty());
+    assert!(wanted.iter().all(|asked| *asked == volume));
+}
+
+// A set that ruled it checked nothing, with no volume left to describe
+// it, is tried again when a volume binds: the descriptions may be in it.
+// A file lost whole is refused, never fed; the refusal is the damage.
+#[test]
+fn a_volume_bound_after_an_unread_ruling_reopens_the_set() {
+    let data = payload(24, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    let index = without_packets(&files[0].1, &[FILE_DESC, IFSC]);
+    job.volume(&files[0].0, &index, ARTICLE as usize, false);
+    let member = job
+        .namespace
+        .announce("payload.bin", Some(data.len() as u64));
+    Recovery::refused(
+        &mut job.object,
+        member,
+        ByteRange::new(0, data.len() as u64),
+    );
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    assert_eq!(job.object.outcome(), None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    assert_eq!(asked(&job), vec![volume]);
+    let mut out = Vec::new();
+    for (at, piece) in bytes.chunks(ARTICLE as usize).enumerate() {
+        job.object.deliver(
+            weaver_graph::Delivery {
+                volume,
+                offset: at as u64 * ARTICLE,
+                bytes: piece,
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut out,
+        );
+    }
+    job.object.volume_closed(volume, &mut out);
+    assert!(
+        job.object
+            .sets
+            .values()
+            .all(|state| state.usable().is_some())
+    );
+    assert_eq!(job.object.outcome(), None);
 }
 
 // A set short of recovery blocks waits while the pieces that bring none

@@ -12,9 +12,10 @@
 // the pool the budget lends, as many at once as it grants threads and as
 // much as it grants memory, and said in archive order as if one by one.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
@@ -46,6 +47,7 @@ impl Extraction for Run {
             input: Input {
                 volumes,
                 failed: Arc::new(AtomicBool::new(false)),
+                reached: Mutex::default(),
             },
             sink,
             budget,
@@ -433,20 +435,22 @@ fn verdict(
         Class::PasswordRequired => vec![Emit::NeedsPassword],
         Class::Recoverable if encrypted => vec![Emit::NeedsPassword],
         Class::Recoverable => {
-            let damaged: Vec<Emit> = spans
+            // A closed volume is damaged whole; a growing one as far as the
+            // run read it, for that is all the run can say of it. A volume
+            // the run never read says nothing.
+            spans
                 .filter_map(|position| {
                     let volume = input.index(position).ok()??;
-                    let length = input.volumes.len(volume)?;
-                    Some(Emit::Damaged {
+                    let known_end = input
+                        .volumes
+                        .len(volume)
+                        .unwrap_or_else(|| input.reached(volume));
+                    (known_end > 0).then(|| Emit::Damaged {
                         volume,
-                        range: ByteRange::new(0, length),
+                        range: ByteRange::new(0, known_end),
                     })
                 })
-                .collect();
-            match damaged.is_empty() {
-                true => vec![Emit::Refuse(Why::Unrepairable)],
-                false => damaged,
-            }
+                .collect()
         }
         Class::Terminal => vec![terminal(error, encrypted)],
     }
@@ -550,10 +554,12 @@ fn unrar_0_11_block_header_checksum_mismatch(detail: &str) -> bool {
 
 // The owner's volumes as unrar-rs reads them: one reader per open, each with
 // its own cursor. A read the owner fails is remembered, so the error unrar-rs
-// makes of it ends the run silently instead of being taken for damage.
+// makes of it ends the run silently instead of being taken for damage. Each
+// volume keeps the furthest byte any of its readers reached, across opens.
 struct Input {
     volumes: Arc<dyn Volumes>,
     failed: Arc<AtomicBool>,
+    reached: Mutex<BTreeMap<VolumeIndex, Arc<AtomicU64>>>,
 }
 
 impl Input {
@@ -577,12 +583,29 @@ impl Input {
     }
 
     fn reader(&self, volume: VolumeIndex) -> Reader {
+        let reached = self
+            .reached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(volume)
+            .or_default()
+            .clone();
         Reader {
             volumes: Arc::clone(&self.volumes),
             failed: Arc::clone(&self.failed),
             volume,
             position: 0,
+            reached,
         }
+    }
+
+    // The furthest byte of the volume any read of the run reached.
+    fn reached(&self, volume: VolumeIndex) -> u64 {
+        self.reached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&volume)
+            .map_or(0, |reached| reached.load(Ordering::Relaxed))
     }
 }
 
@@ -603,6 +626,7 @@ struct Reader {
     failed: Arc<AtomicBool>,
     volume: VolumeIndex,
     position: u64,
+    reached: Arc<AtomicU64>,
 }
 
 impl Read for Reader {
@@ -613,6 +637,7 @@ impl Read for Reader {
         match self.volumes.read_at(self.volume, self.position, into) {
             Ok(read) => {
                 self.position += read as u64;
+                self.reached.fetch_max(self.position, Ordering::Relaxed);
                 Ok(read)
             }
             Err(error) => {

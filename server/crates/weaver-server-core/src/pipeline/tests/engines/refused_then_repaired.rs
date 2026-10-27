@@ -32,7 +32,8 @@ use crate::pipeline::tests::{
 
 const MIXED: &str = "rar5_multifile_lz.rar";
 // A byte inside the archive's headers: the engine's read of it ends in an
-// error that names no volume as damaged, so it refuses the archive.
+// error a repair can mend, which it says as damage on the volume as far as
+// it read it, the volume still open.
 const FLIPPED: usize = 38;
 const FRAME: usize = 16;
 
@@ -56,12 +57,11 @@ fn articles(post: &Post) -> u32 {
 }
 
 // Serve the archive's `volumes`, all but the last article of the volume
-// whose bytes are `damaged`, and hear the job's runs until every volume is
-// refused for the damage; then serve that last article. An engine refuses
-// an archive whose read failed only while no volume it was reading has
-// closed: once the volume closes, the same failure is said as damage on it,
-// which the set's repair is awaited for. Holding the volume open keeps the
-// run's read ahead of its close, however late the run's thread is.
+// whose bytes are `damaged`, and hear the job's runs until the engine has
+// ruled on every volume, refusing it or saying damage on it; then serve
+// that last article. Every article arrives clean, so damage on a volume is
+// the engine's word. Holding the volume open keeps the run's read ahead of
+// its close, however late the run's thread is.
 async fn refused_while_open(
     pipeline: &mut Pipeline,
     scenario: &Scenario,
@@ -79,18 +79,22 @@ async fn refused_while_open(
     }
     loop {
         let writer = job(pipeline).writer();
-        if (0..volumes)
-            .all(|volume| writer.refused(NodeId::ROOT, MemberId(volume)) == Some(Why::Unrepairable))
-        {
+        let root = job(pipeline).tree().namespace(NodeId::ROOT).expect("root");
+        let damaged: Vec<MemberId> = root.damaged_ranges().map(|(member, _)| member).collect();
+        if (0..volumes).map(MemberId).all(|volume| {
+            writer.refused(NodeId::ROOT, volume) == Some(Why::Unrepairable)
+                || damaged.contains(&volume)
+        }) {
             break;
         }
         assert!(
             job(pipeline).awaits_mail(),
-            "no run is out and nothing was refused: {:?}; refused {:?}; awaits mail {}; runs {:?}",
+            "no run is out and nothing was ruled: {:?}; refused {:?}; damaged {:?}; awaits mail {}; runs {:?}",
             job_status_for_assert(pipeline, JOB),
             (0..volumes)
                 .map(|volume| writer.refused(NodeId::ROOT, MemberId(volume)))
                 .collect::<Vec<_>>(),
+            damaged,
             job(pipeline).awaits_mail(),
             job(pipeline).runs()
         );
@@ -161,13 +165,13 @@ pub(super) async fn drive_to_finish(pipeline: &mut Pipeline, scenario: &Scenario
 }
 
 #[tokio::test]
-async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again() {
+async fn a_member_its_engine_said_damaged_before_its_set_repaired_it_is_read_again() {
     let posts = posts();
     let (index, volume) = (articles(&posts[1]), articles(&posts[2]));
     let scenario = Scenario::new(posts).framed(FRAME);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
-    // The archive alone: the engine refuses it before any set is in. The
+    // The archive alone: the engine says the damage before any set is in. The
     // set's articles stay queued, so the completion gate sees the job still
     // owes them and does not end it on the archive alone.
     refused_while_open(&mut pipeline, &scenario, 1, 0).await;
@@ -319,7 +323,7 @@ fn four_volumes_zeroed() -> Vec<Post> {
 // is offered all four again: the volumes it was not yet handed go on from
 // their own files, as they arrived, and the member decodes whole.
 #[tokio::test]
-async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_again() {
+async fn a_four_volume_rar_said_damaged_before_its_set_repaired_one_volume_is_read_again() {
     let scenario = Scenario::new(four_volumes_zeroed()).framed(SLICE);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 

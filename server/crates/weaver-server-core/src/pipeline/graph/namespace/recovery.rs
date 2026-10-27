@@ -568,6 +568,9 @@ impl NamespaceWriter {
             let marked = (node, member, range, Provenance::Damaged);
             self.redeliver(tree, builder, segments, marked, out)?;
         }
+        // A rebuilt volume can let its object place bytes held behind it;
+        // they go down before the set's proof is read back through the map.
+        self.release_held(tree, builder, segments, out)?;
         if matches!(
             outcome,
             Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })

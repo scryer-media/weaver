@@ -129,6 +129,17 @@ struct Entry {
 }
 
 impl Entry {
+    // The part of the file whose packed stream holds all of `stream`: a
+    // range the entry has not taken a part for yet is no member's bytes.
+    fn piece_of(&self, stream: ByteRange) -> Option<usize> {
+        let piece = self
+            .pieces
+            .partition_point(|piece| piece.at <= stream.start)
+            .checked_sub(1)?;
+        let found = &self.pieces[piece];
+        (stream.end <= found.at + found.data.len()).then_some(piece)
+    }
+
     fn packed(&self) -> u64 {
         self.pieces.iter().map(|piece| piece.data.len()).sum()
     }

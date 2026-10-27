@@ -278,7 +278,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
         lengths: par2.lengths.clone(),
         meter: par2.meter.clone(),
         refused: par2.refused,
-        refusals: par2.refusals.clone(),
+        refusals: par2.shown.refusals.clone(),
         output_limit: par2.output_limit,
         memory_limit: par2.memory_limit,
     };
@@ -320,7 +320,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
     par2.lengths = kept.lengths;
     par2.meter = kept.meter;
     par2.refused = kept.refused;
-    par2.refusals = kept.refusals;
+    par2.shown.refusals = kept.refusals;
     par2.output_limit = kept.output_limit;
     par2.memory_limit = kept.memory_limit;
     for key in par2.ordered() {

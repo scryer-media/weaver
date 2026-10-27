@@ -216,6 +216,123 @@ fn a_recovery_volume_whose_head_holds_only_the_index_is_deferred() {
     assert_eq!(out, expected);
 }
 
+// The PAR3 file with every packet of the given type left out: an index
+// posted without its file packets, which ride in the volumes instead.
+fn without_packets(bytes: &[u8], kind: &[u8; 8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 48 <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 24..at + 32].try_into().unwrap()) as usize;
+        if bytes[at + 40..at + 48] != kind[..] {
+            out.extend_from_slice(&bytes[at..at + length]);
+        }
+        at += length;
+    }
+    out
+}
+
+const FILE: &[u8; 8] = b"PAR FIL\0";
+
+fn asked(job: &Job<Par3>) -> Vec<VolumeIndex> {
+    let mut seeks = Vec::new();
+    Recovery::wants(&job.object, &mut seeks);
+    seeks
+        .iter()
+        .filter(|seek| seek.purpose == weaver_graph::Purpose::Recovery)
+        .map(|seek| seek.volume)
+        .collect()
+}
+
+// An index whose file packets are left out reads as no set. The object
+// reads a volume for them only once the namespace shows damage they may
+// cover; on a whole post it checks nothing and asks for nothing.
+#[test]
+fn an_undescribed_object_asks_for_a_volume_only_once_damage_shows() {
+    for damaged in [false, true] {
+        let one = payload(61, 9000);
+        let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+        let mut job = Job::new(Par3::new(OWN), OWN);
+        job.volume(&files[0].0, &without_packets(&files[0].1, FILE), 700, false);
+        let volume = job.name(&files[1].0, &files[1].1);
+        let mut wrong = one.clone();
+        if damaged {
+            wrong[5000] ^= 0x42;
+        }
+        let member = job.member("one.bin", &wrong);
+        if damaged {
+            job.arrive(member, 4900, &wrong[4900..5100], Provenance::Damaged);
+        }
+        bind(&mut job);
+        let outcome = job
+            .object
+            .repair(&mut job.store, weaver_graph::Budget::default());
+        if damaged {
+            assert_eq!(outcome, RepairOutcome::Waiting);
+            assert_eq!(asked(&job), vec![volume]);
+            continue;
+        }
+        assert_eq!(outcome, RepairOutcome::Unread);
+        assert!(asked(&job).is_empty());
+        // Damage that shows after it ruled so makes it due again.
+        Recovery::refused(&mut job.object, member, ByteRange::new(0, 700));
+        assert_eq!(job.object.outcome(), None);
+        assert_eq!(
+            job.object
+                .repair(&mut job.store, weaver_graph::Budget::default()),
+            RepairOutcome::Waiting
+        );
+        assert_eq!(asked(&job), vec![volume]);
+    }
+}
+
+// An object that read no set, with no volume left to describe one, ruled
+// it checked nothing. A volume bound after reopens it: the file packets
+// may be in it, and the repair the damage wants follows once it is in.
+#[test]
+fn a_volume_bound_after_an_unread_ruling_reopens_the_object() {
+    let one = payload(62, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+    let mut job = Job::new(Par3::new(OWN), OWN);
+    job.volume(&files[0].0, &without_packets(&files[0].1, FILE), 700, false);
+    let mut wrong = one.clone();
+    wrong[5000] ^= 0x42;
+    let member = job.member("one.bin", &wrong);
+    job.arrive(member, 4900, &wrong[4900..5100], Provenance::Damaged);
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    assert_eq!(job.object.outcome(), None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    assert_eq!(asked(&job), vec![volume]);
+    deliver(
+        &mut job,
+        volume,
+        bytes,
+        ByteRange::new(0, bytes.len() as u64),
+    );
+    job.object.volume_closed(volume, &mut Vec::new());
+    assert_eq!(job.object.outcome(), None);
+    bind(&mut job);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
+        "{outcome:?}"
+    );
+    assert!(job.store.members[&member] == one);
+}
+
 #[test]
 fn par3_short_of_blocks_is_impossible() {
     let one = payload(5, 9000);
@@ -598,15 +715,18 @@ fn recovery_blocks_ahead_of_their_matrix_wait_until_it_arrives_or_is_lost() {
     ));
 }
 
-// With the index gone, no volume head describes a set: the object waits and
-// asks for the whole of one volume, which carries the description ahead of
-// its blocks, and once that volume is in it rules.
+// With the index gone, no volume head describes a set: while damage shows,
+// the object waits and asks for the whole of one volume, which carries the
+// description ahead of its blocks, and once that volume is in it repairs.
 #[test]
 fn an_undescribed_set_asks_for_one_volume_and_rules_once_it_is_in() {
     const HEAD: usize = 64;
     let one = payload(51, 9000);
     let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
-    let volumes: Vec<_> = files.iter().filter(|(name, _)| name.contains(".vol")).collect();
+    let volumes: Vec<_> = files
+        .iter()
+        .filter(|(name, _)| name.contains(".vol"))
+        .collect();
     assert!(!volumes.is_empty());
     let mut job = Job::new(Par3::new(OWN), OWN);
     let mut named = Vec::new();
@@ -615,7 +735,10 @@ fn an_undescribed_set_asks_for_one_volume_and_rules_once_it_is_in() {
         deliver(&mut job, volume, bytes, ByteRange::new(0, HEAD as u64));
         named.push((volume, bytes));
     }
-    job.member("one.bin", &one);
+    let mut wrong = one.clone();
+    wrong[5000] ^= 0x42;
+    let member = job.member("one.bin", &wrong);
+    job.arrive(member, 4900, &wrong[4900..5100], Provenance::Damaged);
     bind(&mut job);
     assert_eq!(
         job.object
@@ -638,14 +761,22 @@ fn an_undescribed_set_asks_for_one_volume_and_rules_once_it_is_in() {
         .find(|(at, _)| *at == volume)
         .map(|(_, bytes)| *bytes)
         .expect("the asked volume is one of the set's");
-    deliver(&mut job, volume, bytes, ByteRange::new(HEAD as u64, bytes.len() as u64));
+    deliver(
+        &mut job,
+        volume,
+        bytes,
+        ByteRange::new(HEAD as u64, bytes.len() as u64),
+    );
     job.object.volume_closed(volume, &mut Vec::new());
     bind(&mut job);
-    assert_eq!(
-        job.object
-            .repair(&mut job.store, weaver_graph::Budget::default()),
-        RepairOutcome::Clean
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
+        "{outcome:?}"
     );
+    assert!(job.store.members[&member] == one);
 }
 
 // A member with a hole read through what arrived: the hole leaves unknown

@@ -21,8 +21,9 @@ pub struct MemberId(pub u32);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub id: MemberId,
-    // What the producer called it. Changes at most once, when a recovery
-    // object recognises an obfuscated member and renames it.
+    // What the producer called it. Changes when a recovery object
+    // recognises an obfuscated member and renames it, or when its producer,
+    // having started it over, announces it again under another name.
     pub name: String,
     // The name it is written under: the wanted name until the tree's one
     // ledger places it, and what that ledger gave it after.
@@ -571,7 +572,8 @@ impl Namespace {
     }
 
     // The member starts over: its bytes are forgotten and it is unbound. Its
-    // output name is kept, so what comes back lands where it was.
+    // output name is kept, so what comes back lands where it was, until its
+    // producer announces it again under another name.
     pub fn retract(&mut self, member: MemberId) {
         if let Some(found) = self.members.get_mut(&member) {
             found.coverage.clear();

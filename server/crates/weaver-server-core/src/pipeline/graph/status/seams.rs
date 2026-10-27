@@ -476,10 +476,32 @@ impl Pipeline {
                     .collect()
             })
             .unwrap_or_default();
+        // Recovery the post carried for a namespace that no set of it ruled
+        // on, because nothing that described what it covers survived: what
+        // is short there is short because that recovery could not be used.
+        // The root carries what the post named as recovery data, whether or
+        // not a set was ever founded from it.
+        let posted_recovery = state
+            .spec
+            .files
+            .iter()
+            .any(|file| !file.role.counts_toward_health());
+        let unruled = |node: NodeId| {
+            let carried = summary.sets.iter().any(|set| set.namespace == node)
+                || (node == NodeId::ROOT && posted_recovery);
+            carried
+                && !summary.sets.iter().any(|set| {
+                    set.namespace == node
+                        && set
+                            .outcome
+                            .is_some_and(|outcome| outcome != RepairOutcome::Unread)
+                })
+        };
         let unrepaired = |node: NodeId, member: MemberId| {
-            failed.iter().any(|(namespace, set)| {
-                *namespace == node && job.writer().covers(job.tree(), *set, member)
-            })
+            unruled(node)
+                || failed.iter().any(|(namespace, set)| {
+                    *namespace == node && job.writer().covers(job.tree(), *set, member)
+                })
         };
         let delivery = Delivery::read(
             job.tree(),
