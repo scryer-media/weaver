@@ -55,9 +55,28 @@ fn articles(post: &Post) -> u32 {
     post.bytes.len().div_ceil(FRAME) as u32
 }
 
-// Hear the job's runs until the archive's `volumes` are refused for its
-// damage.
-async fn until_refused_unrepairable(pipeline: &mut Pipeline, volumes: u32) {
+// Serve the archive's `volumes`, all but the last article of the volume
+// whose bytes are `damaged`, and hear the job's runs until every volume is
+// refused for the damage; then serve that last article. An engine refuses
+// an archive whose read failed only while no volume it was reading has
+// closed: once the volume closes, the same failure is said as damage on it,
+// which the set's repair is awaited for. Holding the volume open keeps the
+// run's read ahead of its close, however late the run's thread is.
+async fn refused_while_open(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    volumes: u32,
+    damaged: u32,
+) {
+    let held = (damaged, articles_of(scenario, damaged as usize) - 1);
+    for file in 0..volumes {
+        for ordinal in 0..articles_of(scenario, file as usize) {
+            if (file, ordinal) != held {
+                serve_queued(pipeline, scenario, (file, ordinal)).await;
+                pump_pipeline_runtime_queues(pipeline).await;
+            }
+        }
+    }
     loop {
         let writer = job(pipeline).writer();
         if (0..volumes)
@@ -66,7 +85,7 @@ async fn until_refused_unrepairable(pipeline: &mut Pipeline, volumes: u32) {
             break;
         }
         assert!(
-            job(pipeline).runs().live(),
+            job(pipeline).awaits_mail(),
             "no run is out and nothing was refused: {:?}; refused {:?}; awaits mail {}; runs {:?}",
             job_status_for_assert(pipeline, JOB),
             (0..volumes)
@@ -79,6 +98,8 @@ async fn until_refused_unrepairable(pipeline: &mut Pipeline, volumes: u32) {
         pipeline.graph_run_said(said);
         pump_pipeline_runtime_queues(pipeline).await;
     }
+    serve_queued(pipeline, scenario, held).await;
+    pump_pipeline_runtime_queues(pipeline).await;
 }
 
 // Serve one article as a download lane would: taken off the job's queues as
@@ -142,22 +163,14 @@ pub(super) async fn drive_to_finish(pipeline: &mut Pipeline, scenario: &Scenario
 #[tokio::test]
 async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again() {
     let posts = posts();
-    let (archive, index, volume) = (
-        articles(&posts[0]),
-        articles(&posts[1]),
-        articles(&posts[2]),
-    );
+    let (index, volume) = (articles(&posts[1]), articles(&posts[2]));
     let scenario = Scenario::new(posts).framed(FRAME);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
     // The archive alone: the engine refuses it before any set is in. The
     // set's articles stay queued, so the completion gate sees the job still
     // owes them and does not end it on the archive alone.
-    for ordinal in 0..archive {
-        serve_queued(&mut pipeline, &scenario, (0, ordinal)).await;
-        pump_pipeline_runtime_queues(&mut pipeline).await;
-    }
-    until_refused_unrepairable(&mut pipeline, 1).await;
+    refused_while_open(&mut pipeline, &scenario, 1, 0).await;
     assert!(
         pipeline.graph_jobs[&JOB].recovery_summary().is_empty(),
         "no set is in"
@@ -310,8 +323,7 @@ async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_ag
     let scenario = Scenario::new(four_volumes_zeroed()).framed(SLICE);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
-    serve_posts(&mut pipeline, &scenario, 0..4).await;
-    until_refused_unrepairable(&mut pipeline, 4).await;
+    refused_while_open(&mut pipeline, &scenario, 4, 1).await;
 
     serve_posts(&mut pipeline, &scenario, 4..6).await;
     hear_graph_mail(&mut pipeline, JOB).await;
@@ -485,8 +497,7 @@ async fn a_member_delivered_whole_before_its_archive_was_refused_is_made_over_on
     let scenario = Scenario::new(posts).framed(FRAME);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
-    serve_posts(&mut pipeline, &scenario, 0..1).await;
-    until_refused_unrepairable(&mut pipeline, 1).await;
+    refused_while_open(&mut pipeline, &scenario, 1, 0).await;
     let first = extracted(&pipeline);
     assert!(
         first.len() == 1 && first[0].ends_with("hello.txt"),
