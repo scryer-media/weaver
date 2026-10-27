@@ -1126,14 +1126,19 @@ func newFullPreseedBootstrap(tempRoot, profile string, source *fullPhaseContext,
 }
 
 const (
+	// defaultFullPhaseJobs is how many suites of a full run execute at once,
+	// the Product Behavior Gate included: the gate holds a slot of its own and
+	// the other phases share the rest, so the default runs the gate beside
+	// three other suites.
 	defaultFullPhaseJobs = 4
 	// A full run's release gate shares the engine with the other phases, so
 	// it runs narrower than a standalone gate unless the operator sets a width.
 	fullRunReleaseGateJobs = 6
 )
 
-// fullPhaseJobs is how many phases of a full run execute at once, set with
-// E2E_FULL_PHASE_JOBS.
+// fullPhaseJobs is how many suites of a full run execute at once, set with
+// E2E_FULL_PHASE_JOBS. The count includes the Product Behavior Gate's own
+// slot, so the phases other than the gate share one slot fewer than this.
 func fullPhaseJobs(phaseCount int) int {
 	requested := envInt("E2E_FULL_PHASE_JOBS", defaultFullPhaseJobs)
 	if requested > phaseCount {
@@ -1143,6 +1148,41 @@ func fullPhaseJobs(phaseCount int) int {
 		requested = 1
 	}
 	return requested
+}
+
+// fullPhaseSlots paces a full run's phases. The Product Behavior Gate runs its
+// own concurrent release flows, so it holds a dedicated slot and never waits
+// behind the other suites; every other phase takes one of the general slots,
+// which number one fewer than fullPhaseJobs and never fewer than one.
+type fullPhaseSlots struct {
+	general chan struct{}
+	gate    chan struct{}
+}
+
+func newFullPhaseSlots(phaseCount int) fullPhaseSlots {
+	return fullPhaseSlots{
+		general: make(chan struct{}, fullGeneralPhaseJobs(phaseCount)),
+		gate:    make(chan struct{}, 1),
+	}
+}
+
+// fullGeneralPhaseJobs is how many phases other than the Product Behavior
+// Gate execute at once: the suite count less the gate's own slot, never below
+// one.
+func fullGeneralPhaseJobs(phaseCount int) int {
+	general := fullPhaseJobs(phaseCount) - 1
+	if general < 1 {
+		general = 1
+	}
+	return general
+}
+
+// slotFor is the slot channel a phase waits on before it starts.
+func (s fullPhaseSlots) slotFor(phase *fullPhaseContext) chan struct{} {
+	if phase.Command == "release-gate" {
+		return s.gate
+	}
+	return s.general
 }
 
 func runFullPipeline(
@@ -1158,16 +1198,17 @@ func runFullPipeline(
 	// Every phase brings up its own stack and drives it hard, so phases share
 	// a fixed number of slots instead of all starting together. A phase holds
 	// its slot from seeding through its own cleanup.
-	slots := make(chan struct{}, fullPhaseJobs(len(phases)))
+	slots := newFullPhaseSlots(len(phases))
 
 	var wg sync.WaitGroup
 	for _, phase := range phases {
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
+			slot := slots.slotFor(phase)
 			select {
-			case slots <- struct{}{}:
-				defer func() { <-slots }()
+			case slot <- struct{}{}:
+				defer func() { <-slot }()
 			case <-ctx.Done():
 				canceledErr := fmt.Errorf("canceled before the phase started: %w", ctx.Err())
 				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, time.Now(), canceledErr)
