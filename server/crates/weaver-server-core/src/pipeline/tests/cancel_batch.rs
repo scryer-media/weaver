@@ -284,31 +284,55 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
 }
 
 // A cancelled job leaves its lane like a job that finishes or fails: the
-// gauge of the jobs verifying counts it no more. One left that was never
-// counted cannot take the gauge below zero.
-#[tokio::test]
-async fn cancelling_a_verifying_job_takes_it_off_the_verify_gauge() {
+// gauge of its lane counts it no more. One left that was never counted
+// cannot take the gauge below zero.
+async fn cancelling_a_job_takes_it_off_its_lane_gauge(
+    job_id: JobId,
+    status: JobStatus,
+    gauge: fn(&crate::operations::metrics::PipelineMetrics) -> &std::sync::atomic::AtomicUsize,
+) {
     use std::sync::atomic::Ordering;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(31_301);
     insert_queued_jobs(&mut pipeline, &[job_id]).await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let lane = state.post_state;
-    state.status = JobStatus::Verifying;
+    state.status = status;
     state.refresh_runtime_lanes_from_status();
     let entered = state.post_state;
     pipeline.metrics.post_state_moved(lane, entered);
-    assert_eq!(pipeline.metrics.verify_active.load(Ordering::Relaxed), 1);
+    assert_eq!(gauge(&pipeline.metrics).load(Ordering::Relaxed), 1);
 
     let outcome = cancel_batch(&mut pipeline, &[job_id]).await;
 
     assert!(outcome[&job_id].is_ok());
     assert!(!pipeline.jobs.contains_key(&job_id));
-    assert_eq!(pipeline.metrics.verify_active.load(Ordering::Relaxed), 0);
-    pipeline
-        .metrics
-        .post_state_left(crate::jobs::model::PostState::Verifying);
-    assert_eq!(pipeline.metrics.verify_active.load(Ordering::Relaxed), 0);
+    assert_eq!(gauge(&pipeline.metrics).load(Ordering::Relaxed), 0);
+    pipeline.metrics.post_state_left(entered);
+    assert_eq!(gauge(&pipeline.metrics).load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn cancelling_a_verifying_job_takes_it_off_the_verify_gauge() {
+    cancelling_a_job_takes_it_off_its_lane_gauge(JobId(31_301), JobStatus::Verifying, |m| {
+        &m.verify_active
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancelling_a_repairing_job_takes_it_off_the_repair_gauge() {
+    cancelling_a_job_takes_it_off_its_lane_gauge(JobId(31_302), JobStatus::Repairing, |m| {
+        &m.repair_active
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cancelling_an_extracting_job_takes_it_off_the_extract_gauge() {
+    cancelling_a_job_takes_it_off_its_lane_gauge(JobId(31_303), JobStatus::Extracting, |m| {
+        &m.extract_active
+    })
+    .await;
 }

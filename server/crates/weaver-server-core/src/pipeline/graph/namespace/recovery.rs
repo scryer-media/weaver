@@ -337,7 +337,8 @@ impl NamespaceWriter {
     }
 
     // The namespace's sets due to rule, each judged alone. A set that has
-    // not ruled rules once every member it covers is closed and the
+    // not ruled rules once every member it covers is closed, or is open
+    // only for bytes refused above it, and the
     // namespace has announced every member it will get, since a volume of
     // its own may still be on its way behind them. A ruling stands until
     // the object takes it back: a wait on recovery bytes ends in the step
@@ -365,11 +366,32 @@ impl NamespaceWriter {
                 && (covers
                     || closed_volumes(tree, set) > 0
                     || (recovery.undescribed() && self.members_in(tree, node)))
-                && namespace
-                    .members()
-                    .all(|member| !recovery.covers(member.id) || member.closed)
+                && namespace.members().all(|member| {
+                    !recovery.covers(member.id)
+                        || member.closed
+                        || self.open_only_for_refused(tree, node, reading, member)
+                })
         });
         due
+    }
+
+    // Below the root, the object that reads a member closes it only once
+    // the job is quiet, and the job is not quiet while a set over the
+    // member waits to rule. A member there that holds every byte, with no
+    // run left to read more into it and its damage lost for good above,
+    // holds every byte it will: its sets rule on it as on a closed one. A
+    // root member is closed by the root once nothing it waits on can come.
+    fn open_only_for_refused(
+        &self,
+        tree: &Tree,
+        node: NodeId,
+        reading: bool,
+        member: &weaver_graph::Member,
+    ) -> bool {
+        node != NodeId::ROOT
+            && !reading
+            && member.is_complete()
+            && self.refused_above(tree, NodeId::ROOT, node)
     }
 
     // Every member of the namespace holds every byte it will: closed,

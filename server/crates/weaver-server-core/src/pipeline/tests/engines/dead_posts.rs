@@ -383,3 +383,78 @@ async fn a_whole_volume_no_object_opened_is_not_a_usable_file() {
         graph.failure
     );
 }
+
+// A stored RAR holding two files and a PAR2 set over them, one recovery
+// block in it. Two articles inside `quill.bin` are refused by every
+// server, past what the nested set can rebuild: the set rules impossible
+// and says so, `ember.bin` unpacks whole, and the job ends Partial on that
+// one usable file, never Failed.
+#[tokio::test]
+async fn a_nested_par2_set_ruled_impossible_leaves_the_whole_file_partial() {
+    let ember = payload(4 * ARTICLE + 9, 61);
+    let quill = payload(8 * ARTICLE + 3, 62);
+    let archive = par2_in_store(
+        "inner",
+        &[("ember.bin", ember.as_slice()), ("quill.bin", quill.as_slice())],
+        1,
+    );
+    let inside = super::deep::articles_inside(&archive.bytes, &quill);
+    assert!(inside.len() >= 3, "{inside:?}");
+    let scenario = Scenario::new(vec![archive])
+        .lost(0, inside[0])
+        .lost(0, inside[2]);
+    let graph = run(&scenario).await;
+    assert_eq!(
+        graph.status,
+        Some(crate::jobs::model::JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    let delivered = |name: &str| {
+        graph
+            .files
+            .iter()
+            .find(|(path, _)| path.rsplit('/').next() == Some(name))
+            .map(|(_, bytes)| bytes.clone())
+    };
+    assert_eq!(delivered("ember.bin"), Some(ember), "{:?}", graph.files.keys());
+    assert!(
+        graph
+            .graph()
+            .rulings
+            .iter()
+            .any(|(_, ruling)| matches!(
+                ruling,
+                Some(weaver_graph::recovery::RepairOutcome::Impossible { .. })
+            )),
+        "{:?}",
+        graph.graph().rulings
+    );
+}
+
+// The same nested set with blocks to spare: one article inside `quill.bin`
+// refused by every server is rebuilt by the set inside the archive, and
+// the job completes with both files whole.
+#[tokio::test]
+async fn a_nested_par2_set_rebuilds_a_refused_article_inside_a_stored_rar() {
+    let ember = payload(4 * ARTICLE + 9, 61);
+    let quill = payload(8 * ARTICLE + 3, 62);
+    let archive = par2_in_store(
+        "inner",
+        &[("ember.bin", ember.as_slice()), ("quill.bin", quill.as_slice())],
+        8,
+    );
+    let inside = super::deep::articles_inside(&archive.bytes, &quill);
+    let scenario = Scenario::new(vec![archive]).lost(0, inside[1]);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    let delivered = |name: &str| {
+        graph
+            .files
+            .iter()
+            .find(|(path, _)| path.rsplit('/').next() == Some(name))
+            .map(|(_, bytes)| bytes.clone())
+    };
+    assert_eq!(delivered("ember.bin"), Some(ember));
+    assert_eq!(delivered("quill.bin"), Some(quill));
+}

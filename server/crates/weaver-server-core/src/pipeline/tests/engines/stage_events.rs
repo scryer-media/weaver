@@ -128,3 +128,23 @@ async fn a_coded_7z_says_its_extraction() {
     assert_eq!(graph.metrics.segments_committed, articles);
     assert_eq!(lanes(&graph), (0, 0, 0));
 }
+
+// Two plain files, one of which every server failed an article of: only the
+// file whose every article arrived is said to land. The one that lost an
+// article is closed short and never raises a file downloaded.
+#[tokio::test]
+async fn a_file_that_lost_an_article_is_not_said_to_land() {
+    let whole = payload(3 * ARTICLE + 5, 17);
+    let short = payload(3 * ARTICLE + 9, 29);
+    let scenario = Scenario::new(vec![
+        Post::plain("whole.bin", whole.clone()),
+        Post::plain("short.bin", short),
+    ])
+    .lost(1, 1);
+    let graph = run(&scenario).await;
+    assert_eq!(
+        landed(&graph),
+        [("whole.bin".to_string(), whole.len() as u64)],
+        "only the file whose every article arrived lands"
+    );
+}

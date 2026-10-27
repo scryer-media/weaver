@@ -345,24 +345,33 @@ func runEarlyGapDoesNotThrottle(ctx *restartCaseContext) (restartCaseResult, err
 	return classifyRestartResult(ctx.Profile, everyOther, "the file downloaded past an early gap while the gap was missing: "+detail, false, "", "early gap throttled the job: "+detail), nil
 }
 
-// Q5. A damaged job needs its recovery data and the server is slow to send
-// it. Once the payload is in, the item reads FETCHING_REPAIR_DATA while the
-// recovery articles are in flight, not Queued or Downloading; with them in it
-// repairs and completes. A withheld article cannot stand in for a slow one:
-// the server answers it 430 and the job books it missing at once.
+// Q5. A damaged job needs its recovery data and the server holds it back.
+// The primary holds the body of every recovery-volume article and serves the
+// rest, so the payload lands and the repair cannot start: the item reads
+// FETCHING_REPAIR_DATA, not Queued or Downloading. Once the hold is lifted
+// the recovery bytes arrive, and the job repairs and completes. A withheld
+// article cannot stand in for a held one: the server answers it 430 and the
+// job books it missing at once.
 func runRepairDataWaitReadsFetchingRepairData(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "par2-small-repair"
+	recovery, err := recoveryVolumeMessageIDs(slug)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if len(recovery) == 0 {
+		return restartCaseResult{}, fmt.Errorf("%s has no recovery-volume articles", slug)
+	}
 	if err := ctx.startWeaverWithOptions("", 8); err != nil {
 		return restartCaseResult{}, err
 	}
-	// Weaver's start resets the server's chaos, so the slow server is set after it.
-	if err := setNntpChaos("slow_body=1"); err != nil {
+	// Weaver's start resets the server's chaos, so the hold is set after it.
+	if err := setNntpChaosOnServer(nntpHost(), nntpPort(), "hold_ids="+strings.Join(recovery, ";")); err != nil {
 		return restartCaseResult{}, err
 	}
-	restored := false
+	released := false
 	defer func() {
-		if !restored {
-			_ = setNntpChaos("off")
+		if !released {
+			_ = setNntpChaosOnServer(nntpHost(), nntpPort(), "off")
 		}
 	}()
 	jobID, err := ctx.submitSlug(slug)
@@ -375,38 +384,31 @@ func runRepairDataWaitReadsFetchingRepairData(ctx *restartCaseContext) (restartC
 			seen = append(seen, state)
 		}
 	}
-	deadline := time.Now().Add(ctx.Timeout)
-	waiting := false
-	for time.Now().Before(deadline) && !waiting {
+	err = ctx.pollFor("the job reading FETCHING_REPAIR_DATA", func() (bool, error) {
 		snapshot, err := fetchFacadeItemSnapshot(ctx.weaverURL, jobID)
-		if err == nil && snapshot.Found {
-			state := strings.ToUpper(snapshot.Status)
-			note(state)
-			if state == "FETCHING_REPAIR_DATA" {
-				waiting = true
-				break
-			}
-			if facadeTerminalStatus(state) || !snapshot.InQueue {
-				break
-			}
+		if err != nil || !snapshot.Found {
+			return false, nil
 		}
-		time.Sleep(chaosPollInterval)
+		state := strings.ToUpper(snapshot.Status)
+		note(state)
+		if state == "FETCHING_REPAIR_DATA" {
+			return true, nil
+		}
+		if facadeTerminalStatus(state) || !snapshot.InQueue {
+			return false, fmt.Errorf("the job ended at %s with its recovery data held: %v", state, seen)
+		}
+		return false, nil
+	})
+	waiting := err == nil
+	if err != nil {
+		_, _, _, _ = ctx.captureEvidence("no_repair_wait", "")
 	}
-	if err := setNntpChaos("off"); err != nil {
+	beforeRelease := append([]string(nil), seen...)
+	// A config that names no id releases every held body.
+	if err := setNntpChaosOnServer(nntpHost(), nntpPort(), "off"); err != nil {
 		return restartCaseResult{}, err
 	}
-	restored = true
-	beforeRelease := append([]string(nil), seen...)
-	for time.Now().Before(deadline) {
-		snapshot, err := fetchFacadeItemSnapshot(ctx.weaverURL, jobID)
-		if err == nil && snapshot.Found {
-			note(strings.ToUpper(snapshot.Status))
-			if facadeTerminalStatus(snapshot.Status) || !snapshot.InQueue {
-				break
-			}
-		}
-		time.Sleep(chaosPollInterval)
-	}
+	released = true
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
 		return restartCaseResult{}, err
@@ -420,8 +422,40 @@ func runRepairDataWaitReadsFetchingRepairData(ctx *restartCaseContext) (restartC
 			}
 		}
 	}
-	detail := fmt.Sprintf("slow_body_ms_per_line=1 states_before_speedup=%v states_all=%v repaired=%t final=%s",
-		beforeRelease, seen, repaired, statuses[jobID])
+	detail := fmt.Sprintf("held_recovery_articles=%d states_before_release=%v repaired=%t final=%s",
+		len(recovery), beforeRelease, repaired, statuses[jobID])
 	pass := waiting && repaired && statuses[jobID] == "COMPLETE"
 	return classifyRestartResult(ctx.Profile, pass, "a job waiting on recovery data read FETCHING_REPAIR_DATA and repaired once it came: "+detail, false, "", "repair-data wait: "+detail), nil
+}
+
+// recoveryVolumeMessageIDs lists the message-ids of every article of the
+// fixture's PAR2 recovery volumes: the files whose subject names a
+// `.volNN+MM.par2`, not the index.
+func recoveryVolumeMessageIDs(slug string) ([]string, error) {
+	nzbData, err := os.ReadFile(filepath.Join(fixturesDir(), slug, slug+".nzb"))
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Files []struct {
+			Subject  string `xml:"subject,attr"`
+			Segments []struct {
+				MessageID string `xml:",chardata"`
+			} `xml:"segments>segment"`
+		} `xml:"file"`
+	}
+	if err := xml.Unmarshal(nzbData, &doc); err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, file := range doc.Files {
+		subject := strings.ToLower(file.Subject)
+		if !strings.Contains(subject, ".par2") || !strings.Contains(subject, ".vol") {
+			continue
+		}
+		for _, segment := range file.Segments {
+			ids = append(ids, strings.Trim(strings.TrimSpace(segment.MessageID), "<>"))
+		}
+	}
+	return ids, nil
 }

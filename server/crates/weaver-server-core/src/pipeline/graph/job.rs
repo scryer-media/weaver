@@ -517,7 +517,8 @@ impl GraphJob {
 
     // After an article of `volume` was settled: a member with nothing left
     // to fetch is closed. The walk after the step's runs rules what that
-    // completed.
+    // completed. Only a member whose every article arrived has landed; one
+    // that lost an article is closed without being said to have landed.
     fn after_member(&mut self, volume: VolumeIndex) -> Result<(), GraphError> {
         let member = MemberId(volume.0);
         if !self.root.map.volume_waiting(volume) && !self.closed(member) {
@@ -531,7 +532,9 @@ impl GraphJob {
                 &mut out,
             )?;
             self.heard(out)?;
-            self.notes.push(Note::Landed(volume));
+            if self.root.map.volume_whole(volume) {
+                self.notes.push(Note::Landed(volume));
+            }
         }
         Ok(())
     }

@@ -147,6 +147,26 @@ pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     posts
 }
 
+// A single-volume stored RAR5 holding `files` and, beside them, a PAR2
+// set of `blocks` recovery blocks over them named under `base`: the set
+// is nested, reachable only once the archive opens.
+pub(in crate::pipeline::tests) fn par2_in_store(
+    base: &str,
+    files: &[(&str, &[u8])],
+    blocks: u32,
+) -> Post {
+    let mut members: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.to_vec()))
+        .collect();
+    let set = par2_set(base, files, blocks);
+    members.extend(set.iter().map(|post| (post.name.as_str(), post.bytes.clone())));
+    let mut volumes =
+        crate::pipeline::tests::direct_store::multi_member_store_set(&members, 1);
+    let (name, bytes) = volumes.remove(0);
+    Post::plain(&name, bytes)
+}
+
 // A PAR3 index and its volumes over `files`, blocks of one article, named
 // as the creator names them under `base`, the index first.
 pub(in crate::pipeline::tests) fn par3_set(
@@ -368,8 +388,14 @@ impl Scenario {
     }
 
     // What the scenario sets on a pipeline before its job is admitted or
-    // restored: the settings' passwords and policy, and the limits.
+    // restored: its servers, the settings' passwords and policy, and the
+    // limits. A scenario whose primary serves some articles damaged has a
+    // backup that serves them whole, on every pipeline that runs the job,
+    // a restarted one too.
     pub(in crate::pipeline::tests) fn prepare(&self, pipeline: &mut Pipeline) {
+        if !self.corrupt_primary.is_empty() {
+            pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+        }
         if !self.global_passwords.is_empty() {
             pipeline
                 .db
@@ -465,6 +491,11 @@ impl Scenario {
     pub(in crate::pipeline::tests) fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
         self.refused.push((file, ordinal));
         self
+    }
+
+    // Whether `server` answers the article with damaged bytes.
+    pub(in crate::pipeline::tests) fn spoils(&self, server: usize, article: (u32, u32)) -> bool {
+        self.damage.contains(&article) || (server == 0 && self.corrupt_primary.contains(&article))
     }
 
     pub(in crate::pipeline::tests) fn corrupt_on_primary(
@@ -674,9 +705,6 @@ pub(in crate::pipeline::tests) async fn admit_with(
     };
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
-    if !scenario.corrupt_primary.is_empty() {
-        pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
-    }
     scenario.prepare(&mut pipeline);
     setup(&mut pipeline, temp_dir.path());
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
@@ -751,20 +779,7 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
             observe(&pipeline, &mut graph, &mut reads);
             continue;
         }
-        // A body a server spoiled is asked of the next server once the
-        // worker's backoff ends: the retry it scheduled is the job's next
-        // move.
-        if pipeline
-            .pending_retries_by_job
-            .get(&JOB)
-            .is_some_and(|pending| *pending > 0)
-        {
-            let retry = pipeline
-                .retry_rx
-                .recv()
-                .await
-                .expect("a scheduled retry is sent");
-            pipeline.receive_retry_work(retry);
+        if take_retry(&mut pipeline).await {
             continue;
         }
         let after = fingerprint(&pipeline, &requests);
@@ -967,6 +982,40 @@ fn handed_out(
     (!batch.is_empty()).then_some((batch, None))
 }
 
+// A body a server spoiled is asked of the next server once the worker's
+// backoff ends: the retry it scheduled is the job's next move. True when one
+// was taken.
+pub(in crate::pipeline::tests) async fn take_retry(pipeline: &mut Pipeline) -> bool {
+    if !pipeline
+        .pending_retries_by_job
+        .get(&JOB)
+        .is_some_and(|pending| *pending > 0)
+    {
+        return false;
+    }
+    let retry = pipeline
+        .retry_rx
+        .recv()
+        .await
+        .expect("a scheduled retry is sent");
+    pipeline.receive_retry_work(retry);
+    true
+}
+
+// An ask as the worker serves it: the first server it does not exclude
+// answers.
+pub(in crate::pipeline::tests) async fn serve_work(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    work: &DownloadWork,
+) {
+    let article = (
+        work.segment_id.file_id.file_index,
+        work.segment_id.segment_number,
+    );
+    serve_from(pipeline, JOB, scenario, article, &work.exclude_servers, None).await;
+}
+
 // One article as the scenario's server answers it.
 pub(in crate::pipeline::tests) async fn serve(
     pipeline: &mut Pipeline,
@@ -1008,8 +1057,7 @@ async fn serve_from(
         pipeline.book_failed_segment(segment_id);
         return;
     }
-    let intact = !scenario.damage.contains(&(file, ordinal))
-        && !(server == 0 && scenario.corrupt_primary.contains(&(file, ordinal)));
+    let intact = !scenario.spoils(server, (file, ordinal));
     let post = &scenario.posts[file as usize];
     let offset = ordinal as usize * scenario.article;
     let posted = post
