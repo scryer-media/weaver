@@ -13,6 +13,9 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use unicase::UniCase;
+use unicode_normalization::UnicodeNormalization;
+
 use crate::member::MemberId;
 use crate::tree::NodeId;
 
@@ -231,11 +234,39 @@ fn confined(wanted: &str) -> String {
     name
 }
 
-// The path a name takes on disk, lower-cased for case-insensitive file
-// systems. A directory and a file of one name are one path, so they share a
-// key and the ledger gives only one of them the name.
+// The path a name takes on disk, as a case-insensitive, normalising file
+// system sees it: composed (NFC), so a composed and a decomposed spelling of
+// one name are one path, then case-folded character by character. A
+// directory and a file of one name are one path, so they share a key and the
+// ledger gives only one of them the name.
 fn key(name: &str) -> String {
-    name.strip_suffix('/').unwrap_or(name).to_ascii_lowercase()
+    name.strip_suffix('/')
+        .unwrap_or(name)
+        .nfc()
+        .map(fold_case)
+        .collect()
+}
+
+// The Unicode simple case folding of one character, which never changes a
+// name's length in characters: "É" folds to "é", while "ß" stays "ß" and
+// so never meets "ss". The full folding is taken where it is one character;
+// where it expands, the character's own lower case is taken if that is one
+// character ("ẞ" to "ß"), and otherwise the character is its own fold.
+fn fold_case(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    let mut utf8 = [0; 4];
+    let full = UniCase::unicode(&*c.encode_utf8(&mut utf8)).to_folded_case();
+    let mut folded = full.chars();
+    if let (Some(single), None) = (folded.next(), folded.next()) {
+        return single;
+    }
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(single), None) => single,
+        _ => c,
+    }
 }
 
 // "subs.srt" -> ("subs", ".srt"); "archive.tar.gz" -> ("archive.tar", ".gz");
@@ -471,6 +502,57 @@ mod tests {
         let ((top, top_at), (low, low_at)) = (shallow(), deep());
         let (names, _) = settle(&[(low, low_at, "Subs.SRT"), (top, top_at, "subs.srt")]);
         assert_eq!(names, vec!["subs.srt", "Subs (1).SRT"]);
+    }
+
+    #[test]
+    fn a_composed_and_a_decomposed_spelling_are_one_name() {
+        let composed = "Caf\u{e9}.mkv";
+        let decomposed = "Cafe\u{301}.mkv";
+        assert_eq!(key(composed), key(decomposed));
+        // The shallower member keeps the name, whichever spelling it wanted
+        // and whichever arrives first.
+        let ((top, top_at), (low, low_at)) = (shallow(), deep());
+        let first = settle(&[
+            (top, top_at.clone(), composed),
+            (low, low_at.clone(), decomposed),
+        ]);
+        let second = settle(&[(low, low_at, decomposed), (top, top_at, composed)]);
+        assert_eq!(
+            first.0,
+            vec![composed.to_owned(), "Cafe\u{301} (1).mkv".to_owned()]
+        );
+        assert_eq!(second.0, first.0);
+    }
+
+    #[test]
+    fn case_folding_covers_letters_beyond_ascii() {
+        assert_eq!(key("\u{c9}t\u{e9}.mkv"), key("\u{e9}t\u{e9}.mkv"));
+        let mut ledger = NameLedger::new();
+        assert_eq!(
+            root(&mut ledger, 1, "\u{c9}t\u{e9}.mkv"),
+            "\u{c9}t\u{e9}.mkv"
+        );
+        assert_eq!(
+            root(&mut ledger, 2, "\u{e9}t\u{e9}.mkv"),
+            "\u{e9}t\u{e9} (1).mkv"
+        );
+    }
+
+    #[test]
+    fn case_folding_never_changes_a_name_length() {
+        // Simple folding: the sharp s is its own fold, so it never meets
+        // "ss"; the capital sharp s folds to it.
+        assert_ne!(key("stra\u{df}e"), key("STRASSE"));
+        assert_eq!(key("STRA\u{1e9e}E"), key("stra\u{df}e"));
+        let mut ledger = NameLedger::new();
+        assert_eq!(root(&mut ledger, 1, "stra\u{df}e"), "stra\u{df}e");
+        assert_eq!(root(&mut ledger, 2, "STRASSE"), "STRASSE");
+    }
+
+    #[test]
+    fn a_directory_and_a_file_of_one_name_share_a_key() {
+        assert_eq!(key("\u{c9}t\u{e9}/"), key("e\u{301}te\u{301}"));
+        assert_eq!(key("Folder/"), key("folder"));
     }
 
     #[test]
