@@ -3054,7 +3054,7 @@ impl NntpClient {
         error: &NntpError,
         ticket: &crate::recovery::ConnectionHealth,
     ) {
-        if self.pool.dial_declined_over_limit(server_idx, error) {
+        if crate::pool::dial_declined_over_limit(error) {
             // Provider admission pressure parks new sockets, it does not make
             // the server unhealthy. Cooling the whole server here would also
             // block already-established healthy lanes from refilling.
