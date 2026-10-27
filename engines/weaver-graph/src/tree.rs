@@ -1032,6 +1032,7 @@ impl Tree {
     // Whether the object that read `member` of `node`'s namespace, buried
     // since, had announced a member it never closed: its buried node still
     // holds that member.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn left_open(&self, node: NodeId, member: MemberId) -> bool {
         self.kept(node, member).any(|kept| self.leaves_open(kept))
     }
@@ -1800,23 +1801,6 @@ impl Tree {
                 }
             }
         }
-    }
-
-    // The members of the namespace bound to a PAR2 object whose fronts say
-    // they are the set's index, whatever they were posted as.
-    pub fn signed_indexes(&self, node: NodeId) -> Vec<MemberId> {
-        let Some(namespace) = self.namespace(node) else {
-            return Vec::new();
-        };
-        namespace
-            .members()
-            .filter(|member| {
-                self.child_of(node, member.id)
-                    .is_some_and(|(child, _)| self.kind(child) == Some(Kind::Par2))
-                    && crate::sniff::par2_index(namespace.first_bytes(member.id))
-            })
-            .map(|member| member.id)
-            .collect()
     }
 
     // A member no object owns: a leaf whose front has spoken, and which no

@@ -161,6 +161,7 @@ impl HoldsAccountant {
 
     // New budgets judge the next reservation. Nothing already held is evicted
     // when a ceiling falls below it: the holds drain as their headers come.
+    #[cfg(test)]
     pub fn set_budgets(&self, budgets: HoldBudgets) {
         self.lock().budgets = budgets;
     }
@@ -174,6 +175,7 @@ impl HoldsAccountant {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn namespace_usage(&self, namespace: HoldsNamespace) -> NamespaceUsage {
         self.lock().usage(namespace)
     }
@@ -547,6 +549,7 @@ impl HoldLedger {
 
     // Where the next scratch allocation starts, which is how long the
     // scratch file needs to be.
+    #[cfg(test)]
     pub fn scratch_extent(&self) -> u64 {
         self.scratch_end
     }

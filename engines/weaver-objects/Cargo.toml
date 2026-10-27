@@ -32,6 +32,7 @@ zip = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+weaver-graph = { path = "../weaver-graph", features = ["test-support"] }
 lzma-turbo = { workspace = true, features = ["enc"] }
 sevenz-turbo = { workspace = true, features = ["compress"] }
 tempfile = { workspace = true }

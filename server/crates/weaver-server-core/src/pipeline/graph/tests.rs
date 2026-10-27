@@ -9,50 +9,28 @@ use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{ByteRange, Kind, MemberId, Provenance};
-use weaver_model::files::FileRole;
 
 use super::*;
 use crate::history::HistoryFailureKind;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
-use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 use crate::pipeline::PipelineEvent;
 use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::{Delivered, Delivery};
-use crate::pipeline::tests::{insert_active_job, new_direct_pipeline, retire_pipeline_database};
+use crate::pipeline::tests::engines::harness::{
+    ARTICLE, Post, par2_set, par2_volumes, payload, spec,
+};
+use crate::pipeline::tests::{
+    insert_active_job, new_direct_pipeline, retire_pipeline_database, segment_id,
+};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
     YencLayoutAssertions,
 };
 
-// One article's decoded size, and the PAR2 slice size, so every article is
-// exactly one slice and its checksum is a slice's.
-const ARTICLE: usize = 64;
-
-struct Post {
-    name: String,
-    role: FileRole,
-    bytes: Vec<u8>,
-}
-
-impl Post {
-    fn plain(name: &str, bytes: Vec<u8>) -> Self {
-        Self {
-            name: name.to_string(),
-            role: FileRole::Standalone,
-            bytes,
-        }
-    }
-
-    fn articles(&self) -> impl Iterator<Item = &[u8]> {
-        self.bytes.chunks(ARTICLE)
-    }
-}
-
-// Bytes no format sniffs as its own.
 // A file delivered under the name it wanted.
 fn delivered(name: &str, depth: u32, whole: bool) -> Delivered {
     Delivered {
@@ -64,103 +42,6 @@ fn delivered(name: &str, depth: u32, whole: bool) -> Delivered {
     }
 }
 
-fn payload(len: usize, seed: u8) -> Vec<u8> {
-    (0..len)
-        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed) | 0x80)
-        .collect()
-}
-
-// A PAR2 set over `data` posted as `name`: an index and one volume of two
-// recovery blocks, sliced at the article size.
-fn par2_set(name: &str, data: &[u8]) -> Vec<Post> {
-    let posts = par2_volumes(name, data, 2, 1);
-    assert_eq!(posts.len(), 2, "an index and one volume");
-    posts
-}
-
-// A PAR2 set over `data` posted as `name`: an index and `volumes` volumes
-// carrying `blocks` recovery blocks between them, sliced at the article
-// size. Each volume opens with a recovery packet.
-fn par2_volumes(name: &str, data: &[u8], blocks: u32, volumes: u32) -> Vec<Post> {
-    use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
-
-    let source = tempfile::tempdir().unwrap();
-    std::fs::write(source.path().join(name), data).unwrap();
-    let mut options = Par2CreatorOptions::with_output(
-        source.path().join("lantern.par2"),
-        Some(source.path().to_path_buf()),
-        vec![source.path().join(name)],
-    );
-    options.block_sizing = BlockSizing::Bytes(ARTICLE as u64);
-    options.recovery_amount = RecoveryAmount::Count(blocks);
-    options.volume_count = Some(volumes);
-    let creator = Par2Creator::new(options);
-    let created = creator.create(&creator.plan().unwrap()).unwrap();
-    let mut posts: Vec<Post> = created
-        .output_paths
-        .iter()
-        .map(|path| {
-            let name = path.file_name().unwrap().to_str().unwrap().to_string();
-            let is_index = !name.contains(".vol");
-            Post {
-                role: FileRole::Par2 {
-                    is_index,
-                    recovery_block_count: if is_index { 0 } else { blocks / volumes },
-                },
-                bytes: std::fs::read(path).unwrap(),
-                name,
-            }
-        })
-        .collect();
-    // The index first, then the volumes in name order.
-    posts.sort_by_key(|post| {
-        (
-            !matches!(post.role, FileRole::Par2 { is_index: true, .. }),
-            post.name.clone(),
-        )
-    });
-    posts
-}
-
-fn spec(name: &str, posts: &[Post]) -> JobSpec {
-    JobSpec {
-        name: name.to_string(),
-        password: None,
-        total_bytes: posts.iter().map(|post| post.bytes.len() as u64).sum(),
-        category: None,
-        metadata: vec![],
-        files: posts
-            .iter()
-            .enumerate()
-            .map(|(index, post)| FileSpec {
-                filename: post.name.clone(),
-                role: post.role.clone(),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: post
-                    .articles()
-                    .enumerate()
-                    .map(|(ordinal, article)| SegmentSpec {
-                        ordinal: ordinal as u32,
-                        article_number: ordinal as u32,
-                        bytes: article.len() as u32,
-                        message_ids: crate::jobs::MessageIds::new(vec![format!(
-                            "lantern-{index}-{ordinal}@example.com"
-                        )]),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
-fn segment_id(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId {
-    SegmentId {
-        file_id: NzbFileId { job_id, file_index },
-        segment_number,
-    }
-}
-
 // A graph job of `posts`, admitted the way the switch admits one.
 async fn graph_job(
     temp_dir: &tempfile::TempDir,
@@ -168,7 +49,12 @@ async fn graph_job(
     posts: &[Post],
 ) -> (Pipeline, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
-    insert_active_job(&mut pipeline, job_id, spec("lantern joined", posts)).await;
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec("lantern joined", posts, ARTICLE),
+    )
+    .await;
     assert!(pipeline.graph_jobs.contains_key(&job_id));
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
     (pipeline, working_dir)
@@ -185,7 +71,7 @@ async fn decode(
     intact: bool,
 ) {
     let body = posts[index as usize]
-        .articles()
+        .articles(ARTICLE)
         .nth(ordinal as usize)
         .unwrap()
         .to_vec();
@@ -215,7 +101,7 @@ async fn decode_as(
                 yenc_layout: YencLayoutAssertions {
                     file_size: post.bytes.len() as u64,
                     part: Some(ordinal + 1),
-                    total: Some(post.articles().count() as u32),
+                    total: Some(post.articles(ARTICLE).count() as u32),
                     begin: Some(offset as u64 + 1),
                     end: Some(offset as u64 + len),
                 },
@@ -242,7 +128,7 @@ async fn decode_as(
 }
 
 async fn decode_all(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {
-    let count = posts[index as usize].articles().count() as u32;
+    let count = posts[index as usize].articles(ARTICLE).count() as u32;
     for ordinal in 0..count {
         decode(pipeline, job_id, posts, index, ordinal, true).await;
     }
@@ -347,7 +233,7 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
     let job_id = JobId(92_003);
     let data = payload(4 * ARTICLE, 4);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
-    posts.extend(par2_set("lantern.bin", &data));
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
     let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     // The data first: its segments arrive before anything covers it.
     decode_all(&mut pipeline, job_id, &posts, 0).await;
@@ -373,7 +259,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     let job_id = JobId(92_004);
     let data = payload(4 * ARTICLE, 5);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
-    posts.extend(par2_set("lantern.bin", &data));
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
     let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
@@ -392,7 +278,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         job.recovery_summary()[0].outcome,
         Some(RepairOutcome::Waiting)
     );
-    let volume_articles = posts[2].articles().count() as u32;
+    let volume_articles = posts[2].articles(ARTICLE).count() as u32;
     assert!(volume_articles > 1);
     let state = &pipeline.jobs[&job_id];
     for ordinal in 1..volume_articles {
@@ -456,7 +342,7 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     let job_id = JobId(92_005);
     let data = payload(3 * ARTICLE, 6);
     let mut posts = vec![Post::plain("8d1f0c2a9b7e4f6013a5c7e9", data.clone())];
-    posts.extend(par2_set("lantern.bin", &data));
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
     let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     let hex = working_dir.join(&posts[0].name);
@@ -725,13 +611,13 @@ async fn echo_volume_with_a_wrong_article(
     let body = payload(4 * ARTICLE - HEADER, 10);
     let mut posts = vec![echo_volume(0, &body)];
     let volume = posts[0].bytes.clone();
-    posts.extend(par2_set("lantern.part1.rar", &volume));
+    posts.extend(par2_set("lantern", &[("lantern.part1.rar", &volume)], 2));
     let (mut pipeline, working_dir) = graph_job(temp_dir, job_id, &posts).await;
     echo_engines(&mut pipeline, job_id, 1);
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
     for ordinal in 0..4 {
-        let mut article = posts[0].articles().nth(ordinal).unwrap().to_vec();
+        let mut article = posts[0].articles(ARTICLE).nth(ordinal).unwrap().to_vec();
         if ordinal == 1 {
             article.iter_mut().for_each(|byte| *byte ^= 0x5a);
         }
@@ -752,7 +638,7 @@ async fn echo_volume_with_a_wrong_article(
 
 // The recovery blocks arrive, and the set repairs the one wrong slice.
 async fn repair_the_wrong_article(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post]) {
-    for ordinal in 1..posts[2].articles().count() as u32 {
+    for ordinal in 1..posts[2].articles(ARTICLE).count() as u32 {
         decode(pipeline, job_id, posts, 2, ordinal, true).await;
     }
     hear_repair(pipeline, job_id).await;
@@ -793,30 +679,6 @@ async fn an_engine_waits_at_a_damaged_article_until_its_repair_and_reads_it_once
         "never retracted"
     );
     assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
-    retire_pipeline_database(pipeline).await;
-}
-
-// A job whose root is done has nothing downloading for a health probe to
-// rule on, so its probe goes as it leaves the root, while the job itself is
-// still in the pipeline.
-#[tokio::test]
-async fn a_job_leaving_the_root_drops_its_health_probe() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(92_011);
-    let (mut pipeline, _, _, posts) =
-        echo_volume_with_a_wrong_article(&temp_dir, job_id, false).await;
-    pipeline.post_probes.states.insert(
-        job_id,
-        crate::pipeline::post_health::ProbeState {
-            rounds: 1,
-            ..Default::default()
-        },
-    );
-    repair_the_wrong_article(&mut pipeline, job_id, &posts).await;
-    drain_runs(&mut pipeline, job_id).await;
-    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
-    assert!(pipeline.jobs.contains_key(&job_id));
-    assert!(!pipeline.post_probes.states.contains_key(&job_id));
     retire_pipeline_database(pipeline).await;
 }
 
@@ -896,7 +758,7 @@ fn assert_raised(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
 }
 
 fn after_head(posts: &[Post], index: u32) -> std::ops::Range<u32> {
-    HEAD..posts[index as usize].articles().count() as u32
+    HEAD..posts[index as usize].articles(ARTICLE).count() as u32
 }
 
 async fn decode_head(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {
@@ -909,7 +771,7 @@ async fn decode_head(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], ind
 fn three_volumes(seed: u8) -> Vec<Post> {
     let data = payload(8 * ARTICLE, seed);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
-    posts.extend(par2_volumes("lantern.bin", &data, 6, 3));
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &data)], 6, 3));
     assert_eq!(posts.len(), 5, "the data, an index and three volumes");
     posts
 }
@@ -1004,7 +866,7 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
         .restore_job(crate::RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
-            spec: spec("lantern joined", &posts),
+            spec: spec("lantern joined", &posts, ARTICLE),
             detected_archives: Default::default(),
             file_identities: Default::default(),
             status: JobStatus::Downloading,

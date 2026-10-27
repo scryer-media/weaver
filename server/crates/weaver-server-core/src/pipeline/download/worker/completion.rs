@@ -437,6 +437,7 @@ impl Pipeline {
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
         if !self.accept_lane_work(result.lane_id, result.segment_id) {
             let bytes = match &result.data {
+                #[cfg(test)]
                 Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
                 Ok(DownloadPayload::Decoded(decoded)) => decoded.raw_size,
                 Err(DownloadError::Decode { raw_size, .. }) => *raw_size,
@@ -502,6 +503,7 @@ impl Pipeline {
         self.note_download_activity(result.job_id);
         self.publish_active_stage_metrics();
         let actual_raw_bytes = match &result.data {
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
             Ok(DownloadPayload::Decoded(decoded)) => Some(decoded.raw_size),
             Err(DownloadError::Decode { raw_size, .. } | DownloadError::Local { raw_size, .. }) => {
@@ -524,6 +526,7 @@ impl Pipeline {
 
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
         match &result.data {
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(bytes)) => bytes.len() as u64,
             Ok(DownloadPayload::Decoded(decoded)) => decoded.data.len_bytes() as u64,
             Err(_) => 0,
@@ -753,6 +756,7 @@ impl Pipeline {
         }
 
         match result.data {
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(raw)) => {
                 // Empty unless something is failing: skip the hash per article.
                 if !self.transport_failure_streaks.is_empty() {

@@ -19,7 +19,7 @@ use super::seams::apply_moves;
 use super::source::{Class, Move};
 use super::window::{WINDOW_IN_ORDER_VOLUMES, WINDOW_VOLUMES};
 use super::{ArticleRoot, Ask};
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::checkpoint;
@@ -28,7 +28,7 @@ use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd,
+    insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd, segment_id,
 };
 use crate::pipeline::{
     DecodeResult, DecodedChunk, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -249,13 +249,6 @@ fn recovery_role() -> FileRole {
     FileRole::Par2 {
         is_index: false,
         recovery_block_count: 4,
-    }
-}
-
-fn segment_id(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId {
-    SegmentId {
-        file_id: NzbFileId { job_id, file_index },
-        segment_number,
     }
 }
 

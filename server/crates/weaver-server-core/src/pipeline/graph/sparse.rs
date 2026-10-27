@@ -55,10 +55,7 @@ pub(crate) fn create_sparse<M: SparseMarker>(path: &Path, marker: &M) -> io::Res
         .write(true)
         .open(path)?;
     if marker.mark_sparse(&file).is_err() {
-        crate::runtime::perf_probe::record(
-            "direct_store.sparse.mark_failed",
-            std::time::Duration::from_nanos(1),
-        );
+        crate::runtime::perf_probe::record_value("graph.sparse.mark_failed", 1);
     }
     Ok(file)
 }
