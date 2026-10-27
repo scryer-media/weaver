@@ -471,9 +471,12 @@ impl Recovery for Par2 {
         // the description's length when it holds damage and reached less: a
         // member posted without positions closes at the length its articles
         // reached, short of what a lost one took, and the file the set
-        // rebuilds is the length the set describes. A member longer than its
-        // description keeps its length: its posting carries more than the
-        // described file.
+        // rebuilds is the length the set describes. So does one the set
+        // repaired that is longer than its description with no good bytes
+        // past it: the length was booked for articles that never came, and
+        // the rebuilt file is the length the set describes. A member longer
+        // than its description by bytes that arrived keeps its length: its
+        // posting carries more than the described file.
         for state in self.sets.values() {
             let Some(index) = state.usable() else {
                 continue;
@@ -506,13 +509,15 @@ impl Recovery for Par2 {
                 let Some(record) = namespace.get(*member) else {
                     continue;
                 };
-                if record
+                let short = record
                     .length
                     .is_some_and(|length| length < description.length)
-                    && !record.coverage.is_clean()
-                {
+                    && !record.coverage.is_clean();
+                if short {
                     let name = record.name.clone();
                     namespace.recognise(*member, &name, description.length);
+                } else if repaired {
+                    namespace.trim_booked(*member, description.length);
                 }
             }
         }

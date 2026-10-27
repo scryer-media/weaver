@@ -604,6 +604,37 @@ impl Recovery for Par3 {
             }
             bound.insert(path, member);
         }
+        // A member the set repaired whose good bytes reach past its
+        // description is recognised: they arrived shifted along, and the
+        // rebuilt file takes the described path and length. One longer than
+        // its description with no good bytes past it takes the described
+        // length and keeps its name: what lies past was booked for articles
+        // that never came.
+        let repaired = matches!(
+            self.last,
+            Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
+        );
+        for (path, member) in bound.iter().filter(|_| repaired) {
+            let Some(size) = files()
+                .find(|file| file.path() == path)
+                .map(|file| file.size())
+            else {
+                continue;
+            };
+            let shifted = namespace.get(*member).is_some_and(|record| {
+                record
+                    .coverage
+                    .overlapping(ByteRange::new(size, u64::MAX))
+                    .any(|run| run.provenance.is_verified())
+            });
+            if shifted {
+                if namespace.recognise(*member, path, size).is_some() {
+                    renamed.push(*member);
+                }
+            } else {
+                namespace.trim_booked(*member, size);
+            }
+        }
         if learned || bound != self.bound {
             self.last = None;
         }

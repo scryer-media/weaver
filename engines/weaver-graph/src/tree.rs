@@ -4473,9 +4473,16 @@ mod tests {
     // A pretend store whose first volume is `show.rar`, which holds
     // `linked.bin` where its links put it, provisionally: the first free
     // place after the first, and `stated.r00` at the place it states, 1.
-    #[derive(Default)]
+    // A full one takes nothing back from what it parsed of a volume it gave
+    // up, so the volume waits, given back, to be offered again.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
     struct Yielder {
         held: BTreeMap<VolumeIndex, String>,
+        full: bool,
+    }
+
+    impl crate::facts::Durable for Yielder {
+        const VERSION: u16 = 1;
     }
 
     impl Yielder {
@@ -4540,9 +4547,15 @@ mod tests {
                 .map(|name| Box::new(name) as Carried)
         }
         fn reclaim(&mut self, _: &str, carried: &Carried) -> Option<VolumeIndex> {
+            if self.full {
+                return None;
+            }
             (carried.downcast_ref::<String>()? == "linked.bin")
                 .then(|| self.free())
                 .flatten()
+        }
+        fn facts(&self) -> crate::facts::Facts {
+            crate::facts::Facts::of(Kind::RarStore, self)
         }
     }
 
@@ -4628,6 +4641,87 @@ mod tests {
             volume: VolumeIndex(1),
         }));
         assert!(!tree.given_back(NodeId::ROOT, linked));
+    }
+
+    // A store that takes back nothing it gave up, built as found or as its
+    // facts restore it.
+    struct FullBuild;
+    impl Builder for FullBuild {
+        fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
+            (kind == Kind::RarStore).then(|| {
+                Box::new(Yielder {
+                    full: true,
+                    ..Yielder::default()
+                }) as Box<dyn Object>
+            })
+        }
+        fn read(
+            &self,
+            _: &Tree,
+            _: NodeId,
+            _: VolumeIndex,
+            _: &Placement,
+            _: &mut Vec<u8>,
+        ) -> bool {
+            false
+        }
+    }
+
+    impl crate::facts::Restore for FullBuild {
+        fn restore(
+            &self,
+            facts: &crate::facts::Facts,
+        ) -> Result<Box<dyn Object>, crate::facts::RestoreError> {
+            Ok(Box::new(facts.read::<Yielder>(Kind::RarStore)?))
+        }
+    }
+
+    // A member given back with its parse waits to be offered again, and
+    // the parse is not in the records: a tree rebuilt from them holds it
+    // undecided, so its front, coming again, offers it again and it joins
+    // the store as it would have live.
+    #[test]
+    fn a_member_given_back_comes_back_undecided_and_is_offered_again() {
+        let mut build = FullBuild;
+        let mut tree = Tree::new();
+        let mut effects = Vec::new();
+        let deliver = |tree: &mut Tree, member, bytes: &'static [u8], build: &mut FullBuild| {
+            tree.deliver(
+                NodeId::ROOT,
+                member,
+                Posted {
+                    offset: 0,
+                    bytes: Bytes::from_static(bytes),
+                    provenance: Provenance::Fresh,
+                },
+                build,
+                &mut Vec::new(),
+            );
+        };
+        let first = tree.announce_root("show.rar", None, &mut effects);
+        deliver(&mut tree, first, SIGNATURE, &mut build);
+        let store = tree.child_of(NodeId::ROOT, first).expect("bound").0;
+        let linked = tree.announce_root("linked.bin", None, &mut effects);
+        deliver(&mut tree, linked, b"held", &mut build);
+        let stated = tree.announce_root("stated.r00", None, &mut effects);
+        deliver(&mut tree, stated, b"stat", &mut build);
+        assert_eq!(tree.child_of(NodeId::ROOT, linked), None);
+        assert!(tree.given_back(NodeId::ROOT, linked));
+
+        let record = tree.records();
+        let parked = record.nodes[0]
+            .members
+            .iter()
+            .find(|member| member.member == linked)
+            .expect("recorded");
+        assert!(parked.undecided);
+
+        let mut rebuilt = Tree::rebuild(&record, &FullBuild).expect("rebuilds");
+        deliver(&mut rebuilt, linked, b"held", &mut build);
+        assert_eq!(
+            rebuilt.child_of(NodeId::ROOT, linked),
+            Some((store, VolumeIndex(2)))
+        );
     }
 
     // A pretend store that holds every byte as envelope and, on `GIVE`,

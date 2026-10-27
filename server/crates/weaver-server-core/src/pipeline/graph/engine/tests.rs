@@ -702,3 +702,22 @@ async fn an_engine_turned_away_for_memory_starts_once_resident_bytes_are_release
     }
     assert_eq!(accountant.usage().resident, 0);
 }
+
+// A posted volume the run already read closes again at another length, as
+// a recovery set's description corrects it: every offset after it moved, so
+// the run built on the old ones starts over.
+#[tokio::test]
+async fn a_volume_the_run_read_closing_at_another_length_restarts_the_run() {
+    let mut echoing = echoing(3);
+    echoing.deliver(0);
+    echoing.until_closed(0).await;
+    let engine = echoing.engine();
+    let before = echoing.job.runs().generation(engine);
+    assert!(before.is_some(), "the run is live");
+    let namespace = echoing.job.namespace_mut(NodeId::ROOT).unwrap();
+    let name = namespace.get(MemberId(0)).unwrap().name.clone();
+    let length = namespace.get(MemberId(0)).unwrap().length.unwrap();
+    namespace.recognise(MemberId(0), &name, length - 1);
+    echoing.deliver(1);
+    assert_ne!(echoing.job.runs().generation(engine), before);
+}

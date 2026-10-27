@@ -41,6 +41,9 @@ pub(super) enum Signature {
     Foreign,
     // Its own checksum failed.
     Damaged,
+    // A 7z of a major version this object cannot read: its fields lie
+    // elsewhere.
+    Unreadable,
     Start(Start),
 }
 
@@ -55,11 +58,14 @@ pub(super) fn signature(bytes: &[u8]) -> Signature {
         out.copy_from_slice(&bytes[at..at + 4]);
         u32::from_le_bytes(out)
     };
-    if bytes.len() < 32 || bytes[..6] != MAGIC || bytes[6] != 0 {
+    if bytes.len() < 32 || bytes[..6] != MAGIC {
         return Signature::Foreign;
     }
     if crc32(&bytes[12..32]) != word(8) {
         return Signature::Damaged;
+    }
+    if bytes[6] != 0 {
+        return Signature::Unreadable;
     }
     let offset = u64::from_le_bytes(field(12));
     let size = u64::from_le_bytes(field(20));
@@ -209,6 +215,9 @@ mod tests {
         let mut damaged = bytes.clone();
         damaged[20] ^= 1;
         assert_eq!(signature(&damaged), Signature::Damaged);
+        let mut newer = bytes.clone();
+        newer[6] = 1;
+        assert_eq!(signature(&newer), Signature::Unreadable);
         let mut foreign = bytes;
         foreign[0] = b'X';
         assert_eq!(signature(&foreign), Signature::Foreign);
