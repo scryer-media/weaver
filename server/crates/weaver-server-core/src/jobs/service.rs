@@ -929,7 +929,7 @@ impl Pipeline {
             paused_resume_status: request.paused_resume_status.clone(),
             paused_resume_download_state: request.paused_resume_download_state,
             paused_resume_post_state: request.paused_resume_post_state,
-            failure_error: Some(format!("Placement recovery blocked: {error}")),
+            failure_error: Some(format!("Checkpoint could not be restored: {error}")),
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,

@@ -543,6 +543,17 @@ impl ArticleMap {
             .is_some_and(Volume::waiting)
     }
 
+    // Whether every article of the volume is in hand: none waits and every
+    // server failed none.
+    pub(crate) fn volume_whole(&self, volume: VolumeIndex) -> bool {
+        self.volumes.get(volume.0 as usize).is_some_and(|found| {
+            found
+                .articles
+                .iter()
+                .all(|article| matches!(article.state, State::Arrived(_)))
+        })
+    }
+
     pub(crate) fn volume_to_come(&self, volume: VolumeIndex) -> bool {
         self.volumes
             .get(volume.0 as usize)

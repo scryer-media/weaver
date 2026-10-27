@@ -917,7 +917,11 @@ async fn a_file_landed_by_a_step_that_errs_is_still_said() {
         .graph_jobs
         .get_mut(&job_id)
         .unwrap()
-        .lost(VolumeIndex(0), 0, &mut RepairSlots::default(), 1)
+        .intake(
+            decoded(0, 0, 0, &[7; 90], Some(90)),
+            &mut RepairSlots::default(),
+            1,
+        )
         .unwrap();
     let failed = crate::pipeline::graph::job::GraphError::Write(
         crate::pipeline::graph::namespace::WriteError::UnknownMember {

@@ -13,7 +13,7 @@ use sevenz_turbo::EncoderMethod;
 
 use super::harness::{
     ARTICLE, GraphView, JOB, Outcome, Post, Scenario, collect, finished, observe, par2_set,
-    par3_set, payload, run, serve,
+    par3_set, payload, run, serve, serve_work, take_retry,
 };
 use super::sfv::{crc, listing};
 use super::streams::{brotli, bzip2, gzip, members, tar, xz, zstd};
@@ -104,6 +104,8 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
     let mut owed = BTreeSet::new();
     let mut from_disk = BTreeSet::new();
     let mut in_memory = BTreeSet::new();
+    // What the last server to answer spoiled.
+    let mut spoiled = BTreeSet::new();
     let mut restarts = 0;
     let mut quiet = 0;
     let mut graph = GraphView::default();
@@ -118,10 +120,20 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
             let asked = requests.entry(article).or_insert(0usize);
             *asked += 1;
             let first = *asked == 1;
-            if !owed.remove(&article) && !first {
+            // A body a server spoiled was never held whole: asking for it
+            // again, of any server, is no refetch of what is on disk.
+            if !owed.remove(&article) && !first && !spoiled.contains(&article) {
                 from_disk.insert(article);
             }
-            serve(&mut pipeline, scenario, article).await;
+            let server = (0..)
+                .find(|server| !work.exclude_servers.contains(server))
+                .unwrap();
+            if scenario.spoils(server, article) {
+                spoiled.insert(article);
+            } else {
+                spoiled.remove(&article);
+            }
+            serve_work(&mut pipeline, scenario, &work).await;
             observe(&pipeline, &mut graph, &mut reads);
             if finished(&pipeline) {
                 break;
@@ -167,6 +179,9 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
+            continue;
+        }
+        if take_retry(&mut pipeline).await {
             continue;
         }
         let queued = pipeline

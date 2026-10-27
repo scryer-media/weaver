@@ -22,7 +22,7 @@ const (
 	// harness builds its NNTP image from when E2E_NNTP_MODULE_VERSION is unset.
 	// It is fetched as a public Go module; nothing here depends on a checkout
 	// sitting anywhere on the machine.
-	weaverNNTPDefaultModuleVersion = "v0.1.2"
+	weaverNNTPDefaultModuleVersion = "v0.1.3"
 )
 
 // weaverNNTPModuleVersion is the pinned e2e-nntp module version in effect.
