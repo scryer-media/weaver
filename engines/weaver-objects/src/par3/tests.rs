@@ -45,7 +45,11 @@ fn par3_verifies_a_clean_member() {
     let second = job.member("two.bin", &two);
     bind(&mut job);
     assert!(job.object.covers(first) && job.object.covers(second));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(reachable(&job.object) >= 3);
     assert_eq!(job.store.writes, 0);
 }
@@ -62,7 +66,9 @@ fn par3_repairs_one_damaged_member() {
     job.arrive(first, 4900, &wrong[4900..5100], Provenance::Damaged);
     let second = job.member("two.bin", &two);
     bind(&mut job);
-    let outcome = job.object.repair(&mut job.store);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
         "{outcome:?}"
@@ -85,7 +91,11 @@ fn par3_short_of_blocks_waits_until_a_volume_is_in_hand() {
     let member = job.member("one.bin", &wrong);
     job.arrive(member, 4900, &wrong[4900..5100], Provenance::Damaged);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     let mut out = Vec::new();
     for (index, piece) in bytes.chunks(700).enumerate() {
         job.object.deliver(
@@ -102,7 +112,9 @@ fn par3_short_of_blocks_waits_until_a_volume_is_in_hand() {
     }
     job.object.volume_closed(volume, &mut out);
     assert_eq!(job.object.outcome(), None);
-    let outcome = job.object.repair(&mut job.store);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
         "{outcome:?}"
@@ -161,7 +173,8 @@ fn par3_short_of_blocks_is_impossible() {
     job.member("one.bin", &wrong);
     bind(&mut job);
     assert!(matches!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 3,
             reachable: 1
@@ -216,7 +229,8 @@ fn a_hole_in_a_volume_costs_only_the_blocks_it_cuts() {
     let first = job.member("one.bin", &wrong);
     bind(&mut job);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert_eq!(reachable(&job.object), 2);
@@ -240,7 +254,8 @@ fn a_repair_larger_than_the_memory_limit_rebuilds_a_stripe_at_a_time() {
     let member = job.member("one.bin", &wrong);
     bind(&mut job);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 2 }
     );
     assert!(job.store.members[&member] == one);
@@ -251,7 +266,8 @@ fn a_repair_larger_than_the_memory_limit_rebuilds_a_stripe_at_a_time() {
     job.member("one.bin", &wrong);
     bind(&mut job);
     assert!(matches!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible { damaged: 2, .. }
     ));
 }
@@ -260,7 +276,9 @@ fn a_repair_larger_than_the_memory_limit_rebuilds_a_stripe_at_a_time() {
 // read its members back; what the second bind renamed.
 fn identify(job: &mut Job<Par3>) -> (RepairOutcome, Vec<MemberId>) {
     bind(job);
-    let outcome = job.object.repair(&mut job.store);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     let mut renamed = Vec::new();
     job.object.bind(&mut job.namespace, &mut renamed);
     (outcome, renamed)
@@ -349,7 +367,11 @@ fn a_hidden_member_still_arriving_holds_the_set_without_asking_for_recovery() {
         .announce("9725e81b6d3f0a4c", Some(one.len() as u64));
     job.arrive(hidden, 0, &one[..4000], Provenance::Fresh);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     let mut wants = Vec::new();
     Recovery::wants(&job.object, &mut wants);
     assert!(wants.is_empty(), "{wants:?}");
@@ -435,7 +457,8 @@ fn a_matrix_packet_repeated_across_volumes_is_one_matrix_and_every_block_is_usab
     let member = job.member("one.bin", &wrong);
     bind(&mut job);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 3 }
     );
     assert_eq!(reachable(&job.object), 3);
@@ -470,7 +493,11 @@ fn recovery_blocks_ahead_of_their_matrix_wait_until_it_arrives_or_is_lost() {
     let (volumes, member) = start(&mut job);
     let sets = job.object.front_sets();
     assert!(sets[0].matrix_packets().is_empty() && !sets[0].recovery_blocks().is_empty());
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     // Every volume but the last closes over its lost copy; the last copy
     // is still to come.
     let (last, before) = volumes.split_last().unwrap();
@@ -480,7 +507,11 @@ fn recovery_blocks_ahead_of_their_matrix_wait_until_it_arrives_or_is_lost() {
         }
         job.object.volume_closed(*volume, &mut Vec::new());
     }
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     let (volume, holes) = last;
     let bytes = &files.last().unwrap().1;
     for hole in holes {
@@ -488,7 +519,8 @@ fn recovery_blocks_ahead_of_their_matrix_wait_until_it_arrives_or_is_lost() {
     }
     job.object.volume_closed(*volume, &mut Vec::new());
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert!(job.store.members[&member] == one);
@@ -502,7 +534,8 @@ fn recovery_blocks_ahead_of_their_matrix_wait_until_it_arrives_or_is_lost() {
         job.object.volume_closed(*volume, &mut Vec::new());
     }
     assert!(matches!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 1,
             reachable: 0

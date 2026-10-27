@@ -215,7 +215,8 @@ pub(crate) fn restores_alike(
         (facts.kind, facts.version > Facts::UNSUPPORTED),
         (live.kind(), true)
     );
-    let mut restored = crate::restore(&facts).expect("the facts restore");
+    let mut restored =
+        crate::restore(&facts, weaver_graph::Budget::default()).expect("the facts restore");
     assert_eq!(restored.kind(), live.kind());
     let mut theirs = owner.clone();
     for step in again {

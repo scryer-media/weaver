@@ -867,6 +867,10 @@ pub struct JobInfo {
     // Files fully downloaded and committed.
     #[serde(default)]
     pub completed_files: u32,
+    // Each NZB file's bytes not yet downloaded, in the NZB's file order, as
+    // the post declares their sizes. Empty when no download runs for the job.
+    #[serde(default)]
+    pub file_remaining_bytes: Vec<u64>,
     // PAR2 recovery volumes not yet fetched (fetched on demand).
     #[serde(default)]
     pub remaining_par_files: u32,

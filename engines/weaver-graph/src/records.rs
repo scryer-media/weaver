@@ -75,6 +75,9 @@ pub struct MemberRecord {
     // and it is listed nowhere.
     #[serde(default)]
     pub copy_of: Option<MemberId>,
+    // The CRC32 its object's headers state for it.
+    #[serde(default)]
+    pub crc32: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

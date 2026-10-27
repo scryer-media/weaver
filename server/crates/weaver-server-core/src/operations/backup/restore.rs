@@ -788,6 +788,7 @@ fn job_info_from_history(row: crate::JobHistoryRow) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: row.category,
         metadata: row

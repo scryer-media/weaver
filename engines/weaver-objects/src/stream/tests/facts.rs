@@ -81,7 +81,10 @@ fn an_xz_stream_restored_at_every_point_sizes_and_decodes_as_the_live_one() {
     let early = header_facts(&header, 2);
     let late = header_facts(&block, 1 + FIRST / 4);
     assert_eq!(early.reserve(), None);
-    assert_eq!(late.reserve(), Some(Xz::window(&bytes)));
+    assert_eq!(
+        late.reserve(),
+        Some(Xz::window(&bytes, &weaver_graph::Budget::default()))
+    );
 }
 
 fn header_facts(steps: &[Step<'_>], cut: usize) -> XzStream {
@@ -95,7 +98,7 @@ fn a_stream_front_longer_than_it_keeps_is_refused() {
     stream.first = vec![0; FIRST + 1];
     let facts = Facts::of(Kind::Xz, &stream);
     assert!(matches!(
-        crate::restore(&facts),
+        crate::restore(&facts, weaver_graph::Budget::default()),
         Err(weaver_graph::RestoreError::Impossible { .. })
     ));
 }

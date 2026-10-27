@@ -318,3 +318,22 @@ async fn a_tar_holding_an_empty_directory_delivers_it() {
     );
     assert_fetched_once(&graph);
 }
+
+// A compressed stream states no checksum of the file it holds, so the
+// naming plan has none for it.
+#[tokio::test]
+async fn a_stream_member_gives_the_naming_plan_no_checksum() {
+    let graph = run(&Scenario::new(vec![Post::plain(
+        "ember.bin.xz",
+        xz(&ember()),
+    )]))
+    .await;
+    assert_delivered(&graph, &[("ember.bin", ember())]);
+    let files = &graph.graph().delivery.files;
+    assert!(
+        files.iter().any(|file| file.name.ends_with("ember.bin")),
+        "{files:?}"
+    );
+    assert!(files.iter().all(|file| file.crc32.is_none()), "{files:?}");
+    assert!(crate::pipeline::completion::finalize::member_crc32_by_path(files).is_empty());
+}

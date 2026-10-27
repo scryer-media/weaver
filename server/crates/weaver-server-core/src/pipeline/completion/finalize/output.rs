@@ -23,6 +23,36 @@ struct DeliverySourceValidation {
     root_entry_bytes: HashMap<PathBuf, u64>,
 }
 
+// Each delivered file's CRC32 as its object's headers state it, by its path
+// in lowercase. A path two members name with different checksums names
+// none, since either could be the file there.
+pub(in crate::pipeline) fn member_crc32_by_path(
+    files: &[crate::pipeline::graph::status::Delivered],
+) -> HashMap<String, u32> {
+    let mut by_path = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for file in files {
+        let Some(crc32) = file.crc32 else {
+            continue;
+        };
+        let key = file.name.to_ascii_lowercase();
+        if ambiguous.contains(&key) {
+            continue;
+        }
+        match by_path.get(&key).copied() {
+            None => {
+                by_path.insert(key, crc32);
+            }
+            Some(existing) if existing == crc32 => {}
+            Some(_) => {
+                by_path.remove(&key);
+                ambiguous.insert(key);
+            }
+        }
+    }
+    by_path
+}
+
 enum DeliveryPolicySource {
     Persisted(crate::Database),
     #[cfg(test)]
@@ -598,6 +628,27 @@ async fn run_move_to_claimed_destination(
         None => Vec::new(),
     };
 
+    // The delivered tree is the user's Weaver runs as, with the modes its
+    // umask gives, whatever the archives it came out of said.
+    let delivered = dest.clone();
+    match tokio::task::spawn_blocking(move || runtime_fs::normalize_extracted_tree(&delivered))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(MoveToCompleteFailure::Operational(format!(
+                "could not set ownership and modes of {}: {error}",
+                dest.display()
+            )));
+        }
+        Err(error) => {
+            return Err(MoveToCompleteFailure::Operational(format!(
+                "ownership and mode worker failed for {}: {error}",
+                dest.display()
+            )));
+        }
+    }
+
     let output_dir = dest.clone();
     match tokio::task::spawn_blocking(move || mark_weaver_owned_output_dir(&output_dir)).await {
         Ok(Ok(())) => {}
@@ -887,7 +938,11 @@ impl Pipeline {
     // handle to pipeline state so the pass cannot reach back into the
     // orchestrator, and so the outbound lookup — the one step that can take
     // seconds — never runs on the orchestrator's own task.
-    async fn delivery_naming_plan(&self, job_name: &str) -> Option<DeliveryNamingPlan> {
+    async fn delivery_naming_plan(
+        &self,
+        job_id: JobId,
+        job_name: &str,
+    ) -> Option<DeliveryNamingPlan> {
         let (enabled, srrdb_from_config) = {
             let cfg = self.config.read().await;
             (
@@ -902,7 +957,9 @@ impl Pipeline {
         // never opted in never pays for gathering it.
         let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
-            crc32_by_member_path: HashMap::new(),
+            crc32_by_member_path: member_crc32_by_path(
+                &self.graph_delivery(job_id).unwrap_or_default().files,
+            ),
             proxies: self.shared_state.proxy_runtime(),
         });
 
@@ -1042,7 +1099,7 @@ impl Pipeline {
         self.emit_job_event(PipelineEvent::MoveToCompleteStarted { job_id });
         self.report_job(job_id);
 
-        let naming = self.delivery_naming_plan(&job_name).await;
+        let naming = self.delivery_naming_plan(job_id, &job_name).await;
         let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
 
         let move_done_tx = self.move_done_tx.clone();

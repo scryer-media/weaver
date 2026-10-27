@@ -204,6 +204,7 @@ pub(super) fn initial_info(
         total_files: spec.files.len() as u32,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: spec.password.clone(),
         category: spec.category.clone(),
         metadata: spec.metadata.clone(),

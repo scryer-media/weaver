@@ -7,6 +7,7 @@
 pub(crate) mod checkpoint;
 pub(crate) mod engine;
 pub(crate) mod envelope;
+pub(crate) mod hardware;
 pub(crate) mod job;
 pub(crate) mod leaf;
 pub(crate) mod limits;
@@ -14,6 +15,7 @@ pub(crate) mod limits;
 pub(crate) mod lines;
 pub(crate) mod metadata;
 pub(crate) mod namespace;
+pub(crate) mod probe;
 pub(crate) mod restore;
 pub(crate) mod root;
 pub(crate) mod sparse;

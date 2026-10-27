@@ -51,6 +51,13 @@ pub trait Volumes: Send + Sync {
     // The volume's length, once it is closed.
     fn len(&self, volume: VolumeIndex) -> Option<u64>;
 
+    // Whether no read of the volume waits: it is closed, and every byte of
+    // it is in or will never come. Work on a lent pool reads only such
+    // volumes. A view that cannot tell says no.
+    fn settled(&self, _volume: VolumeIndex) -> bool {
+        false
+    }
+
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize>;
 
     // The run read on past a span a read failed on as lost: what it builds
@@ -64,13 +71,99 @@ pub trait Volumes: Send + Sync {
 // by a retraction, a repair, or the job's end, and nothing more is heard.
 pub type Sink<'a> = dyn FnMut(Emit) -> bool + 'a;
 
+// What the owner grants one piece of object work as it starts: a run of an
+// engine or a repair of a recovery set. An object sizes its decoders and its
+// repair workspace from `memory_bytes`, and parallelises across no more
+// than `threads`: a repair on whatever pool its owner runs it inside, a run
+// on the pool the grant lends it. The grant is the one limit: an object's
+// own allowance is what it holds to only when the owner granted no memory.
+// The grant is fixed for the work it was given to: a later grant reaches the
+// next run or repair, never one already going.
+#[derive(Clone, Default)]
+pub struct Budget {
+    pub memory_bytes: Option<u64>,
+    pub threads: usize,
+    // The owner's threads, which work that spreads borrows instead of
+    // starting its own, so the threads of every job together stay within
+    // the pool. None lends threads of the work's own, started for it.
+    pub pool: Option<Arc<dyn Pool>>,
+}
+
+// Threads the owner lends work that spreads. A pool thread must never wait
+// on bytes still downloading: it would hold back every piece of work queued
+// behind it.
+pub trait Pool: Send + Sync {
+    // `work` on `workers` threads at once, returning once every one has.
+    fn spread(&self, workers: usize, work: &(dyn Fn() + Sync));
+}
+
+// Threads started for the work alone, for an owner that lends none.
+struct Own;
+
+impl Pool for Own {
+    fn spread(&self, workers: usize, work: &(dyn Fn() + Sync)) {
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
+    }
+}
+
+impl std::fmt::Debug for Budget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budget")
+            .field("memory_bytes", &self.memory_bytes)
+            .field("threads", &self.threads)
+            .field("pool", &self.pool.is_some())
+            .finish()
+    }
+}
+
+// Two grants are alike when they grant the same memory and threads on the
+// same pool.
+impl PartialEq for Budget {
+    fn eq(&self, other: &Self) -> bool {
+        self.memory_bytes == other.memory_bytes
+            && self.threads == other.threads
+            && match (&self.pool, &other.pool) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Budget {}
+
+impl Budget {
+    // The threads to spread work across: never none.
+    pub fn threads(&self) -> usize {
+        self.threads.max(1)
+    }
+
+    // The pool work spreads on: the owner's, or threads of its own.
+    pub fn pool(&self) -> &dyn Pool {
+        match &self.pool {
+            Some(pool) => pool.as_ref(),
+            None => &Own,
+        }
+    }
+
+    // The memory the work may hold: the grant, or `own`, the object's own
+    // allowance, when the owner granted none.
+    pub fn memory_or(&self, own: u64) -> u64 {
+        self.memory_bytes.unwrap_or(own)
+    }
+}
+
 // One execution of an engine over its volumes, owned by the thread it runs
 // on. It emits `Member`, `Bytes` and `MemberClosed` as it goes, and ends with
 // nothing, with `NeedsPassword`, or with `Refuse` carrying why. The volumes
 // are shared, not borrowed: a decoder holds a reader per volume for as long
 // as it likes, and a reader that outlives no borrow is one it can keep.
 pub trait Extraction: Send {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>);
+    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>, budget: Budget);
 }
 
 // The engine face of an object: what the owner runs.

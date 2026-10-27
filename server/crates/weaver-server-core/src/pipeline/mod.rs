@@ -1248,6 +1248,9 @@ pub struct Pipeline {
     pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
     // Where the engines graph jobs run say what they found.
     pub(super) graph_runs: graph::engine::RunMail,
+    // Each graph job's health probe, and where its rounds say what they
+    // found.
+    pub(super) graph_probes: graph::probe::Probes,
     pub(crate) nzb_admitted: HashSet<JobId>,
     pub(crate) nzb_seen: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
@@ -1651,10 +1654,11 @@ pub struct Pipeline {
     pub(super) fire_and_forget_tasks: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
     // Shared config for runtime category lookups (dest_dir overrides).
     pub(super) config: crate::settings::SharedConfig,
-    // Dedicated low-priority rayon thread pool for post-processing
-    // (extraction, PAR2 verify/repair). Niced on Unix so the OS scheduler
-    // prefers download/decode threads when CPU is contended.
-    pub(super) pp_pool: Arc<rayon::ThreadPool>,
+    // What the hardware profile in force grants graph work as it starts:
+    // the low-priority post-processing pool repairs run inside, niced on
+    // Unix so the OS scheduler prefers download/decode threads when CPU is
+    // contended, and the budgets of a run and a repair.
+    pub(super) graph_hardware: crate::pipeline::graph::hardware::Hardware,
     // Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
     // Scheduling metadata retained by admitted jobs.

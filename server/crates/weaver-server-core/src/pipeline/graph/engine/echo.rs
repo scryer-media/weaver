@@ -35,7 +35,7 @@ impl Builder for Echoes {
     // the echo volumes still recovers them.
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         if !matches!(kind, Kind::RarStore | Kind::RarEngine) {
-            return weaver_objects::Objects.build(kind, id);
+            return weaver_objects::Objects::default().build(kind, id);
         }
         Some(Box::new(Echo {
             volumes: self.volumes,
@@ -135,7 +135,12 @@ struct EchoRun {
 }
 
 impl Extraction for EchoRun {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(
+        self: Box<Self>,
+        volumes: Arc<dyn Volumes>,
+        sink: &mut Sink<'_>,
+        _: weaver_graph::Budget,
+    ) {
         for index in 0..self.volumes {
             let (volume, member) = (VolumeIndex(index), MemberId(index));
             let announced = Emit::Member {

@@ -187,6 +187,13 @@ impl Zip {
             name,
             length: Some(length),
         });
+        // The header's CRC32 is the member's own unless a key went into it.
+        if !directory && !header.encrypted() {
+            out.push(Emit::Checksum {
+                member,
+                crc32: header.crc,
+            });
+        }
         let mut said = Out::default();
         if length == 0 {
             said.closed = true;

@@ -66,7 +66,7 @@ impl Pipeline {
     //
     // Nothing running is stopped or resized. Each limit is taken where an
     // activity starts: a download reads the tuner when it is dispatched, a
-    // decode when it is spawned, an extraction or repair clones the pool,
+    // decode when it is spawned, a graph run or repair takes the grant,
     // the extraction limits and its memory-budget view when it is admitted.
     // Replacing them here therefore leaves running work with what it started
     // on and gives the next activity the new values. A replaced pool is
@@ -79,7 +79,6 @@ impl Pipeline {
             return;
         }
 
-        let prior_extract_threads = self.tuner.params().extract_thread_count;
         self.tuner.set_profile_tuning(tuning);
         self.shared_state
             .set_sevenz_decode_memory_bytes(tuning.sevenz_decode_memory_bytes);
@@ -96,10 +95,7 @@ impl Pipeline {
         }
 
         let extract_threads = self.tuner.params().extract_thread_count;
-        if extract_threads != prior_extract_threads {
-            self.pp_pool =
-                crate::runtime::postprocess_pool::build_postprocess_pool(extract_threads);
-        }
+        self.graph_hardware.follow(&self.tuner);
 
         info!(
             hardware_profile = in_force.active.as_str(),

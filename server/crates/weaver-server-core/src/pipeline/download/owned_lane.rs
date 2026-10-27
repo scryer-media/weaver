@@ -1663,6 +1663,7 @@ fn test_admitted_state(job_id: JobId) -> crate::jobs::handle::SharedPipelineStat
             total_files: 1,
             completed_files: 0,
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: None,
             category: None,
             metadata: Vec::new(),

@@ -224,9 +224,7 @@ impl Pipeline {
         let owned_download_lane_pool =
             download::owned_lane::OwnedDownloadLanePool::new(total_connections.max(1));
         shared_state.set_paused(initial_global_paused);
-        let pp_pool = crate::runtime::postprocess_pool::build_postprocess_pool(
-            tuner.params().extract_thread_count,
-        );
+        let graph_hardware = crate::pipeline::graph::hardware::Hardware::of(&tuner);
 
         let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
             hold_settings.budgets(),
@@ -245,6 +243,7 @@ impl Pipeline {
             graph_status: Default::default(),
             graph_holds,
             graph_runs: Default::default(),
+            graph_probes: Default::default(),
             nzb_admitted,
             nzb_seen: HashSet::new(),
             nzb_pause_releases,
@@ -405,7 +404,7 @@ impl Pipeline {
             db,
             fire_and_forget_tasks: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
             config,
-            pp_pool,
+            graph_hardware,
         };
         let _ = pipeline
             .shared_state
@@ -941,6 +940,10 @@ impl Pipeline {
                     }
                     Some(said) = self.graph_runs.recv() => {
                         self.graph_run_said(said);
+                    }
+                    Some(update) = self.graph_probes.recv() => {
+                        turn_timer.resume();
+                        self.graph_probe_heard(update);
                     }
                     Some(result) = self.decode_done_rx.recv() => {
                         turn_timer.resume();

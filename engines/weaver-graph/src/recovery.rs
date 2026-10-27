@@ -6,6 +6,7 @@
 // beside it; it verifies them from evidence the namespace hands it as bytes
 // pass, and repairs them by asking up for its recovery data.
 
+use crate::engine::Budget;
 use crate::member::{MemberId, Namespace};
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
@@ -144,8 +145,9 @@ pub trait Recovery {
     // damage it knows about.
     fn wants(&self, out: &mut Vec<Seek>);
 
-    // Repair what is damaged among the members this object covers.
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome;
+    // Repair what is damaged among the members this object covers, within
+    // what `budget` grants the repair.
+    fn repair(&mut self, access: &mut dyn MemberAccess, budget: Budget) -> RepairOutcome;
 
     // What the last repair came to, or `None` before one ran, and again
     // after a bind changed which members this object covers: the verdict

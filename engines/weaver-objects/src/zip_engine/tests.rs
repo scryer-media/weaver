@@ -190,6 +190,8 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Retract(member) => out.push(Said::Retract(member.0)),
             Emit::NeedsPassword => out.push(Said::NeedsPassword),
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
+            // Said beside the walk; `checksums` reads them.
+            Emit::Checksum { .. } => {}
             other => panic!("an engine run does not say {other:?}"),
         }
     }
@@ -202,7 +204,9 @@ fn run_over(engine: &mut ZipEngine, gate: Arc<dyn Volumes>) -> Vec<Said> {
         emits.push(emit);
         true
     };
-    engine.start().run(gate, &mut sink);
+    engine
+        .start()
+        .run(gate, &mut sink, weaver_graph::Budget::default());
     said(&emits)
 }
 
@@ -264,7 +268,7 @@ fn a_run_waits_for_the_volume_to_close_and_extracts_once_it_has() {
     let volumes: Arc<dyn Volumes> = gate.clone();
     let runner = thread::spawn(move || {
         let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink);
+        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
     });
 
     gate.wait_for_reader(0);
@@ -288,7 +292,7 @@ fn a_spanned_set_extracts_as_one_once_its_last_volume_lands() {
     let volumes: Arc<dyn Volumes> = gate.clone();
     let runner = thread::spawn(move || {
         let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink);
+        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
     });
 
     gate.wait_for_reader(2);
@@ -438,7 +442,12 @@ fn claim_names_the_volumes_of_its_own_set_with_the_last_after_them() {
 
 #[test]
 fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
-    let object = crate::build(Kind::ZipEngine, ObjectId(4)).unwrap();
+    let object = crate::build(
+        Kind::ZipEngine,
+        ObjectId(4),
+        weaver_graph::Budget::default(),
+    )
+    .unwrap();
     assert_eq!(object.kind(), Kind::ZipEngine);
     assert!(object.reads_in_order());
     assert!(object.engine().is_some());
@@ -723,4 +732,37 @@ fn the_store_and_the_engine_name_an_entry_alike_whatever_its_bytes_and_flag() {
         assert_eq!(local, store, "{case}: local and central headers");
         assert_eq!(store, "café.txt", "{case}");
     }
+}
+
+// Each member's checksum as the run said it, in the order it was said.
+fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
+    emits
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn crc(bytes: &[u8]) -> u32 {
+    crate::grid::crc32(bytes)
+}
+
+#[test]
+fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    ZipEngine::new().start().run(
+        Gate::whole(vec![plain()]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    assert_eq!(
+        checksums(&emits),
+        vec![(1, crc(NOTES)), (2, crc(&second()))]
+    );
 }

@@ -138,7 +138,11 @@ fn a_clean_set_repairs_with_zero_reads() {
             .iter()
             .all(|verdict| *verdict == SliceVerdict::Intact)
     );
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert_eq!((job.store.reads, job.store.volume_reads), (0, 0));
 }
 
@@ -148,7 +152,11 @@ fn an_unfed_clean_member_is_read_back_and_found_clean() {
     let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
     job.member("payload.bin", &data);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(job.store.reads > 0);
     assert_eq!(job.store.writes, 0);
 }
@@ -212,13 +220,81 @@ fn a_damaged_member_is_repaired_through_member_access() {
     bind(&mut job);
     let wrong = job.store.members[&member].clone();
     feed(&mut job, member, &wrong, Some(bad));
-    let outcome = job.object.repair(&mut job.store);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
         "{outcome:?}"
     );
     assert!(job.store.members[&member] == data);
     assert!(job.store.writes > 0 && job.store.volume_reads > 0);
+}
+
+// A member that arrived with its bytes shifted along by three, so three
+// longer than described, is rebuilt, and the bind after recognises it at the
+// described length: what is left is the file, its whole-file hash the
+// description's.
+#[test]
+fn a_repaired_member_longer_than_described_is_recognised_at_its_length() {
+    let data = payload(12, 5000);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 12, 1));
+    let mut shifted = vec![0x9b, 0x7d, 0x1f];
+    shifted.extend_from_slice(&data);
+    let member = job.member("payload.bin", &shifted);
+    assert!(bind(&mut job).is_empty());
+    feed(&mut job, member, &shifted, None);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(bind(&mut job), vec![member]);
+    let record = job.namespace.get(member).unwrap();
+    assert_eq!(record.name, "payload.bin");
+    assert_eq!(record.length, Some(data.len() as u64));
+    assert!(record.is_complete());
+    let described = job
+        .object
+        .sets
+        .values()
+        .find_map(|state| {
+            let file = state
+                .members()
+                .iter()
+                .find_map(|(file, bound)| (*bound == member).then_some(*file))?;
+            state.usable()?.file_description(&file).cloned()
+        })
+        .expect("the set describes the member");
+    assert_eq!(described.length, data.len() as u64);
+    let repaired = &job.store.members[&member][..data.len()];
+    assert_eq!(par2_rs::checksum::md5(repaired), described.hash_full);
+    // Recognised once, it is not again.
+    assert!(bind(&mut job).is_empty());
+}
+
+// A member none of whose bytes came, booked at more than the described
+// length for the articles it lost, is rebuilt and keeps its length: what was
+// booked never arrived, so nothing lies past the description to cut.
+#[test]
+fn a_repaired_member_booked_longer_than_described_is_not_recognised() {
+    let data = payload(13, 5000);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 12, 1));
+    let booked = data.len() as u64 + 300;
+    let member = job.namespace.announce("payload.bin", Some(booked));
+    job.store.members.insert(member, Vec::new());
+    assert!(bind(&mut job).is_empty());
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    assert!(bind(&mut job).is_empty());
+    assert_eq!(job.namespace.get(member).unwrap().length, Some(booked));
 }
 
 #[test]
@@ -238,7 +314,8 @@ fn two_sets_in_one_namespace_bind_and_repair_apart() {
     assert_eq!(verdicts(&job, first).len(), 10);
     assert_eq!(verdicts(&job, second).len(), 6);
     assert!(matches!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { .. }
     ));
     assert!(job.store.members[&second] == two);
@@ -270,7 +347,8 @@ fn a_shared_recovery_file_feeds_both_sets() {
     feed(&mut job, right, &wrong, Some(right_bad));
     assert_eq!(reachable(&job.object), 4);
     assert!(matches!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { .. }
     ));
     assert!(job.store.members[&left] == one);
@@ -310,7 +388,8 @@ fn a_repair_short_of_blocks_reports_counts() {
     bind(&mut job);
     feed(&mut job, member, &wrong, Some(ByteRange::new(0, 2800)));
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 3,
             reachable: 2
@@ -339,7 +418,11 @@ fn wants_asks_for_recovery_while_short() {
             .iter()
             .all(|seek| seek.volume == volume && seek.purpose == weaver_graph::Purpose::Recovery)
     );
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
 }
 
 // A set short of recovery blocks waits while the pieces that bring none
@@ -357,7 +440,11 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
     bind(&mut job);
     let wrong = job.store.members[&member].clone();
     feed(&mut job, member, &wrong, Some(bad));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     let held = |job: &Job<Par2>| -> usize {
         job.object
             .sets
@@ -385,7 +472,8 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
     }
     assert_eq!(held(&job), 1);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert_eq!(
@@ -424,7 +512,11 @@ fn an_object_with_no_sets_rules_unread_once_a_volume_is_read_through() {
     assert_eq!(job.object.outcome(), None);
     job.object.volume_closed(volume, &mut out);
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
     job.volume(&files[1].0, &files[1].1, ARTICLE as usize, false);
     assert_eq!(job.object.outcome(), None);
@@ -535,7 +627,8 @@ fn a_shared_members_damage_counts_once() {
     feed(&mut job, member, &wrong, Some(bad));
     assert!(wanted(&mut job).is_empty());
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert!(job.store.members[&member] == shared);
@@ -561,7 +654,11 @@ fn a_name_two_sets_describe_is_the_first_sets() {
         .collect();
     assert_eq!(bound, [true, false]);
     feed(&mut job, member, &quill, None);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert_eq!(job.store.writes, 0);
 }
 
@@ -574,7 +671,11 @@ fn a_set_covering_nothing_asks_for_nothing() {
     let mut job = job(&files[..1]);
     named_volume(&mut job, &files[1]);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(wanted(&mut job).is_empty());
     assert_eq!(job.store.volume_reads, 0);
 }
@@ -613,7 +714,8 @@ fn a_described_file_no_member_carries_is_named_and_rebuilt_whole() {
     assert!(named.is_empty(), "{named:?}");
 
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 3 }
     );
     assert!(job.store.members[&rebuilt] == absent);
@@ -640,7 +742,8 @@ fn a_member_whose_front_was_lost_is_known_by_its_slices_and_mended_in_place() {
     assert!(named.is_empty(), "{named:?}");
 
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 2 }
     );
     assert!(job.store.members[&posted] == file);
@@ -675,7 +778,8 @@ fn a_member_with_no_intact_byte_binds_by_elimination_and_is_mended_in_place() {
     assert!(named.is_empty(), "{named:?}");
 
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 3 }
     );
     assert!(job.store.members[&posted][..file.len()] == file);
@@ -716,7 +820,11 @@ fn elimination_waits_for_the_members_still_to_come() {
         .announce("a91d07e4c3b25f86", Some(second.len() as u64));
     assert!(bind(&mut job).is_empty());
 
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(!job.object.covers(posted));
     assert!(job.store.members[&posted] == lost);
 
@@ -724,7 +832,8 @@ fn elimination_waits_for_the_members_still_to_come() {
     job.store.members.insert(coming, second.clone());
     assert_eq!(bind(&mut job), vec![coming]);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 3 }
     );
     assert!(job.object.covers(posted));
@@ -820,13 +929,32 @@ fn a_repair_larger_than_the_memory_limit_reads_one_slice_at_a_time() {
         store: &mut job.store,
         widest: 0,
     };
-    let outcome = job.object.repair(&mut access);
+    let outcome = job
+        .object
+        .repair(&mut access, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
         "{outcome:?}"
     );
     assert!(access.widest <= SLICE, "{}", access.widest);
     assert!(job.store.members[&member] == data);
+}
+
+// The memory a repair is granted is its one limit, above the object's own
+// allowance as well as below it; the allowance is what it holds to only
+// when it is granted none.
+#[test]
+fn a_repair_holds_to_the_memory_it_was_granted_not_the_objects_own() {
+    let mut object = Par2::new(OWN);
+    object.memory_limit = 64 * 1024;
+    let granted = |memory_bytes| weaver_graph::Budget {
+        memory_bytes,
+        threads: 1,
+        ..Default::default()
+    };
+    assert_eq!(object.workspace(granted(Some(1 << 30))), 1 << 30);
+    assert_eq!(object.workspace(granted(Some(4096))), 4096);
+    assert_eq!(object.workspace(granted(None)), 64 * 1024);
 }
 
 // A recovery volume whose first article arrived, the rest still to come.

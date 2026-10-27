@@ -424,7 +424,7 @@ fn a_member_whose_checksum_fails_is_damaged_at_its_extent() {
 
 #[test]
 fn the_store_is_built_for_its_kind() {
-    let object = crate::build(Kind::Zip, ObjectId(1)).unwrap();
+    let object = crate::build(Kind::Zip, ObjectId(1), weaver_graph::Budget::default()).unwrap();
     assert_eq!(object.kind(), Kind::Zip);
     assert!(!object.reads_in_order());
 }
@@ -554,4 +554,19 @@ fn a_seek_under_a_deflated_entry_is_unseekable() {
         Located::Never
     );
     assert!(extents.is_empty());
+}
+
+// Each file's checksum as the central directory states it, said as the
+// file is announced.
+#[test]
+fn a_file_carries_its_directory_checksum() {
+    let mut owner = Owner::single(Zip::new(), archive());
+    owner.whole(4096);
+    for (name, bytes) in files() {
+        assert_eq!(
+            owner.member(name).crc32,
+            Some(crate::grid::crc32(&bytes)),
+            "{name}"
+        );
+    }
 }

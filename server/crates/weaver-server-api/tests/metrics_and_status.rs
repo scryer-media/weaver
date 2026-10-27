@@ -134,6 +134,7 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: None,
         metadata: Vec::new(),

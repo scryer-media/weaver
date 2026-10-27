@@ -28,9 +28,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Handed, Kind, Located,
-    MemberId, Object, Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex, Weight,
-    Why, signed,
+    Budget, ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Give, Handed, Kind,
+    Located, MemberId, Object, Placement, Posting, Pull, Seek, Sniff, Standing, Take, VolumeIndex,
+    Weight, Why, signed,
 };
 use zeroize::Zeroizing;
 
@@ -48,6 +48,17 @@ use map::Map;
 // The length of the container a first piece's signature header measures,
 // when the front is one: a front that measures what the set's first piece
 // measured is that piece.
+// What a 7z decode within `budget` may hold: the memory granted, or the
+// decoder's own limits when none was. Header parses, key derivations and
+// runs alike are held to it.
+pub(crate) fn limits(budget: &Budget) -> sevenz_turbo::ArchiveLimits {
+    let limits = sevenz_turbo::ArchiveLimits::default();
+    sevenz_turbo::ArchiveLimits {
+        memory_limit_bytes: budget.memory_or(limits.memory_limit_bytes),
+        ..limits
+    }
+}
+
 pub(crate) fn measured(first_bytes: &[u8]) -> Option<u64> {
     match header::signature(first_bytes) {
         Signature::Start(start) => Some(start.total()),
@@ -165,6 +176,10 @@ struct Candidate {
 pub struct SevenZipStore {
     #[serde(skip, default = "Keys::global")]
     keys: Arc<Keys>,
+    // What its header parses and key derivations may hold, as granted when
+    // it was built or restored.
+    #[serde(skip)]
+    budget: Budget,
     names: BTreeMap<VolumeIndex, String>,
     lengths: BTreeMap<VolumeIndex, u64>,
     kept: Kept,
@@ -269,6 +284,7 @@ impl SevenZipStore {
         kept.want(SIGNATURE);
         Self {
             keys,
+            budget: Budget::default(),
             names: BTreeMap::new(),
             lengths: BTreeMap::new(),
             kept,
@@ -297,6 +313,12 @@ impl SevenZipStore {
             stale: true,
             gone: false,
         }
+    }
+
+    // Held to what `budget` grants.
+    pub fn within(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
     }
 
     // A volume range in container coordinates. Volume 0 starts the
@@ -520,7 +542,7 @@ impl SevenZipStore {
         }
         let total = start.total();
         if !self.encrypted {
-            match header::parse(&self.kept, total, None, false) {
+            match header::parse(&self.kept, total, None, false, &limits(&self.budget)) {
                 header::Parsed::Missing(range) => return self.want_header(range),
                 header::Parsed::Unverified => return,
                 header::Parsed::Broken => {
@@ -570,6 +592,10 @@ impl SevenZipStore {
                 name: entry.name.clone(),
                 length: Some(entry.length),
             });
+            // A 7z checks its members' plain bytes, keyed or not.
+            if let Some(crc32) = entry.crc {
+                out.push(Emit::Checksum { member, crc32 });
+            }
             if entry.length == 0 {
                 members[id].closed = true;
                 out.push(Emit::MemberClosed(member));

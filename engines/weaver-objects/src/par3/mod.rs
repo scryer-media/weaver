@@ -47,8 +47,8 @@ const FRONT_CAP: usize = 1024 * 1024;
 // What one job may carry.
 const MAX_CARRIERS: usize = 4096;
 const MAX_SETS: usize = 256;
-// What one repair's decoder may hold: half the allowance a job has when the
-// host's memory is unknown.
+// What one repair's decoder may hold when the owner grants it no memory:
+// half the allowance a job has when the host's memory is unknown.
 const REPAIR_MEMORY_LIMIT: u64 = 128 << 20;
 
 // A set's ruling and the members its files were bound to when it ruled.
@@ -180,6 +180,7 @@ pub struct Par3 {
     // its files were bound to then. The ruling stands while they are; only
     // a set that waited or could not rebuild is tried again.
     settled: BTreeMap<String, Settled>,
+    // The repair's decoder allowance when the owner grants it none.
     memory_limit: u64,
 }
 
@@ -610,7 +611,11 @@ impl Recovery for Par3 {
         }
     }
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(
+        &mut self,
+        access: &mut dyn MemberAccess,
+        budget: weaver_graph::Budget,
+    ) -> RepairOutcome {
         // Every readable span of every volume, read back and scanned one at
         // a time; a span that does not read back whole is left out.
         let mut packets = Vec::new();
@@ -655,7 +660,17 @@ impl Recovery for Par3 {
                     lost: 0,
                 }
             } else {
-                rebuild::repair_set(&set, &self.bound, coming, self.memory_limit, access)
+                rebuild::repair_set(
+                    &set,
+                    &self.bound,
+                    coming,
+                    weaver_graph::Budget {
+                        memory_bytes: Some(budget.memory_or(self.memory_limit)),
+                        threads: budget.threads,
+                        pool: budget.pool.clone(),
+                    },
+                    access,
+                )
             };
             if result.outcome == RepairOutcome::Waiting {
                 waiting += result.lost;

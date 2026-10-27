@@ -69,6 +69,7 @@
 mod binding_order;
 mod caps;
 mod checkpoint_cost;
+mod dead_posts;
 mod deep;
 mod delivery;
 mod depth;

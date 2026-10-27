@@ -2396,6 +2396,14 @@ impl Tree {
                         effects,
                     );
                 }
+                Emit::Checksum { member, crc32 } => {
+                    if let Some(record) = self
+                        .namespace_mut(node)
+                        .and_then(|namespace| namespace.get_mut(member))
+                    {
+                        record.crc32 = Some(crc32);
+                    }
+                }
                 Emit::MemberClosed(member) => self.close(node, member, builder, effects),
                 Emit::Retract(member) => self.retract(node, member, effects),
                 Emit::RecoveryAt {

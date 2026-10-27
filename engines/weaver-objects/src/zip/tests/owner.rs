@@ -24,6 +24,8 @@ pub(super) struct Got {
     pub bytes: Vec<u8>,
     pub coverage: Coverage,
     pub closed: bool,
+    // The CRC32 the object said its headers state.
+    pub crc32: Option<u32>,
 }
 
 pub(super) struct Owner {
@@ -315,6 +317,10 @@ impl Owner {
                     let got = self.members.get_mut(&member.0).expect("announced first");
                     assert!(!got.closed, "closed once");
                     got.closed = true;
+                }
+                Emit::Checksum { member, crc32 } => {
+                    let got = self.members.get_mut(&member.0).expect("announced first");
+                    got.crc32 = Some(crc32);
                 }
                 Emit::Retract(member) => {
                     self.members.remove(&member.0);

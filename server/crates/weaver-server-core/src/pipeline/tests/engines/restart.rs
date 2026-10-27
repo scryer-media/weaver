@@ -48,25 +48,29 @@ fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
 }
 
 // What a restarted run came to.
-pub(super) struct Restarted {
-    pub(super) status: Option<JobStatus>,
-    pub(super) files: BTreeMap<String, Vec<u8>>,
+pub(in crate::pipeline::tests) struct Restarted {
+    pub(in crate::pipeline::tests) status: Option<JobStatus>,
+    pub(in crate::pipeline::tests) files: BTreeMap<String, Vec<u8>>,
     // Every article asked for again though no restart since it was last
     // served found it in memory: its bytes were on disk when asked.
-    pub(super) from_disk: BTreeSet<(u32, u32)>,
+    pub(in crate::pipeline::tests) from_disk: BTreeSet<(u32, u32)>,
     // Every article some restart found in memory.
-    pub(super) in_memory: BTreeSet<(u32, u32)>,
-    pub(super) restarts: usize,
+    pub(in crate::pipeline::tests) in_memory: BTreeSet<(u32, u32)>,
+    pub(in crate::pipeline::tests) restarts: usize,
     // Every article in the order it was asked for.
-    pub(super) order: Vec<(u32, u32)>,
+    pub(in crate::pipeline::tests) order: Vec<(u32, u32)>,
     // The graph job as last seen before it finished, across every restart.
-    pub(super) graph: GraphView,
+    pub(in crate::pipeline::tests) graph: GraphView,
 }
 
 // Called with each checkpoint as it stood when the pipeline went down.
-pub(super) type Inspect<'a> = &'a mut dyn FnMut(&crate::jobs::graph_checkpoint::GraphCheckpoint);
+pub(in crate::pipeline::tests) type Inspect<'a> =
+    &'a mut dyn FnMut(&crate::jobs::graph_checkpoint::GraphCheckpoint);
 
-pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) -> Restarted {
+pub(in crate::pipeline::tests) async fn run_restarting(
+    scenario: &Scenario,
+    inspect: Inspect<'_>,
+) -> Restarted {
     run_restarting_at(scenario, inspect, Down::Crash, &|_| true).await
 }
 
@@ -74,7 +78,7 @@ pub(super) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) ->
 // that also loses the file written for the member of this output name, so
 // the restore cannot read back any article holding its bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Down<'a> {
+pub(in crate::pipeline::tests) enum Down<'a> {
     Crash,
     Shutdown,
     Losing(&'a str),
@@ -82,7 +86,7 @@ pub(super) enum Down<'a> {
 
 // As `run_restarting`, going down as `down` says and only after the articles
 // `at` picks: the nth article asked for the first time, counted from one.
-pub(super) async fn run_restarting_at(
+pub(in crate::pipeline::tests) async fn run_restarting_at(
     scenario: &Scenario,
     inspect: Inspect<'_>,
     down: Down<'_>,
@@ -329,7 +333,7 @@ async fn restart_heard(
 
 // The restarted run finished as the uninterrupted one did, and asked again
 // only for what some restart since it last fetched it had in memory.
-pub(super) fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
+pub(in crate::pipeline::tests) fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
     assert!(restarted.restarts > 0, "the run restarted");
     assert_eq!(restarted.status, whole.status, "status");
     assert_eq!(
@@ -347,7 +351,7 @@ pub(super) fn assert_restarted(restarted: &Restarted, whole: &Outcome) {
     );
 }
 
-pub(super) async fn restart_row(scenario: Scenario) {
+pub(in crate::pipeline::tests) async fn restart_row(scenario: Scenario) {
     let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
@@ -398,11 +402,11 @@ fn drain(
 }
 
 // What a run restarted once after its repair came to.
-pub(super) struct RestartedDone {
-    pub(super) status: Option<JobStatus>,
-    pub(super) files: BTreeMap<String, Vec<u8>>,
+pub(in crate::pipeline::tests) struct RestartedDone {
+    pub(in crate::pipeline::tests) status: Option<JobStatus>,
+    pub(in crate::pipeline::tests) files: BTreeMap<String, Vec<u8>>,
     // Every event either pipeline sent from admission on, in order.
-    pub(super) events: Vec<PipelineEvent>,
+    pub(in crate::pipeline::tests) events: Vec<PipelineEvent>,
 }
 
 // The job served as `run` serves it, and the pipeline taken down once, the
@@ -514,7 +518,9 @@ async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
 // The job served as `run` serves it, and the pipeline drained and taken down
 // once, the first time a repair of the job is out on a thread. Whether the
 // restored job lent a repair again.
-pub(super) async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
+pub(in crate::pipeline::tests) async fn run_restarted_while_repairing(
+    scenario: &Scenario,
+) -> (RestartedDone, bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
@@ -597,7 +603,7 @@ pub(super) async fn run_restarted_while_repairing(scenario: &Scenario) -> (Resta
 }
 
 // What the job announced of its repair and its end, in order.
-pub(super) fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
+pub(in crate::pipeline::tests) fn repairs_and_end(events: &[PipelineEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {
@@ -652,6 +658,33 @@ async fn a_three_volume_stored_rar_restarted_after_every_article_delivers_its_me
         3,
     ))))
     .await;
+}
+
+// The checksum a store said for its member is in every checkpoint taken
+// once it was said, so the member a restart restores is checked as it was.
+#[tokio::test]
+async fn a_members_checksum_survives_a_restart() {
+    let body = payload(11 * ARTICLE + 9, 73);
+    let scenario = Scenario::new(volumes(single_member_store_set("beacon.bin", &body, 3)));
+    let mut kept = Vec::new();
+    let restarted = run_restarting(&scenario, &mut |rows| {
+        kept.extend(
+            rows.members
+                .iter()
+                .filter(|member| member.name == "beacon.bin")
+                .map(|member| member.crc32),
+        );
+    })
+    .await;
+    let expected = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &body) as i64;
+    assert!(kept.contains(&Some(expected)), "{kept:?}");
+    assert!(
+        kept.iter()
+            .all(|crc32| crc32.is_none_or(|crc32| crc32 == expected)),
+        "{kept:?}"
+    );
+    let whole = run(&scenario).await;
+    assert_restarted(&restarted, &whole);
 }
 
 #[tokio::test]

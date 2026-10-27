@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use sevenz_turbo::{AesProperties, ArchiveLimits};
+use sevenz_turbo::AesProperties;
 use weaver_graph::{ByteRange, Emit, Why};
 use zeroize::Zeroizing;
 
@@ -115,6 +115,7 @@ impl SevenZipStore {
                 total,
                 Some(&self.candidates[index].password),
                 true,
+                &super::limits(&self.budget),
             );
             match parsed {
                 header::Parsed::Missing(range) => return self.want_header(range),
@@ -230,7 +231,7 @@ impl SevenZipStore {
         let password = &self.candidates[index].password;
         let derived = self.keys.derive(&tuple, || {
             properties
-                .derive_key(password, &ArchiveLimits::default())
+                .derive_key(password, &super::limits(&self.budget))
                 .map(|key| Zeroizing::new(key.as_bytes().to_vec()))
         })?;
         let Derived::Key(bytes) = derived else {

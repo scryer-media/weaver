@@ -120,6 +120,7 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: Some("movies".to_string()),
         metadata: vec![

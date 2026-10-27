@@ -185,6 +185,15 @@ impl Volumes for RunVolumes {
         self.shelf.lock().kept.get(&volume.0)?.closed
     }
 
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        let state = self.shelf.lock();
+        state.kept.get(&volume.0).is_some_and(|kept| {
+            kept.closed.is_some_and(|length| {
+                kept.settled || kept.coverage.verified(ByteRange::new(0, length))
+            })
+        })
+    }
+
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
         let range = ByteRange::at(offset, into.len() as u64);
         let (len, path) = self.wait_for(volume, range).inspect_err(|error| {

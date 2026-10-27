@@ -55,6 +55,8 @@ mod full_file_names;
 mod hardware_profile;
 mod idle;
 mod nzb_admission;
+mod par2;
+mod par2_completion;
 #[cfg(unix)]
 mod post_processing_completion;
 mod post_processing_pause;
@@ -319,6 +321,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: None,
         metadata: vec![],

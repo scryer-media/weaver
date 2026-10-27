@@ -30,7 +30,12 @@ impl Run {
 }
 
 impl Extraction for Run {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(
+        self: Box<Self>,
+        volumes: Arc<dyn Volumes>,
+        sink: &mut Sink<'_>,
+        _: weaver_graph::Budget,
+    ) {
         let joined = Joined::new(volumes);
         let failed = joined.failure();
         let image = match Image::open(joined) {
@@ -107,6 +112,12 @@ impl Walk<'_, '_> {
             })?;
             self.open = Some(member);
             let encrypted = file.encrypted();
+            if shape == Shape::File && !encrypted {
+                self.say(Emit::Checksum {
+                    member,
+                    crc32: file.crc32(),
+                })?;
+            }
             let mut out = Out {
                 sink: &mut *self.sink,
                 member,

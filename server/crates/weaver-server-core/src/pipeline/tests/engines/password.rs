@@ -162,6 +162,9 @@ fn assert_fails_for_the_password(outcome: &Outcome) {
         outcome.failure
     );
     assert!(outcome.files.is_empty(), "{:?}", outcome.files.keys());
+    // A password withheld is the extraction's failure, never a deletion
+    // for health.
+    assert!(!outcome.graph().health);
 }
 
 fn every_candidate_wrong() -> Scenario {

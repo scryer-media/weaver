@@ -210,7 +210,11 @@ fn a_set_rules_on_how_many_volumes_are_missing_against_its_recovery_volumes() {
         data(&mut job, name);
     }
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
 
     let mut job = self::job();
     rev(
@@ -221,7 +225,8 @@ fn a_set_rules_on_how_many_volumes_are_missing_against_its_recovery_volumes() {
     let whole = data(&mut job, "lantern.part01.rar");
     bind(&mut job);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 2,
             reachable: 1
@@ -246,12 +251,17 @@ fn a_short_set_waits_until_the_volumes_it_needs_are_in_hand() {
     bind(&mut job);
     let second = arriving(&mut job, "lantern.part2.rev", &rev5(3, 2, 4, &[]));
     let second = second.expect("claimed");
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Waiting));
     job.object.volume_closed(second, &mut Vec::new());
     assert_eq!(job.object.outcome(), None);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 2,
             reachable: 2
@@ -268,7 +278,8 @@ fn a_set_that_could_rebuild_without_scratch_is_impossible() {
     data(&mut job, "lantern.part01.rar");
     bind(&mut job);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 1,
             reachable: 1
@@ -282,7 +293,8 @@ fn a_set_survives_a_restart() {
     rev(&mut job, "lantern.part1.rev", &rev5(2, 1, 2, &[300, 300]));
     data(&mut job, "lantern.part01.rar");
     bind(&mut job);
-    let back = crate::restore(&job.object.facts()).expect("restores");
+    let back =
+        crate::restore(&job.object.facts(), weaver_graph::Budget::default()).expect("restores");
     assert_eq!(back.kind(), Kind::RarRecovery);
     let mut absent = Vec::new();
     back.recovery().expect("a recovery").absent(&mut absent);
@@ -331,7 +343,11 @@ fn a_lost_data_volume_raises_as_many_recovery_volumes_as_it_needs() {
     data(&mut job, "lantern.part01.rar");
     data(&mut job, "lantern.part02.rar");
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     assert_eq!(
         wants(&job.object),
         vec![
@@ -365,7 +381,8 @@ fn a_deferral_is_said_again_after_a_restart() {
     let mut job = job();
     let bytes = rev5(3, 2, 3, &[300, 300, 300]);
     sampled(&mut job, "lantern.part1.rev", &bytes);
-    let back = crate::restore(&job.object.facts()).expect("restores");
+    let back =
+        crate::restore(&job.object.facts(), weaver_graph::Budget::default()).expect("restores");
     let mut again = Vec::new();
     back.wants(&mut again);
     assert_eq!(again, wants(&job.object));

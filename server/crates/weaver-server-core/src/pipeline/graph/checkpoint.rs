@@ -487,6 +487,7 @@ fn node_rows(
             member: i64::from(member.member.0),
             name: member.name.clone(),
             output_name: member.output_name.clone(),
+            crc32: member.crc32.map(i64::from),
             length: member.length.map(|length| length as i64),
             closed: member.closed,
             bound: member.bound_to.map(|object| i64::from(object.0)),
@@ -659,6 +660,10 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             member,
             name: row.name.clone(),
             output_name: row.output_name.clone(),
+            crc32: row
+                .crc32
+                .map(|crc32| u32::try_from(crc32).map_err(|_| refuse("a checksum")))
+                .transpose()?,
             length: row
                 .length
                 .map(|length| u64::try_from(length).map_err(|_| refuse("a length")))

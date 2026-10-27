@@ -17,7 +17,7 @@ impl Decoder for Gzip {
     const KIND: Kind = Kind::Gzip;
 
     // Deflate's window is fixed.
-    fn window(_first: &[u8]) -> u64 {
+    fn window(_first: &[u8], _budget: &weaver_graph::Budget) -> u64 {
         32 << 10
     }
 

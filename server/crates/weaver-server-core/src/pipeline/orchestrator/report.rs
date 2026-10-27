@@ -207,6 +207,11 @@ impl Pipeline {
             } else {
                 state.assembly.complete_file_count() as u32
             },
+            file_remaining_bytes: self
+                .graph_jobs
+                .get(&state.job_id)
+                .map(super::super::graph::job::GraphJob::remaining_bytes)
+                .unwrap_or_default(),
             remaining_par_files,
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),

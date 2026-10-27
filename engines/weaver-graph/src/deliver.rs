@@ -232,6 +232,13 @@ pub enum Emit {
         bytes: Bytes,
         provenance: Provenance,
     },
+    // "My headers say member M's bytes have this CRC32": said once the
+    // object knows it, for a member it announced. Only a checksum of the
+    // member's own bytes, never a keyed one.
+    Checksum {
+        member: MemberId,
+        crc32: u32,
+    },
     // "Member M is complete."
     MemberClosed(MemberId),
     // "What I said about member M was built on bytes that were wrong; forget

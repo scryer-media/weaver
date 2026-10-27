@@ -352,7 +352,7 @@ impl Recovery for RarRecord {
         ByteRange::new(0, self.protected.unwrap_or(length).min(length))
     }
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let said = self.rule(access);
         self.said = Some(said);
         self.outcome().unwrap_or(RepairOutcome::Waiting)

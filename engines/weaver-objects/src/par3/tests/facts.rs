@@ -90,7 +90,11 @@ fn act(twin: &mut Twin, act: Act) -> Said {
             twin.job.object.bind(&mut twin.job.namespace, &mut renamed);
             Said::Renamed(renamed)
         }
-        Act::Repair => Said::Repaired(twin.job.object.repair(&mut twin.job.store)),
+        Act::Repair => Said::Repaired(
+            twin.job
+                .object
+                .repair(&mut twin.job.store, weaver_graph::Budget::default()),
+        ),
     }
 }
 
@@ -200,7 +204,10 @@ fn par3_facts_identifying_a_member_it_could_not_are_refused() {
     let mut kept: Par3Facts = live.job.object.facts().read(Kind::Par3).expect("decodes");
     kept.identified.insert(MemberId(9999), "one.bin".to_owned());
     assert!(matches!(
-        crate::restore(&Facts::of(Kind::Par3, &kept)),
+        crate::restore(
+            &Facts::of(Kind::Par3, &kept),
+            weaver_graph::Budget::default()
+        ),
         Err(weaver_graph::RestoreError::Impossible { .. })
     ));
 }

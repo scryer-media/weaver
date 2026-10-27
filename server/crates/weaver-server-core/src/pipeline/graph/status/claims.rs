@@ -154,6 +154,8 @@ pub(crate) struct Delivered {
     pub(crate) from: String,
     pub(crate) depth: u32,
     pub(crate) whole: bool,
+    // The CRC32 its object's headers state for its bytes, when they do.
+    pub(crate) crc32: Option<u32>,
 }
 
 impl Delivery {
@@ -321,6 +323,7 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
             from: member.name.clone(),
             depth: self.tree.depth(node),
             whole,
+            crc32: member.crc32,
         });
     }
 

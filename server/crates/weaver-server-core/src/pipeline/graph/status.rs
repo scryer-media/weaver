@@ -33,7 +33,6 @@ use super::root::phase::RootPhase;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionFailure;
 
-#[cfg(test)]
 pub(crate) use claims::Delivered;
 pub(crate) use claims::Delivery;
 pub(in crate::pipeline) use seams::advance;

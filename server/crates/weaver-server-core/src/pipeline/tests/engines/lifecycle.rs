@@ -538,3 +538,44 @@ async fn a_dead_repost_beside_a_delivered_file_does_not_refuse_the_job() {
     assert_eq!(row.failed_bytes, 4 * ARTICLE as u64);
     assert_eq!(row.health, 500);
 }
+
+// The job's snapshot says, file by file, what of each the download has
+// still to bring: an article served leaves its file short by its size, and
+// a file nothing of which came is still to come whole.
+#[tokio::test]
+async fn the_job_snapshot_says_what_of_each_file_is_still_to_come() {
+    let scenario = Scenario::new(vec![
+        Post::plain("alpha.bin", payload(4 * ARTICLE, 71)),
+        Post::plain("beta.bin", payload(ARTICLE, 72)),
+    ]);
+    let spec = scenario.spec();
+    let sizes = |file: usize| -> Vec<u64> {
+        spec.files[file]
+            .segments
+            .iter()
+            .map(|segment| u64::from(segment.bytes))
+            .collect()
+    };
+    let (alpha, beta) = (sizes(0), sizes(1));
+    assert!(alpha.len() > 1, "alpha spans several articles");
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+
+    let snapshot = |pipeline: &Pipeline| {
+        pipeline
+            .list_jobs()
+            .into_iter()
+            .find(|job| job.job_id == JOB)
+            .expect("the job is listed")
+            .file_remaining_bytes
+    };
+    assert_eq!(
+        snapshot(&pipeline),
+        vec![alpha.iter().sum::<u64>(), beta.iter().sum::<u64>()]
+    );
+
+    serve_job(&mut pipeline, JOB, &scenario, (0, 0)).await;
+    assert_eq!(
+        snapshot(&pipeline),
+        vec![alpha[1..].iter().sum::<u64>(), beta.iter().sum::<u64>()]
+    );
+}

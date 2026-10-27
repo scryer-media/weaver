@@ -554,6 +554,7 @@ fn job_download_rates_report_only_transferring_download_phases() {
             total_files: 0,
             completed_files: 0,
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: None,
             category: None,
             metadata: Vec::new(),

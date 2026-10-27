@@ -564,6 +564,7 @@ mod tests {
             total_files: 1,
             completed_files: 1,
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: None,
             category: None,
             metadata: Vec::new(),
