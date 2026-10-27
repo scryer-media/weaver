@@ -24,7 +24,7 @@ libloading = "0.9"
 # the workspace entry carries `metal` features this needs none of. par2-rs
 # refuses to build without a named crypto backend, so this names the same one
 # the workspace does.
-par2-rs = { version = "0.10.3", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "0.11.0", default-features = false, features = ["crypto-aws-lc"] }
 
 [[bench]]
 name = "decode_simd"

@@ -191,3 +191,119 @@ fn par2_facts_naming_a_packet_in_no_volume_are_refused() {
         Err(weaver_graph::RestoreError::Impossible { .. })
     ));
 }
+
+// A Unicode Filename packet spelling `name` for `file` of `set`. par2-rs's
+// creator writes none and has no builder for one, so it is framed here:
+// header, file ID, then the name in UTF-16LE padded to four bytes.
+fn unicode_filename(set: [u8; 16], file: [u8; 16], name: &str) -> Vec<u8> {
+    use par2_rs::FileHashState;
+    use par2_rs::packet::header::{HEADER_SIZE, MAGIC, TYPE_UNICODE_FILENAME};
+
+    let mut body = file.to_vec();
+    for unit in name.encode_utf16() {
+        body.extend_from_slice(&unit.to_le_bytes());
+    }
+    while !body.len().is_multiple_of(4) {
+        body.push(0);
+    }
+    let length = (HEADER_SIZE + body.len()) as u64;
+    let mut packet = Vec::with_capacity(length as usize);
+    packet.extend_from_slice(MAGIC);
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.extend_from_slice(&[0; 16]);
+    packet.extend_from_slice(&set);
+    packet.extend_from_slice(TYPE_UNICODE_FILENAME);
+    packet.extend_from_slice(&body);
+    let mut hasher = FileHashState::new();
+    hasher.update(&packet[32..]);
+    let hash = hasher.finalize();
+    packet[16..32].copy_from_slice(&hash);
+    packet
+}
+
+// A set whose File Description carries a non-ASCII name folded to ASCII,
+// and whose Unicode Filename packet spells it: the set claims its member by
+// the Unicode spelling, and its facts give back both packets as posted, so
+// the restored set claims by the same name.
+#[test]
+fn a_unicode_filename_names_the_claim_and_survives_the_facts() {
+    use par2_rs::Packet;
+
+    let data = payload(34, 40_000);
+    let mut files = par2_set("set", &[("_t_.bin", &data)], BLOCK, 2, 1);
+    let index = par2_rs::Par2FileSet::from_files(&[files[0].1.as_slice()]).expect("an index");
+    let file = *index.files.keys().next().expect("one file");
+    let named = unicode_filename(
+        *index.recovery_set_id.as_bytes(),
+        *file.as_bytes(),
+        "\u{c9}t\u{e9}.bin",
+    );
+    files[0].1.extend_from_slice(&named);
+
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    for (name, bytes) in &files {
+        job.volume(name, bytes, ARTICLE as usize, false);
+    }
+    let member = job.member("a8f3c1e09b", &data);
+    let mut renamed = Vec::new();
+    job.object.bind(&mut job.namespace, &mut renamed);
+    assert_eq!(renamed, vec![member]);
+    assert_eq!(job.namespace.get(member).unwrap().name, "\u{c9}t\u{e9}.bin");
+
+    let restored = par2(&job.object.facts()).expect("restores");
+    assert_eq!(restored.facts(), job.object.facts());
+    for object in [&job.object, &restored] {
+        let set = object.sets.values().next().expect("one set");
+        let described = set.index.as_ref().expect("an index");
+        let description = described.file_description(&file).expect("described");
+        assert_eq!(description.filename, "\u{c9}t\u{e9}.bin");
+        let packets = &set.packets().get().0;
+        assert!(packets.iter().any(|packet| matches!(
+            packet,
+            Packet::FileDescription(posted) if posted.par2_name_bytes == b"_t_.bin"
+        )));
+        assert!(packets.iter().any(|packet| matches!(
+            packet,
+            Packet::UnicodeFilename(spelled) if spelled.name == "\u{c9}t\u{e9}.bin"
+        )));
+    }
+}
+
+// Packet facts written before the File Description kept its name bytes
+// still decode, the decoded name's UTF-8 bytes standing in for them.
+#[test]
+fn par2_packet_facts_written_without_name_bytes_still_decode() {
+    use par2_rs::Packet;
+
+    use super::super::facts::Packets;
+
+    // The packet facts as they were encoded before the name bytes.
+    #[derive(serde::Serialize)]
+    enum Before {
+        File {
+            file: [u8; 16],
+            hash_full: [u8; 16],
+            hash_16k: [u8; 16],
+            length: u64,
+            name: String,
+            par2_name: String,
+        },
+    }
+
+    let before = vec![Before::File {
+        file: [1; 16],
+        hash_full: [2; 16],
+        hash_16k: [3; 16],
+        length: 4,
+        name: "a.bin".into(),
+        par2_name: "a.bin".into(),
+    }];
+    let bytes = rmp_serde::to_vec(&before).expect("encodes");
+    let Packets(packets) = rmp_serde::from_slice(&bytes).expect("decodes");
+    let [Packet::FileDescription(description)] = packets.as_slice() else {
+        panic!("one file description: {packets:?}");
+    };
+    assert_eq!(description.par2_name, "a.bin");
+    assert_eq!(description.par2_name_bytes, b"a.bin");
+    assert_eq!(description.file_length, 4);
+}
