@@ -65,6 +65,7 @@ pub(crate) struct MemberRow {
     pub(crate) member: i64,
     pub(crate) name: String,
     pub(crate) output_name: String,
+    pub(crate) crc32: Option<i64>,
     pub(crate) length: Option<i64>,
     pub(crate) closed: bool,
     pub(crate) bound: Option<i64>,
@@ -205,8 +206,8 @@ impl Row for MemberRow {
     type Key = (i64, i64);
     const TABLE: &'static str = "graph_members";
     const KEY: &'static [&'static str] = &["node_id", "member_id"];
-    const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, length, \
-         closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
+    const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, crc32, \
+         length, closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
          given_up_volume, buried, undecided, has_file, refused, copy_of";
 
     fn key(&self) -> (i64, i64) {
@@ -226,6 +227,7 @@ impl Row for MemberRow {
             SqlArg::I64(self.member),
             SqlArg::Text(self.name.clone()),
             SqlArg::Text(self.output_name.clone()),
+            SqlArg::OptI64(self.crc32),
             SqlArg::OptI64(self.length),
             SqlArg::Bool(self.closed),
             SqlArg::OptI64(self.bound),
@@ -619,7 +621,7 @@ async fn read_checkpoint(
         .collect::<Result<_, StateError>>()?;
     let members = tx
         .fetch_all(
-            "SELECT node_id, member_id, name, output_name, length, closed, bound_node_id, \
+            "SELECT node_id, member_id, name, output_name, crc32, length, closed, bound_node_id, \
              owner_node_id, owner_volume, given_up_node_id, given_up_volume, buried, \
              undecided, has_file, refused, copy_of \
              FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
@@ -633,6 +635,7 @@ async fn read_checkpoint(
                 member: row.i64("member_id")?,
                 name: row.text("name")?,
                 output_name: row.text("output_name")?,
+                crc32: row.opt_i64("crc32")?,
                 length: row.opt_i64("length")?,
                 closed: row.bool("closed")?,
                 bound: row.opt_i64("bound_node_id")?,

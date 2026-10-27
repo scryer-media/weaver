@@ -27,14 +27,17 @@ pub(super) struct Run<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
     window: u64,
+    // The stream is its first volume alone.
+    single: bool,
 }
 
 impl<D: Decoder> Run<D> {
-    pub(super) fn new(name: String, window: u64) -> Self {
+    pub(super) fn new(name: String, window: u64, single: bool) -> Self {
         Self {
             decoder: PhantomData,
             name,
             window,
+            single,
         }
     }
 }
@@ -45,7 +48,15 @@ enum Ended {
 }
 
 impl<D: Decoder> Extraction for Run<D> {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(
+        self: Box<Self>,
+        volumes: Arc<dyn Volumes>,
+        sink: &mut Sink<'_>,
+        budget: weaver_graph::Budget,
+    ) {
+        // Asked before anything is read, so a volume still growing is
+        // never waited on for its tail.
+        let closed = self.single && volumes.len(weaver_graph::VolumeIndex(0)).is_some();
         let mut input = Front::new(Arc::clone(&volumes));
         let failed = input.failure();
         let announced = sink(Emit::Member {
@@ -59,7 +70,8 @@ impl<D: Decoder> Extraction for Run<D> {
         let pumped = if D::IDENTITY {
             pump(&mut input, sink, Front::bridge)
         } else {
-            D::open(input, self.window).and_then(|mut reader| pump(&mut *reader, sink, |_, _| None))
+            D::open_with(input, self.window, budget, closed)
+                .and_then(|mut reader| pump(&mut *reader, sink, |_, _| None))
         };
         let error = match pumped {
             Ok(Ended::Whole) => {

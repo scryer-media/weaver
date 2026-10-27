@@ -223,6 +223,15 @@ impl RarStore {
         entry.complete = true;
         entry.crc = member.data_crc32;
         entry.uses_mac = member.data_hash_uses_mac;
+        // A keyed checksum is not the member's own CRC32.
+        if !entry.uses_mac
+            && let Some(crc32) = entry.crc
+        {
+            out.push(Emit::Checksum {
+                member: MemberId(id as u32),
+                crc32,
+            });
+        }
         if entry.plain_len() == Some(0) && !entry.out.closed {
             Arc::make_mut(&mut entry.out).closed = true;
             out.push(Emit::MemberClosed(MemberId(id as u32)));

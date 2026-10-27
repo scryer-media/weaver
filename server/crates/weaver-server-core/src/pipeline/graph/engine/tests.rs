@@ -247,7 +247,7 @@ fn forgetting_the_node_stops_a_waiting_read() {
 struct Quiet;
 
 impl Extraction for Quiet {
-    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>) {}
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {}
 }
 
 fn unbounded() -> Arc<HoldsAccountant> {

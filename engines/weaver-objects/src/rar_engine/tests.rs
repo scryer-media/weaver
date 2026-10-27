@@ -73,19 +73,48 @@ mod rar5 {
         .concat()
     }
 
+    // The signature and a main header with the archive flags given, solid
+    // among them, for volume `number` of a set.
+    pub fn start_flagged(flags: u64, number: u64) -> Vec<u8> {
+        let body = match number {
+            0 => vint(flags | 0x0001),
+            number => [vint(flags | 0x0003), vint(number)].concat(),
+        };
+        [
+            b"Rar!\x1a\x07\x01\x00".as_slice(),
+            &header(1, 0, None, &body),
+        ]
+        .concat()
+    }
+
+    pub const SOLID: u64 = 0x0004;
+
     pub fn end(more: bool) -> Vec<u8> {
         header(5, 0, None, &vint(u64::from(more)))
     }
 
     // A stored member's header and its data.
     pub fn file(name: &str, split: u64, data: &[u8], length: u64, crc: Option<u32>) -> Vec<u8> {
+        file_as(name, split, data, length, crc, 0)
+    }
+
+    // A member's header naming `compression` as its compression info, and
+    // its data as given.
+    pub fn file_as(
+        name: &str,
+        split: u64,
+        data: &[u8],
+        length: u64,
+        crc: Option<u32>,
+        compression: u64,
+    ) -> Vec<u8> {
         let mut body = vint(if crc.is_some() { 0x0004 } else { 0 });
         body.extend(vint(length));
         body.extend(vint(0o644));
         if let Some(crc) = crc {
             body.extend(crc.to_le_bytes());
         }
-        body.extend(vint(0));
+        body.extend(vint(compression));
         body.extend(vint(1));
         body.extend(vint(name.len() as u64));
         body.extend_from_slice(name.as_bytes());
@@ -225,6 +254,11 @@ impl Volumes for Gate {
         state.released[volume.0 as usize].then(|| self.volumes[volume.0 as usize].len() as u64)
     }
 
+    // A released volume's bytes are all in.
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        self.len(volume).is_some()
+    }
+
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
         let bytes = self
             .volumes
@@ -289,6 +323,8 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Damaged { volume, range } => {
                 out.push(Said::Damaged(volume.0, range.start, range.end))
             }
+            // Said beside the walk; `checksums` reads them.
+            Emit::Checksum { .. } => {}
             other => panic!("an engine run does not say {other:?}"),
         }
     }
@@ -301,7 +337,11 @@ fn run(engine: &mut RarEngine, volumes: Vec<Vec<u8>>) -> Vec<Said> {
         emits.push(emit);
         true
     };
-    engine.start().run(Gate::whole(volumes), &mut sink);
+    engine.start().run(
+        Gate::whole(volumes),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
     said(&emits)
 }
 
@@ -498,7 +538,12 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
 
 #[test]
 fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
-    let object = crate::build(Kind::RarEngine, ObjectId(4)).unwrap();
+    let object = crate::build(
+        Kind::RarEngine,
+        ObjectId(4),
+        weaver_graph::Budget::default(),
+    )
+    .unwrap();
     assert_eq!(object.kind(), Kind::RarEngine);
     assert!(object.reads_in_order());
     assert!(object.engine().is_some());
@@ -522,7 +567,7 @@ fn a_run_waits_for_bytes_not_yet_there_and_continues_when_they_land() {
     let volumes: Arc<dyn Volumes> = gate.clone();
     let runner = thread::spawn(move || {
         let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink);
+        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
     });
 
     let mut emits = vec![heard.recv().unwrap()];
@@ -633,9 +678,11 @@ fn a_sink_that_says_stop_hears_nothing_more() {
         emits.push(emit);
         !stop
     };
-    RarEngine::new()
-        .start()
-        .run(Gate::whole(vec![one_volume()]), &mut sink);
+    RarEngine::new().start().run(
+        Gate::whole(vec![one_volume()]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
     let said = said(&emits);
     assert_eq!(said.len(), 2);
     assert_eq!(
@@ -643,4 +690,330 @@ fn a_sink_that_says_stop_hears_nothing_more() {
         Said::Member(0, "notes.txt".into(), Some(NOTES.len() as u64))
     );
     assert!(matches!(said[1], Said::Bytes(0, _)));
+}
+
+// Each member's checksum as the run said it, in the order it was said.
+fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
+    emits
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
+    let archive = [
+        rar5::start(None),
+        rar5::directory("hollow"),
+        rar5::file(
+            "notes.txt",
+            0,
+            NOTES,
+            NOTES.len() as u64,
+            Some(crc32(NOTES)),
+        ),
+        rar5::end(false),
+    ]
+    .concat();
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    RarEngine::new().start().run(
+        Gate::whole(vec![archive]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    assert_eq!(checksums(&emits), vec![(1, crc32(NOTES))]);
+}
+
+// The volumes, recording where every read a run makes of them starts.
+struct Counted {
+    gate: Arc<Gate>,
+    reads: Mutex<Vec<(u32, u64)>>,
+}
+
+impl Volumes for Counted {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        self.gate.next(after)
+    }
+
+    fn len(&self, volume: VolumeIndex) -> Option<u64> {
+        self.gate.len(volume)
+    }
+
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        self.gate.settled(volume)
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        self.reads.lock().unwrap().push((volume.0, offset));
+        self.gate.read_at(volume, offset, into)
+    }
+}
+
+// A pool that lends threads of its own, recording how many each spread
+// asked for.
+#[derive(Default)]
+struct Lent {
+    spreads: Mutex<Vec<usize>>,
+}
+
+impl weaver_graph::Pool for Lent {
+    fn spread(&self, workers: usize, work: &(dyn Fn() + Sync)) {
+        self.spreads.lock().unwrap().push(workers);
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
+    }
+}
+
+// What a run on `threads` of a lent pool said.
+struct OnThreads {
+    said: Vec<Said>,
+    sums: Vec<(u32, u32)>,
+    // Where each read started, in the order made.
+    reads: Vec<(u32, u64)>,
+    // The threads each spread asked of the pool.
+    spreads: Vec<usize>,
+}
+
+impl OnThreads {
+    // The reads of volume 0's first bytes: one for each archive opened.
+    fn opens(&self) -> usize {
+        self.reads.iter().filter(|read| **read == (0, 0)).count()
+    }
+}
+
+// Six stored files over two volumes, three in each, of the set's flags.
+fn six_files(flags: u64) -> Vec<Vec<u8>> {
+    six_files_as(flags, 0)
+}
+
+// The six files, their headers naming the fastest method and the smallest
+// dictionary, 128 KiB. Their data is not compressed: the tests that use
+// them look at how the run lays its work out, not at what it decodes.
+fn six_files_compressed() -> Vec<Vec<u8>> {
+    six_files_as(0, 1 << 7)
+}
+
+fn six_files_as(flags: u64, compression: u64) -> Vec<Vec<u8>> {
+    vec![
+        [
+            rar5::start_flagged(flags, 0),
+            stored(0..3, compression),
+            rar5::end(true),
+        ]
+        .concat(),
+        [
+            rar5::start_flagged(flags, 1),
+            stored(3..6, compression),
+            rar5::end(false),
+        ]
+        .concat(),
+    ]
+}
+
+// The six stored files in one volume.
+fn six_in_one() -> Vec<Vec<u8>> {
+    vec![[rar5::start_flagged(0, 0), stored(0..6, 0), rar5::end(false)].concat()]
+}
+
+// The files numbered `files`, each with its header and its data.
+fn stored(files: std::ops::Range<u8>, compression: u64) -> Vec<u8> {
+    let body = |at: u8| -> Vec<u8> {
+        (0..200u16 + u16::from(at) * 37)
+            .map(|byte| (byte as u8) ^ at)
+            .collect()
+    };
+    files
+        .flat_map(|at| {
+            let bytes = body(at);
+            rar5::file_as(
+                &format!("file{at}.bin"),
+                0,
+                &bytes,
+                bytes.len() as u64,
+                Some(crc32(&bytes)),
+                compression,
+            )
+        })
+        .collect()
+}
+
+fn on_budget(volumes: Vec<Vec<u8>>, memory_bytes: Option<u64>, threads: usize) -> OnThreads {
+    let counted = Arc::new(Counted {
+        gate: Gate::whole(volumes),
+        reads: Mutex::new(Vec::new()),
+    });
+    let lent = Arc::new(Lent::default());
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    RarEngine::new().start().run(
+        Arc::clone(&counted) as Arc<dyn Volumes>,
+        &mut sink,
+        weaver_graph::Budget {
+            memory_bytes,
+            threads,
+            pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
+        },
+    );
+    let reads = std::mem::take(&mut *counted.reads.lock().unwrap());
+    let spreads = std::mem::take(&mut *lent.spreads.lock().unwrap());
+    OnThreads {
+        said: said(&emits),
+        sums: checksums(&emits),
+        reads,
+        spreads,
+    }
+}
+
+fn on_threads(volumes: Vec<Vec<u8>>, threads: usize) -> OnThreads {
+    on_budget(volumes, None, threads)
+}
+
+#[test]
+fn the_files_of_a_set_that_is_not_solid_decode_side_by_side_and_are_said_in_order() {
+    let alone = on_threads(six_files(0), 1);
+    let beside = on_threads(six_files(0), 4);
+    let ids: Vec<u32> = alone
+        .said
+        .iter()
+        .filter_map(|said| match said {
+            Said::Member(id, _, _) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, (0..6).collect::<Vec<_>>());
+    assert!(alone.said.contains(&Said::Closed(5)));
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.sums, alone.sums);
+    // In each volume the first two files decoded side by side on the lent
+    // pool. The third waits for the header after it to show it ends in its
+    // volume, and that is the volume's end record, so it decodes alone.
+    assert!(alone.spreads.is_empty(), "{:?}", alone.spreads);
+    assert_eq!(beside.spreads, vec![2, 2]);
+    // The workers decoded over the headers the walk parsed: none opened
+    // the set again.
+    assert_eq!(beside.opens(), alone.opens());
+}
+
+#[test]
+fn a_run_spreads_no_wider_than_the_threads_it_was_granted() {
+    let beside = on_threads(six_in_one(), 2);
+    assert_eq!(beside.said, on_threads(six_in_one(), 1).said);
+    assert!(!beside.spreads.is_empty());
+    assert!(
+        beside.spreads.iter().all(|&workers| workers <= 2),
+        "{:?}",
+        beside.spreads
+    );
+}
+
+#[test]
+fn a_volume_whose_bytes_are_not_all_in_decodes_one_by_one() {
+    // The volumes are closed, so their lengths are known, but their bytes
+    // are not all in: a worker on the lent pool would wait on them.
+    struct Unsettled(Arc<Gate>);
+    impl Volumes for Unsettled {
+        fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+            self.0.next(after)
+        }
+        fn len(&self, volume: VolumeIndex) -> Option<u64> {
+            self.0.len(volume)
+        }
+        fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+            self.0.read_at(volume, offset, into)
+        }
+    }
+    let lent = Arc::new(Lent::default());
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    RarEngine::new().start().run(
+        Arc::new(Unsettled(Gate::whole(six_files(0)))),
+        &mut sink,
+        weaver_graph::Budget {
+            memory_bytes: None,
+            threads: 4,
+            pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
+        },
+    );
+    assert_eq!(said(&emits), on_threads(six_files(0), 1).said);
+    assert!(lent.spreads.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_solid_set_decodes_one_member_after_another_whatever_the_threads() {
+    let alone = on_threads(six_files(rar5::SOLID), 1);
+    let beside = on_threads(six_files(rar5::SOLID), 4);
+    assert!(alone.said.contains(&Said::Closed(5)), "{:?}", alone.said);
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.sums, alone.sums);
+    assert!(beside.spreads.is_empty(), "{:?}", beside.spreads);
+}
+
+#[test]
+fn files_that_do_not_fit_the_budgets_memory_together_decode_one_by_one() {
+    // No two files fit in 300 bytes.
+    let beside = on_budget(six_files(0), Some(300), 4);
+    assert_eq!(beside.said, on_threads(six_files(0), 1).said);
+    assert!(beside.spreads.is_empty(), "{:?}", beside.spreads);
+}
+
+#[test]
+fn a_compressed_files_decoder_window_counts_against_the_budgets_memory() {
+    // Three files of a few hundred bytes each fit in 4 KiB as bytes, but
+    // not beside the 128 KiB window their compressed headers name.
+    let small = on_budget(six_files_compressed(), Some(4096), 4);
+    assert!(small.spreads.is_empty(), "{:?}", small.spreads);
+    let roomy = on_budget(six_files_compressed(), Some(1 << 20), 4);
+    assert!(!roomy.spreads.is_empty());
+}
+
+#[test]
+fn a_file_that_fails_beside_others_ends_the_run_as_it_would_alone() {
+    let damaged = || {
+        let mut volumes = six_files(0);
+        let body: Vec<u8> = (0..237u16).map(|byte| (byte as u8) ^ 1).collect();
+        let at = volumes[0]
+            .windows(body.len())
+            .position(|window| window == body)
+            .unwrap();
+        volumes[0][at + 5] ^= 0x20;
+        volumes
+    };
+    let OnThreads { said: alone, .. } = on_threads(damaged(), 1);
+    let OnThreads {
+        said: beside,
+        spreads,
+        ..
+    } = on_threads(damaged(), 4);
+    let length = damaged()[0].len() as u64;
+    assert_eq!(
+        alone[alone.len() - 2..],
+        [Said::Retract(1), Said::Damaged(0, 0, length)]
+    );
+    assert!(alone.contains(&Said::Closed(0)));
+    assert!(!alone.contains(&Said::Member(2, "file2.bin".into(), Some(274))));
+    // Alone, the failing file's bytes stream out before its checksum fails;
+    // beside others it is decoded whole first, so none are said. Either way
+    // the file is retracted.
+    let unfailed: Vec<&Said> = alone
+        .iter()
+        .filter(|said| !matches!(said, Said::Bytes(1, _)))
+        .collect();
+    assert_eq!(beside.iter().collect::<Vec<_>>(), unfailed);
+    assert!(!spreads.is_empty());
 }

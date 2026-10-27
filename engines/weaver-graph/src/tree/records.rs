@@ -80,6 +80,7 @@ impl Tree {
                     output_name: member.output_name.clone(),
                     length: member.length,
                     closed: member.closed,
+                    crc32: member.crc32,
                     bound_to: member.bound_to,
                     owner: found.children.get(&member.id).copied(),
                     given_up: self
@@ -203,6 +204,7 @@ impl Tree {
                 bound_to: member.bound_to,
                 coverage: Coverage::new(),
                 closed: member.closed,
+                crc32: member.crc32,
             });
             if member.undecided {
                 // Its front comes again with the replay.

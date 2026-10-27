@@ -34,6 +34,7 @@ fn member(id: u32, name: &str) -> MemberRecord {
         output_name: name.to_owned(),
         length: Some(1_000),
         closed: false,
+        crc32: None,
         bound_to: None,
         owner: None,
         given_up: None,
@@ -77,6 +78,7 @@ fn full() -> Snapshot {
         member(2, "set.r00"),
         member(3, "set.part01.rar"),
     ];
+    root.members[0].crc32 = Some(0xDEAD_BEEF);
     root.members[2].buried = true;
     root.members[3].copy_of = Some(MemberId(0));
     root.members[0].bound_to = Some(ObjectId(1));

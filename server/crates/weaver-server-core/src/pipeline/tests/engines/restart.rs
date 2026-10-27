@@ -64,9 +64,13 @@ pub(in crate::pipeline::tests) struct Restarted {
 }
 
 // Called with each checkpoint as it stood when the pipeline went down.
-pub(in crate::pipeline::tests) type Inspect<'a> = &'a mut dyn FnMut(&crate::jobs::graph_checkpoint::GraphCheckpoint);
+pub(in crate::pipeline::tests) type Inspect<'a> =
+    &'a mut dyn FnMut(&crate::jobs::graph_checkpoint::GraphCheckpoint);
 
-pub(in crate::pipeline::tests) async fn run_restarting(scenario: &Scenario, inspect: Inspect<'_>) -> Restarted {
+pub(in crate::pipeline::tests) async fn run_restarting(
+    scenario: &Scenario,
+    inspect: Inspect<'_>,
+) -> Restarted {
     run_restarting_at(scenario, inspect, Down::Crash, &|_| true).await
 }
 
@@ -514,7 +518,9 @@ async fn a_repaired_job_restarted_after_its_repair_announces_the_repair_once() {
 // The job served as `run` serves it, and the pipeline drained and taken down
 // once, the first time a repair of the job is out on a thread. Whether the
 // restored job lent a repair again.
-pub(in crate::pipeline::tests) async fn run_restarted_while_repairing(scenario: &Scenario) -> (RestartedDone, bool) {
+pub(in crate::pipeline::tests) async fn run_restarted_while_repairing(
+    scenario: &Scenario,
+) -> (RestartedDone, bool) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
@@ -652,6 +658,33 @@ async fn a_three_volume_stored_rar_restarted_after_every_article_delivers_its_me
         3,
     ))))
     .await;
+}
+
+// The checksum a store said for its member is in every checkpoint taken
+// once it was said, so the member a restart restores is checked as it was.
+#[tokio::test]
+async fn a_members_checksum_survives_a_restart() {
+    let body = payload(11 * ARTICLE + 9, 73);
+    let scenario = Scenario::new(volumes(single_member_store_set("beacon.bin", &body, 3)));
+    let mut kept = Vec::new();
+    let restarted = run_restarting(&scenario, &mut |rows| {
+        kept.extend(
+            rows.members
+                .iter()
+                .filter(|member| member.name == "beacon.bin")
+                .map(|member| member.crc32),
+        );
+    })
+    .await;
+    let expected = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &body) as i64;
+    assert!(kept.contains(&Some(expected)), "{kept:?}");
+    assert!(
+        kept.iter()
+            .all(|crc32| crc32.is_none_or(|crc32| crc32 == expected)),
+        "{kept:?}"
+    );
+    let whole = run(&scenario).await;
+    assert_restarted(&restarted, &whole);
 }
 
 #[tokio::test]

@@ -139,6 +139,9 @@ async fn a_lost_recovery_article_short_of_blocks_fails_as_repair() {
         })]
     );
     assert_eq!(view.claims["lantern.bin"], Claim::Damaged, "a damaged leaf");
+    // A repair the post's losses defeated: queue scripts hear the job
+    // deleted for health.
+    assert!(view.health);
     // The set's files are its members, never its own volumes.
     assert_eq!(
         graph.failure.as_deref(),
@@ -166,6 +169,8 @@ async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged() {
     // A failed job ships nothing; the graph's own claim keeps the damage.
     assert_eq!(graph.claims["lantern.bin"], Claim::Missing);
     assert_eq!(graph.graph().claims["lantern.bin"], Claim::Damaged);
+    // Nothing whole for want of what arrived: a deletion for health.
+    assert!(graph.graph().health);
 }
 
 // A damaged member no set covers: the graph leaves it a damaged leaf and

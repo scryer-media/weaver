@@ -137,8 +137,14 @@ fn a_par2_object_restored_at_every_point_repairs_as_the_live_one() {
         for step in &acts[cut..] {
             assert_eq!(act(&mut live, *step), act(&mut again, *step), "cut {cut}");
         }
-        let ours = live.job.object.repair(&mut live.job.store);
-        let theirs = again.job.object.repair(&mut again.job.store);
+        let ours = live
+            .job
+            .object
+            .repair(&mut live.job.store, weaver_graph::Budget::default());
+        let theirs = again
+            .job
+            .object
+            .repair(&mut again.job.store, weaver_graph::Budget::default());
         assert_eq!(ours, theirs, "cut {cut}");
         assert!(again.job.store.members[&again.member] == data, "cut {cut}");
         assert_eq!(
@@ -178,7 +184,10 @@ fn par2_facts_naming_a_packet_in_no_volume_are_refused() {
     let mut kept: Par2Facts = live.job.object.facts().read(Kind::Par2).expect("decodes");
     kept.volumes.truncate(1);
     assert!(matches!(
-        crate::restore(&Facts::of(Kind::Par2, &kept)),
+        crate::restore(
+            &Facts::of(Kind::Par2, &kept),
+            weaver_graph::Budget::default()
+        ),
         Err(weaver_graph::RestoreError::Impossible { .. })
     ));
 }

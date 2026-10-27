@@ -35,6 +35,8 @@ pub struct Member {
     pub coverage: Coverage,
     // Nothing more will arrive for it: everything that could has.
     pub closed: bool,
+    // The CRC32 its object's headers state for its bytes, when they do.
+    pub crc32: Option<u32>,
 }
 
 impl Member {
@@ -251,6 +253,7 @@ impl Namespace {
                 bound_to: None,
                 coverage: Coverage::new(),
                 closed: false,
+                crc32: None,
             },
         );
         id
@@ -555,6 +558,7 @@ impl Namespace {
             found.bound_to = None;
             found.length = None;
             found.closed = false;
+            found.crc32 = None;
         }
         self.ended.remove(&member);
         self.first_bytes.remove(&member);

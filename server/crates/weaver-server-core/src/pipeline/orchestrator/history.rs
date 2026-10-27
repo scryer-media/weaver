@@ -9,6 +9,7 @@ impl Pipeline {
         self.added_script_holds.remove(&job_id);
         self.jobs.remove(&job_id);
         self.forget_graph_repair(job_id);
+        self.graph_probes.states.remove(&job_id);
         if let Some(graph) = self.graph_jobs.get(&job_id) {
             graph.request_stop();
             if !graph.awaits_mail() {
@@ -227,6 +228,7 @@ impl Pipeline {
             total_files: state.assembly.total_file_count() as u32,
             completed_files: state.assembly.complete_file_count() as u32,
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),

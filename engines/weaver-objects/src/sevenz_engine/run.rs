@@ -14,10 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use sevenz_turbo::{
-    ArchiveEntry, ArchiveLimits, ArchiveReader, EntryRead, Error, Password, ReadAt,
-};
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
+use sevenz_turbo::{ArchiveEntry, ArchiveReader, EntryRead, Error, Password, ReadAt};
+use weaver_graph::{Budget, Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 
 use crate::engine::Joined;
 use crate::verdict;
@@ -33,7 +31,7 @@ impl Run {
 }
 
 impl Extraction for Run {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>, budget: Budget) {
         let input = Joined::new(volumes);
         let failed = input.failure();
         let password = self
@@ -46,11 +44,15 @@ impl Extraction for Run {
             open: None,
             stopped: false,
         };
-        let walked = ArchiveReader::from_read_at(input, password, ArchiveLimits::default())
-            .and_then(|mut reader| {
-                reader.set_verify_checksums(true);
-                reader.for_each_entries_direct(|entry, read| walk.entry(entry, read))
-            });
+        // The decoder holds no more than the run was granted, and decodes on
+        // as many threads.
+        let limits = crate::sevenz_store::limits(&budget);
+        let threads = u32::try_from(budget.threads()).unwrap_or(u32::MAX);
+        let walked = ArchiveReader::from_read_at(input, password, limits).and_then(|mut reader| {
+            reader.set_verify_checksums(true);
+            reader.set_threads(threads);
+            reader.for_each_entries_direct(|entry, read| walk.entry(entry, read))
+        });
         let Err(error) = walked else {
             return;
         };
@@ -102,6 +104,12 @@ impl Walk<'_, '_> {
             name,
             length: Some(length),
         })?;
+        if length > 0 && entry.has_crc {
+            self.say(Emit::Checksum {
+                member,
+                crc32: entry.crc as u32,
+            })?;
+        }
         self.open = Some(member);
         let mut out = Out {
             sink: &mut *self.sink,

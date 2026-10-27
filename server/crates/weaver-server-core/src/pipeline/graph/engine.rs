@@ -35,6 +35,7 @@ use weaver_graph::{Emit, Extraction, NodeId, Why};
 
 use self::volumes::RunVolumes;
 use super::envelope::Shelf;
+use super::hardware::Hardware;
 use super::namespace::Returned;
 
 // How many things a run may have said before it waits for the pipeline to
@@ -155,6 +156,8 @@ pub(crate) struct Runs {
     slots: Slots,
     accountant: Arc<HoldsAccountant>,
     runs: BTreeMap<NodeId, Run>,
+    // What a run is granted as it starts, and the job's repairs too.
+    hardware: Hardware,
 }
 
 impl Runs {
@@ -170,7 +173,18 @@ impl Runs {
             slots: Slots::new(slots),
             accountant,
             runs: BTreeMap::new(),
+            hardware: Hardware::default(),
         }
+    }
+
+    // The runs, granted what `hardware` grants as each starts.
+    pub(crate) fn on(mut self, hardware: Hardware) -> Self {
+        self.hardware = hardware;
+        self
+    }
+
+    pub(crate) fn hardware(&self) -> Hardware {
+        self.hardware.clone()
     }
 
     // The job's id and where its runs speak, which its repairs share.
@@ -296,7 +310,8 @@ impl Runs {
         Reservation::Starved(self.admit(admissions))
     }
 
-    // Start the node's run over its shelf, on a blocking thread.
+    // Start the node's run over its shelf, on a blocking thread, with the
+    // budget in force now: a later profile reaches the next run, not this.
     pub(crate) fn start(
         &mut self,
         node: NodeId,
@@ -310,6 +325,7 @@ impl Runs {
         run.life = Life::Running { generation };
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
+        let budget = self.hardware.grant().run;
         let (scope, mail) = (self.scope, self.mail.clone());
         let said = move |heard| Said {
             scope,
@@ -321,7 +337,7 @@ impl Runs {
             let reader = Arc::clone(&volumes);
             let mut sink =
                 |emit| volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok();
-            extraction.run(reader, &mut sink);
+            extraction.run(reader, &mut sink, budget);
             // A run that read bytes nothing will bring, and did not read on
             // past them, built on less than its volumes hold and ends silent
             // on the failed read: what it said is refused as damage nothing

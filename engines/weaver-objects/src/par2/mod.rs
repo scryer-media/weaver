@@ -39,7 +39,8 @@ use crate::grid::{Grid, WHOLE};
 
 // One job holds no more recovery sets than an NZB holds files.
 const MAX_PAR2_RECOVERY_SETS: usize = 100_000;
-// What a job may describe, and what one repair may hold in memory.
+// What a job may describe, and what one repair may hold in memory when the
+// owner grants it no memory of its own.
 const MAX_JOB_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024;
 const REPAIR_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 
@@ -58,10 +59,17 @@ pub struct Par2 {
     // A job past the packet or set limits keeps none of its sets.
     refused: bool,
     output_limit: u64,
+    // The repair's workspace when the owner grants it none.
     memory_limit: usize,
 }
 
 impl Par2 {
+    // A repair's workspace: what it was granted, or the object's own
+    // allowance when it was granted none.
+    fn workspace(&self, budget: weaver_graph::Budget) -> usize {
+        usize::try_from(budget.memory_or(self.memory_limit as u64)).unwrap_or(usize::MAX)
+    }
+
     pub fn new(id: ObjectId) -> Self {
         Self {
             id,
@@ -365,11 +373,16 @@ impl Recovery for Par2 {
         }
         // A member a set bound under a name none of its postings answers
         // to the description with, even folded, is recognised: it takes the
-        // description's name and length.
+        // description's name and length. So is one the set repaired whose
+        // good bytes reach past the description: they arrived shifted
+        // along, and the rebuilt file ends at the length the set describes.
+        // A length booked for articles that never came is not bytes, and
+        // proves nothing.
         for state in self.sets.values() {
             let Some(index) = state.usable() else {
                 continue;
             };
+            let repaired = matches!(state.concluded(), Some(RepairOutcome::Repaired { .. }));
             for (file, member) in state.members() {
                 let Some(description) = index.file_description(file) else {
                     continue;
@@ -377,7 +390,15 @@ impl Recovery for Par2 {
                 let answers = namespace
                     .postings(*member)
                     .any(|record| record.name.eq_ignore_ascii_case(&description.filename));
-                if !answers
+                let past = ByteRange::new(description.length, u64::MAX);
+                let longer = repaired
+                    && namespace.get(*member).is_some_and(|record| {
+                        record
+                            .coverage
+                            .overlapping(past)
+                            .any(|run| run.provenance.is_verified())
+                    });
+                if (!answers || longer)
                     && namespace
                         .recognise(*member, &description.filename, description.length)
                         .is_some()
@@ -533,7 +554,13 @@ impl Recovery for Par2 {
         }
     }
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(
+        &mut self,
+        access: &mut dyn MemberAccess,
+        budget: weaver_graph::Budget,
+    ) -> RepairOutcome {
+        // Its threads are the pool's it runs inside.
+        let memory_limit = self.workspace(budget);
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
             let coming = self.coming(&key);
@@ -543,7 +570,7 @@ impl Recovery for Par2 {
             let result = match state.concluded() {
                 Some(concluded) => concluded,
                 None => {
-                    let result = repair_set(state, &self.grid, coming, self.memory_limit, access);
+                    let result = repair_set(state, &self.grid, coming, memory_limit, access);
                     state.last = Some(result);
                     result.outcome
                 }

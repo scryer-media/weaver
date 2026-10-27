@@ -3357,15 +3357,10 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     for info in targets {
         let job_id = info.job_id;
         let db = ctx.db.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            let nzb = db.load_active_job_persisted_nzb(job_id)?;
-            let runtime = db.load_active_file_runtime(job_id)?;
-            Ok::<_, weaver_server_core::StateError>((nzb, runtime))
-        })
+        let persisted = tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(job_id))
         .await
         .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
         .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?;
-        let (persisted, (progress, complete)) = loaded;
         let Some((_, Some(nzb_zstd))) = persisted else {
             continue;
         };
@@ -3382,16 +3377,21 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         let paused = item.state == QueueItemState::Paused;
         let output_dir = item.output_dir.clone().unwrap_or_default();
         for (index, file) in nzb.files.iter().enumerate() {
-            let index_u32 = index as u32;
             let total: u64 = file
                 .segments
                 .iter()
                 .map(|segment| segment.bytes as u64)
                 .sum();
-            let remaining = if job_done || complete.contains(&index_u32) {
+            // The job's snapshot says what of each file is still to come; a
+            // file it says nothing of has all of it to come.
+            let remaining = if job_done {
                 0
             } else {
-                total.saturating_sub(progress.get(&index_u32).copied().unwrap_or(0))
+                info.file_remaining_bytes
+                    .get(index)
+                    .copied()
+                    .unwrap_or(total)
+                    .min(total)
             };
             let (file_lo, file_hi) = size_parts(total);
             let (remaining_lo, remaining_hi) = size_parts(remaining);

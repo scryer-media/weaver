@@ -827,3 +827,22 @@ fn a_seek_under_a_compressed_folder_is_unseekable() {
     );
     assert!(extents.is_empty());
 }
+
+// A 7z decode holds to the memory it was granted, and to the decoder's own
+// limits only when it was granted none.
+#[test]
+fn a_decode_holds_to_the_memory_it_was_granted() {
+    let granted = super::limits(&weaver_graph::Budget {
+        memory_bytes: Some(64 << 20),
+        threads: 1,
+        ..Default::default()
+    });
+    assert_eq!(granted.memory_limit_bytes, 64 << 20);
+    let own = sevenz_turbo::ArchiveLimits::default();
+    let none = super::limits(&weaver_graph::Budget::default());
+    assert_eq!(none.memory_limit_bytes, own.memory_limit_bytes);
+    assert_eq!(
+        granted.max_header_unpacked_bytes,
+        own.max_header_unpacked_bytes
+    );
+}

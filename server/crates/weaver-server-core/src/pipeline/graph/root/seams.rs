@@ -24,6 +24,7 @@ use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
+use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
 // The priority a window volume is raised to: ahead of every article at the
@@ -73,6 +74,7 @@ impl Pipeline {
             passwords,
             caps,
             nesting: limits::NESTING,
+            hardware: self.graph_hardware.clone(),
         };
         let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
@@ -207,7 +209,25 @@ impl Pipeline {
             &mut self.graph_status.repairs,
             limit,
         );
+        // The verdict is weighed on the loss alone, before the job moves
+        // on from it.
+        let verdict = self.graph_health_verdict(job_id);
         self.after_graph_result(job_id, result);
+        // A dead post fails at once, its post's failure: the failure empties
+        // its queues, so nothing more is fetched for it. A post that is not
+        // dead yet may be one nobody uploaded, which a probe finds out.
+        match verdict {
+            Some(error)
+                if self
+                    .jobs
+                    .get(&job_id)
+                    .is_some_and(|state| RootPhase::may_replace(&state.status)) =>
+            {
+                self.fail_job_on_health(job_id, error);
+            }
+            Some(_) => {}
+            None => self.arm_graph_probe(job_id),
+        }
         true
     }
 

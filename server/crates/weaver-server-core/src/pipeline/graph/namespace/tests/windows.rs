@@ -179,7 +179,7 @@ impl Recovery for Trail {
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let mut volume = Vec::new();
         if access.read_volume(VolumeIndex(0), ByteRange::new(0, self.length), &mut volume) {
             self.tape.lock().unwrap().volume = Some(volume);

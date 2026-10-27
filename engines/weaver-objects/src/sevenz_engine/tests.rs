@@ -207,6 +207,8 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Retract(member) => out.push(Said::Retract(member.0)),
             Emit::NeedsPassword => out.push(Said::NeedsPassword),
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
+            // Said beside the walk; `checksums` reads them.
+            Emit::Checksum { .. } => {}
             other => panic!("an engine run does not say {other:?}"),
         }
     }
@@ -219,7 +221,9 @@ fn run_over(engine: &mut SevenZipEngine, gate: Arc<Gate>) -> Vec<Said> {
         emits.push(emit);
         true
     };
-    engine.start().run(gate, &mut sink);
+    engine
+        .start()
+        .run(gate, &mut sink, weaver_graph::Budget::default());
     said(&emits)
 }
 
@@ -287,7 +291,7 @@ fn a_run_waits_for_the_tail_and_continues_when_it_lands() {
     let volumes: Arc<dyn Volumes> = gate.clone();
     let runner = thread::spawn(move || {
         let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink);
+        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
     });
 
     gate.wait_for_reader(0);
@@ -309,7 +313,7 @@ fn a_run_over_a_set_waits_for_the_volume_holding_the_tail() {
     let volumes: Arc<dyn Volumes> = gate.clone();
     let runner = thread::spawn(move || {
         let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink);
+        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
     });
 
     gate.wait_for_reader(1);
@@ -383,9 +387,11 @@ fn a_sink_that_says_stop_hears_nothing_more() {
         emits.push(emit);
         !stop
     };
-    SevenZipEngine::new()
-        .start()
-        .run(Gate::whole(vec![store()]), &mut sink);
+    SevenZipEngine::new().start().run(
+        Gate::whole(vec![store()]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
     let said = said(&emits);
     assert_eq!(said.len(), 2);
     assert_eq!(
@@ -454,7 +460,12 @@ fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
 
 #[test]
 fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
-    let object = crate::build(Kind::SevenZipEngine, ObjectId(4)).unwrap();
+    let object = crate::build(
+        Kind::SevenZipEngine,
+        ObjectId(4),
+        weaver_graph::Budget::default(),
+    )
+    .unwrap();
     assert_eq!(object.kind(), Kind::SevenZipEngine);
     assert!(object.reads_in_order());
     assert!(object.engine().is_some());
@@ -471,4 +482,37 @@ fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
     object.extent(MemberId(0), ByteRange::new(0, 4), &mut extents);
     assert!(extents.is_empty());
     assert_eq!(object.envelope(2, ByteRange::new(5, 9)), None);
+}
+
+// Each member's checksum as the run said it, in the order it was said.
+fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
+    emits
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn crc(bytes: &[u8]) -> u32 {
+    crate::grid::crc32(bytes)
+}
+
+#[test]
+fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    SevenZipEngine::new().start().run(
+        Gate::whole(vec![store()]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    assert_eq!(
+        checksums(&emits),
+        vec![(0, crc(NOTES)), (1, crc(&second()))]
+    );
 }

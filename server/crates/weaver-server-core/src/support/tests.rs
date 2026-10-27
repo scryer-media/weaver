@@ -195,6 +195,7 @@ fn live_info(id: u64) -> JobInfo {
         total_files: 2,
         completed_files: 2,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: Some(SENTINEL.to_string()),
         category: None,
         metadata: vec![(SENTINEL.to_string(), SENTINEL.to_string())],

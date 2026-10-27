@@ -77,12 +77,12 @@ struct Read {
 }
 
 impl Loan {
-    // Run the repair, where it is not in anyone's way.
-    pub(crate) fn run(mut self) -> Returned {
+    // Run the repair, where it is not in anyone's way, within `budget`.
+    pub(crate) fn run(mut self, budget: weaver_graph::Budget) -> Returned {
         let outcome = self
             .object
             .recovery_mut()
-            .map(|recovery| recovery.repair(&mut self.access));
+            .map(|recovery| recovery.repair(&mut self.access, budget));
         let access = self.access;
         if let Some(dir) = &access.scratch {
             super::remove_scratch(dir);

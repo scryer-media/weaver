@@ -35,8 +35,8 @@ pub mod zip_engine;
 mod testing;
 
 use weaver_graph::{
-    Builder, Durable, Facts, Kind, NodeId, Object, ObjectId, Placement, RecoveryKind, Restore,
-    RestoreError, Tree, VolumeIndex,
+    Budget, Builder, Durable, Facts, Kind, NodeId, Object, ObjectId, Placement, RecoveryKind,
+    Restore, RestoreError, Tree, VolumeIndex,
 };
 
 // What a container may carry after its own end: a recovery set over it,
@@ -46,35 +46,46 @@ pub(crate) const RECOVERY: [(&[u8; 8], RecoveryKind); 2] = [
     (b"PAR3\0PKT", RecoveryKind::Par3),
 ];
 
-// The object for a kind this crate has, or `None` for one it has not.
-pub fn build(kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
+// The object for a kind this crate has, or `None` for one it has not. An
+// object that decodes as it places, as a 7z store parses its header, holds
+// to what `budget` grants it.
+pub fn build(kind: Kind, id: ObjectId, budget: Budget) -> Option<Box<dyn Object>> {
     match kind {
         Kind::Par2 => Some(Box::new(par2::Par2::new(id))),
         Kind::Par3 => Some(Box::new(par3::Par3::new(id))),
         Kind::RarEngine => Some(Box::new(rar_engine::RarEngine::new())),
         Kind::RarStore => Some(Box::new(rar_store::RarStore::new())),
         Kind::SevenZipEngine => Some(Box::new(sevenz_engine::SevenZipEngine::new())),
-        Kind::SevenZipStore => Some(Box::new(sevenz_store::SevenZipStore::new())),
+        Kind::SevenZipStore => Some(Box::new(sevenz_store::SevenZipStore::new().within(budget))),
         Kind::Sfv => Some(Box::new(sfv::Sfv::new(id))),
         Kind::RarRecovery => Some(Box::new(rar_recovery::RarRecovery::new(id))),
         Kind::RarRecord => Some(Box::new(rar_record::RarRecord::new())),
         Kind::Tar => Some(Box::new(tar::Tar::new())),
-        Kind::Xz => Some(Box::new(stream::XzStream::new())),
-        Kind::Gzip => Some(Box::new(stream::GzipStream::new())),
-        Kind::Bzip2 => Some(Box::new(stream::Bzip2Stream::new())),
-        Kind::Zstd => Some(Box::new(stream::ZstdStream::new())),
-        Kind::Brotli => Some(Box::new(stream::BrotliStream::new())),
-        Kind::Deflate => Some(Box::new(stream::DeflateStream::new())),
-        Kind::Split => Some(Box::new(stream::SplitStream::new())),
+        Kind::Xz => Some(Box::new(stream::XzStream::new().within(budget))),
+        Kind::Gzip => Some(Box::new(stream::GzipStream::new().within(budget))),
+        Kind::Bzip2 => Some(Box::new(stream::Bzip2Stream::new().within(budget))),
+        Kind::Zstd => Some(Box::new(stream::ZstdStream::new().within(budget))),
+        Kind::Brotli => Some(Box::new(stream::BrotliStream::new().within(budget))),
+        Kind::Deflate => Some(Box::new(stream::DeflateStream::new().within(budget))),
+        Kind::Split => Some(Box::new(stream::SplitStream::new().within(budget))),
         Kind::Zip => Some(Box::new(zip::Zip::new())),
         Kind::ZipEngine => Some(Box::new(zip_engine::ZipEngine::new())),
     }
 }
 
-// The object of the kind a blob names, at the state the blob describes.
-pub fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
+// The object of the kind a blob names, at the state the blob describes,
+// held to what `budget` grants it as `build` holds a new one.
+pub fn restore(facts: &Facts, budget: Budget) -> Result<Box<dyn Object>, RestoreError> {
     fn back<T: Durable + Object + 'static>(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         Ok(Box::new(facts.read::<T>(facts.kind)?))
+    }
+    fn streamed<D: stream::Decoder>(
+        facts: &Facts,
+        budget: Budget,
+    ) -> Result<Box<dyn Object>, RestoreError> {
+        Ok(Box::new(
+            facts.read::<stream::Stream<D>>(facts.kind)?.within(budget),
+        ))
     }
     match facts.kind {
         Kind::Par2 => par2::facts::restore(facts),
@@ -82,30 +93,36 @@ pub fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         Kind::RarStore => rar_store::facts::restore(facts),
         Kind::RarEngine => back::<rar_engine::RarEngine>(facts),
         Kind::SevenZipEngine => back::<sevenz_engine::SevenZipEngine>(facts),
-        Kind::SevenZipStore => back::<sevenz_store::SevenZipStore>(facts),
+        Kind::SevenZipStore => Ok(Box::new(
+            facts
+                .read::<sevenz_store::SevenZipStore>(facts.kind)?
+                .within(budget),
+        )),
         Kind::Sfv => back::<sfv::Sfv>(facts),
         Kind::RarRecovery => back::<rar_recovery::RarRecovery>(facts),
         Kind::RarRecord => back::<rar_record::RarRecord>(facts),
         Kind::Tar => back::<tar::Tar>(facts),
-        Kind::Xz => back::<stream::XzStream>(facts),
-        Kind::Gzip => back::<stream::GzipStream>(facts),
-        Kind::Bzip2 => back::<stream::Bzip2Stream>(facts),
-        Kind::Zstd => back::<stream::ZstdStream>(facts),
-        Kind::Brotli => back::<stream::BrotliStream>(facts),
-        Kind::Deflate => back::<stream::DeflateStream>(facts),
-        Kind::Split => back::<stream::SplitStream>(facts),
+        Kind::Xz => streamed::<stream::Xz>(facts, budget),
+        Kind::Gzip => streamed::<stream::Gzip>(facts, budget),
+        Kind::Bzip2 => streamed::<stream::Bzip2>(facts, budget),
+        Kind::Zstd => streamed::<stream::Zstd>(facts, budget),
+        Kind::Brotli => streamed::<stream::Brotli>(facts, budget),
+        Kind::Deflate => streamed::<stream::Deflate>(facts, budget),
+        Kind::Split => streamed::<stream::Pieces>(facts, budget),
         Kind::Zip => back::<zip::Zip>(facts),
         Kind::ZipEngine => back::<zip_engine::ZipEngine>(facts),
     }
 }
 
-// The graph's builder over `build`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Objects;
+// The graph's builder over `build`, granting what `budget` grants.
+#[derive(Clone, Debug, Default)]
+pub struct Objects {
+    pub budget: Budget,
+}
 
 impl Builder for Objects {
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
-        build(kind, id)
+        build(kind, id, self.budget.clone())
     }
 
     // The objects keep no bytes: the owner that wraps them reads its own.
@@ -116,6 +133,6 @@ impl Builder for Objects {
 
 impl Restore for Objects {
     fn restore(&self, facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
-        restore(facts)
+        restore(facts, self.budget.clone())
     }
 }

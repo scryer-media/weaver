@@ -93,13 +93,14 @@ pub(super) enum Parsed {
 }
 
 // Parse the end header out of the bytes in hand, with a password when one is
-// offered. `encrypted` says the header is known to be encrypted, so any
+// offered, held to `limits`. `encrypted` says the header is known to be encrypted, so any
 // failure but a hole is that password failing.
 pub(super) fn parse(
     kept: &Kept,
     total: u64,
     password: Option<&Password>,
     encrypted: bool,
+    limits: &ArchiveLimits,
 ) -> Parsed {
     let mut reader = Sparse {
         kept,
@@ -109,11 +110,7 @@ pub(super) fn parse(
         read: Coverage::new(),
     };
     let empty = Password::empty();
-    let result = Archive::read_with_limits(
-        &mut reader,
-        password.unwrap_or(&empty),
-        &ArchiveLimits::default(),
-    );
+    let result = Archive::read_with_limits(&mut reader, password.unwrap_or(&empty), limits);
     if let Some(missing) = reader.missing {
         return Parsed::Missing(missing);
     }

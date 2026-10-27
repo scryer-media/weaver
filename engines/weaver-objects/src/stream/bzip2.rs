@@ -20,7 +20,7 @@ const BLOCK: u64 = 100_000;
 impl Decoder for Bzip2 {
     const KIND: Kind = Kind::Bzip2;
 
-    fn window(first: &[u8]) -> u64 {
+    fn window(first: &[u8], _budget: &weaver_graph::Budget) -> u64 {
         let level = match first {
             [b'B', b'Z', b'h', digit @ b'1'..=b'9', ..] => u64::from(digit - b'0'),
             _ => 9,

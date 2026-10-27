@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::post_processing::effects::JobScriptEffects;
+use crate::post_processing::events::EventContext;
 use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
 use crate::post_processing::model::{PostProcessingSettings, QueueEvent, ScriptName, ScriptStatus};
 
@@ -423,4 +424,68 @@ async fn file_only_scripts_hold_the_pre_move_barrier_without_downloaded_subscrib
     }
     pipeline.db.finish_script_event_for_test(&run_id).unwrap();
     barrier.await.unwrap();
+}
+
+// The NZBNA_DELETESTATUS of every NZB_DELETED event queued for the job, in
+// the order queued. Admissions are taken in the order raised, so once one
+// raised after them has been admitted, every earlier one has been.
+async fn deletions_queued(pipeline: &Pipeline, job_id: JobId, after: EventContext) -> Vec<String> {
+    let _ = pipeline.db.admit_queue_script_event(after, false).await;
+    let datastore = pipeline.db.datastore();
+    let payloads = pipeline
+        .db
+        .run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT payload FROM script_event_queue WHERE job_id = {} AND event = 'NZB_DELETED' ORDER BY seq",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("payload"))
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    payloads
+        .iter()
+        .map(|payload| {
+            let context: EventContext = serde_json::from_str(payload).unwrap();
+            context.env["NZBNA_DELETESTATUS"].clone()
+        })
+        .collect()
+}
+
+// A job its post failed is deleted for health as NZBGet deletes one; any
+// other failure, such as an extraction's, raises no deletion.
+#[tokio::test]
+async fn a_health_failure_raises_the_jobs_deletion_for_health() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_queue_script(&pipeline.db, temp.path());
+    let health = JobId(173);
+    let other = JobId(174);
+    insert_active_job(&mut pipeline, health, standalone_job_spec("dead-post", &[])).await;
+    insert_active_job(&mut pipeline, other, standalone_job_spec("withheld", &[])).await;
+    let after_health = pipeline
+        .queue_script_context(health, QueueEvent::NzbMarked)
+        .unwrap();
+    let after_other = pipeline
+        .queue_script_context(other, QueueEvent::NzbMarked)
+        .unwrap();
+
+    pipeline.fail_job_on_health(health, "first articles are missing".into());
+    pipeline.fail_job(
+        other,
+        "lantern.rar withheld for want of its password".into(),
+    );
+
+    assert_eq!(
+        deletions_queued(&pipeline, health, after_health).await,
+        vec!["HEALTH".to_string()]
+    );
+    assert!(
+        deletions_queued(&pipeline, other, after_other)
+            .await
+            .is_empty()
+    );
 }

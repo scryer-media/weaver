@@ -76,11 +76,12 @@ impl GraphJob {
             return Ok(returned.repaired.remove().map_err(WriteError::from)?);
         }
         let mut out = Vec::new();
+        let objects = self.runs.hardware();
         self.writer.returned(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
-            &weaver_objects::Objects,
+            &objects,
             returned,
             &mut out,
         )?;

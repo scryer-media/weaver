@@ -60,6 +60,7 @@ fn delivered(name: &str, depth: u32, whole: bool) -> Delivered {
         from: name.to_string(),
         depth,
         whole,
+        crc32: None,
     }
 }
 
@@ -792,6 +793,30 @@ async fn an_engine_waits_at_a_damaged_article_until_its_repair_and_reads_it_once
         "never retracted"
     );
     assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job whose root is done has nothing downloading for a health probe to
+// rule on, so its probe goes as it leaves the root, while the job itself is
+// still in the pipeline.
+#[tokio::test]
+async fn a_job_leaving_the_root_drops_its_health_probe() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_011);
+    let (mut pipeline, _, _, posts) =
+        echo_volume_with_a_wrong_article(&temp_dir, job_id, false).await;
+    pipeline.graph_probes.states.insert(
+        job_id,
+        crate::pipeline::graph::probe::ProbeState {
+            rounds: 1,
+            ..Default::default()
+        },
+    );
+    repair_the_wrong_article(&mut pipeline, job_id, &posts).await;
+    drain_runs(&mut pipeline, job_id).await;
+    assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
+    assert!(pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.graph_probes.states.contains_key(&job_id));
     retire_pipeline_database(pipeline).await;
 }
 

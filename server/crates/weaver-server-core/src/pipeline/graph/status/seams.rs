@@ -87,7 +87,11 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
                     }
                 };
                 pipeline.transition_postprocessing_status(job_id, stalled, None);
-                pipeline.fail_job(job_id, error);
+                if pipeline.graph_failure_is_health(job_id) {
+                    pipeline.fail_job_on_health(job_id, error);
+                } else {
+                    pipeline.fail_job(job_id, error);
+                }
             }
             _ => {
                 pipeline.log_deliveries(job_id);
@@ -411,6 +415,19 @@ impl Pipeline {
         Some((delivery, failure))
     }
 
+    // Whether a graph job that delivered nothing whole failed for its post:
+    // a recovery object could not rebuild what it found, or what it lacks
+    // never arrived. A member an object withheld, a password it was not
+    // given or a refusal of the job's extraction budget is the extraction's
+    // failure, not the post's.
+    pub(in crate::pipeline) fn graph_failure_is_health(&self, job_id: JobId) -> bool {
+        self.graph_ruling(job_id)
+            .is_some_and(|(delivery, failure)| match failure {
+                Some(failure) => failure.rejection.is_none(),
+                None => delivery.withheld.is_empty(),
+            })
+    }
+
     pub(in crate::pipeline) fn graph_delivery(&self, job_id: JobId) -> Option<Delivery> {
         self.graph_ruling(job_id).map(|(delivery, _)| delivery)
     }
@@ -455,7 +472,9 @@ impl Pipeline {
     // that will ever rule has ruled: nothing waits on bytes, none is still
     // to rule, and no object below the root is still producing members that
     // could bring another. Each set's ruling and what the repair came to are
-    // said then, once, as the phase is.
+    // said then, once, as the phase is. The job leaves the root there, and
+    // its health probe with it: nothing is downloading for a round to rule
+    // on.
     pub(in crate::pipeline::graph) fn report_graph_phase(&mut self, job_id: JobId) {
         let (Some(graph), Some(state)) =
             (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))
@@ -467,6 +486,7 @@ impl Pipeline {
         };
         metrics::phase(phase);
         if phase == RootPhase::Done {
+            self.graph_probes.states.remove(&job_id);
             log_set_rulings(job_id, graph);
             let summary = RootJob::recovery_summary(&*graph);
             let outcomes = summary.outcomes();

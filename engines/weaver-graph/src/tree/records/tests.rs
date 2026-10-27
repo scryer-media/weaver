@@ -124,7 +124,7 @@ impl Engine for Wrap {
 struct Idle;
 
 impl Extraction for Idle {
-    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>) {}
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: crate::Budget) {}
 }
 
 struct Objects;

@@ -79,7 +79,11 @@ fn sfv_verifies_fed_members_without_reading_them() {
     let mut verdicts = Vec::new();
     job.object.verdicts(first, &mut verdicts);
     assert_eq!(verdicts, vec![SliceVerdict::Intact]);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert_eq!(job.store.reads, 0);
 }
 
@@ -105,7 +109,11 @@ fn sfv_reads_back_what_the_feed_missed() {
     let mut job = job(&sfv_text(&[("one.bin", crc32(&one))]));
     let member = job.member("one.bin", &one);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(job.store.reads > 0);
     assert!(job.store.members[&member] == one);
 }
@@ -122,7 +130,11 @@ fn sfv_with_unknown_names_passes() {
     let member = job.member("ONE.BIN", &one);
     bind(&mut job);
     assert!(job.object.covers(member));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
 }
 
 #[test]
@@ -137,7 +149,8 @@ fn sfv_reports_a_damaged_member_and_never_repairs() {
     job.object
         .feed(member, &segments(0, &damaged, 700, 700, true));
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 1,
             reachable: 0

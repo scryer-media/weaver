@@ -319,7 +319,12 @@ struct LockedRun {
 }
 
 impl Extraction for LockedRun {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(
+        self: Box<Self>,
+        volumes: Arc<dyn Volumes>,
+        sink: &mut Sink<'_>,
+        _: weaver_graph::Budget,
+    ) {
         if self.refuses {
             sink(Emit::Refuse(Why::Unsupported));
             return;

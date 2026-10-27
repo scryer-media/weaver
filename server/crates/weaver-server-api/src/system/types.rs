@@ -130,6 +130,7 @@ impl From<&DownloadBlockState> for DownloadBlock {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct Metrics {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,
@@ -198,6 +199,42 @@ pub struct Metrics {
     pub recovery_queue_depth: u32,
     pub articles_per_sec: f64,
     pub decode_rate_mbps: f64,
+}
+
+// The direct-store set counters, kept in the schema at 0 for the clients that
+// still read them: the graph engine routes no set directly.
+// TODO(0.17.0): remove
+#[ComplexObject]
+impl Metrics {
+    /// Lifetime count of archive sets direct-store admitted. Together with
+    /// the two below this is the external answer to "did direct routing carry
+    /// this work, or quietly fall back?" — output bytes are identical either
+    /// way.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_admitted(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets that left direct routing (demoted); per-reason
+    /// detail is in the server logs.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_demoted(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets that completed without ever writing a source
+    /// volume to disk — direct-store's success case.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_finalized_direct(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets repaired in place without leaving direct
+    /// routing.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_repaired_while_direct(&self) -> u64 {
+        0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Enum)]

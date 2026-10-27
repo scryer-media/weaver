@@ -90,7 +90,7 @@ impl Recovery for Tape {
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
-    fn repair(&mut self, _: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, _: &mut dyn MemberAccess, _: crate::Budget) -> RepairOutcome {
         RepairOutcome::Clean
     }
     fn outcome(&self) -> Option<RepairOutcome> {

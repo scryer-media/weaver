@@ -340,7 +340,7 @@ impl Recovery for Sfv {
 
     fn wants(&self, _out: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let mut damaged = 0;
         for (&member, &expected) in &self.bound {
             let intact = match self.verdict(member, expected) {

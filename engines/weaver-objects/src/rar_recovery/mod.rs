@@ -506,7 +506,7 @@ impl Recovery for RarRecovery {
         }
     }
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let outcome = self.rule(access);
         self.last = Some(match outcome {
             RepairOutcome::Waiting => Ruling::Short {

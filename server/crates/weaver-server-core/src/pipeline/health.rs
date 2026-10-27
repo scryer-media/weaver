@@ -31,6 +31,20 @@ impl Pipeline {
         self.fail_job_with_rejection(job_id, error, false);
     }
 
+    // Mark a job as failed because its post failed it: articles were lost
+    // past what its recovery could rebuild, or nothing arrived whole. Queue
+    // scripts hear the job deleted for health before it fails as any job
+    // does. A failure an extraction made is not a deletion and goes through
+    // `fail_job` or `fail_job_on_extraction_error` instead.
+    pub(super) fn fail_job_on_health(&mut self, job_id: JobId, error: String) {
+        self.raise_queue_script_event(
+            job_id,
+            crate::post_processing::model::QueueEvent::NzbDeleted,
+            Some("HEALTH"),
+        );
+        self.fail_job(job_id, error);
+    }
+
     // Mark a job as failed on an extraction error, routed on its class.
     pub(super) fn fail_job_on_extraction_error(&mut self, job_id: JobId, error: ExtractionError) {
         let reason = error.job_failure_reason();

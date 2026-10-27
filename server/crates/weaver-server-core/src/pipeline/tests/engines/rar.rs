@@ -1394,3 +1394,22 @@ async fn a_rar_holding_an_empty_directory_delivers_it() {
         assert_fetched_once(&graph);
     }
 }
+
+// The CRC32 a member's RAR header states reaches the naming plan's lookup,
+// under the path the member is delivered at.
+#[tokio::test]
+async fn a_rar_members_checksum_reaches_the_naming_plan() {
+    let body = body();
+    let scenario = Scenario::new(posts(single_member_store_set(MEMBER, &body, 2)));
+    let graph = run(&scenario).await;
+    assert_member(&graph, &body);
+    let by_path =
+        crate::pipeline::completion::finalize::member_crc32_by_path(&graph.graph().delivery.files);
+    let expected = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &body) as u32;
+    assert_eq!(
+        by_path.get(&MEMBER.to_ascii_lowercase()),
+        Some(&expected),
+        "{by_path:?} from {:?}",
+        graph.graph().delivery.files
+    );
+}

@@ -897,3 +897,20 @@ kind = "sql"
 file = "migrations/0074_graph_engine/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 75
+description = "a graph checkpoint keeps each member's checksum"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0075_graph_member_crc32/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0075_graph_member_crc32/postgres.sql"
+engine = "postgres"
+scope = "all"

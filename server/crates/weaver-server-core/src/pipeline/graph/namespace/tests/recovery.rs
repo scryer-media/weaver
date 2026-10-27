@@ -134,7 +134,7 @@ fn a_repairs_output_waits_on_disk_past_the_memory_budget_and_lands_whole() {
     let Ok([loan]) = <[Loan; 1]>::try_from(lent.0) else {
         panic!("one loan");
     };
-    let returned = loan.run();
+    let returned = loan.run(weaver_graph::Budget::default());
     assert!(REBUILT.len() as u64 > job.accountant.budgets().resident_limit);
     let output = job.dir.path().join(format!(
         "{}/graph-recovery-{}-{}.repaired",
@@ -153,7 +153,7 @@ fn a_repairs_output_waits_on_disk_past_the_memory_budget_and_lands_whole() {
             &mut job.tree,
             &mut build,
             &Source,
-            &weaver_objects::Objects,
+            &weaver_objects::Objects::default(),
             returned,
             &mut job.out,
         )
@@ -191,7 +191,7 @@ fn a_repair_whose_output_refuses_a_write_fails_and_applies_nothing() {
         set.0
     ));
     std::fs::create_dir_all(&output).unwrap();
-    let returned = loan.run();
+    let returned = loan.run(weaver_graph::Budget::default());
     let mut build = job.build();
     let error = job
         .writer
@@ -199,7 +199,7 @@ fn a_repair_whose_output_refuses_a_write_fails_and_applies_nothing() {
             &mut job.tree,
             &mut build,
             &Source,
-            &weaver_objects::Objects,
+            &weaver_objects::Objects::default(),
             returned,
             &mut job.out,
         )

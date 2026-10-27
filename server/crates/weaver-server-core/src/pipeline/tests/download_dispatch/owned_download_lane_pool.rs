@@ -1138,6 +1138,13 @@ async fn terminal_accounting_is_idempotent() {
 
     // A reprocess is a new admission: the graph fetches every article again,
     // so the article is pending and its loss books its declared bytes afresh.
+    // Health policy is not what is under test: a recovery set large enough to
+    // make the critical threshold zero keeps the loss in the deferral arm
+    // instead of aborting the job out from under the ledger.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.par2_bytes = state.spec.total_bytes;
+    }
     let booked = u64::from(pipeline.jobs[&job_id].spec.files[0].segments[0].bytes);
     pipeline.book_failed_segment(segment_id);
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, booked);

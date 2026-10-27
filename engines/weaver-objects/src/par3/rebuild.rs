@@ -26,7 +26,7 @@ use par3_rs::{
     RecoveryBlock,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
-use weaver_graph::{ByteRange, MemberId};
+use weaver_graph::{Budget, ByteRange, MemberId};
 
 // How much of a member one verification read takes.
 const READ: u64 = 1 << 20;
@@ -184,7 +184,7 @@ pub(super) fn repair_set(
     set: &Par3Set,
     bound: &BTreeMap<String, MemberId>,
     coming: bool,
-    memory_limit: u64,
+    budget: Budget,
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
     // The ranges the bytes proved bad, which a repair that cannot rebuild
@@ -207,7 +207,8 @@ pub(super) fn repair_set(
             lost,
         }
     };
-    let options = ExecutionOptions::default();
+    let mut options = ExecutionOptions::default();
+    options.workers = budget.threads();
     let Ok(layout) = BlockLayout::new(set, &options).map(Arc::new) else {
         return failed(0, 0, &proven, access);
     };
@@ -268,7 +269,7 @@ pub(super) fn repair_set(
         carried: &carried,
         lost: &lost,
         rows,
-        limits: CodecLimits::new(memory_limit),
+        limits: CodecLimits::new(budget.memory_or(super::REPAIR_MEMORY_LIMIT)),
     };
     solve.write_carried(access);
     let solved = match &matrix {

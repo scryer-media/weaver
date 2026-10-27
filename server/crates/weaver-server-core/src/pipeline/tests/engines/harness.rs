@@ -74,7 +74,11 @@ pub(in crate::pipeline::tests) fn payload(len: usize, seed: u8) -> Vec<u8> {
 
 // An index and one volume of `blocks` recovery blocks over `files`, the
 // index first.
-pub(in crate::pipeline::tests) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<Post> {
+pub(in crate::pipeline::tests) fn par2_set(
+    base: &str,
+    files: &[(&str, &[u8])],
+    blocks: u32,
+) -> Vec<Post> {
     let posts = par2_volumes(base, files, blocks, 1);
     assert_eq!(posts.len(), 2, "an index and one volume");
     posts
@@ -145,7 +149,11 @@ pub(in crate::pipeline::tests) fn par2_volumes_sliced(
 
 // A PAR3 index and its volumes over `files`, blocks of one article, named
 // as the creator names them under `base`, the index first.
-pub(in crate::pipeline::tests) fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<Post> {
+pub(in crate::pipeline::tests) fn par3_set(
+    base: &str,
+    files: &[(&str, &[u8])],
+    blocks: u64,
+) -> Vec<Post> {
     let source = tempfile::tempdir().unwrap();
     let names: Vec<std::path::PathBuf> = files
         .iter()
@@ -258,6 +266,37 @@ pub(in crate::pipeline::tests) fn one_block_article(post: &Post) -> u32 {
         .expect("an article inside one block alone")
 }
 
+// The scenario's server as a health probe's STAT asks it.
+struct ScenarioStat {
+    missing: BTreeSet<String>,
+}
+
+impl crate::pipeline::graph::probe::Stat for ScenarioStat {
+    fn stat_many<'a>(
+        &'a self,
+        message_ids: &'a [&'a str],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<bool>>> + Send + 'a>> {
+        let exists = message_ids
+            .iter()
+            .map(|id| !self.missing.contains(*id))
+            .collect();
+        Box::pin(std::future::ready(Some(exists)))
+    }
+}
+
+// A health probe out for the job is heard before the next article is
+// served: its round ends before the download moves on.
+async fn hear_probe(pipeline: &mut Pipeline) {
+    while pipeline.graph_probes.out(JOB) {
+        let update = pipeline
+            .graph_probes
+            .recv()
+            .await
+            .expect("a probe out speaks");
+        pipeline.graph_probe_heard(update);
+    }
+}
+
 pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) posts: Vec<Post>,
     pub(in crate::pipeline::tests) damage: Vec<(u32, u32)>,
@@ -349,6 +388,15 @@ impl Scenario {
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
         }
+        // A health probe asks the scenario's server, which holds every
+        // article but the ones it lost.
+        pipeline.graph_probes.stat = Some(std::sync::Arc::new(ScenarioStat {
+            missing: self
+                .lost
+                .iter()
+                .map(|(file, ordinal)| format!("lantern-{file}-{ordinal}@example.com"))
+                .collect(),
+        }));
     }
 
     // Whatever the download queue hands out at once arrives in reverse.
@@ -419,7 +467,11 @@ impl Scenario {
         self
     }
 
-    pub(in crate::pipeline::tests) fn corrupt_on_primary(mut self, file: u32, ordinal: u32) -> Self {
+    pub(in crate::pipeline::tests) fn corrupt_on_primary(
+        mut self,
+        file: u32,
+        ordinal: u32,
+    ) -> Self {
         self.corrupt_primary.push((file, ordinal));
         self
     }
@@ -484,6 +536,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     pub(in crate::pipeline::tests) offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
     pub(in crate::pipeline::tests) delivery: Delivery,
+    // Whether a failure of the job, at the last look, is its post's: what
+    // queue scripts hear as a deletion for health.
+    pub(in crate::pipeline::tests) health: bool,
     // What the job's checkpoints asked the database to write, at the last
     // look.
     pub(in crate::pipeline::tests) checkpoints: crate::pipeline::graph::checkpoint::Tally,
@@ -662,6 +717,7 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
                     plan.as_ref(),
                 )
                 .await;
+                hear_probe(&mut pipeline).await;
                 observe(&pipeline, &mut graph, &mut reads);
             }
         }
@@ -798,7 +854,9 @@ fn hear(
 // check a step scheduled is run, and a live run is heard. Returns where the
 // job stands once nothing is queued, scheduled or running: the recovery
 // outcomes as last seen, and whether its delivery move is out.
-pub(in crate::pipeline::tests) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOutcome>>, bool) {
+pub(in crate::pipeline::tests) async fn run_unprompted(
+    scenario: &Scenario,
+) -> (Vec<Option<RepairOutcome>>, bool) {
     fn look(pipeline: &Pipeline, outcomes: &mut Vec<Option<RepairOutcome>>) {
         if let Some(job) = pipeline.graph_jobs.get(&JOB) {
             *outcomes = job
@@ -894,7 +952,11 @@ fn handed_out(
 }
 
 // One article as the scenario's server answers it.
-pub(in crate::pipeline::tests) async fn serve(pipeline: &mut Pipeline, scenario: &Scenario, article: (u32, u32)) {
+pub(in crate::pipeline::tests) async fn serve(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    article: (u32, u32),
+) {
     serve_job(pipeline, JOB, scenario, article).await;
 }
 
@@ -1055,7 +1117,11 @@ fn fingerprint(pipeline: &Pipeline, requests: &BTreeMap<(u32, u32), usize>) -> S
 
 // The graph job as it stands; a finished job has left the pipeline, so the
 // last look before that is what the outcome keeps.
-pub(in crate::pipeline::tests) fn observe(pipeline: &Pipeline, view: &mut GraphView, reads: &mut u64) {
+pub(in crate::pipeline::tests) fn observe(
+    pipeline: &Pipeline,
+    view: &mut GraphView,
+    reads: &mut u64,
+) {
     let (Some(job), Some(state)) = (pipeline.graph_jobs.get(&JOB), pipeline.jobs.get(&JOB)) else {
         return;
     };
@@ -1092,6 +1158,7 @@ pub(in crate::pipeline::tests) fn observe(pipeline: &Pipeline, view: &mut GraphV
     view.offered = job.passwords_offered();
     view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
+    view.health = pipeline.graph_failure_is_health(JOB);
     let namespace = job.namespace();
     view.claims = state
         .spec
@@ -1154,7 +1221,11 @@ fn delivered_claim(files: &BTreeMap<String, Vec<u8>>, post: &Post) -> Claim {
 
 // The delivered files, without the marker every output directory carries,
 // whose bytes name the run's own paths.
-pub(in crate::pipeline::tests) fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+pub(in crate::pipeline::tests) fn collect(
+    root: &Path,
+    dir: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

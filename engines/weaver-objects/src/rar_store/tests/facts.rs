@@ -129,7 +129,7 @@ fn rar_facts_of_another_version_are_refused() {
         parts: Vec::new(),
     };
     assert!(matches!(
-        crate::restore(&facts),
+        crate::restore(&facts, weaver_graph::Budget::default()),
         Err(RestoreError::Version { .. })
     ));
 }

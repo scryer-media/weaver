@@ -23,7 +23,7 @@ impl Decoder for Pieces {
     // The member is the pieces' bytes joined, nothing done to them.
     const IDENTITY: bool = true;
 
-    fn window(_first: &[u8]) -> u64 {
+    fn window(_first: &[u8], _budget: &weaver_graph::Budget) -> u64 {
         WINDOW
     }
 

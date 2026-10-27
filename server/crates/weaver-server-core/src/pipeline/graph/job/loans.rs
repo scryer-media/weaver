@@ -14,6 +14,7 @@ use weaver_graph::NodeId;
 use weaver_graph::slots::{AskerId, Ticket};
 
 use super::super::engine::{Heard, Said};
+use super::super::hardware::Hardware;
 use super::super::namespace::{Lender, Loan, SetState};
 use super::super::status::RepairSlots;
 
@@ -24,6 +25,8 @@ pub(crate) struct Loans {
     serial: u64,
     out: Option<Out>,
     ticket: Option<Ticket>,
+    // What a repair is granted as it goes out.
+    hardware: Hardware,
 }
 
 // The repair that is out: its set, its number, and what the set said of
@@ -35,13 +38,14 @@ struct Out {
 }
 
 impl Loans {
-    pub(crate) fn new(scope: u64, mail: mpsc::Sender<Said>) -> Self {
+    pub(crate) fn new(scope: u64, mail: mpsc::Sender<Said>, hardware: Hardware) -> Self {
         Self {
             scope,
             mail,
             serial: 0,
             out: None,
             ticket: None,
+            hardware,
         }
     }
 
@@ -125,8 +129,11 @@ impl Lender for Lending<'_> {
             state: loan.state,
         });
         let mail = loans.mail.clone();
+        // The repair runs inside the pool, on the budget in force as it goes
+        // out: a later profile reaches the next repair, not this one.
+        let grant = loans.hardware.grant();
         tokio::task::spawn_blocking(move || {
-            let returned = loan.run();
+            let returned = grant.install(|| loan.run(grant.repair.clone()));
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(Said {

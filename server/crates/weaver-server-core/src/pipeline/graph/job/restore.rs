@@ -71,7 +71,7 @@ impl GraphJob {
         storage: Storage,
         limit: usize,
     ) -> Result<Restored, RestoreFailure> {
-        let mut tree = Tree::rebuild(&snapshot.tree, &weaver_objects::Objects)?;
+        let mut tree = Tree::rebuild(&snapshot.tree, &storage.hardware)?;
         tree.nest_at_most(storage.nesting);
         let root = ArticleRoot::restore(files, &snapshot.root)?;
         same_post(&tree, files)?;
@@ -80,7 +80,8 @@ impl GraphJob {
             storage.slots,
             storage.mail,
             Arc::clone(&storage.accountant),
-        );
+        )
+        .on(storage.hardware);
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -107,9 +108,9 @@ impl GraphJob {
         let mut job = Self {
             tree,
             root,
-            builder: Box::new(weaver_objects::Objects),
+            builder: Box::new(runs.hardware()),
             writer,
-            loans: Loans::new(runs.scope(), runs.mail()),
+            loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,

@@ -31,8 +31,8 @@ use std::marker::PhantomData;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, Located, MemberId,
-    Object, Placement, Pull, Seek, Sniff, Standing, VolumeIndex, Why, signed,
+    Budget, ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, Located,
+    MemberId, Object, Placement, Pull, Seek, Sniff, Standing, VolumeIndex, Why, signed,
 };
 
 pub use self::brotli::Brotli;
@@ -64,13 +64,28 @@ pub trait Decoder: Send + Sync + 'static {
     const IDENTITY: bool = false;
 
     // The bytes a run of this stream holds resident, as the stream's first
-    // bytes declare them, or the format's largest while they do not say.
-    fn window(first: &[u8]) -> u64;
+    // bytes declare them, or the format's largest while they do not say. A
+    // decoder whose window the format lets grow holds it to the memory
+    // `budget` grants.
+    fn window(first: &[u8], budget: &Budget) -> u64;
 
     // The decoded bytes of the stream read from `input`, holding no more
     // than `window` resident. Nothing to do for an identity decoder.
     fn open(input: Front, _window: u64) -> io::Result<Box<dyn Read + Send>> {
         Ok(Box::new(input))
+    }
+
+    // [`Self::open`], within what the run was granted. `closed` says the
+    // stream is one volume already closed when the run opens it, so its
+    // tail can be read at once; a decoder that reads its structure from
+    // the tail may then choose how to decode.
+    fn open_with(
+        input: Front,
+        window: u64,
+        _budget: weaver_graph::Budget,
+        _closed: bool,
+    ) -> io::Result<Box<dyn Read + Send>> {
+        Self::open(input, window)
     }
 
     // The range of the volume a failed decode proves bad, when the format
@@ -125,6 +140,9 @@ pub struct Stream<D> {
     // The volumes bound, by index.
     #[serde(default)]
     pieces: BTreeSet<u32>,
+    // What a run of it is granted, which sizes its window.
+    #[serde(skip)]
+    budget: Budget,
 }
 
 impl<D: Decoder> Default for Stream<D> {
@@ -135,6 +153,7 @@ impl<D: Decoder> Default for Stream<D> {
             first: Vec::new(),
             closed: false,
             pieces: BTreeSet::new(),
+            budget: Budget::default(),
         }
     }
 }
@@ -142,6 +161,12 @@ impl<D: Decoder> Default for Stream<D> {
 impl<D: Decoder> Stream<D> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // Held to what `budget` grants a run of it.
+    pub fn within(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
@@ -284,7 +309,9 @@ impl<D: Decoder> Engine for Stream<D> {
     fn start(&mut self) -> Box<dyn Extraction> {
         Box::new(run::Run::<D>::new(
             D::member(&self.name),
-            D::window(&self.first),
+            D::window(&self.first, &self.budget),
+            // A stream not cut into pieces is its first volume alone.
+            split::parse(&self.name).is_none(),
         ))
     }
 
@@ -292,7 +319,7 @@ impl<D: Decoder> Engine for Stream<D> {
     // in: a stream inside another object's member often arrives a sliver
     // at a time.
     fn reserve(&self) -> Option<u64> {
-        (self.closed || self.first.len() >= FIRST).then(|| D::window(&self.first))
+        (self.closed || self.first.len() >= FIRST).then(|| D::window(&self.first, &self.budget))
     }
 }
 

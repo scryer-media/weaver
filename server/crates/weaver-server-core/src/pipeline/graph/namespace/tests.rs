@@ -380,7 +380,7 @@ impl Recovery for Par {
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let mut volume = Vec::new();
         let span = ByteRange::new(0, PAR2_SIGNATURE.len() as u64);
         if access.read_volume(VolumeIndex(0), span, &mut volume) {
@@ -536,14 +536,14 @@ impl Job {
     fn run_lent(&mut self, build: &mut dyn Builder, lent: Inline) -> Vec<(NodeId, RepairOutcome)> {
         let mut ruled = Vec::new();
         for loan in lent.0 {
-            let returned = loan.run();
+            let returned = loan.run(weaver_graph::Budget::default());
             ruled.extend(returned.outcome.map(|outcome| (returned.set, outcome)));
             self.writer
                 .returned(
                     &mut self.tree,
                     build,
                     &Source,
-                    &weaver_objects::Objects,
+                    &weaver_objects::Objects::default(),
                     returned,
                     &mut self.out,
                 )
