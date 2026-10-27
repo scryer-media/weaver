@@ -6374,3 +6374,155 @@ async fn a_private_torrent_offers_no_dht_and_no_metadata() {
     assert_eq!(hs.m.ut_metadata, None);
     assert_eq!(hs.metadata_size, None);
 }
+
+/// A memory storage that holds room for a piece from the moment it is
+/// handed out until it verifies or fails its hash, and refuses a write of a
+/// piece it holds no room for: the shape of a storage under a resident
+/// budget.
+#[derive(Clone, Default)]
+struct HeldStorageFactory {
+    inner: MemoryStorageFactory,
+    held: Arc<Mutex<std::collections::HashSet<u32>>>,
+}
+
+struct HeldStorage {
+    inner: Box<dyn TorrentStorage>,
+    held: Arc<Mutex<std::collections::HashSet<u32>>>,
+}
+
+impl StorageFactory for HeldStorageFactory {
+    type Storage = HeldStorage;
+
+    fn create(
+        &self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<HeldStorage> {
+        Ok(HeldStorage {
+            inner: Box::new(self.inner.create(shared, metadata)?),
+            held: self.held.clone(),
+        })
+    }
+
+    fn clone_box(&self) -> BoxStorageFactory {
+        self.clone().boxed()
+    }
+}
+
+impl TorrentStorage for HeldStorage {
+    fn init(
+        &mut self,
+        shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
+    ) -> anyhow::Result<()> {
+        self.inner.init(shared, metadata)
+    }
+
+    fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.inner.pread_exact(file_id, offset, buf)
+    }
+
+    fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        let piece = u32::try_from(offset / u64::from(PIECE_LENGTH))?;
+        anyhow::ensure!(
+            buf.is_empty() || self.held.lock().contains(&piece),
+            "piece {piece} is written while the session holds no room for it"
+        );
+        self.inner.pwrite_all(file_id, offset, buf)
+    }
+
+    fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_file(file_id, filename)
+    }
+
+    fn remove_directory_if_empty(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.inner.remove_directory_if_empty(path)
+    }
+
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        self.inner.ensure_file_length(file_id, length)
+    }
+
+    fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+        Ok(Box::new(HeldStorage {
+            inner: self.inner.take()?,
+            held: self.held.clone(),
+        }))
+    }
+
+    fn reserve_piece(&self, piece: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
+        self.held.lock().insert(piece.get());
+        true
+    }
+
+    fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.held.lock().remove(&piece.get());
+        self.inner.on_piece_completed(piece)
+    }
+
+    fn on_piece_hash_failed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+        self.held.lock().remove(&piece.get());
+        self.inner.on_piece_hash_failed(piece)
+    }
+}
+
+// A piece fails its hash while another peer still owes a block of it: that
+// block is data like any other, written into room the piece is granted
+// afresh, never a write the storage refuses. The torrent keeps going and the
+// piece, fetched again, verifies.
+#[tokio::test]
+async fn a_block_owed_for_a_piece_that_failed_its_hash_is_written_into_room_granted_again() {
+    let storage = HeldStorageFactory::default();
+    let h = Harness::build_on(
+        "block_after_hash_failure",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    tokio::time::pause();
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    let (late, _late_rx) = h.peer("127.0.0.2:6881");
+
+    // The late peer is asked for the piece's last block, then the piece goes
+    // back to the queue with the request still out.
+    let last = CHUNKS_PER_PIECE - 1;
+    h.take(&late, 0);
+    assert!(
+        h.peers
+            .with_live_mut(late.addr, "test", |live| live
+                .add_inflight_request(h.chunk(0, last)))
+            .unwrap()
+    );
+    h.lock_write("test")
+        .get_pieces_mut()
+        .unwrap()
+        .release_pieces_owned_by(late.addr);
+
+    // Another peer fetches the piece whole, and it fails its hash.
+    h.take(&owner, 0);
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send(&owner, (0, chunk), chunk == 0).await.unwrap();
+    }
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2, 3]);
+    assert!(!storage.held.lock().contains(&0));
+
+    // The owed block arrives.
+    let start = (last * CHUNK_SIZE) as usize;
+    late.on_received_piece(Piece::from_data(
+        0,
+        last * CHUNK_SIZE,
+        &h.content[start..start + CHUNK_SIZE as usize],
+    ))
+    .await
+    .unwrap();
+    assert!(h.lock_read("test").fatal_errors_tx.is_some());
+    assert_eq!(h.missing_chunks(0), vec![0, 1, 2]);
+
+    h.take(&late, 0);
+    for chunk in 0..last {
+        h.send(&late, (0, chunk), false).await.unwrap();
+    }
+    assert!(h.have(0));
+    assert!(!storage.held.lock().contains(&0));
+}

@@ -3631,11 +3631,17 @@ impl PeerHandler {
                     .get(piece.index as usize)
                     .map(|l| l.read());
 
-                match g.get_pieces_mut()?.block_arrived(chunk_info, addr) {
+                let admit = |p| state.files.reserve_piece(p, &state.room_notify);
+                match g
+                    .get_pieces_mut()?
+                    .admitted_block_arrived(chunk_info, addr, admit)
+                {
                     Arrival::Write { cancel } => (ppl, cancel),
                     Arrival::Discard => {
                         state.add_redundant_bytes(piece.len() as u64);
-                        debug!("{chunk_info:?} is had, or arrived from another first, ignoring");
+                        debug!(
+                            "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
+                        );
                         return Ok(());
                     }
                 }

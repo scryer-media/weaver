@@ -409,8 +409,9 @@ impl TorrentStorage for PieceStorage {
         Ok(Box::new(self.clone()))
     }
 
-    // Room for a piece the session is about to be handed. A piece given
-    // back by a peer that left keeps what was written and the room it holds.
+    // Room for a piece the session is about to be handed, or of which a
+    // block arrived while no peer owns it. A piece given back by a peer that
+    // left keeps what was written and the room it holds.
     fn reserve_piece(&self, piece: ValidPieceIndex, room: &Arc<Notify>) -> bool {
         // Kept before the budget is asked, so a release after a refusal rings
         // the session that was refused.

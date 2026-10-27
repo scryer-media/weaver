@@ -232,9 +232,10 @@ pub trait TorrentStorage: Send + Sync {
         Ok(())
     }
 
-    /// Asked before a queued piece is handed to a peer: whether the storage has room for it.
-    /// On false the piece stays queued and the peer waits on `room`, which the storage rings
-    /// once it has room again. Default implementation always has room.
+    /// Asked before a queued piece is handed to a peer, or a block of one is written: whether
+    /// the storage has room for it. On false the piece stays queued, the block is discarded,
+    /// and the peer waits on `room`, which the storage rings once it has room again. Default
+    /// implementation always has room.
     fn reserve_piece(&self, _piece_index: ValidPieceIndex, _room: &Arc<Notify>) -> bool {
         true
     }

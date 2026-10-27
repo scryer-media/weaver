@@ -649,13 +649,31 @@ impl PieceTracker {
     /// `piece_picker::mark_as_writing` takes a block of any piece we do not
     /// have, then `torrent::cancel_block` cancels it with the other peers).
     /// A later copy, or a block of a piece we have, is not.
+    #[cfg(test)]
     pub fn block_arrived(&mut self, chunk: &ChunkInfo, peer: PeerHandle) -> Arrival {
-        if self.chunks.is_piece_have(chunk.piece_index)
+        self.admitted_block_arrived(chunk, peer, |_| true)
+    }
+
+    /// [`Self::block_arrived`], with the block's piece asked of `admit`, the
+    /// gate a piece passes to be handed out, when no peer owns it: a piece
+    /// in flight passed it when it was handed out, but one queued may hold
+    /// no room, as one that failed its hash while its block was owed. A
+    /// block of a piece `admit` refuses is discarded.
+    pub fn admitted_block_arrived(
+        &mut self,
+        chunk: &ChunkInfo,
+        peer: PeerHandle,
+        admit: impl FnOnce(ValidPieceIndex) -> bool,
+    ) -> Arrival {
+        let piece = chunk.piece_index;
+        if self.chunks.is_piece_have(piece)
             || self.chunks.is_chunk_received(chunk)
-            || !self.writing.insert(chunk.absolute_index)
+            || self.writing.contains(&chunk.absolute_index)
+            || !(self.inflight.contains_key(&piece) || admit(piece))
         {
             return Arrival::Discard;
         }
+        self.writing.insert(chunk.absolute_index);
         let mut cancel = Vec::new();
         if let Some(info) = self.inflight.get_mut(&chunk.piece_index) {
             if let Some(at) = info
