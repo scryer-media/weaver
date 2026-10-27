@@ -235,6 +235,22 @@ pub const OVER_LIMIT_HOLDOFF_MAX: Duration = Duration::from_secs(10 * 60);
 // caller vanished does not hold the server closed for long.
 pub(crate) const OVER_LIMIT_PROBE_WINDOW: Duration = Duration::from_secs(30);
 
+// Whether a failed fresh dial is the provider declining one more socket
+// rather than the server failing. Every failed dial is one or the other: a
+// decline arms the over-limit holdoff, anything else is the server's health
+// and is paced by the ordinary reconnect delay.
+//
+// A decline is only the provider's explicit too-many-connections reply. A
+// dial the server accepted and then dropped (closed, reset, a failed
+// handshake) is the server's health, however many other sockets are busy,
+// and so is a refused, unreachable or timed-out dial.
+pub(crate) fn dial_declined_over_limit(error: &NntpError) -> bool {
+    matches!(
+        error,
+        NntpError::TooManyConnections | NntpError::ServerOverLimit { .. }
+    )
+}
+
 // The pause the `refusals`th consecutive refused connect of an episode earns,
 // doubling from the plan timing's initial holdoff (production:
 // [`OVER_LIMIT_HOLDOFF_INITIAL`]) up to [`OVER_LIMIT_HOLDOFF_MAX`].
@@ -601,7 +617,7 @@ impl NntpPool {
                     };
                     if let Err(error) = &result {
                         let provider_evidence = !matches!(error, NntpError::Route(route) if route.is_path_evidence() || !route.is_evidence());
-                        if provider_evidence && !pool.dial_declined_over_limit(idx, error) && !matches!(error, NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::AcquireTimeout(_)) {
+                        if provider_evidence && !dial_declined_over_limit(error) && !matches!(error, NntpError::PoolExhausted | NntpError::PoolShutdown | NntpError::AcquireTimeout(_)) {
                             let auth = matches!(error, NntpError::AuthenticationFailed | NntpError::AuthenticationRejected | NntpError::AuthenticationRequired | NntpError::AccessDenied);
                             pool.health.lock().await.record_connection_outcome(idx, &health_lease.0, false, auth);
                             pool.retire_quarantined_idle(idx);
@@ -964,7 +980,7 @@ impl NntpPool {
                             }
                             let provider_evidence = !matches!(&e, NntpError::Route(error) if error.is_path_evidence() || !error.is_evidence());
                             if provider_evidence
-                                && !self.dial_declined_over_limit(idx, &e)
+                                && !dial_declined_over_limit(&e)
                                 && !matches!(
                                     e,
                                     NntpError::PoolExhausted
@@ -1311,7 +1327,7 @@ impl NntpPool {
         result: &Result<T>,
     ) {
         match result {
-            Err(error) if self.dial_declined_over_limit(server.0, error) => {
+            Err(error) if dial_declined_over_limit(error) => {
                 self.note_provider_over_limit(server)
             }
             Ok(_) => self.note_provider_admitted(server, admission),
@@ -1683,45 +1699,13 @@ impl NntpPool {
         })
     }
 
-    // Whether a failed fresh dial is the provider declining one more socket
-    // rather than the server failing. Every failed dial is one or the other:
-    // a decline arms the over-limit holdoff, anything else is the server's
-    // health.
-    //
-    // A decline is the provider's explicit over-limit reply, or a dial the
-    // server accepted and then dropped (closed, reset, a failed handshake)
-    // while it is serving work on sockets it already holds: a provider at
-    // its connection limit often turns the extra socket away that way. A
-    // refused, unreachable or timed-out dial is the server down, whatever
-    // sockets it holds, and so is a dropped dial when no socket is busy:
-    // an idle cached socket says nothing about the server now.
-    pub(crate) fn dial_declined_over_limit(&self, idx: usize, error: &NntpError) -> bool {
-        let dropped = match error {
-            NntpError::TooManyConnections | NntpError::ServerOverLimit { .. } => return true,
-            NntpError::ConnectionClosed | NntpError::Tls(_) => true,
-            NntpError::Io(error) => matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::BrokenPipe
-            ),
-            _ => false,
-        };
-        dropped && {
-            let sockets = self.socket_budgets[idx].snapshot();
-            sockets.physical
-                > sockets.dialing + sockets.closing + sockets.async_idle + sockets.owned_idle
-        }
-    }
-
     // Start the reconnect delay after a fresh dial failed for the server's
     // own reasons. A dial the provider declined, or one the holdoff turned
     // away before it dialled, is paced by the over-limit holdoff alone:
     // stamping the delay for it as well would answer the next caller with
     // `ServerRecovering` instead of the holdoff, as if the server were down.
     async fn note_connect_failure(&self, idx: usize, error: &NntpError) {
-        if !self.dial_declined_over_limit(idx, error) {
+        if !dial_declined_over_limit(error) {
             *self.last_connect_failure[idx].lock().await = Some(Instant::now());
         }
     }
@@ -2775,6 +2759,119 @@ mod tests {
         assert_eq!(pool.server_load(1), (4, 4));
 
         server.abort();
+    }
+
+    // A dial the server accepted and then dropped is the server's health,
+    // however many other sockets are busy: it never arms the over-limit
+    // holdoff, and the next dial goes out once the ordinary reconnect delay
+    // has passed. Only the explicit reply above parks fresh connects.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_dial_beside_busy_sockets_waits_the_reconnect_delay_not_the_holdoff() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use weaver_tunnel::pipe::{DialError, DialPath, Dialed, DialedStream, Dialer, Target};
+        struct DropsAfterTwo {
+            dials: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for DropsAfterTwo {
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                let dial = self.dials.fetch_add(1, Ordering::AcqRel);
+                let (stream, peer) = tokio::io::duplex(1024);
+                if dial < 2 {
+                    tokio::spawn(async move {
+                        let (reader, mut writer) = tokio::io::split(peer);
+                        writer.write_all(b"200 ready\r\n").await.unwrap();
+                        let mut lines = BufReader::new(reader).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let reply = if line == "CAPABILITIES" {
+                                &b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n"[..]
+                            } else {
+                                &b"500 unsupported\r\n"[..]
+                            };
+                            if writer.write_all(reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                } else {
+                    // Accepted, then dropped before the greeting.
+                    drop(peer);
+                }
+                Ok(Dialed {
+                    stream: DialedStream::Tunnel(Box::new(stream)),
+                    outcome: Arc::new(weaver_tunnel::bridge::ConnectionOutcome::default()),
+                    path: DialPath {
+                        leg: Some(0),
+                        ..Default::default()
+                    },
+                    peer: Some("127.0.0.1:119".parse().unwrap()),
+                    source: None,
+                    setup: None,
+                })
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "dropping fixture".into()
+            }
+        }
+        let route = Arc::new(DropsAfterTwo {
+            dials: AtomicUsize::new(0),
+        });
+        let mut config = test_pool_config(4);
+        // Far longer than any real time the test can take, so the delay is
+        // always still running when the next acquire checks it.
+        config.reconnect_delay = Duration::from_secs(3600);
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            plan: None,
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        });
+        let pool = NntpPool::new(config);
+
+        // Two lanes are leased and held: busy sockets on this server.
+        let busy = [
+            pool.acquire(ServerId(0)).await.unwrap(),
+            pool.acquire(ServerId(0)).await.unwrap(),
+        ];
+        assert_eq!(pool.socket_budgets[0].snapshot().physical, 2);
+
+        let Err(dropped) = pool.acquire(ServerId(0)).await else {
+            panic!("the dropped dial must fail");
+        };
+        assert!(
+            matches!(
+                &dropped,
+                NntpError::ConnectionClosed | NntpError::Io(_) | NntpError::Tls(_)
+            ),
+            "{dropped:?}"
+        );
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);
+        assert!(pool.last_connect_failure[0].lock().await.is_some());
+
+        // The next dial waits out the reconnect delay on the paused clock,
+        // then goes out instead of meeting a holdoff.
+        let started = TokioInstant::now();
+        let Err(next) = pool.acquire(ServerId(0)).await else {
+            panic!("the next dial is dropped too");
+        };
+        assert!(
+            !matches!(next, NntpError::ServerOverLimit { .. }),
+            "{next:?}"
+        );
+        assert!(!started.elapsed().is_zero(), "must wait the reconnect delay");
+        assert_eq!(route.dials.load(Ordering::Acquire), 4);
+        assert!(!pool.is_over_limit(ServerId(0)));
+        assert_eq!(pool.over_limit_refusals(ServerId(0)), 0);
+
+        drop(busy);
+        pool.shutdown().await;
     }
 
     #[tokio::test]
