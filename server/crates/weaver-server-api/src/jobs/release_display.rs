@@ -645,6 +645,27 @@ fn imdb_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"tt\d{5,}").expect("valid regex"))
 }
 
+// The titles a job's release display derives from its name, metadata and
+// category: the original, the display and the normalized title. The admin
+// diagnostics package reads these for its stand-in table, so the display is
+// derived the one way the API derives it.
+pub fn release_display_names(
+    job_name: &str,
+    metadata: &[(String, String)],
+    category: Option<&str>,
+) -> Vec<String> {
+    let info = release_display_info(ReleaseDisplayInput {
+        job_name,
+        metadata,
+        category,
+    });
+    vec![
+        info.original_title,
+        info.display_title,
+        info.parsed_release.normalized_title,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

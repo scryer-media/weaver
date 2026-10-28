@@ -21,7 +21,7 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::persistence::{Database, StateError};
 
 const SETTINGS_KEY: &str = "post_processing.settings.v2";
-const SCRIPT_DIRECTORY_KEY: &str = "post_processing.script_directory.v1";
+pub(crate) const SCRIPT_DIRECTORY_KEY: &str = "post_processing.script_directory.v1";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScriptDirectoryError {

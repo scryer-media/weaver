@@ -516,6 +516,110 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     })
 }
 
+// What an NZB names: its title and the file name each `<file>` subject
+// carries, in document order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NzbNames {
+    pub title: Option<String>,
+    pub file_names: Vec<String>,
+}
+
+// Reads only the names an NZB carries. Each file's `<segments>` element is
+// skipped unread, so a large document costs a scan, not a parse of every
+// article.
+pub fn parse_nzb_names_reader<R: BufRead>(reader: R) -> Result<NzbNames, NzbError> {
+    let mut reader = Reader::from_reader(reader);
+    let mut buf = Vec::new();
+    let mut skipped = Vec::new();
+    let mut names = NzbNames::default();
+    let mut in_head = false;
+    let mut in_title = false;
+    let mut title = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                match local_name(name.as_ref()) {
+                    "head" => in_head = true,
+                    "meta" if in_head => {
+                        in_title = false;
+                        for attr in e.attributes() {
+                            let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
+                            if attr.key.as_ref() == "type" && attr.value.as_ref() == "title" {
+                                in_title = true;
+                                title.clear();
+                            }
+                        }
+                    }
+                    "file" => {
+                        for attr in e.attributes() {
+                            let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
+                            if attr.key.as_ref() == "subject" {
+                                let subject = attr
+                                    .normalized_value_with(
+                                        XmlVersion::Implicit1_0,
+                                        1,
+                                        resolve_entity,
+                                    )
+                                    .map_err(|e| NzbError::Xml(e.to_string()))?
+                                    .into_owned();
+                                let file = NzbFile {
+                                    poster: String::new(),
+                                    subject,
+                                    date: 0,
+                                    groups: Vec::new(),
+                                    segments: Vec::new(),
+                                };
+                                if let Some(file_name) = file.filename() {
+                                    names.file_names.push(file_name.to_owned());
+                                }
+                            }
+                        }
+                    }
+                    "segments" => {
+                        let end = e.to_end().into_owned();
+                        reader
+                            .read_to_end_into(end.name(), &mut skipped)
+                            .map_err(|e| NzbError::Xml(e.to_string()))?;
+                        skipped.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                match local_name(name.as_ref()) {
+                    "head" => in_head = false,
+                    "meta" if in_title => {
+                        in_title = false;
+                        names.title = Some(title.trim().to_owned());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) if in_title => {
+                title.push_str(&e.xml_content(XmlVersion::Implicit1_0));
+            }
+            Ok(Event::GeneralRef(e)) if in_title => {
+                if let Some(value) = e
+                    .resolve_char_ref()
+                    .map_err(|_| NzbError::Xml("invalid character reference".into()))?
+                {
+                    title.push(value);
+                } else if let Some(value) = resolve_entity(e.as_ref()) {
+                    title.push_str(value);
+                }
+            }
+            Err(e) => return Err(NzbError::Xml(e.to_string())),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(names)
+}
+
 // The text a named entity in an attribute value or element text stands for. The five XML
 // entities are the XML ones. NZBs written by web tools also carry HTML's
 // named entities, which XML does not define; a name HTML knows decodes to
@@ -1524,5 +1628,32 @@ mod tests {
                 message_ids: vec![String::new()],
             }],
         }
+    }
+
+    #[test]
+    fn names_reader_reads_the_title_and_file_names_and_skips_segments() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head><meta type="category">tv</meta><meta type="title">Some &amp; Title</meta></head>
+  <file poster="p@example.com" date="1" subject="Post - &quot;Some.Title.part01.rar&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="10" number="1">a@example.com</segment>
+      <segment bytes="10" number="2">b@example.com</segment>
+    </segments>
+  </file>
+  <file poster="p@example.com" date="1" subject="Some.Title.nfo (1/1)">
+    <segments><segment bytes="5" number="1">c@example.com</segment></segments>
+  </file>
+</nzb>"#;
+        let names = parse_nzb_names_reader(Cursor::new(&xml[..])).unwrap();
+        assert_eq!(names.title.as_deref(), Some("Some & Title"));
+        assert_eq!(
+            names.file_names,
+            vec![
+                "Some.Title.part01.rar".to_string(),
+                "Some.Title.nfo".to_string()
+            ]
+        );
     }
 }
