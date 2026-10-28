@@ -263,7 +263,12 @@ async fn reconcile_checks_only_jobs_that_could_be_waiting_on_a_check() {
             intermediate_dir.join(format!("queued-{id}")),
         );
         state.status = JobStatus::Queued;
-        state.download_queue.push(queued_work(job_id));
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .push(queued_work(job_id));
         pipeline.jobs.insert(job_id, state);
         pipeline.job_order.push(job_id);
     }

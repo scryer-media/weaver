@@ -28,8 +28,8 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
         .record_failure(0, true);
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -152,8 +152,8 @@ async fn a_fill_server_refusing_credentials_books_the_article_and_leaves_backfil
     assert!(pipeline.no_server_can_serve(job_id, &[]));
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);

@@ -1152,6 +1152,9 @@ pub struct Database {
     // own `Flush` so a re-send in progress is not skipped at shutdown.
     pending_write_retries: Arc<AtomicUsize>,
     pending_write_notify: Arc<Notify>,
+    // The writes waiting, in the order they were queued, for room in the
+    // full writer queue: some while the re-send empties them into it.
+    write_overflow: Arc<Mutex<Option<VecDeque<QueuedWrite>>>>,
     pub(crate) history_delete_wake: Arc<Notify>,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
@@ -1188,6 +1191,7 @@ impl Database {
             writer_tx,
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: None,
@@ -1214,6 +1218,7 @@ impl Database {
             writer_tx,
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
@@ -1431,6 +1436,7 @@ impl Database {
             writer_tx: detached_tx,
             pending_write_retries: self.pending_write_retries.clone(),
             pending_write_notify: self.pending_write_notify.clone(),
+            write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: self.history_delete_wake.clone(),
             job_history_cache: self.job_history_cache.clone(),
             encryption_key: self.encryption_key.clone(),
@@ -1589,47 +1595,69 @@ impl Database {
         self.try_send_with_retry(command, LABEL)
     }
 
-    // Shared enqueue path for ordered writer commands. Tries a non-blocking
-    // send; on a full queue spawns a background re-send tracked by
-    // `pending_write_retries`/`pending_write_notify` (so a flush cannot race
-    // past an in-flight re-send), falling back to a blocking send off-runtime.
+    // Shared enqueue path for ordered writer commands. A write goes straight
+    // into the queue only when no write waits ahead of it. Once the queue is
+    // full, writes wait in an overflow line that one sender empties into it
+    // in order, and a write queued while that line is being emptied joins
+    // its tail, even when the queue has room again: no write overtakes one
+    // queued before it. On the runtime the sender is a background task; off
+    // it, the caller's own thread, which waits for room with the line's lock
+    // released, so a runtime worker queueing meanwhile joins the line and
+    // never waits. Either sender is tracked by
+    // `pending_write_retries`/`pending_write_notify`, so a flush cannot race
+    // past it.
     fn try_send_with_retry(
         &self,
         command: DbWriteCommand,
         context: &'static str,
     ) -> Result<(), StateError> {
         let command = self.enqueue_write(command);
-        match self.writer_tx.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
-                let tx = self.writer_tx.clone();
-                let pending_write_retries = self.pending_write_retries.clone();
-                let pending_write_notify = self.pending_write_notify.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    pending_write_retries.fetch_add(1, Ordering::AcqRel);
-                    handle.spawn(async move {
-                        let send_result = tx.send(command).await;
-                        pending_write_retries.fetch_sub(1, Ordering::AcqRel);
-                        pending_write_notify.notify_waiters();
-                        if let Err(error) = send_result {
-                            tracing::warn!(
-                                context,
-                                error = %error,
-                                "database writer queue closed while retrying enqueue"
-                            );
-                        }
-                    });
-                    Ok(())
-                } else {
-                    tx.blocking_send(command).map_err(|_| {
-                        StateError::Database("database writer queue closed".to_string())
-                    })
+        let mut overflow = self
+            .write_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(waiting) = overflow.as_mut() {
+            waiting.push_back(command);
+            return Ok(());
+        }
+        let command = match self.writer_tx.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(writer_queue_closed());
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => command,
+        };
+        *overflow = Some(VecDeque::from([command]));
+        drop(overflow);
+        self.pending_write_retries.fetch_add(1, Ordering::AcqRel);
+        let tx = self.writer_tx.clone();
+        let overflow = Arc::clone(&self.write_overflow);
+        let pending_write_retries = self.pending_write_retries.clone();
+        let pending_write_notify = self.pending_write_notify.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            let mut sent = Ok(());
+            while let Some(next) = next_in_line(&overflow) {
+                if tx.blocking_send(next).is_err() {
+                    close_line(&overflow, context);
+                    sent = Err(writer_queue_closed());
+                    break;
                 }
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(StateError::Database(
-                "database writer queue closed".to_string(),
-            )),
-        }
+            pending_write_retries.fetch_sub(1, Ordering::AcqRel);
+            pending_write_notify.notify_waiters();
+            return sent;
+        };
+        handle.spawn(async move {
+            while let Some(next) = next_in_line(&overflow) {
+                if tx.send(next).await.is_err() {
+                    close_line(&overflow, context);
+                    break;
+                }
+            }
+            pending_write_retries.fetch_sub(1, Ordering::AcqRel);
+            pending_write_notify.notify_waiters();
+        });
+        Ok(())
     }
 
     // Stamp a command with its enqueue instant and sample how full the ordered
@@ -1647,33 +1675,24 @@ impl Database {
         }
     }
 
+    // Queued through the same line as every other write, so it never
+    // overtakes a write waiting for room in the full queue. It does not wait
+    // for room itself.
     pub async fn queue_archive_job(
         &self,
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
-        let command = self.enqueue_write(DbWriteCommand::ArchiveJob {
-            job_id,
-            history: Box::new(history),
-            typed_terminal_cause: None,
-            failure_kind: None,
-            committed: None,
-        });
-        self.writer_tx
-            .send(command)
-            .await
-            .map_err(|_| StateError::Database("database writer queue closed".to_string()))
+        self.try_queue_archive_job(job_id, history)
     }
 
+    // Queued through the same line as every other write, as
+    // [`Self::queue_archive_job`] is.
     pub async fn queue_job_events(
         &self,
         events: Vec<crate::history::JobEvent>,
     ) -> Result<(), StateError> {
-        let command = self.enqueue_write(DbWriteCommand::InsertJobEvents { events });
-        self.writer_tx
-            .send(command)
-            .await
-            .map_err(|_| StateError::Database("database writer queue closed".to_string()))
+        self.try_send_with_retry(DbWriteCommand::InsertJobEvents { events }, "job_events")
     }
 
     pub async fn flush_write_queue(&self) -> Result<(), StateError> {
@@ -1978,6 +1997,36 @@ impl Database {
             Ok(())
         })
     }
+}
+
+fn writer_queue_closed() -> StateError {
+    StateError::Database("database writer queue closed".to_string())
+}
+
+// The overflow line's next write, taken under its lock and sent with the
+// lock released. The line stays open while its head is sent, so a write
+// queued meanwhile waits behind it; it closes in the same turn it is found
+// empty, so a write queued after that goes straight to the queue.
+fn next_in_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>) -> Option<QueuedWrite> {
+    let mut line = overflow
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let next = line.as_mut().and_then(VecDeque::pop_front);
+    if next.is_none() {
+        *line = None;
+    }
+    next
+}
+
+// No writer is left to take what still waits in the overflow line.
+fn close_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>, context: &'static str) {
+    tracing::warn!(
+        context,
+        "database writer queue closed while retrying enqueue"
+    );
+    *overflow
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 #[cfg(test)]

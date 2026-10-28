@@ -109,6 +109,7 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("graph_recovery", ResetOnRestore, RequireEmpty),
     table!("graph_holds", ResetOnRestore, RequireEmpty),
     table!("graph_facts_parts", ResetOnRestore, RequireEmpty),
+    table!("graph_held_parts", ResetOnRestore, RequireEmpty),
     table!("integration_events", ResetOnRestore, Replace),
     table!("metrics_history_chunks", ResetOnRestore, Replace),
     table!("async_operations", ResetOnRestore, Replace),

@@ -8,7 +8,9 @@
 // bytes are written, so it only ever describes bytes on disk; holds in
 // memory are left out and fetched again. A graceful stop pages every hold it
 // can to scratch first, so its last checkpoint leaves out only what scratch
-// could not take.
+// could not take. The pipeline's parts that arrived and wait to be placed
+// are taken with it the same way: those spooled to the job's working
+// directory, never those still in memory.
 //
 // Each checkpoint is written as what it changed of the one before: a step
 // costs the database the rows it changed, not the job's. One writer per job:
@@ -34,8 +36,8 @@ use super::envelope::durable::KeptRecord;
 use super::job::GraphJob;
 use super::root::facts::{self, Parts, RootFacts, RootFactsError};
 use crate::jobs::graph_checkpoint::{
-    Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, HoldRow, MemberRow,
-    NodeRow, PartRow, Row,
+    Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, HeldPartRow, HoldRow,
+    MemberRow, NodeRow, PartRow, Row,
 };
 use crate::jobs::ids::JobId;
 use crate::pipeline::Pipeline;
@@ -122,6 +124,8 @@ struct Slot {
 struct Held {
     root: Option<NodeRow>,
     nodes: BTreeMap<i64, GraphCheckpoint>,
+    // The pipeline's spooled held parts, in key order.
+    held_parts: Vec<HeldPartRow>,
     // `None` for rows a restore read, not ones taken from the job: the next
     // step reads every node.
     read: Option<Generations>,
@@ -147,9 +151,10 @@ impl Pending {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    // Queue what this checkpoint changes; true when a write must be queued
+    // Queue what this checkpoint changes, the job's spooled held parts
+    // `held_parts` with it, in key order; true when a write must be queued
     // to take it.
-    pub(super) fn put(&self, job: &GraphJob) -> bool {
+    pub(super) fn put(&self, job: &GraphJob, held_parts: Vec<HeldPartRow>) -> bool {
         let mut slot = self.slot();
         let slot = &mut *slot;
         let mut delta = Delta {
@@ -184,6 +189,16 @@ impl Pending {
                 held.nodes.insert(node, now);
             }
         }
+        let was = GraphCheckpoint {
+            held_parts: std::mem::take(&mut held.held_parts),
+            ..GraphCheckpoint::default()
+        };
+        let now = GraphCheckpoint {
+            held_parts,
+            ..GraphCheckpoint::default()
+        };
+        delta.compare(&was, &now);
+        held.held_parts = now.held_parts;
         let changed = root_parts(&mut slot.root_parts, encoding.parts);
         if delta.whole {
             let root = i64::from(NodeId::ROOT.0);
@@ -268,6 +283,7 @@ impl Pending {
         for row in rows.holds {
             held.nodes.entry(row.node).or_default().holds.push(row);
         }
+        held.held_parts = rows.held_parts;
         slot.held = Some(held);
     }
 
@@ -296,13 +312,14 @@ impl Pipeline {
             .map(|graph| graph.pending().settled_bytes())
     }
 
-    // Checkpoint the job's tree as it stands now.
+    // Checkpoint the job's tree as it stands now, and the parts of it that
+    // arrived, wait to be placed and are spooled.
     pub(crate) fn checkpoint_graph_job(&mut self, job_id: JobId) {
         let Some(graph) = self.graph_jobs.get(&job_id) else {
             return;
         };
         let pending = graph.pending().clone();
-        if !pending.put(graph) {
+        if !pending.put(graph, self.held_part_rows(job_id)) {
             return;
         }
         let writer = pending.clone();

@@ -224,17 +224,20 @@ impl std::fmt::Display for ExtractionFailure {
     }
 }
 
-// The process-wide pool that a submitted job's scheduling metadata and
-// repeated-article indexes are reserved from. Admission never waits: a
-// reservation that would pass the limit fails outright.
+// The process-wide ledger of the memory that jobs' article lists and
+// repeated-article indexes hold. Those are recorded as charges and nothing
+// admits a job against the ledger (see
+// [`ProcessMemoryBudget::charge_retained`]). The repeated-article cache is
+// the only thing that refuses: a cache reservation that would pass the limit
+// fails outright and the cache does without it.
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
     limit: u64,
     reserved: Arc<AtomicU64>,
-    // The limit a lowered one replaced, while reservations made under it
+    // The limit a lowered one replaced, while the charges recorded under it
     // still exceed the new one; zero otherwise. Without this a lowered limit
-    // would reject every submission until the work admitted under the wider
-    // limit had finished.
+    // would refuse every repeated-article cache reservation until the work
+    // charged under the wider limit had finished.
     lowered_from: Arc<AtomicU64>,
     admission: Arc<Mutex<()>>,
 }
@@ -249,10 +252,12 @@ impl ProcessMemoryBudget {
         }
     }
 
-    // The same pool under another limit, for the work admitted from now on.
+    // The same ledger under another limit, for the reservations made from
+    // now on.
     //
-    // Reservations are shared with the budget this one replaces. A view
-    // already handed to running work keeps the limit it was given.
+    // Charges and reservations are shared with the budget this one
+    // replaces. A view already handed to running work keeps the limit it was
+    // given.
     pub(crate) fn with_limit(&self, limit: u64) -> Self {
         let _guard = self
             .admission
@@ -269,8 +274,8 @@ impl ProcessMemoryBudget {
         }
     }
 
-    // The limit an admission is judged against: this budget's own, or the
-    // wider one it replaced for as long as reservations made under that one
+    // The limit a reservation is judged against: this budget's own, or the
+    // wider one it replaced for as long as the charges recorded under that one
     // are still above this one. Called with `admission` held.
     fn admission_limit(&self) -> u64 {
         let lowered_from = self.lowered_from.load(Ordering::Acquire);
@@ -310,6 +315,22 @@ impl ProcessMemoryBudget {
             budget: Arc::clone(self),
             bytes,
         })
+    }
+
+    // Record `bytes` the process already holds, or is about to hold, until
+    // the returned permit drops. Never refuses: the charge is recorded as it
+    // is, even past the limit, and only counts against the reservations the
+    // repeated-article cache asks for afterwards.
+    pub(crate) fn charge_retained(self: &Arc<Self>, bytes: u64) -> ProcessMemoryPermit {
+        let _guard = self
+            .admission
+            .lock()
+            .expect("process memory state poisoned");
+        self.reserved.fetch_add(bytes, Ordering::AcqRel);
+        ProcessMemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+        }
     }
 
     #[cfg(test)]

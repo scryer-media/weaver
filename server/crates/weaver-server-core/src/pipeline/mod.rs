@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod activation;
 pub mod archive;
 mod capacity;
 mod completion;
@@ -10,6 +11,7 @@ pub mod download;
 mod extraction;
 pub mod graph;
 mod health;
+pub(crate) mod held;
 mod infrastructure_retry;
 mod nzb_admission;
 mod orchestrator;
@@ -192,6 +194,40 @@ pub(crate) fn assemble_archive_password_candidates(
     candidates
 }
 
+// The job half of the harvest, read from the database: the passwords
+// supplied with the job, then its persisted NZB's, and whether the read,
+// decrypt and parse succeeded (`harvested`).
+pub(crate) fn read_job_password_candidates(
+    db: &crate::Database,
+    job_id: JobId,
+) -> (Vec<ArchivePasswordCandidate>, bool) {
+    match db.load_active_job_password_sources(job_id) {
+        Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
+            match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
+                Ok(nzb) => (job_carried_password_candidates(&supplied, nzb), true),
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        error = %error,
+                        "failed to parse persisted NZB for password candidates"
+                    );
+                    (Vec::new(), false)
+                }
+            }
+        }
+        Ok(Some(((_, None), supplied))) => (supplied, true),
+        Ok(None) => (Vec::new(), true),
+        Err(error) => {
+            warn!(
+                job_id = job_id.0,
+                error = %error,
+                "failed to load password candidates for job"
+            );
+            (Vec::new(), false)
+        }
+    }
+}
+
 impl Pipeline {
     // Consumption boundaries may follow an await in the same actor turn. Read
     // a recorded override there even when it has not reached the runtime spec.
@@ -238,7 +274,7 @@ impl Pipeline {
         let carried = match state.and_then(|state| state.nzb_password_candidates.get()) {
             Some(cached) => cached.clone(),
             None => {
-                let (candidates, harvested) = self.load_job_password_candidates(job_id);
+                let (candidates, harvested) = read_job_password_candidates(&self.db, job_id);
                 // A job in the pipeline already has its row, and nothing
                 // adds NZB bytes or supplied passwords to a row later, so a
                 // missing row or NZB stays missing and its list is
@@ -260,37 +296,6 @@ impl Pipeline {
         };
 
         assemble_archive_password_candidates(spec_password.as_deref(), &carried, &global)
-    }
-
-    // The job half of the harvest, read from the database: the passwords
-    // supplied with the job, then its persisted NZB's, and whether the read,
-    // decrypt and parse succeeded (`harvested`).
-    fn load_job_password_candidates(&self, job_id: JobId) -> (Vec<ArchivePasswordCandidate>, bool) {
-        match self.db.load_active_job_password_sources(job_id) {
-            Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
-                match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
-                    Ok(nzb) => (job_carried_password_candidates(&supplied, nzb), true),
-                    Err(error) => {
-                        warn!(
-                            job_id = job_id.0,
-                            error = %error,
-                            "failed to parse persisted NZB for password candidates"
-                        );
-                        (Vec::new(), false)
-                    }
-                }
-            }
-            Ok(Some(((_, None), supplied))) => (supplied, true),
-            Ok(None) => (Vec::new(), true),
-            Err(error) => {
-                warn!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load password candidates for job"
-                );
-                (Vec::new(), false)
-            }
-        }
     }
 
     // Bring the job's record of full file names up to date after files were
@@ -891,20 +896,21 @@ impl SegmentEncoding {
     }
 }
 
-// Storage for a uuencode part waiting for its prefix.
+// The decoded bytes of a part held until it can be placed: a uuencode part
+// waiting for its prefix, or an article that declared no usable start
+// waiting for the ordinal before it.
 //
 // Disk-backed entries retain their trusted decoded length alongside the
-// temporary path. The spool file's metadata is never used for allocation or
-// validation when the part is released.
-enum UuParkedEntry {
+// spool file's path, under the job's working directory. The spool file's
+// metadata is never used for allocation or validation when the part is
+// released. Dropping an entry leaves its file: a part let go removes it, and
+// one the process stops with stays for the job's restart to take back.
+pub(super) enum ParkedBytes {
     Memory(DecodedChunk),
-    Spilled {
-        path: tempfile::TempPath,
-        decoded_bytes: usize,
-    },
+    Spilled { path: PathBuf, decoded_bytes: usize },
 }
 
-impl UuParkedEntry {
+impl ParkedBytes {
     fn decoded_bytes(&self) -> usize {
         match self {
             Self::Memory(chunk) => chunk.len_bytes(),
@@ -917,54 +923,13 @@ impl UuParkedEntry {
     }
 }
 
-// Remove every stale child of the transient UU spool root without following
-// links outside it. UU assembly checkpoints are not restored after restart.
-pub(super) fn clear_stale_uu_park_root(root: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(std::io::Error::other(format!(
-                "UU spool root is not a directory: {}",
-                root.display()
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(root)?;
-        }
-        Err(error) => return Err(error),
-    }
-
-    for child in std::fs::read_dir(root)? {
-        let child = child?;
-        let path = child.path();
-        let file_type = child.file_type()?;
-        if file_type.is_dir() {
-            std::fs::remove_dir_all(path)?;
-        } else {
-            // This removes a symlink itself rather than its target.
-            std::fs::remove_file(path)?;
-        }
-    }
-    Ok(())
-}
-
-// Remove a job's spool directory once its final transient file is gone.
-//
-// An occupied directory belongs to another still-parked part, and a missing
-// one means a prior cleanup already won the race; neither is an error.
-pub(super) fn remove_empty_uu_park_dir(root: &Path, job_id: JobId) {
-    let path = root.join(job_id.0.to_string());
-    if let Err(error) = std::fs::remove_dir(&path)
-        && error.kind() != std::io::ErrorKind::NotFound
-        && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
-    {
-        warn!(
-            job_id = job_id.0,
-            path = %path.display(),
-            error = %error,
-            "failed to remove empty UU spool directory"
-        );
-    }
+// An article that declared no usable start, held until the ordinal before
+// it is placed. Its decoded bytes are in `bytes`; `result` keeps everything
+// else it decoded to, with no data of its own.
+pub(super) struct UnanchoredPart {
+    pub(super) result: DecodeResult,
+    pub(super) bytes: ParkedBytes,
+    pub(super) source: SegmentSource,
 }
 
 // Sequential-assembly state for one uuencode file.
@@ -985,7 +950,7 @@ pub(super) struct UuFileAssembly {
     //
     // Bounded by the same per-file limit the write reorder buffer uses; see
     // the admission check at the placement seam for what happens on overflow.
-    parked: BTreeMap<u32, UuParkedEntry>,
+    parked: BTreeMap<u32, ParkedBytes>,
     // A part decoded with damage, or a gap was closed by shifting later parts
     // down over a part that never arrived.
     pub(super) damaged: bool,
@@ -1042,33 +1007,6 @@ impl Pipeline {
             uu.damaged = true;
             uu.next_index = next;
         }
-    }
-}
-
-impl UuFileAssembly {
-    // Resident bytes held for parts waiting on their prefix.
-    pub(super) fn parked_memory_bytes(&self) -> usize {
-        self.parked
-            .values()
-            .filter(|entry| !entry.is_spilled())
-            .map(UuParkedEntry::decoded_bytes)
-            .sum()
-    }
-
-    // Disk-backed bytes held for parts waiting on their prefix.
-    pub(super) fn parked_spooled_bytes(&self) -> usize {
-        self.parked
-            .values()
-            .filter(|entry| entry.is_spilled())
-            .map(UuParkedEntry::decoded_bytes)
-            .sum()
-    }
-
-    pub(super) fn parked_spooled_segments(&self) -> usize {
-        self.parked
-            .values()
-            .filter(|entry| entry.is_spilled())
-            .count()
     }
 }
 
@@ -1289,8 +1227,13 @@ pub struct Pipeline {
     pub(super) metrics: Arc<PipelineMetrics>,
     // Per-job state.
     pub(super) jobs: HashMap<JobId, JobState>,
-    // The graph runtime of each job, given when it is admitted or restored.
+    // The graph runtime of each job holding its articles, given when they
+    // are built.
     pub(super) graph_jobs: HashMap<JobId, graph::job::GraphJob>,
+    // The graph runtimes of jobs that dropped their articles while something
+    // of them was still out on a thread: each is stopped, and kept only until
+    // the last of its mail is heard.
+    pub(super) retiring_graph_jobs: HashMap<JobId, graph::job::GraphJob>,
     // The repair slots graph jobs share, and what each job's recovery
     // objects said when it last advanced.
     pub(super) graph_status: graph::status::GraphStatus,
@@ -1466,6 +1409,8 @@ pub struct Pipeline {
     pub(super) nntp_handoff_drained_tx: mpsc::Sender<u64>,
     pub(super) nntp_handoff_drained_rx: mpsc::Receiver<u64>,
     // Channel for background final-move results.
+    pub(super) job_activated_tx: mpsc::Sender<activation::JobActivated>,
+    pub(super) job_activated_rx: mpsc::Receiver<activation::JobActivated>,
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     // Channel for failed jobs whose working directory was released.
@@ -1607,8 +1552,6 @@ pub struct Pipeline {
     // This bounds map and temporary-path overhead even when decoded bytes are
     // tiny.
     pub(super) uu_parked_segments: usize,
-    // Reserved transient spool root below the configured intermediate directory.
-    pub(super) uu_spool_root: PathBuf,
     // Aggregate disk-backed UU byte admission limit.
     pub(super) uu_spool_max_bytes: usize,
     // Aggregate ahead-of-cursor UU entry admission limit.
@@ -1652,8 +1595,9 @@ pub struct Pipeline {
     pub(super) uu_park_requeues: HashMap<SegmentId, (u32, u32)>,
     // Articles that declared no usable start and arrived before the ordinal
     // they follow, held decoded until that ordinal is placed. Their bytes are
-    // charged to the write-buffer ledger while they wait.
-    pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, (DecodeResult, SegmentSource)>>,
+    // charged to the write-buffer ledger while they wait in memory, and to
+    // the spool's once their paused job spills them.
+    pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
     // How often each article that declared no usable start has been sent back
     // for the ordinal before it because the park above had no room for it,
     // paired with how many ordinals of its file were placed when that count
@@ -1714,8 +1658,17 @@ pub struct Pipeline {
     pub(super) graph_hardware: crate::pipeline::graph::hardware::Hardware,
     // Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
-    // Scheduling metadata retained by admitted jobs.
-    pub(super) job_scheduling_memory: HashMap<JobId, ProcessMemoryPermit>,
+    // What every job holding its articles is charged for them, from the
+    // moment they are built until the job leaves the pipeline.
+    pub(super) job_article_memory: HashMap<JobId, ProcessMemoryPermit>,
+    // The number the next read of a job's articles is told by.
+    pub(super) next_activation: u64,
+    // Paused jobs still holding their articles while what was out for them
+    // on a connection or in the decoder comes back.
+    pub(super) parking_jobs: HashSet<JobId>,
+    // Parked jobs whose held parts are still in memory, to spill to their
+    // spool on the next turn.
+    pub(super) spilling_jobs: HashSet<JobId>,
     pub(super) repeated_articles: HashMap<JobId, Arc<download::repeated::RepeatedArticles>>,
     // Shared allowance for scheduling, repair metadata, and extraction decoders.
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,

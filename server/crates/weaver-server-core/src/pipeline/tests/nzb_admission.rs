@@ -4,12 +4,14 @@
 use super::*;
 
 async fn enqueue(pipeline: &mut Pipeline, id: u64) {
+    let spec = segmented_job_spec(&format!("Queued NZB {id}"), "payload.bin", &[512; 8]);
+    let nzb_zstd = nzb_zstd_for(&spec);
     pipeline
         .add_job(
             JobId(id),
-            segmented_job_spec(&format!("Queued NZB {id}"), "payload.bin", &[512; 8]),
+            spec,
             PathBuf::from(format!("queued-{id}.nzb")),
-            sample_nzb_zstd(),
+            nzb_zstd,
             crate::jobs::AddJobOptions::default(),
         )
         .await
@@ -52,7 +54,8 @@ async fn paused_reprocess_initialization_waits_for_resume_admission() {
     assert!(!pipeline.nzb_admitted.contains(&JobId(2)));
     // Reprocessing refetches articles without a placement checkpoint, and
     // none of them may run yet.
-    assert!(!pipeline.jobs[&JobId(2)].download_queue.is_empty());
+    assert!(pipeline.jobs[&JobId(2)].articles.queued_download_len() > 0);
+    assert!(pipeline.jobs[&JobId(2)].articles.active().is_none());
     assert!(
         pipeline
             .graph_jobs
@@ -113,6 +116,14 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
         124
     );
 
+    // The admitted jobs' articles are built as their first handout builds
+    // them.
+    let mut admitted: Vec<JobId> = pipeline.nzb_admitted.iter().copied().collect();
+    admitted.sort_unstable();
+    for job_id in admitted {
+        activate_job(&mut pipeline, job_id).await;
+    }
+
     // Feed real transport failures through the result/retry path. Provider
     // unavailability and missing early articles must not expand admission.
     for (id, error) in [
@@ -130,11 +141,21 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
             .jobs
             .get_mut(&job_id)
             .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
             .download_queue
             .pop()
             .unwrap();
         let segment_id = work.segment_id;
-        pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+        pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue = DownloadQueue::new();
         pipeline.hold_test_lane_works(vec![work], false);
         pipeline
             .handle_download_done(DownloadResult {
@@ -160,7 +181,7 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
     }
     // Empty article queues and stalled downstream processing retain the same owners.
     for state in pipeline.jobs.values_mut() {
-        state.download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
         state.post_state = crate::PostState::WaitingForVolumes;
     }
     for _ in 0..24 {

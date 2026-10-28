@@ -525,7 +525,10 @@ fn retire_schedule_article(pipeline: &mut Pipeline, job: JobId, file: u32, artic
     };
     // The schedule owns delivery, including deliberate duplicates. Retire a
     // queued copy when present so a later drain cannot fabricate a rewrite.
-    for queue in [&mut state.download_queue, &mut state.recovery_queue] {
+    let Some(active) = state.articles.active_mut() else {
+        return;
+    };
+    for queue in [&mut active.download_queue, &mut active.recovery_queue] {
         let queued = queue.drain_all();
         for work in queued {
             if work.segment_id != id {

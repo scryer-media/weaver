@@ -311,6 +311,34 @@ async fn a_run_takes_a_slot_and_the_next_queues_behind_the_limit() {
     assert!(!runs.live());
 }
 
+// A run that panics as it reads.
+struct Panics;
+
+impl Extraction for Panics {
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {
+        panic!("the run panics as it reads");
+    }
+}
+
+// A run that panics still ends: its end is said as its thread unwinds, and
+// gives its slot to the run waiting behind it.
+#[tokio::test]
+async fn a_run_that_panics_still_says_it_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), unbounded());
+    let (first, second) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(first, 1), vec![first]);
+    assert!(runs.ask(second, 1).is_empty());
+    runs.start(first, Box::new(Panics), envelopes.shelf(first));
+
+    let said = mail.recv().await.unwrap();
+    assert_eq!(said.node, first);
+    assert!(matches!(said.heard, Heard::Ended));
+    assert_eq!(runs.ended(first, said.generation, 1), vec![second]);
+}
+
 // A run stopped as the job goes down keeps the generation it ran under, so
 // no run starts on its node under that generation again: what its thread
 // says once stopped, its end included, is not heard as any run's. It gives

@@ -8,13 +8,10 @@ fn handle(pipeline: &Pipeline) -> SchedulerHandle {
 }
 
 async fn add(handle: &SchedulerHandle, id: JobId) {
+    let spec = segmented_job_spec("queue fixture", "payload.bin", &[100]);
+    let nzb_zstd = nzb_zstd_for(&spec);
     handle
-        .add_job(
-            id,
-            segmented_job_spec("queue fixture", "payload.bin", &[100]),
-            PathBuf::from("queue-fixture.nzb"),
-            sample_nzb_zstd(),
-        )
+        .add_job(id, spec, PathBuf::from("queue-fixture.nzb"), nzb_zstd)
         .await
         .unwrap();
 }
@@ -114,7 +111,7 @@ async fn duplicate_admission_and_unknown_mutations_refuse_synchronously() {
             id,
             segmented_job_spec("duplicate", "payload.bin", &[100]),
             PathBuf::from("duplicate.nzb"),
-            sample_nzb_zstd(),
+            nzb_zstd_for(&(segmented_job_spec("duplicate", "payload.bin", &[100]))),
         )
         .await
         .unwrap_err();
@@ -135,7 +132,15 @@ async fn pause_and_semantic_cancel_refuse_post_processing_without_an_actor_turn(
     let id = JobId(9010);
     add(&handle, id).await;
     pipeline.apply_queue_intents().await;
-    pipeline.jobs.get_mut(&id).unwrap().download_queue = DownloadQueue::new();
+    activate_job(&mut pipeline, id).await;
+    pipeline
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     for status in [JobStatus::Extracting, JobStatus::Repairing] {
         pipeline.jobs.get_mut(&id).unwrap().status = status;
         pipeline.report_job(id);
@@ -362,7 +367,7 @@ async fn shutdown_settles_recorded_cancel_and_refuses_new_admission() {
                 JobId(9012),
                 segmented_job_spec("late", "payload.bin", &[100]),
                 PathBuf::from("late.nzb"),
-                sample_nzb_zstd()
+                nzb_zstd_for(&(segmented_job_spec("late", "payload.bin", &[100])))
             )
             .await,
         Err(SchedulerError::ChannelClosed)

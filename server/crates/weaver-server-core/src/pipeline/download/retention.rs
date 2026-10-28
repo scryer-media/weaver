@@ -350,11 +350,15 @@ impl Pipeline {
             Self::unavailable_server_count_from_excludes(&pool, &work.exclude_servers, &retention)
                 >= server_count
         };
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(active) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())
+        else {
             return 0;
         };
-        let mut retired = state.download_queue.extract_matching(unservable);
-        retired.extend(state.recovery_queue.extract_matching(unservable));
+        let mut retired = active.download_queue.extract_matching(unservable);
+        retired.extend(active.recovery_queue.extract_matching(unservable));
         if retired.is_empty() {
             return 0;
         }

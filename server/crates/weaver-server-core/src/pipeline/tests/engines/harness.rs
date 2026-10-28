@@ -913,7 +913,7 @@ pub(in crate::pipeline::tests) async fn run_unprompted(
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             let article = (
                 work.segment_id.file_id.file_index,
@@ -966,7 +966,13 @@ fn handed_out(
         works.reverse();
         return Some((works, Some(lease.checkpoint_plan)));
     }
-    let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&JOB)?
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
     let all = scenario.backwards || !scenario.together.is_empty();
     let mut batch = Vec::new();
     while let Some(work) = queue.pop() {
@@ -1184,8 +1190,8 @@ pub(in crate::pipeline::tests) fn finished(pipeline: &Pipeline) -> bool {
 fn fingerprint(pipeline: &Pipeline, requests: &BTreeMap<(u32, u32), usize>) -> String {
     let queued = pipeline.jobs.get(&JOB).map(|state| {
         (
-            state.download_queue.len(),
-            state.recovery_queue.len(),
+            state.articles.active().unwrap().download_queue.len(),
+            state.articles.active().unwrap().recovery_queue.len(),
             state.status.clone(),
         )
     });
@@ -1406,7 +1412,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
             while let Some(work) = pipeline
                 .jobs
                 .get_mut(&JOB)
-                .and_then(|state| state.download_queue.pop())
+                .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
             {
                 let article = (
                     work.segment_id.file_id.file_index,
@@ -1436,11 +1442,12 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
                 pipeline.graph_run_said(said);
                 continue;
             }
-            if pipeline
-                .jobs
-                .get(&JOB)
-                .is_none_or(|state| state.download_queue.is_empty())
-            {
+            if pipeline.jobs.get(&JOB).is_none_or(|state| {
+                state
+                    .articles
+                    .active()
+                    .is_none_or(|active| active.download_queue.is_empty())
+            }) {
                 return;
             }
         }

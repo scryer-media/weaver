@@ -430,8 +430,8 @@ pub(super) async fn turn(pipeline: &mut Pipeline) {
 pub(super) fn fingerprint(pipeline: &Pipeline) -> String {
     let queued = pipeline.jobs.get(&JOB).map(|state| {
         (
-            state.download_queue.len(),
-            state.recovery_queue.len(),
+            state.articles.active().unwrap().download_queue.len(),
+            state.articles.active().unwrap().recovery_queue.len(),
             state.status.clone(),
         )
     });
@@ -602,7 +602,7 @@ async fn drive_graph_schedule(
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             let article = (
                 work.segment_id.file_id.file_index,

@@ -158,13 +158,6 @@ impl Pipeline {
             intermediate_dir.clone(),
             complete_dir.clone(),
         ));
-        let uu_spool_root = intermediate_dir.join(".uu-park");
-        let cleanup_root = uu_spool_root.clone();
-        if let Err(error) =
-            tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await?
-        {
-            warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
-        }
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -181,6 +174,7 @@ impl Pipeline {
         let (nntp_handoff_drained_tx, nntp_handoff_drained_rx) = mpsc::channel(4);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
+        let (job_activated_tx, job_activated_rx) = mpsc::channel(32);
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
@@ -243,6 +237,7 @@ impl Pipeline {
             metrics,
             jobs: HashMap::new(),
             graph_jobs: HashMap::new(),
+            retiring_graph_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
             graph_runs: Default::default(),
@@ -291,7 +286,6 @@ impl Pipeline {
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
-            uu_spool_root,
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_park_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
@@ -325,6 +319,8 @@ impl Pipeline {
             job_stage_started_at: HashMap::new(),
             nntp_handoff_drained_tx,
             nntp_handoff_drained_rx,
+            job_activated_tx,
+            job_activated_rx,
             move_done_tx,
             move_done_rx,
             failed_release_tx,
@@ -392,7 +388,10 @@ impl Pipeline {
             storage_capacity,
             extraction_limits,
             process_memory_budget,
-            job_scheduling_memory: HashMap::new(),
+            job_article_memory: HashMap::new(),
+            next_activation: 0,
+            parking_jobs: HashSet::new(),
+            spilling_jobs: HashSet::new(),
             repeated_articles: HashMap::new(),
             decode_retries: HashMap::new(),
             phase_progress: HashMap::new(),
@@ -560,7 +559,7 @@ impl Pipeline {
     // one count the live report and the history row both read.
     pub(crate) fn completed_file_count(&self, state: &JobState) -> u32 {
         self.graph_jobs.get(&state.job_id).map_or_else(
-            || state.assembly.complete_file_count(),
+            || state.complete_file_count(),
             super::super::graph::job::GraphJob::whole_file_count,
         ) as u32
     }
@@ -578,7 +577,7 @@ impl Pipeline {
         } else {
             Self::effective_downloaded_bytes(state) as f64 / state.spec.total_bytes as f64
         };
-        state.assembly.progress().max(byte_progress).clamp(0.0, 1.0)
+        state.assembly_progress().max(byte_progress).clamp(0.0, 1.0)
     }
 
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
@@ -653,7 +652,8 @@ impl Pipeline {
                 }
                 continue;
             }
-            let candidate = state.download_queue.is_empty() || unanchored.contains(job_id);
+            let candidate =
+                !state.articles.has_queued_download_work() || unanchored.contains(job_id);
             if !candidate {
                 continue;
             }
@@ -662,8 +662,8 @@ impl Pipeline {
                 state.downloaded_bytes,
                 state.downloaded_wire_bytes,
                 state.failed_bytes,
-                state.download_queue.len(),
-                state.recovery_queue.len(),
+                state.articles.queued_download_len(),
+                state.articles.queued_recovery_len(),
             );
             if self.reconcile_signatures.get(job_id) != Some(&signature) {
                 self.reconcile_signatures.insert(*job_id, signature);
@@ -703,7 +703,7 @@ impl Pipeline {
                     *job_id,
                     in_flight,
                     elapsed,
-                    state.download_queue.len(),
+                    state.articles.queued_download_len(),
                 ))
             })
             .collect();
@@ -893,6 +893,8 @@ impl Pipeline {
             }
 
             self.consume_due_checkpoint_rechecks();
+            self.park_drained_jobs();
+            self.spill_parked_parts().await;
             // A pass over the eligible jobs follows only something that could
             // change its answer: activity, a wake, live transfers, or a gate
             // that lifts with time. An idle turn would find what the last one
@@ -993,6 +995,10 @@ impl Pipeline {
                     Some(generation) = self.nntp_handoff_drained_rx.recv() => {
                         turn_timer.resume();
                         self.handle_nntp_handoff_drained(generation);
+                    }
+                    Some(done) = self.job_activated_rx.recv() => {
+                        turn_timer.resume();
+                        self.handle_job_activated(done);
                     }
                     Some(done) = self.move_done_rx.recv() => {
                         turn_timer.resume();
@@ -1395,11 +1401,15 @@ impl Pipeline {
         let mut work = work;
         self.graph_requeued(&mut work);
         let parks = self.requeue_parks(&work);
-        if let Some(state) = self.jobs.get_mut(&job_id) {
+        if let Some(active) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())
+        {
             if parks {
-                state.recovery_queue.push(work);
+                active.recovery_queue.push(work);
             } else {
-                state.download_queue.push(work);
+                active.download_queue.push(work);
             }
         }
     }

@@ -58,6 +58,9 @@ async fn a_small_post_is_not_judged_on_its_first_articles() {
         .jobs
         .get(&job_id)
         .unwrap()
+        .articles
+        .active()
+        .unwrap()
         .download_queue
         .first_articles()
         .collect();

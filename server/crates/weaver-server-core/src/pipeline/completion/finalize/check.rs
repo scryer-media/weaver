@@ -148,7 +148,7 @@ impl Pipeline {
         let has_queued_work = self
             .jobs
             .get(&job_id)
-            .is_some_and(|state| !state.download_queue.is_empty());
+            .is_some_and(|state| state.articles.has_queued_download_work());
         let has_inflight_downloads = self
             .active_downloads_by_job
             .get(&job_id)

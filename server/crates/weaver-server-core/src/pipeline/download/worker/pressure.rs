@@ -79,6 +79,18 @@ impl CheckpointLease {
 }
 
 impl CheckpointAdmission {
+    // Whether the checkpoint refuses every payload article of the job, of
+    // any size, until its durable floor moves: an article sent to close the
+    // gap is still out, or the lead is already past the limit while the
+    // pipeline holds work that will advance the floor. Answered for the
+    // whole job at once, so a held job's queue need not be read to learn it.
+    pub(in crate::pipeline) fn holds_every_payload_article(self) -> bool {
+        self.enforced
+            && self.limit != 0
+            && (self.progress_article_in_flight
+                || (self.can_advance && self.undurable_bytes > self.limit))
+    }
+
     pub(in crate::pipeline) fn decision(
         self,
         work: &DownloadWork,
@@ -99,7 +111,7 @@ impl CheckpointAdmission {
         if work.is_recovery {
             return CheckpointDecision::RecoveryExempt;
         }
-        if self.progress_article_in_flight {
+        if self.holds_every_payload_article() {
             return CheckpointDecision::WaitingForPipeline;
         }
         let projected = self
@@ -185,17 +197,25 @@ impl Pipeline {
     // one the bytes are refused and the part is requeued, which keeps the
     // spool from writing blind into a filesystem it cannot measure.
     pub(in crate::pipeline) fn admit_uu_spill(&mut self, spilled_bytes: usize) -> bool {
-        let available = self.uu_spool_capacity().best_available_bytes();
-        let admitted =
-            available.is_some() && !self.uu_spool_limits_reached(spilled_bytes, available);
-        if admitted {
-            self.uu_spool_debits.debit(spilled_bytes as u64);
-        } else {
+        let admitted = self.admit_spool_bytes(spilled_bytes);
+        if !admitted {
             self.uu_spool_blocked_spill_bytes = Some(
                 self.uu_spool_blocked_spill_bytes
                     .unwrap_or(0)
                     .max(spilled_bytes),
             );
+        }
+        admitted
+    }
+
+    // Admit `spilled_bytes` of spool against its limits and the measured free
+    // space, debiting the reading when they fit. A refusal changes nothing.
+    pub(in crate::pipeline) fn admit_spool_bytes(&mut self, spilled_bytes: usize) -> bool {
+        let available = self.uu_spool_capacity().best_available_bytes();
+        let admitted =
+            available.is_some() && !self.uu_spool_limits_reached(spilled_bytes, available);
+        if admitted {
+            self.uu_spool_debits.debit(spilled_bytes as u64);
         }
         admitted
     }

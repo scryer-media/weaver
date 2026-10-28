@@ -15,7 +15,6 @@ pub(crate) struct AdmissionResources {
     pub db: crate::Database,
     pub intermediate_dir: PathBuf,
     pub complete_dir: PathBuf,
-    pub memory: Arc<crate::pipeline::ProcessMemoryBudget>,
 }
 
 pub(crate) struct PreparedAdd {
@@ -24,8 +23,6 @@ pub(crate) struct PreparedAdd {
     pub working_dir: PathBuf,
     pub nzb_hash: [u8; 32],
     pub nzb_password_candidates: Option<Vec<crate::jobs::ArchivePasswordCandidate>>,
-    pub scheduling_memory: crate::pipeline::ProcessMemoryPermit,
-    pub repeated_articles: Option<Arc<crate::pipeline::download::repeated::RepeatedArticles>>,
     pub restart: Option<RestartAdmission>,
 }
 

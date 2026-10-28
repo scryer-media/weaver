@@ -831,7 +831,12 @@ fn led_store_set_with_records(
 // gate conclude the download is exhausted and fail the job.
 fn peek_queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32)> {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let work = state.download_queue.drain_all();
+    let work = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     let mut out: Vec<(u32, u32)> = work
         .iter()
         .map(|item| {
@@ -842,7 +847,12 @@ fn peek_queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32
         })
         .collect();
     for item in work {
-        state.download_queue.push(item);
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .push(item);
     }
     out.sort_unstable();
     out

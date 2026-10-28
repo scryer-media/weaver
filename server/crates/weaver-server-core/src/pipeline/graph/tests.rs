@@ -156,6 +156,9 @@ fn member_file(pipeline: &Pipeline, job_id: JobId, member: u32) -> Option<PathBu
 // The assembly never saw a byte of the file.
 fn assembly_wrote_nothing(pipeline: &Pipeline, job_id: JobId, index: u32) {
     let file = pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(NzbFileId {
             job_id,
@@ -285,12 +288,18 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         let id = segment_id(job_id, 2, ordinal);
         assert_eq!(
             state
+                .articles
+                .active()
+                .unwrap()
                 .recovery_queue
                 .count_matching(|work| work.segment_id == id),
             0
         );
         assert_eq!(
             state
+                .articles
+                .active()
+                .unwrap()
                 .download_queue
                 .count_matching(|work| work.segment_id == id
                     && work.is_recovery
@@ -455,25 +464,32 @@ async fn a_turn_hears_all_the_run_mail_waiting() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A paused graph job with nothing out lets its articles and its graph go at
+// once. Resumed while it holds its NZB slot, it is built again from its
+// checkpoint and installed. Its graph starts no run while the slot is taken
+// away, and once the slot is back the articles are written.
 #[tokio::test]
-async fn paused_graph_work_stays_queued_until_resume_has_nzb_admission() {
+async fn paused_graph_work_is_rebuilt_on_resume_and_runs_only_with_nzb_admission() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_100);
     let body = payload(2 * ARTICLE + 9, 8);
     let posts = vec![echo_volume(0, &body)];
     let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
-    echo_engines(&mut pipeline, job_id, 1);
     pipeline.pause_job_runtime(job_id).unwrap();
-    // An already-issued decode may finish after pause, but cannot start
-    // an extraction worker while the job drains its admission.
+    assert!(pipeline.jobs[&job_id].articles.active().is_none());
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+
+    assert!(pipeline.nzb_admitted.contains(&job_id));
+    pipeline.resume_job_runtime(job_id).unwrap();
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    echo_engines(&mut pipeline, job_id, 1);
+    pipeline.nzb_admitted.remove(&job_id);
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     assert!(!pipeline.graph_jobs[&job_id].awaits_mail());
     assert!(!working_dir.join("echo-0.bin").exists());
-    pipeline.nzb_admitted.remove(&job_id);
-    pipeline.resume_graph_work(job_id);
-    assert!(!pipeline.graph_jobs[&job_id].awaits_mail());
     pipeline.nzb_admitted.insert(job_id);
-    pipeline.resume_job_runtime(job_id).unwrap();
+    pipeline.resume_graph_work(job_id);
     assert!(pipeline.graph_jobs[&job_id].awaits_mail());
     drain_runs(&mut pipeline, job_id).await;
     assert_eq!(read(&working_dir.join("echo-0.bin")), body);
@@ -490,9 +506,10 @@ async fn terminal_graph_runtime_is_retained_until_its_worker_stops() {
     decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
     assert!(pipeline.graph_jobs[&job_id].awaits_mail());
     pipeline.purge_terminal_job_runtime(job_id);
-    assert!(pipeline.graph_jobs[&job_id].awaits_mail());
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
     assert!(pipeline.nzb_admitted.contains(&job_id));
-    while pipeline.graph_jobs.contains_key(&job_id) {
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
     }
@@ -573,8 +590,8 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     // The queues owe nothing more, so the completion gate hands the job to
     // its delivery.
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     state.status = JobStatus::Downloading;
     state.refresh_runtime_lanes_from_status();
     pipeline.check_job_completion(job_id).await;
@@ -759,12 +776,18 @@ fn assert_parked(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
     let state = &pipeline.jobs[&job_id];
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .recovery_queue
             .count_matching(|work| work.segment_id == id),
         1
     );
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == id),
         0
@@ -781,12 +804,18 @@ fn assert_raised(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
     let state = &pipeline.jobs[&job_id];
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .recovery_queue
             .count_matching(|work| work.segment_id == id),
         0
     );
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == id
                 && work.is_recovery
@@ -824,7 +853,10 @@ async fn a_recovery_volume_whose_head_arrived_before_damage_is_parked_not_fetche
     let posts = three_volumes(30);
     let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     let state = &pipeline.jobs[&job_id];
-    assert!(state.recovery_queue.is_empty(), "nothing parked by name");
+    assert!(
+        state.articles.active().unwrap().recovery_queue.is_empty(),
+        "nothing parked by name"
+    );
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode_head(&mut pipeline, job_id, &posts, 2).await;
     let rest = after_head(&posts, 2);
