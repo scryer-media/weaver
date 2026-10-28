@@ -152,11 +152,19 @@ test("L06 a dead leg goes Down, probes with one connection, and returns Up once 
     await controlRoute(request, { route: "connect1", up: false, cut: true });
     const stateB = (sample: NetworkFlow) => legOn(sample, serverKey(server), b.id);
     const firstDown = await subscription.next(start, sample => stateB(sample)?.state === "DOWN", "leg B Down");
-    const probing = await subscription.next(firstDown.sampledAt, sample => stateB(sample)?.state === "PROBING", "leg B probing after its cooldown");
+    // Keep each probe in flight until its state has been observed. The flow
+    // subscription may coalesce a fast PROBING -> UP/DOWN transition.
+    await controlRoute(request, { route: "connect1", holdConnect: true });
+    const heldAfter = await flowMark(request);
+    const probing = await subscription.next(Math.max(firstDown.sampledAt, heldAfter), sample => stateB(sample)?.state === "PROBING" && stateB(sample)?.opening === 1, "leg B probing after its cooldown");
     expect(stateB(probing)?.target).toBe(1);
+    await controlRoute(request, { route: "connect1", holdConnect: false });
     const downAgain = await subscription.next(probing.sampledAt, sample => stateB(sample)?.state === "DOWN", "failed probe puts leg B Down again");
-    await controlRoute(request, { route: "connect1", up: true });
-    const probingAgain = await subscription.next(downAgain.sampledAt, sample => stateB(sample)?.state === "PROBING", "leg B probing again");
+    await controlRoute(request, { route: "connect1", up: true, holdConnect: true });
+    const recoveryHeldAfter = await flowMark(request);
+    const probingAgain = await subscription.next(Math.max(downAgain.sampledAt, recoveryHeldAfter), sample => stateB(sample)?.state === "PROBING" && stateB(sample)?.opening === 1, "leg B probing again");
+    expect(stateB(probingAgain)?.target).toBe(1);
+    await controlRoute(request, { route: "connect1", holdConnect: false });
     await subscription.next(probingAgain.sampledAt, sample => stateB(sample)?.state === "UP" && carrying(sample, server, [[a.id, 2], [b.id, 2]]), "leg B Up at 2/2");
     await saveEvidence(info, "L06-states", subscription.since(start).map(sample => ({ at: sample.sampledAt, b: stateB(sample)?.state, targets: legsOf(sample, serverKey(server)).map(leg => leg.target) })));
   } finally {

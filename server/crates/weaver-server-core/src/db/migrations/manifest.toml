@@ -948,3 +948,13 @@ kind = "sql"
 file = "migrations/0077_graph_file_on_disk/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 78
+description = "persist server feed verdicts with graph refusals"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_feed_verdict/schema.sql"
+scope = "all"

@@ -31,6 +31,19 @@ func TestFileCoverageCoversOnlyWhatItsRunsHold(t *testing.T) {
 	}
 }
 
+func TestHealthyCoverageDoesNotCoverRecordedDamage(t *testing.T) {
+	coverage := fileCoverage{Runs: []fileCoverageRun{
+		{0, 10, "fresh"}, {10, 20, "damaged"}, {20, 30, "repaired"},
+	}}
+	healthy := coverage.Healthy()
+	if !coverage.Covers(0, 30) || healthy.Covers(0, 30) || healthy.Covers(10, 20) {
+		t.Fatal("recorded damage must occupy a range without satisfying healthy coverage")
+	}
+	if healthy.CoveredBytes() != 20 || !healthy.Covers(20, 30) {
+		t.Fatalf("healthy coverage lost repaired input: %+v", healthy)
+	}
+}
+
 func TestReadFileCoverageRowsReadsTheArticleRoot(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "weaver.db")
 	db := openTestWeaverStateDB(t, dbPath)

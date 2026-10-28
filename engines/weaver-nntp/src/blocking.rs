@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -216,6 +217,7 @@ pub struct BlockingNntpConnection {
     poisoned: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    body_activity: Option<Arc<AtomicU64>>,
     // The egress's accounting for each outstanding BODY, in step with
     // `body_accounting`. Empty when the connection has no egress control.
     egress_accounting: VecDeque<BodyTransferAccounting>,
@@ -235,6 +237,12 @@ pub struct BlockingNntpConnection {
 }
 
 impl BlockingBodyLane {
+    // The caller owns attribution and generation. Replace before each
+    // response so a reused connection never credits the previous lease.
+    pub fn set_body_activity(&mut self, activity: Arc<AtomicU64>) {
+        self.conn.body_activity = Some(activity);
+    }
+
     // Apply the batch's immutable geometry before every decoded response, so
     // a lane reused by another job cannot carry previous checkpoint state.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
@@ -1238,6 +1246,7 @@ impl BlockingNntpConnection {
             poisoned: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            body_activity: None,
             egress_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
@@ -1611,6 +1620,9 @@ impl BlockingNntpConnection {
     }
 
     fn charge_active_body(&mut self, bytes: usize) -> Duration {
+        if let Some(activity) = &self.body_activity {
+            activity.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         // Both levels are charged before either is waited on, so the read
         // waits for the later deadline: the lower of the two rates.
         let egress_charge = match (self.egress_accounting.front_mut(), &self.egress_control) {

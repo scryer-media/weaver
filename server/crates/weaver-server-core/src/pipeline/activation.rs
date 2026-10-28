@@ -132,7 +132,15 @@ impl Pipeline {
                     }
                 }
                 let (graph, skip, held) = match read.restored {
-                    Some(GraphRestore { job, skip, held }) => (Some(job), skip, held),
+                    Some(GraphRestore {
+                        job,
+                        skip,
+                        held,
+                        feed_verdict,
+                    }) => {
+                        self.post_probes.restore_verdict(job_id, feed_verdict);
+                        (Some(job), skip, held)
+                    }
                     None => (None, HashSet::new(), Vec::new()),
                 };
                 self.activate_job_articles(job_id, &skip, graph, read.repeated, held);
@@ -179,6 +187,7 @@ impl Pipeline {
             Some(graph) => self.install_graph_job(job_id, graph, held_parts),
             None => self.admit_graph_job(job_id),
         }
+        self.abandon_dead_files(job_id);
     }
 
     // The one place a job's articles end, as a paused job parks or a job
@@ -350,11 +359,19 @@ impl Pipeline {
     // Stop the job's graph runtime. One with nothing out on a thread goes at
     // once; one with a run or a repair out is kept, apart from the graphs
     // that serve jobs, until the last of its mail is heard.
-    fn retire_graph_job(&mut self, job_id: JobId) {
+    pub(in crate::pipeline) fn retire_graph_job(&mut self, job_id: JobId) {
         self.forget_graph_repair(job_id);
-        let Some(graph) = self.graph_jobs.remove(&job_id) else {
+        let Some(mut graph) = self.graph_jobs.remove(&job_id) else {
             return;
         };
+        let pending = graph.pending().clone();
+        if !pending.control().cancelled()
+            && pending
+                .await_commit(pending.stamp(), job_id.0, &self.graph_runs.written())
+                .is_none()
+        {
+            graph.owe_mail(pending.stamp());
+        }
         graph.request_stop();
         if graph.awaits_mail() {
             self.retiring_graph_jobs.insert(job_id, graph);

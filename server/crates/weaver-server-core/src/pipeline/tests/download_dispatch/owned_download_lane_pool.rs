@@ -86,6 +86,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         avoid_server: None,
     };
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
@@ -136,6 +137,7 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
         avoid_server: None,
     };
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id: work.segment_id.file_id.job_id,
         runtime_generation: pipeline.pool_generation,
@@ -2677,6 +2679,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
     pipeline.download_lane_owners.insert(
         lane_id,
         DownloadLaneOwner {
+            body_activity: Vec::new(),
             job_id,
             mode: DownloadLaneMode::Sequential,
             completion_critical: false,

@@ -9,7 +9,6 @@ use super::*;
 
 pub(in crate::pipeline::tests) mod archive_schedules;
 
-#[cfg(unix)]
 pub(in crate::pipeline::tests) mod sevenz_store;
 
 // A RAR5 `FHEXTRA_CRYPT` record: `vint(size) || vint(type=1) || body`.

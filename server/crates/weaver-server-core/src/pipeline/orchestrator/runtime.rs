@@ -400,6 +400,7 @@ impl Pipeline {
             body_fetch_failure_log_throttle: Default::default(),
             inflight_moves: HashSet::new(),
             releasing_failed_jobs: HashSet::new(),
+            pending_graph_failures: HashMap::new(),
             deferred_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             shared_state,
@@ -680,6 +681,21 @@ impl Pipeline {
     }
 
     pub(crate) fn auto_pause_stalled_downloads(&mut self) {
+        let mut active = HashSet::new();
+        for owner in self.download_lane_owners.values_mut() {
+            owner.body_activity.retain(|(job, generation, bytes)| {
+                let Some(bytes) = bytes.upgrade() else {
+                    return false;
+                };
+                if *generation == self.pool_generation && bytes.swap(0, Ordering::Relaxed) != 0 {
+                    active.insert(*job);
+                }
+                true
+            });
+        }
+        for job in active {
+            self.note_download_activity(job);
+        }
         let stalled_jobs: Vec<_> = self
             .jobs
             .iter()
@@ -1386,6 +1402,23 @@ impl Pipeline {
             );
             return;
         }
+        // A lane or delayed retry may return work after the feed's verdict.
+        // It must not put an abandoned file back into dispatch.
+        if self
+            .post_probes
+            .verdicts
+            .get(&job_id)
+            .is_some_and(|verdict| {
+                verdict
+                    .abandoned_files
+                    .contains(&segment_id.file_id.file_index)
+            })
+        {
+            self.book_terminal_segment(segment_id, SegmentTerminalState::Abandoned);
+            self.update_queue_metrics();
+            self.maybe_finish_download_pass(job_id);
+            return;
+        }
         // Work every server is excluded from can never be seated by a lane:
         // the queue would hold it, and the job with it, indefinitely. Every
         // producer of a re-queue passes through here, so this is where the
@@ -1414,6 +1447,7 @@ impl Pipeline {
     }
 
     pub(crate) async fn drain(&mut self) {
+        self.db.stop_checkpoint_retries();
         // A failed job whose working directory is still being released
         // records its history before the pipeline is down.
         while !self.releasing_failed_jobs.is_empty() {
@@ -1429,6 +1463,13 @@ impl Pipeline {
         // the run mail; heard here, so nothing of a job is out when the
         // pipeline is down and the checkpoint holds what it came to.
         self.drain_graph_runs().await;
+        // A graph failure may start its release when the last worker ends.
+        while !self.releasing_failed_jobs.is_empty() {
+            let Some(released) = self.failed_release_rx.recv().await else {
+                break;
+            };
+            self.handle_failed_job_released(released);
+        }
         self.checkpoint_graph_holds();
 
         if self.active_downloads > 0
@@ -1570,7 +1611,12 @@ impl Pipeline {
             for job in self.graph_jobs.values_mut() {
                 job.stop_runs(limit);
             }
-            if !self.graph_jobs.values().any(|job| job.awaits_mail()) {
+            if !self
+                .graph_jobs
+                .values()
+                .chain(self.retiring_graph_jobs.values())
+                .any(|job| job.awaits_mail())
+            {
                 return;
             }
             match self.graph_runs.recv().await {

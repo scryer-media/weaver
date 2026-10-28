@@ -293,10 +293,31 @@ impl Pipeline {
     // job's next graph may be built from then on.
     pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
+        if let Heard::CheckpointBlocked {
+            control,
+            revision,
+            error,
+        } = &said.heard
+        {
+            self.pause_graph_checkpoint(job_id, control, *revision, error);
+            return;
+        }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
-            let _ = graph.run_said(said, &mut self.graph_status.repairs, 0);
+            if self.pending_graph_failures.contains_key(&job_id) {
+                if let Err(error) = graph.drain_failed_run(said) {
+                    warn!(job_id = job_id.0, %error, "failed to discard a stopped graph worker's output");
+                }
+            } else {
+                let _ = graph.run_said(said, &mut self.graph_status.repairs, 0);
+            }
             if !graph.awaits_mail() {
-                self.retiring_graph_jobs.remove(&job_id);
+                let graph = self.retiring_graph_jobs.remove(&job_id);
+                if let Some(failure) = self.pending_graph_failures.remove(&job_id) {
+                    if let Some(graph) = graph {
+                        self.graph_jobs.insert(job_id, graph);
+                    }
+                    self.continue_job_failure(job_id, failure);
+                }
                 self.download_dispatch_wake = true;
             }
             return;
@@ -375,6 +396,9 @@ impl Pipeline {
         job_id: JobId,
         result: Result<(), GraphError>,
     ) {
+        if self.job_failure_started(job_id) {
+            return;
+        }
         // What the step landed is said whatever the step came to: a file
         // whose download ended is said once, as it ended, before the job
         // fails on what the step did after.

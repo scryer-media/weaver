@@ -744,6 +744,7 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) failure: Option<String>,
     pub(in crate::pipeline::tests) failure_kind: Option<HistoryFailureKind>,
     pub(in crate::pipeline::tests) files: BTreeMap<String, Vec<u8>>,
+    pub(in crate::pipeline::tests) retained_files: BTreeMap<String, Vec<u8>>,
     // Every directory delivered with nothing in it, by its path and a
     // trailing slash.
     pub(in crate::pipeline::tests) empty: BTreeSet<String>,
@@ -957,6 +958,12 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         .and_then(|state| state.failure_kind);
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
+    let mut retained_files = BTreeMap::new();
+    collect(
+        &pipeline.intermediate_dir,
+        &pipeline.intermediate_dir,
+        &mut retained_files,
+    );
     let mut empty = BTreeSet::new();
     collect_empty(&complete_dir, &complete_dir, &mut empty);
     let claims = scenario
@@ -981,6 +988,7 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         failure,
         failure_kind,
         files,
+        retained_files,
         empty,
         claims,
         requests,

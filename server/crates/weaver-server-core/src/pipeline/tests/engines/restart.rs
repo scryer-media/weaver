@@ -347,7 +347,16 @@ async fn restart_heard(
         !pipeline.blocked_restores.contains_key(&JOB),
         "a checkpointed graph job restores"
     );
-    assert!(pipeline.graph_jobs.contains_key(&JOB));
+    assert!(
+        pipeline.graph_jobs.contains_key(&JOB)
+            || (pipeline.pending_graph_failures.contains_key(&JOB)
+                && pipeline.retiring_graph_jobs.contains_key(&JOB))
+            || matches!(
+                job_status_for_assert(&pipeline, JOB),
+                Some(JobStatus::Failed { .. })
+            ),
+        "the restored graph is active or has failed; each scenario checks its expected outcome"
+    );
     (pipeline, heard)
 }
 
@@ -1701,6 +1710,123 @@ async fn a_paused_job_drops_its_articles_and_resumes_from_its_checkpoint() {
         scenario.spec().scheduling_memory_estimate()
     );
     retire_pipeline_database(pipeline).await;
+}
+
+async fn held_part_survives_pause_restart_resume(scenario: Scenario) {
+    let scenario = scenario.uuencoded().first(&[(0, 1)]);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?}", whole.failure);
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_buffers(&temp, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let work = next_work(&mut pipeline, &scenario).unwrap();
+    assert_eq!(work.segment_id.segment_number, 1);
+    serve_work(&mut pipeline, &scenario, &work).await;
+    pipeline.pause_job_runtime(JOB).unwrap();
+    pipeline.spill_parked_parts().await;
+    assert!(!pipeline.parking_jobs.contains(&JOB));
+    assert!(!pipeline.spilling_jobs.contains(&JOB));
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the checkpoint owner acknowledges retirement");
+        pipeline.graph_run_said(said);
+    }
+    pipeline.db.flush_write_queue().await.unwrap();
+    let rows = pipeline.db.load_graph_checkpoint(JOB).unwrap().unwrap();
+    assert_eq!(rows.held_parts.len(), 1);
+    let held = &rows.held_parts[0];
+    assert_eq!((held.file, held.ordinal), (0, 1));
+    assert_eq!(
+        std::fs::read(working_dir.join(&held.spool_path)).unwrap(),
+        scenario.posts[0].bytes[ARTICLE..2 * ARTICLE]
+    );
+    retire_pipeline_database(pipeline).await;
+
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    pipeline
+        .restore_job(request_for(&scenario, working_dir, JobStatus::Paused))
+        .await
+        .unwrap();
+    assert!(!pipeline.graph_jobs.contains_key(&JOB));
+    pipeline.resume_job_runtime(JOB).unwrap();
+    crate::pipeline::tests::activate_job(&mut pipeline, JOB).await;
+    while !finished(&pipeline) {
+        if let Some(next) = next_work(&mut pipeline, &scenario) {
+            assert_ne!(
+                next.segment_id, work.segment_id,
+                "a committed held part was fetched again"
+            );
+            serve_work(&mut pipeline, &scenario, &next).await;
+            continue;
+        }
+        pipeline.check_job_completion(JOB).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|graph| graph.awaits_mail())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        assert!(
+            take_retry(&mut pipeline).await,
+            "resumed held-part job stalled"
+        );
+    }
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    assert_eq!(files, whole.files);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn a_plain_held_part_survives_pause_restart_resume() {
+    held_part_survives_pause_restart_resume(Scenario::new(vec![Post::plain(
+        "beacon.bin",
+        payload(12 * ARTICLE, 83),
+    )]))
+    .await;
+}
+
+#[tokio::test]
+async fn a_rar_held_part_survives_pause_restart_resume() {
+    held_part_survives_pause_restart_resume(Scenario::new(volumes(single_member_store_set(
+        "beacon.bin",
+        &payload(12 * ARTICLE, 84),
+        1,
+    ))))
+    .await;
+}
+
+#[tokio::test]
+async fn a_numbered_stream_held_part_survives_pause_restart_resume() {
+    let compressed = xz(&payload(12 * ARTICLE, 85));
+    let chunk = compressed.len().div_ceil(3);
+    held_part_survives_pause_restart_resume(Scenario::new(
+        compressed
+            .chunks(chunk)
+            .zip(1..)
+            .map(|(bytes, number)| {
+                Post::plain(&format!("beacon.bin.xz.{number:03}"), bytes.to_vec())
+            })
+            .collect(),
+    ))
+    .await;
 }
 
 // A paused job counts as still to fetch only the articles its checkpoint

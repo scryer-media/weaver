@@ -4,6 +4,7 @@
 package weaver
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -90,6 +91,42 @@ func TestSchemaRewindPlanTouchesOnlyWhatIsThere(t *testing.T) {
 	}
 	if got := rewind.plan(shape); !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
+	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	if err := execAll(dbPath, []string{
+		`CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL)`,
+		`INSERT INTO _sqlx_migrations VALUES (73, 1), (74, 1), (75, 1), (76, 1), (77, 1), (78, 1)`,
+		`CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY)`,
+		`CREATE TABLE job_history (job_id INTEGER PRIMARY KEY)`,
+		`CREATE TABLE graph_members (job_id INTEGER, member_id INTEGER)`,
+		`CREATE TABLE graph_envelopes (job_id INTEGER, node_id INTEGER)`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var migrations []string
+	for _, path := range []string{"0075_graph_member_crc32/sqlite.sql", "0076_graph_held_parts/sqlite.sql", "0077_graph_file_on_disk/sqlite.sql", "0078_feed_verdict/schema.sql"} {
+		data, err := os.ReadFile(filepath.Join("..", "..", "..", "server", "crates", "weaver-server-core", "src", "db", "migrations", path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		migrations = append(migrations, string(data))
+	}
+	if err := execAll(dbPath, migrations); err != nil {
+		t.Fatal(err)
+	}
+	if err := applySchemaRewind(dbPath, rewindToPreGraphEngine, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := execAll(dbPath, migrations); err != nil {
+		t.Fatalf("the historical schema must accept the original migrations again: %v", err)
+	}
+	versions, err := migrationVersions(dbPath)
+	if err != nil || !reflect.DeepEqual(versions, map[int]bool{73: true}) {
+		t.Fatalf("historical ledger = %v, error = %v", versions, err)
 	}
 }
 

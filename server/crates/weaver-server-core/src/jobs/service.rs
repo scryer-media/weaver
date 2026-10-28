@@ -1028,7 +1028,11 @@ impl Pipeline {
         // admitted afresh from its spec and fetches from the start.
         let (graph_restore, skip, held_parts) =
             match self.restore_graph_job(job_id, &spec, &working_dir).await {
-                Ok(restored) => (Some(restored.job), restored.skip, restored.held),
+                Ok(restored) => {
+                    self.post_probes
+                        .restore_verdict(job_id, restored.feed_verdict);
+                    (Some(restored.job), restored.skip, restored.held)
+                }
                 Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => {
                     (None, HashSet::new(), Vec::new())
                 }

@@ -292,6 +292,72 @@ async fn retry_waits_for_cancelled_directory_cleanup_before_readmission() {
 }
 
 #[tokio::test]
+async fn an_explicit_redownload_clears_the_committed_feed_verdict() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = handle(&pipeline);
+    let id = JobId(9012);
+    add(&handle, id).await;
+    pipeline.apply_queue_intents().await;
+    activate_job(&mut pipeline, id).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut verdict = crate::jobs::feed_verdict::FeedVerdict::new("fixture feed refusal".into());
+    verdict.abandoned_files.insert(0);
+    pipeline
+        .db
+        .save_graph_checkpoint(
+            id,
+            Arc::new(crate::jobs::graph_checkpoint::Delta {
+                feed_verdict: Some(verdict.clone()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    pipeline
+        .post_probes
+        .restore_verdict(id, Some(verdict.clone()));
+    assert_eq!(
+        pipeline
+            .db
+            .load_graph_checkpoint(id)
+            .unwrap()
+            .unwrap()
+            .feed_verdict,
+        Some(verdict)
+    );
+
+    pipeline.fail_job(id, "fixture feed refusal".into());
+    settle_failed_releases(&mut pipeline).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(pipeline.db.get_job_history(id.0).unwrap().is_some());
+    handle.redownload_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    activate_job(&mut pipeline, id).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(!pipeline.post_probes.verdicts.contains_key(&id));
+    assert!(!pipeline.post_probes.dead.contains_key(&id));
+    assert!(
+        pipeline
+            .db
+            .load_graph_checkpoint(id)
+            .unwrap()
+            .unwrap()
+            .feed_verdict
+            .is_none()
+    );
+    assert_eq!(
+        pipeline.jobs[&id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
 async fn metadata_intents_preserve_later_script_parameters_and_merge_per_key() {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;

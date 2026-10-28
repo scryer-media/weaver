@@ -275,11 +275,11 @@ func restartCases() []restartCase {
 			Run:         runConventional7zDamagedBlockRepairsOnce,
 		},
 		{
-			Name:        "early_gap_restart_refetches_only_the_gap",
-			Description: "A restart after an early missing article keeps every covered ordinal past it and fetches only what the checkpoint did not cover",
+			Name:        "early_gap_restart_preserves_bytes_and_refusal",
+			Description: "A restart keeps healthy durable bytes past an early missing article and preserves its definitive refusal",
 			Slugs:       []string{"single-mkv"},
 			Timeout:     15 * time.Minute,
-			Run:         runEarlyGapRestartRefetchesOnlyTheGap,
+			Run:         runEarlyGapRestartPreservesBytesAndRefusal,
 		},
 		{
 			Name:        "interrupt_during_verifying_refetches_nothing",
@@ -1022,6 +1022,10 @@ func fetchNntpConnectionMetricsFrom(host, port string) (weaverReleaseNntpConnect
 	if err != nil {
 		return weaverReleaseNntpConnections{}, err
 	}
+	return decodeNntpConnectionMetrics(resp)
+}
+
+func decodeNntpConnectionMetrics(resp string) (weaverReleaseNntpConnections, error) {
 	if !strings.HasPrefix(resp, "290 ") {
 		return weaverReleaseNntpConnections{}, fmt.Errorf("unexpected connection metrics response: %s", resp)
 	}
@@ -1037,7 +1041,8 @@ func fetchNntpConnectionMetricsFrom(host, port string) (weaverReleaseNntpConnect
 const nntpConnectionDrainBudget = 60 * time.Second
 
 // waitForFreeNntpConnectionMetrics reads the provider's connection counters
-// once it has a slot to spare for the read itself.
+// once every previous NNTP session has drained. Control sessions consume
+// admission capacity but are excluded from the active and peak metrics.
 //
 // A capped round ends with every slot held by Weaver's lanes, and stopping
 // Weaver does not hand them back at once: the provider goes on seeing those
@@ -1049,16 +1054,18 @@ func waitForFreeNntpConnectionMetrics(host, port string) (weaverReleaseNntpConne
 	deadline := time.Now().Add(nntpConnectionDrainBudget)
 	for {
 		metrics, err := fetchNntpConnectionMetricsFrom(host, port)
-		if err == nil {
+		if err == nil && metrics.Active == 0 {
 			return metrics, nil
 		}
 		// Only a saturated cap is worth waiting out. Anything else is the
 		// provider itself being wrong, and sitting on it for a minute would
 		// only delay the report.
-		if !errors.Is(err, errNntpConnectionsSaturated) || !time.Now().Before(deadline) {
+		if err != nil && !errors.Is(err, errNntpConnectionsSaturated) {
 			return weaverReleaseNntpConnections{}, err
 		}
-		time.Sleep(500 * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			return metrics, fmt.Errorf("provider sessions did not drain: active=%d: %v", metrics.Active, err)
+		}
 	}
 }
 
@@ -2774,6 +2781,18 @@ var rar5MultiMemberMembers = []string{
 	"tmp/episodes/Test.Show.S01E03.1080p.mkv",
 }
 
+func assertRar5MultiMemberBytes(dbPath string, jobID int) error {
+	_, digest, err := singleMKVSource()
+	if err != nil {
+		return err
+	}
+	expected := map[string]string{}
+	for _, member := range rar5MultiMemberMembers {
+		expected[member] = digest
+	}
+	return assertOutputBLAKE3(dbPath, jobID, expected)
+}
+
 // missingMembers lists the members the snapshot's complete tree lacks.
 func missingMembers(snapshot restartFilesystemSnapshot, members []string) []string {
 	var missing []string
@@ -2786,21 +2805,23 @@ func missingMembers(snapshot restartFilesystemSnapshot, members []string) []stri
 }
 
 // archiveCheckpointAtCrash reads, once the process is gone, which of the
-// slug's articles its checkpoint held whole: the articles a restart may never
-// fetch again.
+// slug's articles have both healthy coverage and a recorded direct backing
+// file. Coverage alone, or an unrecorded envelope on disk, is not durability.
 func archiveCheckpointAtCrash(ctx *restartCaseContext, jobID int, segments []nzbSegmentRef, ranges map[string]decodedRange) (map[string]bool, error) {
-	rows, err := readJobFileCoverage(caseDBPath(ctx), jobID)
+	evidence, err := readCheckpointEvidence(caseDBPath(ctx), jobID)
 	if err != nil {
 		return nil, err
 	}
-	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_coverage.json"), rows)
-	return coveredArticles(segments, ranges, rows), nil
+	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_coverage.json"), evidence.Coverage)
+	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_checkpoint.json"), evidence)
+	return directDurableArticles(segments, ranges, evidence), nil
 }
 
 // The process dies as the archive's engine run finds its first member: the
 // run reads while its volumes may still arrive, and nothing of the run itself
-// is kept. The restart runs the engine again over what the checkpoint held,
-// fetches none of it again, and delivers every member.
+// is kept. There may be no committed durable articles at this boundary.
+// The restart must reconstruct every output; proven direct inputs are also
+// checked for refetch without claiming durability for uncommitted scratch.
 func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "rar5-multi-member"
 	segments, err := nzbSegments(slug)
@@ -2829,10 +2850,6 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if len(covered) == 0 {
-		return restartCaseResult{}, fmt.Errorf("the checkpoint held no whole article when the engine found its first member")
-	}
-
 	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
@@ -2847,9 +2864,13 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 	fetchedAfter, _ := bodyFetchesSinceRestartPoint(preMetrics, metrics)
 	refetched := refetchedArticles(covered, preMetrics, metrics)
 	missing := missingMembers(postFS, rar5MultiMemberMembers)
-	detail := fmt.Sprintf("covered_at_crash=%d of %d articles fetched_after_restart=%d refetched_covered=%d missing=%v final=%s",
-		len(covered), len(segments), fetchedAfter, len(refetched), missing, statuses[jobID])
-	pass := statuses[jobID] == "COMPLETE" && len(missing) == 0 && len(refetched) == 0
+	if err := waitForJobArchived(caseDBPath(ctx), jobID); err != nil {
+		return restartCaseResult{}, err
+	}
+	digestErr := assertRar5MultiMemberBytes(caseDBPath(ctx), jobID)
+	detail := fmt.Sprintf("covered_at_crash=%d of %d articles fetched_after_restart=%d refetched_covered=%d missing=%v output=%v final=%s",
+		len(covered), len(segments), fetchedAfter, len(refetched), missing, digestErr, statuses[jobID])
+	pass := statuses[jobID] == "COMPLETE" && len(missing) == 0 && len(refetched) == 0 && digestErr == nil
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
@@ -3023,9 +3044,10 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 
 	refetched := refetchedArticles(covered, preMetrics, metrics)
 	missing := missingMembers(postFS, rar5MultiMemberMembers)
-	detail := fmt.Sprintf("stale_member=%s covered_at_crash=%d of %d articles refetched_covered=%d missing=%v post_count=%d final=%s",
-		staleMember.MemberName, len(covered), len(segments), len(refetched), missing, postCount, statuses[jobID])
-	pass := statuses[jobID] == "COMPLETE" && postCount == 0 && len(missing) == 0 && len(refetched) == 0
+	digestErr := assertRar5MultiMemberBytes(dbPath, jobID)
+	detail := fmt.Sprintf("stale_member=%s covered_at_crash=%d of %d articles refetched_covered=%d missing=%v post_count=%d output=%v final=%s",
+		staleMember.MemberName, len(covered), len(segments), len(refetched), missing, postCount, digestErr, statuses[jobID])
+	pass := statuses[jobID] == "COMPLETE" && postCount == 0 && len(missing) == 0 && len(refetched) == 0 && digestErr == nil
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,

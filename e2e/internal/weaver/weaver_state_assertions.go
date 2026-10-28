@@ -600,18 +600,24 @@ func assertTerminalFixtureStateEventually(dbPath string, jobID int, expectedStat
 }
 
 func assertTerminalFixtureStateEventuallySweeping(dbPath string, jobID int, expectedStatus string, sweepOrphans bool) error {
-	deadline := time.Now().Add(terminalFixtureStateTimeout)
+	return waitForTerminalFixtureState(func() error {
+		return assertTerminalFixtureStateSweeping(dbPath, jobID, expectedStatus, sweepOrphans)
+	}, time.Now, time.Sleep)
+}
+
+func waitForTerminalFixtureState(check func() error, now func() time.Time, wait func(time.Duration)) error {
+	deadline := now().Add(terminalFixtureStateTimeout)
 	var lastErr error
 	for {
-		err := assertTerminalFixtureStateSweeping(dbPath, jobID, expectedStatus, sweepOrphans)
+		err := check()
 		if err == nil {
 			return nil
 		}
 		lastErr = err
-		if time.Now().After(deadline) {
+		if now().After(deadline) {
 			return lastErr
 		}
-		time.Sleep(terminalFixtureStatePollInterval)
+		wait(terminalFixtureStatePollInterval)
 	}
 }
 

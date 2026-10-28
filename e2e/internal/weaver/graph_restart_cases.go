@@ -27,7 +27,7 @@ const (
 	admissionCap      = 2
 	admissionJobs     = 5
 	seatCap           = 4
-	seatChaos         = "drop_mid_body=10"
+	seatChaos         = "drop_mid_body=100"
 	refusedArchiveLog = "failed to archive a job during startup recovery"
 )
 
@@ -391,33 +391,56 @@ func runWarmDialNeverExceedsTheSeatCap(ctx *restartCaseContext) (restartCaseResu
 	if err := ctx.startWeaverWithOptions("", seatCap); err != nil {
 		return restartCaseResult{}, err
 	}
-	// Dropped bodies force redials across the whole job; each one is retried.
-	if err := setNntpChaosOnServer(nntpHost(), nntpPort(), seatChaos); err != nil {
+	// Keep one control session for the entire observation window. Resetting
+	// its admission out of the counters leaves every subsequent dial Weaver's.
+	control, err := openNntpCommandSession(nntpHost(), nntpPort(), true)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
+	defer control.close()
 	defer liftPrimaryHold()
-	// From here the only harness connection the server sees is the one
-	// reading the counters at the end.
-	if err := resetNntpMetrics(); err != nil {
+	if response, err := control.send("CHAOS " + seatChaos); err != nil {
 		return restartCaseResult{}, err
+	} else if err := validateNntpChaosResponse(response); err != nil {
+		return restartCaseResult{}, err
+	}
+	if _, err := control.send("METRICS RESET"); err != nil {
+		return restartCaseResult{}, err
+	}
+	readConnections := func() (weaverReleaseNntpConnections, error) {
+		response, err := control.send("METRICS CONNECTIONS")
+		if err != nil {
+			return weaverReleaseNntpConnections{}, err
+		}
+		return decodeNntpConnectionMetrics(response)
 	}
 	jobID, err := ctx.submitSlug(graphCaseSlug)
 	if err != nil {
+		return restartCaseResult{}, err
+	}
+	// End disruption once a seat's worth of sessions has disconnected and
+	// at least one replacement dial is observed. Permanent per-line drops
+	// cannot complete a BODY and must not remain enabled until completion.
+	if err := ctx.pollFor("disconnects and replacement dials", func() (bool, error) {
+		connections, err := readConnections()
+		return connections.Accepted-connections.Active >= int64(seatCap) && connections.Attempted > int64(seatCap), err
+	}); err != nil {
+		return restartCaseResult{}, err
+	}
+	if response, err := control.send("CHAOS off"); err != nil {
+		return restartCaseResult{}, err
+	} else if err := validateNntpChaosResponse(response); err != nil {
 		return restartCaseResult{}, err
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	connections, err := waitForFreeNntpConnectionMetrics(nntpHost(), nntpPort())
+	connections, err := readConnections()
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := liftPrimaryHold(); err != nil {
-		return restartCaseResult{}, err
-	}
-	const harnessReads = 1
-	weaverDials := connections.Attempted - harnessReads
+	weaverDials := connections.Attempted
 	// More dials than seats means some seat was dialled twice: the redials
 	// the dropped bodies forced are in the window the peak covers.
 	redialed := weaverDials > int64(seatCap)
@@ -577,16 +600,37 @@ func (ctx *restartCaseContext) seedUpgradeJobs(checkpointed bool) (upgradeSeed, 
 	if err := holdPrimaryBodies(); err != nil {
 		return upgradeSeed{}, err
 	}
-	active, err := ctx.submitSlugNTimes(graphCaseSlug, 2)
-	if err != nil {
-		return upgradeSeed{}, err
-	}
-	if checkpointed {
-		for _, id := range active {
+	var active []int
+	for index := 0; index < 2; index++ {
+		id, err := ctx.submitScenarioAs(graphCaseSlug, fmt.Sprintf("E2E upgrade seed %d", index), true)
+		if err != nil {
+			return upgradeSeed{}, err
+		}
+		active = append(active, id)
+		if checkpointed {
 			if err := ctx.pollFor(fmt.Sprintf("job %d's first checkpoint", id), func() (bool, error) {
 				rows, err := graphNodeRows(dbPath, id)
 				return rows > 0, err
 			}); err != nil {
+				return upgradeSeed{}, err
+			}
+			// Only the head job activates. Park this seed and drain its
+			// leased bodies before submitting the next seed, so each one
+			// gets a real committed checkpoint under the normal scheduler.
+			if err := pauseQueueItemGraphQL(ctx.weaverURL, id); err != nil {
+				return upgradeSeed{}, err
+			}
+			if err := liftPrimaryHold(); err != nil {
+				return upgradeSeed{}, err
+			}
+			if err := ctx.pollFor(fmt.Sprintf("job %d parked after checkpoint", id), func() (bool, error) {
+				rows, err := readAdmissionRows(dbPath, []int{id})
+				row, present := rows[id]
+				return present && row.Status == "paused" && !row.Admitted, err
+			}); err != nil {
+				return upgradeSeed{}, err
+			}
+			if err := holdPrimaryBodies(); err != nil {
 				return upgradeSeed{}, err
 			}
 		}
@@ -607,6 +651,13 @@ func (ctx *restartCaseContext) judgeUpgrade(seed upgradeSeed, from int) (restart
 	if err := ctx.restartWeaver(); err != nil {
 		return classifyRestartResult(ctx.Profile, false, "", false, "", "the upgraded database did not start: "+err.Error()), nil
 	}
+	for _, id := range seed.active {
+		if status, ok := restartJobStatusFromDB(caseDBPath(ctx), id); ok && status == "PAUSED" {
+			if err := resumeQueueItemGraphQL(ctx.weaverURL, id); err != nil {
+				return restartCaseResult{}, err
+			}
+		}
+	}
 	statuses, err := ctx.waitForAllTerminal(seed.active, ctx.Timeout)
 	if err != nil {
 		return restartCaseResult{}, err
@@ -622,7 +673,7 @@ func (ctx *restartCaseContext) judgeUpgrade(seed upgradeSeed, from int) (restart
 		return restartCaseResult{}, err
 	}
 	var missing []int
-	for version := from; version <= graphEngineMigration; version++ {
+	for version := from; version <= graphLatestMigration; version++ {
 		if !versions[version] {
 			missing = append(missing, version)
 		}
@@ -663,11 +714,8 @@ func (ctx *restartCaseContext) judgeUpgrade(seed upgradeSeed, from int) (restart
 		statuses, completed, historyRead, missing, left)
 	rest := completed == 2 && historyRead == 2 && leftTotal == 0
 	pass := rest && len(missing) == 0
-	// Until the graph-engine migration lands, it is the one version a full
-	// upgrade cannot record; everything else the case owes still holds.
-	gap := len(missing) == 1 && missing[0] == graphEngineMigration && completed == 2 && historyRead == 2
 	return classifyRestartResult(ctx.Profile, pass, "the database upgraded and its jobs completed: "+detail,
-		gap, fmt.Sprintf("migration %d is not in this build: %s", graphEngineMigration, detail), detail), nil
+		false, "", detail), nil
 }
 
 // G9a. A 0.16.5 database upgrades.
@@ -702,6 +750,9 @@ func runUpgradeFromEngineStampedDatabase(ctx *restartCaseContext) (restartCaseRe
 	}
 	// A classic job never wrote a graph checkpoint.
 	for _, table := range graphTables {
+		if table == "graph_held_parts" {
+			continue // Migration 76 has not run in this historical schema.
+		}
 		plant = append(plant, fmt.Sprintf(`DELETE FROM %s WHERE job_id = %d`, table, classic))
 	}
 	plant = append(plant, plantClassicRows(classic)...)

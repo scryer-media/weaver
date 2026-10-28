@@ -33,6 +33,7 @@ var graphTables = []string{
 	"graph_recovery",
 	"graph_holds",
 	"graph_facts_parts",
+	"graph_held_parts",
 }
 
 // holdEveryBody makes the primary news server serve one line and then block
@@ -594,6 +595,7 @@ var rewindTo0165 = schemaRewind{
 		{"active_jobs", "root_phase"},
 		{"active_jobs", "nzb_admitted"},
 		{"active_jobs", "nzb_release_pending"},
+		{"active_jobs", "feed_verdict"},
 		{"job_history", "engine"},
 	},
 	RestoreTables: classicOnlyTables,
@@ -604,10 +606,18 @@ var rewindTo0165 = schemaRewind{
 // engine: it drops active_jobs.engine, job_history.engine and the ten
 // classicOnlyTables.
 const graphEngineMigration = 74
+const graphLatestMigration = 78
 
 // rewindToPreGraphEngine is a database written before that migration: the
 // engine stamps and every classic-only table are there.
 var rewindToPreGraphEngine = schemaRewind{
+	DropTables: []string{"graph_held_parts"},
+	DropColumns: []tableColumn{
+		{"active_jobs", "feed_verdict"},
+		{"graph_members", "crc32"},
+		{"graph_members", "on_disk"},
+		{"graph_envelopes", "file"},
+	},
 	RestoreTables: classicOnlyTables,
 	AddColumns: []columnAdd{
 		{"active_jobs", "engine", "TEXT NOT NULL DEFAULT 'classic'"},

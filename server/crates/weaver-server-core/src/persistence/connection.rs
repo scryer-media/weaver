@@ -797,6 +797,10 @@ enum DbWriteCommand {
         lane: Option<WriteLane>,
         op: WriteOp,
     },
+    GraphCheckpoint {
+        job_id: crate::jobs::ids::JobId,
+        prepare: Box<dyn FnOnce() -> super::checkpoint_write::CheckpointWrite + Send>,
+    },
     Flush {
         reply: oneshot::Sender<()>,
     },
@@ -831,6 +835,7 @@ impl DbWriteCommand {
                 WriteLane::Job(job_id.0),
             )),
             Self::InsertJobEvents { .. } => Some((&[], WriteLane::Events)),
+            Self::GraphCheckpoint { job_id, .. } => Some((&[], WriteLane::Job(job_id.0))),
             Self::Write {
                 lane: Some(lane), ..
             } => Some((&[], *lane)),
@@ -965,6 +970,31 @@ async fn execute_write_command(
             .await
             .ok();
         }
+        DbWriteCommand::GraphCheckpoint { job_id, prepare } => {
+            let mut write = prepare();
+            let blocked = write.blocked;
+            let failures = Arc::clone(&writer_db.checkpoint_failures);
+            write.blocked = Box::new(move |revision, error| {
+                failures.send_modify(|failures| {
+                    failures.insert(job_id, error.to_owned());
+                });
+                blocked(revision, error);
+            });
+            let result = write
+                .run(job_id, writer_db, writer_db.checkpoint_shutdown.subscribe())
+                .await;
+            writer_db
+                .checkpoint_failures
+                .send_modify(|failures| match result {
+                    Ok(true) => {
+                        failures.remove(&job_id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        failures.insert(job_id, error);
+                    }
+                });
+        }
         DbWriteCommand::Flush { reply } => {
             let _ = reply.send(());
         }
@@ -1081,6 +1111,7 @@ impl DbWriteCommand {
             Self::ArchiveJobs { .. } => "archive_jobs",
             Self::InsertJobEvents { .. } => "insert_job_events",
             Self::Write { label, .. } => label,
+            Self::GraphCheckpoint { .. } => "save_graph_checkpoint",
             Self::Flush { .. } => "flush",
         }
     }
@@ -1146,6 +1177,8 @@ pub struct Database {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     writer_tx: mpsc::Sender<QueuedWrite>,
+    checkpoint_shutdown: watch::Sender<bool>,
+    checkpoint_failures: Arc<watch::Sender<BTreeMap<crate::jobs::ids::JobId, String>>>,
     // Count of in-flight background re-sends into the bounded writer queue
     // (archive jobs and generic ordered writes) spawned when `try_send` hit a
     // full queue. `flush_write_queue` waits for this to reach zero before its
@@ -1189,6 +1222,8 @@ impl Database {
             sql_services,
             sql_worker,
             writer_tx,
+            checkpoint_shutdown: watch::channel(false).0,
+            checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
             write_overflow: Arc::new(Mutex::new(None)),
@@ -1216,6 +1251,8 @@ impl Database {
             sql_services,
             sql_worker,
             writer_tx,
+            checkpoint_shutdown: watch::channel(false).0,
+            checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
             write_overflow: Arc::new(Mutex::new(None)),
@@ -1434,6 +1471,8 @@ impl Database {
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,
+            checkpoint_shutdown: self.checkpoint_shutdown.clone(),
+            checkpoint_failures: self.checkpoint_failures.clone(),
             pending_write_retries: self.pending_write_retries.clone(),
             pending_write_notify: self.pending_write_notify.clone(),
             write_overflow: Arc::new(Mutex::new(None)),
@@ -1578,6 +1617,26 @@ impl Database {
         self.try_send_with_retry(command, label)
     }
 
+    pub(crate) fn try_queue_graph_checkpoint(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        prepare: impl FnOnce() -> super::checkpoint_write::CheckpointWrite + Send + 'static,
+    ) -> Result<(), StateError> {
+        self.try_send_with_retry(
+            DbWriteCommand::GraphCheckpoint {
+                job_id,
+                prepare: Box::new(prepare),
+            },
+            "save_graph_checkpoint",
+        )
+    }
+
+    // Stop retry waits at shutdown without claiming any unwritten delta
+    // committed. A database call already running is still awaited.
+    pub(crate) fn stop_checkpoint_retries(&self) {
+        self.checkpoint_shutdown.send_replace(true);
+    }
+
     // Queue a server attribution or support facts checkpoint. Checkpoints keep their order
     // against each other, and a job's archive waits for the ones queued
     // before it; on Postgres they otherwise run alongside other writes
@@ -1696,18 +1755,51 @@ impl Database {
     }
 
     pub async fn flush_write_queue(&self) -> Result<(), StateError> {
-        // Drain any in-flight background re-sends (archive jobs and generic
-        // writes) into the queue first, so the `Flush` we enqueue below sits
-        // behind every write that had already been accepted for the queue.
-        self.wait_for_pending_write_retries().await;
-        let (reply, rx) = oneshot::channel();
-        let command = self.enqueue_write(DbWriteCommand::Flush { reply });
-        self.writer_tx
-            .send(command)
-            .await
-            .map_err(|_| StateError::Database("database writer queue closed".to_string()))?;
-        rx.await
-            .map_err(|_| StateError::Database("database writer flush failed".to_string()))
+        // Subscribe before queuing the barrier. A checkpoint that needs
+        // explicit resume retains its ordered slot, but a flush must report
+        // that unresolved failure instead of waiting behind it forever.
+        let mut failures = self.checkpoint_failures.subscribe();
+        let flush = async {
+            // Drain any in-flight background re-sends (archive jobs and generic
+            // writes) into the queue first, so the `Flush` we enqueue below sits
+            // behind every write that had already been accepted for the queue.
+            self.wait_for_pending_write_retries().await;
+            let (reply, rx) = oneshot::channel();
+            let command = self.enqueue_write(DbWriteCommand::Flush { reply });
+            self.writer_tx
+                .send(command)
+                .await
+                .map_err(|_| StateError::Database("database writer queue closed".to_string()))?;
+            rx.await
+                .map_err(|_| StateError::Database("database writer flush failed".to_string()))?;
+            Ok::<_, StateError>(())
+        };
+        tokio::pin!(flush);
+        let mut flushed = false;
+        loop {
+            {
+                let unresolved = failures.borrow_and_update();
+                if !unresolved.is_empty() {
+                    return Err(StateError::Database(format!(
+                        "unresolved graph checkpoint writes: {}",
+                        unresolved
+                            .iter()
+                            .map(|(job, error)| format!("job {}: {error}", job.0))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )));
+                }
+            }
+            if flushed {
+                return Ok(());
+            }
+            tokio::select! {
+                result = &mut flush => { result?; flushed = true; }
+                changed = failures.changed() => {
+                    changed.map_err(|_| StateError::Database("checkpoint failure reporting closed".into()))?;
+                }
+            }
+        }
     }
 
     async fn wait_for_pending_write_retries(&self) {

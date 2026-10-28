@@ -502,6 +502,38 @@ async fn paused_graph_work_is_rebuilt_on_resume_and_runs_only_with_nzb_admission
 }
 
 #[tokio::test]
+async fn a_checkpoint_error_queued_before_resume_cannot_pause_the_resumed_job() {
+    use super::engine::{Heard, Said};
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_103);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let control = pipeline.graph_jobs[&job_id].pending().control();
+    let revision = control.revision();
+    let error = |revision| Said {
+        scope: job_id.0,
+        node: weaver_graph::NodeId::ROOT,
+        generation: 0,
+        heard: Heard::CheckpointBlocked {
+            control: control.clone(),
+            revision,
+            error: "fixture storage failure".into(),
+        },
+    };
+    pipeline.graph_run_said(error(revision));
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Paused);
+    pipeline.resume_job_runtime(job_id).unwrap();
+    let resumed = pipeline.jobs[&job_id].status.clone();
+    assert_ne!(resumed, JobStatus::Paused);
+    assert_ne!(control.revision(), revision);
+    pipeline.graph_run_said(error(revision));
+    assert_eq!(pipeline.jobs[&job_id].status, resumed);
+    pipeline.graph_run_said(error(control.revision()));
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Paused);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
 async fn terminal_graph_runtime_is_retained_until_its_worker_stops() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_101);
@@ -518,6 +550,73 @@ async fn terminal_graph_runtime_is_retained_until_its_worker_stops() {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
     }
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn repeated_failure_keeps_worker_ownership_and_releases_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_102);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    echo_engines(&mut pipeline, job_id, 1);
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    assert!(pipeline.graph_jobs[&job_id].awaits_mail());
+    pipeline.transition_postprocessing_status(job_id, JobStatus::Extracting, None);
+    assert_eq!(
+        pipeline
+            .metrics
+            .extract_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    pipeline.fail_job(job_id, "first failure".into());
+    pipeline.fail_job(job_id, "late failure".into());
+    assert_eq!(
+        pipeline
+            .metrics
+            .extract_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(pipeline.pending_graph_failures.contains_key(&job_id));
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(working_dir.exists());
+    assert_eq!(
+        pipeline.jobs[&job_id].failure_error.as_deref(),
+        Some("first failure")
+    );
+    let retired = &pipeline.retiring_graph_jobs[&job_id];
+    let node = retired.tree().engines()[0];
+    let generation = retired.runs().generation(node).unwrap();
+    pipeline.graph_run_said(super::engine::Said {
+        scope: job_id.0,
+        node,
+        generation: generation.wrapping_add(1),
+        heard: super::engine::Heard::Ended,
+    });
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(!pipeline.pending_graph_failures.contains_key(&job_id));
+    assert!(pipeline.releasing_failed_jobs.contains(&job_id));
+    pipeline.fail_job(job_id, "cleanup raced".into());
+    crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(pipeline.failed_release_rx.try_recv().is_err());
+    assert_eq!(
+        pipeline
+            .metrics
+            .extract_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(
+        !working_dir.join("echo-0.bin").exists(),
+        "late worker output must not be published"
+    );
     retire_pipeline_database(pipeline).await;
 }
 

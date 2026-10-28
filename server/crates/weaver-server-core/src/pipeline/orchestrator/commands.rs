@@ -224,6 +224,7 @@ impl Pipeline {
         for job_id in job_ids {
             match self.begin_cancel_job(job_id, origin) {
                 Ok((row, cleanup)) => {
+                    self.cancel_graph_checkpoint_retries(job_id);
                     archives.push((job_id, row));
                     cleanups.push(cleanup);
                 }

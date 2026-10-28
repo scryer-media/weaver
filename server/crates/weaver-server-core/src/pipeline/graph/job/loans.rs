@@ -136,9 +136,22 @@ impl Lender for Lending<'_> {
         let grant = loans.hardware.grant();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
+            tracing::info!(
+                job_id = scope,
+                node = set.0,
+                generation = serial,
+                "graph repair worker started"
+            );
             crate::e2e_failpoint::maybe_delay(crate::e2e_failpoint::REPAIR_TASK_START);
             crate::e2e_failpoint::maybe_trip(crate::e2e_failpoint::REPAIR_TASK_START);
             let returned = grant.install(|| loan.run(grant.repair.clone(), &shutdown));
+            tracing::info!(
+                job_id = scope,
+                node = set.0,
+                generation = serial,
+                cancelled = returned.stopped(),
+                "graph repair worker ended"
+            );
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(Said {

@@ -1345,6 +1345,8 @@ impl NntpPool {
         }
         episode.probe_started = now;
         episode.probe_token = episode.probe_token.wrapping_add(1);
+        self.health_changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         debug!(
             server = idx,
             refusals = episode.refusals,
@@ -1398,6 +1400,8 @@ impl NntpPool {
         episode.probe_started = 0;
         deadline_slot.store(0, Ordering::Release);
         drop(episode);
+        self.health_changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         if let Some(server) = self.configs.get(idx) {
             server.dialer.inner.over_limit_cleared();
         }
@@ -1421,6 +1425,9 @@ impl NntpPool {
             && episode.probe_token == token
         {
             episode.probe_started = 0;
+            drop(episode);
+            self.health_changed
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
     }
 
@@ -1508,6 +1515,8 @@ impl NntpPool {
         episode.probe_started = 0;
         deadline_slot.store(deadline, Ordering::Release);
         drop(episode);
+        self.health_changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         warn!(
             server = idx,
             server_address = %self.server_address(server),
@@ -1822,20 +1831,34 @@ impl NntpPool {
         if gate == Some(ConnectionHold::Recovery) {
             return gate;
         }
-        // A stamp being written right now is a hold about to start or end;
-        // the next read sees it.
-        let Some(reconnect) = self.last_connect_failure[idx]
+        // Provider refusal holds fresh sockets even when recovery considers
+        // the server healthy. An expired episode admits one probe only.
+        let provider = self.over_limit_until_epoch_ms(ServerId(idx)).map(|until| {
+            Instant::now() + Duration::from_millis(until.saturating_sub(unix_epoch_ms()))
+        });
+        let reconnect = self.last_connect_failure[idx]
             .try_lock()
             .ok()
-            .and_then(|failed_at| self.reconnect_hold(*failed_at))
-        else {
-            return gate;
-        };
-        // The reconnect delay holds even a probe that is due.
-        Some(ConnectionHold::Until(match gate {
-            Some(ConnectionHold::Until(at)) => at.max(reconnect),
-            _ => reconnect,
-        }))
+            .and_then(|failed_at| self.reconnect_hold(*failed_at));
+        let deadline = provider
+            .into_iter()
+            .chain(reconnect)
+            .chain(match gate {
+                Some(ConnectionHold::Until(at)) => Some(at),
+                _ => None,
+            })
+            .max();
+        if let Some(until) = deadline {
+            return Some(ConnectionHold::Until(until));
+        }
+        if self.over_limit_until[idx].load(Ordering::Acquire) != 0 {
+            return Some(if demanded {
+                ConnectionHold::Probe
+            } else {
+                ConnectionHold::Recovery
+            });
+        }
+        gate
     }
 
     // How many new demanded connections server `idx` admits right now: its
@@ -3464,6 +3487,35 @@ mod tests {
             pool.over_limit_until_epoch_ms(ServerId(0)),
             Some(first_deadline)
         );
+    }
+
+    #[tokio::test]
+    async fn provider_hold_seats_only_one_probe_and_announces_its_answer() {
+        use crate::recovery::ConnectionHold;
+        let pool = Arc::new(NntpPool::new(test_pool_config(4)));
+        let mut changes = pool.server_health_changes();
+        pool.note_provider_over_limit(ServerId(0));
+        changes.changed().await;
+        assert_eq!(pool.new_connection_seats(0), 0);
+        assert!(pool.next_connection_hold_deadline().is_some());
+
+        pool.over_limit_until[0].store(unix_epoch_ms() - 1, Ordering::Release);
+        assert_eq!(pool.connection_hold(0, true), Some(ConnectionHold::Probe));
+        assert_eq!(pool.new_connection_seats(0), 1);
+        let probe = pool.admit_fresh_connect(ServerId(0)).unwrap();
+        changes.changed().await;
+        assert_eq!(pool.new_connection_seats(0), 0);
+        assert!(pool.next_connection_hold_deadline().is_some());
+        assert!(pool.admit_fresh_connect(ServerId(0)).is_err());
+
+        pool.release_over_limit_probe(ServerId(0), probe);
+        changes.changed().await;
+        assert_eq!(pool.new_connection_seats(0), 1);
+        let probe = pool.admit_fresh_connect(ServerId(0)).unwrap();
+        pool.note_provider_admitted(ServerId(0), probe);
+        changes.changed().await;
+        assert_eq!(pool.new_connection_seats(0), 4);
+        assert_eq!(pool.next_connection_hold_deadline(), None);
     }
 
     // A server whose one recovery probe is out holds every new connection,

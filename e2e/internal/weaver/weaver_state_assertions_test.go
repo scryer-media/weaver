@@ -27,35 +27,26 @@ func TestAssertTerminalFixtureStatePassesWhenArchivedJobIsClean(t *testing.T) {
 }
 
 func TestAssertTerminalFixtureStateEventuallyWaitsForHistoryVisibility(t *testing.T) {
-	previousTimeout := terminalFixtureStateTimeout
-	previousPollInterval := terminalFixtureStatePollInterval
-	terminalFixtureStateTimeout = 250 * time.Millisecond
-	terminalFixtureStatePollInterval = 10 * time.Millisecond
-	t.Cleanup(func() {
-		terminalFixtureStateTimeout = previousTimeout
-		terminalFixtureStatePollInterval = previousPollInterval
-	})
-
 	dbPath := newTestWeaverStateDB(t)
-
-	errCh := make(chan error, 1)
-	go func() {
-		time.Sleep(25 * time.Millisecond)
-		db, err := sql.Open("sqlite", dbPath)
-		if err != nil {
-			errCh <- err
-			return
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	now := time.Unix(0, 0)
+	checks := 0
+	err := waitForTerminalFixtureState(func() error {
+		checks++
+		return assertTerminalFixtureState(dbPath, 2, "COMPLETE")
+	}, func() time.Time { return now }, func(interval time.Duration) {
+		if checks != 1 {
+			t.Fatalf("expected exactly one observation before history becomes visible, got %d", checks)
 		}
-		defer db.Close()
-		_, err = db.Exec(`INSERT INTO job_history (job_id, status) VALUES (2, 'COMPLETED')`)
-		errCh <- err
-	}()
-
-	if err := assertTerminalFixtureStateEventually(dbPath, 2, "COMPLETE"); err != nil {
+		mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (2, 'COMPLETED')`)
+		now = now.Add(interval)
+	})
+	if err != nil {
 		t.Fatalf("expected eventual terminal state validation to pass, got %v", err)
 	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("insert delayed job history row: %v", err)
+	if checks != 2 {
+		t.Fatalf("expected absent then visible history, got %d observations", checks)
 	}
 }
 

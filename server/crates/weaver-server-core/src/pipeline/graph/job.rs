@@ -99,7 +99,7 @@ pub(crate) struct GraphJob {
     pending: Pending,
     // A member's file waits to move on a checkpoint the database has not
     // said it committed, and the run mail will say when it has.
-    mail_owed: bool,
+    mail_owed: Option<u64>,
     // What the job did since the pipeline last asked, for its events.
     notes: Vec<Note>,
 }
@@ -192,7 +192,7 @@ impl GraphJob {
             passwords: Passwords::default(),
             reported: None,
             pending: Pending::default(),
-            mail_owed: false,
+            mail_owed: None,
             notes: Vec::new(),
         }
     }
@@ -221,7 +221,7 @@ impl GraphJob {
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
     pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
-        self.runs.in_flight() || self.loans.out() || self.mail_owed
+        self.runs.in_flight() || self.loans.out() || self.mail_owed.is_some()
     }
 
     // The checkpoint `stamp` records every name the job's files want and
@@ -244,8 +244,8 @@ impl GraphJob {
 
     // The run mail will say when the awaited checkpoint commits. True when
     // it was not owed already, so no write queued yet is sure to say it.
-    pub(crate) fn owe_mail(&mut self) -> bool {
-        !std::mem::replace(&mut self.mail_owed, true)
+    pub(crate) fn owe_mail(&mut self, stamp: u64) -> bool {
+        self.mail_owed.replace(stamp).is_none()
     }
 
     // The checkpoints through `stamp` have committed: every move they
@@ -258,8 +258,14 @@ impl GraphJob {
     // The database's word on the checkpoints a move waited on: committed
     // through `stamp`, or a write failed and the next checkpoint carries
     // them again.
-    pub(crate) fn written(&mut self, stamp: Option<u64>) -> Result<(), GraphError> {
-        self.mail_owed = false;
+    fn acknowledge_checkpoint(&mut self, stamp: u64) {
+        if self.mail_owed.is_some_and(|owed| owed <= stamp) {
+            self.mail_owed = None;
+        }
+    }
+
+    pub(crate) fn written(&mut self, stamp: Option<u64>, requested: u64) -> Result<(), GraphError> {
+        self.acknowledge_checkpoint(stamp.unwrap_or(requested));
         if let Some(stamp) = stamp {
             self.committed(stamp)?;
         }

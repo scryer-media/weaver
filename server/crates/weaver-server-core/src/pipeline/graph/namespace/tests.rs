@@ -1174,6 +1174,68 @@ fn a_bound_member_reads_back_through_its_envelope_and_its_child() {
 }
 
 #[test]
+fn an_envelope_on_disk_reads_through_the_root_only_after_its_ownership_is_restored() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    let kept = job.writer.envelopes.records(child);
+    assert_eq!(kept.len(), 1);
+    let file = job.writer.file_state(child, MemberId(0));
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    job.writer
+        .restore_file(&job.tree, child, MemberId(0), &file)
+        .unwrap();
+
+    let mut posted = Vec::new();
+    assert!(
+        !job.writer
+            .read_posted(&job.tree, member, ByteRange::new(0, 7), &mut posted),
+        "an existing envelope without committed ownership is not adopted"
+    );
+    job.writer.restore_kept(&kept[0]).unwrap();
+    assert!(
+        job.writer
+            .read_posted(&job.tree, member, ByteRange::new(0, 12), &mut posted)
+    );
+    assert_eq!(posted, [SIGNATURE, b"hello"].concat());
+}
+
+#[test]
+fn a_deleted_output_does_not_hide_the_surviving_committed_envelope() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    let kept = job.writer.envelopes.records(child);
+    let file = job.writer.file_state(child, MemberId(0));
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    std::fs::remove_file(job.dir.path().join("inner.bin")).unwrap();
+    job.writer.restore_kept(&kept[0]).unwrap();
+    job.writer
+        .restore_file(&job.tree, child, MemberId(0), &file)
+        .unwrap();
+
+    let mut posted = Vec::new();
+    assert!(
+        job.writer
+            .read_posted(&job.tree, member, ByteRange::new(0, 7), &mut posted)
+    );
+    assert_eq!(posted, SIGNATURE);
+    let mut missing = Vec::new();
+    assert!(
+        !job.writer
+            .read_posted(&job.tree, member, ByteRange::new(7, 12), &mut missing)
+    );
+}
+
+#[test]
 fn a_retraction_truncates_the_leaf_and_keeps_its_name_for_what_comes_back() {
     let mut job = Job::new(PLENTY);
     let (member, child) = bound_store(&mut job);

@@ -3,6 +3,11 @@
 
 use super::*;
 
+pub(crate) struct PendingGraphFailure {
+    pub(super) error: String,
+    pub(super) extraction_rejected: bool,
+}
+
 impl Pipeline {
     pub(crate) fn critical_health_milli(total: u64, par2_bytes: u64) -> u32 {
         if par2_bytes == 0 {
@@ -22,8 +27,9 @@ impl Pipeline {
     // Reject untrusted delivery content or an incomplete security check
     // without exposing the working tree to terminal scripts or publication.
     pub(super) fn fail_delivery_security_check(&mut self, job_id: JobId, error: String) {
-        let release = self.prepare_failed_job_runtime(job_id, &error, false);
-        self.finish_failed_job(job_id, error, release);
+        // Security refusal uses the same ownership barrier and suppresses
+        // terminal scripts, as an extraction budget refusal does.
+        self.fail_job_with_rejection(job_id, error, true);
     }
 
     // Mark a job as failed and purge its queued segments.
@@ -37,6 +43,9 @@ impl Pipeline {
     // does. A failure an extraction made is not a deletion and goes through
     // `fail_job` or `fail_job_on_extraction_error` instead.
     pub(super) fn fail_job_on_health(&mut self, job_id: JobId, error: String) {
+        if self.job_failure_started(job_id) {
+            return;
+        }
         self.raise_queue_script_event(
             job_id,
             crate::post_processing::model::QueueEvent::NzbDeleted,
@@ -53,6 +62,9 @@ impl Pipeline {
     }
 
     fn fail_job_with_rejection(&mut self, job_id: JobId, error: String, extraction_rejected: bool) {
+        if self.job_failure_started(job_id) {
+            return;
+        }
         tracing::error!(job_id = job_id.0, reason = %error, "job failed");
         let failure_stage = self
             .jobs
@@ -74,6 +86,65 @@ impl Pipeline {
         self.pipeline_failure_stages
             .entry(job_id)
             .or_insert(failure_stage);
+        self.cancel_graph_checkpoint_retries(job_id);
+        if self
+            .graph_jobs
+            .get(&job_id)
+            .is_some_and(|graph| graph.awaits_mail())
+        {
+            self.retire_graph_job(job_id);
+            self.transition_postprocessing_status(
+                job_id,
+                JobStatus::Failed {
+                    error: error.clone(),
+                },
+                None,
+            );
+            if let Some(state) = self.jobs.get_mut(&job_id)
+                && let Some(active) = state.articles.active_mut()
+            {
+                active.download_queue = DownloadQueue::new();
+                active.recovery_queue = DownloadQueue::new();
+            }
+            self.pending_graph_failures.insert(
+                job_id,
+                PendingGraphFailure {
+                    error,
+                    extraction_rejected,
+                },
+            );
+            return;
+        }
+        self.continue_job_failure(
+            job_id,
+            PendingGraphFailure {
+                error,
+                extraction_rejected,
+            },
+        );
+    }
+
+    pub(in crate::pipeline) fn job_failure_started(&self, job_id: JobId) -> bool {
+        self.pending_graph_failures.contains_key(&job_id)
+            || self.releasing_failed_jobs.contains(&job_id)
+            || (self.inflight_terminal_post_processing.contains(&job_id)
+                && self.pipeline_failure_stages.contains_key(&job_id))
+            || self
+                .jobs
+                .get(&job_id)
+                .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. }))
+    }
+
+    pub(in crate::pipeline) fn continue_job_failure(
+        &mut self,
+        job_id: JobId,
+        failure: PendingGraphFailure,
+    ) {
+        let PendingGraphFailure {
+            error,
+            extraction_rejected,
+        } = failure;
+        let failure_stage = self.pipeline_failure_stages[&job_id];
         // Scripts run on failure too, so the job's own failure survives them:
         // the primary failure is carried through and re-applied afterwards.
         let scripts_may_run = self

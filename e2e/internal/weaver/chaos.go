@@ -122,10 +122,18 @@ func (session *nntpCommandSession) send(cmd string) (string, error) {
 	return line, nil
 }
 
-func (session *nntpCommandSession) close() {
-	_ = session.conn.SetWriteDeadline(time.Now().Add(time.Second))
-	_, _ = session.conn.Write([]byte("QUIT\r\n"))
-	_ = session.conn.Close()
+func (session *nntpCommandSession) close() error {
+	defer session.conn.Close()
+	if _, err := session.send("QUIT"); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	// EOF follows the fixture's session and admission-counter release. A
+	// local socket close alone does not prove the provider freed the seat.
+	_, err := io.Copy(io.Discard, session.reader)
+	return err
 }
 
 func sendNntpCommandToOnceWithAuth(host, port, cmd string, authenticate bool) (string, error) {
@@ -133,8 +141,12 @@ func sendNntpCommandToOnceWithAuth(host, port, cmd string, authenticate bool) (s
 	if err != nil {
 		return "", err
 	}
-	defer session.close()
-	return session.send(cmd)
+	response, err := session.send(cmd)
+	closed := session.close()
+	if err != nil {
+		return "", err
+	}
+	return response, closed
 }
 
 func resetNntpServer(host, port, label string) error {

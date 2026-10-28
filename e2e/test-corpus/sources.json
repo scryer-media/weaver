@@ -9,10 +9,12 @@
         "go-andybalholm-brotli@v1.2.3",
         "go-archive-tar",
         "go-archive-zip",
+        "go-archive-zip@go1.27.3",
         "go-compress-flate",
         "go-compress-gzip",
         "go-dsnet-bzip2@v0.0.1",
         "go-fixture-bytes",
+        "go-fixture-bytes@go1.27.3",
         "go-klauspost-zstd@v1.19.2",
         "par2cmdline-turbo-1.4.0",
         "par3cmdline-2971702e",
@@ -4182,6 +4184,48 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-exact-name-content-match/b.bin",
+      "size": 8192,
+      "blake3": "b321ea74f3bf6de2920ed1b2743edab6139d88f7ef76f08a2cae6976a06c6211",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-exact-name-content-match/set.par2",
+      "size": 752,
+      "blake3": "6e7f25cf9873dce4a63e3612e3db57b82b6e662e41ba31f74bd5341dd54a38d6",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-exact-name-content-match/set.vol0+4.par2",
+      "size": 18696,
+      "blake3": "c1ce6c571332e19709ce83f80cf8ddebceef0d58c250798e28b9a068c35daa94",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
         ]
       }
     },
@@ -12162,6 +12206,20 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/zip-unicode-collisions/archive.zip",
+      "size": 12615,
+      "blake3": "223fa709a2cc47244c94fb2850905b7c142720438f740cde6b6ff5af037d26fe",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
         ]
       }
     },

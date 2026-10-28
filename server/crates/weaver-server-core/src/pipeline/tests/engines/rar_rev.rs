@@ -13,7 +13,9 @@ use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run, run_holding
 use super::rar::{delivered, posts};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::scenarios::{HeaderCheck, header_encrypted_store_set};
-use crate::pipeline::tests::direct_store::single_member_store_set;
+use crate::pipeline::tests::direct_store::{
+    protected_rar4_store_set, protected_store_set, single_member_store_set,
+};
 use crate::pipeline::tests::{
     single_member_rar4_old_numbering_set, single_recovery_volume_for_rar4_set,
     with_rar4_header_crcs,
@@ -128,6 +130,56 @@ async fn rar_rev_rebuilds_one_absent_rar5_volume_from_one_recovery_volume() {
 async fn rar_rev_rebuilds_two_absent_rar5_volumes_from_two_recovery_volumes() {
     let (body, scenario) = rar5_set(&[1, 3], 2);
     assert_rebuilt(&run(&scenario).await, &body, 2);
+}
+
+async fn records_and_recovery_volumes_rebuild(scenario: Scenario, body: &[u8]) {
+    let outcome = run(&scenario.damaged(0, 2)).await;
+    assert!(
+        outcome.completed(),
+        "{:?} {:?}; rulings: {:?}",
+        outcome.status,
+        outcome.failure,
+        outcome.graph().rulings,
+    );
+    assert_eq!(outcome.files.len(), 1);
+    assert_eq!(outcome.files.values().next().unwrap(), body);
+    for kind in ["rar_record", "rar_recovery"] {
+        assert!(
+            outcome
+                .graph()
+                .rulings
+                .iter()
+                .any(|(engine, result)| engine == kind
+                    && matches!(result, Some(RepairOutcome::Repaired { .. }))),
+            "{kind} did not repair: {:?}",
+            outcome.graph().rulings,
+        );
+    }
+    assert!(outcome.refetched().is_empty(), "{:?}", outcome.refetched());
+}
+
+#[tokio::test]
+async fn rar5_records_and_recovery_volumes_rebuild_damage_and_an_absent_volume() {
+    // The recovery-record headers require four more payload bytes to keep
+    // this set's longest volume even for RAR5 recovery-volume parity words.
+    let body = payload(11 * ARTICLE + 33, 61);
+    let volumes = protected_store_set(MEMBER, &body, 4, 1);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let revs = rar5_revs("silver.horizon", &bytes, 1);
+    records_and_recovery_volumes_rebuild(Scenario::new(posted(volumes, &[2], revs)), &body).await;
+}
+
+#[tokio::test]
+async fn rar4_records_and_recovery_volumes_rebuild_damage_and_an_absent_volume() {
+    let body = body();
+    let volumes = protected_rar4_store_set(MEMBER, &body, 4, 8);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let rev = Post::plain(
+        "silver.horizon.part1.rev",
+        single_recovery_volume_for_rar4_set(&bytes),
+    );
+    records_and_recovery_volumes_rebuild(Scenario::new(posted(volumes, &[2], vec![rev])), &body)
+        .await;
 }
 
 // Two data volumes never posted and two recovery volumes, the server

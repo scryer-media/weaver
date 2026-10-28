@@ -451,6 +451,13 @@ impl Pipeline {
             return Ok(());
         }
         let persist_status = Self::persist_active_status_for(&resume_status);
+        if let Some(graph) = self
+            .graph_jobs
+            .get(&job_id)
+            .or_else(|| self.retiring_graph_jobs.get(&job_id))
+        {
+            graph.pending().control().resume();
+        }
         self.transition_runtime_snapshot(
             job_id,
             resume_status.clone(),

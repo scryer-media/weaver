@@ -279,6 +279,7 @@ pub(crate) struct Probes {
     pub(crate) states: HashMap<JobId, ProbeState>,
     // The posts the feed gave up, in its words.
     pub(crate) dead: HashMap<JobId, String>,
+    pub(crate) verdicts: HashMap<JobId, crate::jobs::feed_verdict::FeedVerdict>,
     // Batches waiting for a seat, in the order they will be offered one.
     pub(crate) waiting: VecDeque<ProbeBatch>,
     // The rounds out on the lanes.
@@ -293,6 +294,7 @@ impl Default for Probes {
             receiver,
             states: HashMap::new(),
             dead: HashMap::new(),
+            verdicts: HashMap::new(),
             waiting: VecDeque::new(),
             lane_rounds: HashMap::new(),
         }
@@ -300,6 +302,17 @@ impl Default for Probes {
 }
 
 impl Probes {
+    pub(crate) fn restore_verdict(
+        &mut self,
+        job_id: JobId,
+        verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
+    ) {
+        if let Some(verdict) = verdict {
+            self.dead.insert(job_id, verdict.reason.clone());
+            self.verdicts.insert(job_id, verdict);
+        }
+    }
+
     pub(crate) fn sender(&self) -> mpsc::Sender<ProbeMail> {
         self.sender.clone()
     }
@@ -327,6 +340,7 @@ impl Probes {
     pub(crate) fn forget(&mut self, job_id: JobId) {
         self.retire(job_id);
         self.dead.remove(&job_id);
+        self.verdicts.remove(&job_id);
     }
 
     // Whether `batch` belongs to the round its job is waiting on.
@@ -1017,10 +1031,16 @@ impl Pipeline {
     // of the post is lost, so a file whose first loss lands after the post
     // was given up is abandoned then.
     pub(in crate::pipeline) fn abandon_dead_files(&mut self, job_id: JobId) {
-        if !self.post_probes.dead.contains_key(&job_id) {
+        let Some(reason) = self.post_probes.dead.get(&job_id).cloned() else {
             return;
-        }
-        let lost: BTreeSet<u32> = self
+        };
+        let mut verdict = self
+            .post_probes
+            .verdicts
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_else(|| crate::jobs::feed_verdict::FeedVerdict::new(reason));
+        let mut lost: BTreeSet<u32> = self
             .segment_terminal_states
             .iter()
             .filter(|(segment, state)| {
@@ -1028,6 +1048,7 @@ impl Pipeline {
             })
             .map(|(segment, _)| segment.file_id.file_index)
             .collect();
+        lost.extend(verdict.abandoned_files.iter().copied());
         let Some(active) = self
             .jobs
             .get_mut(&job_id)
@@ -1038,12 +1059,15 @@ impl Pipeline {
         let lost_file = |work: &DownloadWork| lost.contains(&work.segment_id.file_id.file_index);
         let mut abandoned = active.download_queue.extract_matching(lost_file);
         abandoned.extend(active.recovery_queue.extract_matching(lost_file));
-        if abandoned.is_empty() {
-            return;
-        }
         for work in abandoned {
             self.book_terminal_segment(work.segment_id, SegmentTerminalState::Abandoned);
         }
+        // Publish the new decision to the checkpoint only after all its
+        // refusals have reached the root. Earlier checkpoints may commit
+        // earlier decisions, never this decision without its refusals.
+        verdict.abandoned_files = lost;
+        self.post_probes.verdicts.insert(job_id, verdict);
+        self.checkpoint_graph_job(job_id);
         self.update_queue_metrics();
         self.maybe_finish_download_pass(job_id);
     }

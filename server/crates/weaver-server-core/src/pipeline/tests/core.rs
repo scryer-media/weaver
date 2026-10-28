@@ -490,18 +490,28 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
         .await
         .unwrap();
 
-    // The scheduler also keeps the queued workload off the held-off provider.
-    // Leasing more articles than the job holds means at least one lease came
-    // back unserved and its articles were leased again, so a lane has asked
-    // the held-off server and been answered.
-    wait_until(|| {
+    // Wait for this job's activated queue, then cross another actor turn.
+    // A held provider offers no fresh seats, so there must be no refused
+    // handouts to wait for: those were the dispatch spin this test guards.
+    loop {
+        let snapshot = harness.handle.pipeline_diagnostics().await.unwrap();
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| job.job_id == job_id.0 && job.download_queue_len == SEGMENTS)
+        {
+            break;
+        }
+    }
+    harness.handle.pipeline_diagnostics().await.unwrap();
+    assert_eq!(
         harness
             .handle
             .get_live_metrics()
-            .download_lane_lease_items_total
-            > leased_before + SEGMENTS as u64
-    })
-    .await;
+            .download_lane_lease_items_total,
+        leased_before,
+        "a held-off provider must not receive and return leases"
+    );
     assert_eq!(
         accepted.load(Ordering::SeqCst),
         1,

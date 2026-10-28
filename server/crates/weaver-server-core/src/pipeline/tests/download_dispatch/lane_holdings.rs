@@ -31,6 +31,7 @@ fn lease_works_to_new_lane(
     works: Vec<DownloadWork>,
 ) -> DownloadBatchLease {
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: Pipeline::next_download_lane_id(),
         job_id,
         runtime_generation: pipeline.pool_generation,

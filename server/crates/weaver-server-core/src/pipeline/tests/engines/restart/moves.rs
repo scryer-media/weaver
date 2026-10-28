@@ -67,7 +67,13 @@ fn delivered(restarted: &Restarted) -> Vec<&str> {
     restarted
         .files
         .keys()
-        .map(|name| name.rsplit('/').next().unwrap_or(name))
+        .map(|name| {
+            std::path::Path::new(name)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
         .collect()
 }
 

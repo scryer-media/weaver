@@ -237,6 +237,10 @@ func (docker *Docker) prepare(ctx context.Context, toolchain Toolchain) error {
 	}
 	dockerfile := filepath.Join(docker.Root, filepath.FromSlash(toolchain.Dockerfile))
 	args := []string{"build", "--platform", toolchain.Platform, "--tag", toolchain.Image, "--file", dockerfile}
+	if containerengine.Current().Kind == containerengine.Docker {
+		// Container-backed BuildKit builders otherwise leave only a cache entry.
+		args = append(args, "--load")
+	}
 	for _, argument := range toolchain.buildArgs() {
 		args = append(args, "--build-arg", argument)
 	}

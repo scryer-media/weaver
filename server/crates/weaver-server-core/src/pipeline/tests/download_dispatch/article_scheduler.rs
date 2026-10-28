@@ -71,6 +71,7 @@ fn lane_holding(pipeline: &mut Pipeline, job_id: JobId, holds: usize, depth: usi
     pipeline.download_lane_owners.insert(
         lane_id,
         DownloadLaneOwner {
+            body_activity: Vec::new(),
             job_id,
             mode: DownloadLaneMode::Sequential,
             completion_critical: false,

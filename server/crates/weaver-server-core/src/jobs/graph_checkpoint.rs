@@ -36,6 +36,8 @@ const BATCH: usize = 64;
 // Every row, each table in key order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GraphCheckpoint {
+    // Server-owned state read in the same transaction as its refusals.
+    pub(crate) feed_verdict: Option<super::feed_verdict::FeedVerdict>,
     pub(crate) nodes: Vec<NodeRow>,
     pub(crate) members: Vec<MemberRow>,
     pub(crate) coverage: Vec<CoverageRow>,
@@ -473,6 +475,9 @@ pub(crate) type Changes<R> = BTreeMap<<R as Row>::Key, Option<R>>;
 // What one checkpoint changes of the one before it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delta {
+    // None leaves the verdict unchanged. New retry attempts get a new
+    // active row; ordinary checkpoint replacement must not clear it.
+    pub(crate) feed_verdict: Option<super::feed_verdict::FeedVerdict>,
     // Nothing is known of what the database holds of the job, so every row
     // of it goes before these are written.
     pub(crate) whole: bool,
@@ -502,10 +507,16 @@ impl Delta {
     }
 
     // This change followed by `later`, as one.
-    pub(crate) fn absorb(&mut self, later: Delta) {
+    pub(crate) fn absorb(&mut self, mut later: Delta) {
         if later.whole {
+            if later.feed_verdict.is_none() {
+                later.feed_verdict = self.feed_verdict.take();
+            }
             *self = later;
             return;
+        }
+        if later.feed_verdict.is_some() {
+            self.feed_verdict = later.feed_verdict;
         }
         self.nodes.extend(later.nodes);
         self.members.extend(later.members);
@@ -518,7 +529,7 @@ impl Delta {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        !self.whole && self.rows() == 0
+        !self.whole && self.rows() == 0 && self.feed_verdict.is_none()
     }
 
     // How many rows it writes or deletes.
@@ -626,6 +637,13 @@ async fn write_delta(tx: &mut SqlTx<'_>, job_id: JobId, delta: &Delta) -> Result
     write(tx, id, &delta.parts).await?;
     write(tx, id, &delta.holds).await?;
     write(tx, id, &delta.held_parts).await?;
+    if let Some(verdict) = &delta.feed_verdict {
+        tx.execute(
+            "UPDATE active_jobs SET feed_verdict = {} WHERE job_id = {}",
+            &[SqlArg::Text(verdict.encode()?), SqlArg::I64(id)],
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -870,7 +888,19 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
+    let feed_verdict = tx
+        .fetch_optional(
+            "SELECT feed_verdict FROM active_jobs WHERE job_id = {}",
+            &args,
+        )
+        .await?
+        .map(|row| row.opt_text("feed_verdict"))
+        .transpose()?
+        .flatten()
+        .map(|value| super::feed_verdict::FeedVerdict::decode(&value))
+        .transpose()?;
     Ok(Some(GraphCheckpoint {
+        feed_verdict,
         nodes,
         members,
         coverage,

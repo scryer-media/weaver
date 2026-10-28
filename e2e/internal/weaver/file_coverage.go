@@ -27,6 +27,18 @@ type fileCoverage struct {
 	Runs []fileCoverageRun `json:"runs"`
 }
 
+// Healthy excludes recorded damage: damaged bytes occupy a range but cannot
+// satisfy a restart assertion about input the downloader may keep.
+func (coverage fileCoverage) Healthy() fileCoverage {
+	var healthy fileCoverage
+	for _, run := range coverage.Runs {
+		if run.Provenance == "fresh" || run.Provenance == "repaired" {
+			healthy.Runs = append(healthy.Runs, run)
+		}
+	}
+	return healthy
+}
+
 func (coverage fileCoverage) CoveredBytes() uint64 {
 	var total uint64
 	for _, run := range coverage.Runs {

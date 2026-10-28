@@ -158,7 +158,10 @@ impl TestHarness {
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
-            direct_store: None,
+            direct_store: Some(crate::settings::DirectStoreOverrides {
+                holds_disk_reserve_bytes: Some(1),
+                ..Default::default()
+            }),
             // Pinned off rather than left at the shipped default, so an
             // extraction fixture whose member happens to be called
             // `sample.mkv` keeps asserting extraction instead of asserting the
@@ -220,6 +223,8 @@ impl TestHarness {
         )
         .await
         .unwrap();
+        // Ordinary fixtures do not inherit the host's production disk reserve.
+        Arc::make_mut(&mut pipeline.extraction_limits).min_free_bytes = 1;
         let pipeline_task = tokio::spawn(async move {
             pipeline.run().await;
         });
@@ -301,6 +306,14 @@ pub(in crate::pipeline) fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
 // Build a waiting job's articles as its first handout would, and wait for
 // them: the read is sent for and its result delivered on the actor's turn.
 pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the retiring owner acknowledges completion");
+        pipeline.graph_run_said(said);
+    }
     pipeline.request_job_activation(job_id);
     let done = pipeline
         .job_activated_rx
@@ -597,6 +610,10 @@ async fn new_direct_pipeline_on_machine(
     // Jobs added through the handle persist their archive password, which
     // needs a key, exactly as a running server has one.
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let mut direct_store = direct_store.unwrap_or_default();
+    // A drained fixture can page its holds regardless of host disk headroom.
+    // Keep any explicit reserve supplied by the scenario.
+    direct_store.holds_disk_reserve_bytes.get_or_insert(1);
     let config: SharedConfig = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
         hardware_profile: None,
@@ -612,7 +629,7 @@ async fn new_direct_pipeline_on_machine(
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
-        direct_store,
+        direct_store: Some(direct_store),
         // Pinned off for the same reason as the harness above: an extraction
         // fixture must not start asserting the delivery-naming policy.
         delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
@@ -651,7 +668,7 @@ async fn new_direct_pipeline_on_machine(
     });
     let buffers = BufferPool::new(buffer_config);
 
-    let pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
         buffers,
@@ -670,6 +687,8 @@ async fn new_direct_pipeline_on_machine(
     .await
     .unwrap();
 
+    // Reserve-specific scenarios install their own limits after construction.
+    Arc::make_mut(&mut pipeline.extraction_limits).min_free_bytes = 1;
     (pipeline, intermediate_dir, complete_dir)
 }
 
@@ -1946,6 +1965,14 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
 // Hands the actor every failed job's working-directory release in flight,
 // so each records its history as the orchestrator records it.
 pub(in crate::pipeline) async fn settle_failed_releases(pipeline: &mut Pipeline) {
+    while !pipeline.pending_graph_failures.is_empty() {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("a failed graph retains its workers until their acknowledgment");
+        pipeline.graph_run_said(said);
+    }
     while !pipeline.releasing_failed_jobs.is_empty() {
         let released = pipeline
             .failed_release_rx

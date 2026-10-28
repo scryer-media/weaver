@@ -11,8 +11,8 @@ import (
 
 func TestDeadPostFailureModesAreIsolated(t *testing.T) {
 	// One dead post with nothing to recover from and one whose advertised
-	// recovery is deleted with it. Both fail with nothing delivered whole:
-	// the graph has no health abort, so the verdict is what was delivered.
+	// recovery is deleted with it. The server feed supplies the failure
+	// reason; neither case may deliver usable output.
 	scenarios := loadScenariosForSlugs([]string{"dead-post-first-articles-missing", "dead-post-recovery-unobtainable"})
 	if len(scenarios) != 2 {
 		t.Fatalf("expected both dead-post scenarios, got %d", len(scenarios))
@@ -22,8 +22,12 @@ func TestDeadPostFailureModesAreIsolated(t *testing.T) {
 			if scenario.ExpectedOutcome != "health_failure" || !slices.Contains(scenario.DeleteSubjectContains, ".rar") {
 				t.Fatal("both cases must delete their data articles and require a failure")
 			}
-			if scenario.ExpectedErrorContains != "no file was delivered whole" {
-				t.Fatalf("%s must fail with nothing delivered whole, not %q", scenario.Slug, scenario.ExpectedErrorContains)
+			wantReason := "below critical"
+			if scenario.Slug == "dead-post-first-articles-missing" {
+				wantReason = "first articles are missing"
+			}
+			if scenario.ExpectedErrorContains != wantReason {
+				t.Fatalf("%s must report %q, not %q", scenario.Slug, wantReason, scenario.ExpectedErrorContains)
 			}
 			par2 := false
 			for _, asset := range scenario.FixtureAssets {

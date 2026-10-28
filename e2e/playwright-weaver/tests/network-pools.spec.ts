@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { expect, test } from "./helpers";
+import { expect, metricValue, metrics, test } from "./helpers";
 import { waitTerminal } from "./support/downloads";
 import {
   type NetworkFlow, type PoolFlow, type ProxyProfile, extended, flowAfter, flowMark, graphqlErrors, ladderLeg, legOn,
   platformNetworking, poolOn, proxyProfiles, rung, serverKey, testPool, updatePool,
 } from "./support/network-flow";
 import { NetworkWorld, PROXIED_HOST, saveEvidence, serverHealth } from "./support/network-scenario";
-import { fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
+import { controlRoute, fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
 import { addBandwidth, addLatency, addToxic, removeToxic } from "./support/toxiproxy";
 import { controlTunnel } from "./support/tunnel-fixture";
 
@@ -125,16 +125,20 @@ test("P04 @extended the interval race re-pins the fastest member once it recover
 
 test("P05 a race runs once a server over-limit clears and the pin holds", async ({ request }) => {
   test.setTimeout(0);
-  const { view, connect1 } = await latencyPool(request);
+  const { view, connect1, server } = await latencyPool(request);
   await world.holdChaosSession();
   const download = await world.pacedDownload("p05-over-limit");
   const before = await pinned(request, view, connect1.id, "connect1 pinned");
   // The held control session takes one slot of max_conns=2, leaving Weaver one.
-  const healthBefore = (await serverHealth(request, PROXIED_HOST))[0]?.failureCount ?? 0;
-  await world.setChaos("slow_body=1500,max_conns=2");
-  await expect.poll(async () => (await serverHealth(request, PROXIED_HOST))[0]?.failureCount ?? 0, { timeout: 0, message: "over-limit refusals recorded" }).toBeGreaterThan(healthBefore);
+  const refusals = async () => metricValue(await metrics(request), "weaver_server_provider_refusals_total", { server_id: String(server) }) ?? 0;
+  const refusalsBefore = await refusals();
+  await world.setChaos("slow_body=10,max_conns=2");
+  // Admission limits do not evict established sessions. Force fresh admissions
+  // through the unchanged routes so the provider can actually refuse them.
+  await Promise.all(["connect1", "connect2", "connect3"].map(route => controlRoute(request, { route, cut: true })));
+  await expect.poll(refusals, { timeout: 0, message: "over-limit refusals recorded" }).toBeGreaterThan(refusalsBefore);
   const atOff = await flowAfter(request, await flowMark(request), () => true, "a sample at the over-limit");
-  await world.setChaos("slow_body=1500");
+  await world.setChaos("slow_body=10");
   const raced = await flowAfter(request, atOff.sampledAt, flow => view(flow)!.members.some(candidate => {
     const earlier = member(view(atOff), candidate.id);
     return candidate.connectMs !== earlier?.connectMs || candidate.samples > (earlier?.samples ?? 0);
@@ -253,8 +257,9 @@ test("P12 a slower handshake on the pin raises its connect time while delivery h
   const before = await pinned(request, view, connect1.id, "connect1 pinned");
   const baseline = member(view(before), connect1.id)!.connectMs!;
   await addLatency(request, "connect1", 500);
-  // Churn makes Weaver dial connect1 again so its connect time is re-measured.
-  await world.setChaos("slow_body=1500,drop_conn=20");
+  // Re-dial after the latency change instead of waiting for a random drop
+  // after an arbitrarily long BODY. Keep the route available to reconnect.
+  await controlRoute(request, { route: "connect1", cut: true });
   const slower = await flowAfter(request, before.sampledAt, flow => (member(view(flow), connect1.id)?.connectMs ?? 0) > baseline, "connect1 connect time rose");
   // Until a race runs (P03, P04) the pin holds and delivery continues.
   expect(view(slower)!.pinnedMember).toBe(connect1.id);

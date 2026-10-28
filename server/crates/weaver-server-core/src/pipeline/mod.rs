@@ -322,6 +322,8 @@ impl Pipeline {
 }
 
 pub(super) struct DownloadLaneOwner {
+    // Weak lease counters: only live response contexts keep them alive.
+    body_activity: Vec<(JobId, u64, std::sync::Weak<std::sync::atomic::AtomicU64>)>,
     job_id: JobId,
     mode: DownloadLaneMode,
     completion_critical: bool,
@@ -333,6 +335,7 @@ pub(super) struct DownloadLaneOwner {
 }
 
 pub(super) struct DownloadBatchLease {
+    pub(super) body_activity: Arc<std::sync::atomic::AtomicU64>,
     pub(super) lane_id: u64,
     pub(super) job_id: JobId,
     pub(super) runtime_generation: u64,
@@ -1635,6 +1638,7 @@ pub struct Pipeline {
     // Failed jobs whose working directory is being released; each records
     // its history when the release comes back.
     pub(super) releasing_failed_jobs: HashSet<JobId>,
+    pub(super) pending_graph_failures: HashMap<JobId, health::PendingGraphFailure>,
     // Final moves admitted after the post-processing hold is lifted.
     pub(super) deferred_moves: HashSet<JobId>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.

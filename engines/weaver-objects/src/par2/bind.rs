@@ -134,8 +134,10 @@ pub(super) fn bind_sets(
 
 // The file the member is, by its content first and its name after.
 fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId> {
-    if let Some(file) = by_content(index, candidate) {
-        return Some(file);
+    match by_content(index, candidate) {
+        ContentMatch::Unique(file) => return Some(file),
+        ContentMatch::Ambiguous => return None,
+        ContentMatch::Inconclusive => {}
     }
     let mut matches = described(index, |description| description.filename == candidate.name);
     if matches.is_empty() {
@@ -173,15 +175,22 @@ fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId
 // A zero-length description has no content to be identified by, and a
 // window the front does not reach cannot be tested. A split fragment begins
 // with the whole described file, so its front matches though it is not it.
-fn by_content(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId> {
+enum ContentMatch {
+    Unique(FileId),
+    Inconclusive,
+    Ambiguous,
+}
+
+fn by_content(index: &Par2FileSet, candidate: &Candidate<'_>) -> ContentMatch {
     let matches = described(index, |description| {
         !candidate.contradicts(description.length)
             && !is_split_fragment_of(candidate.name, &description.filename)
             && candidate.window_hash(description.length) == Some(description.hash_16k)
     });
     match matches.as_slice() {
-        [(file, _)] => Some(*file),
-        _ => None,
+        [(file, _)] => ContentMatch::Unique(*file),
+        [] => ContentMatch::Inconclusive,
+        _ => ContentMatch::Ambiguous,
     }
 }
 

@@ -15,6 +15,28 @@ use crate::pipeline::graph::namespace::{Returned, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
 impl GraphJob {
+    // A terminal failure keeps worker ownership until the matching end
+    // acknowledgments arrive. Late output and checkpoint acknowledgments
+    // must not publish more files or start another step of the failed job.
+    pub(crate) fn drain_failed_run(&mut self, said: Said) -> Result<(), GraphError> {
+        match said.heard {
+            Heard::Ended if self.runs.current(said.node, said.generation) => {
+                self.runs.ended(said.node, said.generation, 0);
+            }
+            Heard::Repaired(returned) => {
+                self.loans.returned(said.node, said.generation);
+                returned.repaired.remove().map_err(WriteError::from)?;
+            }
+            Heard::Written { stamp, control } => {
+                if self.pending.control().same(&control) {
+                    self.acknowledge_checkpoint(stamp.unwrap_or(said.generation));
+                }
+            }
+            Heard::Emit(_) | Heard::Ended | Heard::CheckpointBlocked { .. } => {}
+        }
+        Ok(())
+    }
+
     // What a run said, or a repair lent off the loop came back with. A
     // stopped run's words carry an old generation and are not heard.
     pub(crate) fn run_said(
@@ -28,7 +50,14 @@ impl GraphJob {
             Heard::Repaired(returned) => {
                 return self.repaired(node, said.generation, *returned, slots, limit);
             }
-            Heard::Written(stamp) => return self.written(stamp),
+            Heard::Written { stamp, control } => {
+                return if self.pending.control().same(&control) {
+                    self.written(stamp, said.generation)
+                } else {
+                    Ok(())
+                };
+            }
+            Heard::CheckpointBlocked { .. } => return Ok(()),
             _ if !self.runs.current(node, said.generation) => return Ok(()),
             Heard::Emit(emit) => {
                 // The tree is told the run is asking, as it is told how far

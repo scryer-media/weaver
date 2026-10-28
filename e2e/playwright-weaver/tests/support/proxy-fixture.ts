@@ -18,7 +18,7 @@ export type FixtureEvent = {
   client?: string; status?: number; socksReply?: number; path?: string; name?: string; bytes?: number;
 };
 /** A route's service as the control last set it. */
-export type RouteService = { up: boolean; hold: boolean; connectStatus: number | null; socksReply: number | null };
+export type RouteService = { up: boolean; hold: boolean; holdConnect: boolean; connectStatus: number | null; socksReply: number | null };
 export type FixtureState = {
   ip: string; addresses: string[]; ports: Record<string, number>; sequence: number;
   events: FixtureEvent[]; active: Record<string, number>; routes: Record<string, RouteService>;
@@ -53,6 +53,8 @@ export async function waitFixtureEvents(
 
 export type RouteCommand = {
   route: string; up?: boolean; hold?: boolean; cut?: boolean;
+  /** Hold connection admission until the test has observed the pending probe. */
+  holdConnect?: boolean;
   /** CONNECT answers this status instead of 200; null restores normal service. */
   connectStatus?: number | null;
   /** SOCKS5 answers this reply code instead of success; null restores it. */
@@ -73,7 +75,7 @@ export const SOCKS_MEMBERS = ["socks1", "socks2", "socks3", "socks4"] as const;
 
 /** Normal service: up, not held, and answering CONNECT and SOCKS5 as it should. */
 export const inService = (service: RouteService | undefined): boolean =>
-  service !== undefined && service.up && !service.hold && service.connectStatus === null && service.socksReply === null;
+  service !== undefined && service.up && !service.hold && !service.holdConnect && service.connectStatus === null && service.socksReply === null;
 
 /**
  * Wait until the fixture itself reports every named route in normal service.
@@ -102,7 +104,7 @@ export async function resetRoutes(request: APIRequestContext): Promise<void> {
   const failures: string[] = [];
   for (const route of Object.keys(state.routes)) {
     try {
-      await controlRoute(request, { route, up: true, hold: false, connectStatus: null, socksReply: null });
+      await controlRoute(request, { route, up: true, hold: false, holdConnect: false, connectStatus: null, socksReply: null });
     } catch (error) {
       failures.push(`${route}: ${String(error)}`);
     }

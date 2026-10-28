@@ -16,6 +16,34 @@ import (
 	"github.com/scryer-media/weaver/e2e/internal/fixturegen"
 )
 
+func TestExtractsNothingAllowsOnlyUnchangedPostedFilesAfterFailure(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "posted.zip")
+	writeFile(t, source, "posted archive bytes")
+	for _, tc := range []struct {
+		name, status, output, contents string
+		allowed                        bool
+	}{
+		{"retained post", "FAILED", "posted.zip", "posted archive bytes", true},
+		{"ownership marker", "FAILED", ".weaver-job-dir", "marker", true},
+		{"extracted payload", "FAILED", "payload.bin", "decoded bytes", false},
+		{"overwritten post", "FAILED", "posted.zip", "decoded bytes", false},
+		{"graph scratch", "FAILED", ".weaver-chunks/graph-envelope-1-0", "scratch", false},
+		{"published post", "COMPLETE", "posted.zip", "posted archive bytes", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := t.TempDir()
+			writeFile(t, filepath.Join(out, tc.output), tc.contents)
+			problems := checkUnextractedFiles(adversarialSettled{
+				Status: tc.status, OutputDir: out, Outputs: []string{tc.output},
+			}, []stagedSeedFile{{source: source, name: "posted.zip"}})
+			if (len(problems) == 0) != tc.allowed {
+				t.Fatalf("allowed=%v, problems=%v", tc.allowed, problems)
+			}
+		})
+	}
+}
+
 func TestEveryAdversarialScenarioCarriesAValidContract(t *testing.T) {
 	cases, err := loadAdversarialCases(testdataDir())
 	if err != nil {
@@ -190,6 +218,17 @@ func TestAdversarialNameLeaksSkipEveryOutputDirectory(t *testing.T) {
 	}
 	if !reflect.DeepEqual(leaks, []string{leaked}) {
 		t.Fatalf("leaks %v, want only %s", leaks, leaked)
+	}
+}
+
+func TestAdversarialOutputTreeRefusesEmptyGraphScratch(t *testing.T) {
+	output := t.TempDir()
+	if err := os.Mkdir(filepath.Join(output, ".weaver-chunks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	problems := adversarialOutputTreeProblems(output)
+	if len(problems) != 1 || !strings.Contains(problems[0].Error(), "graph scratch") {
+		t.Fatalf("empty graph scratch was not rejected: %v", problems)
 	}
 }
 

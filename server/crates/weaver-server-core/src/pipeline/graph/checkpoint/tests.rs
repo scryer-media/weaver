@@ -381,6 +381,7 @@ fn held(delta: &Delta) -> GraphCheckpoint {
     }
     assert!(delta.whole);
     GraphCheckpoint {
+        feed_verdict: delta.feed_verdict.clone(),
         nodes: of(&delta.nodes),
         members: of(&delta.members),
         coverage: of(&delta.coverage),
@@ -464,6 +465,46 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     let delta = restored.take().0.unwrap();
     assert_eq!(delta.rows(), 1, "{delta:?}");
     assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));
+}
+
+#[test]
+fn checkpoint_acknowledgments_belong_to_the_owner_and_latest_awaited_stamp() {
+    use crate::pipeline::graph::engine::{Heard, Said};
+    let (mut job, _dir) = long_post(20);
+    let pending = job.pending().clone();
+    pending.put(&job, Vec::new());
+    let (_, first) = pending.take();
+    job.owe_mail(first);
+    intake(&mut job, 20);
+    pending.put(&job, Vec::new());
+    let (_, latest) = pending.take();
+    assert!(latest > first);
+    job.owe_mail(latest);
+    let mut slots = RepairSlots::default();
+    let message = |stamp, control| Said {
+        scope: 0,
+        node: NodeId::ROOT,
+        generation: stamp,
+        heard: Heard::Written {
+            stamp: Some(stamp),
+            control,
+        },
+    };
+    job.run_said(message(latest, Pending::default().control()), &mut slots, 0)
+        .unwrap();
+    assert!(
+        job.awaits_mail(),
+        "a former owner's completion cannot release this graph"
+    );
+    job.run_said(message(first, pending.control()), &mut slots, 0)
+        .unwrap();
+    assert!(
+        job.awaits_mail(),
+        "an older checkpoint cannot release the current wait"
+    );
+    job.run_said(message(latest, pending.control()), &mut slots, 0)
+        .unwrap();
+    assert!(!job.awaits_mail());
 }
 
 // What `after` changes of `before`, which is the checkpoint the database

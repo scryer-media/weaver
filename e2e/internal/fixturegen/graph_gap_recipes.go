@@ -8,12 +8,13 @@ import (
 	"bytes"
 	"compress/flate"
 	"context"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 )
 
-// The zip fixtures behind the graph engine's zip rulings: a byte lost inside
+// The ZIP fixtures behind the graph engine's ZIP rulings: a byte lost inside
 // one entry of a compressed zip fails that entry alone, and a zip's empty
 // directories and code page 437 names come out as the entries declare them.
 // Both are written by Go from the generator's own pseudorandom payloads, so
@@ -44,7 +45,7 @@ type zipEntry struct {
 	UTF8Flag bool
 }
 
-// GraphGapRecipes are the fixtures for the graph-engine zip scenarios.
+// GraphGapRecipes exercise ZIP delivery and PAR2 content identity.
 func GraphGapRecipes() []Recipe {
 	return []Recipe{
 		{
@@ -99,6 +100,56 @@ func GraphGapRecipes() []Recipe {
 					cp437DecodedName:  env.StagePath("cafe.txt"),
 					unflaggedUTF8Name: env.StagePath("nandu.srt"),
 				}, nil
+			},
+		},
+		{
+			Slug: "zip-unicode-collisions", Family: "zip", ByteReproducible: true,
+			Notes: "Three UTF-8 ZIP members collide under Unicode normalization and case folding. Every distinct payload must survive under the existing namespace suffix policy.",
+			Build: func(_ context.Context, env *Env) error {
+				names := []string{"Café.txt", "Cafe\u0301.txt", "CAFÉ.TXT"}
+				var entries []zipEntry
+				for index, name := range names {
+					source := env.StagePath(fmt.Sprintf("member-%d", index))
+					if err := WritePRNG(source, "zip-unicode-collisions/"+name, 4096); err != nil {
+						return err
+					}
+					entries = append(entries, zipEntry{RawName: name, Source: source, Deflate: true, UTF8Flag: true})
+				}
+				return writeZipEntries(env.OutputPath("archive.zip"), entries)
+			},
+			ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
+				return map[string]string{
+					"Café.txt":           env.StagePath("member-0"),
+					"Cafe\u0301 (1).txt": env.StagePath("member-1"),
+					"CAFÉ (2).TXT":       env.StagePath("member-2"),
+				}, nil
+			},
+		},
+		{
+			Slug: "par2-exact-name-content-match", Family: "PAR2", ByteReproducible: true,
+			Notes: "A valid PAR2 set describes a.bin and b.bin. Only a.bin's bytes are posted, under b.bin's exact name; content must bind them to a.bin and recovery must reconstruct b.bin.",
+			Build: func(ctx context.Context, env *Env) error {
+				for _, member := range []struct {
+					name string
+					size int64
+				}{{"a.bin", 8192}, {"b.bin", 16384}} {
+					if err := WritePRNG(env.StagePath(member.name), "par2-exact-name-content-match/"+member.name, member.size); err != nil {
+						return err
+					}
+					if err := CopyFile(env.StagePath(member.name), env.OutputPath(member.name)); err != nil {
+						return err
+					}
+				}
+				if err := env.PAR2(ctx, PAR2Spec{Base: "set.par2", SliceSize: 4096, RecoveryBlocks: 4, RecoveryFiles: 1, Sources: []string{"a.bin", "b.bin"}}); err != nil {
+					return err
+				}
+				if err := os.Remove(env.OutputPath("a.bin")); err != nil {
+					return err
+				}
+				return CopyFile(env.StagePath("a.bin"), env.OutputPath("b.bin"))
+			},
+			ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
+				return map[string]string{"a.bin": env.StagePath("a.bin"), "b.bin": env.StagePath("b.bin")}, nil
 			},
 		},
 	}

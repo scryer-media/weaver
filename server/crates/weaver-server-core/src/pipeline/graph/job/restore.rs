@@ -124,7 +124,7 @@ impl GraphJob {
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
-            mail_owed: false,
+            mail_owed: None,
             notes: Vec::new(),
         };
         for (node, index) in &snapshot.passwords {

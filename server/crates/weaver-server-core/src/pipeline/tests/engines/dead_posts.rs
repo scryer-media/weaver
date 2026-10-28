@@ -94,6 +94,51 @@ async fn a_first_article_lost_before_a_restart_still_counts_toward_the_sample() 
 }
 
 #[tokio::test]
+async fn committed_feed_verdict_survives_restart_without_fetching_abandoned_files() {
+    let first: Vec<_> = (0..10).map(|file| (file, 0)).collect();
+    let scenario = (0..10).fold(Scenario::new(files()).first(&first), |scenario, file| {
+        scenario.lost(file, 0)
+    });
+    let mut committed = false;
+    let restarted = super::restart::run_restarting_at(
+        &scenario,
+        &mut |rows| {
+            let verdict = rows
+                .feed_verdict
+                .as_ref()
+                .expect("the crash follows a committed feed verdict");
+            assert!(verdict.reason.contains("first articles are missing"));
+            assert_eq!(verdict.abandoned_files, (0..10).collect());
+            committed = true;
+        },
+        super::restart::Down::Crash,
+        &|asked| asked == 10,
+    )
+    .await;
+    assert!(committed);
+    assert_eq!(restarted.restarts, 1);
+    assert_eq!(restarted.status, Some(JobStatus::Partial));
+    for file in 0..10 {
+        let fetched: Vec<_> = restarted
+            .order
+            .iter()
+            .copied()
+            .filter(|(index, _)| *index == file)
+            .collect();
+        assert_eq!(fetched, vec![(file, 0)], "abandoned file {file} restarted");
+    }
+    for file in 10..12u8 {
+        let suffix = format!("lantern{file:02}.bin");
+        let (_, delivered) = restarted
+            .files
+            .iter()
+            .find(|(name, _)| name.ends_with(&suffix))
+            .expect("healthy files still finish");
+        assert_eq!(*delivered, payload(4 * ARTICLE, file));
+    }
+}
+
+#[tokio::test]
 async fn the_sample_is_the_payloads_first_articles_and_not_its_recoverys() {
     // Eleven of twelve files lost at their first article, beside a recovery
     // set of four blocks in four volumes whose first articles all came, far
