@@ -406,6 +406,14 @@ impl<'de> serde::Deserialize<'de> for LayerEntries<'de> {
 pub struct TorrentMetaV1Info<BufType> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<BufType>,
+    /// The name in UTF-8, which libtorrent takes over `name` where both
+    /// are given.
+    #[serde(
+        rename = "name.utf-8",
+        default = "none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub name_utf8: Option<BufType>,
     /// SHA-1 piece hashes, present whenever the torrent has a v1 listing.
     #[serde(default = "none", skip_serializing_if = "Option::is_none")]
     pub pieces: Option<BufType>,
@@ -1208,6 +1216,7 @@ where
     fn clone_to_owned(&self, within_buffer: Option<&Bytes>) -> Self::Target {
         TorrentMetaV1Info {
             name: self.name.clone_to_owned(within_buffer),
+            name_utf8: self.name_utf8.clone_to_owned(within_buffer),
             pieces: self.pieces.clone_to_owned(within_buffer),
             piece_length: self.piece_length,
             meta_version: self.meta_version,

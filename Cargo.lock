@@ -6526,6 +6526,7 @@ dependencies = [
  "walkdir",
  "weaver-model",
  "windows",
+ "x509-parser",
 ]
 
 [[package]]

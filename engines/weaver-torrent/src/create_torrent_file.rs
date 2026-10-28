@@ -171,6 +171,7 @@ async fn create_torrent_raw<'a>(
     Ok(CreateTorrentRawResult {
         info: TorrentMetaV1Info {
             name: Some(name),
+            name_utf8: None,
             pieces: Some(piece_hashes.into()),
             piece_length,
             meta_version: None,
