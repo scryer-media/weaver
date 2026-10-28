@@ -52,15 +52,8 @@ impl Image {
     pub(super) fn open(joined: Joined, budget: &weaver_graph::Budget) -> Result<Image, Unopened> {
         let lengths = joined.closed_lens()?;
         let total: u64 = lengths.iter().sum();
-        let whole = |joined| Image {
-            joined,
-            prefix: total,
-            rest: Vec::new(),
-            position: 0,
-        };
-        // With no end record the library says what is wrong.
         let Some((start, found)) = find_end(&joined, total)? else {
-            return Ok(whole(joined));
+            return Err(Unopened::Refused(Why::Unrepairable));
         };
         let base = |disk: u32| -> Option<u64> {
             lengths
@@ -110,7 +103,7 @@ impl Image {
                     .checked_add(end.size)
                     .is_some_and(|end| end <= after)
             });
-        let rest = match directory {
+        let mut rest = match directory {
             Some(directory) => {
                 let mut bytes = vec![0u8; end.size as usize];
                 joined.read_exact(directory, &mut bytes)?;
@@ -118,6 +111,26 @@ impl Image {
             }
             None => None,
         };
+        // A single-volume archive may have a prepended executable. Its
+        // directory still ends before the end records; shift the offsets
+        // only after validating that bounded directory at its actual place.
+        if rest.is_none()
+            && lengths.len() == 1
+            && end.directory_disk == 0
+            && let Some((directory, shift)) = after.checked_sub(end.size).and_then(|directory| {
+                directory
+                    .checked_sub(end.offset)
+                    .filter(|shift| *shift > 0)
+                    .map(|shift| (directory, shift))
+            })
+        {
+            let mut bytes = vec![0u8; end.size as usize];
+            joined.read_exact(directory, &mut bytes)?;
+            rest = rewrite(&bytes, &end, directory, &|disk| {
+                (disk == 0).then_some(shift)
+            })
+            .map(|rest| (directory, rest));
+        }
         match rest {
             Some((prefix, rest)) => Ok(Image {
                 joined,
@@ -125,9 +138,6 @@ impl Image {
                 rest,
                 position: 0,
             }),
-            // A volume whose directory is not where its end record puts it
-            // has bytes in front of the archive: the library finds it there.
-            None if lengths.len() == 1 => Ok(whole(joined)),
             None => Err(Unopened::Refused(Why::Unsupported)),
         }
     }
@@ -135,12 +145,8 @@ impl Image {
     // The archive, as the library reads it. Where the run holds the records,
     // the library learns the archive from them alone, at their places in
     // the whole and with nothing in front of them, so it reads no entry's
-    // bytes to open it; it then reads each entry from the set. Otherwise it
-    // reads the set, finds the archive in it, or says what is wrong.
+    // bytes to open it; it then reads each entry from the set.
     pub(super) fn archive(self) -> ZipResult<ZipArchive<Image>> {
-        if self.rest.is_empty() {
-            return ZipArchive::new(self);
-        }
         let records = Records {
             prefix: self.prefix,
             rest: &self.rest,

@@ -467,6 +467,20 @@
       }
     },
     {
+      "path": "testdata/adv-zip-directory-memory-lie/directory.zip",
+      "size": 9449160,
+      "blake3": "3d1117731698e27ad29c3469625efb161a00bffc7ac0925de5532410fc356eff",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
       "path": "testdata/adv-zip-directory-memory/directory.zip",
       "size": 9449160,
       "blake3": "7ada62eadfd3e8d60b4f562e1d2f20b97400d8eafab5bac7a17963966ac6ff49",

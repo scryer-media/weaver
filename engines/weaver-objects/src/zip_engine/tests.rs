@@ -278,6 +278,33 @@ fn a_directory_larger_than_the_run_memory_budget_is_refused() {
 }
 
 #[test]
+fn a_lying_directory_size_cannot_bypass_the_memory_limit() {
+    let mut archive = plain();
+    let end = records::find_end(&archive).unwrap().at as usize;
+    archive[end + 12..end + 16].copy_from_slice(&1u32.to_le_bytes());
+    let mut emits = Vec::new();
+    ZipEngine::new().start().run(
+        Gate::whole(vec![archive]),
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        weaver_graph::Budget {
+            memory_bytes: Some(8),
+            ..Default::default()
+        },
+    );
+    assert!(matches!(emits.as_slice(), [Emit::Refuse(_)]));
+}
+
+#[test]
+fn a_zip_with_prepended_bytes_extracts_normally() {
+    let mut archive = b"a self-extracting executable prefix".to_vec();
+    archive.extend(plain());
+    assert_eq!(run(&mut ZipEngine::new(), vec![archive]), plain_said());
+}
+
+#[test]
 fn a_run_waits_for_the_volume_to_close_and_extracts_once_it_has() {
     let archive = plain();
     let gate = Gate::new(vec![archive.clone()], vec![archive.len() / 2]);

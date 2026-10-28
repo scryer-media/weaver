@@ -217,6 +217,9 @@ pub(crate) fn directory(bytes: &[u8], entries: u64) -> Option<Vec<Central>> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while at < bytes.len() {
+        if out.len() as u64 == entries {
+            return None;
+        }
         let (entry, next) = central(bytes, at)?;
         out.push(entry);
         at = next;

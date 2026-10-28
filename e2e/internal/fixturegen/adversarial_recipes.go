@@ -174,6 +174,23 @@ func AdversarialRecipes() []Recipe {
 			Notes: "A valid zip with a central directory over eight MiB, built from large per-entry comments. Its tiny empty members must not make the directory allocation escape the run's memory reservation.",
 			Build: writeAdversarialZip("directory.zip", oversizedDirectoryEntries()),
 		},
+		{
+			Slug: "adv-zip-directory-memory-lie", Family: "adversarial", ByteReproducible: true,
+			Notes: "The oversized directory reports a size of one byte. Invalid directory metadata must not reopen the whole archive through an unbounded library fallback.",
+			Build: sequence(
+				writeAdversarialZip("directory.zip", oversizedDirectoryEntries()),
+				func(_ context.Context, env *Env) error {
+					path := env.OutputPath("directory.zip")
+					data, err := os.ReadFile(path)
+					if err != nil {
+						return err
+					}
+					end := len(data) - 22
+					binary.LittleEndian.PutUint32(data[end+12:end+16], 1)
+					return os.WriteFile(path, data, 0o644)
+				},
+			),
+		},
 	}
 	for _, lie := range adversarialPAR2Lies {
 		recipes = append(recipes, Recipe{
