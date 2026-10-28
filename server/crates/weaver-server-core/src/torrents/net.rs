@@ -500,6 +500,14 @@ where
     fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
         Ok(self.builder(target)?.build()?)
     }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a torrent session's client, built for its leg"
+    )]
+    fn title_case_client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        Ok(self.builder(target)?.http1_title_case_headers().build()?)
+    }
 }
 
 #[cfg(any(

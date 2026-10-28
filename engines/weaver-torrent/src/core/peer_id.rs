@@ -6,7 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use crate::core::hash_id::Id20;
-use rand::{self, Rng};
+use rand::RngExt;
 
 /// Return the version of the invoking crate as a tuple
 #[macro_export]
@@ -171,9 +171,20 @@ pub fn generate_peer_id(fingerprint: &[u8]) -> Id20 {
     let mut peer_id = [0u8; 20];
 
     peer_id[..8].copy_from_slice(fingerprint);
-    rand::rng().fill_bytes(&mut peer_id[8..]);
+    url_random(&mut peer_id[8..]);
 
     Id20::new(peer_id)
+}
+
+/// Fills `dest` with characters a URL carries unescaped, ' left out as some
+/// trackers fail on it (libtorrent `url_random`, the rest of its peer ids).
+pub fn url_random(dest: &mut [u8]) {
+    const PRINTABLE: &[u8] =
+        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_.!~*()";
+    let mut rng = rand::rng();
+    for byte in dest {
+        *byte = PRINTABLE[rng.random_range(0..PRINTABLE.len())];
+    }
 }
 
 #[cfg(test)]

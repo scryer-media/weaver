@@ -226,6 +226,12 @@ pub trait HttpClients: Send + Sync + 'static {
     fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
         Ok(self.builder(target)?.build()?)
     }
+
+    /// As [`Self::client`], writing each word of a header name capitalised,
+    /// as libtorrent writes them.
+    fn title_case_client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
+        Ok(self.builder(target)?.http1_title_case_headers().build()?)
+    }
 }
 
 /// The clients a builder makes, each held to its target.

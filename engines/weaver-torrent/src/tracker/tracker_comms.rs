@@ -948,6 +948,8 @@ pub struct TrackerScrape {
 struct Scraper {
     info_hashes: Mutex<Vec<Id20>>,
     user_agent: String,
+    /// The shape of the torrent's client's requests.
+    shape: tracker_comms_http::Shape,
     // In table order, one per URL.
     trackers: Mutex<Vec<SupportedTracker>>,
     http_clients: Arc<dyn HttpClients>,
@@ -1006,8 +1008,9 @@ impl Scraper {
             &url,
             tracker.named_by,
             Ask::Scrape,
-            &tracker_comms_http::scrape_querystring(&info_hash),
+            &tracker_comms_http::scrape_querystring(&info_hash, self.shape),
             &self.user_agent,
+            self.shape,
         )
         .await?;
         tracker_comms_http::parse_scrape(&answer.body, &info_hash)
@@ -1128,6 +1131,7 @@ impl TrackerStatus {
             scraper: Scraper {
                 info_hashes: Mutex::new(info_hashes),
                 user_agent: identity.user_agent.clone(),
+                shape: tracker_comms_http::Shape::of(&identity.peer_id),
                 trackers: Mutex::new(unique),
                 http_clients,
                 reachable,
@@ -2065,6 +2069,7 @@ impl TrackerComms {
             Ask::Announce,
             &request.as_querystring(),
             &self.identity.user_agent,
+            tracker_comms_http::Shape::of(&self.identity.peer_id),
         )
         .await?;
         let response = read_answer(&answer.body)?;

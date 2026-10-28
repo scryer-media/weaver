@@ -6,7 +6,10 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::Mutex;
 use url::Url;
 
-use crate::core::{hash_id::Id20, peer_id::generate_azereus_style};
+use crate::core::{
+    hash_id::Id20,
+    peer_id::{generate_azereus_style, url_random},
+};
 use crate::crate_version;
 
 /// How a torrent names itself to its peers and trackers. A torrent keeps one
@@ -68,8 +71,9 @@ impl Identity {
     /// The same client under a fresh peer id and tracker key: the eight
     /// bytes that name the client are kept, the rest drawn anew.
     pub fn same_client(&self) -> Self {
-        let mut peer_id: [u8; 20] = rand::random();
+        let mut peer_id = [0u8; 20];
         peer_id[..8].copy_from_slice(&self.peer_id.0[..8]);
+        url_random(&mut peer_id[8..]);
         Self {
             peer_id: Id20::new(peer_id),
             tracker_key: rand::random(),

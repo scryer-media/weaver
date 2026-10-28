@@ -599,10 +599,10 @@ impl Client {
     pub const fn name(self) -> ClientIdentity {
         match self {
             Self::Weaver => IDENTITY,
-            // libtorrent's fingerprint of `qB` 5.2.3.0; libtorrent sends the
+            // libtorrent's fingerprint of `qB` 5.3.0.0; libtorrent sends the
             // user agent as `v`.
             Self::QBittorrent => {
-                ClientIdentity::new(*b"-qB5230-", "qBittorrent/5.2.3", "qBittorrent/5.2.3")
+                ClientIdentity::new(*b"-qB5300-", "qBittorrent/5.3.0", "qBittorrent/5.3.0")
             }
             // Major, minor and patch in base 62, then `0` for a stable
             // release.
@@ -1317,7 +1317,7 @@ mod tests {
             qb.prefix(),
             &libtorrent(b"qB", &version(qb.user_agent(), '/'))
         );
-        assert_eq!(qb.prefix(), b"-qB5230-");
+        assert_eq!(qb.prefix(), b"-qB5300-");
         assert_eq!(qb.version(), qb.user_agent());
         assert_eq!(&libtorrent(b"qB", &[5, 1, 2]), b"-qB5120-");
         assert_eq!(&libtorrent(b"qB", &[5, 10, 0]), b"-qB5A00-");
