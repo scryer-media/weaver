@@ -225,3 +225,37 @@ fn a_post_at_exactly_its_critical_line_is_still_healthy() {
     assert!(below_critical(849, 850));
     assert!(!below_critical(851, 850));
 }
+
+// Ten files: the share is eight first articles lost.
+fn ten_heads(lost: usize, outstanding: usize) -> Gate {
+    let heads = std::iter::repeat_n(Head::Lost, lost)
+        .chain(std::iter::repeat_n(Head::Outstanding, outstanding))
+        .chain(std::iter::repeat(Head::Settled))
+        .take(10);
+    first_article_gate(heads)
+}
+
+#[test]
+fn the_sample_decides_before_health_while_its_outstanding_first_articles_could_reach_its_share() {
+    // Four lost, six to come: the six could take it past eight.
+    assert_eq!(ten_heads(4, 6), Gate::Undecided);
+    // Four lost, three to come, three in hand: seven at most.
+    assert_eq!(ten_heads(4, 3), Gate::Open);
+    // Eight lost rules with two still to come.
+    assert_eq!(
+        ten_heads(8, 2),
+        Gate::Dead {
+            missing: 8,
+            total: 10
+        }
+    );
+    // A sample of fewer than ten files never rules, so health speaks.
+    assert_eq!(
+        first_article_gate(std::iter::repeat_n(Head::Lost, 9)),
+        Gate::Open
+    );
+    assert_eq!(
+        first_article_gate(std::iter::repeat_n(Head::Outstanding, 9)),
+        Gate::Open
+    );
+}

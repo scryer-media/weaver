@@ -8,10 +8,12 @@
 use std::io::Write;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload, run,
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload,
+    repair_and_terminal_events, run,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::lines::Lines;
 
 fn ember() -> Vec<u8> {
     payload(9 * ARTICLE + 21, 61)
@@ -118,6 +120,42 @@ async fn an_xz_stream_split_into_numbered_pieces_delivers_the_file_it_holds() {
         .collect();
     let graph = run(&Scenario::new(pieces)).await;
     assert_delivered(&graph, &[("ember.bin", ember())]);
+}
+
+// A damaged xz posted in numbered pieces: the stream is refused for its own
+// reason and gives its pieces back, each listed damaged as it was posted,
+// and with nothing usable the job fails.
+#[tokio::test]
+async fn a_damaged_xz_split_into_numbered_pieces_fails() {
+    let compressed = damaged_in_the_middle(xz(&prose()));
+    let chunk = compressed.len().div_ceil(3);
+    let pieces = compressed
+        .chunks(chunk)
+        .zip(1..)
+        .map(|(bytes, number)| Post::plain(&format!("ember.bin.xz.{number:03}"), bytes.to_vec()))
+        .collect();
+    let graph = run(&Scenario::new(pieces)).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+    let files = &graph.graph().delivery.files;
+    let listed: Vec<(&str, u32, bool)> = files
+        .iter()
+        .map(|file| (file.name.as_str(), file.depth, file.whole))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("ember.bin.xz.001", 0, false),
+            ("ember.bin.xz.002", 0, false),
+            ("ember.bin.xz.003", 0, false),
+        ],
+        "{files:?}"
+    );
 }
 
 #[tokio::test]
@@ -339,12 +377,42 @@ async fn a_stream_member_gives_the_naming_plan_no_checksum() {
     assert!(crate::pipeline::completion::finalize::member_crc32_by_path(files).is_empty());
 }
 
-// A single archive or compressed stream posted under `name` with no
-// recovery, which ends with nothing usable: an object opened it and got
-// nothing whole from it, or nothing opened it and it is left as it was
-// posted, which is no file the user opens. With nothing else usable the job
-// fails, never Partial and never Complete.
-async fn assert_a_single_archive_with_nothing_usable_fails(name: &str, bytes: Vec<u8>) {
+// A single file posted under `name` with a compressed stream's or a tar's
+// name and no recovery, whose bytes all arrived and which nothing opened: it
+// is no stream, so it is a file as posted, the delivery, whole and
+// unmarked, and the job completes with it and with nothing unpacked from it.
+async fn assert_a_single_stream_completes_as_posted(name: &str, bytes: Vec<u8>) {
+    let graph = run(&Scenario::new(vec![Post::plain(name, bytes.clone())])).await;
+    assert!(
+        graph.completed(),
+        "{name}: {:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        [delivered(name)],
+        "{name}: delivered names"
+    );
+    assert!(graph.files[&delivered(name)] == bytes, "{name}: bytes");
+    let files = &graph.graph().delivery.files;
+    assert!(
+        files.len() == 1 && files[0].depth == 0 && files[0].whole,
+        "{name}: {files:?}"
+    );
+    assert_eq!(
+        graph.graph().claims.get(name),
+        Some(&Claim::Complete),
+        "{name}: the claim"
+    );
+}
+
+// A single compressed stream or tar posted under `name` with no recovery,
+// whose bytes all arrived and which opened and came out damaged: the
+// object refuses it for its own reason, so the posted file is listed
+// damaged, and with nothing usable the job fails.
+async fn assert_a_single_damaged_stream_fails(name: &str, bytes: Vec<u8>) {
     let graph = run(&Scenario::new(vec![Post::plain(name, bytes)])).await;
     assert!(
         matches!(graph.status, Some(JobStatus::Failed { .. })),
@@ -352,6 +420,11 @@ async fn assert_a_single_archive_with_nothing_usable_fails(name: &str, bytes: Ve
         graph.status,
         graph.failure,
         graph.files.keys().collect::<Vec<_>>()
+    );
+    let files = &graph.graph().delivery.files;
+    assert!(
+        files.len() == 1 && files[0].name.ends_with(name) && files[0].depth == 0 && !files[0].whole,
+        "{name}: {files:?}"
     );
 }
 
@@ -361,7 +434,7 @@ fn unopened() -> Vec<u8> {
 
 // Text a compressor codes rather than stores, so damage to it lands in
 // coded data the decoder reads.
-fn prose() -> Vec<u8> {
+pub(super) fn prose() -> Vec<u8> {
     b"a lantern by the quill, an ember in the beacon; "
         .iter()
         .copied()
@@ -372,7 +445,7 @@ fn prose() -> Vec<u8> {
 
 // The bytes with a run in their middle arrived wrong under a good article
 // checksum: the signature still opens them and the damage lies past it.
-fn damaged_in_the_middle(mut bytes: Vec<u8>) -> Vec<u8> {
+pub(super) fn damaged_in_the_middle(mut bytes: Vec<u8>) -> Vec<u8> {
     let at = bytes.len() / 2;
     for byte in &mut bytes[at..at + 16] {
         *byte ^= 0x5a;
@@ -388,46 +461,134 @@ fn tar_with_a_damaged_header() -> Vec<u8> {
     bytes
 }
 
+// The tar's own header checksum marks nothing in the posted file: the walk
+// is refused, the tar listed damaged, and with nothing usable the job fails.
 #[tokio::test]
 async fn a_single_tar_whose_header_is_damaged_fails() {
-    assert_a_single_archive_with_nothing_usable_fails("lantern.tar", tar_with_a_damaged_header())
-        .await;
+    assert_a_single_damaged_stream_fails("lantern.tar", tar_with_a_damaged_header()).await;
+}
+
+// An xz whose one block arrived with its check wrong under a good article
+// checksum: the block decodes and its check fails. The check speaks of what
+// the stream reads out and marks nothing in the posted file: the stream is
+// refused, listed damaged, and with nothing usable the job fails.
+#[tokio::test]
+async fn a_single_xz_whose_block_check_fails_fails() {
+    let mut bytes = xz(&prose());
+    assert_ne!(bytes[7] & 0x0f, 0, "the stream carries a block check");
+    let backward = u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+    let index = bytes.len() - 12 - (backward as usize + 1) * 4;
+    bytes[index - 1] ^= 0x01;
+    assert_a_single_damaged_stream_fails("lantern.mkv.xz", bytes).await;
+}
+
+// A tar of two entries whose second header arrived wrong under a good
+// article checksum, with no recovery: the walk reads the first entry whole,
+// holds at the second header, and refuses the tar once nothing more will
+// arrive. What came out whole stays delivered, beside the tar listed
+// damaged, and the job ends Partial.
+#[tokio::test]
+async fn a_tar_whose_second_header_is_damaged_is_partial_with_its_first_entry() {
+    let first = prose();
+    let mut bytes = tar(&[("lantern.mkv", first.clone()), ("ember.bin", ember())]);
+    let second = 512 + first.len().div_ceil(512) * 512;
+    bytes[second] ^= 0x5a;
+    let (lines, guard) = Lines::capture();
+    let graph = run(&Scenario::new(vec![Post::plain(
+        "lantern.tar",
+        bytes.clone(),
+    )]))
+    .await;
+    drop(guard);
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?} {:?}",
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+    let refused = lines.of("object refused");
+    assert!(
+        refused.len() == 1 && refused[0].contains("kind=tar member=lantern.tar why=unrepairable"),
+        "{refused:?}"
+    );
+    assert!(
+        graph.files[&delivered("lantern.mkv")] == first,
+        "lantern.mkv bytes"
+    );
+    let files = &graph.graph().delivery.files;
+    let depth_of = |name: &str| {
+        files
+            .iter()
+            .find(|file| file.name.ends_with(name))
+            .map(|file| (file.depth, file.whole))
+    };
+    assert_eq!(depth_of("lantern.mkv"), Some((1, true)), "{files:?}");
+    assert_eq!(depth_of("lantern.tar"), Some((0, false)), "{files:?}");
+}
+
+// The same damaged tar under a PAR2 set made from the tar as it should be:
+// the set's own verification finds the posted file wrong and repairs it to
+// the original, with no mark of the tar's to drive it, and the tar then
+// walks whole.
+#[tokio::test]
+async fn a_tar_whose_header_is_damaged_under_par2_is_repaired_to_the_original() {
+    let original = tar(&[("lantern.mkv", prose())]);
+    let mut posts = vec![Post::plain("lantern.tar", tar_with_a_damaged_header())];
+    posts.extend(par2_set("lantern", &[("lantern.tar", &original)], 2));
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        ["RepairComplete 1", "JobCompleted"]
+    );
+    assert_eq!(
+        graph.graph().claims.get("lantern.tar"),
+        Some(&Claim::Complete)
+    );
+    assert_delivered(&graph, &[("lantern.mkv", prose())]);
 }
 
 #[tokio::test]
 async fn a_single_damaged_tar_gz_fails() {
     let bytes = damaged_in_the_middle(gzip(&tar(&[("lantern.mkv", prose())])));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.gz", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.tar.gz", bytes).await;
 }
 
 #[tokio::test]
 async fn a_single_damaged_tar_bz2_fails() {
     let bytes = damaged_in_the_middle(bzip2(&tar(&[("lantern.mkv", prose())])));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.bz2", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.tar.bz2", bytes).await;
 }
 
 #[tokio::test]
 async fn a_single_damaged_tar_xz_fails() {
     let bytes = damaged_in_the_middle(xz(&tar(&[("lantern.mkv", prose())])));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.xz", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.tar.xz", bytes).await;
 }
 
 #[tokio::test]
 async fn a_single_damaged_gz_fails() {
     let bytes = damaged_in_the_middle(gzip(&prose()));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.gz", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.mkv.gz", bytes).await;
 }
 
 #[tokio::test]
 async fn a_single_damaged_deflate_fails() {
     let bytes = damaged_in_the_middle(deflate(&prose()));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.deflate", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.mkv.deflate", bytes).await;
 }
 
 #[tokio::test]
 async fn a_single_damaged_brotli_fails() {
     let bytes = damaged_in_the_middle(brotli(&prose()));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.br", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.mkv.br", bytes).await;
 }
 
 // A zstd frame carrying its content checksum, as the command-line tool
@@ -442,42 +603,42 @@ fn zstd_checked(bytes: &[u8]) -> Vec<u8> {
 #[tokio::test]
 async fn a_single_damaged_zstd_fails() {
     let bytes = damaged_in_the_middle(zstd_checked(&prose()));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.zst", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.mkv.zst", bytes).await;
 }
 
 #[tokio::test]
 async fn a_single_damaged_bzip2_fails() {
     let bytes = damaged_in_the_middle(bzip2(&prose()));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.bz2", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.mkv.bz2", bytes).await;
 }
 
 #[tokio::test]
 async fn a_single_damaged_xz_fails() {
     let bytes = damaged_in_the_middle(xz(&prose()));
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.xz", bytes).await;
+    assert_a_single_damaged_stream_fails("lantern.mkv.xz", bytes).await;
 }
 
 #[tokio::test]
-async fn an_unopened_single_tar_gz_fails() {
-    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.gz", unopened()).await;
+async fn an_unopened_single_tar_gz_completes_as_posted() {
+    assert_a_single_stream_completes_as_posted("lantern.tar.gz", unopened()).await;
 }
 
 #[tokio::test]
-async fn an_unopened_single_tar_xz_fails() {
-    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.xz", unopened()).await;
+async fn an_unopened_single_tar_xz_completes_as_posted() {
+    assert_a_single_stream_completes_as_posted("lantern.tar.xz", unopened()).await;
 }
 
 #[tokio::test]
-async fn an_unopened_single_gz_fails() {
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.gz", unopened()).await;
+async fn an_unopened_single_gz_completes_as_posted() {
+    assert_a_single_stream_completes_as_posted("lantern.mkv.gz", unopened()).await;
 }
 
 #[tokio::test]
-async fn an_unopened_single_zstd_fails() {
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.zst", unopened()).await;
+async fn an_unopened_single_zstd_completes_as_posted() {
+    assert_a_single_stream_completes_as_posted("lantern.mkv.zst", unopened()).await;
 }
 
 #[tokio::test]
-async fn an_unopened_single_xz_fails() {
-    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.xz", unopened()).await;
+async fn an_unopened_single_xz_completes_as_posted() {
+    assert_a_single_stream_completes_as_posted("lantern.mkv.xz", unopened()).await;
 }

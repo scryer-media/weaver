@@ -2,19 +2,17 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // xz: streams of blocks, each block checked as it decodes, concatenated
-// streams read through as one. A block whose check fails names its stream,
-// and the stream's own index, read back from the volume's tail, says where
-// that stream lies, so the damage is called at that stream alone.
+// streams read through as one. A block whose check fails fails the decode
+// as any other error does: the check speaks of what the stream reads out.
 
 use std::io::{self, Read, Seek, SeekFrom};
 
 use lzma_turbo::Lzma2Reader;
 use lzma_turbo::xz::block::header_size_from_first_byte;
 use lzma_turbo::xz::{
-    BlockHeader, StreamHeader, XzError, XzErrorKind, XzOptions, XzParallelReader, XzReader,
-    single_stream_block_count, stream_table,
+    BlockHeader, StreamHeader, XzOptions, XzParallelReader, XzReader, single_stream_block_count,
 };
-use weaver_graph::{Budget, ByteRange, Kind};
+use weaver_graph::{Budget, Kind};
 
 use super::{Decoder, Front};
 
@@ -63,16 +61,6 @@ impl Decoder for Xz {
                 .map(|reader| Box::new(reader) as Box<dyn Read + Send>);
         }
         Self::open(input, window)
-    }
-
-    fn damaged(error: &io::Error, input: &mut Front) -> Option<ByteRange> {
-        let failed = error.get_ref()?.downcast_ref::<XzError>()?;
-        if failed.kind != XzErrorKind::CheckMismatch {
-            return None;
-        }
-        let streams = stream_table(input, u64::MAX).ok()?;
-        let stream = streams.get(usize::try_from(failed.stream).ok()?)?;
-        Some(ByteRange::at(stream.stream_offset, stream.stream_size))
     }
 }
 

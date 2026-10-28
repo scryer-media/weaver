@@ -249,10 +249,12 @@ pub(crate) fn declares_recovery(file: &FileSpec) -> bool {
     }
 }
 
-// Whether a file's name makes it a piece of something else: an archive or
-// one of its volumes, a compressed stream, a split part, or recovery data,
+// Whether a file's name makes it a piece of something else: a RAR volume, a
+// 7z or zip archive or one of its volumes, a split part, or recovery data,
 // classified as the feed classifies the post's files. Whole or not, such a
-// file is never one the user opens.
+// file is never one the user opens as it was posted. A compressed stream or
+// a tar is not one: posted whole, it is a file as it stands, whatever
+// opening it gave.
 pub(crate) fn names_a_piece(name: &str) -> bool {
     let role = FileRole::from_filename(name);
     name.to_ascii_lowercase().ends_with(".rev")
@@ -264,16 +266,6 @@ pub(crate) fn names_a_piece(name: &str) -> bool {
                 | FileRole::SevenZipArchive
                 | FileRole::SevenZipSplit { .. }
                 | FileRole::ZipArchive
-                | FileRole::TarArchive
-                | FileRole::TarGzArchive
-                | FileRole::TarBz2Archive
-                | FileRole::TarXzArchive
-                | FileRole::GzArchive
-                | FileRole::DeflateArchive
-                | FileRole::BrotliArchive
-                | FileRole::ZstdArchive
-                | FileRole::Bzip2Archive
-                | FileRole::XzArchive
                 | FileRole::SplitFile { .. }
         )
 }
@@ -292,24 +284,61 @@ pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
         .sum()
 }
 
-// The sample's verdict, once it is certain: how many of the sampled files
-// every server failed the first article of, and how many were sampled, when
-// the lost reach the failure share of the whole sample. `heads` is whether
-// each payload file's first article is gone. Only a loss counts toward the
-// share, and an article still to come can only add to it, so a sample that
-// reaches the share with articles outstanding has the verdict the complete
-// sample would have. A sample short of the share says nothing yet.
-pub(crate) fn first_article_verdict(
-    heads: impl IntoIterator<Item = bool>,
-) -> Option<(usize, usize)> {
+// Where one payload file's first article stands in the sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Head {
+    // Every server failed it.
+    Lost,
+    // In hand, or ended some other way that is no loss.
+    Settled,
+    // Still to come.
+    Outstanding,
+}
+
+// The sample's word on the post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gate {
+    // The lost reach the failure share of the whole sample: how many of the
+    // sampled files every server failed the first article of, of how many.
+    Dead { missing: usize, total: usize },
+    // The sample is too small to rule, or can no longer reach its share
+    // whatever its outstanding first articles do: the post's health speaks.
+    Open,
+    // Short of its share with first articles still to come that could take
+    // it there: nothing speaks for the post yet.
+    Undecided,
+}
+
+// The sample's verdict on `heads`, one per payload file. Only a loss counts
+// toward the share, and an article still to come can only add to it, so a
+// sample that reaches the share with articles outstanding has the verdict
+// the complete sample would have, and one that cannot reach it even were
+// every outstanding article lost has let the post through.
+pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
     let mut total = 0;
     let mut lost = 0;
-    for gone in heads {
+    let mut outstanding = 0;
+    for head in heads {
         total += 1;
-        lost += usize::from(gone);
+        match head {
+            Head::Lost => lost += 1,
+            Head::Outstanding => outstanding += 1,
+            Head::Settled => {}
+        }
     }
-    (total >= FIRST_ARTICLE_GATE_MIN_FILES && lost * 100 >= total * FIRST_ARTICLE_GATE_MISSING_PCT)
-        .then_some((lost, total))
+    let reaches = |lost: usize| lost * 100 >= total * FIRST_ARTICLE_GATE_MISSING_PCT;
+    if total < FIRST_ARTICLE_GATE_MIN_FILES {
+        Gate::Open
+    } else if reaches(lost) {
+        Gate::Dead {
+            missing: lost,
+            total,
+        }
+    } else if reaches(lost + outstanding) {
+        Gate::Undecided
+    } else {
+        Gate::Open
+    }
 }
 
 pub(crate) fn first_article_verdict_error(missing: usize, total: usize) -> String {
@@ -446,22 +475,27 @@ pub(crate) async fn sample(
 }
 
 impl Pipeline {
-    // The first article of each file the post names: its first segment,
-    // and whether it reached a terminal state without arriving.
-    fn first_article_lost(&self, job_id: JobId, index: u32, file: &FileSpec) -> bool {
-        file.segments
-            .iter()
-            .map(|segment| segment.ordinal)
-            .min()
-            .is_some_and(|first| {
-                self.segment_terminal_states.get(&SegmentId {
-                    file_id: NzbFileId {
-                        job_id,
-                        file_index: index,
-                    },
-                    segment_number: first,
-                }) == Some(&SegmentTerminalState::Missing)
-            })
+    // The first article of each file the post names, its first segment:
+    // lost when every server failed it, settled when the root holds it or
+    // it ended some other way, and otherwise still to come.
+    fn first_article(&self, job_id: JobId, index: u32, file: &FileSpec) -> Head {
+        let Some(first) = file.segments.iter().map(|segment| segment.ordinal).min() else {
+            return Head::Settled;
+        };
+        let segment = SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: index,
+            },
+            segment_number: first,
+        };
+        match self.segment_terminal_states.get(&segment) {
+            Some(SegmentTerminalState::Missing) => Head::Lost,
+            Some(_) => Head::Settled,
+            None if self.graph_article_given_up(segment) => Head::Lost,
+            None if self.graph_article_settled(segment) => Head::Settled,
+            None => Head::Outstanding,
+        }
     }
 
     // The files the post names as payload that lost at least one article.
@@ -486,42 +520,49 @@ impl Pipeline {
     }
 
     // Why the post is dead, if it is, in the feed's own words. The
-    // first-article sample rules first: past its share the post is dead,
-    // unless the recovery files whose first articles came outweigh the
-    // payload files the sample lost. Then the post's health, at the failed
-    // bytes it lost or a round projected it will, against its critical line.
+    // first-article sample rules first, and until it has, nothing does:
+    // past its share the post is dead, unless the recovery files whose
+    // first articles have not been lost outweigh the payload files the
+    // sample lost; short of it with first articles still to come that could
+    // take it there, the post has no verdict yet. Only a post the sample let
+    // through is weighed by its health, at the failed bytes it lost or a
+    // round projected it will, against its critical line.
     pub(in crate::pipeline) fn post_health_verdict(&self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) {
             return None;
         }
         let state = self.jobs.get(&job_id)?;
         let spec = &state.spec;
-        let heads: Vec<(u32, &FileSpec, bool)> = spec
+        let heads: Vec<(u32, &FileSpec, Head)> = spec
             .files
             .iter()
             .zip(0u32..)
             .filter(|(file, _)| !file.segments.is_empty())
-            .map(|(file, index)| (index, file, self.first_article_lost(job_id, index, file)))
+            .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
         let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));
-        if let Some((missing, total)) = first_article_verdict(payload.clone().map(|head| head.2)) {
-            let bytes = |file: &FileSpec| -> u64 {
-                file.segments
+        match first_article_gate(payload.clone().map(|head| head.2)) {
+            Gate::Undecided => return None,
+            Gate::Open => {}
+            Gate::Dead { missing, total } => {
+                let bytes = |file: &FileSpec| -> u64 {
+                    file.segments
+                        .iter()
+                        .map(|segment| u64::from(segment.bytes))
+                        .sum()
+                };
+                let lost: u64 = payload
+                    .filter(|(_, _, head)| *head == Head::Lost)
+                    .map(|(_, file, _)| bytes(file))
+                    .sum();
+                let reachable: u64 = heads
                     .iter()
-                    .map(|segment| u64::from(segment.bytes))
-                    .sum()
-            };
-            let lost: u64 = payload
-                .filter(|(_, _, gone)| *gone)
-                .map(|(_, file, _)| bytes(file))
-                .sum();
-            let reachable: u64 = heads
-                .iter()
-                .filter(|(_, file, gone)| declares_recovery(file) && !gone)
-                .map(|(_, file, _)| bytes(file))
-                .sum();
-            if lost > reachable {
-                return Some(first_article_verdict_error(missing, total));
+                    .filter(|(_, file, head)| declares_recovery(file) && *head != Head::Lost)
+                    .map(|(_, file, _)| bytes(file))
+                    .sum();
+                if lost > reachable {
+                    return Some(first_article_verdict_error(missing, total));
+                }
             }
         }
         let probe = self

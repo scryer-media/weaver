@@ -3,8 +3,9 @@
 
 // One run of a stream: its volume decoded from the front into its one member,
 // waiting for bytes still on their way. A decode that fails ends the member:
-// what was said of it is retracted, and the stream is called damaged where
-// its format can say so and refused where it cannot. A stream whose decoder
+// what was said of it is retracted and the stream refused. Its decoder's
+// checks speak of what the stream reads out, never of the volume's bytes,
+// so a failed decode marks nothing in the volume. A stream whose decoder
 // does nothing to its bytes reads on past bytes that will never come: the
 // member holds them as a gap marked damaged, at the same offsets.
 
@@ -85,25 +86,7 @@ impl<D: Decoder> Extraction for Run<D> {
         if failed.load(Ordering::Acquire) || !sink(Emit::Retract(MEMBER)) {
             return;
         }
-        let mut again = Front::new(volumes);
-        let damaged = D::damaged(&error, &mut again)
-            .map(|range| again.place(range))
-            .transpose();
-        if again.failure().load(Ordering::Acquire) {
-            return;
-        }
-        match damaged {
-            Ok(Some(pieces)) if !pieces.is_empty() => {
-                for (volume, range) in pieces {
-                    if !sink(Emit::Damaged { volume, range }) {
-                        return;
-                    }
-                }
-            }
-            _ => {
-                sink(Emit::Refuse(why(&error)));
-            }
-        }
+        sink(Emit::Refuse(why(&error)));
     }
 }
 

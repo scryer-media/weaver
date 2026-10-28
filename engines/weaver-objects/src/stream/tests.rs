@@ -409,8 +409,11 @@ fn xz_check_byte(bytes: &[u8], end: usize) -> usize {
     index - 1
 }
 
+// A block check speaks of what the stream reads out, never of the volume's
+// bytes: the stream is refused for its own reason, as any failed decode
+// is, and nothing in the volume is marked.
 #[test]
-fn a_failed_xz_check_names_the_stream_it_failed_in() {
+fn a_failed_xz_check_refuses_the_stream_and_marks_nothing() {
     let first = xz(&first_payload());
     let second = xz(&second_payload());
     let mut bytes = [first.clone(), second.clone()].concat();
@@ -419,10 +422,11 @@ fn a_failed_xz_check_names_the_stream_it_failed_in() {
     let said = whole(&mut stream::<Xz>("a.xz"), bytes);
     assert_eq!(
         ending(&said),
-        [
-            Said::Retract,
-            Said::Damaged(ByteRange::at(first.len() as u64, second.len() as u64)),
-        ]
+        [Said::Retract, Said::Refuse(Why::Unrepairable)]
+    );
+    assert!(
+        !said.iter().any(|said| matches!(said, Said::Damaged(_))),
+        "{said:?}"
     );
     // The first stream decoded whole before the second failed.
     let Said::Bytes(out) = &said[1] else {
