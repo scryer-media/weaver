@@ -2767,6 +2767,28 @@ impl Tree {
         self.descend(vec![(node, volume, range)], effects);
     }
 
+    // The member's bytes, every one of them in, fail the checksum its
+    // object's headers state for them. Which bytes are wrong is not known,
+    // so the whole member is damaged, and the damage descends as any other.
+    pub fn checksum_failed(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
+        let Some(length) = self
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .and_then(|record| record.length)
+        else {
+            return;
+        };
+        let mut pending = Vec::new();
+        self.mark(
+            node,
+            member,
+            ByteRange::new(0, length),
+            effects,
+            &mut pending,
+        );
+        self.descend(pending, effects);
+    }
+
     // An object found its own volume bad: a header checksum failed. The
     // member that volume is in the parent's namespace is marked first, so
     // the recovery beside it repairs those bytes, and the damage then
