@@ -16,6 +16,7 @@ use weaver_graph::recovery::RepairOutcome;
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
+use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{Entry, build_7z_shaped};
 
 use super::harness::{
     ARTICLE, Claim, JOB, Outcome, Post, Scenario, admit, assert_fetched_once, collect, kinds,
@@ -619,6 +620,36 @@ async fn an_lzma2_7z_with_a_damaged_member_and_no_par2_delivers_the_members_it_c
     assert_eq!(
         graph.graph().claims.get("lantern.7z"),
         Some(&Claim::Damaged)
+    );
+}
+
+// A single 7z whose head arrived wrong under a good article checksum, with
+// no recovery: no store founds on it, so it reaches the end whole as
+// posted. A whole archive is not a file the user opens, and nothing else
+// came out of it, so the job fails and publishes nothing.
+#[tokio::test]
+async fn a_single_7z_with_a_damaged_head_and_no_recovery_fails() {
+    let (name, ember) = members().swap_remove(0);
+    let mut archive = build_7z_shaped(
+        &[Entry::file(name, ember.clone())],
+        EncoderMethod::COPY,
+        None,
+        false,
+    );
+    for byte in &mut archive[..ARTICLE] {
+        *byte ^= 0x5a;
+    }
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "graph: {:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        graph.files.get(&delivered(name)) != Some(&ember),
+        "ember.bin never comes out of a container no store founds on"
     );
 }
 

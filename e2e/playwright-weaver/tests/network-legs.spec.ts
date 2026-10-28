@@ -9,7 +9,7 @@ import {
   graphqlErrors, ladderLeg, legOn, legsOf, openOn, proxyProfiles, resetProxyHostKey, rssKey, rung, saveProxyProfile, serverKey,
 } from "./support/network-flow";
 import { DIRECT_HOST, NetworkWorld, PROXIED_HOST, expectNoFailureEvents, saveEvidence, serverHealth } from "./support/network-scenario";
-import { attemptsOn, controlRoute, fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
+import { attemptsOn, controlRoute, fixtureEvents, fixtureMark, waitFixtureEvents, waitRoutesInService } from "./support/proxy-fixture";
 import { addToxic, removeToxic } from "./support/toxiproxy";
 import { controlTunnel, tunnelState } from "./support/tunnel-fixture";
 
@@ -136,12 +136,16 @@ test("L05 Hold parks a dead leg's share instead of moving it", async ({ request 
 test("L06 a dead leg goes Down, probes with one connection, and returns Up once its proxy does", async ({ request }, info) => {
   test.setTimeout(0);
   const { a, b, server } = await proxiedSecondLeg("REDISTRIBUTE");
+  // Leg B's proxy must be in service before the download starts, or the leg
+  // goes Down on its first dial and the states below start from the wrong one.
+  await waitRoutesInService(request, ["connect1"]);
   // The fixture paces every body line, so 10 ms lets a 64 KiB article finish in
   // about five seconds, inside the per-article soft timeout: a recovery probe can
   // succeed while the job is still paced. 480 parts outlast the leg cooldowns
   // and the 60 s cap on server recovery backoff several times over.
   const download = await world.pacedDownload("l06-probing", { parts: 480, slowMs: 10 });
-  await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
+  await flowAfter(request, await flowMark(request),
+    sample => legOn(sample, serverKey(server), b.id)?.state === "UP" && carrying(sample, server, [[a.id, 2], [b.id, 2]]), "leg B Up, legs 2/2 open");
   const subscription = await FlowSubscription.open();
   try {
     const start = (await subscription.next(0, () => true, "first sample")).sampledAt;

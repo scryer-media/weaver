@@ -11,7 +11,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -179,6 +181,102 @@ func nzbSegments(slug string) ([]nzbSegmentRef, error) {
 	return out, nil
 }
 
+// decodedRange is the bytes of its file an article decodes to, as [Start, End).
+type decodedRange struct {
+	Start uint64
+	End   uint64
+}
+
+var ybeginSize = regexp.MustCompile(`^=ybegin .*\bsize=(\d+)`)
+
+// articleDecodedRange reads the range an article decodes to from its yEnc
+// header lines: `=ypart begin= end=` (one-based, inclusive) for a part of a
+// multi-part file, or the whole of `=ybegin size=` for a file in one article.
+func articleDecodedRange(wire []byte) (decodedRange, error) {
+	var size uint64
+	sawSize := false
+	for _, line := range bytes.Split(wire, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if match := ypartLine.FindSubmatch(line); match != nil {
+			begin, err := strconv.ParseUint(string(match[1]), 10, 64)
+			if err != nil {
+				return decodedRange{}, err
+			}
+			end, err := strconv.ParseUint(string(match[2]), 10, 64)
+			if err != nil {
+				return decodedRange{}, err
+			}
+			if begin == 0 || end < begin {
+				return decodedRange{}, fmt.Errorf("=ypart begin=%d end=%d is not a range", begin, end)
+			}
+			return decodedRange{Start: begin - 1, End: end}, nil
+		}
+		if match := ybeginSize.FindSubmatch(line); match != nil && !sawSize {
+			value, err := strconv.ParseUint(string(match[1]), 10, 64)
+			if err != nil {
+				return decodedRange{}, err
+			}
+			size, sawSize = value, true
+		}
+	}
+	if !sawSize {
+		return decodedRange{}, fmt.Errorf("no yEnc header")
+	}
+	return decodedRange{Start: 0, End: size}, nil
+}
+
+// segmentDecodedRanges reads, by message id, the range each segment decodes
+// to, from the articles the news server holds. ARTICLE is not a BODY, so the
+// server's body counts do not see it.
+func segmentDecodedRanges(host, port string, segments []nzbSegmentRef) (map[string]decodedRange, error) {
+	session, err := openNntpCommandSession(host, port, true)
+	if err != nil {
+		return nil, err
+	}
+	defer session.close()
+	out := make(map[string]decodedRange, len(segments))
+	for _, segment := range segments {
+		wire, err := readStoredArticle(session, segment.MessageID)
+		if err != nil {
+			return nil, err
+		}
+		decoded, err := articleDecodedRange(wire)
+		if err != nil {
+			return nil, fmt.Errorf("<%s>: %w", segment.MessageID, err)
+		}
+		out[segment.MessageID] = decoded
+	}
+	return out, nil
+}
+
+// coveredArticles names the articles whose decoded bytes the checkpoint rows
+// hold whole: the articles a restart may never fetch again.
+func coveredArticles(segments []nzbSegmentRef, ranges map[string]decodedRange, rows []fileCoverageRow) map[string]bool {
+	covered := map[string]bool{}
+	for _, row := range rows {
+		for _, segment := range segments {
+			decoded, known := ranges[segment.MessageID]
+			if known && segment.FileIndex == row.FileIndex && row.Coverage.Covers(decoded.Start, decoded.End) {
+				covered[segment.MessageID] = true
+			}
+		}
+	}
+	return covered
+}
+
+// refetchedArticles lists, sorted, the covered articles the server served
+// again between the two readings of its body counts.
+func refetchedArticles(covered map[string]bool, before, after restartNntpMetrics) []string {
+	var out []string
+	for id, count := range after.BodyCounts {
+		if count > before.BodyCounts[id] && covered[id] {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func fileBLAKE3(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -232,6 +330,13 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 	if gap == nil {
 		return restartCaseResult{}, fmt.Errorf("%s has no segment %d", slug, gapNumber)
 	}
+	// The checkpoint holds decoded bytes, so each article is named by the
+	// range it decodes to, read before the gap's article is taken away.
+	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	gapRange := ranges[gap.MessageID]
 	putBack, err := withholdArticles(nntpHost(), nntpPort(), []string{gap.MessageID})
 	if err != nil {
 		return restartCaseResult{}, err
@@ -269,7 +374,7 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		if err == nil {
 			lastCoverage = rows
 			for _, row := range rows {
-				if row.FileIndex == gap.FileIndex && row.Err == nil && !row.Coverage.Contains(gap.Ordinal) && row.Coverage.CoveredBytes() >= coveredFloor {
+				if row.FileIndex == gap.FileIndex && !row.Coverage.Covers(gapRange.Start, gapRange.End) && row.Coverage.CoveredBytes() >= coveredFloor {
 					reached = true
 				}
 			}
@@ -301,19 +406,10 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
 			fmt.Sprintf("job was %q at shutdown, not an active download", status)), nil
 	}
-	covered := map[string]bool{}
+	covered := coveredArticles(segments, ranges, preCoverage)
 	var coveredBytes uint64
 	for _, row := range preCoverage {
-		if row.Err != nil {
-			return classifyRestartResult(ctx.Profile, false, "", false, "",
-				fmt.Sprintf("file %d checkpoint does not decode: %v", row.FileIndex, row.Err)), nil
-		}
 		coveredBytes += row.Coverage.CoveredBytes()
-		for _, segment := range segments {
-			if segment.FileIndex == row.FileIndex && row.Coverage.Contains(segment.Ordinal) {
-				covered[segment.MessageID] = true
-			}
-		}
 	}
 	if covered[gap.MessageID] {
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
@@ -336,19 +432,9 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, err
 	}
 
-	var refetchedCovered []string
+	refetchedCovered := refetchedArticles(covered, preNntp, postNntp)
 	gapFetched := postNntp.BodyCounts[gap.MessageID] > preNntp.BodyCounts[gap.MessageID]
-	fetchedAfter := 0
-	for id, count := range postNntp.BodyCounts {
-		if count <= preNntp.BodyCounts[id] {
-			continue
-		}
-		fetchedAfter++
-		if covered[id] {
-			refetchedCovered = append(refetchedCovered, id)
-		}
-	}
-	sort.Strings(refetchedCovered)
+	fetchedAfter, _ := bodyFetchesSinceRestartPoint(preNntp, postNntp)
 
 	source := filepath.Join(testdataDir(), slug, "test-media.mkv")
 	info, err := os.Stat(source)

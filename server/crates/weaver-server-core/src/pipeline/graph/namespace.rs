@@ -793,6 +793,14 @@ impl NamespaceWriter {
                 if in_own_file {
                     self.close_leaf(tree, *node, *member)?;
                 }
+                // A file whose bytes fail the checksum its object states
+                // for them is damaged, whatever each byte's own check said:
+                // the graph hears it as damage on the whole member.
+                if in_own_file && self.fails_its_checksum(tree, *node, *member) {
+                    let mut effects = Vec::new();
+                    tree.checksum_failed(*node, *member, &mut effects);
+                    self.apply_each(tree, builder, segments, effects, out)?;
+                }
                 self.bind_recoveries(tree, builder, segments, *node, out)?;
             }
             Effect::Bound {
@@ -1252,6 +1260,33 @@ impl NamespaceWriter {
         self.admit_file(tree, node, member, length)?;
         self.leaf(node, member, &output_name)?.close(length)?;
         Ok(())
+    }
+
+    // Whether the member's file, every byte of it in and none damaged,
+    // fails the CRC32 its object's headers state for it. The leaf folded
+    // the CRC of its writes as they landed, so nothing is read back. A
+    // member with no stated checksum, one already short or damaged, or one
+    // whose writes no longer fold to one run has nothing more for the
+    // check to say.
+    fn fails_its_checksum(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+        let Some(record) = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+        else {
+            return false;
+        };
+        let (Some(stated), Some(length)) = (record.crc32, record.length) else {
+            return false;
+        };
+        let whole = ByteRange::new(0, length);
+        if !record.coverage.covered(whole) || record.coverage.damaged(whole) {
+            return false;
+        }
+        self.files
+            .get(&node)
+            .and_then(|files| files.leaves.get(&member))
+            .and_then(|leaf| leaf.crc32(length))
+            .is_some_and(|written| written != stated)
     }
 
     // The member's file reaches `end`, by a write or by taking its length.

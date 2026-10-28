@@ -878,7 +878,7 @@ impl Pipeline {
                         error = %failure.message,
                         "NNTP BODY fetch failed"
                     );
-                    crate::runtime::job_debug_ring::dump(job_id.0, "NNTP BODY fetch failed");
+                    self.dump_job_debug_ring(job_id, "NNTP BODY fetch failed");
                 }
                 if failure.kind == DownloadFailureKind::ServerQuota {
                     let mut retry_after = failure.retry_after;
@@ -1085,8 +1085,8 @@ impl Pipeline {
                                 error = %failure.message,
                                 "downloads waiting: local BODY lane capacity is saturated; a server is eligible and the work retries as lanes free"
                             );
-                            crate::runtime::job_debug_ring::dump(
-                                job_id.0,
+                            self.dump_job_debug_ring(
+                                job_id,
                                 "downloads waiting: local BODY lane capacity is saturated",
                             );
                         }
@@ -1105,8 +1105,8 @@ impl Pipeline {
                             error = %failure.message,
                             "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
                         );
-                        crate::runtime::job_debug_ring::dump(
-                            job_id.0,
+                        self.dump_job_debug_ring(
+                            job_id,
                             "downloads waiting: no eligible news server",
                         );
                     }

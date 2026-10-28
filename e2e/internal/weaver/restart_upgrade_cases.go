@@ -38,7 +38,7 @@ func (ctx *restartCaseContext) downloadThenInterrupt(slug string, floor uint64, 
 		}
 		if rows, err := readJobFileCoverage(dbPath, jobID); err == nil {
 			for _, row := range rows {
-				if row.Err == nil && row.Coverage.CoveredBytes() >= floor {
+				if row.Coverage.CoveredBytes() >= floor {
 					reached = true
 				}
 			}
@@ -59,9 +59,10 @@ func (ctx *restartCaseContext) downloadThenInterrupt(slug string, floor uint64, 
 }
 
 // R4. A database last written before migration 65 holds a prefix floor, not
-// coverage. The upgrade drops it, so the partly downloaded file downloads
-// again from nothing: a floor that claims more than was written is never
-// trusted.
+// coverage, and no graph checkpoint: the graph tables came later. The upgrade
+// drops the floor, and with no checkpoint the job is admitted afresh, so the
+// partly downloaded file downloads again from nothing: a floor that claims
+// more than was written is never trusted.
 func runPre65CheckpointRowRefused(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "single-mkv"
 	const checkpointBytes = 4 * 1024 * 1024
@@ -88,6 +89,18 @@ func runPre65CheckpointRowRefused(ctx *restartCaseContext) (restartCaseResult, e
 		pre65ActiveFileProgressDDL(datastore),
 		fmt.Sprintf(`INSERT INTO active_file_progress (job_id, file_index, contiguous_bytes_written) VALUES (%d, 0, %d)`, jobID, wrongFloor),
 		`DELETE FROM _sqlx_migrations WHERE version = 65`,
+	}
+	// A database from before migration 65 holds no graph checkpoint, so the
+	// job's is taken away with the rest of what came later.
+	for _, table := range graphTables {
+		present, err := weaverStateTableExists(db, datastore, table)
+		if err != nil {
+			closeWeaverStateDB(db, datastore)
+			return restartCaseResult{}, err
+		}
+		if present {
+			statements = append(statements, fmt.Sprintf(`DELETE FROM %s WHERE job_id = %d`, table, jobID))
+		}
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {

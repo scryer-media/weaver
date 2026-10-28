@@ -369,7 +369,13 @@ export async function startProxyFixture(options = {}) {
         if (!Number.isInteger(after) || after < 0) { response.writeHead(400).end(JSON.stringify({ error: "after must be a non-negative integer" })); return; }
         response.end(JSON.stringify({ sequence, events: events.filter(event => event.sequence > after) })); return;
       }
-      response.end(JSON.stringify({ ip, addresses, ports, sequence, events, active: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, route.sockets.size])) })); return;
+      response.end(JSON.stringify({
+        ip, addresses, ports, sequence, events,
+        active: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, route.sockets.size])),
+        // Each route's service as the control last set it, so a caller can wait
+        // on the fixture's own word that a route is back.
+        routes: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, { up: route.up, hold: route.hold, connectStatus: route.connectStatus, socksReply: route.socksReply }])),
+      })); return;
     }
     try {
       let body = "";

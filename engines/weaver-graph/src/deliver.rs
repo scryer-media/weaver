@@ -197,7 +197,7 @@ impl Why {
     // member, which is delivered as it stands, never whole.
     pub fn disclaims(self) -> bool {
         match self {
-            Why::Unsupported => true,
+            Why::Unsupported | Why::TooDeep => true,
             Why::Compressed
             | Why::TailUnreachable
             | Why::EncryptedHeader
@@ -208,8 +208,7 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
-            | Why::OrderUnknown
-            | Why::TooDeep => false,
+            | Why::OrderUnknown => false,
         }
     }
 }
@@ -317,10 +316,15 @@ mod tests {
         for why in delivered {
             assert!(!why.withholds(), "{why:?}");
         }
-        // Only a shape the object does not implement leaves the member the
-        // posted file; every other refusal is its set failing.
+        // Only a shape the object does not implement, or an object the job
+        // never opens for its depth, leaves the member the posted file;
+        // every other refusal is its set failing.
         for why in withheld.into_iter().chain(delivered) {
-            assert_eq!(why.disclaims(), why == Why::Unsupported, "{why:?}");
+            assert_eq!(
+                why.disclaims(),
+                matches!(why, Why::Unsupported | Why::TooDeep),
+                "{why:?}"
+            );
         }
     }
 }

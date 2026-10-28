@@ -785,6 +785,37 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     assert_eq!(job.file("video.mkv"), b"abcmidend");
 }
 
+// A member whose object states a CRC32 for its bytes is checked when it
+// closes: bytes that each arrived good but together fail the stated
+// checksum are damage on the whole member, and bytes that match it stay
+// clean.
+#[test]
+fn a_member_failing_its_stated_checksum_is_damaged_when_it_closes() {
+    for (sent, damaged) in [(&b"abcmidend"[..], false), (&b"abcmixend"[..], true)] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("video.mkv", Some(9));
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .and_then(|namespace| namespace.get_mut(member))
+            .expect("the announced member")
+            .crc32 = Some(crc32(b"abcmidend"));
+        job.send(member, 0, sent, Provenance::Fresh);
+        job.close(member);
+        assert!(!job.is_open(NodeId::ROOT, member));
+        let expected = if damaged {
+            vec![(member, ByteRange::new(0, 9))]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            job.root().damaged_ranges().collect::<Vec<_>>(),
+            expected,
+            "sent {:?}",
+            String::from_utf8_lossy(sent)
+        );
+    }
+}
+
 // The tree's coverage and the leaf on disk agree: a run the coverage records
 // that the file no longer gives back ends the replay with the file's error.
 #[test]

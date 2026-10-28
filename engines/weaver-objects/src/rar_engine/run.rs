@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use unrar_rs::{
-    CachedArchiveHeaders, CompressionMethod, KdfCache, RarArchive, RarError, ReadSeek,
-    VolumeProvider, VolumeProviderError,
+    ArchiveFormat, CachedArchiveHeaders, CompressionMethod, KdfCache, RarArchive, RarError,
+    ReadSeek, VolumeProvider, VolumeProviderError,
 };
 use weaver_graph::{
     Budget, ByteRange, Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why,
@@ -289,6 +289,7 @@ impl Walk<'_, '_> {
                 Some(Ok(bytes)) => {
                     self.deliver(member, bytes)?;
                     self.open = None;
+                    self.checksum_of(archive, at, member)?;
                     self.say(Emit::MemberClosed(member))?;
                 }
                 Some(Err(error)) => return Err(self.fail(error)),
@@ -298,8 +299,9 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
-    // A file member's announcement and its header's checksum, leaving it
-    // open.
+    // A file member's announcement, leaving it open. It states no checksum:
+    // until the member's final part's header has been read, the archive
+    // knows none for it. `checksum_of` states it once the member is decoded.
     fn announce(&mut self, info: &unrar_rs::MemberInfo) -> Result<MemberId, Stop> {
         let member = MemberId(self.next);
         self.next += 1;
@@ -308,12 +310,6 @@ impl Walk<'_, '_> {
             name: unrar_rs::sanitize_path(&info.raw_name),
             length: info.unpacked_size,
         })?;
-        // An encrypted member's checksum may be keyed, so it says none.
-        if !info.is_encrypted
-            && let Some(crc32) = info.crc32
-        {
-            self.say(Emit::Checksum { member, crc32 })?;
-        }
         self.open = Some(Open {
             member,
             encrypted: info.is_encrypted,
@@ -321,6 +317,26 @@ impl Walk<'_, '_> {
             last: info.volumes.last_volume,
         });
         Ok(member)
+    }
+
+    // The CRC32 a file member's final part's header states for it, said
+    // once the member is decoded, before it closes. Decoding reads that
+    // header, so the archive is asked again then rather than at the
+    // announcement. A member whose header states no CRC32, such as one
+    // carrying only a BLAKE2sp hash, states nothing. Nor does an encrypted
+    // RAR5 member: its header's CRC32 is keyed, and a keyed checksum is not
+    // the member's own.
+    fn checksum_of(
+        &mut self,
+        archive: &RarArchive,
+        index: usize,
+        member: MemberId,
+    ) -> Result<(), Stop> {
+        let keyed = archive.format() == ArchiveFormat::Rar5 && archive.member_is_encrypted(index);
+        match archive.member_info(index).and_then(|info| info.crc32) {
+            Some(crc32) if !keyed => self.say(Emit::Checksum { member, crc32 }),
+            _ => Ok(()),
+        }
     }
 
     // A member decoded whole, said in pieces no larger than a decoder's.
@@ -390,6 +406,7 @@ impl Walk<'_, '_> {
         match decoded {
             Ok(_) => {
                 self.open = None;
+                self.checksum_of(archive, index, member)?;
                 self.say(Emit::MemberClosed(member))
             }
             Err(_) if out.stopped => Err(Stop::Silent),

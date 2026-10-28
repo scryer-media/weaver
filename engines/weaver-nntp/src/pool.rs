@@ -98,6 +98,9 @@ pub struct NntpPool {
     // The health tracker's availability, read without its lock.
     availability: Arc<crate::health::AvailabilityBoard>,
     recovery_gates: Vec<Arc<crate::recovery::RecoveryGate>>,
+    // Bumped by every change to any of `recovery_gates`; see
+    // [`NntpPool::server_health_changes`].
+    health_changed: Arc<tokio::sync::watch::Sender<u64>>,
     // Per-server timestamp of the last failed connection attempt.
     last_connect_failure: Vec<Arc<Mutex<Option<Instant>>>>,
     reconnect_delay: Duration,
@@ -373,6 +376,39 @@ impl ServerPoolConfig {
     }
 }
 
+// See [`NntpPool::server_health_changes`].
+pub struct ServerHealthChanges {
+    receiver: tokio::sync::watch::Receiver<u64>,
+    pool: std::sync::Weak<NntpPool>,
+}
+
+impl ServerHealthChanges {
+    // Completes on the next change to any server's recovery. Never completes
+    // once the pool is gone.
+    pub async fn changed(&mut self) {
+        if self.receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    // Whether this watch is on `pool`, rather than on a pool it replaced.
+    pub fn follows(&self, pool: &Arc<NntpPool>) -> bool {
+        std::ptr::eq(self.pool.as_ptr(), Arc::as_ptr(pool))
+    }
+}
+
+// A recovery probe held out on a server, for tests. Answering it lifts the
+// quarantine; dropping it unanswered gives the probe back.
+#[cfg(any(test, feature = "test-support"))]
+pub struct RecoveryProbeForTest(crate::recovery::ConnectionHealthLease);
+
+#[cfg(any(test, feature = "test-support"))]
+impl RecoveryProbeForTest {
+    pub fn answer(self) {
+        assert!(self.0.0.complete_recovery());
+    }
+}
+
 impl Drop for NntpPool {
     fn drop(&mut self) {
         self.shutdown.cancel();
@@ -469,9 +505,13 @@ impl NntpPool {
                 health.set_recovery_gate(idx, Arc::clone(&control.recovery));
             }
         }
-        let recovery_gates = (0..server_count)
+        let recovery_gates: Vec<_> = (0..server_count)
             .map(|idx| Arc::clone(&health.server(idx).recovery))
             .collect();
+        let health_changed = Arc::new(tokio::sync::watch::channel(0).0);
+        for gate in &recovery_gates {
+            gate.add_listener(Arc::downgrade(&health_changed));
+        }
         let availability = health.availability();
         let health = Arc::new(Mutex::new(health));
 
@@ -492,6 +532,7 @@ impl NntpPool {
             health,
             availability,
             recovery_gates,
+            health_changed,
             last_connect_failure,
             reconnect_delay: config.reconnect_delay,
             groups,
@@ -1660,7 +1701,7 @@ impl NntpPool {
         let recent_failure = self.last_connect_failure[idx]
             .try_lock()
             .map_err(|_| NntpError::PoolExhausted)?;
-        if recent_failure.is_some_and(|at| at.elapsed() < self.reconnect_delay) {
+        if self.reconnect_hold(*recent_failure).is_some() {
             return Err(NntpError::ServerRecovering);
         }
         drop(recent_failure);
@@ -1755,6 +1796,93 @@ impl NntpPool {
 
     pub fn recovery_snapshot(&self, idx: usize) -> crate::recovery::RecoverySnapshot {
         self.recovery_gates[idx].snapshot()
+    }
+
+    // When the reconnect delay after a dial that failed at `failed_at` ends,
+    // while it still runs.
+    fn reconnect_hold(&self, failed_at: Option<Instant>) -> Option<Instant> {
+        failed_at
+            .map(|at| at + self.reconnect_delay)
+            .filter(|until| *until > Instant::now())
+    }
+
+    // What holds a new connection to server `idx` back right now, if
+    // anything: the reconnect delay after a failed dial, or the recovery gate
+    // of a quarantined server. The permit path refuses a dial on exactly
+    // these terms, so a dispatcher that reads this sends no lease that would
+    // only come back refused. A connection already open is not new and is
+    // not held.
+    pub fn connection_hold(
+        &self,
+        idx: usize,
+        demanded: bool,
+    ) -> Option<crate::recovery::ConnectionHold> {
+        use crate::recovery::ConnectionHold;
+        let gate = self.recovery_gates.get(idx)?.hold(demanded);
+        if gate == Some(ConnectionHold::Recovery) {
+            return gate;
+        }
+        // A stamp being written right now is a hold about to start or end;
+        // the next read sees it.
+        let Some(reconnect) = self.last_connect_failure[idx]
+            .try_lock()
+            .ok()
+            .and_then(|failed_at| self.reconnect_hold(*failed_at))
+        else {
+            return gate;
+        };
+        // The reconnect delay holds even a probe that is due.
+        Some(ConnectionHold::Until(match gate {
+            Some(ConnectionHold::Until(at)) => at.max(reconnect),
+            _ => reconnect,
+        }))
+    }
+
+    // How many new demanded connections server `idx` admits right now: its
+    // free permits, at most one while its recovery probe is due, and none
+    // while it is held.
+    pub fn new_connection_seats(&self, idx: usize) -> usize {
+        match self.connection_hold(idx, true) {
+            None => self.server_load(idx).0,
+            Some(crate::recovery::ConnectionHold::Probe) => self.server_load(idx).0.min(1),
+            Some(_) => 0,
+        }
+    }
+
+    // The earliest instant a held server admits demanded work again on its
+    // own, with no recovery event to announce it.
+    pub fn next_connection_hold_deadline(&self) -> Option<Instant> {
+        (0..self.server_count())
+            .filter_map(|idx| match self.connection_hold(idx, true) {
+                Some(crate::recovery::ConnectionHold::Until(at)) => Some(at),
+                _ => None,
+            })
+            .min()
+    }
+
+    // A watch on every server's recovery gate: its `changed` completes on
+    // each quarantine, probe answer or probe given back, on any server, after
+    // the last time it completed. Kept for the pool's life, it misses nothing
+    // between waits.
+    pub fn server_health_changes(self: &Arc<Self>) -> ServerHealthChanges {
+        ServerHealthChanges {
+            receiver: self.health_changed.subscribe(),
+            pool: Arc::downgrade(self),
+        }
+    }
+
+    // Quarantine server `idx` with its deadline already past and take its
+    // one probe, as a dial would. Health leaves the server ranked, as it
+    // does once a quarantine's deadline has lapsed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_recovery_probe_for_test(&self, idx: usize) -> RecoveryProbeForTest {
+        let gate = &self.recovery_gates[idx];
+        gate.quarantine(Duration::ZERO, None)
+            .expect("an unconditional quarantine always lands");
+        RecoveryProbeForTest(
+            gate.admit(true)
+                .expect("a lapsed quarantine admits one demanded probe"),
+        )
     }
 
     pub fn requires_recovery(&self, idx: usize) -> bool {
@@ -3336,5 +3464,120 @@ mod tests {
             pool.over_limit_until_epoch_ms(ServerId(0)),
             Some(first_deadline)
         );
+    }
+
+    // A server whose one recovery probe is out holds every new connection,
+    // for a dispatcher's choice of server and for the permit path alike, and
+    // only the probe's answer lifts the hold. The answer is an event a watch
+    // taken before it sees: nothing has to ask again to find out.
+    #[tokio::test]
+    async fn a_probe_out_holds_new_connections_until_its_answer_wakes_the_watch() {
+        use crate::recovery::ConnectionHold;
+        let pool = Arc::new(NntpPool::new(test_pool_config(2)));
+        assert_eq!(pool.connection_hold(0, true), None);
+
+        let probe = pool.take_recovery_probe_for_test(0);
+        assert_eq!(
+            pool.connection_hold(0, true),
+            Some(ConnectionHold::Recovery)
+        );
+        assert!(matches!(
+            pool.try_acquire_blocking_permit_for_work(ServerId(0), true),
+            Err(NntpError::ServerRecovering)
+        ));
+        assert_eq!(
+            pool.next_connection_hold_deadline(),
+            None,
+            "a probe's answer is an event, not a deadline"
+        );
+
+        let mut changes = pool.server_health_changes();
+        probe.answer();
+        changes.changed().await;
+        assert_eq!(pool.connection_hold(0, true), None);
+        assert!(
+            pool.try_acquire_blocking_permit_for_work(ServerId(0), true)
+                .is_ok()
+        );
+    }
+
+    // A probe given back unanswered lets the next demanded dial through as
+    // the probe; the watch wakes on that too.
+    #[tokio::test]
+    async fn a_probe_given_back_wakes_the_watch_and_admits_the_next_probe() {
+        use crate::recovery::ConnectionHold;
+        let pool = Arc::new(NntpPool::new(test_pool_config(2)));
+        let probe = pool.take_recovery_probe_for_test(0);
+        let mut changes = pool.server_health_changes();
+        drop(probe);
+        changes.changed().await;
+        assert_eq!(pool.connection_hold(0, true), Some(ConnectionHold::Probe));
+        assert_eq!(pool.new_connection_seats(0), 1);
+        assert_eq!(
+            pool.connection_hold(0, false),
+            Some(ConnectionHold::Recovery),
+            "a dial no work waits on is never the probe"
+        );
+    }
+
+    // The delay after a failed dial is a hold with a deadline, and the
+    // deadline is what the pool reports for a waiter to sleep until.
+    #[tokio::test]
+    async fn a_failed_dial_holds_new_connections_until_the_reconnect_delay_ends() {
+        use crate::recovery::ConnectionHold;
+        let mut config = test_pool_config(2);
+        config.reconnect_delay = Duration::from_secs(3600);
+        let pool = NntpPool::new(config);
+        let failed_at = Instant::now();
+        *pool.last_connect_failure[0].lock().await = Some(failed_at);
+        let until = failed_at + Duration::from_secs(3600);
+        assert_eq!(
+            pool.connection_hold(0, true),
+            Some(ConnectionHold::Until(until))
+        );
+        assert_eq!(pool.next_connection_hold_deadline(), Some(until));
+        assert!(matches!(
+            pool.try_acquire_blocking_permit_for_work(ServerId(0), true),
+            Err(NntpError::ServerRecovering)
+        ));
+
+        *pool.last_connect_failure[0].lock().await =
+            failed_at.checked_sub(Duration::from_secs(7200));
+        assert_eq!(pool.connection_hold(0, true), None);
+        assert_eq!(pool.next_connection_hold_deadline(), None);
+    }
+
+    // A quarantined server whose deadline has lapsed, with no probe out,
+    // admits one new connection, the probe, however many permits are free:
+    // the dispatcher seats exactly one lease on it, not one per permit.
+    #[test]
+    fn a_lapsed_quarantine_seats_one_probe_not_every_free_permit() {
+        use crate::recovery::ConnectionHold;
+        let pool = NntpPool::new(test_pool_config(30));
+        pool.recovery_gates[0].quarantine(Duration::ZERO, None);
+        assert_eq!(pool.server_load(0).0, 30);
+        assert_eq!(pool.connection_hold(0, true), Some(ConnectionHold::Probe));
+        assert_eq!(pool.new_connection_seats(0), 1);
+        assert_eq!(
+            pool.connection_hold(0, false),
+            Some(ConnectionHold::Recovery),
+            "a dial no work waits on is never the probe"
+        );
+    }
+
+    // One watch kept across waits misses no change: a probe answered while
+    // nobody waits is still seen by the next wait.
+    #[tokio::test]
+    async fn a_kept_watch_sees_a_change_made_between_waits() {
+        let pool = Arc::new(NntpPool::new(test_pool_config(2)));
+        let mut changes = pool.server_health_changes();
+        let probe = pool.take_recovery_probe_for_test(0);
+        changes.changed().await;
+        probe.answer();
+        changes.changed().await;
+        assert_eq!(pool.connection_hold(0, true), None);
+        assert!(changes.follows(&pool));
+        let other = Arc::new(NntpPool::new(test_pool_config(2)));
+        assert!(!changes.follows(&other));
     }
 }

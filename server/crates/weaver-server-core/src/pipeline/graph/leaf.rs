@@ -12,6 +12,7 @@
 // first write or it allocates every hole, which is why every leaf is created
 // through the sparse marker.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -44,6 +45,17 @@ pub(crate) struct Leaf {
     // Open while bytes are still arriving; dropped when the member is
     // covered, and reopened only for a repair.
     file: Option<File>,
+    // The CRC32 of what was written, by contiguous run keyed by its start,
+    // folded as the writes land so the member's own CRC is known without
+    // reading the file back.
+    written: BTreeMap<u64, Written>,
+}
+
+// A contiguous run of written bytes and their CRC32.
+#[derive(Clone, Copy, Debug)]
+struct Written {
+    end: u64,
+    crc32: u32,
 }
 
 impl Leaf {
@@ -54,6 +66,7 @@ impl Leaf {
             path: dir.join(relative_path(output_name)?),
             directory: Self::is_directory(output_name),
             file: None,
+            written: BTreeMap::new(),
         })
     }
 
@@ -86,7 +99,55 @@ impl Leaf {
         length: Option<u64>,
     ) -> Result<(), LeafError> {
         let file = self.open(length)?;
-        write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))
+        write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))?;
+        self.wrote(offset, bytes);
+        Ok(())
+    }
+
+    // Fold a write into the runs. A run the write overlaps is superseded by
+    // it; its CRC cannot be split from the part the write leaves standing,
+    // so the whole run is forgotten. The write then joins the runs it abuts.
+    fn wrote(&mut self, offset: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let end = offset + bytes.len() as u64;
+        let overlapped: Vec<u64> = self
+            .written
+            .range(..end)
+            .rev()
+            .take_while(|(_, run)| run.end > offset)
+            .map(|(start, _)| *start)
+            .collect();
+        for start in overlapped {
+            self.written.remove(&start);
+        }
+        let mut start = offset;
+        let mut run = Written {
+            end,
+            crc32: crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32,
+        };
+        if let Some((&before, prior)) = self.written.range(..offset).next_back()
+            && prior.end == offset
+        {
+            run.crc32 = combine(prior.crc32, run.crc32, end - offset);
+            start = before;
+            self.written.remove(&before);
+        }
+        if let Some(after) = self.written.remove(&end) {
+            run.crc32 = combine(run.crc32, after.crc32, after.end - end);
+            run.end = after.end;
+        }
+        self.written.insert(start, run);
+    }
+
+    // The CRC32 of the member's `length` bytes, when one run of writes
+    // covers exactly them.
+    pub(crate) fn crc32(&self, length: u64) -> Option<u32> {
+        match self.written.iter().next() {
+            Some((0, run)) if self.written.len() == 1 && run.end == length => Some(run.crc32),
+            _ => None,
+        }
     }
 
     // How far the file reaches: every byte written to it lies below.
@@ -139,6 +200,7 @@ impl Leaf {
     // The member starts over: the file stays, so the name stays reserved on
     // disk, but none of its bytes do.
     pub(crate) fn truncate(&mut self) -> Result<(), LeafError> {
+        self.written.clear();
         if self.file.is_none() && !self.path.exists() {
             return Ok(());
         }
@@ -272,4 +334,14 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Res
         }
         Ok(())
     }
+}
+
+// The CRC32 of `first` followed by `len_second` bytes whose CRC32 is `second`.
+fn combine(first: u32, second: u32, len_second: u64) -> u32 {
+    crc_turbo::checksum_combine(
+        crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
+        u64::from(first),
+        u64::from(second),
+        len_second,
+    ) as u32
 }

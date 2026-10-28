@@ -4,7 +4,6 @@
 package weaver
 
 import (
-	"database/sql"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -135,7 +134,7 @@ func TestSchemaRewindAndHistoryCloneApplyToSQLite(t *testing.T) {
 	if !reflect.DeepEqual(versions, map[int]bool{65: true}) {
 		t.Fatalf("ledger = %v, want only 65", versions)
 	}
-	err = withStateDB(dbPath, func(db *sql.DB) error {
+	err = withStateDB(dbPath, func(db *stateConn) error {
 		tables, err := existingTables(db)
 		if err != nil {
 			return err
@@ -235,5 +234,44 @@ func TestActiveStateSweepsSkipTablesTheUpgradeDropped(t *testing.T) {
 	}
 	if err := assertTerminalFixtureStateSweeping(dbPath, 9, "complete", false); err == nil || !strings.Contains(err.Error(), "active_extracted=1") {
 		t.Fatalf("job sweep = %v, want the lingering row named", err)
+	}
+}
+
+// On Postgres the classic-only tables come back in its own dialect, and on
+// SQLite exactly as SQLite created them.
+func TestClassicOnlyTablesTranslateToPostgres(t *testing.T) {
+	for _, table := range classicOnlyTables {
+		if got := table.in(weaverDatastoreSQLite); got != table.DDL {
+			t.Fatalf("%s on SQLite = %s", table.Name, got)
+		}
+		ddl := table.in(weaverDatastorePostgres)
+		for _, sqliteOnly := range []string{"WITHOUT ROWID", "INTEGER", "BLOB"} {
+			if strings.Contains(ddl, sqliteOnly) {
+				t.Fatalf("%s on Postgres keeps %s: %s", table.Name, sqliteOnly, ddl)
+			}
+		}
+		if !strings.HasPrefix(ddl, "CREATE TABLE "+table.Name+" (") {
+			t.Fatalf("%s on Postgres = %s", table.Name, ddl)
+		}
+	}
+}
+
+// The SQLite refusal makes the database refuse exactly the named job's
+// history row, and lifting it lets that row land.
+func TestRefuseArchiveRefusesOnlyTheNamedJobOnSQLite(t *testing.T) {
+	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	refuse, lift := refuseArchive(7)
+	if err := execAll(dbPath, append([]string{`CREATE TABLE job_history (job_id INTEGER PRIMARY KEY)`}, refuse...)); err != nil {
+		t.Fatal(err)
+	}
+	if err := execAll(dbPath, []string{`INSERT INTO job_history VALUES (8)`}); err != nil {
+		t.Fatalf("another job's row was refused: %v", err)
+	}
+	if err := execAll(dbPath, []string{`INSERT INTO job_history VALUES (7)`}); err == nil || !strings.Contains(err.Error(), "e2e injected archive failure") {
+		t.Fatalf("the named job's row = %v, want the injected refusal", err)
+	}
+	if err := execAll(dbPath, append(lift, `INSERT INTO job_history VALUES (7)`)); err != nil {
+		t.Fatalf("after the lift: %v", err)
 	}
 }

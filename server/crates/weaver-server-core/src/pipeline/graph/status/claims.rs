@@ -129,9 +129,10 @@ pub(crate) fn refused<'c>(
 // closed is. Refused, every volume of its set is delivered as it stands,
 // never whole, however clean its bytes: the object failed, not the post.
 // An object that disclaims a member (`Why::disclaims`) leaves it the
-// posted file, whole when its bytes are. A member the post names as an
-// archive volume, a split part or recovery data is never whole as a leaf:
-// only what an object unpacks from it is a usable file.
+// posted file, whole when its bytes are, whatever its name says it is.
+// Otherwise a member the post names as an archive volume, a split part or
+// recovery data is never whole as a leaf: only what an object unpacks from
+// it is a usable file.
 // A member given back for a reason that withholds it (`Why::withholds`)
 // delivered nothing: its bytes are a container nothing opened, neither
 // whole nor short, and stay as they stand.
@@ -331,12 +332,14 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
             self.delivery.withheld.push((name, why));
             return;
         }
-        // A piece left as a leaf is delivered as it stands: whole bytes of
-        // a volume no object opened are no usable file.
+        // A member an object disclaimed is the file it was posted as, and
+        // whole when its bytes are, whatever its name says it is. Otherwise
+        // a piece left as a leaf is delivered as it stands: whole bytes of a
+        // volume nothing produced a file from are no usable file.
         let whole = claim == Claim::Complete
-            && !(self.piece)(node, member.id)
-            && (self.tree.refused_by(node, member.id).is_none()
-                || refused.is_some_and(Why::disclaims));
+            && (refused.is_some_and(Why::disclaims)
+                || (!(self.piece)(node, member.id)
+                    && self.tree.refused_by(node, member.id).is_none()));
         let delivery = &mut self.delivery;
         match whole {
             true => delivery.whole.push(name.clone()),

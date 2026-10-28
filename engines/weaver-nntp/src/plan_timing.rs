@@ -36,7 +36,7 @@ pub struct PlanTiming {
     // How old a pin may get before the next connect races again.
     pub replan_interval: Duration,
     // How long connects dial candidates one by one after a race found
-    // nothing answering.
+    // nothing answering, with or without a kept pin.
     pub failed_race_holdoff: Duration,
     // Wire time booked fetches must add up to before they count as evidence.
     pub delivery_min_wire: Duration,
