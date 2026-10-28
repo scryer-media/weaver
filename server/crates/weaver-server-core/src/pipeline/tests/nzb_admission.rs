@@ -196,9 +196,15 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
                 .contains(&JobId(11))
         );
     }
-    // Empty article queues and stalled downstream processing retain the same owners.
-    for state in pipeline.jobs.values_mut() {
-        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    // Empty article queues and stalled downstream processing retain the same
+    // owners. Every job is installed, but only an admitted job has had its
+    // articles built; the rest hold none until a slot admits them.
+    for (id, state) in pipeline.jobs.iter_mut() {
+        if pipeline.nzb_admitted.contains(id) {
+            state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        } else {
+            assert!(state.articles.active().is_none());
+        }
         state.post_state = crate::PostState::WaitingForVolumes;
     }
     for _ in 0..24 {

@@ -51,6 +51,9 @@ async fn a_repeated_article_cache_failure_fails_the_job_when_its_articles_are_bu
     assert!(!pipeline.repeated_articles.contains_key(&id));
     activate_job(&mut pipeline, id).await;
     assert!(!pipeline.repeated_articles.contains_key(&id));
+    // The failed job leaves once its working directory is released off the
+    // actor.
+    settle_failed_releases(&mut pipeline).await;
     assert!(!pipeline.jobs.contains_key(&id));
     let status = pipeline
         .finished_jobs()
