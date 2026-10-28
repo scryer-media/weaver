@@ -857,7 +857,7 @@ impl Tree {
     // that. When an engine took the volumes it reads them again and makes
     // every member over, so nothing of the node stays. A refused node stays
     // whatever it keeps, to claim the rest of its set.
-    pub fn bury(&mut self, node: NodeId, member: MemberId) {
+    pub fn bury(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
         let Some((retired, _)) = self
             .nodes
             .retired_mut(&(node, member))
@@ -879,9 +879,9 @@ impl Tree {
             .nodes
             .get(&retired)
             .is_some_and(|found| found.refused.is_some());
-        if read_again || !(self.keep_closed(retired) || refused) {
-            self.drop_subtree(retired);
-            self.remove_node(retired);
+        if read_again || !(self.keep_closed(retired, effects) || refused) {
+            self.drop_subtree(retired, effects);
+            self.remove_node(retired, effects);
         }
     }
 
@@ -915,8 +915,8 @@ impl Tree {
             if let Some((_, volumes)) = self.volumes(refuser) {
                 reopened.extend(volumes.values().copied());
             }
-            self.drop_subtree(refuser);
-            self.remove_node(refuser);
+            self.drop_subtree(refuser, effects);
+            self.remove_node(refuser, effects);
         }
         for volume in &reopened {
             self.nodes.unretire(&(node, *volume));
@@ -937,7 +937,7 @@ impl Tree {
     // object left one open. It keeps no name and no file. The rest goes with
     // its name, and so does every window, which owns nothing of its member.
     // `false` when nothing stays, and removing the node is the caller's.
-    fn keep_closed(&mut self, node: NodeId) -> bool {
+    fn keep_closed(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> bool {
         let Some(found) = self.nodes.get_mut(&node) else {
             return false;
         };
@@ -951,20 +951,20 @@ impl Tree {
             .map(|record| (record.id, record.is_whole(), record.closed))
             .collect();
         for window in windows {
-            self.drop_subtree(window);
-            self.remove_node(window);
+            self.drop_subtree(window, effects);
+            self.remove_node(window, effects);
         }
         for (member, whole, closed) in members {
             let owner = self.child_of(node, member).map(|(child, _)| child);
-            if owner.is_some_and(|child| self.keep_closed(child)) {
+            if owner.is_some_and(|child| self.keep_closed(child, effects)) {
                 continue;
             }
             // A recovery volume lives in its member's own file, as a leaf does.
             let own_file = owner.is_none_or(|child| self.recovers(child));
             let open = !closed && !owner.is_some_and(|child| self.recovers(child));
             if let Some(child) = owner {
-                self.drop_subtree(child);
-                self.remove_node(child);
+                self.drop_subtree(child, effects);
+                self.remove_node(child, effects);
             }
             let Some(found) = self.nodes.get_mut(&node) else {
                 return false;
@@ -974,12 +974,12 @@ impl Tree {
             if open {
                 found.undecided.remove(&member);
                 self.nodes.retire((node, member), None);
-                self.names.release((node, member));
+                self.release_name((node, member), effects);
             } else if !(whole && own_file) {
                 found.namespace.remove(member);
                 found.undecided.remove(&member);
                 self.nodes.unretire(&(node, member));
-                self.names.release((node, member));
+                self.release_name((node, member), effects);
             }
         }
         self.nodes
@@ -1388,7 +1388,7 @@ impl Tree {
             from: child,
             volume,
         });
-        self.forget_empty(child, empty);
+        self.forget_empty(child, empty, effects);
         self.identify_again(node, member, builder, effects);
     }
 
@@ -1442,7 +1442,7 @@ impl Tree {
                 offered.push(member);
             }
         }
-        self.forget_empty(node, empty);
+        self.forget_empty(node, empty, effects);
         for member in offered {
             self.identify_again(parent, member, builder, effects);
         }
@@ -1462,10 +1462,10 @@ impl Tree {
         self.given_back(node, member).then_some(Why::Unmapped)
     }
 
-    fn forget_empty(&mut self, node: NodeId, empty: bool) {
+    fn forget_empty(&mut self, node: NodeId, empty: bool, effects: &mut Vec<Effect>) {
         if empty {
-            self.drop_subtree(node);
-            self.remove_node(node);
+            self.drop_subtree(node, effects);
+            self.remove_node(node, effects);
         }
     }
 
@@ -1505,6 +1505,37 @@ impl Tree {
         }
     }
 
+    // A member's file has moved off `name`, so the ledger may give it
+    // again, and the member that wanted it while it was left moves to it.
+    pub fn vacated(&mut self, name: &str, effects: &mut Vec<Effect>) {
+        let mut moved = Vec::new();
+        self.names.vacated(name, &mut moved);
+        self.report_moves(moved, effects);
+    }
+
+    // Restored, every member the ledger kept off the name it wants while a
+    // file left it takes the name, now free.
+    pub fn settle_names(&mut self, effects: &mut Vec<Effect>) {
+        let mut moved = Vec::new();
+        self.names.settle(&mut moved);
+        self.report_moves(moved, effects);
+    }
+
+    // A member leaves the ledger. Each name it was moving off is handed to
+    // the member that wanted it while it was left, as that member's move;
+    // the member's file goes there once nothing sits at the name on disk.
+    fn release_name(&mut self, holder: (NodeId, MemberId), effects: &mut Vec<Effect>) {
+        let mut moved = Vec::new();
+        self.names.release(holder, &mut moved);
+        self.report_moves(moved, effects);
+    }
+
+    // A restored member's file still sits at `name`, which it is moving off:
+    // the ledger gives it to no other member until it has.
+    pub fn leaving(&mut self, node: NodeId, member: MemberId, name: &str) {
+        self.names.leaving((node, member), name);
+    }
+
     // Give the member the output name the ledger allocates for the name it
     // wants, and move whichever members that displaced.
     fn place(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
@@ -1526,6 +1557,12 @@ impl Tree {
         {
             record.output_name = given;
         }
+        self.report_moves(moved, effects);
+    }
+
+    // Members the ledger moved take their new names, and each move is
+    // reported.
+    fn report_moves(&mut self, moved: Vec<Moved>, effects: &mut Vec<Effect>) {
         for Moved { holder, old, new } in moved {
             let (node, member) = holder;
             if let Some(record) = self
@@ -1561,11 +1598,11 @@ impl Tree {
 
     // A node leaves the tree, and its members' names with it. A set that
     // moved into its namespace is homed where it was posted again.
-    fn remove_node(&mut self, node: NodeId) -> Option<Node> {
+    fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
         self.given.retain(|(at, _), _| *at != node);
         for record in removed.namespace.members() {
-            self.names.release((node, record.id));
+            self.release_name((node, record.id), effects);
         }
         self.rehome(node);
         for set in self.recovery_nodes(node) {
@@ -2001,7 +2038,7 @@ impl Tree {
                 .get(&sibling)
                 .and_then(|found| found.binding.as_ref())
                 .is_some_and(|binding| binding.volumes.is_empty());
-            self.forget_empty(sibling, empty);
+            self.forget_empty(sibling, empty, effects);
         }
     }
 
@@ -2229,7 +2266,7 @@ impl Tree {
         }
         found.undecided.remove(&copy);
         self.given.remove(&(node, copy));
-        self.names.release((node, copy));
+        self.release_name((node, copy), effects);
         effects.push(Effect::Folded { node, copy, into });
         true
     }
@@ -2622,8 +2659,8 @@ impl Tree {
             .get(&node)
             .and_then(|found| found.children.get(&member).copied())
         {
-            self.drop_subtree(child);
-            let volumes = self.detach(child);
+            self.drop_subtree(child, effects);
+            let volumes = self.detach(child, effects);
             if let Some(found) = self.nodes.get_mut(&node) {
                 for volume in &volumes {
                     found.children.remove(volume);
@@ -2645,8 +2682,8 @@ impl Tree {
         }
         // A window was a range of the member's old bytes.
         for window in self.windows_on(node, member) {
-            self.drop_subtree(window);
-            self.remove_node(window);
+            self.drop_subtree(window, effects);
+            self.remove_node(window, effects);
         }
         if let Some(found) = self.nodes.get_mut(&node) {
             found.windows.remove(&member);
@@ -2679,8 +2716,8 @@ impl Tree {
         if binding.window.is_some() {
             // A window owns none of its member: nothing is given up, and
             // nothing reads back through it, so it simply goes.
-            self.drop_subtree(node);
-            self.remove_node(node);
+            self.drop_subtree(node, effects);
+            self.remove_node(node, effects);
             if let Some(found) = self.nodes.get_mut(&binding.parent) {
                 for windows in found.windows.values_mut() {
                     windows.retain(|window| *window != node);
@@ -2755,8 +2792,8 @@ impl Tree {
     }
 
     // Remove a node and return the parent members that were its volumes.
-    fn detach(&mut self, node: NodeId) -> Vec<MemberId> {
-        self.remove_node(node)
+    fn detach(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Vec<MemberId> {
+        self.remove_node(node, effects)
             .and_then(|removed| removed.binding)
             .map(|binding| binding.volumes.into_values().collect())
             .unwrap_or_default()
@@ -2764,12 +2801,12 @@ impl Tree {
 
     // A node's subtree goes with it, the objects that refused their volumes
     // in its namespace among it.
-    fn drop_subtree(&mut self, node: NodeId) {
+    fn drop_subtree(&mut self, node: NodeId, effects: &mut Vec<Effect>) {
         let mut below = self.bound_below(node);
         below.extend(self.refused_below(node));
         for child in below {
-            self.drop_subtree(child);
-            self.remove_node(child);
+            self.drop_subtree(child, effects);
+            self.remove_node(child, effects);
         }
     }
 
@@ -4065,9 +4102,9 @@ mod tests {
         );
         assert!(tree.namespace(child).is_some());
         assert!(tree.engines().is_empty());
-        tree.bury(NodeId::ROOT, first);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
         assert!(tree.namespace(child).is_some(), "one volume still unread");
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         // Nothing of the store stays but a member it left open, buried.
         assert!(tree.namespace(child).is_none_or(|namespace| {
             namespace
@@ -4119,8 +4156,8 @@ mod tests {
             &mut Build,
             &mut Vec::new(),
         );
-        tree.bury(NodeId::ROOT, first);
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         assert!(
             tree.namespace(child).is_none_or(|namespace| {
                 namespace
@@ -4177,7 +4214,7 @@ mod tests {
             &mut Build,
             &mut Vec::new(),
         );
-        tree.bury(NodeId::ROOT, first);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
         let later = tree.announce_root("show.r01", None, &mut Vec::new());
         let mut bytes = SIGNATURE.to_vec();
         bytes.extend_from_slice(b"hello");
@@ -4251,7 +4288,7 @@ mod tests {
         }));
         assert!(!tree.buried(child), "its volume is still to be read back");
         assert_eq!(tree.kept(NodeId::ROOT, first).count(), 0);
-        tree.bury(NodeId::ROOT, first);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
         assert!(tree.buried(child));
         assert_eq!(tree.kept(NodeId::ROOT, first).collect::<Vec<_>>(), [child]);
         assert!(tree.live().iter().all(|node| *node != child));
@@ -4279,6 +4316,48 @@ mod tests {
             effect,
             Effect::Renamed { node, member: MemberId(0), .. } if *node == child
         )));
+    }
+
+    // A member moved off a name leaves the ledger before its file has left
+    // the name: the member given another name while it was left takes it
+    // now, as its move, so it is written under the name it wanted once the
+    // file is gone, never under the suffixed one for good.
+    #[test]
+    fn a_name_a_released_member_was_leaving_goes_to_the_member_that_wanted_it() {
+        let (mut tree, first, child, _) = bound_tree();
+        tree.emitted(
+            child,
+            vec![
+                Emit::Retract(MemberId(0)),
+                Emit::Member {
+                    member: MemberId(0),
+                    name: "other.bin".into(),
+                    length: Some(5),
+                },
+            ],
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let wanting = tree.announce_root("inner.bin", None, &mut Vec::new());
+        assert_eq!(output_name(&tree, NodeId::ROOT, wanting), "inner (1).bin");
+        tree.emitted(
+            child,
+            vec![Emit::Refuse(Why::Compressed)],
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let mut effects = Vec::new();
+        tree.bury(NodeId::ROOT, first, &mut effects);
+        assert!(
+            effects.contains(&Effect::Renamed {
+                node: NodeId::ROOT,
+                member: wanting,
+                old: "inner (1).bin".into(),
+                new: "inner.bin".into(),
+            }),
+            "{effects:?}"
+        );
+        assert_eq!(output_name(&tree, NodeId::ROOT, wanting), "inner.bin");
     }
 
     // Volumes named out of order are each held at announce, by name, before
@@ -4458,8 +4537,8 @@ mod tests {
         let mut wants = Vec::new();
         tree.collect_wants(&mut wants);
         assert!(wants.iter().all(|(node, _)| *node != child));
-        tree.bury(NodeId::ROOT, first);
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         assert!(tree.namespace(child).is_none());
         assert!(tree.namespace(engine).is_some());
     }
@@ -4479,8 +4558,8 @@ mod tests {
             &mut Vec::new(),
         );
         let (engine, _) = tree.child_of(NodeId::ROOT, first).unwrap();
-        tree.bury(NodeId::ROOT, first);
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         let mut effects = Vec::new();
         tree.emitted(
             engine,

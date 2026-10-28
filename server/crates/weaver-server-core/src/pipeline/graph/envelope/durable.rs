@@ -8,7 +8,7 @@
 
 use weaver_graph::{Coverage, NodeId, Run};
 
-use super::{Envelopes, Kept};
+use super::{Envelopes, Kept, envelope_name};
 use crate::pipeline::graph::leaf::{Leaf, LeafError};
 
 // One kept envelope: its node, its number, the runs of it that are on disk,
@@ -20,6 +20,8 @@ pub(crate) struct KeptRecord {
     pub(crate) runs: Vec<Run>,
     pub(crate) closed: Option<u64>,
     pub(crate) settled: bool,
+    // The file it sits in, when not the one its node and number name.
+    pub(crate) file: Option<String>,
 }
 
 impl Envelopes {
@@ -38,6 +40,9 @@ impl Envelopes {
                 runs: kept.coverage.runs().copied().collect(),
                 closed: kept.closed,
                 settled: kept.settled,
+                file: Some(kept.leaf.name())
+                    .filter(|name| *name != envelope_name(node, *envelope))
+                    .map(str::to_owned),
             })
             .collect()
     }
@@ -57,12 +62,10 @@ impl Envelopes {
     pub(crate) fn restore(&mut self, record: &KeptRecord) -> Result<(), LeafError> {
         let shelf = self.shelf(record.node);
         self.marks.mark(record.node);
-        let name = format!(
-            "{}/graph-envelope-{}-{}",
-            weaver_graph::names::INTERNAL_DIR,
-            record.node.0,
-            record.envelope
-        );
+        let name = record
+            .file
+            .clone()
+            .unwrap_or_else(|| envelope_name(record.node, record.envelope));
         let leaf = Leaf::at(&shelf.dir, &name);
         let mut coverage = Coverage::new();
         for run in &record.runs {

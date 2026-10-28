@@ -60,6 +60,10 @@ struct Entry {
 pub struct NameLedger {
     // Allocated name, as its path on disk, to the member holding it.
     taken: HashMap<String, Holder>,
+    // A name, as its path on disk, a member was moved off whose file still
+    // sits there: it is free again only once that file has moved, so no
+    // other member is given a name a file is still written under.
+    leaving: HashMap<String, Holder>,
     entries: HashMap<Holder, Entry>,
 }
 
@@ -92,11 +96,13 @@ impl NameLedger {
         };
         let rank = (position, holder);
         // The old name stays the holder's until it has a new one, so no
-        // member it moves can move into a file it has not yet left.
+        // member it moves can move into a file it has not yet left; it then
+        // stays shut until the holder's file has left it.
         let name = self.place(holder, &rank, &wanted, moved);
         if let Some(old) = old.filter(|old| *old != name) {
             if key(&old) != key(&name) {
                 self.taken.remove(&key(&old));
+                self.leaving.insert(key(&old), holder);
             }
             moved.push(Moved {
                 holder,
@@ -141,9 +147,91 @@ impl NameLedger {
         );
     }
 
-    pub fn release(&mut self, holder: Holder) {
+    // A holder leaves the ledger. Each name it was moving off is no longer
+    // kept for it: the holder that wanted the name while it was left, the
+    // highest ranked when several were, takes it now, and its move is pushed
+    // to `moved`, as when the name is vacated. Whether a file still sits at
+    // the name on disk is not the ledger's to say; the move waits for that.
+    pub fn release(&mut self, holder: Holder, moved: &mut Vec<Moved>) {
         if let Some(entry) = self.entries.remove(&holder) {
             self.taken.remove(&key(&entry.name));
+        }
+        let mut left: Vec<String> = self
+            .leaving
+            .iter()
+            .filter(|(_, leaving)| **leaving == holder)
+            .map(|(name, _)| name.clone())
+            .collect();
+        left.sort();
+        for name in left {
+            self.leaving.remove(&name);
+            self.take_wanted(name, moved);
+        }
+    }
+
+    // The file written under `name` has moved off it: the name is free.
+    // The holder that wanted it and was given another while it was left,
+    // the highest ranked when several were, takes it now, and its move is
+    // pushed to `moved`: a name shut while a file leaves it delays a
+    // member's name, never changes it.
+    pub fn vacated(&mut self, name: &str, moved: &mut Vec<Moved>) {
+        let name = key(name);
+        if self.leaving.remove(&name).is_some() {
+            self.take_wanted(name, moved);
+        }
+    }
+
+    // Restored, a holder given another name while the one it wanted was
+    // left takes it when nothing holds or leaves it any more.
+    pub fn settle(&mut self, moved: &mut Vec<Moved>) {
+        let mut wanted: Vec<String> = self
+            .entries
+            .values()
+            .filter(|entry| key(&entry.wanted) != key(&entry.name))
+            .map(|entry| key(&entry.wanted))
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        for name in wanted {
+            if !self.leaving.contains_key(&name) {
+                self.take_wanted(name, moved);
+            }
+        }
+    }
+
+    // The highest ranked holder that wants the free name `name` and holds
+    // another takes it.
+    fn take_wanted(&mut self, name: String, moved: &mut Vec<Moved>) {
+        if self.taken.contains_key(&name) {
+            return;
+        }
+        let Some((holder, wanted)) = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| key(&entry.wanted) == name && key(&entry.name) != name)
+            .min_by(|(_, one), (_, other)| one.rank.cmp(&other.rank))
+            .map(|(holder, entry)| (*holder, entry.wanted.clone()))
+        else {
+            return;
+        };
+        let entry = self.entries.get_mut(&holder).expect("found above");
+        let old = std::mem::replace(&mut entry.name, wanted.clone());
+        self.taken.remove(&key(&old));
+        self.leaving.insert(key(&old), holder);
+        self.taken.insert(name, holder);
+        moved.push(Moved {
+            holder,
+            old,
+            new: wanted,
+        });
+    }
+
+    // A restored holder's file still sits at `name`, which it is moving
+    // off: the name stays shut until it has, unless another holder holds it.
+    pub fn leaving(&mut self, holder: Holder, name: &str) {
+        let name = key(name);
+        if !self.taken.contains_key(&name) {
+            self.leaving.insert(name, holder);
         }
     }
 
@@ -153,6 +241,7 @@ impl NameLedger {
 
     pub fn clear(&mut self) {
         self.taken.clear();
+        self.leaving.clear();
         self.entries.clear();
     }
 
@@ -173,6 +262,13 @@ impl NameLedger {
                 n => format!("{stem} ({n}){extension}"),
             };
             let key = key(&candidate);
+            match self.leaving.get(&key) {
+                Some(leaving) if *leaving != holder => continue,
+                Some(_) => {
+                    self.leaving.remove(&key);
+                }
+                None => {}
+            }
             let outranked = match self.taken.get(&key) {
                 None => None,
                 Some(other) if *other == holder => None,
@@ -255,8 +351,9 @@ fn confined_part(part: &str) -> String {
 // system sees it: composed (NFC), so a composed and a decomposed spelling of
 // one name are one path, then case-folded character by character. A
 // directory and a file of one name are one path, so they share a key and the
-// ledger gives only one of them the name.
-fn key(name: &str) -> String {
+// ledger gives only one of them the name. The writer asks it too, of the
+// names files sit at on disk.
+pub fn key(name: &str) -> String {
     name.strip_suffix('/')
         .unwrap_or(name)
         .nfc()
@@ -332,7 +429,7 @@ mod tests {
     fn a_released_name_is_free_again() {
         let mut ledger = NameLedger::new();
         root(&mut ledger, 1, "a.bin");
-        ledger.release((ROOT, MemberId(1)));
+        ledger.release((ROOT, MemberId(1)), &mut Vec::new());
         assert_eq!(root(&mut ledger, 2, "a.bin"), "a.bin");
     }
 
@@ -352,7 +449,61 @@ mod tests {
                 new: "show.part01.rar".into(),
             }]
         );
-        assert_eq!(root(&mut ledger, 2, "3f9a.bin"), "3f9a.bin");
+        // The file still sits at the name it left until it has moved; the
+        // member that wanted it then takes it.
+        assert_eq!(root(&mut ledger, 2, "3f9a.bin"), "3f9a (1).bin");
+        let mut moved = Vec::new();
+        ledger.vacated("3f9a.bin", &mut moved);
+        assert_eq!(ledger.given((ROOT, MemberId(2))), Some("3f9a.bin"));
+        assert_eq!(
+            moved,
+            vec![Moved {
+                holder: (ROOT, MemberId(2)),
+                old: "3f9a (1).bin".into(),
+                new: "3f9a.bin".into(),
+            }]
+        );
+    }
+
+    // One member moves off a name and another wants it in the same step:
+    // the second is given the name only once the first has left it, so a
+    // file never moves onto one that has not moved off.
+    #[test]
+    fn a_name_left_is_shut_to_others_until_its_file_has_moved() {
+        let mut ledger = NameLedger::new();
+        let (a, b) = ((ROOT, MemberId(1)), (ROOT, MemberId(2)));
+        root(&mut ledger, 1, "old.bin");
+        root(&mut ledger, 2, "taken.bin");
+        let mut moved = Vec::new();
+        assert_eq!(
+            ledger.allocate(b, at(&[2]), "later.bin", &mut moved),
+            "later.bin"
+        );
+        assert_eq!(
+            ledger.allocate(a, at(&[1]), "taken.bin", &mut moved),
+            "taken (1).bin"
+        );
+        // Its own name left is the holder's to take back.
+        assert_eq!(
+            ledger.allocate(b, at(&[2]), "taken.bin", &mut moved),
+            "taken.bin"
+        );
+        ledger.allocate(b, at(&[2]), "later.bin", &mut moved);
+        moved.clear();
+        ledger.vacated("taken.bin", &mut moved);
+        assert_eq!(ledger.given(a), Some("taken.bin"));
+        assert_eq!(
+            moved,
+            vec![Moved {
+                holder: a,
+                old: "taken (1).bin".into(),
+                new: "taken.bin".into(),
+            }]
+        );
+        // A released holder leaves nothing shut.
+        ledger.allocate(a, at(&[1]), "else.bin", &mut moved);
+        ledger.release(a, &mut Vec::new());
+        assert_eq!(root(&mut ledger, 3, "taken.bin"), "taken.bin");
     }
 
     #[test]

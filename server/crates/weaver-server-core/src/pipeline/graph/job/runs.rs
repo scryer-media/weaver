@@ -28,6 +28,7 @@ impl GraphJob {
             Heard::Repaired(returned) => {
                 return self.repaired(node, said.generation, *returned, slots, limit);
             }
+            Heard::Written(stamp) => return self.written(stamp),
             _ if !self.runs.current(node, said.generation) => return Ok(()),
             Heard::Emit(emit) => {
                 // The tree is told the run is asking, as it is told how far

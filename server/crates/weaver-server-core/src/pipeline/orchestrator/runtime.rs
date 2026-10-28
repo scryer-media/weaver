@@ -979,9 +979,9 @@ impl Pipeline {
                     Some(said) = self.graph_runs.recv() => {
                         self.graph_run_said(said);
                     }
-                    Some(update) = self.post_probes.recv() => {
+                    Some(mail) = self.post_probes.recv() => {
                         turn_timer.resume();
-                        self.post_probe_heard(update);
+                        self.post_probe_mail(mail);
                     }
                     Some(result) = self.decode_done_rx.recv() => {
                         turn_timer.resume();

@@ -1205,7 +1205,7 @@ async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
         assert!(pending.put(&admitted, Vec::new()));
         pipeline
             .db
-            .save_graph_checkpoint(restored_id, Arc::new(pending.take().unwrap()))
+            .save_graph_checkpoint(restored_id, Arc::new(pending.take().0.unwrap()))
             .unwrap();
         retire_pipeline_database(pipeline).await;
         working_dir

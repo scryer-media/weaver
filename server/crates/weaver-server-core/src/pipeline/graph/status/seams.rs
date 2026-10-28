@@ -45,6 +45,15 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     if pipeline.graph_status.repairs.handed(asker(job_id)) {
         pipeline.lend_graph_repairs(job_id);
     }
+    // A file waiting to move waits on a checkpoint's commit: one is taken,
+    // so the database says when.
+    if pipeline
+        .graph_jobs
+        .get(&job_id)
+        .is_some_and(GraphJob::moves_waiting)
+    {
+        pipeline.checkpoint_graph_job(job_id);
+    }
     let limit = pipeline.graph_job_slot_limit(job_id);
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;

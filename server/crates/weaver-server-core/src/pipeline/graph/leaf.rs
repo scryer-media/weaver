@@ -3,7 +3,10 @@
 
 // A leaf is a member no object owns, and its bytes go to a file. The file
 // sits under the job's working directory at the name its namespace
-// allocated; the leaf never chooses a name. Delivery out of the working
+// allocated; the leaf never chooses a name. A member the ledger names again
+// keeps its file where it is until the checkpoint that records the new name
+// has committed: the leaf holds both names until then, and only the name it
+// sits at is ever opened. Delivery out of the working
 // directory stays with finalize, which moves what is there and renames
 // obfuscated members on the way.
 //
@@ -37,6 +40,11 @@ impl LeafError {
 #[derive(Debug)]
 pub(crate) struct Leaf {
     path: PathBuf,
+    // The name the file sits at, as `path` joins it under the directory.
+    name: String,
+    // The name the file is to move to once the checkpoint that records it
+    // has committed; `None` while it sits at its name.
+    wants: Option<String>,
     // A directory member, by its name: it has no bytes, and closing it
     // makes the directory.
     directory: bool,
@@ -62,6 +70,8 @@ impl Leaf {
     pub(crate) fn at(dir: &Path, output_name: &str) -> Self {
         Self {
             path: dir.join(relative_path(output_name)),
+            name: output_name.to_owned(),
+            wants: None,
             directory: Self::is_directory(output_name),
             file: None,
             written: BTreeMap::new(),
@@ -70,6 +80,16 @@ impl Leaf {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    // The name the file sits at.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    // The name the file waits to move to, if it waits.
+    pub(crate) fn wants(&self) -> Option<&str> {
+        self.wants.as_deref()
     }
 
     #[cfg(test)]
@@ -217,19 +237,28 @@ impl Leaf {
         file.set_len(0).map_err(LeafError::io(&self.path))
     }
 
-    // The member was renamed; the file follows it.
-    pub(crate) fn rename(&mut self, dir: &Path, output_name: &str) -> Result<(), LeafError> {
-        let path = dir.join(relative_path(output_name));
-        if path == self.path {
-            return Ok(());
-        }
+    // The member was named again: the file is to follow it, once the
+    // checkpoint that records the name has committed. Nothing on disk
+    // changes here, and a name the file already sits at wants no move.
+    pub(crate) fn intend(&mut self, output_name: &str) {
+        self.wants = (output_name != self.name).then(|| output_name.to_owned());
+    }
+
+    // The file moves to the name it wants, which the checkpoint has
+    // recorded. The name it left, when it moved.
+    pub(crate) fn move_on(&mut self, dir: &Path) -> Result<Option<String>, LeafError> {
+        let Some(wants) = self.wants.clone() else {
+            return Ok(None);
+        };
+        let path = dir.join(relative_path(&wants));
         let had_file = self.file.take().is_some() || self.path.exists();
-        if had_file {
+        if had_file && path != self.path {
             create_parent(&path)?;
             std::fs::rename(&self.path, &path).map_err(LeafError::io(&self.path))?;
         }
         self.path = path;
-        Ok(())
+        self.wants = None;
+        Ok(Some(std::mem::replace(&mut self.name, wants)))
     }
 
     // The member is gone with its subtree.

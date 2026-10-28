@@ -93,6 +93,10 @@ impl RootJob for Prepared {
     fn repair_out(&self) -> bool {
         false
     }
+
+    fn moves_waiting(&self) -> bool {
+        false
+    }
 }
 
 // A member: its name, its length, and the runs it holds with how each came.

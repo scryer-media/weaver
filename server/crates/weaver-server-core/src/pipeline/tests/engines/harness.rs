@@ -18,7 +18,7 @@ use weaver_model::files::FileRole;
 
 use super::super::{
     checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
-    pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
+    pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -284,34 +284,169 @@ pub(in crate::pipeline::tests) fn one_block_article(post: &Post) -> u32 {
         .expect("an article inside one block alone")
 }
 
-// The scenario's server as a health probe's STAT asks it.
-struct ScenarioStat {
-    missing: BTreeSet<String>,
+// A listener on this machine that answers each connection it is dialed on
+// a thread of its own, for as long as the test holds it, and closes the
+// connection once its answer returns. Dropped, it stops
+// taking connections, closes its socket, shuts every connection it took, and
+// joins every thread it ran, so nothing it started outlives the test.
+pub(in crate::pipeline::tests) struct Listener {
+    pub(in crate::pipeline::tests) port: u16,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accepting: Option<std::thread::JoinHandle<Vec<Answering>>>,
 }
 
-impl crate::pipeline::post_health::Stat for ScenarioStat {
-    fn stat_many<'a>(
-        &'a self,
-        message_ids: &'a [&'a str],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<bool>>> + Send + 'a>> {
-        let exists = message_ids
-            .iter()
-            .map(|id| !self.missing.contains(*id))
-            .collect();
-        Box::pin(std::future::ready(Some(exists)))
+// A connection the listener took, and the thread answering it.
+type Answering = (std::net::TcpStream, std::thread::JoinHandle<()>);
+
+impl Listener {
+    pub(in crate::pipeline::tests) fn serve(
+        answer: impl Fn(std::net::TcpStream) + Send + Sync + 'static,
+    ) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the listener");
+        let port = listener.local_addr().unwrap().port();
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&stopping);
+        let answer = std::sync::Arc::new(answer);
+        let accepting = std::thread::Builder::new()
+            .name("harness-listener".into())
+            .spawn(move || {
+                let mut answering = Vec::new();
+                for socket in listener.incoming() {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(socket) = socket else { continue };
+                    let (Ok(held), Ok(closing)) = (socket.try_clone(), socket.try_clone()) else {
+                        continue;
+                    };
+                    let answer = std::sync::Arc::clone(&answer);
+                    // The listener holds the connection too, so it is shut
+                    // here once the answer is done with it, as a server
+                    // closes a connection it is done answering.
+                    let thread = std::thread::spawn(move || {
+                        answer(socket);
+                        let _ = closing.shutdown(std::net::Shutdown::Both);
+                    });
+                    answering.push((held, thread));
+                }
+                answering
+            })
+            .expect("spawn the listener");
+        Self {
+            port,
+            stopping,
+            accepting: Some(accepting),
+        }
     }
 }
 
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The accept loop wakes on a connection, sees it is stopping, and
+        // returns, closing the listening socket as it goes.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        let Some(answering) = self.accepting.take().and_then(|thread| thread.join().ok()) else {
+            return;
+        };
+        for (socket, thread) in answering {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            let _ = thread.join();
+        }
+    }
+}
+
+// The scenario's server as a health probe's STAT batches ask it on the
+// download lanes: a listener that holds every article but `missing`,
+// answering STAT and HEAD on each connection it is dialed. The harness
+// serves the articles themselves, so nothing asks it for a body.
+fn stat_server(missing: BTreeSet<String>) -> Listener {
+    Listener::serve(move |socket| answer_stat(socket, &missing))
+}
+
+fn answer_stat(socket: std::net::TcpStream, missing: &BTreeSet<String>) {
+    use std::io::{BufRead, Write};
+    let mut writer = socket.try_clone().unwrap();
+    if writer.write_all(b"200 ready\r\n").is_err() {
+        return;
+    }
+    for line in std::io::BufReader::new(socket).lines() {
+        let Ok(line) = line else { break };
+        let upper = line.to_ascii_uppercase();
+        let asked = |command: &str| {
+            upper
+                .starts_with(command)
+                .then(|| line[command.len()..].trim().to_string())
+        };
+        let held = |id: &str| !missing.contains(id.trim_matches(['<', '>']));
+        let reply = if upper == "CAPABILITIES" {
+            "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n".to_string()
+        } else if let Some(id) = asked("STAT ") {
+            if held(&id) {
+                format!("223 0 {id}\r\n")
+            } else {
+                "430 no such article\r\n".to_string()
+            }
+        } else if let Some(id) = asked("HEAD ") {
+            if held(&id) {
+                format!("221 0 {id}\r\nSubject: lantern\r\n.\r\n")
+            } else {
+                "430 no such article\r\n".to_string()
+            }
+        } else if upper.starts_with("QUIT") {
+            let _ = writer.write_all(b"205 closing\r\n");
+            break;
+        } else {
+            "500 command not recognized\r\n".to_string()
+        };
+        if writer.write_all(reply.as_bytes()).is_err() {
+            break;
+        }
+    }
+}
+
+// The pipeline's client for a scenario: `servers` servers, all the
+// scenario's STAT server, one connection each.
+fn scenario_client(servers: usize, port: u16) -> weaver_nntp::client::NntpClient {
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers: (0..servers)
+            .map(|_| weaver_nntp::ServerPoolConfig {
+                max_connections: 1,
+                ..weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port,
+                    tls: false,
+                    ..Default::default()
+                })
+            })
+            .collect(),
+        ..weaver_nntp::client::NntpClientConfig::single(Default::default(), 1)
+    })
+}
+
 // A health probe out for the job is heard before the next article is
-// served: its round ends before the download moves on.
+// served: its round ends before the download moves on. Each batch waiting
+// for a seat is seated as a dispatch pass seats it, and the harness leases
+// no article to a lane, so a batch finds a seat free once the one before
+// it has answered. A batch every server has answered for is ruled on as it
+// is seated, so the round can end there, and only a round still out after
+// the seating waits for the next answer.
 async fn hear_probe(pipeline: &mut Pipeline) {
-    while pipeline.post_probes.out(JOB) {
-        let update = pipeline
+    loop {
+        pipeline.seat_waiting_probes(
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        );
+        if !pipeline.post_probes.out(JOB) {
+            return;
+        }
+        let mail = pipeline
             .post_probes
             .recv()
             .await
             .expect("a probe out speaks");
-        pipeline.post_probe_heard(update);
+        pipeline.post_probe_mail(mail);
     }
 }
 
@@ -350,6 +485,9 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
     pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
+    // The STAT server of every pipeline the scenario prepared, held as long
+    // as the scenario is.
+    stat_servers: std::sync::Mutex<Vec<Listener>>,
 }
 
 impl Scenario {
@@ -370,6 +508,7 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
+            stat_servers: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -391,9 +530,21 @@ impl Scenario {
     // backup that serves them whole, on every pipeline that runs the job,
     // a restarted one too.
     pub(in crate::pipeline::tests) fn prepare(&self, pipeline: &mut Pipeline) {
-        if !self.corrupt_primary.is_empty() {
-            pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
-        }
+        // A health probe asks the scenario's servers on the download lanes,
+        // and each holds every article but the ones the scenario lost.
+        let missing = self
+            .lost
+            .iter()
+            .map(|(file, ordinal)| format!("lantern-{file}-{ordinal}@example.com"))
+            .collect();
+        let servers = if self.corrupt_primary.is_empty() {
+            1
+        } else {
+            2
+        };
+        let server = stat_server(missing);
+        pipeline.nntp = std::sync::Arc::new(scenario_client(servers, server.port));
+        self.stat_servers.lock().unwrap().push(server);
         if !self.global_passwords.is_empty() {
             pipeline
                 .db
@@ -412,15 +563,6 @@ impl Scenario {
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
         }
-        // A health probe asks the scenario's server, which holds every
-        // article but the ones it lost.
-        pipeline.post_probes.stat = Some(std::sync::Arc::new(ScenarioStat {
-            missing: self
-                .lost
-                .iter()
-                .map(|(file, ordinal)| format!("lantern-{file}-{ordinal}@example.com"))
-                .collect(),
-        }));
     }
 
     // Whatever the download queue hands out at once arrives in reverse.

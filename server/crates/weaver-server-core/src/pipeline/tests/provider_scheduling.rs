@@ -241,7 +241,7 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
                 Some(_) = pipeline.download_lane_parked_rx.recv() => parked += 1,
             }
         }
-        assert!(pipeline.owned_download_lane_pool.reset().is_empty());
+        assert!(pipeline.owned_download_lane_pool.reset().leases.is_empty());
         for _ in 0..4 {
             assert!(closures.recv().await.unwrap() < 2);
         }

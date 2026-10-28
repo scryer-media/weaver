@@ -323,7 +323,7 @@ fn a_member_a_buried_refusal_left_open_comes_back_buried() {
         &mut Objects,
         &mut effects,
     );
-    tree.bury(NodeId::ROOT, archive);
+    tree.bury(NodeId::ROOT, archive, &mut Vec::new());
     assert!(tree.left_open(NodeId::ROOT, archive));
     let open: Vec<(NodeId, MemberId)> = [NodeId(1), NodeId(2)]
         .into_iter()

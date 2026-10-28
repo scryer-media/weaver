@@ -11,7 +11,7 @@
 // against the critical line its declared recovery sets, as NZBGet draws it:
 // a post that names no recovery is held to 85%, and the more recovery it
 // names the lower the line. And the STAT probe: once the losses take the
-// shape of a release nobody uploaded, a task asks the servers whether a
+// shape of a release nobody uploaded, the servers are asked whether a
 // stride of the post's articles exists, by STAT and never by BODY, and the
 // share it finds gone, taken over the whole payload, is a projected loss the
 // health is weighed against as well as against what it has lost so far, so a
@@ -24,15 +24,24 @@
 // files and RAR recovery volumes, each by its name. A RAR recovery record
 // inside a volume is invisible here; the 85% line is what leaves room for
 // it.
+//
+// A round's STAT batches are work on the download lanes like an article.
+// Each batch waits for a free seat on a server it has not asked yet, the
+// seat a lease for an article would take there, and is answered on that
+// lane between leases. It never borrows a lane that is mid-transfer and
+// never opens a connection of its own, and a server held back from new
+// connections seats no batch. A lane on a server a batch is waiting for,
+// with no seat free anywhere the batch could go, yields at its next refill
+// so the batch has a seat to take.
 
-use std::collections::{BTreeSet, HashMap};
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use weaver_model::files::FileRole;
+use weaver_nntp::client::ProbeBatchResult;
+use weaver_nntp::pool::ServerId;
 
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec};
@@ -65,35 +74,10 @@ pub(crate) const DEAD_RELEASE_LANDED_DIVISOR: u64 = 4;
 
 // Articles asked of the servers in one STAT batch.
 const BATCH_SIZE: usize = 50;
-// Batches between progress updates within a round.
-const UPDATE_INTERVAL: usize = 10;
-// Updates the mail holds before a round waits for the pipeline to hear one.
+// Answers the mail holds before a lane waits for the pipeline to hear one.
 const MAIL_CAPACITY: usize = 64;
 
-// What a round asks the servers: whether each article exists on any of
-// them. An error is a batch that could not settle, never a verdict that the
-// articles are gone.
-pub(crate) trait Stat: Send + Sync {
-    fn stat_many<'a>(
-        &'a self,
-        message_ids: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Option<Vec<bool>>> + Send + 'a>>;
-}
-
-impl Stat for weaver_nntp::NntpClient {
-    fn stat_many<'a>(
-        &'a self,
-        message_ids: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Option<Vec<bool>>> + Send + 'a>> {
-        Box::pin(async move {
-            weaver_nntp::NntpClient::stat_many(self, message_ids)
-                .await
-                .ok()
-        })
-    }
-}
-
-// What a round found so far, or in all.
+// What a round found, once every batch in it is back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProbeUpdate {
     pub(crate) job_id: JobId,
@@ -104,15 +88,14 @@ pub(crate) struct ProbeUpdate {
     pub(crate) missed: usize,
     // Articles left unanswered by a batch that could not settle.
     pub(crate) unverified: usize,
-    pub(crate) done: bool,
-    // The round is done and nothing in it answered.
+    // Nothing in the round answered.
     pub(crate) inconclusive: bool,
 }
 
 // Running tally over one round's batches.
 //
-// A batch can come back without an answer: a transport failure, or no
-// connection free while the download lanes hold every permit. That costs
+// A batch can come back without an answer: a transport failure, or a server
+// that could not settle it. That costs
 // the round coverage, not its verdict: the batches that did answer are still
 // evidence about the release, and a sample that is smaller than intended is
 // what `total` already stands for. Only a round that answered for nothing at
@@ -143,18 +126,122 @@ impl ProbeTally {
         self.unverified = self.unverified.saturating_add(batch_len);
     }
 
-    // The update the round reports with what it has so far.
-    pub(crate) fn update(&self, job_id: JobId, round: u32, done: bool) -> ProbeUpdate {
+    // Fold in a batch every server it could go to has answered for. An
+    // article no server has said it holds is gone only when every server
+    // that might hold it said so: one that could not settle the batch, or
+    // one the batch never reached and that still accepts the credentials,
+    // leaves the batch unsettled.
+    pub(crate) fn record_batch(&mut self, batch: &ProbeBatch, unasked_could_hold: bool) {
+        if !batch.settled() && (batch.uncertain || unasked_could_hold) {
+            self.record_unsettled(batch.ids.len());
+        } else {
+            self.record_answered(&batch.found);
+        }
+    }
+
+    // The update the round reports once every batch is back.
+    pub(crate) fn update(&self, job_id: JobId, round: u32) -> ProbeUpdate {
         ProbeUpdate {
             job_id,
             round,
             total: self.checked,
             missed: self.missed,
             unverified: self.unverified,
-            done,
-            inconclusive: done && self.checked == 0,
+            inconclusive: self.checked == 0,
         }
     }
+}
+
+// One batch of a round, carried from server to server until a server holds
+// every article in it or every server it may go to has answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeBatch {
+    pub(crate) job_id: JobId,
+    pub(crate) round: u32,
+    ids: Vec<String>,
+    // One per article: a server said it holds it.
+    found: Vec<bool>,
+    // The servers that have answered for the batch or failed to, each asked
+    // once.
+    asked: Vec<usize>,
+    // A server could not settle the batch.
+    uncertain: bool,
+}
+
+impl ProbeBatch {
+    pub(crate) fn new(job_id: JobId, round: u32, ids: Vec<String>) -> Self {
+        Self {
+            job_id,
+            round,
+            found: vec![false; ids.len()],
+            ids,
+            asked: Vec::new(),
+            uncertain: false,
+        }
+    }
+
+    // The articles no server has said it holds yet, in batch order: what the
+    // next server is asked.
+    pub(crate) fn unfound(&self) -> Vec<String> {
+        self.ids
+            .iter()
+            .zip(&self.found)
+            .filter(|(_, found)| !**found)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    // The servers this batch has been put to.
+    pub(crate) fn asked(&self) -> &[usize] {
+        &self.asked
+    }
+
+    // Whether a server holds every article in the batch.
+    pub(crate) fn settled(&self) -> bool {
+        self.found.iter().all(|found| *found)
+    }
+
+    // Fold in `server`'s answer for [`Self::unfound`], given in that order.
+    // The server is not asked again, whatever it answered: an answer that
+    // could not settle the batch, or that does not cover it, leaves the batch
+    // uncertain.
+    pub(crate) fn fold(&mut self, server: usize, result: ProbeBatchResult) {
+        self.asked.push(server);
+        let unfound = self.found.iter().filter(|found| !**found).count();
+        if result.inconclusive || result.exists.len() != unfound {
+            self.uncertain = true;
+            return;
+        }
+        let mut answers = result.exists.into_iter();
+        for found in self.found.iter_mut().filter(|found| !**found) {
+            *found = answers.next().unwrap_or(false);
+        }
+    }
+}
+
+// A lane's answer for one batch, on the server it was seated at.
+#[derive(Debug)]
+pub(crate) struct ProbeAnswer {
+    pub(crate) batch: ProbeBatch,
+    pub(crate) server: usize,
+    pub(crate) result: ProbeBatchResult,
+}
+
+// What the probes' mail carries: a lane answering one batch, or handing
+// one back unasked because no lane could be had on its seat yet.
+#[derive(Debug)]
+pub(crate) enum ProbeMail {
+    Answered(ProbeAnswer),
+    Unseated(ProbeBatch),
+}
+
+// A round out on the lanes: what its finished batches found, and how many
+// it still waits on.
+#[derive(Debug, Clone, Copy)]
+struct LaneRound {
+    round: u32,
+    tally: ProbeTally,
+    left: usize,
 }
 
 // Where a job's probe stands between rounds.
@@ -187,14 +274,15 @@ impl ProbeState {
 
 // The probes of every graph job, and the mail their rounds speak through.
 pub(crate) struct Probes {
-    sender: mpsc::Sender<ProbeUpdate>,
-    receiver: mpsc::Receiver<ProbeUpdate>,
+    sender: mpsc::Sender<ProbeMail>,
+    receiver: mpsc::Receiver<ProbeMail>,
     pub(crate) states: HashMap<JobId, ProbeState>,
     // The posts the feed gave up, in its words.
     pub(crate) dead: HashMap<JobId, String>,
-    // Who answers a round's STAT batches, when not the pipeline's own
-    // client.
-    pub(crate) stat: Option<Arc<dyn Stat>>,
+    // Batches waiting for a seat, in the order they will be offered one.
+    pub(crate) waiting: VecDeque<ProbeBatch>,
+    // The rounds out on the lanes.
+    lane_rounds: HashMap<JobId, LaneRound>,
 }
 
 impl Default for Probes {
@@ -205,17 +293,18 @@ impl Default for Probes {
             receiver,
             states: HashMap::new(),
             dead: HashMap::new(),
-            stat: None,
+            waiting: VecDeque::new(),
+            lane_rounds: HashMap::new(),
         }
     }
 }
 
 impl Probes {
-    pub(crate) fn sender(&self) -> mpsc::Sender<ProbeUpdate> {
+    pub(crate) fn sender(&self) -> mpsc::Sender<ProbeMail> {
         self.sender.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<ProbeUpdate> {
+    pub(crate) async fn recv(&mut self) -> Option<ProbeMail> {
         self.receiver.recv().await
     }
 
@@ -230,12 +319,21 @@ impl Probes {
     // goes, and the post's verdict, if the feed gave one, stays.
     pub(crate) fn retire(&mut self, job_id: JobId) {
         self.states.remove(&job_id);
+        self.lane_rounds.remove(&job_id);
+        self.waiting.retain(|batch| batch.job_id != job_id);
     }
 
     // The job has gone: the feed keeps nothing of it.
     pub(crate) fn forget(&mut self, job_id: JobId) {
-        self.states.remove(&job_id);
+        self.retire(job_id);
         self.dead.remove(&job_id);
+    }
+
+    // Whether `batch` belongs to the round its job is waiting on.
+    fn current(&self, batch: &ProbeBatch) -> bool {
+        self.lane_rounds
+            .get(&batch.job_id)
+            .is_some_and(|lane_round| lane_round.round == batch.round)
     }
 }
 
@@ -426,54 +524,6 @@ pub(crate) fn next_failed_bytes(
         .max(immediate)
 }
 
-// One round: the sampled articles asked in batches, a progress update every
-// few batches, and the tally sent when every batch has answered or failed to.
-pub(crate) async fn sample(
-    stat: Arc<dyn Stat>,
-    job_id: JobId,
-    round: u32,
-    probes: Vec<String>,
-    mail: mpsc::Sender<ProbeUpdate>,
-) {
-    let mut tally = ProbeTally::default();
-    let mut since_update = 0usize;
-    for (batch_index, batch) in probes.chunks(BATCH_SIZE).enumerate() {
-        let ids: Vec<&str> = batch.iter().map(String::as_str).collect();
-        match stat.stat_many(&ids).await {
-            Some(exists) if exists.len() == batch.len() => tally.record_answered(&exists),
-            _ => {
-                // One batch that could not settle is a hole in the sample,
-                // not a verdict about the release: the remaining batches are
-                // still worth asking, and what they answer stands.
-                tally.record_unsettled(batch.len());
-                warn!(
-                    job_id = job_id.0,
-                    round,
-                    batch_index,
-                    batch_len = batch.len(),
-                    "health probe: STAT batch inconclusive, skipping batch"
-                );
-            }
-        }
-        since_update += 1;
-        if since_update >= UPDATE_INTERVAL {
-            since_update = 0;
-            if mail.send(tally.update(job_id, round, false)).await.is_err() {
-                return;
-            }
-        }
-    }
-    info!(
-        job_id = job_id.0,
-        round,
-        checked = tally.checked,
-        missed = tally.missed,
-        unverified = tally.unverified,
-        "health probe complete"
-    );
-    let _ = mail.send(tally.update(job_id, round, true)).await;
-}
-
 impl Pipeline {
     // The first article of each file the post names, its first segment:
     // lost when every server failed it, settled when the root holds it or
@@ -647,11 +697,6 @@ impl Pipeline {
             .into_iter()
             .map(|index| candidates[index].clone())
             .collect();
-        let stat = self
-            .post_probes
-            .stat
-            .clone()
-            .unwrap_or_else(|| Arc::clone(&self.nntp) as Arc<dyn Stat>);
         info!(
             job_id = job_id.0,
             round,
@@ -661,27 +706,222 @@ impl Pipeline {
             failed_bytes = decided,
             "health probe armed: STAT sampling"
         );
-        tokio::spawn(sample(
-            stat,
+        let batches: Vec<ProbeBatch> = probes
+            .chunks(BATCH_SIZE)
+            .map(|batch| ProbeBatch::new(job_id, round, batch.to_vec()))
+            .collect();
+        self.post_probes.lane_rounds.insert(
             job_id,
+            LaneRound {
+                round,
+                tally: ProbeTally::default(),
+                left: batches.len(),
+            },
+        );
+        self.post_probes.waiting.extend(batches);
+        self.download_dispatch_wake = true;
+    }
+
+    // What the probes' mail said.
+    pub(in crate::pipeline) fn post_probe_mail(&mut self, mail: ProbeMail) {
+        match mail {
+            ProbeMail::Answered(answer) => self.post_probe_answered(answer),
+            ProbeMail::Unseated(batch) => self.post_probe_unseated(batch),
+        }
+    }
+
+    // A lane could not take the batch's seat for a reason that says nothing
+    // about the server. Nothing was asked, so the batch waits for a seat as
+    // it did before, and the dispatch pass that seats it is woken now.
+    fn post_probe_unseated(&mut self, batch: ProbeBatch) {
+        if !self.post_probes.current(&batch) {
+            return;
+        }
+        self.post_probes.waiting.push_back(batch);
+        self.download_dispatch_wake = true;
+    }
+
+    // A lane answered one batch. The batch is done once a server holds every
+    // article in it; otherwise it waits for a seat on the next server it may
+    // go to, and the dispatch pass that seats it is woken now.
+    fn post_probe_answered(&mut self, answer: ProbeAnswer) {
+        let ProbeAnswer {
+            mut batch,
+            server,
+            result,
+        } = answer;
+        if !self.post_probes.current(&batch) {
+            return;
+        }
+        batch.fold(server, result);
+        if batch.settled() {
+            self.post_probe_batch_done(batch);
+            return;
+        }
+        self.post_probes.waiting.push_back(batch);
+        self.download_dispatch_wake = true;
+    }
+
+    // Hand each waiting batch a seat the dispatch pass has not given out:
+    // the first server, in the order a lease would be routed, that the batch
+    // has not asked, that is not held back from new connections, and that
+    // has a seat left in the pass's ledger. Each seat taken is entered in
+    // the ledger, so no article lease takes it too. A batch every server it
+    // may go to has answered for is done; one that finds no seat waits.
+    pub(in crate::pipeline) fn seat_waiting_probes(
+        &mut self,
+        sent_this_pass: &mut HashMap<usize, usize>,
+        headroom_at_pass_start: &mut HashMap<usize, usize>,
+    ) {
+        if self.post_probes.waiting.is_empty() {
+            return;
+        }
+        let idle_by_server = self.idle_download_lanes_by_server();
+        let waiting = std::mem::take(&mut self.post_probes.waiting);
+        let mut done = Vec::new();
+        for batch in waiting {
+            if !self.post_probes.current(&batch) {
+                continue;
+            }
+            // The selection was contended, which says nothing about the
+            // servers; the next pass asks again.
+            let Some(order) = self.nntp.blocking_body_server_order(batch.asked()) else {
+                self.post_probes.waiting.push_back(batch);
+                continue;
+            };
+            if order.is_empty() {
+                done.push(batch);
+                continue;
+            }
+            let seat = order.into_iter().map(|server| server.0).find(|server| {
+                !self.probe_held_off(*server)
+                    && self.pass_has_seat(
+                        *server,
+                        &idle_by_server,
+                        sent_this_pass,
+                        headroom_at_pass_start,
+                    )
+            });
+            let Some(server) = seat else {
+                self.post_probes.waiting.push_back(batch);
+                continue;
+            };
+            *sent_this_pass.entry(server).or_default() += 1;
+            let ids = batch.unfound();
+            let unasked = ids.len();
+            // A pool that has stopped seats nothing: the batch is unsettled
+            // on that server and goes on to the next.
+            if let Err(mut batch) = self.owned_download_lane_pool.probe(
+                Arc::clone(&self.nntp),
+                ServerId(server),
+                ids,
+                batch,
+                self.post_probes.sender(),
+            ) {
+                batch.fold(
+                    server,
+                    ProbeBatchResult {
+                        exists: vec![false; unasked],
+                        inconclusive: true,
+                    },
+                );
+                self.post_probes.waiting.push_back(batch);
+            }
+        }
+        for batch in done {
+            self.post_probe_batch_done(batch);
+        }
+    }
+
+    // Whether a refill on `server` should yield its lane to a waiting batch:
+    // some batch may go to `server` and to no server with a seat free now.
+    // A batch that can be seated elsewhere takes that seat at the next pass,
+    // and a lane on a server held back from new connections is never
+    // yielded, since no batch may take its seat.
+    pub(in crate::pipeline) fn probe_waits_for_seat_on(&self, server: usize) -> bool {
+        if self.post_probes.waiting.is_empty() || self.probe_held_off(server) {
+            return false;
+        }
+        let idle_by_server = self.idle_download_lanes_by_server();
+        let seat_free = |candidate: usize| {
+            !self.probe_held_off(candidate)
+                && (idle_by_server.get(&candidate).copied().unwrap_or(0) > 0
+                    || self.nntp.pool().new_connection_seats(candidate) > 0)
+        };
+        self.post_probes.waiting.iter().any(|batch| {
+            let Some(order) = self.nntp.blocking_body_server_order(batch.asked()) else {
+                return false;
+            };
+            order.iter().any(|candidate| candidate.0 == server)
+                && !order.iter().any(|candidate| seat_free(candidate.0))
+        })
+    }
+
+    // Whether `server` is held back from new connections, by the delay after
+    // a failed dial or by a quarantine, so a batch may not take a seat
+    // there, not even one an idle connection holds.
+    fn probe_held_off(&self, server: usize) -> bool {
+        matches!(
+            self.nntp.pool().connection_hold(server, true),
+            Some(
+                weaver_nntp::recovery::ConnectionHold::Until(_)
+                    | weaver_nntp::recovery::ConnectionHold::Recovery
+            )
+        )
+    }
+
+    // A batch is done: fold it into its round, and once the round has every
+    // batch back, the round is heard.
+    fn post_probe_batch_done(&mut self, batch: ProbeBatch) {
+        let pool = self.nntp.pool();
+        let unasked_could_hold = (0..pool.server_count())
+            .any(|server| !batch.asked().contains(&server) && !pool.refuses_credentials(server));
+        let job_id = batch.job_id;
+        let Some(lane_round) = self
+            .post_probes
+            .lane_rounds
+            .get_mut(&job_id)
+            .filter(|lane_round| lane_round.round == batch.round)
+        else {
+            return;
+        };
+        lane_round.tally.record_batch(&batch, unasked_could_hold);
+        if !batch.settled() && (batch.uncertain || unasked_could_hold) {
+            warn!(
+                job_id = job_id.0,
+                round = batch.round,
+                batch_len = batch.ids.len(),
+                "health probe: STAT batch inconclusive, skipping batch"
+            );
+        }
+        lane_round.left = lane_round.left.saturating_sub(1);
+        if lane_round.left > 0 {
+            return;
+        }
+        let LaneRound { round, tally, .. } = *lane_round;
+        self.post_probes.lane_rounds.remove(&job_id);
+        info!(
+            job_id = job_id.0,
             round,
-            probes,
-            self.post_probes.sender(),
-        ));
+            checked = tally.checked,
+            missed = tally.missed,
+            unverified = tally.unverified,
+            "health probe complete"
+        );
+        self.post_probe_heard(tally.update(job_id, round));
     }
 
     // What a round said. Only the round the job waits on is heard: a job
-    // that has gone or has moved past downloading forgets its probe. A done
+    // that has gone or has moved past downloading forgets its probe. The
     // round folds its projection into the post's health, sets when the next
     // round is armed, and gives the post its verdict again.
     pub(in crate::pipeline) fn post_probe_heard(&mut self, update: ProbeUpdate) {
         let job_id = update.job_id;
-        if !update.done
-            || self
-                .post_probes
-                .states
-                .get(&job_id)
-                .is_none_or(|probe| probe.out != Some(update.round))
+        if self
+            .post_probes
+            .states
+            .get(&job_id)
+            .is_none_or(|probe| probe.out != Some(update.round))
         {
             return;
         }

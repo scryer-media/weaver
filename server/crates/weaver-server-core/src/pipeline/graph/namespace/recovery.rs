@@ -899,7 +899,7 @@ impl NamespaceWriter {
         let (moves, claims): (Vec<Effect>, Vec<Effect>) = effects
             .into_iter()
             .partition(|effect| matches!(effect, Effect::Renamed { .. }));
-        self.moved(&moves)?;
+        self.moved(tree, &moves)?;
         // A recognised member's length is the description's: its file, if
         // it has one, takes it.
         for member in &renamed {

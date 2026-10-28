@@ -155,6 +155,7 @@ fn full() -> Snapshot {
                 (NodeId(1), MemberId(0)),
                 FileState {
                     has_file: true,
+                    on_disk: None,
                     refused: Some(Why::Unrepairable),
                 },
             ),
@@ -162,6 +163,7 @@ fn full() -> Snapshot {
                 (NodeId(0), MemberId(1)),
                 FileState {
                     has_file: true,
+                    on_disk: Some(".weaver-chunks/graph-waiting-0-1".to_owned()),
                     refused: None,
                 },
             ),
@@ -182,6 +184,7 @@ fn full() -> Snapshot {
                 ],
                 closed: Some(500),
                 settled: true,
+                file: None,
             },
             KeptRecord {
                 node: NodeId(1),
@@ -189,6 +192,7 @@ fn full() -> Snapshot {
                 runs: Vec::new(),
                 closed: None,
                 settled: false,
+                file: Some(".weaver-chunks/graph-envelope-1-1-1".to_owned()),
             },
         ],
         holds: vec![
@@ -263,7 +267,7 @@ fn rows(taken: &Snapshot) -> GraphCheckpoint {
                 taken
                     .files
                     .get(&(node.node, member))
-                    .copied()
+                    .cloned()
                     .unwrap_or_default()
             },
             taken.passwords.get(&node.node).map(|index| *index as i64),
@@ -393,11 +397,11 @@ fn a_step_writes_only_the_rows_and_parts_it_changed() {
     let (mut job, _dir) = long_post(40);
     let pending = Pending::default();
     assert!(pending.put(&job, Vec::new()));
-    let first = pending.take().unwrap();
+    let first = pending.take().0.unwrap();
     assert!(first.whole);
     intake(&mut job, 40);
     assert!(pending.put(&job, Vec::new()));
-    let step = pending.take().unwrap();
+    let step = pending.take().0.unwrap();
     assert!(!step.whole);
     // The arrival's chunk alone of the root's parts; the root row only names
     // its parts, so it stays as it was.
@@ -422,7 +426,7 @@ fn a_step_writes_only_the_rows_and_parts_it_changed() {
     written.extend(changed);
     let fresh = Pending::default();
     assert!(fresh.put(&job, Vec::new()));
-    assert_eq!(root_parts(&fresh.take().unwrap()), written);
+    assert_eq!(root_parts(&fresh.take().0.unwrap()), written);
 }
 
 #[test]
@@ -430,12 +434,12 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     let (job, _dir) = long_post(20);
     let pending = Pending::default();
     assert!(pending.put(&job, Vec::new()));
-    let first = pending.take().unwrap();
+    let first = pending.take().0.unwrap();
     // A write that failed: the next checkpoint is the whole job again, every
     // root part with it.
     pending.forget();
     assert!(pending.put(&job, Vec::new()));
-    let again = pending.take().unwrap();
+    let again = pending.take().0.unwrap();
     assert!(again.whole);
     assert_eq!(root_parts(&again), root_parts(&first));
     assert!(!root_parts(&again).is_empty());
@@ -444,7 +448,7 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     let restored = Pending::default();
     restored.written(held(&first));
     assert!(!restored.put(&job, Vec::new()));
-    assert!(restored.take().is_none());
+    assert!(restored.take().0.is_none());
     // A root part the database holds and the root no longer has is deleted,
     // and only it.
     let stale = PartRow {
@@ -457,7 +461,7 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     let restored = Pending::default();
     restored.written(rows);
     assert!(restored.put(&job, Vec::new()));
-    let delta = restored.take().unwrap();
+    let delta = restored.take().0.unwrap();
     assert_eq!(delta.rows(), 1, "{delta:?}");
     assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));
 }

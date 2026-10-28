@@ -32,6 +32,9 @@ use weaver_graph::{
     NodeRecord, NodeState, ObjectId, Part, Provenance, Run, TreeRecord, VolumeIndex, Why,
 };
 
+use tokio::sync::mpsc::UnboundedSender;
+
+use super::engine::{Heard, Said};
 use super::envelope::durable::KeptRecord;
 use super::job::GraphJob;
 use super::root::facts::{self, Parts, RootFacts, RootFactsError};
@@ -78,9 +81,12 @@ pub(crate) struct Generations {
 }
 
 // What the writer holds of one member.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileState {
     pub(crate) has_file: bool,
+    // The name the file sits at while it waits to move to the member's
+    // output name.
+    pub(crate) on_disk: Option<String>,
     // Why it is a leaf, when something refused to own it.
     pub(crate) refused: Option<Why>,
 }
@@ -114,6 +120,37 @@ struct Slot {
     // The change a queued write takes: `Some` exactly while one is queued.
     queued: Option<Delta>,
     tally: Tally,
+    // The stamp of the last checkpoint that changed anything. A write
+    // takes the stamp with the change, and once it has committed every
+    // checkpoint through that stamp is in the database.
+    asked: u64,
+    // The last stamp a write committed.
+    committed: u64,
+    // A write failed, so the database holds less than the stamps say until
+    // a write of the whole job commits.
+    lost: bool,
+    // Who to tell once a stamp has committed, or a write has failed, while
+    // a member's file waits on it to move.
+    owed: Option<Owed>,
+}
+
+// The word a move waits on, and where to send it.
+struct Owed {
+    stamp: u64,
+    scope: u64,
+    mail: UnboundedSender<Said>,
+}
+
+impl Owed {
+    fn send(self, stamp: Option<u64>) {
+        // A pipeline that has gone hears nothing, and needs to.
+        let _ = self.mail.send(Said {
+            scope: self.scope,
+            node: NodeId::ROOT,
+            generation: 0,
+            heard: Heard::Written(stamp),
+        });
+    }
 }
 
 // Every row the database holds of the job but the root's facts parts, the
@@ -221,6 +258,7 @@ impl Pending {
         if delta.is_empty() {
             return false;
         }
+        slot.asked += 1;
         match &mut slot.queued {
             Some(queued) => {
                 queued.absorb(delta);
@@ -233,16 +271,73 @@ impl Pending {
         }
     }
 
-    pub(super) fn take(&self) -> Option<Delta> {
-        self.slot().queued.take()
+    // The change a write takes, and the stamp of the last checkpoint it
+    // carries: every checkpoint through it is in the database once the
+    // write commits.
+    pub(super) fn take(&self) -> (Option<Delta>, u64) {
+        let mut slot = self.slot();
+        (slot.queued.take(), slot.asked)
+    }
+
+    // The stamp of the last checkpoint that changed anything.
+    pub(crate) fn stamp(&self) -> u64 {
+        self.slot().asked
+    }
+
+    // A move waits on the checkpoint `stamp`: the last stamp committed when
+    // it already has, and otherwise the mail says so once it does, or once
+    // a write fails.
+    pub(super) fn await_commit(
+        &self,
+        stamp: u64,
+        scope: u64,
+        mail: &UnboundedSender<Said>,
+    ) -> Option<u64> {
+        let mut slot = self.slot();
+        if !slot.lost && slot.committed >= stamp {
+            return Some(slot.committed);
+        }
+        slot.owed = Some(Owed {
+            stamp,
+            scope,
+            mail: mail.clone(),
+        });
+        None
+    }
+
+    // A write committed every checkpoint through `stamp`; `whole` when it
+    // wrote the whole job.
+    fn committed(&self, stamp: u64, whole: bool) {
+        let mut slot = self.slot();
+        if whole {
+            slot.lost = false;
+        }
+        if slot.lost {
+            return;
+        }
+        slot.committed = slot.committed.max(stamp);
+        let committed = slot.committed;
+        if slot
+            .owed
+            .as_ref()
+            .is_some_and(|owed| owed.stamp <= committed)
+            && let Some(owed) = slot.owed.take()
+        {
+            owed.send(Some(committed));
+        }
     }
 
     // A write failed or was never queued, so what the database holds is not
-    // known: the next checkpoint writes the whole job, and queues it.
+    // known: the next checkpoint writes the whole job, and queues it. A move
+    // waiting on a commit hears so, and waits on the next one.
     fn forget(&self) {
         let mut slot = self.slot();
         slot.held = None;
         slot.queued = None;
+        slot.lost = true;
+        if let Some(owed) = slot.owed.take() {
+            owed.send(None);
+        }
     }
 
     // The database holds these rows, as a restore read them. A job's
@@ -312,24 +407,66 @@ impl Pipeline {
             .map(|graph| graph.pending().settled_bytes())
     }
 
-    // Checkpoint the job's tree as it stands now, and the parts of it that
-    // arrived, wait to be placed and are spooled.
+    // Checkpoint the job's tree as it stands now. A member's file that
+    // waits to move moves once the checkpoint that records the name it
+    // wants has committed: when it already has, the move runs here and the
+    // checkpoint is taken again to record it; otherwise the database's
+    // word that it has comes through the run mail, and a write is queued
+    // to carry it if none would.
     pub(crate) fn checkpoint_graph_job(&mut self, job_id: JobId) {
-        let Some(graph) = self.graph_jobs.get(&job_id) else {
-            return;
-        };
-        let pending = graph.pending().clone();
-        if !pending.put(graph, self.held_part_rows(job_id)) {
-            return;
+        let mail = self.graph_runs.written();
+        loop {
+            let held = self.held_part_rows(job_id);
+            let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
+                return;
+            };
+            let pending = graph.pending().clone();
+            let mut queue = pending.put(graph, held);
+            graph.recorded(pending.stamp());
+            let mut moved = false;
+            if graph.moves_waiting() {
+                match pending.await_commit(graph.awaited(), job_id.0, &mail) {
+                    Some(committed) => match graph.committed(committed) {
+                        Ok(left) => moved = left,
+                        // A file that could not move fails the job, as it
+                        // does when the run mail says the commit.
+                        Err(error) => return self.after_graph_result(job_id, Err(error.into())),
+                    },
+                    None => queue |= graph.owe_mail(),
+                }
+            }
+            if queue {
+                self.queue_graph_checkpoint(job_id, pending);
+            }
+            if !moved {
+                return;
+            }
         }
-        let writer = pending.clone();
+    }
+
+    // Queue the write that takes the job's waiting change, if any, and says
+    // what it committed. A write dropped before it runs has failed.
+    fn queue_graph_checkpoint(&self, job_id: JobId, pending: Pending) {
+        let unwritten = Unwritten(Some(pending.clone()));
         let queued = self
             .db
             .try_queue_job_write(job_id, "save_graph_checkpoint", move |db| {
-                let Some(delta) = writer.take() else {
+                let mut unwritten = unwritten;
+                let Some(writer) = unwritten.0.take() else {
                     return Ok(());
                 };
-                let (rows, facts) = (delta.rows(), delta.facts());
+                let (delta, stamp) = writer.take();
+                // Nothing queued: a write queued earlier took the change
+                // through `stamp`. The database runs a job's writes one at
+                // a time in the order they were queued, on SQLite's single
+                // writer and on the job's own Postgres lane alike, so that
+                // write has already committed it, or failed and said so,
+                // and this one only passes its word on.
+                let Some(delta) = delta else {
+                    writer.committed(stamp, false);
+                    return Ok(());
+                };
+                let (rows, facts, whole) = (delta.rows(), delta.facts(), delta.whole);
                 let started = Instant::now();
                 let written = db.save_graph_checkpoint(job_id, Arc::new(delta));
                 debug!(
@@ -339,14 +476,27 @@ impl Pipeline {
                     elapsed_us = started.elapsed().as_micros() as u64,
                     "graph checkpoint written"
                 );
-                if written.is_err() {
-                    writer.forget();
+                match &written {
+                    Ok(()) => writer.committed(stamp, whole),
+                    Err(_) => writer.forget(),
                 }
                 written
             });
         if let Err(error) = queued {
             pending.forget();
             warn!(job_id = job_id.0, error = %error, "could not queue the graph checkpoint");
+        }
+    }
+}
+
+// A queued checkpoint write that has not run. Dropped unrun, as when the
+// database's writer goes down first, it has failed.
+struct Unwritten(Option<Pending>);
+
+impl Drop for Unwritten {
+    fn drop(&mut self) {
+        if let Some(pending) = self.0.take() {
+            pending.forget();
         }
     }
 }
@@ -437,7 +587,7 @@ fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
         .map_or_else(GraphCheckpoint::default, |(record, files)| {
             node_rows(
                 &record,
-                |member| files.get(&member).copied().unwrap_or_default(),
+                |member| files.get(&member).cloned().unwrap_or_default(),
                 job.last_offered(node).map(|index| index as i64),
             )
         });
@@ -513,6 +663,7 @@ fn node_rows(
             buried: member.buried,
             undecided: member.undecided,
             has_file: state.has_file,
+            on_disk: state.on_disk,
             refused: state.refused.map(|why| why_name(why).to_owned()),
             copy_of: member.copy_of.map(|into| i64::from(into.0)),
         });
@@ -552,6 +703,7 @@ fn envelope_rows(kept: &[KeptRecord]) -> Vec<EnvelopeRow> {
             provenance: provenance_name(provenance).to_owned(),
             closed: kept.closed.map(|length| length as i64),
             settled: kept.settled,
+            file: kept.file.clone(),
         };
         // An envelope with nothing kept yet still says whether it closed.
         if kept.runs.is_empty() {
@@ -714,6 +866,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             .push(record);
         let state = FileState {
             has_file: row.has_file,
+            on_disk: row.on_disk.clone(),
             refused,
         };
         if state != FileState::default() {
@@ -774,7 +927,9 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             runs: Vec::new(),
             closed: None,
             settled: false,
+            file: None,
         });
+        entry.file.clone_from(&row.file);
         entry.closed = row
             .closed
             .map(|length| u64::try_from(length).map_err(|_| refuse("a length")))

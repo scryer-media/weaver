@@ -206,6 +206,15 @@ impl Pipeline {
             });
             return;
         }
+        // A health probe batch waits for a seat on this server and has none
+        // free anywhere it may go. The lane is given no more articles: it
+        // finishes the ones it holds and parks keeping its connection, and
+        // the next dispatch pass seats the batch there. The batch never
+        // shares the lane with articles in flight.
+        if self.probe_waits_for_seat_on(server_idx) {
+            self.park_download_lane_refill(request, LaneParkReason::ProbeYield, held_since, now);
+            return;
+        }
 
         let pressure = self.refresh_download_pressure();
         let lane_mode = self.download_lane_mode_for_server(

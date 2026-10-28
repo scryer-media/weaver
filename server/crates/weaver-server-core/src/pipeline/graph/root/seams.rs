@@ -306,9 +306,16 @@ impl Pipeline {
             return;
         };
         let ended = matches!(said.heard, Heard::Ended | Heard::Repaired(_));
+        let moving = graph.moves_waiting();
         let result = graph.run_said(said, &mut self.graph_status.repairs, limit);
         self.after_graph_result(job_id, result);
-        if ended {
+        // The last file to move is where the delivery takes it from now.
+        let moved = moving
+            && !self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(GraphJob::moves_waiting);
+        if ended || moved {
             self.schedule_job_completion_check(job_id);
         }
     }

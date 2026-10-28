@@ -99,8 +99,16 @@ impl GraphJob {
             {
                 continue;
             }
-            writer.restore_file(&tree, *node, *member, *state)?;
+            writer.restore_file(&tree, *node, *member, state)?;
         }
+        // A file that still sits at a name it is moving off keeps that name
+        // from every other member until it has moved.
+        for (node, member, name) in writer.waiting() {
+            tree.leaving(node, member, &name);
+        }
+        let mut settled = Vec::new();
+        tree.settle_names(&mut settled);
+        writer.moved(&mut tree, &settled)?;
         writer.restore_read_backs(snapshot.root.read_backs);
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
@@ -116,6 +124,7 @@ impl GraphJob {
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
+            mail_owed: false,
             notes: Vec::new(),
         };
         for (node, index) in &snapshot.passwords {

@@ -23,7 +23,6 @@
 // disk. It takes a node everywhere and never assumes the root.
 
 use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -128,6 +127,14 @@ pub(crate) struct NamespaceWriter {
     // later hold replaced before the next checkpoint reached the database.
     stopped: bool,
     renamed: Vec<MemberId>,
+    // Members whose files wait to move to the names the ledger gave them,
+    // in the order it gave them.
+    moves: Vec<moves::Waiting>,
+    // The names files left, by the ledger's key, each with the checkpoint
+    // that records it left once one is taken.
+    left: BTreeMap<String, Option<u64>>,
+    // The latest checkpoint the database has committed.
+    committed: u64,
     segments: Vec<Segment>,
     placements: Vec<Placement>,
     // Where the time a member write takes on disk is published, when the
@@ -153,6 +160,9 @@ impl NamespaceWriter {
             read_backs: 0,
             stopped: false,
             renamed: Vec::new(),
+            moves: Vec::new(),
+            left: BTreeMap::new(),
+            committed: 0,
             segments: Vec::new(),
             placements: Vec::new(),
             metrics: None,
@@ -415,7 +425,7 @@ impl NamespaceWriter {
         let files = self.files_mut(node);
         files.refused.remove(&copy);
         if let Some(leaf) = files.leaves.remove(&copy) {
-            leaf.remove()?;
+            self.discard(leaf)?;
         }
         self.caps.forget(tree, node, copy);
         Ok(())
@@ -498,31 +508,38 @@ impl NamespaceWriter {
         let output_name = tree
             .rename(node, member, name, &mut self.placing(builder), &mut effects)
             .ok_or(WriteError::UnknownMember { node, member })?;
-        self.moved(&effects)?;
+        self.moved(tree, &effects)?;
         Ok(output_name)
     }
 
     // Output names the ledger changed: each file written under its old name
-    // moves to its new one, in the order the ledger gave, so no file lands
-    // on one still in place. A member never written has nothing to move.
-    fn moved(&mut self, effects: &[Effect]) -> Result<(), WriteError> {
+    // wants its new one, in the order the ledger gave, and moves there once
+    // the checkpoint that records it has committed. A member never written
+    // has nothing to move.
+    pub(crate) fn moved(&mut self, tree: &mut Tree, effects: &[Effect]) -> Result<(), WriteError> {
+        let mut freed = Vec::new();
         for effect in effects {
             let Effect::Renamed {
-                node, member, new, ..
+                node,
+                member,
+                old,
+                new,
             } = effect
             else {
                 continue;
             };
             self.caps.admit_name(new)?;
-            if let Some(leaf) = self
-                .files
-                .get_mut(node)
-                .and_then(|files| files.leaves.get_mut(member))
-            {
-                leaf.rename(&self.working_dir, new)?;
+            self.intend(*node, *member, new);
+            // A name no file of the member sits at is free once the ledger
+            // moved the member off it.
+            if !self.sits_at(*node, *member, old) {
+                tree.vacated(old, &mut freed);
             }
         }
-        Ok(())
+        if freed.is_empty() {
+            return Ok(());
+        }
+        self.moved(tree, &freed)
     }
 
     // The builder, with this writer behind it: what an object taking a
@@ -824,8 +841,10 @@ impl NamespaceWriter {
                     self.bound(tree, *node, *member, kind, engine);
                 }
                 self.materialise(tree, builder, segments, *node, *member, out)?;
-                tree.bury(*node, *member);
+                let mut effects = Vec::new();
+                tree.bury(*node, *member, &mut effects);
                 self.prune(tree)?;
+                self.apply_each(tree, builder, segments, effects, out)?;
             }
             Effect::GivenBack {
                 node,
@@ -893,7 +912,7 @@ impl NamespaceWriter {
                 );
                 self.apply_each(tree, builder, segments, effects, out)?;
             }
-            Effect::Renamed { .. } => self.moved(std::slice::from_ref(&effect))?,
+            Effect::Renamed { .. } => self.moved(tree, std::slice::from_ref(&effect))?,
             Effect::NeedsPassword { .. } => {}
             // Every effect before it is applied, so what the object reads
             // back of its members is on disk.
@@ -926,11 +945,11 @@ impl NamespaceWriter {
             .and_then(|namespace| namespace.get(member))
             .map(|record| record.output_name.clone())
             .ok_or(WriteError::UnknownMember { node, member })?;
-        if let Some(mut leaf) = self.envelopes.take(from, volume.0) {
-            leaf.rename(&self.working_dir, &output_name)?;
+        if let Some(leaf) = self.envelopes.take(from, volume.0) {
             if let Some(stale) = self.files_mut(node).leaves.insert(member, leaf) {
-                stale.remove()?;
+                self.discard(stale)?;
             }
+            self.intend(node, member, &output_name);
         }
         self.release_to_leaf(tree, node, member)?;
         Ok(())
@@ -1337,7 +1356,7 @@ impl NamespaceWriter {
                         self.caps.forget(tree, node, *member);
                     }
                     for leaf in files.leaves.into_values().chain(files.scratch) {
-                        leaf.remove()?;
+                        self.discard(leaf)?;
                     }
                 }
                 continue;
@@ -1355,7 +1374,7 @@ impl NamespaceWriter {
                 let files = self.files_mut(node);
                 files.refused.remove(&member);
                 if let Some(leaf) = files.leaves.remove(&member) {
-                    leaf.remove()?;
+                    self.discard(leaf)?;
                 }
                 self.caps.forget(tree, node, member);
             }
@@ -1413,12 +1432,19 @@ impl NamespaceWriter {
         member: MemberId,
         output_name: &str,
     ) -> Result<&mut Leaf, WriteError> {
-        let dir = self.working_dir.clone();
-        let leaves = &mut self.files_mut(node).leaves;
-        match leaves.entry(member) {
-            Entry::Occupied(leaf) => Ok(leaf.into_mut()),
-            Entry::Vacant(free) => Ok(free.insert(Leaf::at(&dir, output_name))),
+        let opened = self
+            .files
+            .get(&node)
+            .is_some_and(|files| files.leaves.contains_key(&member));
+        if !opened {
+            let leaf = self.new_leaf(node, member, output_name);
+            self.files_mut(node).leaves.insert(member, leaf);
         }
+        Ok(self
+            .files_mut(node)
+            .leaves
+            .get_mut(&member)
+            .expect("opened above"))
     }
 
     // The free space the holds budgets judge a page-out against.
@@ -1734,6 +1760,7 @@ fn index(offset: u64) -> usize {
 mod claimed;
 mod durable;
 mod loan;
+mod moves;
 mod recovery;
 mod refusal;
 

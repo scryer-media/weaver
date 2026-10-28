@@ -68,19 +68,34 @@ pub(crate) enum Heard {
     // A recovery set's repair, lent off the loop, came back: addressed to
     // the set's node, under the loan's number for a generation.
     Repaired(Box<Returned>),
+    // The job's checkpoints committed through this stamp, or a write of
+    // them failed (`None`), while a member's file waited on them to move.
+    // Addressed to the root, under no run's generation.
+    Written(Option<u64>),
 }
 
-// Where every graph job's runs speak.
+// Where every graph job's runs speak, and where the database says a
+// checkpoint a move waits on has committed. That word comes from the
+// database's writer, which must never wait on the pipeline, so it has a
+// channel of its own without a bound: at most one word per checkpoint write.
 #[derive(Debug)]
 pub(crate) struct RunMail {
     sender: mpsc::Sender<Said>,
     receiver: mpsc::Receiver<Said>,
+    written: mpsc::UnboundedSender<Said>,
+    heard_written: mpsc::UnboundedReceiver<Said>,
 }
 
 impl Default for RunMail {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(MAIL_CAPACITY);
-        Self { sender, receiver }
+        let (written, heard_written) = mpsc::unbounded_channel();
+        Self {
+            sender,
+            receiver,
+            written,
+            heard_written,
+        }
     }
 }
 
@@ -89,8 +104,16 @@ impl RunMail {
         self.sender.clone()
     }
 
+    pub(crate) fn written(&self) -> mpsc::UnboundedSender<Said> {
+        self.written.clone()
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<Said> {
-        self.receiver.recv().await
+        tokio::select! {
+            biased;
+            Some(said) = self.heard_written.recv() => Some(said),
+            said = self.receiver.recv() => said,
+        }
     }
 
     // What the runs said that waits to be heard, at most what the mail holds
@@ -99,6 +122,9 @@ impl RunMail {
     // the turn.
     pub(crate) fn waiting(&mut self) -> Vec<Said> {
         let mut waiting = Vec::new();
+        while let Ok(said) = self.heard_written.try_recv() {
+            waiting.push(said);
+        }
         while waiting.len() < MAIL_CAPACITY {
             let Ok(said) = self.receiver.try_recv() else {
                 break;

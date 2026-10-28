@@ -103,7 +103,7 @@ impl NamespaceWriter {
             let files = self.files_mut(node);
             files.refused.remove(&member);
             if let Some(leaf) = files.leaves.remove(&member) {
-                leaf.remove()?;
+                self.discard(leaf)?;
             }
         }
         Ok(())
