@@ -35,10 +35,7 @@ impl Pipeline {
                 };
                 row.report.moving = moving;
                 row.report.nzb_admitted = self.nzb_admitted.contains(&job_id);
-                if !self.nzb_admitted.contains(&job_id)
-                    && row.intents.paused == Some(false)
-                    && row.intents.cancelled.is_none()
-                {
+                if self.waits_for_nzb_slot(row) {
                     row.report.job.download_wait_reason =
                         Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON.into());
                     row.report.job.download_state = crate::DownloadState::Queued;

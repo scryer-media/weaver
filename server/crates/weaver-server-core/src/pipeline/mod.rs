@@ -1305,7 +1305,6 @@ pub struct Pipeline {
     pub(crate) nzb_admitted: HashSet<JobId>,
     pub(crate) nzb_seen: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
-    pub(crate) nzb_added_scripts_pending: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.

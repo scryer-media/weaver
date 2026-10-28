@@ -9,29 +9,25 @@ impl Pipeline {
         self.answer_diagnostics_request();
         self.apply_queue_globals().await;
         self.reconcile_nzb_admission().await;
+        // Installing a job is its add, whether it comes from intake or from a
+        // restart, under any pause and with every slot taken; only a shutdown
+        // installs nothing. Admission decides only whether its articles go
+        // out. A restore whose row carries a pause installs parked.
         let restores = self.shared_state.queue.write(|inner| {
+            if inner.globals.shutting_down {
+                return Change::unchanged(Vec::new());
+            }
             Change::unchanged(
                 inner
                     .jobs
                     .iter_mut()
-                    .filter(|row| {
-                        self.nzb_admitted.contains(&row.id)
-                            || row.intents.paused == Some(true)
-                            || row.intents.cancelled.is_some()
-                            || row
-                                .intents
-                                .restore
-                                .as_ref()
-                                .is_some_and(|request| request.status == JobStatus::Paused)
-                    })
                     .filter_map(|row| {
+                        let paused = row.intents.paused == Some(true);
                         row.intents.restore.take().map(|mut request| {
-                            if !self.nzb_admitted.contains(&row.id) {
-                                if request.status != JobStatus::Paused {
-                                    request.paused_resume_status = Some(request.status.clone());
-                                    request.paused_resume_download_state = request.download_state;
-                                    request.paused_resume_post_state = request.post_state;
-                                }
+                            if paused && request.status != JobStatus::Paused {
+                                request.paused_resume_status = Some(request.status.clone());
+                                request.paused_resume_download_state = request.download_state;
+                                request.paused_resume_post_state = request.post_state;
                                 request.status = JobStatus::Paused;
                                 request.run_state = Some(crate::RunState::Paused);
                             }
@@ -55,6 +51,9 @@ impl Pipeline {
             });
         }
         let admissions = self.shared_state.queue.write(|inner| {
+            if inner.globals.shutting_down {
+                return Change::unchanged(Vec::new());
+            }
             Change::unchanged(
                 inner
                     .jobs
@@ -68,23 +67,7 @@ impl Pipeline {
                                 .get(&row.id)
                                 .is_some_and(|graph| graph.awaits_mail())
                     })
-                    .filter(|row| {
-                        self.nzb_admitted.contains(&row.id)
-                            || row.intents.paused == Some(true)
-                            || row.intents.cancelled.is_some()
-                            || row
-                                .admission
-                                .as_ref()
-                                .is_some_and(|job| job.options.initially_paused)
-                    })
-                    .filter_map(|row| {
-                        row.admission.take().map(|mut job| {
-                            if !self.nzb_admitted.contains(&row.id) {
-                                job.options.initially_paused = true;
-                            }
-                            (row.id, job)
-                        })
-                    })
+                    .filter_map(|row| row.admission.take().map(|job| (row.id, job)))
                     .collect::<Vec<_>>(),
             )
         });
