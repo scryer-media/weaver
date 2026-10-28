@@ -180,6 +180,7 @@ impl Pipeline {
         let (retry_tx, retry_rx) = mpsc::channel(256);
         let (nntp_handoff_drained_tx, nntp_handoff_drained_rx) = mpsc::channel(4);
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
+        let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
@@ -224,7 +225,9 @@ impl Pipeline {
         let owned_download_lane_pool =
             download::owned_lane::OwnedDownloadLanePool::new(total_connections.max(1));
         shared_state.set_paused(initial_global_paused);
-        let graph_hardware = crate::pipeline::graph::hardware::Hardware::of(&tuner);
+        let graph_hardware = crate::pipeline::graph::hardware::Hardware::of(&tuner).until(
+            crate::pipeline::graph::hardware::Shutdown::of(shared_state.shutdown_started()),
+        );
 
         let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
             hold_settings.budgets(),
@@ -324,6 +327,8 @@ impl Pipeline {
             nntp_handoff_drained_rx,
             move_done_tx,
             move_done_rx,
+            failed_release_tx,
+            failed_release_rx,
             terminal_post_processing_done_tx,
             terminal_post_processing_done_rx,
             script_effects_rx,
@@ -396,6 +401,7 @@ impl Pipeline {
             body_lane_capacity_log_throttle: Default::default(),
             body_fetch_failure_log_throttle: Default::default(),
             inflight_moves: HashSet::new(),
+            releasing_failed_jobs: HashSet::new(),
             deferred_moves: HashSet::new(),
             deferred_post_processing: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
@@ -968,6 +974,10 @@ impl Pipeline {
                         self.handle_move_to_complete_done(done).await;
                         self.report_job(reported_job);
                     }
+                    Some(released) = self.failed_release_rx.recv() => {
+                        turn_timer.resume();
+                        self.handle_failed_job_released(released);
+                    }
                     Ok(()) = self.script_effects_rx.changed() => {
                         turn_timer.resume();
                         for job_id in self.db.take_script_effects() {
@@ -1361,6 +1371,14 @@ impl Pipeline {
     }
 
     pub(crate) async fn drain(&mut self) {
+        // A failed job whose working directory is still being released
+        // records its history before the pipeline is down.
+        while !self.releasing_failed_jobs.is_empty() {
+            let Some(released) = self.failed_release_rx.recv().await else {
+                break;
+            };
+            self.handle_failed_job_released(released);
+        }
         // Unblock lanes waiting on deferred refills so they can finish their
         // batches and exit; dropping the senders answers them with an error.
         self.drain_inflight_download_and_decode_work().await;

@@ -27,6 +27,7 @@ use weaver_graph::{
 };
 
 use super::super::envelope::Shelf;
+use super::super::hardware::Shutdown;
 use super::super::leaf::{Leaf, LeafError, read_exact_at};
 use super::{
     ALL, NamespaceWriter, READ_BACK, SetState, Source, held_volume, index, read_member, read_pieces,
@@ -70,19 +71,37 @@ impl std::fmt::Debug for Returned {
 }
 
 // What the repair read that the loop may move: every shelf with the
-// generation it stood at, and every file at the path it had.
+// generation it stood at, and every file at the path it had, and whether
+// the pipeline began shutting down before the repair was done, so that what
+// it read may have been cut short.
 struct Read {
     shelves: Vec<(Arc<Shelf>, u64)>,
     leaves: Vec<(NodeId, MemberId, PathBuf)>,
+    stopped: bool,
+}
+
+impl Returned {
+    // The shutdown stopped the repair: it is not repaired, and nothing it
+    // came to stands.
+    pub(crate) fn stopped(&self) -> bool {
+        self.read.stopped
+    }
 }
 
 impl Loan {
-    // Run the repair, where it is not in anyone's way, within `budget`.
-    pub(crate) fn run(mut self, budget: weaver_graph::Budget) -> Returned {
+    // Run the repair, where it is not in anyone's way, within `budget`. A
+    // repair given after `shutdown` started, or after the job's working
+    // directory went, reads nothing, and one going when either happens
+    // reads nothing more: each comes back stopped.
+    pub(crate) fn run(mut self, budget: weaver_graph::Budget, shutdown: &Shutdown) -> Returned {
+        self.access.shutdown = shutdown.clone();
+        let given = !self.access.stopped();
         let outcome = self
             .object
             .recovery_mut()
+            .filter(|_| given)
             .map(|recovery| recovery.repair(&mut self.access, budget));
+        let stopped = self.access.stopped();
         let access = self.access;
         if let Some(dir) = &access.scratch {
             super::remove_scratch(dir);
@@ -103,6 +122,7 @@ impl Loan {
             read: Read {
                 shelves: access.shelves.into_values().collect(),
                 leaves,
+                stopped,
             },
         }
     }
@@ -118,11 +138,22 @@ struct Taken {
     bound: Option<(NodeId, VolumeIndex)>,
 }
 
+impl Lent {
+    // The pipeline began shutting down, or the job's working directory was
+    // released: the repair reads and writes nothing more.
+    fn stopped(&self) -> bool {
+        self.shutdown.started() || !self.internal.is_dir()
+    }
+}
+
 // The owned access a lent repair reads and writes through.
 struct Lent {
     namespace: NodeId,
     set: NodeId,
-    working_dir: PathBuf,
+    // The directory the repair's scratch and output lie in, made when the
+    // repair is lent. The repair never makes it again: once it is gone, the
+    // job's working directory was released under the repair.
+    internal: PathBuf,
     members: BTreeMap<(NodeId, MemberId), Taken>,
     postings: BTreeMap<NodeId, Box<dyn Posting>>,
     shelves: BTreeMap<NodeId, (Arc<Shelf>, u64)>,
@@ -137,6 +168,8 @@ struct Lent {
     repaired: Repaired,
     found: Vec<(MemberId, ByteRange)>,
     scratch: Option<PathBuf>,
+    // The pipeline's shutdown: once it starts, no read is answered.
+    shutdown: Shutdown,
 }
 
 // What a repair rewrote: runs of members in the order written, each one's
@@ -183,7 +216,11 @@ impl Repaired {
             start: self.written,
             end: self.written + bytes.len() as u64,
         };
-        match self.output.write(at.start, bytes, None) {
+        let written = self
+            .output
+            .create_within()
+            .and_then(|()| self.output.write(at.start, bytes, None));
+        match written {
             Ok(()) => {
                 self.written = at.end;
                 self.runs.push((member, offset, at));
@@ -234,7 +271,7 @@ impl NamespaceWriter {
         let mut access = Lent {
             namespace,
             set,
-            working_dir: self.working_dir.clone(),
+            internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
             postings: BTreeMap::new(),
             shelves: BTreeMap::new(),
@@ -245,6 +282,7 @@ impl NamespaceWriter {
             repaired: Repaired::new(&self.working_dir, namespace, set)?,
             found: Vec::new(),
             scratch: None,
+            shutdown: Shutdown::default(),
         };
         let mut seen = BTreeSet::new();
         self.take_namespace(tree, namespace, &mut access, &mut seen);
@@ -259,6 +297,15 @@ impl NamespaceWriter {
             }
         }
         let state = self.state(tree, namespace, set);
+        match std::fs::create_dir(&access.internal) {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(LeafError::Io {
+                    path: access.internal,
+                    source: error,
+                });
+            }
+            _ => {}
+        }
         let Some(object) = tree.lend(set) else {
             return Ok(None);
         };
@@ -473,6 +520,9 @@ impl Source for Lent {
 
 impl MemberAccess for Lent {
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        if self.stopped() {
+            return false;
+        }
         self.reads += 1;
         let start = into.len();
         let read = read_member(self, self.namespace, member, range, into);
@@ -483,6 +533,9 @@ impl MemberAccess for Lent {
     }
 
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+        if self.stopped() {
+            return;
+        }
         self.repaired.write(member, offset, bytes);
     }
 
@@ -509,14 +562,12 @@ impl MemberAccess for Lent {
     // Under the directory finalize never delivers, one per recovery object
     // and namespace, so two repairs never share one.
     fn scratch(&mut self) -> Option<PathBuf> {
-        let dir = self.working_dir.join(format!(
-            "{}/graph-recovery-{}-{}",
-            weaver_graph::names::INTERNAL_DIR,
-            self.namespace.0,
-            self.set.0
+        let dir = self.internal.join(format!(
+            "graph-recovery-{}-{}",
+            self.namespace.0, self.set.0
         ));
         super::remove_scratch(&dir);
-        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::create_dir(&dir).ok()?;
         self.scratch = Some(dir.clone());
         Some(dir)
     }
@@ -525,6 +576,9 @@ impl MemberAccess for Lent {
     // window on one, read wherever the member's bytes are: its own file, or
     // back through the inverse map of the object that owns it.
     fn read_volume(&mut self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        if self.stopped() {
+            return false;
+        }
         let Some(&(parent, member)) = self.volumes.get(&volume) else {
             return false;
         };

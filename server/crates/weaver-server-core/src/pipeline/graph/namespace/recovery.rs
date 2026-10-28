@@ -515,7 +515,11 @@ impl NamespaceWriter {
         if !tree.lent(returned.set) {
             return Ok(returned.repaired.remove()?);
         }
-        let rebuilt = if self.moved_since(&returned) {
+        // A repair the shutdown stopped is not repaired: what it read was
+        // cut short. It is rebuilt as it left, as one the loop moved under
+        // is, and its set is due again, which the restored job rules.
+        let stopped = returned.stopped();
+        let rebuilt = if stopped || self.moved_since(&returned) {
             tree.lent_facts(returned.set)
                 .and_then(|facts| restore.restore(facts).ok())
         } else {
@@ -549,6 +553,11 @@ impl NamespaceWriter {
         }
         tree.take_back(set, object, &mut self.placing(builder), &mut effects);
         self.apply_all(tree, builder, segments, effects, out)?;
+        // A stopped repair whose object keeps no facts is taken back as it
+        // came, and nothing it came to is applied.
+        if stopped {
+            return Ok(repaired.remove()?);
+        }
         self.read_backs += reads;
         let mut rewritten = std::collections::BTreeSet::new();
         for (member, offset, bytes) in repaired.slices() {

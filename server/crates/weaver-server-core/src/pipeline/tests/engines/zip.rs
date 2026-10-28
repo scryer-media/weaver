@@ -205,6 +205,19 @@ async fn a_deflate_zip_delivers_alike_in_every_frame_size() {
     }
 }
 
+// A zip posted under an index's name, stored and deflated: the name
+// proposes a recovery index, the bytes say zip, and the bytes decide. The
+// members are delivered and the posted file is not.
+#[tokio::test]
+async fn a_zip_posted_under_a_par2_name_is_extracted() {
+    for archive in [archive(stored()), deflated()] {
+        let scenario = Scenario::new(vec![Post::plain("lantern.par2", archive)]);
+        let graph = run(&scenario).await;
+        assert_members(&graph);
+        assert_fetched_once(&graph);
+    }
+}
+
 // A wrong candidate and then the right one. The store hands the enciphered
 // entries to the engine, whose run asks for a password, fails the wrong one
 // and asks again; each candidate is offered once.
@@ -220,6 +233,31 @@ async fn an_aes_zip_tries_a_wrong_candidate_once_then_the_right_one() {
     let offered: Vec<_> = graph.graph().offered.values().copied().collect();
     assert_eq!(offered, [2], "one try for each of the two candidates");
     assert_fetched_once(&graph);
+}
+
+// Every candidate wrong for an AES zip: each run under a wrong one writes
+// until the MAC refutes it, and none of what a refused run wrote stays. The
+// job fails for the password, and its working directory never holds more
+// than the posted archive.
+#[tokio::test]
+async fn an_aes_zip_no_candidate_opens_keeps_no_more_than_was_posted() {
+    let enciphered = stored().with_aes_encryption(AesMode::Aes256, SECRET);
+    let archive = archive(enciphered);
+    let posted = archive.len() as u64;
+    let scenario = Scenario::new(vec![Post::plain("lantern.zip", archive)])
+        .global_password("cinder-wrong-guess")
+        .global_password("cinder-wrong-again");
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(
+        graph.graph().scratch <= posted,
+        "the working directory held {} bytes, {posted} were posted",
+        graph.graph().scratch
+    );
 }
 
 // The second entry's local header.

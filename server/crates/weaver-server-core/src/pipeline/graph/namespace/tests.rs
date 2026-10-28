@@ -259,12 +259,13 @@ impl Segments for Source {
 }
 
 // What the pretend recovery set saw: its evidence, and what it read when
-// asked to repair.
+// asked to repair, and what happens between its two reads.
 #[derive(Default)]
 struct Seen {
     fed: Vec<Segment>,
     read: Option<Vec<u8>>,
     volume: Option<Vec<u8>>,
+    between: Option<Box<dyn FnMut() + Send>>,
 }
 
 // The repair the pretend set makes: read the named member, write a fix.
@@ -385,6 +386,9 @@ impl Recovery for Par {
         let span = ByteRange::new(0, PAR2_SIGNATURE.len() as u64);
         if access.read_volume(VolumeIndex(0), span, &mut volume) {
             self.seen.lock().unwrap().volume = Some(volume);
+        }
+        if let Some(between) = self.seen.lock().unwrap().between.as_mut() {
+            between();
         }
         let (Some(fix), Some(member)) = (self.fix, self.fixing) else {
             return RepairOutcome::Clean;
@@ -536,7 +540,7 @@ impl Job {
     fn run_lent(&mut self, build: &mut dyn Builder, lent: Inline) -> Vec<(NodeId, RepairOutcome)> {
         let mut ruled = Vec::new();
         for loan in lent.0 {
-            let returned = loan.run(weaver_graph::Budget::default());
+            let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
             ruled.extend(returned.outcome.map(|outcome| (returned.set, outcome)));
             self.writer
                 .returned(

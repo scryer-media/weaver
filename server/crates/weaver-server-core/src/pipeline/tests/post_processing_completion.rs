@@ -766,6 +766,7 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
     // The output could not be moved.
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Moving;
     pipeline.fail_job(job_id, "could not move the output".to_string());
+    settle_failed_releases(&mut pipeline).await;
     assert_eq!(
         pipeline.jobs[&job_id].status,
         JobStatus::QueuedPostProcessing

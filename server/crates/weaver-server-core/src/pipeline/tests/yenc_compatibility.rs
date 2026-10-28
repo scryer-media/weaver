@@ -484,6 +484,7 @@ async fn cancellation_does_not_allow_a_late_retry_to_write() {
     pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
     deliver(&mut pipeline, file_id, 0, 0, b"bad!", false).await;
     pipeline.fail_job(file_id.job_id, "cancelled fixture".to_string());
+    settle_failed_releases(&mut pipeline).await;
     // Whatever the failed job left on disk is all there ever is.
     let left = std::fs::read(&path).ok();
     let retry = pipeline.retry_rx.recv().await.unwrap();

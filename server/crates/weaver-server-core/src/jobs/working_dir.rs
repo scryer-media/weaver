@@ -473,6 +473,37 @@ pub fn remove_job_working_dir(
     }
 }
 
+// A failed job's working directory keeps only what the job delivered. The
+// graph's internals go: their checkpoint leaves with the job, so nothing
+// could read them again. A directory left holding nothing but its ownership
+// marker goes whole. A directory this job does not own is left as it is.
+pub(crate) fn release_failed_working_dir(
+    root: &Path,
+    path: &Path,
+    job_id: JobId,
+) -> std::io::Result<()> {
+    let dir = match open_working_directory(root, path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    let stored = read_working_marker(&dir)?;
+    if judge_history_marker(&dir, path, &stored, job_id)? != HistoryWorkingDir::Owned {
+        return Ok(());
+    }
+    match dir.remove_dir_all(weaver_graph::names::INTERNAL_DIR) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let mut delivered = false;
+    for entry in dir.entries()? {
+        delivered |= entry?.file_name() != WORKING_DIR_MARKER;
+    }
+    if !delivered {
+        dir.remove_open_dir_all()?;
+    }
+    Ok(())
+}
+
 pub async fn stamp_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {
     let root = root.to_path_buf();
     let path = path.to_path_buf();

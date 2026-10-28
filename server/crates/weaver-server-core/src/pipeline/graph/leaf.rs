@@ -89,6 +89,17 @@ impl Leaf {
         write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))
     }
 
+    // Create the file in the directory it lies in, which must already be
+    // there: nothing above the file is made. A file already open is kept.
+    pub(crate) fn create_within(&mut self) -> Result<(), LeafError> {
+        if self.file.is_none() {
+            let file =
+                create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
+            self.file = Some(file);
+        }
+        Ok(())
+    }
+
     // How far the file reaches: every byte written to it lies below.
     pub(crate) fn len(&self) -> Result<u64, LeafError> {
         match &self.file {

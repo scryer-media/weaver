@@ -1281,16 +1281,20 @@ impl NamespaceWriter {
     }
 
     // Forget what the tree dropped: the envelopes of every node nothing
-    // reads back through, and the file of every member no namespace holds,
-    // with the namespace's own files once the namespace is gone too. A
-    // namespace retired or gone holds no entries and keeps nothing resident.
+    // reads back through, whether or not it ever wrote a file, and the file
+    // of every member no namespace holds, with the namespace's own files
+    // once the namespace is gone too. A namespace retired or gone holds no
+    // entries and keeps nothing resident.
     fn prune(&mut self, tree: &Tree) -> Result<(), WriteError> {
         self.caps.release_gone(tree);
-        let nodes: Vec<NodeId> = self.files.keys().copied().collect();
-        for node in nodes {
+        let shelved: Vec<NodeId> = self.envelopes.nodes().collect();
+        for node in shelved {
             if tree.buried(node) {
                 self.envelopes.forget(node)?;
             }
+        }
+        let nodes: Vec<NodeId> = self.files.keys().copied().collect();
+        for node in nodes {
             let Some(namespace) = tree.namespace(node) else {
                 // Dropping the namespace's holds gives their count back.
                 if let Some(files) = self.files.remove(&node) {

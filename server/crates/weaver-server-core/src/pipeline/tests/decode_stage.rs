@@ -1036,6 +1036,8 @@ async fn fail_job_clears_write_backlog_accounting() {
 
     pipeline.fail_job(job_id, "forced failure".to_string());
 
+    settle_failed_releases(&mut pipeline).await;
+
     assert!(!pipeline.unanchored_parked.contains_key(&file_id));
     assert_eq!(pipeline.write_buffered_bytes, 0);
     assert_eq!(pipeline.write_buffered_segments, 0);
@@ -1112,6 +1114,7 @@ async fn disk_write_failure_fails_job_before_commit() {
         ),
         "{status:?}"
     );
+    settle_failed_releases(&mut pipeline).await;
     assert!(!pipeline.jobs.contains_key(&job_id));
     assert!(working_dir.join("blocked.bin").is_dir());
 }

@@ -4,6 +4,9 @@
 // The namespace's rules for its recovery sets: which members a set covers,
 // when it rules, and what the namespace holds for an index still to come.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::super::super::hardware::Shutdown;
 use super::*;
 
 const VIDEO_FIX: Fix = Fix {
@@ -134,7 +137,7 @@ fn a_repairs_output_waits_on_disk_past_the_memory_budget_and_lands_whole() {
     let Ok([loan]) = <[Loan; 1]>::try_from(lent.0) else {
         panic!("one loan");
     };
-    let returned = loan.run(weaver_graph::Budget::default());
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
     assert!(REBUILT.len() as u64 > job.accountant.budgets().resident_limit);
     let output = job.dir.path().join(format!(
         "{}/graph-recovery-{}-{}.repaired",
@@ -227,7 +230,7 @@ fn a_repair_whose_output_refuses_a_write_fails_and_applies_nothing() {
         set.0
     ));
     std::fs::create_dir_all(&output).unwrap();
-    let returned = loan.run(weaver_graph::Budget::default());
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
     let mut build = job.build();
     let error = job
         .writer
@@ -329,4 +332,112 @@ fn the_coordinator_holds_only_for_declared_indexes_still_to_come() {
         None,
         "nothing is held once every index is in"
     );
+}
+
+// The set's one loan, lent out of the job.
+fn lend_one(job: &mut Job, set: NodeId) -> Loan {
+    let mut lent = Inline::default();
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+        .expect("lent");
+    let Ok([loan]) = <[Loan; 1]>::try_from(lent.0) else {
+        panic!("one loan");
+    };
+    loan
+}
+
+// A repair the shutdown reaches while it is running reads nothing more:
+// the read after it is refused, and the repair comes back stopped with
+// nothing it came to applied.
+#[test]
+fn a_shutdown_that_starts_mid_repair_refuses_the_next_read_and_applies_nothing() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let loan = lend_one(&mut job, set);
+    let started = Arc::new(AtomicBool::new(false));
+    let flip = Arc::clone(&started);
+    job.par.lock().unwrap().between = Some(Box::new(move || flip.store(true, Ordering::Release)));
+    let returned = loan.run(weaver_graph::Budget::default(), &Shutdown::of(started));
+    let seen = job.par.lock().unwrap();
+    assert!(seen.volume.is_some(), "the repair ran before the shutdown");
+    assert!(
+        seen.read.is_none(),
+        "the read after the shutdown is refused"
+    );
+    drop(seen);
+    assert!(returned.stopped());
+    let mut build = job.build();
+    job.writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .expect("returned");
+    assert!(!job.tree.lent(set));
+    assert_eq!(job.file("video.mkv"), b"goXXgood");
+}
+
+// A job failed while its repair is out has its working directory released
+// under the repair: the repair reads and writes nothing more, and nothing
+// it does makes the directory again.
+#[test]
+fn a_repair_out_when_its_job_fails_never_makes_the_working_directory_again() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let loan = lend_one(&mut job, set);
+    let working_dir = job.dir.path().to_path_buf();
+    let released = working_dir.clone();
+    job.par.lock().unwrap().between = Some(Box::new(move || {
+        std::fs::remove_dir_all(&released).expect("released");
+    }));
+    let returned = loan.run(weaver_graph::Budget::default(), &Shutdown::default());
+    assert!(
+        job.par.lock().unwrap().read.is_none(),
+        "the read after the release is refused"
+    );
+    assert!(returned.stopped());
+    assert!(!working_dir.exists(), "the working directory stays gone");
+}
+
+// A repair that goes out as the pipeline shuts down reads nothing and
+// applies nothing: the set takes its object back unruled and repairs on its
+// next ruling, as the restored job rules it.
+#[test]
+fn a_repair_stopped_by_shutdown_reads_nothing_applies_nothing_and_rules_again() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let loan = lend_one(&mut job, set);
+    let shutdown = Shutdown::of(Arc::new(AtomicBool::new(true)));
+    let returned = loan.run(weaver_graph::Budget::default(), &shutdown);
+    assert!(
+        job.par.lock().unwrap().read.is_none(),
+        "the stopped repair read nothing"
+    );
+    assert!(returned.stopped());
+    let mut build = job.build();
+    job.writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .expect("returned");
+    assert!(!job.tree.lent(set));
+    assert_eq!(job.file("video.mkv"), b"goXXgood");
+
+    job.rule(false);
+    assert_eq!(job.file("video.mkv"), b"goOKgood");
 }

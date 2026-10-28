@@ -1039,6 +1039,65 @@ async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     );
 }
 
+// Dispatch never sends work to a server that is out of quota, so queued work
+// behind an exhausted pool never parks. The block still has to say why it
+// cannot move, as soon as the queue holds it.
+#[tokio::test]
+async fn queued_work_behind_quota_blocked_fills_shows_the_server_quota_block() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let control = weaver_nntp::transfer::ServerTransferRegistry::new().configure(
+        weaver_nntp::transfer::StableServerId(31),
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 128,
+                generation: 1,
+                retry_at: None,
+            }),
+        },
+    );
+    let _spent = control.try_reserve(128).unwrap();
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "spent-quota.example.com".to_string(),
+                ..Default::default()
+            },
+            stable_id: weaver_nntp::transfer::StableServerId(31),
+            transfer_control: Some(std::sync::Arc::clone(&control)),
+            max_connections: 1,
+            group: 0,
+            backfill: false,
+            retention_days: 0,
+        }],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    assert!(pipeline.nntp.all_normal_fill_servers_quota_blocked());
+
+    let job_id = JobId(20995);
+    let spec = standalone_job_spec("Spent Quota", &[("queued.bin".to_string(), 512u32)]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.update_queue_metrics();
+
+    assert!(pipeline.server_quota_parked.is_empty());
+    assert!(!pipeline.jobs[&job_id].download_queue.is_empty());
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+
+    // With nothing left queued, an exhausted pool holds nothing back.
+    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline.update_queue_metrics();
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::None
+    );
+}
+
 #[tokio::test]
 async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1078,9 +1137,11 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
 
     assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    // The queue change re-derives the block from the pool, whose server has
+    // quota, so the stale presentation gives way to the schedule beneath it.
     assert_eq!(
         pipeline.shared_state.download_block().kind,
-        crate::jobs::handle::DownloadBlockKind::ServerQuota
+        crate::jobs::handle::DownloadBlockKind::Scheduled
     );
 }
 

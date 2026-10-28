@@ -166,6 +166,20 @@ impl Refusing {
         self.dir.path().join(name).exists()
     }
 
+    // The files under the directory finalize never delivers.
+    fn internal(&self) -> Vec<String> {
+        let Ok(entries) =
+            std::fs::read_dir(self.dir.path().join(weaver_graph::names::INTERNAL_DIR))
+        else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     // A root member is a leaf: nothing is bound over it.
     fn is_leaf(&self, member: u32) -> bool {
         self.job
@@ -319,6 +333,18 @@ fn a_store_no_candidate_opens_refuses_after_the_last() {
     assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
     assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
     assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+// A store that kept every byte as envelope and then refused gave them all
+// back to its leaf: buried, its envelopes go with it, so the posted bytes are
+// on disk once, in the leaf.
+#[test]
+fn a_store_that_refuses_after_keeping_everything_as_envelope_leaves_none_behind() {
+    let mut refusing = refusing(Mode::Locked, 1, &WRONG);
+    refusing.deliver(0);
+    assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
+    assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
+    assert_eq!(refusing.internal(), Vec::<String>::new());
 }
 
 #[tokio::test]

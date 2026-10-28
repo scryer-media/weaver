@@ -478,6 +478,7 @@ async fn a_health_failure_raises_the_jobs_deletion_for_health() {
         other,
         "lantern.rar withheld for want of its password".into(),
     );
+    settle_failed_releases(&mut pipeline).await;
 
     assert_eq!(
         deletions_queued(&pipeline, health, after_health).await,
