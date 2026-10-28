@@ -14,6 +14,7 @@
 // outer one's bytes. Its grant lends it the pool for work over bytes that
 // are all in, so the threads every job spreads across stay within it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use weaver_graph::{
@@ -27,6 +28,24 @@ use crate::runtime::HardwareProfile;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Hardware {
     grant: Arc<RwLock<Grant>>,
+    shutdown: Shutdown,
+}
+
+// The pipeline's shutdown as graph work reads it: an atomic set from the
+// moment shutdown is asked for, read on repair threads without any lock. A
+// repair does not begin once it is set, and one going stops reading.
+// Outside a pipeline nothing sets it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Shutdown(Arc<AtomicBool>);
+
+impl Shutdown {
+    pub(crate) fn of(started: Arc<AtomicBool>) -> Self {
+        Self(started)
+    }
+
+    pub(crate) fn started(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 // What work starting now is given.
@@ -107,7 +126,18 @@ impl Hardware {
         );
         Self {
             grant: Arc::new(RwLock::new(Grant::of(tuner, pool))),
+            shutdown: Shutdown::default(),
         }
+    }
+
+    // The same hardware, given to work that stops at `shutdown`.
+    pub(crate) fn until(self, shutdown: Shutdown) -> Self {
+        Self { shutdown, ..self }
+    }
+
+    // The pipeline's shutdown, as the work given this hardware reads it.
+    pub(crate) fn shutdown(&self) -> &Shutdown {
+        &self.shutdown
     }
 
     // What work starting now is given.

@@ -595,6 +595,7 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
 
     let release = hold_database_writer(&pipeline);
     pipeline.fail_job(job_id, "durable failure".to_string());
+    settle_failed_releases(&mut pipeline).await;
 
     assert!(
         !drain_job_events(&mut events, job_id)
@@ -622,6 +623,57 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
         .list_job_history(&crate::HistoryFilter::default())
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
+}
+
+// A failed job's working directory is what the history lists as its
+// output: the graph's internals never stay in it, and one that delivered
+// nothing goes whole.
+#[tokio::test]
+async fn a_failed_job_leaves_only_what_it_delivered_in_its_working_dir() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let mut dirs = Vec::new();
+    for (job_id, name, delivered) in [
+        (JobId(30061), "Refused Nothing Delivered", None),
+        (JobId(30062), "Refused One Delivered", Some("kept.bin")),
+    ] {
+        let spec = standalone_job_spec(name, &[("posted.zip".to_string(), 123)]);
+        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            &pipeline.intermediate_dir,
+            &working_dir,
+            job_id,
+        )
+        .unwrap();
+        let internal = working_dir.join(weaver_graph::names::INTERNAL_DIR);
+        std::fs::create_dir_all(&internal).unwrap();
+        std::fs::write(internal.join("graph-envelope-1-0"), b"posted bytes").unwrap();
+        if let Some(delivered) = delivered {
+            std::fs::write(working_dir.join(delivered), b"delivered").unwrap();
+        }
+        pipeline.fail_job(job_id, "refused".to_string());
+        // The history row waits on the release, which comes back as an
+        // event the actor hears.
+        settle_failed_releases(&mut pipeline).await;
+        pipeline.db.flush_write_queue().await.unwrap();
+        assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_some());
+        dirs.push((working_dir, delivered));
+    }
+    let (nothing, _) = &dirs[0];
+    assert!(!nothing.exists(), "{} is still there", nothing.display());
+    let (one, delivered) = &dirs[1];
+    let mut left: Vec<String> = std::fs::read_dir(one)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec![
+            crate::jobs::working_dir::WORKING_DIR_MARKER.to_string(),
+            delivered.unwrap().to_string(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -676,6 +728,7 @@ async fn failed_history_row_keeps_why_the_job_failed() {
         insert_active_job(&mut pipeline, job_id, spec).await;
         pipeline.jobs.get_mut(&job_id).unwrap().status = status;
         pipeline.fail_job(job_id, error.to_string());
+        settle_failed_releases(&mut pipeline).await;
         wait_for_job_event(
             &mut events,
             |event| matches!(event, PipelineEvent::JobFailed { job_id: failed, .. } if *failed == job_id),
@@ -802,6 +855,7 @@ async fn updating_history_edits_the_row_and_the_finished_job() {
     let spec = standalone_job_spec("Finished Job", &[("finished.mkv".to_string(), 123)]);
     insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.fail_job(job_id, "too many articles are missing".to_string());
+    settle_failed_releases(&mut pipeline).await;
     wait_for_job_event(
         &mut events,
         |event| matches!(event, PipelineEvent::JobFailed { job_id: failed, .. } if *failed == job_id),

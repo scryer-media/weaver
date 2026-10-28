@@ -106,8 +106,10 @@ async fn drive(
     }
 }
 
-// The job's history row, once every queued write has landed.
-async fn history(pipeline: &Pipeline, job: JobId) -> crate::JobHistoryRow {
+// The job's history row, once a failed job's working directory is
+// released and every queued write has landed.
+async fn history(pipeline: &mut Pipeline, job: JobId) -> crate::JobHistoryRow {
+    super::super::settle_failed_releases(pipeline).await;
     pipeline.db.flush_write_queue().await.unwrap();
     pipeline
         .db
@@ -230,7 +232,7 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         "{:?}",
         job_status_for_assert(&pipeline, job)
     );
-    assert_eq!(history(&pipeline, job).await.status, "failed");
+    assert_eq!(history(&mut pipeline, job).await.status, "failed");
     assert_eq!(
         pipeline
             .db
@@ -435,7 +437,7 @@ async fn a_retiring_job_refuses_mutations_until_its_history_commits() {
         |event| matches!(event, PipelineEvent::JobCompleted { job_id } if *job_id == JOB),
     )
     .await;
-    assert_eq!(history(&pipeline, JOB).await.status, "complete");
+    assert_eq!(history(&mut pipeline, JOB).await.status, "complete");
 }
 
 // The final move cannot be made: the job fails with the move's reason, and
@@ -457,7 +459,7 @@ async fn a_final_move_that_fails_fails_the_job() {
         other => panic!("the job did not fail: {other:?}"),
     }
     assert!(complete_dir.is_file());
-    assert_eq!(history(&pipeline, JOB).await.status, "failed");
+    assert_eq!(history(&mut pipeline, JOB).await.status, "failed");
 }
 
 // `weaver_files_missing_total` counts files, not articles: two articles lost
@@ -499,7 +501,7 @@ async fn a_short_unprotected_file_keeps_an_honest_health() {
         job_status_for_assert(&pipeline, JOB),
         Some(JobStatus::Partial)
     );
-    let row = history(&pipeline, JOB).await;
+    let row = history(&mut pipeline, JOB).await;
     assert_eq!(row.failed_bytes, ARTICLE as u64);
     assert_eq!(row.health, 950);
 }
@@ -535,7 +537,7 @@ async fn a_dead_repost_beside_a_delivered_file_does_not_refuse_the_job() {
         "{:?}",
         files.keys()
     );
-    let row = history(&pipeline, JOB).await;
+    let row = history(&mut pipeline, JOB).await;
     assert_eq!(row.failed_bytes, 4 * ARTICLE as u64);
     assert_eq!(row.health, 500);
 }

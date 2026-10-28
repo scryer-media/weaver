@@ -1882,6 +1882,20 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
         pipeline.pump_decode_queue();
     }
     settle_inflight_moves(pipeline).await;
+    settle_failed_releases(pipeline).await;
+}
+
+// Hands the actor every failed job's working-directory release in flight,
+// so each records its history as the orchestrator records it.
+pub(in crate::pipeline) async fn settle_failed_releases(pipeline: &mut Pipeline) {
+    while !pipeline.releasing_failed_jobs.is_empty() {
+        let released = pipeline
+            .failed_release_rx
+            .recv()
+            .await
+            .expect("release channel should stay open");
+        pipeline.handle_failed_job_released(released);
+    }
 }
 
 // Polls until `predicate` holds. There is no deadline: the test runner

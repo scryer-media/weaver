@@ -591,6 +591,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     // its sets proved it (every one covering it ruled clean or repaired and
     // none is out), and whether the root still keeps its checksums.
     pub(in crate::pipeline::tests) sealing: Vec<Vec<(String, bool, bool)>>,
+    // The most the job's working directory held at any look, every file
+    // under it by its length.
+    pub(in crate::pipeline::tests) scratch: u64,
 }
 
 #[derive(Debug)]
@@ -797,6 +800,7 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         }
     }
 
+    super::super::settle_failed_releases(&mut pipeline).await;
     let status = job_status_for_assert(&pipeline, JOB);
     let failure = match &status {
         Some(JobStatus::Failed { error }) => Some(error.clone()),
@@ -1234,6 +1238,7 @@ pub(in crate::pipeline::tests) fn observe(
             .map(|kind| kind.to_string()),
     );
     view.offered = job.passwords_offered();
+    view.scratch = view.scratch.max(tree_bytes(&state.working_dir));
     view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
     view.health = pipeline.graph_failure_is_health(JOB);
@@ -1299,6 +1304,24 @@ fn delivered_claim(files: &BTreeMap<String, Vec<u8>>, post: &Post) -> Claim {
 
 // The delivered files, without the marker every output directory carries,
 // whose bytes name the run's own paths.
+// Every file under `dir` by its length, links not followed.
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                tree_bytes(&entry.path())
+            } else {
+                entry.metadata().map_or(0, |metadata| metadata.len())
+            }
+        })
+        .sum()
+}
+
 pub(in crate::pipeline::tests) fn collect(
     root: &Path,
     dir: &Path,

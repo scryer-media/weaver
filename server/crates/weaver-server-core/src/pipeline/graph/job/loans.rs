@@ -104,9 +104,11 @@ pub(crate) struct Lending<'a> {
 }
 
 impl Lender for Lending<'_> {
+    // No repair goes out once the pipeline is shutting down: its set rules
+    // again after the restart.
     fn admit(&mut self) -> bool {
         let loans = &mut *self.loans;
-        if loans.out.is_some() {
+        if loans.out.is_some() || loans.hardware.shutdown().started() {
             return false;
         }
         if loans.ticket.is_some() {
@@ -132,10 +134,11 @@ impl Lender for Lending<'_> {
         // The repair runs inside the pool, on the budget in force as it goes
         // out: a later profile reaches the next repair, not this one.
         let grant = loans.hardware.grant();
+        let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
             crate::e2e_failpoint::maybe_delay(crate::e2e_failpoint::REPAIR_TASK_START);
             crate::e2e_failpoint::maybe_trip(crate::e2e_failpoint::REPAIR_TASK_START);
-            let returned = grant.install(|| loan.run(grant.repair.clone()));
+            let returned = grant.install(|| loan.run(grant.repair.clone(), &shutdown));
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(Said {

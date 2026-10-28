@@ -174,9 +174,14 @@ impl Pipeline {
             .is_some_and(|segment| segment.message_ids.has_next())
     }
 
+    // The download block names the server quota whenever queued work cannot
+    // move because every normal fill server is out of quota. Queued work is
+    // what the queues hold plus what a quota rejection parked; dispatch never
+    // sends to a blocked server, so most of it never parks at all.
     pub(in crate::pipeline) fn refresh_server_quota_block_presentation(&self) {
-        let blocked = !self.server_quota_parked.is_empty()
-            && self.nntp.all_normal_fill_servers_quota_blocked();
+        let queued = !self.server_quota_parked.is_empty()
+            || self.metrics.download_queue_depth.load(Ordering::Relaxed) != 0;
+        let blocked = queued && self.nntp.all_normal_fill_servers_quota_blocked();
         self.shared_state.set_server_quota_blocked(blocked);
         self.shared_state
             .set_egress_quota_block(self.parked_egress_quota_block());

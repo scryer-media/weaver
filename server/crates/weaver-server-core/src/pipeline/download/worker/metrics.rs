@@ -653,7 +653,8 @@ impl Pipeline {
         );
     }
 
-    // Update shared atomic queue depth metrics from per-job queues.
+    // Update shared atomic queue depth metrics from per-job queues, and the
+    // server quota block that reads them.
     pub(crate) fn update_queue_metrics(&self) {
         let (total, recovery) = self.jobs.values().fold((0usize, 0usize), |(t, r), s| {
             (
@@ -668,6 +669,7 @@ impl Pipeline {
             .recovery_queue_depth
             .store(recovery, Ordering::Relaxed);
         self.publish_active_stage_metrics();
+        self.refresh_server_quota_block_presentation();
     }
 
     // Payload delivered and the wall time it took, with deliberate throttle

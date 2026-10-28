@@ -408,6 +408,31 @@ async fn an_aes_stored_7z_tries_a_wrong_candidate_once_then_the_right_one() {
     assert_fetched_once(&graph);
 }
 
+// Every candidate wrong for a coded AES 7z: each run under a wrong one
+// writes until the checksum refutes it, and none of what a refused run
+// wrote stays. The job fails for the password, and its working directory
+// never holds more than the posted archive.
+#[tokio::test]
+async fn a_coded_aes_7z_no_candidate_opens_keeps_no_more_than_was_posted() {
+    let archive = container(Lzma2Options::from_level(1).into(), Some(SECRET));
+    let posted = archive.len() as u64;
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)])
+        .global_password("cinder-wrong-guess")
+        .global_password("cinder-wrong-again");
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert!(
+        graph.graph().scratch <= posted,
+        "the working directory held {} bytes, {posted} were posted",
+        graph.graph().scratch
+    );
+}
+
 // AES over the members, coded by `method`, and over the end header alike,
 // as 7zz writes `-mhe=on`.
 pub(super) fn sealed_header(method: EncoderConfiguration) -> Vec<u8> {

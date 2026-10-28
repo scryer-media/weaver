@@ -680,6 +680,7 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
                 .to_string()
         })
     );
+    crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
     while !matches!(
         events.recv().await.expect("pipeline event channel closed"),
         PipelineEvent::JobFailed { job_id: failed, .. } if failed == job_id

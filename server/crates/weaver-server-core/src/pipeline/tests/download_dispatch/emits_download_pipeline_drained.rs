@@ -1703,6 +1703,8 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
 
     pipeline.fail_job(job_id, "expected failure".to_string());
 
+    settle_failed_releases(&mut pipeline).await;
+
     assert_eq!(
         pipeline
             .pending_released_download_results_by_job

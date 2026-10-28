@@ -776,6 +776,13 @@ impl std::fmt::Display for MoveToCompleteFailure {
     }
 }
 
+// A failed job's working directory, released off the actor: its history
+// is recorded once this comes back.
+pub(super) struct FailedJobReleased {
+    pub(super) job_id: JobId,
+    pub(super) error: String,
+}
+
 pub(super) struct MoveToCompleteDone {
     pub(super) job_id: JobId,
     pub(super) dest: PathBuf,
@@ -1461,6 +1468,9 @@ pub struct Pipeline {
     // Channel for background final-move results.
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
+    // Channel for failed jobs whose working directory was released.
+    pub(super) failed_release_tx: mpsc::Sender<FailedJobReleased>,
+    pub(super) failed_release_rx: mpsc::Receiver<FailedJobReleased>,
     pub(super) terminal_post_processing_done_tx: mpsc::Sender<TerminalPostProcessingEvent>,
     pub(super) terminal_post_processing_done_rx: mpsc::Receiver<TerminalPostProcessingEvent>,
     pub(super) script_effects_rx: tokio::sync::watch::Receiver<()>,
@@ -1679,6 +1689,9 @@ pub struct Pipeline {
     pub(super) body_fetch_failure_log_throttle: download::JobLogThrottle,
     // Jobs currently performing their final move into the complete directory.
     pub(super) inflight_moves: HashSet<JobId>,
+    // Failed jobs whose working directory is being released; each records
+    // its history when the release comes back.
+    pub(super) releasing_failed_jobs: HashSet<JobId>,
     // Final moves admitted after the post-processing hold is lifted.
     pub(super) deferred_moves: HashSet<JobId>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.

@@ -22,8 +22,8 @@ impl Pipeline {
     // Reject untrusted delivery content or an incomplete security check
     // without exposing the working tree to terminal scripts or publication.
     pub(super) fn fail_delivery_security_check(&mut self, job_id: JobId, error: String) {
-        self.prepare_failed_job_runtime(job_id, &error, false);
-        self.finish_failed_job(job_id, error);
+        let release = self.prepare_failed_job_runtime(job_id, &error, false);
+        self.finish_failed_job(job_id, error, release);
     }
 
     // Mark a job as failed and purge its queued segments.
@@ -91,7 +91,7 @@ impl Pipeline {
             && scripts_may_run
             && self.jobs.contains_key(&job_id)
             && !self.inflight_terminal_post_processing.contains(&job_id);
-        self.prepare_failed_job_runtime(job_id, &error, should_defer);
+        let release = self.prepare_failed_job_runtime(job_id, &error, should_defer);
 
         if should_defer {
             self.start_terminal_post_processing_with_outcome(
@@ -106,7 +106,7 @@ impl Pipeline {
             return;
         }
 
-        self.finish_failed_job(job_id, error);
+        self.finish_failed_job(job_id, error, release);
     }
 
     pub(crate) fn finalize_failed_job_after_terminal_post_processing(
@@ -114,12 +114,19 @@ impl Pipeline {
         job_id: JobId,
         error: String,
     ) {
-        self.prepare_failed_job_runtime(job_id, &error, false);
-        self.finish_failed_job(job_id, error);
+        let release = self.prepare_failed_job_runtime(job_id, &error, false);
+        self.finish_failed_job(job_id, error, release);
     }
 
-    fn prepare_failed_job_runtime(&mut self, job_id: JobId, error: &str, preserve_staging: bool) {
-        let (staging_dir, released) = if let Some(state) = self.jobs.get_mut(&job_id) {
+    // Returns the working directory to release, unless the staging is kept
+    // for the scripts that run on the failure first.
+    fn prepare_failed_job_runtime(
+        &mut self,
+        job_id: JobId,
+        error: &str,
+        preserve_staging: bool,
+    ) -> Option<PathBuf> {
+        let (staging_dir, working_dir, released) = if let Some(state) = self.jobs.get_mut(&job_id) {
             let released = state.post_state;
             state.queued_repair_at_epoch_ms = None;
             state.queued_extract_at_epoch_ms = None;
@@ -130,14 +137,14 @@ impl Pipeline {
             // Clear per-job queues to free memory.
             state.download_queue = DownloadQueue::new();
             state.recovery_queue = DownloadQueue::new();
-            let staging_dir = if preserve_staging {
-                None
+            let (staging_dir, working_dir) = if preserve_staging {
+                (None, None)
             } else {
-                state.staging_dir.take()
+                (state.staging_dir.take(), Some(state.working_dir.clone()))
             };
-            (staging_dir, Some(released))
+            (staging_dir, working_dir, Some(released))
         } else {
-            (None, None)
+            (None, None, None)
         };
         if let Some(released) = released {
             self.metrics
@@ -176,9 +183,50 @@ impl Pipeline {
         self.clear_job_phase_progress_runtime(job_id);
         self.clear_job_retention_excludes(job_id);
         self.clear_job_write_backlog(job_id);
+        working_dir
     }
 
-    fn finish_failed_job(&mut self, job_id: JobId, error: String) {
+    // What the job leaves in its working directory is what it delivered:
+    // the directory is released off the actor before the history records
+    // it, so the record never lists the graph's internals.
+    fn finish_failed_job(&mut self, job_id: JobId, error: String, release: Option<PathBuf>) {
+        let Some(working_dir) = release else {
+            self.record_failed_job(job_id, error);
+            return;
+        };
+        let root = self.intermediate_dir.clone();
+        let done = self.failed_release_tx.clone();
+        self.releasing_failed_jobs.insert(job_id);
+        tokio::spawn(async move {
+            let dir = working_dir.clone();
+            let released = tokio::task::spawn_blocking(move || {
+                crate::jobs::working_dir::release_failed_working_dir(&root, &dir, job_id)
+            })
+            .await;
+            let failure = match released {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(failure) = failure {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    dir = %working_dir.display(),
+                    error = %failure,
+                    "failed to release a failed job's working directory"
+                );
+            }
+            // A closed channel means the pipeline is gone.
+            let _ = done.send(super::FailedJobReleased { job_id, error }).await;
+        });
+    }
+
+    pub(super) fn handle_failed_job_released(&mut self, released: super::FailedJobReleased) {
+        self.releasing_failed_jobs.remove(&released.job_id);
+        self.record_failed_job(released.job_id, released.error);
+    }
+
+    fn record_failed_job(&mut self, job_id: JobId, error: String) {
         self.record_job_history(job_id, Some(PipelineEvent::JobFailed { job_id, error }));
         self.job_order.retain(|id| *id != job_id);
         self.report_job(job_id);

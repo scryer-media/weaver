@@ -174,6 +174,11 @@ impl Envelopes {
         }
     }
 
+    // Every node with a shelf, in node order.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.shelves.keys().copied()
+    }
+
     // The node's shelf, if anything was ever kept on it.
     pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
         self.shelves.get(&node).map(Arc::clone)

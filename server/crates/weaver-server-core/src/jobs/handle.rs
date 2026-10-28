@@ -71,6 +71,9 @@ pub struct SharedPipelineState {
     metrics: Arc<PipelineMetrics>,
     download_block: Arc<RwLock<DownloadBlockState>>,
     server_quota_blocked: Arc<AtomicBool>,
+    // Set once shutdown is asked for, with the queue's own signal, for work
+    // off the actor that must not take the queue's lock to read it.
+    shutdown_started: Arc<AtomicBool>,
     // The egress whose download quota holds work back, while one does.
     egress_quota_block: Arc<RwLock<Option<EgressQuotaBlock>>>,
     proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
@@ -119,6 +122,7 @@ impl SharedPipelineState {
             metrics,
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
             egress_quota_block: Arc::new(RwLock::new(None)),
             proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
@@ -409,6 +413,9 @@ impl SharedPipelineState {
     // Record which egress quota, if any, holds work back, and re-lay the
     // published block state over it.
     pub fn set_egress_quota_block(&self, block: Option<EgressQuotaBlock>) {
+        if *self.egress_quota_block.read().unwrap() == block {
+            return;
+        }
         let mut state = self.download_block.write().unwrap();
         {
             let mut current = self.egress_quota_block.write().unwrap();
@@ -451,11 +458,21 @@ impl SharedPipelineState {
         });
     }
 
+    // The shutdown signal as an atomic, for work off the actor.
+    pub(crate) fn shutdown_started(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_started)
+    }
+
     pub fn server_quota_blocked(&self) -> bool {
         self.server_quota_blocked.load(Ordering::Relaxed)
     }
 
+    // The block is laid again only when the value changed: the pipeline
+    // derives it on every queue change.
     pub fn set_server_quota_blocked(&self, blocked: bool) {
+        if self.server_quota_blocked.load(Ordering::Relaxed) == blocked {
+            return;
+        }
         let mut state = self.download_block.write().unwrap();
         self.server_quota_blocked.store(blocked, Ordering::Relaxed);
         self.apply_quota_blocks(&mut state);
@@ -1655,6 +1672,7 @@ impl SchedulerHandle {
             inner.globals.shutting_down = true;
             Change::changed(())
         });
+        self.state.shutdown_started.store(true, Ordering::Release);
         // An e2e hook held until shutdown is released by the same signal
         // the pipeline reads.
         crate::e2e_failpoint::release_shutdown_holds();
