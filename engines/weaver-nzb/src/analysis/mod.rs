@@ -30,10 +30,10 @@ use weaver_model::files::{FileRole, archive_base_name};
 use crate::parser::ParseDiagnostics;
 use crate::types::{Nzb, NzbFile};
 
-pub use self::classify::{DomainSpread, PosterTool};
+pub use self::classify::{DomainSpread, FileExt, PosterTool, file_ext};
 use self::classify::{
-    FileExt, NameShape, NameSource, StemClass, SubjectNumbers, classify_name, file_ext,
-    name_mentions_password, par_base_name, parse_subject_numbers, poster_tool, stem_class,
+    NameShape, NameSource, StemClass, SubjectNumbers, classify_name, name_mentions_password,
+    par_base_name, parse_subject_numbers, poster_tool, stem_class,
 };
 
 // Bumped whenever a field changes meaning or disappears.

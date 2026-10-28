@@ -10,19 +10,34 @@
 // configuration, and the pipeline internals that are reachable from nowhere
 // else.
 //
-// Two rules govern everything here:
+// Three rules govern everything here:
 //
 // 1. **No credential leaves the host.** Every GraphQL payload passes through
 //    [`redact`], every configuration file is parsed and re-serialized with its
 //    secrets removed, and a configuration file that cannot be parsed is left
 //    out rather than copied verbatim.
-// 2. **A failed component never fails the package.** Each piece records
+// 2. **No name leaves the host.** The package is attached to public bug
+//    reports, so nothing in it may identify the operator, their machine, their
+//    providers or what they downloaded. Every component, the logs included,
+//    passes through one table of [`sanitize`] stand-ins on its way into the
+//    archive: a provider, a proxy, an egress, a schedule, a job, its files,
+//    its category and metadata, a directory and the host each become one
+//    stable stand-in that is the same in every file, so a maintainer can still
+//    follow one job from the queue through the logs. Sizes, counts, timings,
+//    ports, states, error kinds and versions are left as they are, because
+//    they identify nobody. The manifest records how many stand-ins the
+//    package allocated, so a reader knows the names are not real, and how
+//    many finished jobs the history holds: names are read for the 2,000 most
+//    recent. A table source that cannot be read leaves every component out.
+//    There is no way to turn this off.
+// 3. **A failed component never fails the package.** Each piece records
 //    either its bytes or its error, and the error is written into the manifest.
 //    A report that is missing one section is still a report; a 500 is not.
 
 mod archive;
 mod graphql;
 mod redact;
+mod sanitize;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -36,9 +51,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
 use weaver_server_api::WeaverSchema;
-use weaver_server_core::SchedulerHandle;
 use weaver_server_core::operations::disk::StorageCapacity;
 use weaver_server_core::settings::model::SharedConfig;
+use weaver_server_core::{Database, SchedulerHandle};
 
 use self::archive::Component;
 use self::graphql::SchemaShape;
@@ -129,27 +144,32 @@ pub(super) async fn diagnostics_package_handler(
     let generated_at_utc = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let filename = archive::archive_filename(&generated_at_utc);
 
-    let components = collect_components(
+    let (components, sanitized) = collect_components(
         &schema,
         &handle,
         &exporter,
         &disk_space,
         &http_metrics,
         &config,
+        &request_auth.db,
         caller,
     )
     .await;
 
-    let archive =
-        match archive::build_archive(components, env!("CARGO_PKG_VERSION"), &generated_at_utc) {
-            Ok(archive) => archive,
-            Err(error) => {
-                return super::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("failed to write diagnostics archive: {error}"),
-                );
-            }
-        };
+    let archive = match archive::build_archive(
+        components,
+        env!("CARGO_PKG_VERSION"),
+        &generated_at_utc,
+        sanitized,
+    ) {
+        Ok(archive) => archive,
+        Err(error) => {
+            return super::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to write diagnostics archive: {error}"),
+            );
+        }
+    };
 
     (
         [
@@ -175,8 +195,9 @@ async fn collect_components(
     disk_space: &Arc<StorageCapacity>,
     http_metrics: &super::HttpMetricsHandle,
     config: &SharedConfig,
+    db: &Database,
     caller: super::auth::ResolvedCaller,
-) -> Vec<Component> {
+) -> (Vec<Component>, archive::ManifestSanitized) {
     let started = Instant::now();
     let mut components = Vec::new();
 
@@ -188,16 +209,26 @@ async fn collect_components(
     components.extend(collect_graphql_components(schema, &caller).await);
     components.push(collect_pipeline_internals(handle).await);
 
-    let (data_dir, intermediate_dir, complete_dir) = {
+    let (data_dir, intermediate_dir, complete_dir, watch_dir) = {
         let config = config.read().await;
         (
             PathBuf::from(&config.data_dir),
             PathBuf::from(config.intermediate_dir()),
             PathBuf::from(config.complete_dir()),
+            config
+                .watch_folder
+                .path
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
         )
     };
 
-    let host_dirs = (data_dir.clone(), intermediate_dir, complete_dir);
+    let host_dirs = (
+        data_dir.clone(),
+        intermediate_dir.clone(),
+        complete_dir.clone(),
+    );
     let host = tokio::task::spawn_blocking(move || collect_host_facts(host_dirs)).await;
     components.push(match host {
         Ok(facts) => Component::json("host.json", &facts),
@@ -219,7 +250,66 @@ async fn collect_components(
         exporter.render(disk_space, http_metrics).await,
     ));
 
-    components
+    // Everything is collected; nothing leaves before the stand-ins replace
+    // the names in it.
+    let local = sanitize::LocalNames::current(data_dir, intermediate_dir, complete_dir, watch_dir);
+    // The table is read once everything is collected, so a name added
+    // during the collection is in it.
+    let stored = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || sanitize::read_stored_names(&db))
+            .await
+            .unwrap_or_else(|error| {
+                Err(format!(
+                    "the stand-in table could not read the database: {error}"
+                ))
+            })
+    };
+    sanitize_components(components, stored, local).await
+}
+
+// The one sanitizing pass over a collected package. A table source that
+// cannot be read, or a table that cannot be built, leaves every component
+// out: a table missing a source would let that source's names leave. The
+// pass scans every byte, so it runs off the async runtime.
+async fn sanitize_components(
+    components: Vec<Component>,
+    stored: Result<sanitize::StoredNames, String>,
+    local: sanitize::LocalNames,
+) -> (Vec<Component>, archive::ManifestSanitized) {
+    let names: Vec<String> = components
+        .iter()
+        .map(|component| component.name.clone())
+        .collect();
+    let history_jobs_total = stored.as_ref().ok().map(|stored| stored.history_total);
+    let schema_keys = SchemaShape::current()
+        .map(SchemaShape::field_names)
+        .unwrap_or_default();
+    let fallback = local.clone();
+    let pass = tokio::task::spawn_blocking(move || {
+        let mut components = components;
+        let result = stored.and_then(|stored| {
+            sanitize::sanitize_package(&mut components, &local, &stored, schema_keys)
+        });
+        match result {
+            Ok(stand_ins) => (components, stand_ins),
+            Err(error) => {
+                let names = components.into_iter().map(|component| component.name);
+                (sanitize::left_out(&local, names, &error), 0)
+            }
+        }
+    })
+    .await;
+    let (components, stand_ins) = pass.unwrap_or_else(|error| {
+        let reason = format!("the stand-in table could not be built: {error}");
+        (sanitize::left_out(&fallback, names.into_iter(), &reason), 0)
+    });
+    let sanitized = archive::ManifestSanitized {
+        stand_ins: stand_ins as u64,
+        history_jobs_total,
+        note: sanitize::SANITIZED_NOTE.to_string(),
+    };
+    (components, sanitized)
 }
 
 // Everything reachable over GraphQL, each root group in its own file.
@@ -472,7 +562,7 @@ async fn collect_log_files() -> Vec<Component> {
                     ),
                 ),
                 Ok(_) => match read_file_tail(&path, MAX_LOG_BYTES).await {
-                    Ok(data) => Component::bytes(name, data),
+                    Ok(data) => Component::gzip(name, data),
                     Err(error) => Component::failed(name, error),
                 },
                 Err(error) => {
@@ -482,15 +572,22 @@ async fn collect_log_files() -> Vec<Component> {
             continue;
         }
 
+        // The live log is written while it is read: it ends at its last
+        // whole line, so a line cut mid-name does not leave as a fragment.
         components.push(match read_file_tail(&path, MAX_LOG_BYTES).await {
-            Ok(data) => Component::bytes(name, data),
+            Ok(mut data) => {
+                sanitize::to_last_line(&mut data);
+                Component::bytes(name, data)
+            }
             Err(error) => Component::failed(name, error),
         });
     }
     components
 }
 
-// Every TOML file sitting directly in the data directory, redacted.
+// Every TOML file sitting directly in the data directory, redacted. A file
+// is named by its place in sorted order, because its own name is the
+// operator's to choose.
 async fn collect_config_files(data_dir: &Path) -> Vec<Component> {
     let mut entries = match tokio::fs::read_dir(data_dir).await {
         Ok(entries) => entries,
@@ -526,20 +623,21 @@ async fn collect_config_files(data_dir: &Path) -> Vec<Component> {
     paths.sort();
 
     let mut components = Vec::with_capacity(paths.len());
-    for path in paths {
-        let name = format!(
-            "config/{}",
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "config.toml".to_string())
-        );
+    for (index, path) in paths.into_iter().enumerate() {
+        let name = format!("config/config-{}.toml", index + 1);
         components.push(match read_file_tail(&path, MAX_CONFIG_BYTES).await {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(contents) => match redact::redact_toml_document(&contents) {
-                    Ok(redacted) => Component::text(name, redacted),
+                    Ok(redacted) => Component::toml(name, redacted),
                     Err(error) => Component::failed(
                         name,
-                        format!("left out because it could not be parsed for redaction: {error}"),
+                        // The error's display quotes the line it failed
+                        // on, which may hold the secret; only its kind is
+                        // kept.
+                        format!(
+                            "left out because it could not be parsed for redaction: {}",
+                            error.message()
+                        ),
                     ),
                 },
                 Err(_) => Component::failed(name, "left out because it is not valid UTF-8"),
@@ -550,7 +648,8 @@ async fn collect_config_files(data_dir: &Path) -> Vec<Component> {
     components
 }
 
-// Reads at most `max_bytes` from the end of a file.
+// Reads at most `max_bytes` from the end of a file. A file cut short starts
+// at its first whole line, so no name is left as a fragment.
 async fn read_file_tail(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -572,6 +671,9 @@ async fn read_file_tail(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> 
         .read_to_end(&mut data)
         .await
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if length > max_bytes {
+        sanitize::from_first_line(&mut data);
+    }
     Ok(data)
 }
 

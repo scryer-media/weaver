@@ -87,6 +87,7 @@ rand = { version = "0.10", default-features = false, features = ["std", "std_rng
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode"] }
 ipnet = { version = "2.12", default-features = false, features = ["std"] }
 unicode-normalization = { version = "0.1.25", default-features = false }
+aho-corasick = { version = "1.1.5", default-features = false, features = ["std", "perf-literal"] }
 tar = { version = "0.4", default-features = false }
 cap-std = { version = "4", default-features = false }
 cap-fs-ext = { version = "4", default-features = false, features = ["std"] }

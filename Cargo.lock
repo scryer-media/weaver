@@ -5981,6 +5981,7 @@ dependencies = [
 name = "weaver"
 version = "0.16.5"
 dependencies = [
+ "aho-corasick",
  "application-updater",
  "async-graphql",
  "async-graphql-axum",
@@ -6012,6 +6013,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-turbo",
+ "sha2 0.11.1",
  "tar",
  "tempfile",
  "tikv-jemalloc-sys",

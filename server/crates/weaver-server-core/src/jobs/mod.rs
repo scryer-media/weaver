@@ -3,6 +3,7 @@
 
 mod archive_password;
 pub mod assembly;
+pub mod diagnostic_names;
 pub mod duplicate;
 pub mod duplicate_persistence;
 pub mod error;
