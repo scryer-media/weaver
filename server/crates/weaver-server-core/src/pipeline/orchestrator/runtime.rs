@@ -245,7 +245,6 @@ impl Pipeline {
             nzb_admitted,
             nzb_seen: HashSet::new(),
             nzb_pause_releases,
-            nzb_added_scripts_pending: HashSet::new(),
             nzb_reprocess_pending: HashSet::new(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),

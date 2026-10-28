@@ -12,7 +12,8 @@ struct AdmissionRow {
     position: usize,
     priority: u8,
     paused: bool,
-    // The row still carries an intake, a restore or a resume for the actor.
+    // The row still carries an intake, a restore or a resume for the actor,
+    // or its job is installed and waits for a slot to download.
     pending: bool,
     cancelled_or_retiring: bool,
     // The row carries a fresh intake the actor has not installed yet.
@@ -41,13 +42,9 @@ impl Pipeline {
                 Change::unchanged(())
             }
         });
-        let (stopped, rows) = self.shared_state.queue.read(|inner| {
+        let (shutting_down, rows) = self.shared_state.queue.read(|inner| {
             (
-                inner.globals.paused
-                    || inner.globals.scheduled_pause
-                    || inner.globals.speed_test_paused
-                    || inner.globals.shutting_down
-                    || inner.globals.schedule_replay_paused,
+                inner.globals.shutting_down,
                 inner
                     .jobs
                     .iter()
@@ -63,10 +60,15 @@ impl Pipeline {
                                     .as_ref()
                                     .is_some_and(|job| job.status == JobStatus::Paused)
                                 || row.report.job.run_state == crate::RunState::Paused
+                                || self
+                                    .jobs
+                                    .get(&row.id)
+                                    .is_some_and(|state| state.run_state == crate::RunState::Paused)
                         });
                         let pending = row.admission.is_some()
                             || row.intents.restore.is_some()
-                            || row.intents.paused == Some(false);
+                            || row.intents.paused == Some(false)
+                            || self.jobs.contains_key(&row.id);
                         let info = row.info(&inner.globals);
                         let priority = info
                             .metadata
@@ -141,18 +143,18 @@ impl Pipeline {
         for id in retired {
             self.nzb_seen.remove(&id);
             self.nzb_pause_releases.remove(&id);
-            self.nzb_added_scripts_pending.remove(&id);
             self.nzb_reprocess_pending.remove(&id);
         }
         // A history retry can replace a canceled, unadmitted paused job
         // before this actor sees the old row disappear.
         for row in &rows {
             if row.intake && !self.jobs.contains_key(&row.id) && !self.nzb_work_in_flight(row.id) {
-                self.nzb_added_scripts_pending.remove(&row.id);
                 self.nzb_reprocess_pending.remove(&row.id);
             }
         }
-        if stopped {
+        // Only a shutdown stops admission; the pauses and the slot count are
+        // read per candidate below.
+        if shutting_down {
             return;
         }
         let mut candidates: Vec<_> = rows
@@ -201,9 +203,9 @@ impl Pipeline {
                 continue;
             }
             self.nzb_admitted.insert(id);
-            if self.nzb_added_scripts_pending.remove(&id) {
-                self.raise_added_script_event(id);
-            }
+            // A job restored without a slot queued its engine runs; release
+            // them now that it holds one.
+            self.resume_graph_work(id);
             self.download_dispatch_wake = true;
         }
         self.shared_state.queue.write(|inner| {
@@ -224,19 +226,7 @@ impl Pipeline {
                     changed = true;
                     continue;
                 }
-                let waiting = !self.nzb_admitted.contains(&row.id)
-                    && row.intents.cancelled.is_none()
-                    && row.intents.paused != Some(true)
-                    && (row
-                        .admission
-                        .as_ref()
-                        .is_some_and(|job| !job.options.initially_paused)
-                        || row
-                            .intents
-                            .restore
-                            .as_ref()
-                            .is_some_and(|job| job.status != JobStatus::Paused)
-                        || row.intents.paused == Some(false));
+                let waiting = self.waits_for_nzb_slot(row);
                 if waiting
                     && row.report.job.download_wait_reason.as_deref() != Some(NZB_SLOT_WAIT_REASON)
                 {
@@ -256,6 +246,29 @@ impl Pipeline {
                 Change::unchanged(())
             }
         });
+    }
+
+    // Whether the row's job would download now but holds no slot: an intake,
+    // a restore or a resume that is not paused, or an installed job that is
+    // not paused, none of them cancelled.
+    pub(crate) fn waits_for_nzb_slot(&self, row: &crate::pipeline::queue::JobRow) -> bool {
+        !self.nzb_admitted.contains(&row.id)
+            && row.intents.cancelled.is_none()
+            && row.intents.paused != Some(true)
+            && (row
+                .admission
+                .as_ref()
+                .is_some_and(|job| !job.options.initially_paused)
+                || row
+                    .intents
+                    .restore
+                    .as_ref()
+                    .is_some_and(|job| job.status != JobStatus::Paused)
+                || row.intents.paused == Some(false)
+                || self
+                    .jobs
+                    .get(&row.id)
+                    .is_some_and(|state| state.run_state != crate::RunState::Paused))
     }
 
     fn nzb_work_in_flight(&self, id: JobId) -> bool {
