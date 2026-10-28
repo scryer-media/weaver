@@ -537,6 +537,13 @@ impl ArticleMap {
             .collect()
     }
 
+    // How many volumes have every article in hand.
+    pub(crate) fn whole_count(&self) -> usize {
+        (0..self.volumes.len())
+            .filter(|&index| self.volume_whole(VolumeIndex(index as u32)))
+            .count()
+    }
+
     pub(crate) fn volume_waiting(&self, volume: VolumeIndex) -> bool {
         self.volumes
             .get(volume.0 as usize)

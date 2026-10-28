@@ -397,7 +397,6 @@ impl Pipeline {
             body_fetch_failure_log_throttle: Default::default(),
             inflight_moves: HashSet::new(),
             deferred_moves: HashSet::new(),
-            deferred_post_processing: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             shared_state,
             db,
@@ -548,6 +547,16 @@ impl Pipeline {
         &self,
     ) -> crate::post_processing::executor::PostProcessingExecutor {
         self.terminal_post_processing_executor.clone()
+    }
+
+    // The job's files the download has brought whole, every article in
+    // hand: the graph's count for a graph job, the assembly's otherwise. The
+    // one count the live report and the history row both read.
+    pub(crate) fn completed_file_count(&self, state: &JobState) -> u32 {
+        self.graph_jobs.get(&state.job_id).map_or_else(
+            || state.assembly.complete_file_count(),
+            super::super::graph::job::GraphJob::whole_file_count,
+        ) as u32
     }
 
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {

@@ -69,7 +69,9 @@ impl Pipeline {
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
             // An explicitly paused restore owns no NZB slot. Rebuild its
-            // checkpoint, but leave engine runs queued until admission.
+            // checkpoint, but leave engine runs queued until admission. The
+            // pipeline's limit is none under a post-processing pause, whose
+            // release steps them.
             slots: if self.nzb_admitted.contains(&job_id) {
                 self.graph_slot_limit()
             } else {

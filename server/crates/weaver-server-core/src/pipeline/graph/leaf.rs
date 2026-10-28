@@ -21,8 +21,6 @@ use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
-    #[error("output name {0:?} would escape the directory it is written under")]
-    UnsafeName(String),
     #[error("{}: {source}", path.display())]
     Io { path: PathBuf, source: io::Error },
 }
@@ -61,13 +59,13 @@ struct Written {
 impl Leaf {
     // The leaf for `output_name` under `dir`. Nothing is created until the
     // first byte arrives.
-    pub(crate) fn at(dir: &Path, output_name: &str) -> Result<Self, LeafError> {
-        Ok(Self {
-            path: dir.join(relative_path(output_name)?),
+    pub(crate) fn at(dir: &Path, output_name: &str) -> Self {
+        Self {
+            path: dir.join(relative_path(output_name)),
             directory: Self::is_directory(output_name),
             file: None,
             written: BTreeMap::new(),
-        })
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -210,7 +208,7 @@ impl Leaf {
 
     // The member was renamed; the file follows it.
     pub(crate) fn rename(&mut self, dir: &Path, output_name: &str) -> Result<(), LeafError> {
-        let path = dir.join(relative_path(output_name)?);
+        let path = dir.join(relative_path(output_name));
         if path == self.path {
             return Ok(());
         }
@@ -252,37 +250,33 @@ impl Leaf {
     }
 }
 
-// An output name as a path relative to the directory it is written under,
-// refused when it would leave it: an absolute path, `..`, a root or prefix
-// component, a Windows drive letter, an embedded NUL, or nothing at all.
-fn relative_path(output_name: &str) -> Result<PathBuf, LeafError> {
-    let unsafe_name = || LeafError::UnsafeName(output_name.to_owned());
+// An output name as a path relative to the directory it is written under.
+// Every name a leaf is given was confined by the name ledger
+// (`weaver_graph::names`), which keeps it inside that directory: never
+// empty, no NUL, no root, prefix or `..` part. That is asserted here, never
+// judged: a part that would leave the directory is not joined, so even a
+// name the ledger let through by mistake lands inside it.
+fn relative_path(output_name: &str) -> PathBuf {
     let normalized = output_name.replace('\\', "/");
     let name = normalized.trim_end_matches('/');
-    let path = Path::new(name);
-    if name.is_empty() || name.contains('\0') || path.is_absolute() {
-        return Err(unsafe_name());
-    }
+    debug_assert!(
+        !name.is_empty() && !name.contains('\0'),
+        "the name ledger handed the leaf {output_name:?}"
+    );
     let mut safe = PathBuf::new();
-    for component in path.components() {
+    for component in Path::new(name).components() {
         match component {
-            Component::Normal(part) => {
-                let bytes = part.as_encoded_bytes();
-                if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-                    return Err(unsafe_name());
-                }
-                safe.push(part);
-            }
+            Component::Normal(part) => safe.push(part),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(unsafe_name());
+                debug_assert!(
+                    false,
+                    "the name ledger let {output_name:?} leave its directory"
+                );
             }
         }
     }
-    if safe.as_os_str().is_empty() {
-        return Err(unsafe_name());
-    }
-    Ok(safe)
+    safe
 }
 
 fn create_parent(path: &Path) -> Result<(), LeafError> {

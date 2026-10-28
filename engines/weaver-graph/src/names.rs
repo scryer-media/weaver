@@ -211,20 +211,27 @@ impl NameLedger {
 // scratch, repair and envelope files. No output is written under it.
 pub const INTERNAL_DIR: &str = ".weaver-chunks";
 
-// A name an archive gave, kept inside the folder it is written under: either
-// separator splits it, and empty, `.` and `..` parts are dropped, so a path
-// can neither climb out nor start at the root. A path that starts at the
-// internal directory starts at that directory's first suffixed name instead.
-// A trailing separator, which names a directory, is kept.
+// A name an archive gave, kept inside the folder it is written under. This
+// is the one confinement every output name passes: the leaf that writes it
+// only asserts what is decided here. Either separator splits the name, and
+// empty, `.` and `..` parts are dropped, so a path can neither climb out nor
+// start at the root. A NUL, which no file system takes in a name, becomes
+// `_`. A part spelled like a drive (`C:`) is an ordinary directory where
+// paths have no drives; on Windows, where a colon in any part names a drive
+// (`C:`, `C:foo`) or a file's stream, every colon becomes `_`. A path that starts at the internal directory starts at
+// that directory's first suffixed name instead. A trailing separator, which
+// names a directory, is kept.
 fn confined(wanted: &str) -> String {
-    let outside = format!("{INTERNAL_DIR} (1)");
-    let mut parts: Vec<&str> = wanted
+    let mut parts: Vec<String> = wanted
         .split(['/', '\\'])
         .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+        .map(confined_part)
         .collect();
     match parts.first_mut() {
         None => return "_".to_owned(),
-        Some(first) if first.eq_ignore_ascii_case(INTERNAL_DIR) => *first = &outside,
+        Some(first) if first.eq_ignore_ascii_case(INTERNAL_DIR) => {
+            *first = format!("{INTERNAL_DIR} (1)");
+        }
         Some(_) => {}
     }
     let mut name = parts.join("/");
@@ -232,6 +239,16 @@ fn confined(wanted: &str) -> String {
         name.push('/');
     }
     name
+}
+
+// One part of a confined name, as the file system takes it.
+fn confined_part(part: &str) -> String {
+    let part = part.replace('\0', "_");
+    if cfg!(windows) {
+        part.replace(':', "_")
+    } else {
+        part
+    }
 }
 
 // The path a name takes on disk, as a case-insensitive, normalising file
@@ -346,6 +363,35 @@ mod tests {
         assert_eq!(root(&mut ledger, 3, "deep/./dir\\"), "deep/dir/");
         assert_eq!(root(&mut ledger, 4, ".."), "_");
         assert_eq!(root(&mut ledger, 5, "plain.bin"), "plain.bin");
+    }
+
+    // A drive-shaped part is a directory like any other where paths have no
+    // drives, and a NUL never reaches the file system.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_drive_letter_part_stays_a_directory_and_a_nul_is_replaced() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(
+            root(&mut ledger, 1, "C:/adv-escape-drive.txt"),
+            "C:/adv-escape-drive.txt"
+        );
+        assert_eq!(root(&mut ledger, 2, "D:\\x\\y.bin"), "D:/x/y.bin");
+        assert_eq!(root(&mut ledger, 3, "dir/c:/z.bin"), "dir/c:/z.bin");
+        assert_eq!(root(&mut ledger, 4, "a\0b.bin"), "a_b.bin");
+    }
+
+    // On Windows the same part would name the drive, so its colon goes.
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_letter_part_never_names_a_drive() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(
+            root(&mut ledger, 1, "C:/adv-escape-drive.txt"),
+            "C_/adv-escape-drive.txt"
+        );
+        assert_eq!(root(&mut ledger, 2, "a\0b.bin"), "a_b.bin");
+        assert_eq!(root(&mut ledger, 3, "C:foo/bar.bin"), "C_foo/bar.bin");
+        assert_eq!(root(&mut ledger, 4, "dir/x:y.bin"), "dir/x_y.bin");
     }
 
     #[test]

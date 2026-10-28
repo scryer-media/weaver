@@ -205,7 +205,7 @@ impl Pipeline {
             completed_files: if self.blocked_restores.contains_key(&state.job_id) {
                 0
             } else {
-                state.assembly.complete_file_count() as u32
+                self.completed_file_count(state)
             },
             file_remaining_bytes: self
                 .graph_jobs

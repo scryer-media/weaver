@@ -262,8 +262,7 @@ impl Pipeline {
                     .jobs
                     .get(&job_id)
                     .is_some_and(|state| state.run_state != crate::jobs::model::RunState::Paused)
-                    && (self.deferred_moves.contains(&job_id)
-                        || self.deferred_post_processing.contains(&job_id))
+                    && self.deferred_moves.contains(&job_id)
                 {
                     self.schedule_job_completion_check(job_id);
                 }
@@ -474,7 +473,9 @@ impl Pipeline {
                 self.fail_job(job_id, error);
             }
         }
-        let jobs: Vec<_> = self.deferred_post_processing.drain().collect();
+        // The pause held every graph job's repair and extraction slots. Each
+        // live job asks for them again, and its completion gate looks again.
+        let jobs: Vec<_> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
             if self.shared_state.queue.read(|inner| {
                 inner.jobs.iter().any(|row| {
@@ -482,14 +483,13 @@ impl Pipeline {
                         && (row.intents.paused == Some(true) || row.intents.cancelled.is_some())
                 })
             }) {
-                self.deferred_post_processing.insert(job_id);
                 continue;
             }
             self.apply_pending_job_update(job_id);
             if !self.jobs.contains_key(&job_id) {
                 continue;
             }
-            self.schedule_job_completion_check(job_id);
+            self.resume_graph_work(job_id);
         }
     }
 }

@@ -663,3 +663,43 @@ async fn a_sized_by_descriptor_zip_entry_under_an_xz_parent_is_refused_unbounded
     assert_eq!(delivery.whole, [FILE], "{delivery:?}");
     assert_eq!(delivery.files[0].depth, 2, "{delivery:?}");
 }
+
+// A member named like a drive (`C:/...`) is a directory like any other
+// where paths have no drives: the name ledger confines it, and the job
+// completes with it under a `C:` directory beside the plain member.
+#[cfg(not(windows))]
+async fn a_drive_letter_member_beside_a_plain_one_delivers_both(post: &str, wrap: ContainerOf) {
+    let hostile = noise(ARTICLE + 5, 11);
+    let plain = noise(ARTICLE + 9, 12);
+    let entries = [
+        ("C:/adv-escape-drive.txt", hostile.clone()),
+        ("plain.bin", plain.clone()),
+    ];
+    let outcome = run(&Scenario::new(vec![Post::plain(post, wrap(&entries))])).await;
+    assert!(outcome.completed(), "{post}: {:?}", outcome.failure);
+    assert_eq!(
+        outcome.files.get(&delivered("C:/adv-escape-drive.txt")),
+        Some(&hostile),
+        "{post}: the drive-named member"
+    );
+    assert_eq!(
+        outcome.files.get(&delivered("plain.bin")),
+        Some(&plain),
+        "{post}: the plain member"
+    );
+}
+
+#[cfg(not(windows))]
+type ContainerOf = fn(&[(&str, Vec<u8>)]) -> Vec<u8>;
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_zip_with_a_drive_letter_member_delivers_every_member() {
+    a_drive_letter_member_beside_a_plain_one_delivers_both("lantern.zip", zip).await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_tar_with_a_drive_letter_member_delivers_every_member() {
+    a_drive_letter_member_beside_a_plain_one_delivers_both("lantern.tar", tar).await;
+}

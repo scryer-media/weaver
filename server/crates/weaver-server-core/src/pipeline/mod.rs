@@ -1681,8 +1681,6 @@ pub struct Pipeline {
     pub(super) inflight_moves: HashSet<JobId>,
     // Final moves admitted after the post-processing hold is lifted.
     pub(super) deferred_moves: HashSet<JobId>,
-    // Jobs whose post-processing admission was refused by the global hold.
-    pub(super) deferred_post_processing: HashSet<JobId>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.
     pub(super) reserved_complete_destinations: HashMap<JobId, PathBuf>,
     // Shared state for control plane reads (API handlers read without channel round-trip).

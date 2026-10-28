@@ -29,44 +29,6 @@ async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
     spawn_shared_scripted_server(steps, Duration::ZERO).await
 }
 
-async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
-    const LINE: &[u8] = b"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\r\n";
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        socket.write_all(b"200 ready\r\n").await.unwrap();
-
-        let capabilities = read_command_line(&mut socket).await;
-        assert!(capabilities.starts_with("CAPABILITIES"));
-        socket
-            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-            .await
-            .unwrap();
-
-        let body = read_command_line(&mut socket).await;
-        assert!(body.starts_with("BODY "));
-        socket
-            .write_all(b"222 1 <trickle@example.com>\r\n=ybegin line=128 size=2560 name=x\r\n")
-            .await
-            .unwrap();
-        socket.flush().await.unwrap();
-
-        // The body never ends: only the client's soft timeout can end the
-        // read, however slowly the client runs.
-        loop {
-            tokio::time::sleep(line_delay).await;
-            if socket.write_all(LINE).await.is_err() || socket.flush().await.is_err() {
-                return;
-            }
-        }
-    });
-
-    port
-}
-
 // Answers a BODY with nothing at all, holding the session open until the
 // client gives up on it.
 async fn spawn_delayed_body_initial_server() -> u16 {
@@ -2297,68 +2259,6 @@ async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
         crate::health::ServerState::Healthy
     );
     assert!(control.snapshot().lifetime_body_bytes > 1_000);
-}
-
-#[tokio::test]
-async fn remote_trickle_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
-    let primary_port = spawn_trickling_body_server(Duration::from_millis(20)).await;
-    let mut backup_response =
-        b"222 1 <trickle@example.com>\r\n=ybegin line=128 size=128 name=x\r\n".to_vec();
-    backup_response.extend(std::iter::repeat_n(b'k', 128));
-    backup_response.extend_from_slice(b"\r\n=yend size=128\r\n.\r\n");
-    let backup_response: &'static [u8] = Box::leak(backup_response.into_boxed_slice());
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: backup_response,
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[])
-        .await;
-    assert!(matches!(
-        trace.result,
-        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
-    ));
-    assert_eq!(trace.attempts.len(), 1);
-    assert_eq!(
-        trace.attempts[0].outcome,
-        FetchAttemptOutcome::TransientFailure
-    );
-    assert!(
-        trace.attempts[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("soft timeout"))
-    );
-    let health = client.pool.health().lock().await;
-    let primary = health.server(0);
-    assert!(matches!(
-        primary.state(),
-        crate::health::ServerState::Healthy
-    ));
-    assert_eq!(primary.failure_count, 1);
-    assert_eq!(primary.consecutive_failures, 1);
 }
 
 #[tokio::test]

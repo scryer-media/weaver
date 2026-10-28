@@ -281,7 +281,7 @@ impl NamespaceWriter {
         self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
             self.settle(tree, builder, segments, node, member, out)?;
-            Leaf::at(&self.working_dir, &output_name)?.create_directory()?;
+            Leaf::at(&self.working_dir, &output_name).create_directory()?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
         }
@@ -1413,7 +1413,7 @@ impl NamespaceWriter {
         let leaves = &mut self.files_mut(node).leaves;
         match leaves.entry(member) {
             Entry::Occupied(leaf) => Ok(leaf.into_mut()),
-            Entry::Vacant(free) => Ok(free.insert(Leaf::at(&dir, output_name)?)),
+            Entry::Vacant(free) => Ok(free.insert(Leaf::at(&dir, output_name))),
         }
     }
 
@@ -1432,7 +1432,7 @@ impl NamespaceWriter {
         let dir = self.working_dir.clone();
         let files = self.files_mut(node);
         if files.scratch.is_none() {
-            let mut scratch = Leaf::at(&dir, &scratch_name(node))?;
+            let mut scratch = Leaf::at(&dir, &scratch_name(node));
             scratch.truncate()?;
             files.scratch = Some(scratch);
         }

@@ -229,6 +229,9 @@ pub struct BlockingNntpConnection {
     // offered, because the server has never been shown to need one. See
     // [`crate::server_caps`].
     group_probe_armed: bool,
+    // The recovery ticket of the lane this connection serves, told when a
+    // BODY is answered. See [`crate::recovery::ConnectionHealth::answered`].
+    health: Option<Arc<crate::recovery::ConnectionHealth>>,
 }
 
 impl BlockingBodyLane {
@@ -260,6 +263,7 @@ impl BlockingBodyLane {
         let mut conn =
             BlockingNntpConnection::connect_for_group(config, groups.first().map(String::as_str))?;
         conn.set_transfer_control(transfer_control);
+        conn.health = Some(Arc::clone(&permit.health_lease.0));
         permit.socket_slot.set_path(conn.route_path.as_ref());
         permit
             .socket_slot
@@ -1238,6 +1242,7 @@ impl BlockingNntpConnection {
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
             group_probe_armed: false,
+            health: None,
         };
 
         // The route's setup evidence is whether the server answered over this
@@ -1643,33 +1648,6 @@ impl BlockingNntpConnection {
             permit.add_throttle_wait(server_wait);
         }
         egress_wait.saturating_add(server_wait)
-    }
-
-    fn charge_active_body_without_wait(&mut self, bytes: usize) {
-        if let Some(outcome) = &self.route_outcome {
-            outcome.read(bytes);
-        }
-        match (self.egress_accounting.front_mut(), &self.egress_control) {
-            (Some(BodyTransferAccounting::Tracked(permit)), _) => {
-                permit.record_without_wait(bytes);
-            }
-            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
-                control.record_unlimited_body_bytes(bytes);
-            }
-            (None, Some(control)) => control.pace_read_without_wait(bytes),
-            (_, None) => {}
-        }
-        match self.body_accounting.front_mut() {
-            Some(BodyTransferAccounting::Unlimited) => {
-                if let Some(control) = &self.transfer_control {
-                    control.record_unlimited_body_bytes(bytes);
-                }
-            }
-            Some(BodyTransferAccounting::Tracked(permit)) => {
-                permit.record_without_wait(bytes);
-            }
-            None => {}
-        }
     }
 
     fn finish_active_body(&mut self) {
@@ -2213,6 +2191,9 @@ impl BlockingNntpConnection {
                 return Err(error);
             }
         };
+        if let Some(health) = &self.health {
+            health.answered();
+        }
         let profile_cpu = profile_cpu_timings_enabled();
         decoder.set_profile_cpu(profile_cpu);
         decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
@@ -2229,25 +2210,13 @@ impl BlockingNntpConnection {
             let payload_delta = decoder
                 .body_payload_bytes_consumed()
                 .saturating_sub(payload_before);
-            if let Some(budget) = budget.as_deref()
-                && budget.remaining().is_zero()
-            {
-                self.charge_active_body_without_wait(payload_delta as usize);
-                let error = active_transfer_timeout(budget);
-                self.fail_body_pipeline();
-                return Err(error.into());
-            }
+            // Every turn follows bytes arriving (the status line or a read),
+            // and a deliberate local rate-limit wait is not the server's
+            // silence, so the inactivity budget restarts after both.
             let waited = self.charge_active_body(payload_delta as usize);
             throttle_wait = throttle_wait.saturating_add(waited);
             if let Some(budget) = budget.as_deref_mut() {
-                budget.exclude_wait(waited);
-            }
-            if let Some(budget) = budget.as_deref()
-                && budget.remaining().is_zero()
-            {
-                let error = active_transfer_timeout(budget);
-                self.fail_body_pipeline();
-                return Err(error.into());
+                budget.progress_at(Instant::now());
             }
             match decoded {
                 Err(error) => {

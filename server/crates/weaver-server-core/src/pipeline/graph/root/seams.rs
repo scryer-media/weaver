@@ -299,12 +299,22 @@ impl Pipeline {
     }
 
     // How many runs a graph job may hold now: the extraction concurrency the
-    // tuner allows at this moment, the limit the repair slots follow too.
+    // tuner allows at this moment, the limit the repair slots follow too, and
+    // none while post-processing is paused. The pause is read as applied to
+    // the executor, the state whose release walks every graph job again, so
+    // a hold always has its release.
     pub(in crate::pipeline) fn graph_slot_limit(&self) -> usize {
-        limits::slots(&self.tuner)
+        if self.terminal_post_processing_executor.is_paused() {
+            0
+        } else {
+            limits::slots(&self.tuner)
+        }
     }
 
-    fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
+    // How many runs and repairs the job may hold now: the pipeline's limit,
+    // and none while the job is not admitted or is paused, so each of those
+    // holds its extraction and repair and nothing else.
+    pub(in crate::pipeline) fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
         if self.nzb_admitted.contains(&job_id)
             && self
                 .jobs
@@ -360,15 +370,10 @@ impl Pipeline {
     // Lend the job's due repairs under the repair slots every graph job
     // shares.
     pub(in crate::pipeline::graph) fn lend_graph_repairs(&mut self, job_id: JobId) {
-        if !self.nzb_admitted.contains(&job_id)
-            || self
-                .jobs
-                .get(&job_id)
-                .is_none_or(|state| state.run_state == crate::jobs::model::RunState::Paused)
-        {
+        let limit = self.graph_job_slot_limit(job_id);
+        if limit == 0 {
             return;
         }
-        let limit = self.graph_slot_limit();
         if let Some(graph) = self.graph_jobs.get_mut(&job_id)
             && let Err(error) = graph.lend(&mut self.graph_status.repairs, limit)
         {
