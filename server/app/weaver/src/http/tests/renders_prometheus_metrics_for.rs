@@ -600,6 +600,7 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
             "provider_priority",
             "uu_cursor",
             "checkpoint",
+            "activation",
         ],
     );
     assert_label_set(

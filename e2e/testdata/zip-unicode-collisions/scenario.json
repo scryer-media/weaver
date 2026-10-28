@@ -1,0 +1,11 @@
+{
+  "slug": "zip-unicode-collisions",
+  "title": "E2E Unicode namespace collisions",
+  "description": "Composed, decomposed, and case-equivalent ZIP member names retain all three distinct payloads under the existing namespace suffix policy.",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "CAFÉ (2).TXT": "a1b75792a304e719b8d9d1c6f96f2f61942093a341d99a6b48b1388979219c4f",
+    "Café (1).txt": "f810f91998bb1f0ca5d03c773f92838e6ef56912dea8cca523d9e10504b2aa0b",
+    "Café.txt": "a338d525bdda8a018f4b7c347ca0471ab614097c0fb7733660063c9e44584be2"
+  }
+}

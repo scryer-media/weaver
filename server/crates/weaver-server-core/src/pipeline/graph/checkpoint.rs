@@ -43,6 +43,7 @@ use crate::jobs::graph_checkpoint::{
     MemberRow, NodeRow, PartRow, Row,
 };
 use crate::jobs::ids::JobId;
+use crate::persistence::checkpoint_write::{CheckpointControl, CheckpointWrite};
 use crate::pipeline::Pipeline;
 
 // The root row's kind: the root is the article object, not one the builder
@@ -108,6 +109,7 @@ pub(crate) struct Pending(Arc<Mutex<Slot>>);
 
 #[derive(Default)]
 struct Slot {
+    control: CheckpointControl,
     root: facts::Encoded,
     // The root's facts parts as `root` last encoded them, by part: what the
     // database holds of them once what is queued is written, when it holds
@@ -117,6 +119,7 @@ struct Slot {
     // `None` until a checkpoint is written or read: what the database holds
     // of the job is not known, so the next change is the whole job.
     held: Option<Held>,
+    feed_verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
     // The change a queued write takes: `Some` exactly while one is queued.
     queued: Option<Delta>,
     tally: Tally,
@@ -136,6 +139,7 @@ struct Slot {
 
 // The word a move waits on, and where to send it.
 struct Owed {
+    control: CheckpointControl,
     stamp: u64,
     scope: u64,
     mail: UnboundedSender<Said>,
@@ -147,8 +151,11 @@ impl Owed {
         let _ = self.mail.send(Said {
             scope: self.scope,
             node: NodeId::ROOT,
-            generation: 0,
-            heard: Heard::Written(stamp),
+            generation: self.stamp,
+            heard: Heard::Written {
+                stamp,
+                control: self.control,
+            },
         });
     }
 }
@@ -184,6 +191,10 @@ pub(crate) struct Tally {
 }
 
 impl Pending {
+    pub(crate) fn control(&self) -> CheckpointControl {
+        self.slot().control.clone()
+    }
+
     fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -191,13 +202,29 @@ impl Pending {
     // Queue what this checkpoint changes, the job's spooled held parts
     // `held_parts` with it, in key order; true when a write must be queued
     // to take it.
+    #[cfg(test)]
     pub(super) fn put(&self, job: &GraphJob, held_parts: Vec<HeldPartRow>) -> bool {
+        self.put_with_feed(job, held_parts, None)
+    }
+
+    fn put_with_feed(
+        &self,
+        job: &GraphJob,
+        held_parts: Vec<HeldPartRow>,
+        feed_verdict: Option<&crate::jobs::feed_verdict::FeedVerdict>,
+    ) -> bool {
         let mut slot = self.slot();
         let slot = &mut *slot;
         let mut delta = Delta {
             whole: slot.held.is_none(),
             ..Delta::default()
         };
+        if let Some(verdict) = feed_verdict
+            && (delta.whole || slot.feed_verdict.as_ref() != Some(verdict))
+        {
+            delta.feed_verdict = Some(verdict.clone());
+            slot.feed_verdict = Some(verdict.clone());
+        }
         let held = slot.held.get_or_insert_with(Held::default);
         let encoding = job.encode_root(&mut slot.root, job.next_node());
         held.settled_bytes = job.settled_bytes();
@@ -287,7 +314,7 @@ impl Pending {
     // A move waits on the checkpoint `stamp`: the last stamp committed when
     // it already has, and otherwise the mail says so once it does, or once
     // a write fails.
-    pub(super) fn await_commit(
+    pub(in crate::pipeline) fn await_commit(
         &self,
         stamp: u64,
         scope: u64,
@@ -298,6 +325,7 @@ impl Pending {
             return Some(slot.committed);
         }
         slot.owed = Some(Owed {
+            control: slot.control.clone(),
             stamp,
             scope,
             mail: mail.clone(),
@@ -332,6 +360,7 @@ impl Pending {
     // waiting on a commit hears so, and waits on the next one.
     fn forget(&self) {
         let mut slot = self.slot();
+        slot.control.cancel();
         slot.held = None;
         slot.queued = None;
         slot.lost = true;
@@ -346,6 +375,7 @@ impl Pending {
     // and is compared with them.
     pub(crate) fn written(&self, rows: GraphCheckpoint) {
         let mut slot = self.slot();
+        slot.feed_verdict = rows.feed_verdict;
         let root = i64::from(NodeId::ROOT.0);
         let mut held = Held::default();
         for row in rows.nodes {
@@ -399,6 +429,88 @@ impl Pending {
 }
 
 impl Pipeline {
+    pub(in crate::pipeline) fn cancel_graph_checkpoint_retries(&self, job_id: JobId) {
+        if let Some(graph) = self
+            .graph_jobs
+            .get(&job_id)
+            .or_else(|| self.retiring_graph_jobs.get(&job_id))
+        {
+            graph.pending().control().cancel();
+        }
+    }
+
+    // Called only after the ordered archive command answered: every old
+    // checkpoint and its completion callback has relinquished this job.
+    pub(in crate::pipeline) fn recover_cancelled_graph_checkpoint(&mut self, job_id: JobId) {
+        let held = self.held_part_rows(job_id);
+        let Some(graph) = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .or_else(|| self.retiring_graph_jobs.get_mut(&job_id))
+        else {
+            return;
+        };
+        let pending = graph.pending().clone();
+        // Cancellation deliberately did not acknowledge the old delta. Take
+        // a new full snapshot rather than revive that obsolete replay payload.
+        pending.forget();
+        pending.control().resume();
+        let queue = pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
+        let stamp = pending.stamp();
+        graph.recorded(stamp);
+        if pending
+            .await_commit(stamp, job_id.0, &self.graph_runs.written())
+            .is_none()
+        {
+            graph.owe_mail(stamp);
+        }
+        if queue {
+            self.queue_graph_checkpoint(job_id, pending);
+        }
+    }
+
+    pub(in crate::pipeline) fn pause_graph_checkpoint(
+        &mut self,
+        job_id: JobId,
+        control: &CheckpointControl,
+        revision: u64,
+        error: &str,
+    ) {
+        // A reply belongs to this checkpoint owner, never to a later graph
+        // rebuilt under the same job id after a pause or retry.
+        if self.job_failure_started(job_id)
+            || control.cancelled()
+            || control.revision() != revision
+            || !self
+                .graph_jobs
+                .get(&job_id)
+                .or_else(|| self.retiring_graph_jobs.get(&job_id))
+                .is_some_and(|graph| graph.pending().control().same(control))
+        {
+            return;
+        }
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if state.run_state != crate::jobs::model::RunState::Paused {
+            state.paused_resume_status = Some(state.status.clone());
+            state.paused_resume_download_state = Some(state.download_state);
+            state.paused_resume_post_state = Some(state.post_state);
+            self.remove_pending_completion_check(job_id);
+            self.transition_postprocessing_status(
+                job_id,
+                crate::jobs::model::JobStatus::Paused,
+                Some("paused"),
+            );
+        }
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.failure_error = Some(format!(
+                "Checkpoint could not be persisted: {error}. Resolve the storage error and resume to retry; files are retained."
+            ));
+        }
+        self.report_job(job_id);
+    }
+
     // A graph job's durable download floor: the bytes its last checkpoint
     // spares a restore. `None` once the job has gone.
     pub(in crate::pipeline) fn graph_checkpointed_bytes(&self, job_id: JobId) -> Option<u64> {
@@ -421,7 +533,11 @@ impl Pipeline {
                 return;
             };
             let pending = graph.pending().clone();
-            let mut queue = pending.put(graph, held);
+            if pending.control().cancelled() {
+                return;
+            }
+            let mut queue =
+                pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
             graph.recorded(pending.stamp());
             let mut moved = false;
             if graph.moves_waiting() {
@@ -432,7 +548,7 @@ impl Pipeline {
                         // does when the run mail says the commit.
                         Err(error) => return self.after_graph_result(job_id, Err(error.into())),
                     },
-                    None => queue |= graph.owe_mail(),
+                    None => queue |= graph.owe_mail(graph.awaited()),
                 }
             }
             if queue {
@@ -448,42 +564,80 @@ impl Pipeline {
     // what it committed. A write dropped before it runs has failed.
     fn queue_graph_checkpoint(&self, job_id: JobId, pending: Pending) {
         let unwritten = Unwritten(Some(pending.clone()));
-        let queued = self
-            .db
-            .try_queue_job_write(job_id, "save_graph_checkpoint", move |db| {
-                let mut unwritten = unwritten;
-                let Some(writer) = unwritten.0.take() else {
-                    return Ok(());
-                };
-                let (delta, stamp) = writer.take();
-                // Nothing queued: a write queued earlier took the change
-                // through `stamp`. The database runs a job's writes one at
-                // a time in the order they were queued, on SQLite's single
-                // writer and on the job's own Postgres lane alike, so that
-                // write has already committed it, or failed and said so,
-                // and this one only passes its word on.
-                let Some(delta) = delta else {
-                    writer.committed(stamp, false);
-                    return Ok(());
-                };
-                let (rows, facts, whole) = (delta.rows(), delta.facts(), delta.whole);
-                let started = Instant::now();
-                let written = db.save_graph_checkpoint(job_id, Arc::new(delta));
-                debug!(
-                    job_id = job_id.0,
-                    rows,
-                    facts,
-                    elapsed_us = started.elapsed().as_micros() as u64,
-                    "graph checkpoint written"
-                );
-                match &written {
-                    Ok(()) => writer.committed(stamp, whole),
-                    Err(_) => writer.forget(),
-                }
-                written
+        let mail = self.graph_runs.written();
+        let blocked_mail = mail.clone();
+        let queued = self.db.try_queue_graph_checkpoint(job_id, move || {
+            let mut unwritten = unwritten;
+            let writer = unwritten
+                .0
+                .as_ref()
+                .expect("checkpoint owns its pending state")
+                .clone();
+            let (delta, stamp) = writer.take();
+            let feed_verdict = delta.as_ref().and_then(|delta| delta.feed_verdict.clone());
+            let (rows, facts, whole) = delta.as_ref().map_or((0, 0, false), |delta| {
+                (delta.rows(), delta.facts(), delta.whole)
             });
+            let control = writer.control();
+            let failed_control = control.clone();
+            let started = Instant::now();
+            CheckpointWrite {
+                delta: delta.map(Arc::new),
+                control,
+                blocked: Box::new(move |revision, error| {
+                    let _ = blocked_mail.send(Said {
+                        scope: job_id.0,
+                        node: NodeId::ROOT,
+                        generation: stamp,
+                        heard: Heard::CheckpointBlocked {
+                            control: failed_control.clone(),
+                            revision,
+                            error: error.to_owned(),
+                        },
+                    });
+                }),
+                finished: Box::new(move |written| {
+                    unwritten.0.take();
+                    match written {
+                        Ok(()) => {
+                            writer.committed(stamp, whole);
+                            if let Some(verdict) = feed_verdict {
+                                tracing::info!(
+                                    job_id = job_id.0,
+                                    stamp,
+                                    abandoned_files = verdict.abandoned_files.len(),
+                                    "server feed verdict committed with checkpoint refusals"
+                                );
+                            }
+                            debug!(
+                                job_id = job_id.0,
+                                stamp,
+                                rows,
+                                facts,
+                                elapsed_us = started.elapsed().as_micros() as u64,
+                                "graph checkpoint written"
+                            );
+                        }
+                        Err(_) => writer.forget(),
+                    }
+                }),
+            }
+        });
         if let Err(error) = queued {
             pending.forget();
+            // No writer owns this command. Forget its delta, but keep the
+            // failure actionable rather than masking it as cancellation.
+            pending.control().resume();
+            let _ = mail.send(Said {
+                scope: job_id.0,
+                node: NodeId::ROOT,
+                generation: pending.stamp(),
+                heard: Heard::CheckpointBlocked {
+                    control: pending.control(),
+                    revision: pending.control().revision(),
+                    error: error.to_string(),
+                },
+            });
             warn!(job_id = job_id.0, error = %error, "could not queue the graph checkpoint");
         }
     }

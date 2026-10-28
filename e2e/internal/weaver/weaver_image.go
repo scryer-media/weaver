@@ -37,7 +37,7 @@ const weaverImageBootstrapBase = "rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc
 
 // The Go toolchain copied into the runtime image, for the Go post-processing
 // scripts weaver builds with `go`.
-const weaverImageGoToolchain = "golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61"
+const weaverImageGoToolchain = "golang:1.27.3-bookworm@sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9"
 
 // Used when weaver has no readable rust-toolchain.toml. rustup would still pick
 // up a toolchain file copied into the image, so this only covers the case where
@@ -301,7 +301,7 @@ func rejectOutOfTreePatches(weaverRoot string, manifest string) error {
 }
 
 func (plan weaverImagePlan) dockerfile() string {
-	return fmt.Sprintf(`# syntax=docker/dockerfile:1.7
+	return fmt.Sprintf(`# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 FROM %s AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     make pkg-config libssl-dev curl ca-certificates gnupg && \
@@ -330,7 +330,7 @@ RUN --mount=type=cache,id=weaver-e2e-cargo-registry,target=/usr/local/cargo/regi
     cargo build --locked -p weaver && \
     cp target/debug/weaver /tmp/weaver-debug
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 # python3 and a Go toolchain are here for the post-processing script flows:
 # weaver runs .py scripts through python3 and builds .go scripts with go, and
 # those contracts are proven from inside real runs.

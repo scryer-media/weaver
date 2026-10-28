@@ -1,0 +1,10 @@
+{
+  "slug": "par2-exact-name-content-match",
+  "title": "E2E PAR2 exact name content match",
+  "description": "Valid recovery metadata for a.bin and b.bin, with a.bin posted as b.bin. Verified bytes must outrank the misleading exact name and both original files must be delivered.",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "a.bin": "b321ea74f3bf6de2920ed1b2743edab6139d88f7ef76f08a2cae6976a06c6211",
+    "b.bin": "d827c9a16ba6348ba6bb9aaed4c25fbd6764e57936800f64a3e4b996be0b31cb"
+  }
+}

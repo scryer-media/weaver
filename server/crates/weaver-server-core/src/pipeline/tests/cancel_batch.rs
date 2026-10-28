@@ -199,10 +199,35 @@ async fn cancel_batch_archive_failure_leaves_that_job_live_and_recoverable() {
     let ids = [JobId(31_401), JobId(31_402), JobId(31_403)];
     insert_queued_jobs(&mut pipeline, &ids).await;
     let failing = JobId(31_402);
+    pipeline.db.flush_write_queue().await.unwrap();
+    let pending = pipeline.graph_jobs[&failing].pending().clone();
+    let control = pending.control();
+    let revision = control.revision();
+    let stamp = pending.stamp();
     fail_history_insert_for(&pipeline, failing).await;
     let mut events = pipeline.event_tx.subscribe();
 
     let outcome = cancel_batch(&mut pipeline, &ids).await;
+
+    assert!(
+        !control.cancelled(),
+        "a failed archive restores checkpoint writes"
+    );
+    assert_ne!(control.revision(), revision, "old error mail becomes stale");
+    assert!(
+        pending.stamp() > stamp,
+        "recovery records a fresh full checkpoint"
+    );
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(
+        !pipeline
+            .db
+            .load_graph_checkpoint(failing)
+            .unwrap()
+            .unwrap()
+            .nodes
+            .is_empty()
+    );
 
     // Every intent was recorded. The failed id stays the live job: in
     // memory, visible in the Queue with no cancel pending, with its active

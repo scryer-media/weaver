@@ -51,6 +51,7 @@ type Scenario struct {
 	// terminal error and the run has to fail for that reason. Matched
 	// case-insensitively against the job's terminal error message.
 	ExpectedErrorContains              string            `json:"expectedErrorContains,omitempty"`
+	ExpectedFailureKind                string            `json:"expectedFailureKind,omitempty"`
 	Password                           string            `json:"password,omitempty"`
 	SegmentSize                        int               `json:"segment_size,omitempty"`
 	NZBSegmentNumbers                  []int             `json:"nzb_segment_numbers,omitempty"`
@@ -75,13 +76,17 @@ type Scenario struct {
 	// the whole job, so a fixture whose outcome depends on the primary copy
 	// alone cannot be satisfied by the backup taking the first fetch when the
 	// primary is out of seats. The gate lifts once the job is terminal.
-	BackupUnavailableUntilJobTerminal bool                       `json:"backupUnavailableUntilJobTerminal,omitempty"`
-	RequiredJobEvents                 []string                   `json:"requiredJobEvents,omitempty"`
-	ForbiddenJobEvents                []string                   `json:"forbiddenJobEvents,omitempty"`
-	MaxJobEventCounts                 map[string]int             `json:"maxJobEventCounts,omitempty"`
-	ExpectedOutputBLAKE3              map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
-	ForbiddenOutputPaths              []string                   `json:"forbiddenOutputPaths,omitempty"`
-	RuntimeAssertions                 *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
+	BackupUnavailableUntilJobTerminal bool              `json:"backupUnavailableUntilJobTerminal,omitempty"`
+	RequiredJobEvents                 []string          `json:"requiredJobEvents,omitempty"`
+	ForbiddenJobEvents                []string          `json:"forbiddenJobEvents,omitempty"`
+	MaxJobEventCounts                 map[string]int    `json:"maxJobEventCounts,omitempty"`
+	ExpectedOutputBLAKE3              map[string]string `json:"expectedOutputBLAKE3,omitempty"`
+	ExactOutputFiles                  bool              `json:"exactOutputFiles,omitempty"`
+	// Failed jobs may retain damaged inputs without delivering usable files.
+	// When present, this is the exact retained file set apart from the ownership marker.
+	ExpectedRetainedOutputBLAKE3 map[string]string          `json:"expectedRetainedOutputBLAKE3,omitempty"`
+	ForbiddenOutputPaths         []string                   `json:"forbiddenOutputPaths,omitempty"`
+	RuntimeAssertions            *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
 	// Disabled keeps a fixture in the corpus, seeded and verified, while the
 	// canonical runs leave it out. The value says why: the behavior it pins is
 	// one weaver does not deliver yet.
@@ -1251,6 +1256,33 @@ func testdataDir() string {
 }
 
 var canonicalFixtureSlugs = []string{
+	"sniff-trailing-names",
+	"split-gzip",
+	"split-bzip2",
+	"split-zstd",
+	"split-xz-damaged",
+	"split-gzip-damaged",
+	"split-xz-missing",
+	"split-xz-missing-article",
+	"split-xz-missing-par2",
+	"split-xz-damaged-par2",
+	"xz-corrupted",
+	"bzip2-corrupted",
+	"zstd-corrupted",
+	"tarxz-corrupted-empty",
+	"tarxz-corrupted-partial",
+	"rar4-record-repair",
+	"rar5-record-repair",
+	"rar4-record-and-volume-repair",
+	"rar5-record-and-volume-repair",
+	"par2-unicode-names",
+	"par3-unicode-names",
+	"par2-unrelated-set",
+	"par2-describes-unposted",
+	"rar-par2-case-collision",
+	"held-plain-uu",
+	"held-rar-uu",
+	"held-stream-uu",
 	// The 7z direct-unpack codec matrix: every coder chain the pinned 7-Zip
 	// writes and weaver decodes, in both shapes. The split variants are the
 	// ones a chase can overlap; the single .7z ones have no topology until
@@ -1358,6 +1390,7 @@ var canonicalFixtureSlugs = []string{
 	"par2-multi-set-archives-clean",
 	"par2-multi-set-archives-insufficient",
 	"par2-direct-repair",
+	"par2-exact-name-content-match",
 	"par2-ignorable-deficit",
 	"par2-partial-volume",
 	"par2-two-sets",
@@ -1475,6 +1508,7 @@ var canonicalFixtureSlugs = []string{
 	"zip-unencrypted",
 	"zip-deflate-lost-article",
 	"zip-cp437-empty-dirs",
+	"zip-unicode-collisions",
 	"xz-text",
 	"xz-video",
 	"zstd-single",

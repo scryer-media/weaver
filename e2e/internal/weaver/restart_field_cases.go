@@ -6,6 +6,7 @@ package weaver
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -305,9 +306,10 @@ func completedFilesBySize(size int64) []string {
 
 // R1. One article early in a single plain file is missing while the rest of
 // the file downloads, so the file's coverage has a hole near its start and
-// most of its bytes past it. A restart must keep every covered ordinal and
-// fetch only what the checkpoint did not cover, the hole among them.
-func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCaseResult, error) {
+// most of its bytes past it. A restart must keep the healthy durable bytes
+// and the definitive missing-article refusal. Restoring the provider's article
+// does not turn a process restart into a new download attempt.
+func runEarlyGapRestartPreservesBytesAndRefusal(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "single-mkv"
 	const checkpointBytes = 4 * 1024 * 1024
 	checkpointEnv := fmt.Sprintf("WEAVER_E2E_DOWNLOAD_RESTART_CHECKPOINT_BYTES=%d", checkpointBytes)
@@ -374,7 +376,8 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		if err == nil {
 			lastCoverage = rows
 			for _, row := range rows {
-				if row.FileIndex == gap.FileIndex && !row.Coverage.Covers(gapRange.Start, gapRange.End) && row.Coverage.CoveredBytes() >= coveredFloor {
+				healthy := row.Coverage.Healthy()
+				if row.FileIndex == gap.FileIndex && !healthy.Covers(gapRange.Start, gapRange.End) && healthy.CoveredBytes() >= coveredFloor {
 					reached = true
 				}
 			}
@@ -386,8 +389,9 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 	}
 	if !reached {
 		_, _, _, _ = ctx.captureEvidence("pre_timeout", "")
+		coverageJSON, _ := json.Marshal(lastCoverage)
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
-			fmt.Sprintf("the restart point was never reached: no checkpoint covered %d bytes past the missing ordinal %d (last coverage %+v)", coveredFloor, gap.Ordinal, lastCoverage)), nil
+			fmt.Sprintf("the restart point was never reached: no checkpoint covered %d healthy bytes past the missing ordinal %d (last coverage %s)", coveredFloor, gap.Ordinal, coverageJSON)), nil
 	}
 
 	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
@@ -406,10 +410,18 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
 			fmt.Sprintf("job was %q at shutdown, not an active download", status)), nil
 	}
-	covered := coveredArticles(segments, ranges, preCoverage)
+	proof, err := readCheckpointEvidence(dbPath, jobID)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_restart_checkpoint.json"), proof)
+	covered := directDurableArticles(segments, ranges, proof)
+	if len(covered) == 0 {
+		return restartCaseResult{}, fmt.Errorf("early-gap checkpoint contains no proven durable articles")
+	}
 	var coveredBytes uint64
 	for _, row := range preCoverage {
-		coveredBytes += row.Coverage.CoveredBytes()
+		coveredBytes += row.Coverage.Healthy().CoveredBytes()
 	}
 	if covered[gap.MessageID] {
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
@@ -456,15 +468,17 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 
 	detail := fmt.Sprintf("covered_at_shutdown=%d bytes (%d of %d ordinals) gap_ordinal=%d fetched_after_restart=%d refetched_covered=%d gap_refetched=%t final=%s output_ok=%t",
 		coveredBytes, len(covered), len(segments), gap.Ordinal, fetchedAfter, len(refetchedCovered), gapFetched, statuses[jobID], outputOK)
-	pass := statuses[jobID] == "COMPLETE" && len(refetchedCovered) == 0 && gapFetched && outputOK
+	// There is no recovery or other usable end file in this post. The persisted
+	// refusal must therefore end Failed, even though the provider now has it.
+	pass := statuses[jobID] == "FAILED" && len(refetchedCovered) == 0 && !gapFetched && !outputOK
 	failure := "early-gap restart: " + detail
 	if len(refetchedCovered) > 0 {
 		failure += fmt.Sprintf(" refetched covered ids: %v", refetchedCovered)
 	}
-	if !outputOK {
+	if outputOK {
 		failure += fmt.Sprintf(" output candidates=%v last_blake3=%s want=%s", outputs, got, want)
 	}
-	return classifyRestartResult(ctx.Profile, pass, "restart after an early gap fetched only what the checkpoint did not cover: "+detail, false, "", failure), nil
+	return classifyRestartResult(ctx.Profile, pass, "restart preserved healthy durable bytes and the missing-article refusal: "+detail, false, "", failure), nil
 }
 
 // R2. The operator stops Weaver while a job is verifying. Every article was
@@ -528,6 +542,7 @@ func runInterruptDuringVerifyingRefetchesNothing(ctx *restartCaseContext) (resta
 // The log lines a PAR2 pass writes while it scans or repairs. None may follow
 // the drain's last line.
 var par2PassLogNeedles = []string{
+	"graph repair worker",
 	"par2 damaged-path analysis",
 	"par2 repair",
 	"par2 scan",
@@ -614,7 +629,15 @@ func runInterruptDuringPar2PassStopsThePass(ctx *restartCaseContext) (restartCas
 		return restartCaseResult{}, err
 	}
 	secondRun := stripANSIEscapeSequences(string(full[len(firstRun):]))
-	rescanned := strings.Contains(secondRun, "par2 damaged-path analysis started")
+	startedAgain := len(graphLogEvents(secondRun, jobID, "graph repair worker started")) > 0
+	cancelled := false
+	for _, started := range graphLogEvents(string(firstRun), jobID, "graph repair worker started") {
+		for _, ended := range graphLogEvents(string(firstRun), jobID, "graph repair worker ended") {
+			if started["node"] == ended["node"] && started["generation"] == ended["generation"] && ended["cancelled"] == "true" {
+				cancelled = true
+			}
+		}
+	}
 	repaired := false
 	if kinds, err := jobEventKinds(caseDBPath(ctx), jobID); err == nil && len(kinds) >= len(preKinds) {
 		for _, kind := range kinds[len(preKinds):] {
@@ -624,9 +647,17 @@ func runInterruptDuringPar2PassStopsThePass(ctx *restartCaseContext) (restartCas
 		}
 	}
 
-	detail := fmt.Sprintf("status_at_shutdown=%s drain_finished=%t pass_lines_after_signal=%d pass_lines_after_drain=%d rescanned_after_restart=%t repaired_after_restart=%t final=%s",
-		preStatus, stoppedAt >= 0, len(afterSignal), len(afterDrain), rescanned, repaired, statuses[jobID])
-	pass := stoppedAt >= 0 && len(afterDrain) == 0 && rescanned && repaired && statuses[jobID] == "COMPLETE"
+	if err := waitForJobArchived(caseDBPath(ctx), jobID); err != nil {
+		return restartCaseResult{}, err
+	}
+	size, digest, err := singleMKVSource()
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	outputOK := deliveredCopy(completeDirOf(caseDBPath(ctx), jobID), size, digest)
+	detail := fmt.Sprintf("status_at_shutdown=%s drain_finished=%t pass_lines_after_signal=%d pass_lines_after_drain=%d generation_cancelled=%t repair_started_after_restart=%t repaired_after_restart=%t output_verified=%t final=%s",
+		preStatus, stoppedAt >= 0, len(afterSignal), len(afterDrain), cancelled, startedAgain, repaired, outputOK, statuses[jobID])
+	pass := stoppedAt >= 0 && len(afterDrain) == 0 && cancelled && startedAgain && repaired && outputOK && statuses[jobID] == "COMPLETE"
 	failure := "Ctrl-C during a PAR2 pass: " + detail
 	if len(afterSignal) > 0 {
 		failure += fmt.Sprintf(" first pass lines after the signal: %q", afterSignal[:min(len(afterSignal), 3)])

@@ -210,6 +210,34 @@ test("pool member routes answer forced CONNECT statuses and SOCKS replies, then 
   } finally { await fixture.close(); }
 });
 
+test("connection barriers retain admission until released and use the current route state", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts });
+  try {
+    for (const outcome of ["accept", "refuse", "cut"]) {
+      await control(fixture, "/", { route: "primary", up: true, holdConnect: true });
+      const watermark = (await control(fixture, "/events?after=0")).body.sequence;
+      const socket = net.connect(fixture.ports.primary, "127.0.0.1");
+      const chunks = [];
+      socket.on("data", chunk => chunks.push(chunk));
+      const closed = once(socket, "close");
+      socket.write(`CONNECT news.proxy.test:${fixture.ports.http} HTTP/1.1\r\nProxy-Authorization: Basic ${Buffer.from("fixture:fixture").toString("base64")}\r\n\r\nGET /feed.xml HTTP/1.1\r\nHost: news.proxy.test\r\nConnection: close\r\n\r\n`);
+      let events;
+      do {
+        events = (await control(fixture, `/events?after=${watermark}`)).body.events;
+      } while (!events.some(event => event.kind === "held-connect"));
+      assert.equal(chunks.length, 0);
+      assert.equal(events.filter(event => event.kind === "attempt").length, 1);
+      assert.equal(events.filter(event => event.kind === "connected").length, 0);
+      await control(fixture, "/", { route: "primary", up: outcome !== "refuse", cut: outcome === "cut", holdConnect: false });
+      await closed;
+      const response = Buffer.concat(chunks).toString();
+      if (outcome === "accept") assert.match(response, /<rss/);
+      else if (outcome === "refuse") assert.match(response, /502 Bad Gateway/);
+      else assert.equal(response, "");
+    }
+  } finally { await fixture.close(); }
+});
+
 test("event reads after a watermark return only newer events", async () => {
   const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts });
   try {
@@ -285,7 +313,7 @@ test("download paths ignore the query string and the non-NZB body is served", as
 test("the state reports each route's service as the control last set it", async () => {
   const fixture = await startProxyFixture({ ip: "127.0.0.1", routes: ["connect1"], ports: { ...zeroPorts, connect1: 0 } });
   try {
-    const normal = { up: true, hold: false, connectStatus: null, socksReply: null };
+    const normal = { up: true, hold: false, holdConnect: false, connectStatus: null, socksReply: null };
     assert.deepEqual((await control(fixture, "/")).body.routes.connect1, normal);
     await control(fixture, "/", { route: "connect1", up: false, cut: true, connectStatus: 503 });
     assert.deepEqual((await control(fixture, "/")).body.routes.connect1, { ...normal, up: false, connectStatus: 503 });

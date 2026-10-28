@@ -9,6 +9,6 @@
     "outcome": "either"
   },
   "expectedOutputBLAKE3": {
-    "lie-payload.bin": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c"
+    "mie-payload.bin": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c"
   }
 }

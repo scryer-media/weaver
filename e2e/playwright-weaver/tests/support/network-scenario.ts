@@ -187,17 +187,18 @@ export class NetworkWorld {
   }
 
   /**
-   * Post a file whose parts e2e-nntp serves `slowMs` late, so a download
-   * stays in flight while the test acts on it; `release` lifts the pacing and
-   * waits for the job to finish. Pacing is a floor on the job's duration, not
-   * a clock the test reads: every wait is still on an observable.
+   * Pace each BODY line while the test acts on the download. The fixture
+   * snapshots pacing when a BODY starts: release affects later requests,
+   * so individual articles must still finish promptly. More parts keep work
+   * available through recovery without making one BODY take many minutes.
+   * Every assertion waits on an observable, never on the pacing interval.
    */
   async pacedDownload(name: string, options: { parts?: number; partBytes?: number; slowMs?: number; chaos?: string } = {}) {
-    const parts = options.parts ?? 160;
+    const parts = options.parts ?? 480;
     const partBytes = options.partBytes ?? 64 * 1024;
     const articles = await postProbeFile(name, { count: parts, partBytes });
     await this.holdChaosSession();
-    await this.setChaos([`slow_body=${options.slowMs ?? 1500}`, options.chaos].filter(Boolean).join(","));
+    await this.setChaos([`slow_body=${options.slowMs ?? 10}`, options.chaos].filter(Boolean).join(","));
     const jobId = await submit(this.request, name, articles);
     this.jobs.push(jobId);
     return {

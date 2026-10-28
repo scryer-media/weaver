@@ -1715,6 +1715,7 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
         pipeline.download_lane_owners.insert(
             Pipeline::next_download_lane_id(),
             DownloadLaneOwner {
+                body_activity: Vec::new(),
                 job_id: hot_job_id,
                 mode: DownloadLaneMode::Sequential,
                 completion_critical: false,

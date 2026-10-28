@@ -193,7 +193,7 @@ impl Pipeline {
 
 // What a cancelled job's directory cleanup waits for and removes, carried
 // from the turn that takes the cancel to the turn that handles its archive.
-struct CancelledJobCleanup {
+pub(in crate::pipeline) struct CancelledJobCleanup {
     job_id: JobId,
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
     working_dir: PathBuf,
@@ -224,6 +224,7 @@ impl Pipeline {
         for job_id in job_ids {
             match self.begin_cancel_job(job_id, origin) {
                 Ok((row, cleanup)) => {
+                    self.cancel_graph_checkpoint_retries(job_id);
                     archives.push((job_id, row));
                     cleanups.push(cleanup);
                 }
@@ -244,7 +245,7 @@ impl Pipeline {
                 // Nothing was archived: every job stays live and recoverable,
                 // and a further cancel needs a new intent.
                 tracing::error!(error = %error, "failed to queue cancelled job archives");
-                self.release_cancel_intents(&ids);
+                self.release_cancel_intents(&ids, false);
                 return;
             }
         };
@@ -286,7 +287,7 @@ impl Pipeline {
         } = done;
         let mut failed = Vec::new();
         let mut cancelled = Vec::new();
-        for mut cleanup in cleanups {
+        for cleanup in cleanups {
             let job_id = cleanup.job_id;
             let failure = match &archived {
                 Ok(errors) => errors.get(&job_id).cloned(),
@@ -297,61 +298,78 @@ impl Pipeline {
                 failed.push(job_id);
                 continue;
             }
-            if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
-                cleanup.working_dir = state.working_dir;
-                cleanup.staging_dir = state.staging_dir;
+            self.retire_graph_job(job_id);
+            if self.retiring_graph_jobs.contains_key(&job_id) {
+                // Archival commits the cancellation, but workers still own
+                // their files. Keep the queue row retiring until their ACKs.
+                self.pending_graph_terminals.insert(
+                    job_id,
+                    super::super::health::PendingGraphTerminal::Cancelled {
+                        cleanup,
+                        keep_files,
+                    },
+                );
+            } else {
+                self.pending_graph_terminals.remove(&job_id);
+                cancelled.push(cleanup);
             }
-            cancelled.push(cleanup);
         }
-        self.release_cancel_intents(&failed);
-        if cancelled.is_empty() {
-            return;
+        self.release_cancel_intents(&failed, archived.is_ok());
+        for cleanup in cancelled {
+            self.finish_cancelled_job(cleanup, keep_files);
+        }
+    }
+
+    pub(in crate::pipeline) fn finish_cancelled_job(
+        &mut self,
+        mut cleanup: CancelledJobCleanup,
+        keep_files: bool,
+    ) {
+        let job_id = cleanup.job_id;
+        if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
+            cleanup.working_dir = state.working_dir;
+            cleanup.staging_dir = state.staging_dir;
         }
         // Same boundary as a job that completed or failed: the cancelled
         // jobs' article pages are free and unwanted, so hand them back rather
         // than holding a job-sized working set until the purge clock runs out.
         crate::runtime::thread_release::release_job_completion_memory();
         let queue = self.shared_state.queue.clone();
-        for cleanup in cancelled {
-            let job_id = cleanup.job_id;
-            let delete_history = queue.write(|inner| {
-                let delete_history = inner
-                    .jobs
-                    .iter()
-                    .any(|row| row.id == job_id && row.intents.delete_history_after_cancel);
-                if !keep_files {
-                    inner.pending_cleanup.insert(job_id);
-                }
-                inner.retain_jobs(|row| row.id != job_id);
-                let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
-                crate::pipeline::queue::Change::changed(delete_history)
-            });
-            if delete_history {
-                let history = queue.clone();
-                tokio::spawn(async move {
-                    let result = history
-                        .delete_history(BTreeSet::from([job_id]), false)
-                        .await
-                        .and_then(|mut outcome| {
-                            outcome.refused.remove(&job_id).map_or(Ok(()), Err)
-                        });
-                    if let Err(error) = result {
-                        tracing::error!(job_id = job_id.0, %error, "failed to finish requested history deletion after cancellation");
-                    }
-                });
-            }
-            // A cancel that keeps the files schedules nothing.
+        let delete_history = queue.write(|inner| {
+            let delete_history = inner
+                .jobs
+                .iter()
+                .any(|row| row.id == job_id && row.intents.delete_history_after_cancel);
             if !keep_files {
-                let cleanup_db = self.db.clone();
-                let queue = queue.clone();
-                tokio::spawn(async move {
-                    Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
-                    queue.write(|inner| {
-                        inner.pending_cleanup.remove(&job_id);
-                        crate::pipeline::queue::Change::changed(())
-                    });
-                });
+                inner.pending_cleanup.insert(job_id);
             }
+            inner.retain_jobs(|row| row.id != job_id);
+            let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
+            crate::pipeline::queue::Change::changed(delete_history)
+        });
+        if delete_history {
+            let history = queue.clone();
+            tokio::spawn(async move {
+                let result = history
+                    .delete_history(BTreeSet::from([job_id]), false)
+                    .await
+                    .and_then(|mut outcome| outcome.refused.remove(&job_id).map_or(Ok(()), Err));
+                if let Err(error) = result {
+                    tracing::error!(job_id = job_id.0, %error, "failed to finish requested history deletion after cancellation");
+                }
+            });
+        }
+        // A cancel that keeps the files schedules nothing.
+        if !keep_files {
+            let cleanup_db = self.db.clone();
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
+                queue.write(|inner| {
+                    inner.pending_cleanup.remove(&job_id);
+                    crate::pipeline::queue::Change::changed(())
+                });
+            });
         }
     }
 
@@ -359,7 +377,7 @@ impl Pipeline {
     // visible again in the same write that withdraws the cancel, and a
     // further cancel needs a new intent. Whatever the job finished while it
     // waited is judged now.
-    fn release_cancel_intents(&mut self, ids: &[JobId]) {
+    fn release_cancel_intents(&mut self, ids: &[JobId], checkpoint_order_drained: bool) {
         if ids.is_empty() {
             return;
         }
@@ -372,15 +390,25 @@ impl Pipeline {
             crate::pipeline::queue::Change::changed(())
         });
         for &job_id in ids {
-            self.restore_after_failed_cancellation(job_id);
+            self.restore_after_failed_cancellation(job_id, checkpoint_order_drained);
             self.report_job(job_id);
         }
     }
 
     // The archive did not commit, so future work belongs to a live job again.
     // Tokens already handed to workers stay cancelled.
-    fn restore_after_failed_cancellation(&mut self, job_id: JobId) {
+    fn restore_after_failed_cancellation(&mut self, job_id: JobId, checkpoint_order_drained: bool) {
         self.shared_state.clear_job_cancellations(job_id);
+        if !self.retiring_graph_jobs.contains_key(&job_id)
+            && let Some(super::super::health::PendingGraphTerminal::Failed(failure)) =
+                self.pending_graph_terminals.remove(&job_id)
+        {
+            self.continue_job_failure(job_id, failure);
+            return;
+        }
+        if checkpoint_order_drained {
+            self.recover_cancelled_graph_checkpoint(job_id);
+        }
         self.schedule_job_completion_check(job_id);
     }
 
@@ -500,6 +528,8 @@ impl Pipeline {
     fn purge_cancelled_job_runtime(&mut self, job_id: JobId) -> Option<JobState> {
         self.release_job_articles(job_id);
         let state = self.jobs.remove(&job_id)?;
+        self.post_probes.forget(job_id);
+        self.pipeline_failure_stages.remove(&job_id);
         self.metrics.post_state_left(state.post_state);
         self.retire_stalled_download_lanes(job_id);
         self.job_order.retain(|id| *id != job_id);

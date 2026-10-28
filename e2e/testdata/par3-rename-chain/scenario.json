@@ -1,0 +1,16 @@
+{
+  "slug": "par3-rename-chain",
+  "title": "E2E.Test.PAR3.Rename.Chain.2026-TESTGRP",
+  "description": "An obfuscated beacon.bin is posted beside BEACON.BIN whose content belongs to lantern.bin. The namespace must move the occupant before installing beacon.bin. The restart harness commits independent 00-keep.bin before allowing this chain.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "00-keep.bin": "5f4c8b6c3f705367c42ceb3627b8685639b79019f9ce938eebb4094a0d9290bf",
+    "beacon.bin": "a5ff5c388e63367d61522fbfe45fc4d20f1fa2c61579c234727486adc212360d",
+    "lantern.bin": "ed870755b06e5a635173b51d4f15e392c90dd0dce24a954ab0067d5625106198"
+  },
+  "exactOutputFiles": true,
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ]
+}

@@ -382,6 +382,7 @@ impl Pipeline {
             .filter(|idx| *idx != server_idx)
             .collect();
         Some(DownloadBatchLease {
+            body_activity: Arc::default(),
             lane_id,
             job_id,
             runtime_generation: self.pool_generation,

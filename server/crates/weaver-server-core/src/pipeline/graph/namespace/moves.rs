@@ -77,10 +77,12 @@ impl NamespaceWriter {
             .collect()
     }
 
-    // A new file for the member, at its name when nothing sits there, and
-    // otherwise under the internal directory, wanting its name.
+    // A new file for the member, at its name when nothing sits there and
+    // no pending move can change the allocation. Otherwise it waits under
+    // the internal directory until a checkpoint records its ownership and
+    // intended name: a crash must not expose an unrecorded temporary name.
     pub(super) fn new_leaf(&mut self, node: NodeId, member: MemberId, name: &str) -> Leaf {
-        if self.free_at(name, (node, member)) {
+        if !self.moves_waiting() && self.free_at(name, (node, member)) {
             return Leaf::at(&self.working_dir, name);
         }
         let mut leaf = Leaf::at(&self.working_dir, &waiting_name(node, member, name));

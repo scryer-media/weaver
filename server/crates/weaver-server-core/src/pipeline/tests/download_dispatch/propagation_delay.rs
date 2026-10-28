@@ -29,6 +29,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
     let segment_id = work.segment_id;
     pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
@@ -115,6 +116,7 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
     let segment_id = work.segment_id;
     pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
@@ -1852,6 +1854,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     pipeline.download_lane_owners.insert(
         lane_id,
         DownloadLaneOwner {
+            body_activity: Vec::new(),
             job_id,
             mode: DownloadLaneMode::Sequential,
             completion_critical: false,
@@ -1922,6 +1925,76 @@ async fn auto_pause_ignores_stale_jobs_without_inflight_downloads() {
         Some(JobStatus::Downloading)
     );
     assert!(pipeline.active_download_passes.contains(&job_id));
+}
+
+#[tokio::test]
+async fn body_activity_keeps_only_its_current_job_alive_without_article_results() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let live = JobId(31234);
+    let silent = JobId(31235);
+    let stale = JobId(31236);
+    let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let old_bytes = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    for job in [live, silent, stale] {
+        pipeline.jobs.insert(
+            job,
+            minimal_job_state(job, "paced", temp_dir.path().join(job.0.to_string())),
+        );
+        pipeline.active_downloads_by_job.insert(job, 1);
+    }
+    pipeline.download_lane_owners.insert(
+        Pipeline::next_download_lane_id(),
+        DownloadLaneOwner {
+            body_activity: vec![
+                (live, pipeline.pool_generation, Arc::downgrade(&bytes)),
+                (
+                    stale,
+                    pipeline.pool_generation.wrapping_add(1),
+                    Arc::downgrade(&old_bytes),
+                ),
+            ],
+            job_id: live,
+            mode: DownloadLaneMode::Sequential,
+            completion_critical: false,
+            server_idx: Some(0),
+            connection: false,
+            outstanding: HashMap::new(),
+        },
+    );
+    for _ in 0..4 {
+        for job in [live, silent, stale] {
+            pipeline.job_last_download_activity.insert(
+                job,
+                std::time::Instant::now()
+                    - STALLED_DOWNLOAD_IDLE_THRESHOLD
+                    - Duration::from_secs(1),
+            );
+        }
+        bytes.fetch_add(128, std::sync::atomic::Ordering::Relaxed);
+        pipeline.auto_pause_stalled_downloads();
+        assert_eq!(pipeline.jobs[&live].status, JobStatus::Downloading);
+        assert_eq!(pipeline.jobs[&silent].status, JobStatus::Paused);
+        assert_eq!(pipeline.jobs[&stale].status, JobStatus::Paused);
+    }
+    pipeline.job_last_download_activity.insert(
+        live,
+        std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
+    );
+    pipeline.auto_pause_stalled_downloads();
+    assert_eq!(pipeline.jobs[&live].status, JobStatus::Paused);
+
+    // Resuming the same ID need not replace the pool. A retired lease can
+    // still return bytes, but only leases admitted after retirement count.
+    pipeline.resume_job_runtime(live).unwrap();
+    pipeline.active_downloads_by_job.insert(live, 1);
+    pipeline.job_last_download_activity.insert(
+        live,
+        std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
+    );
+    bytes.fetch_add(128, std::sync::atomic::Ordering::Relaxed);
+    pipeline.auto_pause_stalled_downloads();
+    assert_eq!(pipeline.jobs[&live].status, JobStatus::Paused);
 }
 
 #[tokio::test]

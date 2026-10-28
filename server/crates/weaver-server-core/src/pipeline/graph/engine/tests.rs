@@ -524,6 +524,7 @@ fn echoing_within(count: u32, window: u64, accountant: Arc<HoldsAccountant>) -> 
         volumes: count,
         bids: Arc::default(),
         window,
+        gate: None,
     };
     let bids = Arc::clone(&echoes.bids);
     let dir = tempfile::tempdir().unwrap();

@@ -284,6 +284,13 @@ async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
         "one engine over both"
     );
     refusing.until_ended().await;
+    // Publication waits for the checkpoints that record the final names.
+    let mut stamp = 1;
+    while refusing.job.moves_waiting() {
+        refusing.job.recorded(stamp);
+        refusing.job.committed(stamp).unwrap();
+        stamp += 1;
+    }
     // The engine read the volumes back from what the store had placed, its
     // header envelopes and its members' files, and wrote what it found.
     for member in 0..2 {

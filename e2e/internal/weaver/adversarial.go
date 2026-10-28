@@ -63,9 +63,11 @@ type adversarialSpec struct {
 	// RejectionMetric is the reason label of
 	// weaver_extraction_rejections_total that must move by one.
 	RejectionMetric string `json:"rejectionMetric,omitempty"`
-	// ExtractsNothing demands an empty output directory and scratch holding
-	// no more than what was posted.
+	// ExtractsNothing permits only unchanged posted files and the ownership
+	// marker retained by a failed job; no extracted payload or graph scratch.
 	ExtractsNothing bool `json:"extractsNothing,omitempty"`
+	// RequiredObjectKinds names the formats that must be recognized by content.
+	RequiredObjectKinds []string `json:"requiredObjectKinds,omitempty"`
 	// EscapeNames are member names as the archive spells them. Wherever one
 	// would land outside a directory Weaver writes into, nothing may exist,
 	// and no file of its base name may appear outside the output directory.

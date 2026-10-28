@@ -71,7 +71,15 @@ pub(crate) enum Heard {
     // The job's checkpoints committed through this stamp, or a write of
     // them failed (`None`), while a member's file waited on them to move.
     // Addressed to the root, under no run's generation.
-    Written(Option<u64>),
+    Written {
+        stamp: Option<u64>,
+        control: crate::persistence::checkpoint_write::CheckpointControl,
+    },
+    CheckpointBlocked {
+        control: crate::persistence::checkpoint_write::CheckpointControl,
+        revision: u64,
+        error: String,
+    },
 }
 
 // Where every graph job's runs speak, and where the database says a

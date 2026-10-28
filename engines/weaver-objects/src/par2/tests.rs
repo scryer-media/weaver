@@ -106,6 +106,95 @@ fn binds_by_prefix_and_renames_through_the_namespace() {
     assert!(bind(&mut job).is_empty());
 }
 
+#[test]
+fn unique_content_outranks_another_files_exact_name() {
+    let a = payload(31, 5000);
+    let b = payload(32, 5000);
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &a), ("b.bin", &b)],
+        BLOCK,
+        2,
+        1,
+    ));
+    let member = job.member("b.bin", &a);
+    assert_eq!(bind(&mut job), vec![member]);
+    assert!(job.object.covers(member));
+    assert_eq!(job.namespace.get(member).unwrap().name, "a.bin");
+}
+
+#[test]
+fn identical_files_bind_to_their_exact_described_names_without_repair() {
+    let data = payload(33, 5000);
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &data), ("b.bin", &data)],
+        BLOCK,
+        2,
+        1,
+    ));
+    let a = job.member("a.bin", &data);
+    let b = job.member("b.bin", &data);
+    assert!(bind(&mut job).is_empty());
+    for member in [a, b] {
+        assert!(job.object.covers(member));
+        feed(&mut job, member, &data, None);
+        assert!(
+            verdicts(&job, member)
+                .iter()
+                .all(|v| *v == SliceVerdict::Intact)
+        );
+    }
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert_eq!(job.store.writes, 0);
+}
+
+#[test]
+fn a_content_tie_requires_an_exact_name_among_the_matching_descriptions() {
+    let data = payload(33, 5000);
+    let other = payload(34, 5000);
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &data), ("b.bin", &data), ("c.bin", &other)],
+        BLOCK,
+        2,
+        1,
+    ));
+    for name in ["obfuscated", "A.BIN", "c.bin"] {
+        let member = job.member(name, &data);
+        assert!(bind(&mut job).is_empty());
+        assert!(
+            !job.object.covers(member),
+            "{name} must not resolve the tie"
+        );
+    }
+}
+
+#[test]
+fn an_exact_name_resolves_a_prefix_tie_without_hiding_later_damage() {
+    let a = payload(35, 40_000);
+    let mut b = a.clone();
+    b[20_000] ^= 0x5A;
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &a), ("b.bin", &b)],
+        BLOCK,
+        2,
+        1,
+    ));
+    let member = job.member("b.bin", &a);
+    assert!(bind(&mut job).is_empty());
+    assert!(job.object.covers(member));
+    feed(&mut job, member, &a, None);
+    let seen = verdicts(&job, member);
+    assert!(seen.contains(&SliceVerdict::Damaged));
+    assert!(!seen.contains(&SliceVerdict::Intact));
+}
+
 // A member its producer started over and announced again under the name it
 // was posted with has lost the front it was known by, so nothing binds it by
 // that name; once its front arrives again it is known by its content and

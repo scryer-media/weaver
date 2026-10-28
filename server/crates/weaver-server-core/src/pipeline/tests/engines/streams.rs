@@ -76,7 +76,10 @@ pub(super) fn tar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn delivered(name: &str) -> String {
-    format!("lantern beacon/{name}")
+    std::path::Path::new("lantern beacon")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // The job completed and delivered exactly `expected`.
@@ -122,17 +125,155 @@ async fn an_xz_stream_split_into_numbered_pieces_delivers_the_file_it_holds() {
     assert_delivered(&graph, &[("ember.bin", ember())]);
 }
 
-// A damaged xz posted in numbered pieces: the stream is refused for its own
-// reason and gives its pieces back, each listed damaged as it was posted,
-// and with nothing usable the job fails.
+fn unicode_numbered_stream(recovery: bool) -> Scenario {
+    let compressed = xz(&ember());
+    let chunk = compressed.len().div_ceil(3);
+    let mut posts: Vec<_> = compressed
+        .chunks(chunk)
+        .zip(1..)
+        .map(|(bytes, number)| Post::plain(&format!("灯火.bin.xz.{number:03}"), bytes.to_vec()))
+        .collect();
+    if recovery {
+        let files: Vec<_> = posts
+            .iter()
+            .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+            .collect();
+        let parity = par2_set("回復", &files, 8);
+        posts.extend(parity);
+    }
+    Scenario::new(posts)
+}
+
+#[tokio::test]
+async fn a_numbered_stream_with_non_ascii_names_is_repaired_from_a_missing_piece() {
+    let mut scenario = unicode_numbered_stream(true);
+    let articles = scenario.posts[1].articles(ARTICLE).count();
+    for article in 0..articles {
+        scenario = scenario.lost(1, u32::try_from(article).unwrap());
+    }
+    let graph = run(&scenario).await;
+    assert_delivered(&graph, &[("灯火.bin", ember())]);
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        [
+            format!("RepairComplete {articles}"),
+            "JobCompleted".to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_numbered_stream_with_non_ascii_names_is_repaired_from_damaged_bytes() {
+    let graph = run(&unicode_numbered_stream(true).damaged(1, 1)).await;
+    assert_delivered(&graph, &[("灯火.bin", ember())]);
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        ["RepairComplete 1", "JobCompleted"]
+    );
+}
+
+#[tokio::test]
+async fn a_numbered_stream_missing_a_piece_without_recovery_fails() {
+    let mut scenario = unicode_numbered_stream(false);
+    let articles = scenario.posts[1].articles(ARTICLE).count();
+    for article in 0..articles {
+        scenario = scenario.lost(1, u32::try_from(article).unwrap());
+    }
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(graph.files.is_empty());
+    assert!(graph.graph().delivery.files.iter().all(|file| !file.whole));
+}
+
+#[tokio::test]
+async fn a_numbered_stream_with_an_unposted_middle_piece_retains_the_original_pieces() {
+    let mut scenario = unicode_numbered_stream(false);
+    scenario.posts.remove(1);
+    assert_unposted_middle_preserves_pieces(scenario).await;
+}
+
+#[tokio::test]
+async fn an_unposted_middle_piece_cannot_publish_an_accidentally_valid_decoded_join() {
+    let compressed = xz(&ember());
+    let (first, last) = compressed.split_at(compressed.len() / 2);
+    // Concatenating these inputs happens to make a valid complete XZ. The
+    // ordinal gap still has no known length and cannot be silently erased.
+    let scenario = Scenario::new(vec![
+        Post::plain("灯火.bin.xz.001", first.to_vec()),
+        Post::plain("灯火.bin.xz.003", last.to_vec()),
+    ]);
+    assert_unposted_middle_preserves_pieces(scenario).await;
+}
+
+#[tokio::test]
+async fn a_numbered_stream_with_an_unposted_middle_piece_recovers_with_par2() {
+    let mut scenario = unicode_numbered_stream(true);
+    scenario.posts.remove(1);
+    let graph = run(&scenario).await;
+    assert_delivered(&graph, &[("灯火.bin", ember())]);
+}
+
+async fn assert_unposted_middle_preserves_pieces(scenario: Scenario) {
+    let originals: std::collections::BTreeMap<_, _> = scenario
+        .posts
+        .iter()
+        .map(|post| (post.name.clone(), post.bytes.clone()))
+        .collect();
+    let graph = run(&scenario).await;
+    assert!(matches!(graph.status, Some(JobStatus::Failed { .. })));
+    let listed: Vec<_> = graph
+        .graph()
+        .delivery
+        .files
+        .iter()
+        .map(|file| (file.name.as_str(), file.depth, file.whole))
+        .collect();
+    assert_eq!(
+        listed,
+        [("灯火.bin.xz.001", 0, false), ("灯火.bin.xz.003", 0, false)]
+    );
+    for (name, bytes) in originals {
+        let retained = graph
+            .retained_files
+            .iter()
+            .find(|(path, _)| std::path::Path::new(path).file_name().unwrap() == name.as_str())
+            .map(|(_, bytes)| bytes);
+        assert_eq!(retained, Some(&bytes), "original piece {name} was changed");
+    }
+    assert_eq!(
+        graph
+            .retained_files
+            .keys()
+            .filter(|path| { std::path::Path::new(path).file_name().unwrap() != ".weaver-job-dir" })
+            .count(),
+        2
+    );
+    assert!(graph.files.is_empty(), "a decoded descendant was published");
+}
+
+// A damaged stream gives back the join's one member, preserving the posted
+// compressed bytes. Nothing usable came out, so the job fails.
 #[tokio::test]
 async fn a_damaged_xz_split_into_numbered_pieces_fails() {
-    let compressed = damaged_in_the_middle(xz(&prose()));
+    damaged_numbered_stream("xz", damaged_in_the_middle(xz(&prose()))).await;
+}
+
+#[tokio::test]
+async fn a_damaged_gzip_split_into_numbered_pieces_fails() {
+    damaged_numbered_stream("gz", damaged_in_the_middle(gzip(&prose()))).await;
+}
+
+async fn damaged_numbered_stream(extension: &str, compressed: Vec<u8>) {
+    let joined = format!("ember.bin.{extension}");
     let chunk = compressed.len().div_ceil(3);
     let pieces = compressed
         .chunks(chunk)
         .zip(1..)
-        .map(|(bytes, number)| Post::plain(&format!("ember.bin.xz.{number:03}"), bytes.to_vec()))
+        .map(|(bytes, number)| Post::plain(&format!("{joined}.{number:03}"), bytes.to_vec()))
         .collect();
     let graph = run(&Scenario::new(pieces)).await;
     assert!(
@@ -147,14 +288,12 @@ async fn a_damaged_xz_split_into_numbered_pieces_fails() {
         .iter()
         .map(|file| (file.name.as_str(), file.depth, file.whole))
         .collect();
-    assert_eq!(
-        listed,
-        [
-            ("ember.bin.xz.001", 0, false),
-            ("ember.bin.xz.002", 0, false),
-            ("ember.bin.xz.003", 0, false),
-        ],
-        "{files:?}"
+    assert_eq!(listed, [(joined.as_str(), 1, false)], "{files:?}");
+    assert!(
+        graph
+            .retained_files
+            .values()
+            .any(|bytes| *bytes == compressed)
     );
 }
 

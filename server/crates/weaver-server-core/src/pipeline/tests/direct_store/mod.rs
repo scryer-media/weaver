@@ -523,12 +523,16 @@ fn rar4_store_set_with_records(
                 },
             ));
             bytes.extend_from_slice(part);
+            // Recovery volumes validate header CRCs. Seal the protected
+            // headers before computing the recovery record over those bytes.
+            bytes = super::with_rar4_header_crcs(bytes);
             let record = record(&bytes);
             bytes.extend(record);
             bytes.extend_from_slice(&build_test_rar4_end_header_numbered(
                 !is_last,
                 volume as u16,
             ));
+            bytes = super::with_rar4_header_crcs(bytes);
             (format!("silver.horizon.part{:02}.rar", volume + 1), bytes)
         })
         .collect()

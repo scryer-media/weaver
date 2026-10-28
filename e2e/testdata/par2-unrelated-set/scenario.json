@@ -1,0 +1,15 @@
+{
+  "slug": "par2-unrelated-set",
+  "title": "E2E.Test.par2.unrelated.set.2026-TESTGRP",
+  "description": "An unrelated PAR2 set beside an RAR with damaged bytes must not interfere with embedded record repair.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "record.bin": "3a6157ad43a2bab09622e4785e1af8f81877c3e9f19ead61ad502e6092310e57",
+    "unrelated.bin": "a96a54844a6ac70ad6a2441eb39cb61edb33c96923f402157eb26ee5dca17c82"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}

@@ -170,6 +170,9 @@ impl Pipeline {
     // step, so nothing more is fetched or decoded for it. True when it
     // failed.
     pub(in crate::pipeline::graph) fn fail_graph_job_on_breach(&mut self, job_id: JobId) -> bool {
+        if self.job_failure_started(job_id) {
+            return true;
+        }
         let breached = self
             .graph_jobs
             .get(&job_id)
@@ -199,6 +202,9 @@ impl Pipeline {
     // in the words of the sets that could not rebuild what they cover, at
     // the repair stage. True when it failed.
     pub(in crate::pipeline) fn fail_graph_job_ruled_short(&mut self, job_id: JobId) -> bool {
+        if self.job_failure_started(job_id) {
+            return true;
+        }
         let Some(failure) = self.graph_jobs.get(&job_id).and_then(super::ruled_short) else {
             return false;
         };
@@ -263,8 +269,8 @@ impl Pipeline {
         self.graph_jobs.get(&job_id).is_some_and(RootJob::unpacked)
     }
 
-    // A job going away gives back the repair slot it holds, a repair still
-    // out among them, and its place in the queue for one.
+    // A job going away gives back an idle repair slot and its place in the
+    // queue. A repair still out keeps its ticket until retirement hears it.
     pub(in crate::pipeline) fn forget_graph_repair(&mut self, job_id: JobId) {
         if let Some(ticket) = self
             .graph_jobs

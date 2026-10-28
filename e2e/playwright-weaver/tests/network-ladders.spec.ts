@@ -135,7 +135,10 @@ test("F05 a leg whose rungs are all down goes Down and the other leg takes its s
   const mark = await flowMark(request);
   await controlRoute(request, { route: "connect1", up: false, cut: true });
   await controlRoute(request, { route: "connect2", up: false, cut: true });
-  const flow = await flowAfter(request, mark, sample => legOn(sample, serverKey(server), b.id)?.state === "DOWN", "leg B Down");
+  const flow = await flowAfter(request, mark, sample => {
+    const down = legOn(sample, serverKey(server), b.id);
+    return down?.state === "DOWN" && down.target === 0 && legOn(sample, serverKey(server), a.id)?.target === 4;
+  }, "leg B's allocation parked and leg A holding the full cap");
   expect(legOn(flow, serverKey(server), a.id)?.target).toBe(4);
   expect(await download.release()).toBe("COMPLETED");
   await expectNoFailureEvents(request, download.jobId);

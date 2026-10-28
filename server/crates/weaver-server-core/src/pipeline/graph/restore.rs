@@ -44,6 +44,7 @@ pub(crate) enum GraphRestoreError {
 }
 
 pub(crate) struct GraphRestore {
+    pub(crate) feed_verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
     pub(crate) job: GraphJob,
     // The articles the queue does not fetch again.
     pub(crate) skip: HashSet<SegmentId>,
@@ -161,6 +162,7 @@ impl RestoreSeat {
             refetched,
         } = GraphJob::restore(&snapshot, &files, job_id.0, storage, limit)?;
         // The next checkpoint writes only what it changes of these.
+        let feed_verdict = rows.feed_verdict.clone();
         job.pending().written(rows);
         if !refetched.is_empty() {
             tracing::info!(
@@ -179,7 +181,12 @@ impl RestoreSeat {
                 segment_number: ordinal,
             })
             .collect();
-        Ok(GraphRestore { job, skip, held })
+        Ok(GraphRestore {
+            job,
+            skip,
+            held,
+            feed_verdict,
+        })
     }
 }
 

@@ -196,7 +196,41 @@ func checkAdversarialVerdict(tc adversarialCase, settled adversarialSettled) []e
 		}
 	}
 	if spec.ExtractsNothing && len(settled.Outputs) > 0 {
-		problems = append(problems, fmt.Errorf("delivered %d files, want none: %v", len(settled.Outputs), adversarialFirst(settled.Outputs, 5)))
+		posted, err := collectFixtureStagingFiles(filepath.Join(testdataDir(), tc.Scenario.Slug), true,
+			filepath.Join(testdataDir(), "shared"), tc.Scenario.SharedAssets, testdataDir(), tc.Scenario.FixtureAssets)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("identify posted files: %w", err))
+		} else {
+			problems = append(problems, checkUnextractedFiles(settled, posted)...)
+		}
+	}
+	return problems
+}
+
+func checkUnextractedFiles(settled adversarialSettled, posted []stagedSeedFile) []error {
+	var problems []error
+	sources := map[string]string{}
+	for _, file := range posted {
+		sources[filepath.ToSlash(file.name)] = file.source
+	}
+	for _, output := range settled.Outputs {
+		if settled.Status != "FAILED" {
+			problems = append(problems, fmt.Errorf("published %s despite extractsNothing", output))
+			continue
+		}
+		if output == ".weaver-job-dir" {
+			continue
+		}
+		source, posted := sources[output]
+		if !posted {
+			problems = append(problems, fmt.Errorf("retained unposted output %s", output))
+			continue
+		}
+		want, sourceErr := fileBLAKE3(source)
+		got, outputErr := fileBLAKE3(filepath.Join(settled.OutputDir, filepath.FromSlash(output)))
+		if sourceErr != nil || outputErr != nil || got != want {
+			problems = append(problems, fmt.Errorf("retained %s differs from posted bytes (source=%v output=%v)", output, sourceErr, outputErr))
+		}
 	}
 	return problems
 }
@@ -284,6 +318,15 @@ func checkAdversarialScratch(tc adversarialCase, jobID int, settled adversarialS
 // rejection counted on the metrics endpoint.
 func checkAdversarialSignals(tc adversarialCase, settled adversarialSettled, before adversarialBefore) []error {
 	var problems []error
+	for _, kind := range tc.Spec.RequiredObjectKinds {
+		seen := false
+		for _, bound := range graphLogEvents(settled.LogWindow, settled.JobID, graphObjectBoundMessage) {
+			seen = seen || bound["kind"] == kind
+		}
+		if !seen {
+			problems = append(problems, fmt.Errorf("job never recognized required object kind %s", kind))
+		}
+	}
 	if settled.TerminalEvents != 1 {
 		problems = append(problems, fmt.Errorf("%d terminal job events, want 1", settled.TerminalEvents))
 	}
@@ -335,6 +378,9 @@ func adversarialOutputTreeProblems(outputDir string) []error {
 				return fs.SkipAll
 			}
 			return err
+		}
+		if current == filepath.Join(outputDir, ".weaver-chunks") {
+			problems = append(problems, fmt.Errorf("retained graph scratch %s", current))
 		}
 		if entry.Type()&fs.ModeSymlink != 0 {
 			problems = append(problems, fmt.Errorf("delivered a symbolic link %s", current))

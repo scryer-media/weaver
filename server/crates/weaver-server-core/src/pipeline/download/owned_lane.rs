@@ -844,6 +844,7 @@ fn discard_closed_cached_lane(cached_lane: &mut Option<CachedOwnedLane>) -> bool
 // "what is the current lease" when it lands. The context rides with the work
 // instead.
 struct LaneLeaseContext {
+    body_activity: Arc<std::sync::atomic::AtomicU64>,
     lane_id: u64,
     job_id: JobId,
     runtime_generation: u64,
@@ -865,6 +866,7 @@ impl LaneLeaseContext {
     ) -> Self {
         Self {
             lane_id: lease.lane_id,
+            body_activity: lease.body_activity.clone(),
             job_id: lease.job_id,
             runtime_generation: lease.runtime_generation,
             completion_critical: lease.completion_critical,
@@ -1454,6 +1456,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         // decoded, so applying the head request's plan here is what keeps two
         // leases' geometries apart on one ring.
         if let Some((_, head_context)) = inflight.front() {
+            lane.set_body_activity(head_context.body_activity.clone());
             lane.set_checkpoint_plan(head_context.checkpoint_plan.clone());
         }
         let Some((trace, meta)) = lane.ring_read_next() else {
@@ -1935,6 +1938,7 @@ fn test_lease(
     works: Vec<DownloadWork>,
 ) -> DownloadBatchLease {
     DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id,
         runtime_generation,

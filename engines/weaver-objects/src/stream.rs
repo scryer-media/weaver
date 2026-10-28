@@ -32,7 +32,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     Budget, ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, Located,
-    MemberId, Object, Placement, Pull, Seek, Sniff, Standing, VolumeIndex, Why, signed,
+    MemberId, Object, Placement, Pull, Seek, Sniff, Standing, VolumeIndex, signed,
 };
 
 pub use self::brotli::Brotli;
@@ -96,8 +96,12 @@ pub trait Decoder: Send + Sync + 'static {
     // Why the stream gives its volumes back once nothing more will reach
     // its run: a member left damaged cannot be read whole from them, nor
     // one never closed.
-    fn quiet(standing: &dyn Standing) -> Option<Why> {
-        crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
+    fn quiet(standing: &dyn Standing, _pieces: &BTreeSet<u32>, out: &mut Vec<Emit>) {
+        out.extend(
+            crate::quiet::damaged(standing)
+                .or_else(|| crate::quiet::unplaced(standing))
+                .map(Emit::Refuse),
+        );
     }
 }
 
@@ -205,7 +209,7 @@ impl<D: Decoder> Object for Stream<D> {
     // Nothing more will reach the run; the decoder says whether its volumes
     // go back as they stand.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        out.extend(D::quiet(standing).map(Emit::Refuse));
+        D::quiet(standing, &self.pieces, out);
     }
 
     // One volume, read in order: there is nothing to bid for.

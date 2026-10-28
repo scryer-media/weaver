@@ -1590,6 +1590,7 @@ func Recipes() []Recipe {
 	recipes = append(recipes, SpeedTestRecipes()...)
 	recipes = append(recipes, AdversarialRecipes()...)
 	recipes = append(recipes, GraphGapRecipes()...)
+	recipes = append(recipes, GraphBoundaryRecipes()...)
 	return recipes
 }
 

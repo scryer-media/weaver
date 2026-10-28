@@ -82,12 +82,6 @@ impl Loans {
         self.ticket.take()
     }
 
-    // The slot, whatever holds it: the job is going away.
-    pub(crate) fn forget(&mut self) -> Option<Ticket> {
-        self.out = None;
-        self.ticket.take()
-    }
-
     // A lender over these loans that asks `slots` for a slot when it holds
     // none, or, without slots, lends only under the one it holds.
     pub(crate) fn lending<'a>(
@@ -109,6 +103,11 @@ impl Lender for Lending<'_> {
     fn admit(&mut self) -> bool {
         let loans = &mut *self.loans;
         if loans.out.is_some() || loans.hardware.shutdown().started() {
+            return false;
+        }
+        // A retained ticket still belongs to the retiring or paused job,
+        // but a zero-slot grant may not start another repair under it.
+        if self.slots.as_ref().is_some_and(|(_, limit)| *limit == 0) {
             return false;
         }
         if loans.ticket.is_some() {
@@ -136,9 +135,22 @@ impl Lender for Lending<'_> {
         let grant = loans.hardware.grant();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
+            tracing::info!(
+                job_id = scope,
+                node = set.0,
+                generation = serial,
+                "graph repair worker started"
+            );
             crate::e2e_failpoint::maybe_delay(crate::e2e_failpoint::REPAIR_TASK_START);
             crate::e2e_failpoint::maybe_trip(crate::e2e_failpoint::REPAIR_TASK_START);
             let returned = grant.install(|| loan.run(grant.repair.clone(), &shutdown));
+            tracing::info!(
+                job_id = scope,
+                node = set.0,
+                generation = serial,
+                cancelled = returned.stopped(),
+                "graph repair worker ended"
+            );
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(Said {

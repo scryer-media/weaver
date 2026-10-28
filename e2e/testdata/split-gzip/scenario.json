@@ -1,0 +1,14 @@
+{
+  "slug": "split-gzip",
+  "title": "E2E.Test.split.gzip.2026-TESTGRP",
+  "description": "A healthy numbered gzip stream must join and decode to exact original bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "lantern.bin": "953810107f892f110fa01643569e6361f39e737aee2aca22c522b4f6f0152f26"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}

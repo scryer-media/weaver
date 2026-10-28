@@ -7,6 +7,7 @@ pub mod diagnostic_names;
 pub mod duplicate;
 pub mod duplicate_persistence;
 pub mod error;
+pub(crate) mod feed_verdict;
 pub(crate) mod graph_checkpoint;
 pub mod handle;
 pub mod ids;

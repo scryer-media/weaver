@@ -43,6 +43,9 @@ pub enum Sniff {
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
     // A name never outvotes bytes that might still turn out to be a signature.
     match signed(first_bytes, length) {
+        Sniff::Object(
+            Kind::Xz | Kind::Gzip | Kind::Bzip2 | Kind::Zstd | Kind::Brotli | Kind::Deflate,
+        ) if numbered_piece(trimmed(name)) => Sniff::Object(Kind::Split),
         Sniff::Leaf => named(name)
             .or_else(|| sevenz_by_name(name, first_bytes))
             .map_or(Sniff::Leaf, Sniff::Object),

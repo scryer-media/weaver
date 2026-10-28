@@ -1037,6 +1037,8 @@ async fn flush_write_queue_succeeds_without_raw_sqlite_connection() {
     db.flush_write_queue().await.unwrap();
 }
 
+mod checkpoint;
+
 #[test]
 fn writer_task_does_not_retain_database_sender() {
     let db = Database::open_in_memory().unwrap();

@@ -75,6 +75,7 @@ fn book_connected_lane(pipeline: &mut Pipeline, job_id: JobId, completion_critic
     pipeline.download_lane_owners.insert(
         lane_id,
         DownloadLaneOwner {
+            body_activity: Vec::new(),
             job_id,
             mode: DownloadLaneMode::Sequential,
             completion_critical,

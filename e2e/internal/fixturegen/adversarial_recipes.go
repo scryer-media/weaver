@@ -208,7 +208,11 @@ func AdversarialRecipes() []Recipe {
 				tellPAR2LieInOutputs(lie),
 			),
 			ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
-				return map[string]string{"lie-payload.bin": env.OutputPath("lie-payload.bin")}, nil
+				name := "lie-payload.bin"
+				if lie == "name-other" {
+					name = "mie-payload.bin"
+				}
+				return map[string]string{name: env.OutputPath("lie-payload.bin")}, nil
 			},
 		})
 	}

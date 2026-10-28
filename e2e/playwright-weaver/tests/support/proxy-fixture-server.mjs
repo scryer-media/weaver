@@ -98,7 +98,7 @@ export async function startProxyFixture(options = {}) {
   const events = [];
   const sockets = new Set();
   const resolvers = new Set();
-  const routes = Object.fromEntries(["primary", "secondary", "tertiary", "direct", ...extraRoutes].map(name => [name, { up: true, hold: false, connectStatus: null, socksReply: null, sockets: new Set() }]));
+  const routes = Object.fromEntries(["primary", "secondary", "tertiary", "direct", ...extraRoutes].map(name => [name, { up: true, hold: false, holdConnect: false, pendingConnects: new Map(), connectStatus: null, socksReply: null, sockets: new Set() }]));
   const servers = [];
   const held = new Set();
   let sequence = 0;
@@ -163,6 +163,17 @@ export async function startProxyFixture(options = {}) {
   function forward(client, route, host, port, reply) {
     const peer = client.remoteAddress;
     record("attempt", { route, host, port, client: peer });
+    if (routes[route].holdConnect) {
+      routes[route].pendingConnects.set(client, () => finishForward(client, route, host, port, reply));
+      client.once("close", () => routes[route].pendingConnects.delete(client));
+      record("held-connect", { route, host, port, client: peer });
+      return;
+    }
+    finishForward(client, route, host, port, reply);
+  }
+  function finishForward(client, route, host, port, reply) {
+    if (client.destroyed) return;
+    const peer = client.remoteAddress;
     const publicTarget = publicTargets.find(target => target.port === port
       && (target.host === host.toLowerCase() || target.addresses.includes(host)));
     const allowedHost = host === ip || addresses.includes(host) || /^[a-z0-9-]+\.proxy\.test$/.test(host);
@@ -374,7 +385,7 @@ export async function startProxyFixture(options = {}) {
         active: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, route.sockets.size])),
         // Each route's service as the control last set it, so a caller can wait
         // on the fixture's own word that a route is back.
-        routes: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, { up: route.up, hold: route.hold, connectStatus: route.connectStatus, socksReply: route.socksReply }])),
+        routes: Object.fromEntries(Object.entries(routes).map(([name, route]) => [name, { up: route.up, hold: route.hold, holdConnect: route.holdConnect, connectStatus: route.connectStatus, socksReply: route.socksReply }])),
       })); return;
     }
     try {
@@ -394,7 +405,18 @@ export async function startProxyFixture(options = {}) {
           if (command.socksReply !== null && !(Number.isInteger(command.socksReply) && command.socksReply >= 1 && command.socksReply <= 255)) throw new Error("socksReply must be a non-zero byte or null");
           route.socksReply = command.socksReply;
         }
-        if (command.cut) for (const socket of route.sockets) socket.destroy();
+        if (command.cut) {
+          for (const socket of route.sockets) socket.destroy();
+          for (const socket of route.pendingConnects.keys()) socket.destroy();
+        }
+        if (typeof command.holdConnect === "boolean") {
+          route.holdConnect = command.holdConnect;
+          if (!route.holdConnect) {
+            const pending = [...route.pendingConnects.values()];
+            route.pendingConnects.clear();
+            for (const finish of pending) finish();
+          }
+        }
       }
       if ("dnsTtl" in command) {
         if (!(Number.isInteger(command.dnsTtl) && command.dnsTtl >= 0 && command.dnsTtl <= 86400)) throw new Error("dnsTtl must be whole seconds from 0 to 86400");

@@ -191,6 +191,7 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         panic!("a lane opened with no server that may serve the article");
     };
     let lease = DownloadBatchLease {
+        body_activity: std::sync::Arc::default(),
         lane_id: 0,
         job_id: job,
         runtime_generation: pipeline.pool_generation,

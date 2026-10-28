@@ -58,7 +58,7 @@ services:
   # bandwidth limits, timeouts at the TCP stack level.
   # API on port 8474 for runtime toxic management.
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:latest@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    image: ghcr.io/shopify/toxiproxy:latest@sha256:5d3dae09bc185dcc5ff6cf43abf6062a4a720aff0c4306a471e773acdcd107aa
     ports:
       - "${E2E_TOXIPROXY_API_PORT:-8474}:8474"   # toxiproxy API
       - "${E2E_TOXIPROXY_NNTP1_PORT:-3119}:3119" # proxied NNTP server 1
@@ -115,7 +115,7 @@ services:
 
   # Published Weaver image under test against fake NNTP.
   weaver:
-    image: ${E2E_WEAVER_IMAGE:-ghcr.io/scryer-media/weaver:latest}
+    image: ${E2E_WEAVER_IMAGE:-ghcr.io/scryer-media/weaver:latest@sha256:3ad2ebc2b0b3eab2ad7462e8a73eff083dd8b6a5aa2b746c295997bfa5677c00}
     depends_on:
       nntp:
         condition: service_healthy
@@ -174,7 +174,7 @@ services:
       retries: 20
 
   nzbget:
-    image: lscr.io/linuxserver/nzbget:latest@sha256:5f3d3fa71029004156eff2cbf4ef4455ce4ce59517cf13fa7d1d7c8a4cd2c8a4
+    image: lscr.io/linuxserver/nzbget:latest@sha256:631a76760263014e846a3f1ddeaba789a103dea27c9f131846bdd8b39c281efd
     depends_on:
       nntp:
         condition: service_healthy
@@ -229,7 +229,7 @@ services:
   # both SQLite and this service, so its environment and volume are named apart
   # from the rest of the stack and are torn down with the run.
   weaver-postgres:
-    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    image: public.ecr.aws/docker/library/postgres:18@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4
     environment:
       POSTGRES_DB: "${E2E_WEAVER_POSTGRES_DB:-weaver}"
       POSTGRES_USER: "${E2E_WEAVER_POSTGRES_USER:-weaver}"
