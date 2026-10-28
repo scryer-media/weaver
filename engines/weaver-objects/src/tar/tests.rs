@@ -11,7 +11,7 @@ use weaver_graph::{
 };
 
 use super::Tar;
-use crate::testing::payload;
+use crate::testing::{Quiet, payload};
 
 const BLOCK: usize = 512;
 
@@ -481,8 +481,11 @@ fn bytes_that_arrive_before_their_headers_are_held_until_the_walk_reaches_them()
     assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
 }
 
+// The header's own checksum speaks of the walk, not of the volume: the walk
+// holds there, marks nothing, and reads on when a repair delivers the
+// header again.
 #[test]
-fn a_header_whose_checksum_fails_is_damaged_until_it_is_repaired() {
+fn a_header_whose_checksum_fails_holds_the_walk_until_it_is_repaired() {
     let writer = mixed();
     let at = writer.headers[2];
     let mut bad = writer.bytes.clone();
@@ -494,15 +497,8 @@ fn a_header_whose_checksum_fails_is_damaged_until_it_is_repaired() {
         owner.deliver_as(piece, Provenance::Damaged, Some(&bytes));
     }
     owner.close();
-    assert_eq!(
-        owner.said,
-        [Emit::Damaged {
-            volume: VolumeIndex(0),
-            range: header
-        }]
-    );
+    assert!(owner.said.is_empty(), "{:?}", owner.said);
     assert_eq!(owner.members.len(), 2, "only the entries before it");
-    owner.said.clear();
     let repaired = writer.bytes[at..at + BLOCK].to_vec();
     owner.deliver_as(header, Provenance::Repaired, Some(&repaired));
     clean(&owner);
@@ -545,24 +541,24 @@ fn a_repair_of_a_header_already_read_retracts_from_that_entry_on() {
     assert_eq!(owner.files(), mixed_files());
 }
 
+// The missing tail of a volume that ends inside an entry speaks of the walk,
+// not of the volume: it marks nothing, and the archive is refused once
+// nothing more will arrive.
 #[test]
-fn a_volume_that_closes_inside_an_entry_is_damaged_for_the_missing_tail() {
+fn a_volume_that_closes_inside_an_entry_refuses_the_archive_once_quiet() {
     let writer = mixed();
     let data = writer.data[2];
     let cut = data + 1_234;
     let mut owner = Owner::new(writer.bytes[..cut].to_vec());
     owner.whole(4096);
-    assert_eq!(
-        owner.said,
-        [Emit::Damaged {
-            volume: VolumeIndex(0),
-            range: ByteRange::new(cut as u64, (data + 5_000) as u64)
-        }]
-    );
+    assert!(owner.said.is_empty(), "{:?}", owner.said);
     let beta = &owner.members[&2];
     assert_eq!(beta.name, "deep/beta.bin");
     assert!(!beta.closed);
     assert!(owner.members[&0].closed);
+    let mut out = Vec::new();
+    owner.tar.quiet(&Quiet(Vec::new()), &mut out);
+    assert_eq!(out, [Emit::Refuse(Why::Unrepairable)]);
 }
 
 #[test]

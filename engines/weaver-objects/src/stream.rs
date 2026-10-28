@@ -88,12 +88,6 @@ pub trait Decoder: Send + Sync + 'static {
         Self::open(input, window)
     }
 
-    // The range of the volume a failed decode proves bad, when the format
-    // can say: read through `input`, a fresh view of the volume.
-    fn damaged(_error: &io::Error, _input: &mut Front) -> Option<ByteRange> {
-        None
-    }
-
     // The name the one member is announced under, from the first volume's.
     fn member(volume: &str) -> String {
         member_name(volume)

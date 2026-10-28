@@ -16,7 +16,7 @@ use weaver_graph::Why;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, try_run};
 use super::restart::run_restarting;
-use super::streams::tar;
+use super::streams::{damaged_in_the_middle, gzip, prose, tar};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::lines::Lines;
 use crate::pipeline::tests::direct_store::scenarios::{
@@ -1036,6 +1036,61 @@ async fn a_tar_inside_a_stored_rar_whose_entry_size_is_not_a_number_is_delivered
                 "name=lantern.tar from=lantern.tar depth=1 whole=true",
                 QUILL,
             ],
+        },
+    )
+    .await;
+}
+
+// A file posted as a compressed stream whose contents came out damaged:
+// the stream is refused for its own reason, the file is listed damaged, and
+// with nothing usable the job fails.
+
+fn damaged_gzip() -> Vec<u8> {
+    damaged_in_the_middle(gzip(&prose()))
+}
+
+#[tokio::test]
+async fn a_gzip_whose_contents_come_out_damaged_fails_with_the_posted_file_damaged() {
+    let scenario = Scenario::new(vec![Post::plain("lantern.mkv.gz", damaged_gzip())]);
+    run_expecting(
+        &scenario,
+        Graph {
+            status: Some(Status::Failed(
+                "no file was delivered whole; 1 short: lantern.mkv.gz",
+            )),
+            kind: Some("Unpack"),
+            files: vec![],
+            whole: &[],
+            damaged: &["lantern.mkv.gz"],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &["kind=stream_gz member=lantern.mkv.gz why=unrepairable"],
+            delivered: &[],
+        },
+    )
+    .await;
+}
+
+// One level down the stored RAR opened, and the stream it produced is
+// refused the same way: listed damaged, and the job fails.
+#[tokio::test]
+async fn a_gzip_inside_a_stored_rar_whose_contents_come_out_damaged_fails_with_the_stream_damaged()
+{
+    let scenario = Scenario::new(nest(&one("lantern.mkv.gz", damaged_gzip())));
+    run_expecting(
+        &scenario,
+        Graph {
+            status: Some(Status::Failed(
+                "no file was delivered whole; 1 short: lantern.mkv.gz",
+            )),
+            kind: Some("Unpack"),
+            files: vec![],
+            whole: &[],
+            damaged: &["lantern.mkv.gz"],
+            unrepaired: &[],
+            withheld: &[],
+            refused: &["kind=stream_gz member=lantern.mkv.gz why=unrepairable"],
+            delivered: &[],
         },
     )
     .await;

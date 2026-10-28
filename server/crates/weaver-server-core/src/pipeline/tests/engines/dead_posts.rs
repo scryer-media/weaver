@@ -10,6 +10,7 @@
 
 use super::harness::*;
 use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 
 // Twelve files of four articles each.
 fn files() -> Vec<Post> {
@@ -21,8 +22,8 @@ fn files() -> Vec<Post> {
 #[tokio::test]
 async fn a_post_whose_first_articles_are_lost_fails_before_its_payload_is_fetched() {
     // Twelve files and no recovery: the post's health crosses its critical
-    // line before the sample reaches its share, and the feed gives the post
-    // up on whichever crosses first.
+    // line before the sample reaches its share, but the sample rules first,
+    // and ten of twelve first articles lost is past its share.
     let scenario = (0..10).fold(Scenario::new(files()), |scenario, file| {
         scenario.lost(file, 0)
     });
@@ -33,6 +34,63 @@ async fn a_post_whose_first_articles_are_lost_fails_before_its_payload_is_fetche
     for name in ["lantern10.bin", "lantern11.bin"] {
         assert_eq!(graph.claims.get(name), Some(&Claim::Complete), "{name}");
     }
+}
+
+// Ten files of two articles and no recovery, every file's first article
+// refused by every server. The post's health falls below its critical line
+// at the fourth lost first article, long before the sample reaches its
+// share at the eighth; while the first articles still to come could take
+// the sample there, health says nothing, and the post fails in the
+// sample's words.
+#[tokio::test]
+async fn a_post_whose_every_first_article_is_lost_fails_on_the_sample_never_on_its_health() {
+    let posts: Vec<Post> = (0..10u8)
+        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(2 * ARTICLE, at)))
+        .collect();
+    let scenario = (0..10).fold(Scenario::new(posts), |scenario, file| {
+        scenario.lost(file, 0)
+    });
+    let graph = run(&scenario).await;
+    let failure = graph.failure.as_deref().unwrap_or_default();
+    assert!(
+        failure.starts_with("aborted: ") && failure.contains(" of 10 first articles are missing"),
+        "{failure}"
+    );
+    assert!(!failure.contains("health"), "{failure}");
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+}
+
+// The same post, the pipeline going down once three first articles are
+// lost: what the root ruled lost before the restart is still lost after it,
+// so the sample counts all ten and the post fails in the sample's words.
+#[tokio::test]
+async fn a_first_article_lost_before_a_restart_still_counts_toward_the_sample() {
+    let posts: Vec<Post> = (0..10u8)
+        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(2 * ARTICLE, at)))
+        .collect();
+    let scenario = (0..10).fold(Scenario::new(posts), |scenario, file| {
+        scenario.lost(file, 0)
+    });
+    let restarted = super::restart::run_restarting_at(
+        &scenario,
+        &mut |_| {},
+        super::restart::Down::Crash,
+        &|asked| asked == 3,
+    )
+    .await;
+    assert_eq!(restarted.restarts, 1, "the pipeline went down once");
+    let Some(JobStatus::Failed { error }) = &restarted.status else {
+        panic!("{:?}", restarted.status);
+    };
+    assert!(
+        error.starts_with("aborted: ") && error.contains(" of 10 first articles are missing"),
+        "{error}"
+    );
+    assert!(!error.contains("health"), "{error}");
 }
 
 #[tokio::test]
