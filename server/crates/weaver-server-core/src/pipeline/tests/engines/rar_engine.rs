@@ -660,3 +660,34 @@ async fn a_compressed_volume_whose_recovery_volumes_lost_their_heads_waits_for_i
 fn mixed_framed_posts(posts: Vec<Post>) -> Scenario {
     Scenario::new(posts).framed(64)
 }
+
+// A compressed RAR4 member split over four volumes reaches the naming
+// plan's lookup with the CRC32 its final part's header states, which is the
+// CRC32 of the bytes delivered, not the first part's packed-bytes CRC.
+#[tokio::test]
+async fn a_split_compressed_members_checksum_reaches_the_naming_plan() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|part| {
+            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
+            (format!("silver.horizon.part{part}.rar"), bytes)
+        })
+        .collect();
+    let graph = run(&Scenario::new(posts(volumes))).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_engine_ran(&graph);
+    let member = delivered("compressible.txt");
+    let expected =
+        crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &graph.files[&member]) as u32;
+    let by_path =
+        crate::pipeline::completion::finalize::member_crc32_by_path(&graph.graph().delivery.files);
+    assert_eq!(
+        by_path.get("compressible.txt"),
+        Some(&expected),
+        "{by_path:?} from {:?}",
+        graph.graph().delivery.files
+    );
+}
