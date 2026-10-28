@@ -366,7 +366,15 @@ impl Pipeline {
         }
         servers.retain(|server| {
             let idle = idle_by_server.get(server).copied().unwrap_or(0);
-            let (available, _) = self.nntp.pool().server_load(*server);
+            // A server holding new connections back (a quarantine waiting on
+            // its one probe, or the delay after a failed dial) seats only the
+            // connections it already has, and one whose probe is due seats
+            // one more, the probe. A lease past those would only come back
+            // refused, and every refusal would put the work back for the next
+            // pass to send again. The work waits in its queue instead, and the
+            // run loop wakes dispatch on the server's recovery or on the
+            // hold's deadline.
+            let available = self.nntp.pool().new_connection_seats(*server);
             // The seat count is read once per server per pass, the first time
             // the pass looks at it and so before it has sent anything there.
             // Re-reading it would charge each lease twice: once as a lease in
@@ -817,7 +825,7 @@ impl Pipeline {
                     suppressed_since_last,
                     "dispatch stall: job not eligible"
                 );
-                crate::runtime::job_debug_ring::dump(job_id.0, "dispatch stall: job not eligible");
+                self.dump_job_debug_ring(job_id, "dispatch stall: job not eligible");
             }
         }
 

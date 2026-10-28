@@ -120,6 +120,17 @@ impl Pipeline {
     // whose server cannot be named is credited to the job's bytes and left
     // out of the ledger: an uncounted article is recoverable from the totals,
     // a misattributed one is not.
+    // Write the job's debug ring out beside a stall report, once per stall
+    // episode. The job's downloaded wire bytes are its progress: a report at
+    // the same count as the last replay belongs to the same episode.
+    pub(crate) fn dump_job_debug_ring(&self, job_id: JobId, reason: &'static str) {
+        let progress = self
+            .jobs
+            .get(&job_id)
+            .map_or(0, |state| state.downloaded_wire_bytes);
+        crate::runtime::job_debug_ring::dump(job_id.0, progress, reason);
+    }
+
     pub(crate) fn note_job_wire_bytes(
         &mut self,
         segment_id: SegmentId,

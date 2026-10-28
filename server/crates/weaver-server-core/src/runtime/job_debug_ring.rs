@@ -7,8 +7,15 @@
 // the job's own DEBUG and TRACE events — were filtered out long before the
 // report fired. The binary installs a tracing layer that feeds every such
 // event carrying a `job_id` field into a small ring per job, and the code that
-// reports a stall calls [`dump`] to write that ring out once, beside the
-// report, as a short burst of "stall diagnostics" records.
+// reports a stall calls [`dump`] to write that ring out beside the report, as
+// a short burst of "stall diagnostics" records.
+//
+// A job's ring is replayed once per stall episode. A report names the job's
+// progress, its downloaded wire bytes, and the ring remembers the progress of
+// its last replay: a report at that same progress is the same episode and
+// writes nothing, however many reports fire or whichever of them fires. Once
+// the job has moved, the next report replays again. Progress itself never
+// touches the rings, so the download path pays nothing for the episodes.
 //
 // Capture sits on the download and decode hot paths, so it is kept cheap:
 // rings are sharded by job so threads working different jobs do not share a
@@ -66,7 +73,14 @@ impl DebugLine {
     }
 }
 
-type Shard = HashMap<u64, VecDeque<DebugLine>>;
+// One job's recent lines, and the job's progress when a report last replayed
+// them.
+struct JobRing {
+    lines: VecDeque<DebugLine>,
+    replayed_at: Option<u64>,
+}
+
+type Shard = HashMap<u64, JobRing>;
 
 // Per-job rings of debug lines.
 pub struct JobDebugRings {
@@ -104,21 +118,38 @@ impl JobDebugRings {
             // nothing more.
             shard.clear();
         }
-        let ring = shard
-            .entry(job_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.lines_per_job.min(16)));
-        if ring.len() >= self.lines_per_job {
-            ring.pop_front();
+        let ring = shard.entry(job_id).or_insert_with(|| JobRing {
+            lines: VecDeque::with_capacity(self.lines_per_job.min(16)),
+            replayed_at: None,
+        });
+        if ring.lines.len() >= self.lines_per_job {
+            ring.lines.pop_front();
         }
-        ring.push_back(line);
+        ring.lines.push_back(line);
     }
 
     // Removes and returns the job's ring, oldest line first.
     pub fn take(&self, job_id: u64) -> Vec<DebugLine> {
         self.shard(job_id)
             .remove(&job_id)
-            .map(Vec::from)
+            .map(|ring| Vec::from(ring.lines))
             .unwrap_or_default()
+    }
+
+    // The lines a stall report made at the job's `progress` should write
+    // out, oldest first: the job's whole ring on the first report at that
+    // progress, nothing on every later one. Lines handed out leave the ring;
+    // lines captured after keep collecting for the next episode.
+    pub fn replay(&self, job_id: u64, progress: u64) -> Vec<DebugLine> {
+        let mut shard = self.shard(job_id);
+        let Some(ring) = shard.get_mut(&job_id) else {
+            return Vec::new();
+        };
+        if ring.replayed_at == Some(progress) || ring.lines.is_empty() {
+            return Vec::new();
+        }
+        ring.replayed_at = Some(progress);
+        Vec::from(std::mem::take(&mut ring.lines))
     }
 
     pub fn forget(&self, job_id: u64) {
@@ -173,19 +204,20 @@ pub fn forget(job_id: u64) {
     }
 }
 
-// Writes the job's ring out once, at WARN, and clears it: a header record
-// giving the count, then one record per captured line, so a log viewer shows
-// one row per line. Each record carries the captured event in parts, as
-// `replayed_level`, `replayed_target`, `replayed_message` and
+// Writes the job's ring out at WARN, once per stall episode, and clears it: a
+// header record giving the count, then one record per captured line, so a log
+// viewer shows one row per line. Each record carries the captured event in
+// parts, as `replayed_level`, `replayed_target`, `replayed_message` and
 // `replayed_fields`, never as the event's own rendered line.
 //
-// Callers are the throttled stall reports, so this runs at most as often as
-// they do; an empty ring writes nothing.
-pub fn dump(job_id: u64, reason: &'static str) {
+// Callers are the throttled stall reports, each naming the job's `progress`.
+// Only the first report at a given progress writes; the rest, and any report
+// over an empty ring, write nothing.
+pub fn dump(job_id: u64, progress: u64, reason: &'static str) {
     let Some(rings) = RINGS.get() else {
         return;
     };
-    let lines = rings.take(job_id);
+    let lines = rings.replay(job_id, progress);
     if lines.is_empty() {
         return;
     }
@@ -274,6 +306,38 @@ mod tests {
             vec!["line"],
             "the newest job keeps its ring"
         );
+    }
+
+    #[test]
+    fn a_ring_replays_once_per_stall_episode() {
+        let rings = JobDebugRings::new(8, 8);
+        rings.record(5, event("before the stall"));
+        assert_eq!(texts(rings.replay(5, 100)), vec!["before the stall"]);
+
+        rings.record(5, event("still stalled"));
+        assert!(
+            rings.replay(5, 100).is_empty(),
+            "a second report of the same episode writes nothing"
+        );
+
+        rings.record(5, event("stalled again"));
+        assert_eq!(
+            texts(rings.replay(5, 164)),
+            vec!["still stalled", "stalled again"],
+            "progress ends the episode, and the next report replays what built up"
+        );
+    }
+
+    #[test]
+    fn a_report_over_an_empty_ring_leaves_the_episode_unreported() {
+        let rings = JobDebugRings::new(8, 8);
+        assert!(rings.replay(6, 0).is_empty());
+        rings.record(6, event("first line"));
+        assert_eq!(rings.replay(6, 0).len(), 1);
+        assert!(rings.replay(6, 0).is_empty());
+        assert!(rings.replay(6, 10).is_empty(), "nothing new was captured");
+        rings.record(6, event("next line"));
+        assert_eq!(texts(rings.replay(6, 10)), vec!["next line"]);
     }
 
     #[test]

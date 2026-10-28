@@ -6,7 +6,7 @@ use crate::history;
 use crate::history::persistence::replace_job_history_attributes_tx;
 use crate::jobs::ids::JobId;
 use crate::jobs::persistence::lock_active_job_for_delete_tx;
-use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
 use crate::persistence::{Database, DatabaseWriterExecutor};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,6 @@ impl OrphanActiveStateCounts {
     }
 }
 
-const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
-
 const ACTIVE_JOB_CHILD_TABLES: [&str; 13] = [
     "active_file_progress",
     "active_files",
@@ -48,19 +46,6 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 13] = [
     "graph_holds",
     "graph_facts_parts",
 ];
-
-async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {
-    if datastore.engine() != SqlEngine::Sqlite {
-        return Ok(());
-    }
-    SqlRuntime::execute(
-        datastore.read_exec(),
-        &format!("PRAGMA incremental_vacuum({INLINE_INCREMENTAL_VACUUM_PAGES})"),
-        &[],
-    )
-    .await?;
-    Ok(())
-}
 
 async fn delete_orphan_rows(tx: &mut SqlTx<'_>, table: &'static str) -> Result<usize, StateError> {
     let deleted = tx
@@ -264,7 +249,6 @@ async fn archive_job_sql(
         })
     })
     .await?;
-    run_inline_incremental_vacuum(&datastore).await?;
     Ok(archived)
 }
 
@@ -302,7 +286,6 @@ impl Database {
             })
             .await?;
             db.notify_script_events_changed();
-            run_inline_incremental_vacuum(&datastore).await?;
             Ok(())
         });
         if result.is_ok() {
@@ -314,40 +297,31 @@ impl Database {
     pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let counts =
-                SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
-                    Box::pin(async move {
-                        Ok(OrphanActiveStateCounts {
-                            active_file_progress: delete_orphan_rows(tx, "active_file_progress")
-                                .await?,
-                            active_files: delete_orphan_rows(tx, "active_files").await?,
-                            active_file_identities: delete_orphan_rows(
-                                tx,
-                                "active_file_identities",
-                            )
+            SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
+                Box::pin(async move {
+                    Ok(OrphanActiveStateCounts {
+                        active_file_progress: delete_orphan_rows(tx, "active_file_progress")
                             .await?,
-                            active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
-                            active_detected_archives: delete_orphan_rows(
-                                tx,
-                                "active_detected_archives",
-                            )
+                        active_files: delete_orphan_rows(tx, "active_files").await?,
+                        active_file_identities: delete_orphan_rows(tx, "active_file_identities")
                             .await?,
-                            graph_checkpoint: {
-                                let mut removed = 0;
-                                for table in crate::jobs::graph_checkpoint::TABLES {
-                                    removed += delete_orphan_rows(tx, table).await?;
-                                }
-                                removed
-                            },
-                        })
+                        active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
+                        active_detected_archives: delete_orphan_rows(
+                            tx,
+                            "active_detected_archives",
+                        )
+                        .await?,
+                        graph_checkpoint: {
+                            let mut removed = 0;
+                            for table in crate::jobs::graph_checkpoint::TABLES {
+                                removed += delete_orphan_rows(tx, table).await?;
+                            }
+                            removed
+                        },
                     })
                 })
-                .await?;
-
-            if counts.total_removed() > 0 {
-                run_inline_incremental_vacuum(&datastore).await?;
-            }
-            Ok(counts)
+            })
+            .await
         })
     }
 }
