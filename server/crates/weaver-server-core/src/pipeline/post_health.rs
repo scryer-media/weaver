@@ -734,12 +734,16 @@ impl Pipeline {
             })
             .map(|(segment, _)| segment.file_id.file_index)
             .collect();
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(active) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())
+        else {
             return;
         };
         let lost_file = |work: &DownloadWork| lost.contains(&work.segment_id.file_id.file_index);
-        let mut abandoned = state.download_queue.extract_matching(lost_file);
-        abandoned.extend(state.recovery_queue.extract_matching(lost_file));
+        let mut abandoned = active.download_queue.extract_matching(lost_file);
+        abandoned.extend(active.recovery_queue.extract_matching(lost_file));
         if abandoned.is_empty() {
             return;
         }

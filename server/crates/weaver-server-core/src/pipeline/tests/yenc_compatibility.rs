@@ -15,7 +15,12 @@ async fn setup(temp: &TempDir, id: u64, sizes: &[u32]) -> (Pipeline, NzbFileId, 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.par2_bytes = state.spec.total_bytes;
     // These tests deliver the results of already dispatched requests.
-    state.download_queue.drain_all();
+    state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     let path = state.working_dir.join("sample.bin");
     (
         pipeline,
@@ -343,7 +348,14 @@ async fn giving_up_a_predecessor_retires_the_articles_held_behind_it() {
             Some(&SegmentTerminalState::DecodeExhausted)
         );
     }
-    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
 }
 
 // An article that cannot be held is asked for again without retry budget, and
@@ -361,7 +373,15 @@ async fn an_article_that_cannot_be_held_is_requeued_until_the_file_stalls() {
     assert!(pipeline.unanchored_parked.is_empty());
     assert_eq!(pipeline.unanchored_requeues.get(&segment), Some(&(1, 0)));
     assert!(!pipeline.decode_retries.contains_key(&segment));
-    assert_eq!(pipeline.jobs[&file_id.job_id].download_queue.len(), 1);
+    assert_eq!(
+        pipeline.jobs[&file_id.job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
 
     deliver(&mut pipeline, file_id, 0, 0, b"aaaa", true).await;
     deliver_unanchored(&mut pipeline, file_id, 2, b"cccc").await;
@@ -390,7 +410,14 @@ async fn an_article_behind_a_given_up_predecessor_is_not_held() {
         }),
         Some(&SegmentTerminalState::DecodeExhausted)
     );
-    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
 }
 
 // Every article of the file is in the job's root intact: none lost, none
@@ -398,7 +425,13 @@ async fn an_article_behind_a_given_up_predecessor_is_not_held() {
 fn in_hand(pipeline: &Pipeline, file_id: NzbFileId) -> bool {
     let state = &pipeline.jobs[&file_id.job_id];
     let count = state.spec.files[file_id.file_index as usize].segments.len() as u32;
-    let file = state.assembly.file(file_id).unwrap();
+    let file = state
+        .articles
+        .active()
+        .unwrap()
+        .assembly
+        .file(file_id)
+        .unwrap();
     (0..count).all(|number| {
         article_in_hand(pipeline, file_id, number) && !file.segment_has_retained_damage(number)
     })
@@ -432,6 +465,9 @@ async fn stale_metadata_assembles_twenty_parts_without_abandonment() {
     let expected: Vec<u8> = (0..20).flat_map(|number| [number; 4]).collect();
     assert_eq!(std::fs::read(path).unwrap(), expected);
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -506,6 +542,9 @@ async fn an_article_without_a_start_follows_the_one_before_it() {
     deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
     assert_eq!(std::fs::read(path).unwrap(), b"headtail");
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -533,19 +572,36 @@ async fn an_article_without_a_start_waits_for_its_predecessor() {
     assert!(!pipeline.decode_retries.contains_key(&segment));
     assert!(!pipeline.segment_terminal_states.contains_key(&segment));
     assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 0);
-    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
     assert!(!article_in_hand(&pipeline, file_id, 1));
     deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
     assert_eq!(std::fs::read(path).unwrap(), b"headtail");
     assert!(pipeline.unanchored_parked.is_empty());
     assert_eq!(pipeline.write_buffered_bytes, buffered);
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
     assert!(in_hand(&pipeline, file_id));
     assert_eq!(file.placement_of(1), Some((4, 4)));
-    assert!(pipeline.jobs[&file_id.job_id].download_queue.is_empty());
+    assert!(
+        pipeline.jobs[&file_id.job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
 }
 
 // A run of held articles releases in one pass once its head is placed, each
@@ -561,6 +617,9 @@ async fn a_run_of_held_articles_releases_behind_its_head() {
     assert_eq!(std::fs::read(path).unwrap(), b"aaaabbbbcccc");
     assert!(pipeline.unanchored_parked.is_empty());
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -668,6 +727,9 @@ async fn a_held_article_anchors_on_the_range_a_given_up_predecessor_declared() {
     assert_eq!(std::fs::read(&path).unwrap(), b"bad\0\0tail");
 
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -699,6 +761,9 @@ async fn a_run_held_behind_settled_damage_releases_in_order() {
     assert!(pipeline.unanchored_parked.is_empty());
     assert_eq!(std::fs::read(&path).unwrap(), b"aa\0\0bbbbcccc");
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -737,6 +802,9 @@ async fn a_believable_length_anchors_even_without_a_declared_range() {
 
     assert!(pipeline.unanchored_parked.is_empty());
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -783,6 +851,9 @@ async fn a_body_cut_short_without_a_range_anchors_nothing() {
         Some(&SegmentTerminalState::DecodeExhausted)
     );
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -826,6 +897,9 @@ async fn assert_only_the_bad_part_is_fetched_again(
         segment_number: 0,
     };
     let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(file_id)
         .unwrap();
@@ -876,6 +950,9 @@ async fn a_bad_extent_that_arrives_first_fails_alone_and_its_neighbours_place() 
     deliver_part(&mut pipeline, file_id, 0, 12, b"XXXX").await;
     assert_eq!(
         pipeline.jobs[&file_id.job_id]
+            .articles
+            .active()
+            .unwrap()
             .assembly
             .file(file_id)
             .unwrap()

@@ -138,8 +138,8 @@ fn member(namespace: &Namespace, id: u32) -> &Member {
 // The job as the completion gate sees it once the download pass is over.
 fn settle_download_state(pipeline: &mut Pipeline, job_id: JobId) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     state.status = JobStatus::Downloading;
     state.refresh_runtime_lanes_from_status();
 }

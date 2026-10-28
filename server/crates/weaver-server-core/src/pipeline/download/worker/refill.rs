@@ -463,7 +463,7 @@ impl Pipeline {
             queued = self
                 .jobs
                 .values()
-                .map(|state| state.download_queue.len())
+                .map(|state| state.articles.queued_download_len())
                 .sum::<usize>(),
             "download lane refill denied; lane parking"
         );

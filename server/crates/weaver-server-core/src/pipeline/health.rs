@@ -128,8 +128,10 @@ impl Pipeline {
             state.paused_resume_post_state = None;
             state.set_failure(error.to_string());
             // Clear per-job queues to free memory.
-            state.download_queue = DownloadQueue::new();
-            state.recovery_queue = DownloadQueue::new();
+            if let Some(active) = state.articles.active_mut() {
+                active.download_queue = DownloadQueue::new();
+                active.recovery_queue = DownloadQueue::new();
+            }
             let staging_dir = if preserve_staging {
                 None
             } else {

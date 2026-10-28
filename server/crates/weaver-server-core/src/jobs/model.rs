@@ -158,9 +158,11 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
-    // Conservative admission estimate for the spec, queue entries, assembly
-    // indexes, and their cloned strings. Count placements even when message
-    // IDs repeat: each placement still owns scheduling and output state.
+    // Conservative estimate of everything a running job holds: the spec's
+    // article lists, queue entries, assembly indexes, and their cloned
+    // strings. Count placements even when message IDs repeat: each placement
+    // still owns scheduling and output state. Charged when the job's articles
+    // are built and held until it leaves the pipeline.
     pub(crate) fn scheduling_memory_estimate(&self) -> u64 {
         let per_file = (8 * std::mem::size_of::<crate::jobs::assembly::FileAssembly>()
             + 4 * std::mem::size_of::<FileSpec>()) as u64;
@@ -182,6 +184,21 @@ impl JobSpec {
                     )
                 })
         })
+    }
+
+    // Takes every file's article list out of the spec, leaving what a job
+    // waiting its turn keeps, and returns what the lists held.
+    pub fn drop_article_lists(&mut self) -> FileSummaries {
+        FileSummaries(
+            self.files
+                .iter_mut()
+                .map(|file| {
+                    let summary = FileSummary::of(file);
+                    file.segments = Vec::new();
+                    summary
+                })
+                .collect(),
+        )
     }
 
     // Total bytes of PAR2 recovery files in this spec.
@@ -696,7 +713,10 @@ pub struct JobState {
     pub download_state: DownloadState,
     pub post_state: PostState,
     pub run_state: RunState,
-    pub assembly: JobAssembly,
+    // The job's per-article state, by where the job is in its run: nothing
+    // per article while it waits its turn, everything once it is first handed
+    // work. See [`JobArticles`].
+    pub articles: JobArticles,
     pub created_at: std::time::Instant,
     // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
@@ -747,10 +767,6 @@ pub struct JobState {
     pub detected_archives: std::collections::HashMap<u32, DetectedArchiveIdentity>,
     // Mutable file identity used by runtime/archive logic after rename/classification.
     pub file_identities: std::collections::HashMap<u32, ActiveFileIdentity>,
-    // Primary download queue (data files, PAR2 index, RAR volumes).
-    pub download_queue: DownloadQueue,
-    // Recovery download queue (PAR2 repair blocks, spare bandwidth).
-    pub recovery_queue: DownloadQueue,
     // Staging directory for extraction output (under complete_dir).
     // Extraction writes chunks and assembled files here instead of
     // working_dir, keeping local storage usage low for NFS setups.
@@ -775,7 +791,177 @@ pub struct JobState {
     pub nzb_password_candidates: std::sync::OnceLock<Vec<ArchivePasswordCandidate>>,
 }
 
+// One file of a job as a job waiting its turn knows it: how many articles
+// it has and what they add up to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileSummary {
+    pub articles: u32,
+    pub bytes: u64,
+}
+
+impl FileSummary {
+    pub fn of(file: &FileSpec) -> Self {
+        Self {
+            articles: file.segments.len() as u32,
+            bytes: file
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.bytes))
+                .sum(),
+        }
+    }
+}
+
+// The summary of every file of a job, in the spec's file order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileSummaries(pub Vec<FileSummary>);
+
+// Everything a job holds per article, built in one place when the job is
+// first handed work and dropped with the job.
+pub struct ActiveArticles {
+    pub assembly: JobAssembly,
+    // Primary download queue (data files, PAR2 index, RAR volumes).
+    pub download_queue: DownloadQueue,
+    // Recovery download queue (PAR2 repair blocks, spare bandwidth).
+    pub recovery_queue: DownloadQueue,
+}
+
+// Where a job is in its run, as far as its articles go.
+//
+// A job waits its turn holding nothing per article: its spec keeps every
+// file's name and identity, its article lists are empty, and these summaries
+// say what the lists held. When the scheduler first reaches it the job is
+// activating while its article lists are read back from the stored NZB, off
+// the pipeline thread. Once they are in, the job is active and holds its
+// article lists, assembly and queues until it leaves the pipeline. A job
+// never goes back.
+pub enum JobArticles {
+    Queued(FileSummaries),
+    Activating(FileSummaries),
+    Active(Box<ActiveArticles>),
+}
+
+impl JobArticles {
+    pub fn active(&self) -> Option<&ActiveArticles> {
+        match self {
+            Self::Active(active) => Some(active),
+            Self::Queued(_) | Self::Activating(_) => None,
+        }
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut ActiveArticles> {
+        match self {
+            Self::Active(active) => Some(active),
+            Self::Queued(_) | Self::Activating(_) => None,
+        }
+    }
+
+    // The job's primary queue, or nothing while the job holds no articles.
+    pub fn download_queue(&self) -> Option<&DownloadQueue> {
+        self.active().map(|active| &active.download_queue)
+    }
+
+    pub fn download_queue_mut(&mut self) -> Option<&mut DownloadQueue> {
+        self.active_mut().map(|active| &mut active.download_queue)
+    }
+
+    pub fn recovery_queue(&self) -> Option<&DownloadQueue> {
+        self.active().map(|active| &active.recovery_queue)
+    }
+
+    pub fn recovery_queue_mut(&mut self) -> Option<&mut DownloadQueue> {
+        self.active_mut().map(|active| &mut active.recovery_queue)
+    }
+
+    pub fn assembly(&self) -> Option<&JobAssembly> {
+        self.active().map(|active| &active.assembly)
+    }
+
+    pub fn assembly_mut(&mut self) -> Option<&mut JobAssembly> {
+        self.active_mut().map(|active| &mut active.assembly)
+    }
+
+    // Articles still waiting in the primary queue. A job whose articles are
+    // not built yet has every one of them still to fetch.
+    pub fn queued_download_len(&self) -> usize {
+        match self {
+            Self::Queued(summaries) | Self::Activating(summaries) => {
+                summaries.0.iter().map(|file| file.articles as usize).sum()
+            }
+            Self::Active(active) => active.download_queue.len(),
+        }
+    }
+
+    // Articles parked in the recovery queue; none before the job's articles
+    // are built.
+    pub fn queued_recovery_len(&self) -> usize {
+        self.recovery_queue().map_or(0, DownloadQueue::len)
+    }
+
+    // Whether the job still has articles to fetch in its primary queue. A
+    // job whose articles are not built yet has every one of them still to
+    // fetch.
+    pub fn has_queued_download_work(&self) -> bool {
+        self.download_queue().is_none_or(|queue| !queue.is_empty())
+    }
+}
+
 impl JobState {
+    // One file's article count and size, whether the job holds its articles
+    // or only their summary.
+    pub fn file_summary(&self, file_index: usize) -> FileSummary {
+        match &self.articles {
+            JobArticles::Queued(summaries) | JobArticles::Activating(summaries) => {
+                summaries.0.get(file_index).copied().unwrap_or_default()
+            }
+            JobArticles::Active(_) => self
+                .spec
+                .files
+                .get(file_index)
+                .map(FileSummary::of)
+                .unwrap_or_default(),
+        }
+    }
+
+    // The recovery files' total size and what of them has arrived; nothing
+    // has arrived of a job not yet handed work.
+    pub fn optional_recovery_bytes(&self) -> (u64, u64) {
+        if let Some(assembly) = self.articles.assembly() {
+            return assembly.optional_recovery_bytes();
+        }
+        if !self
+            .spec
+            .files
+            .iter()
+            .any(|file| file.role.counts_toward_health())
+        {
+            return (0, 0);
+        }
+        let recovery = (0..self.spec.files.len())
+            .filter(|index| self.spec.files[*index].role.is_recovery())
+            .map(|index| self.file_summary(index).bytes)
+            .sum();
+        (recovery, 0)
+    }
+
+    pub fn total_file_count(&self) -> usize {
+        self.articles
+            .assembly()
+            .map_or(self.spec.files.len(), JobAssembly::total_file_count)
+    }
+
+    pub fn complete_file_count(&self) -> usize {
+        self.articles
+            .assembly()
+            .map_or(0, JobAssembly::complete_file_count)
+    }
+
+    // The share of the job's files assembled; none of a job not yet handed
+    // work.
+    pub fn assembly_progress(&self) -> f64 {
+        self.articles.assembly().map_or(0.0, JobAssembly::progress)
+    }
+
     pub fn refresh_runtime_lanes_from_status(&mut self) {
         let (download_state, post_state, run_state) =
             runtime_lanes_from_status_snapshot(&self.status);

@@ -71,9 +71,9 @@ pub(in crate::pipeline::download) struct ServableWorkFilter<'a> {
 pub(in crate::pipeline::download) enum ServableWork<'a> {
     // Retention rules this server out for the whole job.
     RetentionExcluded,
-    // Every queued file is refused by a clause decided per file, so no
-    // article can pass and there is nothing to scan. Carries the clauses
-    // that refused them.
+    // Every queued article is refused by a clause decided for the whole
+    // queue or per file, so no article can pass and there is nothing to
+    // scan. Carries the clauses that refused them.
     NoQueuedFilePasses(BlockedBy),
     // Some article may pass; scan the queue with this filter.
     Scan(ServableWorkFilter<'a>),
@@ -265,9 +265,9 @@ impl Pipeline {
     // hint — is sampled once here, so a whole handout costs one sample rather
     // than one per article.
     //
-    // Before the queue is scanned, the clauses that can refuse a whole file
-    // are put to every queued file at once (see
-    // [`Self::queued_file_may_pass`]); when none passes, the answer is
+    // Before the queue is scanned, the clauses that can refuse a whole queue
+    // or a whole file are put to it at once (see
+    // [`Self::queued_work_may_pass`]); when none passes, the answer is
     // [`ServableWork::NoQueuedFilePasses`] and no scan is owed.
     //
     // The filter starts from an empty lease. A caller cutting a batch passes
@@ -285,7 +285,8 @@ impl Pipeline {
         if retention_excludes.contains(&server_idx) {
             return ServableWork::RetentionExcluded;
         }
-        if let Err(blocked) = self.queued_file_may_pass(job_id, bootstrap_files) {
+        let checkpoint = self.checkpoint_admission(job_id);
+        if let Err(blocked) = self.queued_work_may_pass(job_id, checkpoint, bootstrap_files) {
             return ServableWork::NoQueuedFilePasses(blocked);
         }
         ServableWork::Scan(ServableWorkFilter {
@@ -298,7 +299,7 @@ impl Pipeline {
             retention_excludes,
             bootstrap_files,
             uu_cursor_ordinals,
-            checkpoint: self.checkpoint_admission(job_id),
+            checkpoint,
             leased: CheckpointLease::default(),
             checkpoint_blocked: std::cell::Cell::new(false),
             skipped: std::cell::Cell::new(0),
@@ -307,29 +308,37 @@ impl Pipeline {
         })
     }
 
-    // Whether any queued file of the job could get an article past the
-    // clause that refuses whole files, the PAR2 index bootstrap, answered
-    // from the queue's per-file counts without looking at an article.
+    // Whether any queued article of the job could get past the clauses that
+    // refuse whole sets of articles at once, answered from the queue's counts
+    // without looking at an article: the restart checkpoint, when it holds
+    // every payload article and the queue holds no recovery article, and the
+    // PAR2 index bootstrap, per file.
     //
     // Only an `Err` is acted on, so this may answer `Ok` freely and must
     // never answer `Err` while some article would pass. The other clauses
     // cannot refuse a whole file this way: the UU cursor admits the article
     // at its ordinal; exclusions, rotation hints and the backfill gate are
-    // per article; and the checkpoint's refusals must be observed article by
-    // article for the recheck it owes. Retention is decided for the whole
+    // per article; and a checkpoint that admits some payload sizes but not
+    // others is asked article by article. Retention is decided for the whole
     // job before this is asked.
-    fn queued_file_may_pass(
+    fn queued_work_may_pass(
         &self,
         job_id: JobId,
+        checkpoint: CheckpointAdmission,
         bootstrap_files: Option<&[u32]>,
     ) -> Result<(), BlockedBy> {
-        let Some(bootstrap_files) = bootstrap_files else {
-            return Ok(());
-        };
         let Some(state) = self.jobs.get(&job_id) else {
             return Ok(());
         };
-        let queue = &state.download_queue;
+        let Some(queue) = state.articles.download_queue() else {
+            return Err(BlockedBy::only(SchedulerBlockClause::Activation));
+        };
+        if checkpoint.holds_every_payload_article() && queue.recovery_work_count() == 0 {
+            return Err(BlockedBy::only(SchedulerBlockClause::Checkpoint));
+        }
+        let Some(bootstrap_files) = bootstrap_files else {
+            return Ok(());
+        };
         let mut counted = 0usize;
         let mut blocked = BlockedBy::default();
         for file_index in (0..state.spec.files.len()).filter_map(|index| u32::try_from(index).ok())
@@ -366,7 +375,8 @@ impl Pipeline {
         if self
             .jobs
             .get(&job_id)
-            .is_none_or(|state| state.download_queue.excluded_work_count() == 0)
+            .and_then(|state| state.articles.download_queue())
+            .is_none_or(|queue| queue.excluded_work_count() == 0)
         {
             return Vec::new();
         }

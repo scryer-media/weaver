@@ -78,8 +78,10 @@ impl Pipeline {
         };
         let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
-        state.download_queue.extend_segment_ids(&mut queued);
-        state.recovery_queue.extend_segment_ids(&mut queued);
+        if let Some(active) = state.articles.active() {
+            active.download_queue.extend_segment_ids(&mut queued);
+            active.recovery_queue.extend_segment_ids(&mut queued);
+        }
         graph.arrived_before(|volume, ordinal| queued.contains(&segment(job_id, volume, ordinal)));
         self.install_graph_job(job_id, graph);
     }
@@ -393,8 +395,11 @@ impl Pipeline {
         else {
             return;
         };
+        let Some(active) = state.articles.active() else {
+            return;
+        };
         let round = {
-            let (download, recovery) = (&state.download_queue, &state.recovery_queue);
+            let (download, recovery) = (&active.download_queue, &active.recovery_queue);
             graph.seek_round(|volume| {
                 let file_id = file(job_id, volume);
                 download.queued_count_for_file(file_id) + recovery.queued_count_for_file(file_id)
@@ -426,6 +431,10 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
         return;
     }
     let job_id = state.job_id;
+    // Only a job holding its articles has a root to move them.
+    let Some(state) = state.articles.active_mut() else {
+        return;
+    };
     // The latest class of each moved article, by its place in the post.
     let classes: BTreeMap<(u32, u32), Class> = moves
         .iter()

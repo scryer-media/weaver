@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod activation;
 pub mod archive;
 mod capacity;
 mod completion;
@@ -1459,6 +1460,8 @@ pub struct Pipeline {
     pub(super) nntp_handoff_drained_tx: mpsc::Sender<u64>,
     pub(super) nntp_handoff_drained_rx: mpsc::Receiver<u64>,
     // Channel for background final-move results.
+    pub(super) job_activated_tx: mpsc::Sender<activation::JobActivated>,
+    pub(super) job_activated_rx: mpsc::Receiver<activation::JobActivated>,
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
     pub(super) terminal_post_processing_done_tx: mpsc::Sender<TerminalPostProcessingEvent>,
@@ -1703,8 +1706,9 @@ pub struct Pipeline {
     pub(super) graph_hardware: crate::pipeline::graph::hardware::Hardware,
     // Environment-derived, always-on extraction ceilings.
     pub(super) extraction_limits: Arc<ExtractionLimits>,
-    // Scheduling metadata retained by admitted jobs.
-    pub(super) job_scheduling_memory: HashMap<JobId, ProcessMemoryPermit>,
+    // What every job holding its articles is charged for them, from the
+    // moment they are built until the job leaves the pipeline.
+    pub(super) job_article_memory: HashMap<JobId, ProcessMemoryPermit>,
     pub(super) repeated_articles: HashMap<JobId, Arc<download::repeated::RepeatedArticles>>,
     // Shared allowance for scheduling, repair metadata, and extraction decoders.
     pub(super) process_memory_budget: Arc<ProcessMemoryBudget>,

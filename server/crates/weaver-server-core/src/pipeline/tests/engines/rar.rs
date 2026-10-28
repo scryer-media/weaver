@@ -298,7 +298,7 @@ async fn drive_to_move(pipeline: &mut Pipeline, job: JobId, scenario: &Scenario)
         while let Some(work) = pipeline
             .jobs
             .get_mut(&job)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             served = true;
             let article = (
@@ -390,8 +390,18 @@ async fn dispatch_schedules_no_parked_recovery_check() {
     let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
     serve_job(&mut pipeline, JOB, &scenario, (2, 0)).await;
     let state = pipeline.jobs.get_mut(&JOB).unwrap();
-    while state.download_queue.pop().is_some() {}
-    assert!(!state.recovery_queue.is_empty(), "recovery queued");
+    while state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .is_some()
+    {}
+    assert!(
+        !state.articles.active().unwrap().recovery_queue.is_empty(),
+        "recovery queued"
+    );
     pipeline.dispatch_downloads();
     assert!(
         !pipeline.pending_completion_checks.contains(&JOB),

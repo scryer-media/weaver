@@ -368,7 +368,7 @@ impl Pipeline {
         let Some(file) = self
             .jobs
             .get_mut(&file_id.job_id)
-            .and_then(|state| state.assembly.file_mut(file_id))
+            .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
         else {
             return false;
         };
@@ -535,8 +535,9 @@ impl Pipeline {
                 return;
             }
             let expected_layout = state
-                .assembly
-                .file(file_id)
+                .articles
+                .assembly()
+                .and_then(|assembly| assembly.file(file_id))
                 .ok_or(AuthoritativeLayoutError::FileMissing)
                 .and_then(|file| expected_segment_layout(file, segment_id.segment_number));
             let expected_layout = match expected_layout {
@@ -650,7 +651,7 @@ impl Pipeline {
                     let file = self
                         .jobs
                         .get(&job_id)
-                        .and_then(|state| state.assembly.file(file_id));
+                        .and_then(|state| state.articles.assembly()?.file(file_id));
                     let anchor = file.and_then(|file| file.anchor_end_after(predecessor, settled));
                     // An anchor the part before it never placed is one read off
                     // bytes that are being kept only for repair — and it is
@@ -722,7 +723,7 @@ impl Pipeline {
             let held_damage = self
                 .jobs
                 .get(&job_id)
-                .and_then(|state| state.assembly.file(file_id))
+                .and_then(|state| state.articles.assembly()?.file(file_id))
                 .map(|file| {
                     (
                         file.segment_has_retained_damage(segment_id.segment_number),
@@ -746,7 +747,7 @@ impl Pipeline {
             let mut conflict = match self
                 .jobs
                 .get_mut(&job_id)
-                .and_then(|state| state.assembly.file_mut(file_id))
+                .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
             {
                 Some(file) => {
                     if retain_damage {
@@ -794,7 +795,7 @@ impl Pipeline {
                 conflict = self
                     .jobs
                     .get_mut(&job_id)
-                    .and_then(|state| state.assembly.file_mut(file_id))
+                    .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
                     .and_then(|file| {
                         let other = file.placement_conflict(
                             segment_id.segment_number,
@@ -870,7 +871,7 @@ impl Pipeline {
                 if let Some(file) = self
                     .jobs
                     .get_mut(&job_id)
-                    .and_then(|state| state.assembly.file_mut(file_id))
+                    .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
                 {
                     file.note_retained_damage(
                         segment_id.segment_number,
@@ -937,7 +938,7 @@ impl Pipeline {
         let already_placed = self
             .jobs
             .get(&file_id.job_id)
-            .and_then(|state| state.assembly.file(file_id))
+            .and_then(|state| state.articles.assembly()?.file(file_id))
             .and_then(|file| file.placement_of(segment_number));
 
         let uu = self.uu_file(file_id);
@@ -1232,7 +1233,7 @@ impl Pipeline {
         let anchored = self
             .jobs
             .get(&file_id.job_id)
-            .and_then(|state| state.assembly.file(file_id))
+            .and_then(|state| state.articles.assembly()?.file(file_id))
             .is_some_and(|file| file.anchor_end_after(predecessor, settled).is_some());
         if !anchored {
             return None;
@@ -1253,7 +1254,7 @@ impl Pipeline {
             || self
                 .jobs
                 .get(&segment_id.file_id.job_id)
-                .and_then(|state| state.assembly.file(segment_id.file_id))
+                .and_then(|state| state.articles.assembly()?.file(segment_id.file_id))
                 .is_some_and(|file| file.segment_has_retained_damage(segment_id.segment_number))
     }
 
@@ -1333,7 +1334,7 @@ impl Pipeline {
         let placed = self
             .jobs
             .get(&segment_id.file_id.job_id)
-            .and_then(|state| state.assembly.file(segment_id.file_id))
+            .and_then(|state| state.articles.assembly()?.file(segment_id.file_id))
             .map_or(0, |file| file.placed_segment_count());
         let (attempts, seen_placed) = self
             .unanchored_requeues

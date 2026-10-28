@@ -113,8 +113,18 @@ async fn serve_queued(pipeline: &mut Pipeline, scenario: &Scenario, (file, ordin
         let this = |work: &crate::pipeline::download::queue::DownloadWork| {
             work.segment_id.file_id.file_index == file && work.segment_id.segment_number == ordinal
         };
-        state.download_queue.extract_matching(this);
-        state.recovery_queue.extract_matching(this);
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .extract_matching(this);
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .recovery_queue
+            .extract_matching(this);
     }
     serve(pipeline, scenario, (file, ordinal)).await;
 }
@@ -127,7 +137,7 @@ pub(super) async fn drive_to_finish(pipeline: &mut Pipeline, scenario: &Scenario
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             moved = true;
             let article = (

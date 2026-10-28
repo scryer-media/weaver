@@ -139,6 +139,9 @@ pub struct DownloadQueue {
     // that may need a backfill lane) or a rotation hint. Maintained on
     // push/pop; recounted on the rare bulk-removal paths.
     excluded_work: usize,
+    // Queued recovery items, which the restart checkpoint never holds back.
+    // Maintained on push/pop; recounted on the bulk-removal paths.
+    recovery_work: usize,
     // Queued items per file, maintained on every push and removal. The RAR
     // unlock planner asks "does this file still have queued work" once per
     // volume; answering that by scanning the queue made every replan cost
@@ -158,6 +161,7 @@ impl DownloadQueue {
             ordinary_work: ClassMap::new(),
             next_sequence: 0,
             excluded_work: 0,
+            recovery_work: 0,
             queued_by_file: HashMap::new(),
             first_articles: std::collections::HashSet::new(),
         }
@@ -182,6 +186,7 @@ impl DownloadQueue {
         if work.is_steered() {
             self.excluded_work += 1;
         }
+        self.recovery_work += usize::from(work.is_recovery);
         *self
             .queued_by_file
             .entry(work.segment_id.file_id)
@@ -214,6 +219,11 @@ impl DownloadQueue {
             self.note_removed(work);
         }
         work
+    }
+
+    // Number of queued recovery items, in O(1).
+    pub fn recovery_work_count(&self) -> usize {
+        self.recovery_work
     }
 
     // Number of queued items with failure exclusions or a rotation hint.
@@ -266,6 +276,7 @@ impl DownloadQueue {
 
     fn recount_derived_counts(&mut self) {
         self.excluded_work = self.iter().filter(|work| work.is_steered()).count();
+        self.recovery_work = self.iter().filter(|work| work.is_recovery).count();
         let mut queued_by_file = HashMap::new();
         for work in self.iter() {
             *queued_by_file.entry(work.segment_id.file_id).or_default() += 1;
@@ -286,6 +297,7 @@ impl DownloadQueue {
     #[cfg(test)]
     pub fn drain_all(&mut self) -> Vec<DownloadWork> {
         self.excluded_work = 0;
+        self.recovery_work = 0;
         self.queued_by_file.clear();
         std::mem::take(&mut self.completion_critical_work)
             .into_values()
@@ -373,6 +385,9 @@ impl DownloadQueue {
         if work.is_steered() {
             self.excluded_work = self.excluded_work.saturating_sub(1);
         }
+        self.recovery_work = self
+            .recovery_work
+            .saturating_sub(usize::from(work.is_recovery));
         if let Some(count) = self.queued_by_file.get_mut(&work.segment_id.file_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {

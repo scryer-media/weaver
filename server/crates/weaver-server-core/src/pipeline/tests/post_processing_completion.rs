@@ -568,6 +568,9 @@ async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivere
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();

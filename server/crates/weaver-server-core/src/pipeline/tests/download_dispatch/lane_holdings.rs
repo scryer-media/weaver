@@ -12,7 +12,15 @@ use super::*;
 fn lease_to_new_lane(pipeline: &mut Pipeline, job_id: JobId, take: usize) -> DownloadBatchLease {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let works: Vec<DownloadWork> = (0..take)
-        .map(|_| state.download_queue.pop().expect("the job has queued work"))
+        .map(|_| {
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .pop()
+                .expect("the job has queued work")
+        })
         .collect();
     lease_works_to_new_lane(pipeline, job_id, works)
 }
@@ -136,7 +144,15 @@ fn assert_gauges_match_lanes(pipeline: &Pipeline) {
 }
 
 fn queued(pipeline: &Pipeline, job_id: JobId) -> usize {
-    pipeline.jobs.get(&job_id).unwrap().download_queue.len()
+    pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len()
 }
 
 fn mark_idle_past_the_stall_threshold(pipeline: &mut Pipeline, job_id: JobId) {
@@ -195,6 +211,9 @@ async fn an_article_the_lane_does_not_hold_is_refused_without_moving_a_gauge() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -232,6 +251,9 @@ async fn a_lease_that_names_an_article_twice_owes_one_result() {
     let work = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -316,6 +338,9 @@ async fn a_stall_release_takes_back_the_tail_a_lane_carries_for_its_previous_job
             pipeline
                 .jobs
                 .get_mut(&next_job)
+                .unwrap()
+                .articles
+                .active_mut()
                 .unwrap()
                 .download_queue
                 .pop()

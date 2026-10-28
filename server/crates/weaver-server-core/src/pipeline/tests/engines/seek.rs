@@ -592,10 +592,15 @@ async fn recovery_seek() -> (Scenario, Outcome) {
 }
 
 fn recovering(pipeline: &Pipeline) -> bool {
-    pipeline
-        .jobs
-        .get(&JOB)
-        .is_some_and(|state| state.download_queue.count_matching(|work| work.is_recovery) > 0)
+    pipeline.jobs.get(&JOB).is_some_and(|state| {
+        state
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .count_matching(|work| work.is_recovery)
+            > 0
+    })
 }
 
 // How a restart takes the pipeline down: drained, as a graceful stop does,
@@ -658,7 +663,7 @@ async fn run_restarting_once(
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             let article = (
                 work.segment_id.file_id.file_index,
@@ -691,10 +696,9 @@ async fn run_restarting_once(
             pipeline.graph_run_said(said);
             continue;
         }
-        let queued = pipeline
-            .jobs
-            .get(&JOB)
-            .map_or(0, |state| state.download_queue.len());
+        let queued = pipeline.jobs.get(&JOB).map_or(0, |state| {
+            state.articles.active().unwrap().download_queue.len()
+        });
         assert!(queued > 0, "the restarted job stalled");
     }
     assert!(restarted, "the run restarted");

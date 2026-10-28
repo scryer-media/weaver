@@ -35,9 +35,13 @@ impl Pipeline {
         self.reset_owned_download_lanes();
         self.drop_held_download_refills();
         self.clear_retention_exclude_cache();
-        for state in self.jobs.values_mut() {
-            state.download_queue.clear_exclude_servers();
-            state.recovery_queue.clear_exclude_servers();
+        for active in self
+            .jobs
+            .values_mut()
+            .filter_map(|state| state.articles.active_mut())
+        {
+            active.download_queue.clear_exclude_servers();
+            active.recovery_queue.clear_exclude_servers();
         }
         self.metrics
             .nntp_generation_recovery_requeues
@@ -448,7 +452,7 @@ impl Pipeline {
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.assembly.optional_recovery_bytes();
+            state.optional_recovery_bytes();
         let health = health_milli(total, state.failed_bytes);
         let row = crate::JobHistoryRow {
             job_id: job_id.0,
@@ -494,7 +498,7 @@ impl Pipeline {
 
     // Drops a cancelled job's runtime state once its archive has committed.
     fn purge_cancelled_job_runtime(&mut self, job_id: JobId) -> Option<JobState> {
-        let state = self.jobs.remove(&job_id)?;
+        let state = self.release_job_articles(job_id)?;
         self.metrics.post_state_left(state.post_state);
         self.retire_stalled_download_lanes(job_id);
         self.job_order.retain(|id| *id != job_id);

@@ -241,13 +241,15 @@ struct Reply {
 }
 
 impl RepeatedArticles {
+    // The index of a job whose articles are being built, charged as it
+    // stands and never refused, like everything else built then.
     pub(crate) fn new(
         spec: &crate::jobs::JobSpec,
         root: &Path,
         memory: Arc<ProcessMemoryBudget>,
     ) -> Result<Option<Arc<Self>>, String> {
         let count: usize = spec.files.iter().map(|file| file.segments.len()).sum();
-        let scratch = memory.try_reserve_retained((count as u64).saturating_mul(48))?;
+        let scratch = memory.charge_retained((count as u64).saturating_mul(48));
         let mut counts = HashMap::<&str, bool>::new();
         for file in &spec.files {
             for id in file
@@ -270,7 +272,7 @@ impl RepeatedArticles {
             .filter(|(_, repeated)| **repeated)
             .map(|(id, _)| id.len() as u64 + 512)
             .sum();
-        let index_memory = memory.try_reserve_retained(bytes)?;
+        let index_memory = memory.charge_retained(bytes);
         let entries = counts
             .into_iter()
             .filter(|(_, repeated)| *repeated)
@@ -522,22 +524,6 @@ impl RepeatedArticles {
 }
 
 impl Pipeline {
-    pub(crate) fn install_repeated_articles(
-        &mut self,
-        state: &crate::jobs::JobState,
-    ) -> Result<(), crate::SchedulerError> {
-        if let Some(cache) = RepeatedArticles::new(
-            &state.spec,
-            &state.working_dir,
-            Arc::clone(&self.process_memory_budget),
-        )
-        .map_err(crate::SchedulerError::InvalidInput)?
-        {
-            self.repeated_articles.insert(state.job_id, cache);
-        }
-        Ok(())
-    }
-
     pub(in crate::pipeline::download) fn spawn_repeated_download_batch(
         &self,
         lease: DownloadBatchLease,

@@ -140,6 +140,5 @@ pub(crate) fn admission_resources(
         db,
         intermediate_dir: root.join("intermediate"),
         complete_dir: root.join("complete"),
-        memory: Arc::new(ProcessMemoryBudget::new(1024 * 1024 * 1024)),
     }
 }

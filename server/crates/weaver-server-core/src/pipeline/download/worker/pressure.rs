@@ -79,6 +79,18 @@ impl CheckpointLease {
 }
 
 impl CheckpointAdmission {
+    // Whether the checkpoint refuses every payload article of the job, of
+    // any size, until its durable floor moves: an article sent to close the
+    // gap is still out, or the lead is already past the limit while the
+    // pipeline holds work that will advance the floor. Answered for the
+    // whole job at once, so a held job's queue need not be read to learn it.
+    pub(in crate::pipeline) fn holds_every_payload_article(self) -> bool {
+        self.enforced
+            && self.limit != 0
+            && (self.progress_article_in_flight
+                || (self.can_advance && self.undurable_bytes > self.limit))
+    }
+
     pub(in crate::pipeline) fn decision(
         self,
         work: &DownloadWork,
@@ -99,7 +111,7 @@ impl CheckpointAdmission {
         if work.is_recovery {
             return CheckpointDecision::RecoveryExempt;
         }
-        if self.progress_article_in_flight {
+        if self.holds_every_payload_article() {
             return CheckpointDecision::WaitingForPipeline;
         }
         let projected = self

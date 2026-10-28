@@ -479,7 +479,7 @@ async fn a_split_7z_with_encrypted_headers_whose_last_volume_came_first_opens_on
     while pipeline
         .jobs
         .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
+        .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         .is_some()
     {}
     serve_posts(&mut pipeline, &scenario, 2..3).await;

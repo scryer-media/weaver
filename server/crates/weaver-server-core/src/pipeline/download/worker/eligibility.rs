@@ -31,11 +31,15 @@ impl Pipeline {
             if !Self::status_allows_download_dispatch(&state.status) {
                 return false;
             }
+            // A job whose articles are not built yet has every one to hand out
+            // once they are.
+            let Some(queue) = state.articles.download_queue() else {
+                return true;
+            };
             // The checkpoint holds articles one by one, so raw queue occupancy
             // would overstate what this job can hand out right now.
             if checkpoint.enforced {
-                return state
-                    .download_queue
+                return queue
                     .peek_first_matching(|work| {
                         checkpoint.decision(work, &[]).allows()
                             && (!uu_capped
@@ -49,7 +53,7 @@ impl Pipeline {
                     .is_some();
             }
             if !uu_capped {
-                return !state.download_queue.is_empty();
+                return !queue.is_empty();
             }
             // A blocked UU head must not hide another encoding deeper in
             // either heap. Reuse per-file counts instead of scanning articles
@@ -58,11 +62,10 @@ impl Pipeline {
                 .uu_files
                 .keys()
                 .filter(|file_id| file_id.job_id == job_id)
-                .map(|file_id| state.download_queue.queued_count_for_file(*file_id) as usize)
+                .map(|file_id| queue.queued_count_for_file(*file_id) as usize)
                 .sum();
-            state.download_queue.len() > queued_uu
-                || state
-                    .download_queue
+            queue.len() > queued_uu
+                || queue
                     .peek_next_matching(|work| {
                         self.uu_files
                             .get(&work.segment_id.file_id)
@@ -89,7 +92,7 @@ impl Pipeline {
         job_id: JobId,
     ) -> Option<&'static str> {
         let state = self.jobs.get(&job_id)?;
-        if state.download_queue.is_empty()
+        if !state.articles.has_queued_download_work()
             || !Self::status_allows_download_dispatch(&state.status)
             || self.job_has_current_download_activity(job_id)
         {
@@ -110,7 +113,8 @@ impl Pipeline {
             return None;
         }
         let open = state
-            .download_queue
+            .articles
+            .download_queue()?
             .peek_first_matching(|work| checkpoint.decision(work, &[]).allows());
         if open.is_some() {
             None

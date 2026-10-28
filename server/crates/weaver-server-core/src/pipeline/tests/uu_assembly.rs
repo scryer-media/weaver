@@ -106,7 +106,7 @@ fn queued_segment_count(pipeline: &Pipeline, job_id: JobId) -> usize {
     pipeline
         .jobs
         .get(&job_id)
-        .map(|state| state.download_queue.len())
+        .map(|state| state.articles.active().unwrap().download_queue.len())
         .unwrap_or(0)
 }
 

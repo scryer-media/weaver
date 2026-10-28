@@ -48,8 +48,8 @@ async fn drive(
     let look = |pipeline: &Pipeline| {
         let queued = pipeline.jobs.get(&job).map(|state| {
             (
-                state.download_queue.len(),
-                state.recovery_queue.len(),
+                state.articles.active().unwrap().download_queue.len(),
+                state.articles.active().unwrap().recovery_queue.len(),
                 state.status.clone(),
             )
         });
@@ -64,7 +64,7 @@ async fn drive(
         while let Some(work) = pipeline
             .jobs
             .get_mut(&job)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             let article = (
                 work.segment_id.file_id.file_index,
@@ -173,6 +173,9 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         .jobs
         .get_mut(&job)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -252,7 +255,7 @@ async fn the_last_decode_holds_the_job_at_the_nzb_downloaded_barrier() {
     while let Some(work) = pipeline
         .jobs
         .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
+        .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
     {
         let article = (
             work.segment_id.file_id.file_index,

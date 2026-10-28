@@ -15,7 +15,12 @@ use crate::pipeline::download::transport::DownloadLaneMode;
 
 fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let works = state.download_queue.drain_all();
+    let works = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     assert!(!works.is_empty(), "the fixture job has queued work");
     let completion_critical = works.iter().any(|work| work.completion_critical);
     pipeline.hold_test_lane_works(works.clone(), false);
@@ -68,7 +73,15 @@ async fn a_contended_acquire_requeues_its_work_and_asks_for_another_pass() {
     );
 
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         leased,
         "contention is not a verdict about the servers: every work item goes \
          back to the scheduler"
@@ -202,7 +215,14 @@ async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
     // So does running out of work: idle lanes with an empty queue are the
     // ordinary end of a job, not a fault.
     pipeline.active_download_connections = 0;
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     pipeline.log_download_lanes_under_cap(later + Duration::from_secs(2), 8);
     assert!(pipeline.download_lanes_under_cap_since.is_none());
 }

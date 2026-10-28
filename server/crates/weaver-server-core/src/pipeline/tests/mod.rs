@@ -255,6 +255,61 @@ pub(in crate::pipeline) fn sample_nzb_zstd() -> Vec<u8> {
     crate::ingest::compress_nzb_bytes(&sample_nzb_bytes()).unwrap()
 }
 
+// The stored NZB a fixture spec would have been read from: the same files,
+// in the same order, with the same articles, so a job added with it reads
+// its articles back when it is first handed work.
+pub(in crate::pipeline) fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
+    fn escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">"#,
+    );
+    for file in &spec.files {
+        let count = file.segments.len();
+        xml.push_str(&format!(
+            r#"<file poster="fixture" date="{}" subject="{}"><groups>"#,
+            file.posted_at_epoch.unwrap_or(1_700_000_000),
+            escape(&format!("\"{}\" yEnc (1/{count})", file.filename)),
+        ));
+        for group in &file.groups {
+            xml.push_str(&format!("<group>{}</group>", escape(group)));
+        }
+        if file.groups.is_empty() {
+            xml.push_str("<group>alt.binaries.test</group>");
+        }
+        xml.push_str("</groups><segments>");
+        for segment in &file.segments {
+            for message_id in segment.message_ids.all() {
+                xml.push_str(&format!(
+                    r#"<segment bytes="{}" number="{}">{}</segment>"#,
+                    segment.bytes,
+                    segment.article_number.max(segment.ordinal + 1),
+                    escape(message_id),
+                ));
+            }
+        }
+        xml.push_str("</segments></file>");
+    }
+    xml.push_str("</nzb>");
+    crate::ingest::compress_nzb_bytes(xml.as_bytes()).unwrap()
+}
+
+// Build a waiting job's articles as its first handout would, and wait for
+// them: the read is sent for and its result delivered on the actor's turn.
+pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: JobId) {
+    pipeline.request_job_activation(job_id);
+    let done = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the activation channel stays open");
+    pipeline.handle_job_activated(done);
+}
+
 fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobState {
     JobState {
         job_id,
@@ -271,7 +326,13 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         download_state: crate::jobs::model::DownloadState::Downloading,
         post_state: crate::jobs::model::PostState::Idle,
         run_state: crate::jobs::model::RunState::Active,
-        assembly: JobAssembly::new(job_id),
+        articles: crate::jobs::model::JobArticles::Active(Box::new(
+            crate::jobs::model::ActiveArticles {
+                assembly: JobAssembly::new(job_id),
+                download_queue: DownloadQueue::new(),
+                recovery_queue: DownloadQueue::new(),
+            },
+        )),
         created_at: std::time::Instant::now(),
         created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
         queued_repair_at_epoch_ms: None,
@@ -290,8 +351,6 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         support_facts: Default::default(),
         detected_archives: HashMap::new(),
         file_identities: HashMap::new(),
-        download_queue: DownloadQueue::new(),
-        recovery_queue: DownloadQueue::new(),
         staging_dir: None,
         category_bytes: None,
         nzb_password_candidates: Default::default(),
@@ -1539,7 +1598,8 @@ pub(in crate::pipeline) async fn insert_active_job(
     job_id: JobId,
     spec: JobSpec,
 ) -> PathBuf {
-    insert_active_job_with_persisted_nzb(pipeline, job_id, spec, sample_nzb_zstd()).await
+    let nzb_zstd = nzb_zstd_for(&spec);
+    insert_active_job_with_persisted_nzb(pipeline, job_id, spec, nzb_zstd).await
 }
 
 async fn insert_active_job_with_persisted_nzb(
@@ -1606,7 +1666,6 @@ async fn insert_active_job_with_persisted_nzb_named(
             supplied_password_candidates: Vec::new(),
         })
         .unwrap();
-    let (assembly, download_queue) = Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
     // This fixture represents work already admitted, not queued intake.
     pipeline.db.set_nzb_admitted(job_id, true).unwrap();
     pipeline.nzb_admitted.insert(job_id);
@@ -1622,7 +1681,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             download_state: crate::jobs::model::DownloadState::Downloading,
             post_state: crate::jobs::model::PostState::Idle,
             run_state: crate::jobs::model::RunState::Active,
-            assembly,
+            articles: crate::jobs::model::JobArticles::Queued(Default::default()),
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: None,
@@ -1641,14 +1700,13 @@ async fn insert_active_job_with_persisted_nzb_named(
             support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
-            download_queue,
-            recovery_queue: DownloadQueue::new(),
             staging_dir: None,
             category_bytes: None,
             nzb_password_candidates: Default::default(),
         },
     );
-    pipeline.admit_graph_job(job_id);
+    // The fixture's articles are built as a job's first handout builds them.
+    pipeline.activate_job_articles(job_id, &HashSet::new(), None, None);
     pipeline.job_order.push(job_id);
     pipeline.report_all_for_test();
     working_dir
@@ -1765,7 +1823,7 @@ async fn submit_decoded_segment_with_segments(
     let declared_file_len = pipeline
         .jobs
         .get(&file_id.job_id)
-        .and_then(|state| state.assembly.file(file_id))
+        .and_then(|state| state.articles.assembly()?.file(file_id))
         .expect("active test file assembly")
         .total_bytes();
     submit_decoded_segment_declaring(
@@ -1807,7 +1865,7 @@ async fn submit_decoded_segment_declaring(
     let file = pipeline
         .jobs
         .get(&file_id.job_id)
-        .and_then(|state| state.assembly.file(file_id))
+        .and_then(|state| state.articles.assembly()?.file(file_id))
         .expect("active test file assembly");
     let yenc_layout = YencLayoutAssertions {
         file_size: declared_file_len,

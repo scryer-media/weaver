@@ -156,6 +156,9 @@ fn member_file(pipeline: &Pipeline, job_id: JobId, member: u32) -> Option<PathBu
 // The assembly never saw a byte of the file.
 fn assembly_wrote_nothing(pipeline: &Pipeline, job_id: JobId, index: u32) {
     let file = pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(NzbFileId {
             job_id,
@@ -285,12 +288,18 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         let id = segment_id(job_id, 2, ordinal);
         assert_eq!(
             state
+                .articles
+                .active()
+                .unwrap()
                 .recovery_queue
                 .count_matching(|work| work.segment_id == id),
             0
         );
         assert_eq!(
             state
+                .articles
+                .active()
+                .unwrap()
                 .download_queue
                 .count_matching(|work| work.segment_id == id
                     && work.is_recovery
@@ -569,8 +578,8 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     // The queues owe nothing more, so the completion gate hands the job to
     // its delivery.
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     state.status = JobStatus::Downloading;
     state.refresh_runtime_lanes_from_status();
     pipeline.check_job_completion(job_id).await;
@@ -755,12 +764,18 @@ fn assert_parked(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
     let state = &pipeline.jobs[&job_id];
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .recovery_queue
             .count_matching(|work| work.segment_id == id),
         1
     );
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == id),
         0
@@ -777,12 +792,18 @@ fn assert_raised(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
     let state = &pipeline.jobs[&job_id];
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .recovery_queue
             .count_matching(|work| work.segment_id == id),
         0
     );
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == id
                 && work.is_recovery
@@ -820,7 +841,10 @@ async fn a_recovery_volume_whose_head_arrived_before_damage_is_parked_not_fetche
     let posts = three_volumes(30);
     let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     let state = &pipeline.jobs[&job_id];
-    assert!(state.recovery_queue.is_empty(), "nothing parked by name");
+    assert!(
+        state.articles.active().unwrap().recovery_queue.is_empty(),
+        "nothing parked by name"
+    );
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode_head(&mut pipeline, job_id, &posts, 2).await;
     let rest = after_head(&posts, 2);

@@ -28,7 +28,8 @@ use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline, retire_pipeline_database, sample_nzb_zstd, segment_id,
+    activate_job, insert_active_job, new_direct_pipeline, nzb_zstd_for, retire_pipeline_database,
+    segment_id,
 };
 use crate::pipeline::{
     DecodeResult, DecodedChunk, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -510,9 +511,15 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
     let parked = segment_id(job_id, 1, 1);
     let waiting = |state: &crate::jobs::model::JobState| {
         state
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == parked)
             + state
+                .articles
+                .active()
+                .unwrap()
                 .recovery_queue
                 .count_matching(|work| work.segment_id == parked)
     };
@@ -526,7 +533,13 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
         }],
     );
     assert_eq!(waiting(state), 1);
-    let first = state.download_queue.pop().unwrap();
+    let first = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
     assert_eq!(first.segment_id, parked);
     assert!(first.completion_critical && first.is_recovery);
 }
@@ -550,7 +563,7 @@ async fn a_window_move_leads_the_ordinary_articles_of_other_files() {
         }),
     );
     let mut order = Vec::new();
-    while let Some(work) = state.download_queue.pop() {
+    while let Some(work) = state.articles.active_mut().unwrap().download_queue.pop() {
         if work.segment_id.segment_number > 0 {
             order.push(work.segment_id);
         }
@@ -582,13 +595,25 @@ async fn the_first_article_of_every_member_is_requested_before_ordinary_articles
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let leading: Vec<SegmentId> = (0..members)
-        .map(|_| state.download_queue.pop().unwrap().segment_id)
+        .map(|_| {
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .pop()
+                .unwrap()
+                .segment_id
+        })
         .collect();
     assert!(leading.iter().all(|id| id.segment_number == 0));
     let sampled: HashSet<u32> = leading.iter().map(|id| id.file_id.file_index).collect();
     assert_eq!(sampled.len(), members);
     assert_ne!(
         state
+            .articles
+            .active_mut()
+            .unwrap()
             .download_queue
             .pop()
             .unwrap()
@@ -666,7 +691,14 @@ async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles
     )
     .await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    while state.download_queue.pop().is_some() {}
+    while state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .is_some()
+    {}
 
     // The first RAR volume's role ranks it ahead of everything, and a
     // retry rebuilt from the post says so; the root holds it ordinary.
@@ -681,10 +713,24 @@ async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles
     pipeline.enqueue_download_work(retry);
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let requeued = state.download_queue.pop().unwrap();
+    let requeued = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
     assert_eq!(requeued.segment_id, first_volume);
     assert_eq!(requeued.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
-    assert!(state.download_queue.pop().is_none());
+    assert!(
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .pop()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1099,27 +1145,30 @@ fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
     assert_eq!(changed(400), small);
 }
 
-// Admission makes every new job a graph job.
+// Every job becomes a graph job when its articles are built, and not before.
 #[tokio::test]
-async fn admission_makes_a_graph_job() {
+async fn a_job_becomes_a_graph_job_when_its_articles_are_built() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(91_008);
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let resources = pipeline.admission_resources();
+    let lantern = spec(
+        "lantern default",
+        vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
+    );
     let prepared = crate::pipeline::Pipeline::prepare_add(
         &resources,
         job_id,
-        spec(
-            "lantern default",
-            vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
-        ),
+        lantern.clone(),
         PathBuf::from("lantern-default.nzb"),
-        sample_nzb_zstd(),
+        nzb_zstd_for(&lantern),
         crate::jobs::AddJobOptions::default(),
     )
     .await
     .unwrap();
     pipeline.install_prepared_add(job_id, prepared);
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+    activate_job(&mut pipeline, job_id).await;
     assert!(pipeline.graph_jobs.contains_key(&job_id));
     retire_pipeline_database(pipeline).await;
 }
@@ -1140,11 +1189,12 @@ async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
                 job_id,
                 lantern.clone(),
                 PathBuf::from("lantern-stamp.nzb"),
-                sample_nzb_zstd(),
+                nzb_zstd_for(&lantern),
                 crate::jobs::AddJobOptions::default(),
             )
             .await
             .unwrap();
+        activate_job(&mut pipeline, job_id).await;
         assert!(pipeline.graph_jobs.contains_key(&job_id));
 
         // A row with the checkpoint its admission took.

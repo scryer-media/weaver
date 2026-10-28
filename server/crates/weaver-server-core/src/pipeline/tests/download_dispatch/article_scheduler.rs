@@ -125,7 +125,15 @@ fn article_counts(
 }
 
 fn queued(pipeline: &Pipeline, job_id: JobId) -> usize {
-    pipeline.jobs.get(&job_id).unwrap().download_queue.len()
+    pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len()
 }
 
 // Hold a job's payload behind the restart checkpoint: an enforced durable
@@ -136,6 +144,9 @@ fn try_block_on_checkpoint(pipeline: &mut Pipeline, job_id: JobId) -> bool {
     let Some(segment_id) = pipeline
         .jobs
         .get(&job_id)
+        .unwrap()
+        .articles
+        .active()
         .unwrap()
         .download_queue
         .peek_in_class(false)
@@ -176,12 +187,22 @@ fn unblock_checkpoint(pipeline: &mut Pipeline, job_id: JobId) {
 // Rewrite a job's whole queue through `edit`, keeping it in the same queue.
 fn rewrite_queue(pipeline: &mut Pipeline, job_id: JobId, mut edit: impl FnMut(&mut DownloadWork)) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let mut works = state.download_queue.drain_all();
+    let mut works = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     for work in &mut works {
         edit(work);
     }
     for work in works {
-        state.download_queue.push(work);
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .push(work);
     }
 }
 
@@ -1100,4 +1121,235 @@ async fn the_share_never_starves_a_pipe() {
         3,
         "everything the job has, well inside the floor"
     );
+}
+
+fn scan_skips(pipeline: &Pipeline) -> u64 {
+    pipeline
+        .metrics
+        .download_scheduler_scan_items_skipped_total
+        .load(Ordering::Relaxed)
+}
+
+// A hot job the restart checkpoint holds whole is passed without reading its
+// queue: the walk reaches the next job having looked at none of the held
+// job's articles, and the recheck the checkpoint owes is still noted. A
+// recovery article, which the checkpoint never holds, is still found.
+#[tokio::test]
+async fn a_checkpoint_held_hot_job_is_passed_without_reading_its_queue() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let hot = JobId(71201);
+    let next = JobId(71202);
+    add_job(&mut pipeline, hot, "Held Archive", 500).await;
+    add_job(&mut pipeline, next, "Open Archive", 200).await;
+    block_on_checkpoint(&mut pipeline, hot);
+
+    let works = taken(ask(&mut pipeline, SERVER_A, 8, None));
+    assert_eq!(single_job(&works), next);
+    assert_eq!(scan_skips(&pipeline), 0);
+    assert!(
+        pipeline
+            .download_restart_durable_lead_retry_after
+            .contains_key(&hot),
+        "a whole-queue checkpoint refusal must leave the recheck note the queue owes"
+    );
+
+    rewrite_queue(&mut pipeline, hot, |work| {
+        work.is_recovery = work.segment_id.segment_number == 7;
+    });
+    let works = taken(ask(&mut pipeline, SERVER_A, 8, None));
+    assert_eq!(single_job(&works), hot);
+    assert_eq!(works.len(), 1);
+    assert!(works[0].is_recovery);
+    assert_eq!(idle_with_servable(&pipeline), 0);
+}
+
+// Add a job through admission as a submitted NZB is added, so it waits its
+// turn with its NZB stored. Returns the job's spec as read from that NZB.
+async fn add_queued_job(pipeline: &mut Pipeline, job_id: JobId, articles: usize) -> JobSpec {
+    let segments: String = (1..=articles)
+        .map(|number| {
+            format!(
+                r#"<segment bytes="512" number="{number}">{}-{number}@queued.test</segment>"#,
+                job_id.0
+            )
+        })
+        .collect();
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <file poster="poster" date="1700000000" subject="&quot;payload.bin&quot; yEnc (1/{articles})">
+            <groups><group>alt.binaries.test</group></groups>
+            <segments>{segments}</segments>
+          </file>
+        </nzb>"#
+    );
+    let nzb_zstd = crate::ingest::compress_nzb_bytes(xml.as_bytes()).unwrap();
+    let nzb_path = PathBuf::from(format!("queued-{}.nzb", job_id.0));
+    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd).unwrap();
+    let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, None, vec![]);
+    let resources = pipeline.admission_resources();
+    let prepared = Pipeline::prepare_add(
+        &resources,
+        job_id,
+        spec.clone(),
+        nzb_path,
+        nzb_zstd,
+        crate::jobs::AddJobOptions::default(),
+    )
+    .await
+    .unwrap();
+    pipeline.install_prepared_add(job_id, prepared);
+    spec
+}
+
+// Deliver the read of a job's articles the scheduler sent for.
+async fn deliver_activation(pipeline: &mut Pipeline) {
+    let done = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the activation channel stays open");
+    pipeline.handle_job_activated(done);
+}
+
+// A job waiting its turn holds nothing per article and is charged nothing:
+// its files keep their article counts and sizes, and nothing else.
+#[tokio::test]
+async fn a_queued_job_is_charged_nothing_and_holds_no_article_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job = JobId(71211);
+    let spec = add_queued_job(&mut pipeline, job, 24).await;
+
+    let state = &pipeline.jobs[&job];
+    let crate::jobs::model::JobArticles::Queued(summaries) = &state.articles else {
+        panic!("a job waiting its turn must hold no built articles");
+    };
+    assert_eq!(summaries.0.len(), 1);
+    assert_eq!(summaries.0[0].articles, 24);
+    assert_eq!(
+        summaries.0[0].bytes,
+        spec.files[0]
+            .segments
+            .iter()
+            .map(|segment| u64::from(segment.bytes))
+            .sum::<u64>()
+    );
+    assert!(state.spec.files.iter().all(|file| file.segments.is_empty()));
+    assert_eq!(state.spec.files[0].filename, spec.files[0].filename);
+    assert_eq!(state.articles.queued_download_len(), 24);
+    assert!(!pipeline.repeated_articles.contains_key(&job));
+    assert!(!pipeline.job_article_memory.contains_key(&job));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+}
+
+// A job's articles are built the first time the scheduler reaches it, read
+// back from its stored NZB, and charged then, past a full ledger. Until they
+// arrive its turn passes to the next job.
+#[tokio::test]
+async fn a_queued_job_is_built_on_its_first_handout_and_charged() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job = JobId(71221);
+    let next = JobId(71222);
+    let spec = add_queued_job(&mut pipeline, job, 16).await;
+    // The job holds its place among the NZBs being downloaded.
+    pipeline.db.set_nzb_admitted(job, true).unwrap();
+    pipeline.nzb_admitted.insert(job);
+    add_job(&mut pipeline, next, "Running Reel", 16).await;
+    // A ledger with no room: what a job builds is charged past it.
+    pipeline.process_memory_budget = Arc::new(crate::pipeline::ProcessMemoryBudget::new(0));
+
+    // The first reach sends for the articles; the job's turn spills on.
+    assert_eq!(
+        single_job(&taken(ask(&mut pipeline, SERVER_A, 4, None))),
+        next
+    );
+    assert!(matches!(
+        pipeline.jobs[&job].articles,
+        crate::jobs::model::JobArticles::Activating(_)
+    ));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+
+    deliver_activation(&mut pipeline).await;
+    let state = &pipeline.jobs[&job];
+    let ordinals = |segments: &[crate::jobs::model::SegmentSpec]| -> Vec<(u32, u32)> {
+        segments
+            .iter()
+            .map(|segment| (segment.ordinal, segment.bytes))
+            .collect()
+    };
+    assert_eq!(
+        ordinals(&state.spec.files[0].segments),
+        ordinals(&spec.files[0].segments)
+    );
+    assert_eq!(state.articles.active().unwrap().download_queue.len(), 16);
+    let charged = spec.scheduling_memory_estimate();
+    assert!(pipeline.job_article_memory.contains_key(&job));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), charged);
+
+    let works = taken(ask(&mut pipeline, SERVER_A, 4, None));
+    assert_eq!(single_job(&works), job);
+    // Handing work out again charges nothing more.
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), charged);
+}
+
+// A job's articles, its repeated-article index and their charge go when the
+// job leaves the pipeline, as it ends or is cancelled.
+#[tokio::test]
+async fn a_built_job_drops_its_articles_and_charge_when_it_ends() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let ended = JobId(71231);
+    let cancelled = JobId(71232);
+    add_queued_job(&mut pipeline, ended, 8).await;
+    let cancelled_spec = add_queued_job(&mut pipeline, cancelled, 8).await;
+    for job in [ended, cancelled] {
+        pipeline.request_job_activation(job);
+        deliver_activation(&mut pipeline).await;
+        assert!(pipeline.jobs[&job].articles.active().is_some());
+    }
+    assert!(pipeline.process_memory_budget.reserved_bytes() > 0);
+
+    pipeline.purge_terminal_job_runtime(ended);
+    assert!(!pipeline.jobs.contains_key(&ended));
+    assert!(!pipeline.job_article_memory.contains_key(&ended));
+    assert!(!pipeline.repeated_articles.contains_key(&ended));
+    assert_eq!(
+        pipeline.process_memory_budget.reserved_bytes(),
+        cancelled_spec.scheduling_memory_estimate()
+    );
+
+    crate::pipeline::tests::cancel_one_job(
+        &mut pipeline,
+        cancelled,
+        crate::jobs::handle::CancellationOrigin::User,
+    )
+    .await
+    .unwrap();
+    assert!(!pipeline.jobs.contains_key(&cancelled));
+    assert!(!pipeline.job_article_memory.contains_key(&cancelled));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+}
+
+// A job whose stored NZB cannot be read back ends Failed through the
+// failure path, and is never left waiting.
+#[tokio::test]
+async fn a_job_whose_articles_cannot_be_read_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job = JobId(71241);
+    add_queued_job(&mut pipeline, job, 8).await;
+    pipeline.db.delete_active_job(job).unwrap();
+    pipeline.request_job_activation(job);
+    deliver_activation(&mut pipeline).await;
+    assert!(
+        pipeline
+            .jobs
+            .get(&job)
+            .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. }))
+    );
+    assert!(!pipeline.job_article_memory.contains_key(&job));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
 }

@@ -226,7 +226,9 @@ impl std::fmt::Display for ExtractionFailure {
 
 // The process-wide pool that a submitted job's scheduling metadata and
 // repeated-article indexes are reserved from. Admission never waits: a
-// reservation that would pass the limit fails outright.
+// reservation that would pass the limit fails outright. State already
+// admitted is charged without a limit check (see
+// [`ProcessMemoryBudget::charge_retained`]).
 #[derive(Debug)]
 pub(crate) struct ProcessMemoryBudget {
     limit: u64,
@@ -310,6 +312,23 @@ impl ProcessMemoryBudget {
             budget: Arc::clone(self),
             bytes,
         })
+    }
+
+    // Record `bytes` the process already holds, or is about to hold for work
+    // it has already admitted, until the returned permit drops. Never
+    // refuses: the limit is judged when work is admitted, and state that was
+    // admitted is charged as it is, even past the limit, so the next
+    // admission sees it.
+    pub(crate) fn charge_retained(self: &Arc<Self>, bytes: u64) -> ProcessMemoryPermit {
+        let _guard = self
+            .admission
+            .lock()
+            .expect("process memory state poisoned");
+        self.reserved.fetch_add(bytes, Ordering::AcqRel);
+        ProcessMemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+        }
     }
 
     #[cfg(test)]

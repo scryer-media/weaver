@@ -334,9 +334,9 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
         .handle
         .add_job(
             job_id,
-            spec,
+            spec.clone(),
             PathBuf::from("capacity-recovery.nzb"),
-            Vec::new(),
+            nzb_zstd_for(&spec),
         )
         .await
         .unwrap();
@@ -481,7 +481,12 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
 
     harness
         .handle
-        .add_job(job_id, spec, PathBuf::from("held-off.nzb"), Vec::new())
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("held-off.nzb"),
+            nzb_zstd_for(&spec),
+        )
         .await
         .unwrap();
 
@@ -821,7 +826,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
     }
 
     let make_work = || DownloadWork {
@@ -852,6 +857,9 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("stale retry should still requeue");
@@ -871,6 +879,9 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     let queued = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -996,7 +1007,12 @@ async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
 
     harness
         .handle
-        .add_job(job_id, spec, PathBuf::from("wire-frame.nzb"), Vec::new())
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("wire-frame.nzb"),
+            nzb_zstd_for(&spec),
+        )
         .await
         .unwrap();
 
@@ -1094,7 +1110,7 @@ async fn cancel_mid_download_archives_then_cleans_up() {
             id,
             segmented_job_spec("Held download", "payload.bin", &[100]),
             PathBuf::from("held.nzb"),
-            sample_nzb_zstd(),
+            nzb_zstd_for(&(segmented_job_spec("Held download", "payload.bin", &[100]))),
         )
         .await
         .unwrap();
@@ -1195,7 +1211,12 @@ async fn repeated_article_case(uuencode: bool) {
     }
     harness
         .handle
-        .add_job(id, spec, PathBuf::from("repeat.nzb"), sample_nzb_zstd())
+        .add_job(
+            id,
+            spec.clone(),
+            PathBuf::from("repeat.nzb"),
+            nzb_zstd_for(&spec),
+        )
         .await
         .unwrap();
     let status = loop {
@@ -1314,6 +1335,9 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
         let work = pipeline
             .jobs
             .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
             .unwrap()
             .download_queue
             .pop()
