@@ -17,6 +17,15 @@
 
 #![warn(clippy::cast_possible_truncation)]
 
+// The e2e carveout lets a torrent make the session announce to local
+// addresses. It builds only with debug assertions on (the dev and e2e
+// profiles), so no release binary can carry it.
+#[cfg(all(feature = "e2e-local-trackers", not(debug_assertions)))]
+compile_error!(
+    "`e2e-local-trackers` is for e2e builds only (--profile e2e or a dev build); \
+     it never builds without debug assertions, so no release binary carries it"
+);
+
 macro_rules! aframe {
     ($e:expr) => {{ $e }};
 }

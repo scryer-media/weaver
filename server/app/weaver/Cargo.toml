@@ -14,6 +14,13 @@ path = "src/main.rs"
 name = "weaver-tray"
 path = "src/tray.rs"
 
+[features]
+# e2e builds only (`cargo build --profile e2e -p weaver --features
+# e2e-local-trackers`): a torrent's trackers may be announced to at local
+# addresses. It refuses to build without debug assertions, so no release
+# binary carries it.
+e2e-local-trackers = ["weaver-server-core/e2e-local-trackers"]
+
 [dependencies]
 weaver-server-core = { path = "../../crates/weaver-server-core", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }

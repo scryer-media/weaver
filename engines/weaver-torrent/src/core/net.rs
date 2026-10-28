@@ -119,6 +119,27 @@ impl NamedBy {
             NamedBy::Operator => true,
         }
     }
+
+    /// Whether a tracker so named may be announced to at `ip`: where it may
+    /// be asked, and, in an e2e build, a torrent's tracker at a local
+    /// address too, so the e2e rigs can serve real trackers on loopback and
+    /// container networks. Web seeds stay under [`NamedBy::may_ask`].
+    pub fn may_announce_to(self, ip: IpAddr) -> bool {
+        #[cfg(feature = "e2e-local-trackers")]
+        if is_local(ip) {
+            return true;
+        }
+        self.may_ask(ip)
+    }
+}
+
+/// Whether `ip` is loopback, private IPv4 or unique-local IPv6.
+#[cfg(feature = "e2e-local-trackers")]
+fn is_local(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(a) => a.is_loopback() || a.is_private(),
+        IpAddr::V6(a) => a.is_loopback() || a.is_unique_local(),
+    }
 }
 
 /// Whether `ip` is a public internet address: global, so neither loopback,
@@ -237,4 +258,39 @@ pub fn for_target(
         .map(|ip| SocketAddr::new(*ip, target.port))
         .collect();
     builder.resolve_to_addrs(target.host, &addrs)
+}
+
+#[cfg(all(test, feature = "e2e-local-trackers"))]
+mod e2e_local_tracker_tests {
+    use super::NamedBy;
+    use std::net::IpAddr;
+
+    #[test]
+    fn an_e2e_build_announces_to_a_torrents_tracker_at_local_addresses_only() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for local in [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "10.89.2.7",
+            "172.16.0.1",
+            "192.168.127.254",
+            "fd00::1",
+        ] {
+            assert!(NamedBy::Torrent.may_announce_to(ip(local)), "{local}");
+            // Web seeds keep the public-only rule.
+            assert!(!NamedBy::Torrent.may_ask(ip(local)), "{local}");
+        }
+        for refused in [
+            "169.254.1.1",
+            "fe80::1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "192.0.2.1",
+            "100.64.0.1",
+        ] {
+            assert!(!NamedBy::Torrent.may_announce_to(ip(refused)), "{refused}");
+        }
+        assert!(NamedBy::Torrent.may_announce_to(ip("8.8.8.8")));
+    }
 }

@@ -214,7 +214,7 @@ pub(crate) fn only_reachable<A>(
             let ip = ip(a);
             match reachable(ip) {
                 Err(why) => unreachable = unreachable.max(Some(why)),
-                Ok(()) if !named_by.may_ask(ip) => not_public = true,
+                Ok(()) if !named_by.may_announce_to(ip) => not_public = true,
                 Ok(()) => return true,
             }
             false
@@ -4370,6 +4370,8 @@ mod tests {
         )
     }
 
+    // The e2e carveout asks a torrent's tracker at these local addresses.
+    #[cfg(not(feature = "e2e-local-trackers"))]
     #[tokio::test]
     async fn a_tracker_the_torrent_named_is_refused_at_a_private_address() {
         // A tracker that came with the torrent, at a loopback, private,
@@ -4429,6 +4431,55 @@ mod tests {
         token.cancel();
     }
 
+    #[cfg(feature = "e2e-local-trackers")]
+    #[tokio::test]
+    async fn an_e2e_build_asks_a_tracker_the_torrent_named_at_a_local_address() {
+        // In an e2e build a tracker that came with the torrent is asked at a
+        // private address, as a container network gives one; at a
+        // link-local address it is still refused before any client is
+        // built for it.
+        let (tracker, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let named = |s: &str| Url::parse(&s.replace("PORT", &port.to_string())).unwrap();
+        let refused = named("http://link.invalid:PORT/announce");
+        let asked = named("http://ten.invalid:PORT/announce");
+        let names = Names(vec![
+            ("link.invalid", Ipv4Addr::new(169, 254, 1, 1).into()),
+            ("ten.invalid", Ipv4Addr::new(10, 0, 0, 1).into()),
+        ]);
+        let tiers = vec![
+            vec![Tracker::torrent(refused.clone())],
+            vec![Tracker::torrent(asked)],
+        ];
+        let clients = Wired::new(&at);
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, status } =
+            start_through(tiers, clients.clone(), names, &token, &stopped);
+
+        let e = refusal_of(&status, &mut peers, &refused).await;
+        assert!(e.contains("not public"), "{refused}: {e}");
+        let q = answer_with_a_peer(
+            &tracker,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        assert_eq!(
+            *clients.built.lock(),
+            [IpAddr::from(Ipv4Addr::new(10, 0, 0, 1))]
+        );
+
+        drop(peers);
+        let q = next_announce(&tracker).await;
+        assert_eq!(query_param(&q, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    // The e2e carveout asks a torrent's tracker at these local addresses.
+    #[cfg(not(feature = "e2e-local-trackers"))]
     #[tokio::test]
     async fn a_udp_tracker_is_resolved_to_the_addresses_its_naming_allows() {
         // A UDP tracker that came with the torrent has no address to be
@@ -4471,6 +4522,8 @@ mod tests {
         }
     }
 
+    // The e2e carveout asks a torrent's tracker at these local addresses.
+    #[cfg(not(feature = "e2e-local-trackers"))]
     #[tokio::test]
     async fn a_public_tracker_may_not_move_an_announce_to_a_private_address() {
         // A tracker reached at public addresses only that redirects to a

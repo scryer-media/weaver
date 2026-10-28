@@ -8,6 +8,12 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# e2e builds only: a torrent's trackers may be announced to at loopback,
+# private and unique-local addresses. Refuses to build without debug
+# assertions, so it can never reach a release binary.
+e2e-local-trackers = []
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }

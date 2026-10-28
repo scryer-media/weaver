@@ -670,6 +670,8 @@ mod tests {
     // any other, and no client is built; one the operator named is asked at
     // loopback at a tracker's path. Under a name the network resolves at
     // its exit nothing is refused by address, whoever named it.
+    // The e2e carveout asks a torrent's tracker at these local addresses.
+    #[cfg(not(feature = "e2e-local-trackers"))]
     #[tokio::test]
     async fn a_tracker_the_torrent_named_is_asked_at_public_addresses_only() {
         let reachable: Reachable = std::sync::Arc::new(|_| Ok(()));
@@ -740,6 +742,55 @@ mod tests {
                 [("tracker.test".to_owned(), 80, Vec::new())]
             );
         }
+    }
+
+    // In an e2e build a tracker that came with the torrent is asked at a
+    // loopback, private or unique-local address, at loopback only at a
+    // tracker's path; at a link-local address it is still refused, and no
+    // client is built.
+    #[cfg(feature = "e2e-local-trackers")]
+    #[tokio::test]
+    async fn an_e2e_build_asks_a_tracker_the_torrent_named_at_local_addresses() {
+        let reachable: Reachable = std::sync::Arc::new(|_| Ok(()));
+        let at = |ip: &str| Answering {
+            answer: Resolved::Addresses(vec![SocketAddr::new(ip.parse().unwrap(), 80)]),
+            asked: Default::default(),
+        };
+        let ask_at = |ip: &'static str, path: &str, ask: Ask| {
+            let url = url::Url::parse(&format!("http://tracker.test{path}")).unwrap();
+            let at = at(ip);
+            let reachable = reachable.clone();
+            async move {
+                let clients = Targets::default();
+                let asked = reach(&clients, &url, NamedBy::Torrent, ask, &at, &reachable).await;
+                let built = !clients.0.lock().unwrap().is_empty();
+                (asked, built)
+            }
+        };
+
+        for ip in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "fd00::1"] {
+            for (path, ask) in [("/announce", Ask::Announce), ("/scrape", Ask::Scrape)] {
+                let (asked, built) = ask_at(ip, path, ask).await;
+                let (_, addrs) = asked.unwrap_or_else(|e| panic!("{ip} {path}: {e:#}"));
+                assert_eq!(addrs, [ip.parse::<IpAddr>().unwrap()], "{ip} {path}");
+                assert!(built, "{ip} {path}");
+            }
+        }
+
+        let (asked, built) = ask_at("127.0.0.1", "/admin", Ask::Announce).await;
+        let refused = asked.err().expect("loopback /admin was asked");
+        assert!(format!("{refused:#}").contains("SSRF"), "{refused:#}");
+        assert!(!built);
+
+        let (asked, built) = ask_at("169.254.1.1", "/announce", Ask::Announce).await;
+        let refused = asked.err().expect("169.254.1.1 was asked");
+        assert!(
+            refused
+                .downcast_ref::<crate::tracker::tracker_comms::NotPublic>()
+                .is_some(),
+            "{refused:#}"
+        );
+        assert!(!built);
     }
 
     #[test]
