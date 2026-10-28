@@ -22,7 +22,14 @@ async fn an_ineligible_job_reports_at_most_once_a_window() {
     // Articles queued, a status that dispatches, and still nothing handed out:
     // this is the shape the stall reports. Here the job holds no admission.
     pipeline.nzb_admitted.remove(&job_id);
-    assert!(!pipeline.jobs[&job_id].download_queue.is_empty());
+    assert!(
+        !pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
 
     // Every pass runs at an instant the test names, so the window is the
     // passes', not the machine's.
@@ -90,7 +97,12 @@ async fn a_job_past_its_download_is_not_a_stall() {
         .await;
         {
             let state = pipeline.jobs.get_mut(&job_id).unwrap();
-            state.download_queue.drain_all();
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .drain_all();
             state.status = status.clone();
         }
 
@@ -122,9 +134,19 @@ async fn parked_recovery_behind_a_moving_job_is_not_a_stall() {
     .await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let parked = state.download_queue.drain_all();
+        let parked = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all();
         for work in parked {
-            state.recovery_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .recovery_queue
+                .push(work);
         }
         state.status = JobStatus::Moving;
     }

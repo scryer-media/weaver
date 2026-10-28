@@ -500,12 +500,16 @@ impl Pipeline {
         let share = capacity.div_ceil(self.nzb_admitted.len().max(1));
         // Sized for a payload article. A job with no payload queued has
         // nothing for a warm connection to carry.
-        let Some((queued, byte_estimate)) = self.jobs.get(&job_id).and_then(|state| {
-            state
-                .download_queue
-                .peek_in_class(false)
-                .map(|work| (state.download_queue.len_in_class(false), work.byte_estimate))
-        }) else {
+        let Some((queued, byte_estimate)) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.articles.download_queue())
+            .and_then(|queue| {
+                queue
+                    .peek_in_class(false)
+                    .map(|work| (queue.len_in_class(false), work.byte_estimate))
+            })
+        else {
             return;
         };
         let limit = free.min(share).min(queued);
@@ -637,7 +641,7 @@ impl Pipeline {
             // Optional recovery files remain parked in `recovery_queue` until
             // explicitly promoted, so they must not keep a download pass open
             // once all dispatchable work has drained.
-            !state.download_queue.is_empty()
+            state.articles.has_queued_download_work()
         }) || self
             .pending_retries_by_job
             .get(&job_id)
@@ -766,7 +770,7 @@ impl Pipeline {
             for (i, jid) in self.job_order.iter().enumerate() {
                 if let Some(s) = self.jobs.get(jid) {
                     let status_allows_dispatch = Self::status_allows_download_dispatch(&s.status);
-                    let download_pipeline_draining = s.download_queue.is_empty()
+                    let download_pipeline_draining = !s.articles.has_queued_download_work()
                         && status_allows_dispatch
                         && self.job_has_pending_download_pipeline_work(*jid);
                     if download_pipeline_draining {
@@ -774,8 +778,8 @@ impl Pipeline {
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
+                            queue_len = s.articles.queued_download_len(),
+                            recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
                         );
@@ -786,7 +790,7 @@ impl Pipeline {
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
+                            queue_len = s.articles.queued_download_len(),
                             "dispatch idle: waiting for scripts that run when a job is added"
                         );
                     } else if matches!(
@@ -804,12 +808,12 @@ impl Pipeline {
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
+                            queue_len = s.articles.queued_download_len(),
+                            recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: job not eligible by status"
                         );
-                    } else if !status_allows_dispatch || s.download_queue.is_empty() {
+                    } else if !status_allows_dispatch || !s.articles.has_queued_download_work() {
                         // A job with nothing queued to fetch — its download is
                         // done and it is verifying, extracting or moving its
                         // output, or its last articles are still settling — is
@@ -820,8 +824,8 @@ impl Pipeline {
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
+                            queue_len = s.articles.queued_download_len(),
+                            recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: nothing for dispatch to hand out"
                         );
@@ -830,8 +834,8 @@ impl Pipeline {
                             *jid,
                             i,
                             s.status.clone(),
-                            s.download_queue.len(),
-                            s.recovery_queue.len(),
+                            s.articles.queued_download_len(),
+                            s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                         ));
                     }

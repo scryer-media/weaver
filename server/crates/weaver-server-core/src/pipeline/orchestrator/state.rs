@@ -106,20 +106,14 @@ impl Pipeline {
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
 
-        let mut released_bytes = 0usize;
-        let mut released_segments = 0usize;
-        let mut released_spooled_bytes = 0usize;
-        let mut released_spooled_segments = 0usize;
-        let mut released_uu_parked_segments = 0usize;
         for file_id in file_ids {
-            // Memory and disk parks use distinct ledgers. Removing the entry
-            // drops `TempPath` and unlinks every remaining per-job spool file.
+            // Memory and disk parks use distinct ledgers; each part is let
+            // go as any part is, its spool file with it.
             if let Some(uu) = self.uu_files.remove(&file_id) {
-                released_bytes += uu.parked_memory_bytes();
-                released_segments += uu.parked.len() - uu.parked_spooled_segments();
-                released_spooled_bytes += uu.parked_spooled_bytes();
-                released_spooled_segments += uu.parked_spooled_segments();
-                released_uu_parked_segments += uu.parked.len();
+                for bytes in uu.parked.into_values() {
+                    self.release_parked_bytes(bytes);
+                    self.release_uu_parked_segment();
+                }
             }
             self.uu_park_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
@@ -127,24 +121,14 @@ impl Pipeline {
                 .retain(|segment_id, _| segment_id.file_id != file_id);
             self.pending_unanchored_release
                 .retain(|segment_id| segment_id.file_id != file_id);
-            if let Some(parked) = self.unanchored_parked.remove(&file_id) {
-                released_bytes += parked
-                    .values()
-                    .map(|(result, _)| result.data.len_bytes())
-                    .sum::<usize>();
-                released_segments += parked.len();
+            for part in self
+                .unanchored_parked
+                .remove(&file_id)
+                .into_iter()
+                .flat_map(BTreeMap::into_values)
+            {
+                self.release_parked_bytes(part.bytes);
             }
         }
-
-        if released_bytes > 0 || released_segments > 0 {
-            self.release_write_buffered(released_bytes, released_segments);
-        }
-        if released_spooled_bytes > 0 || released_spooled_segments > 0 {
-            self.release_uu_spooled(released_spooled_bytes, released_spooled_segments);
-        }
-        for _ in 0..released_uu_parked_segments {
-            self.release_uu_parked_segment();
-        }
-        remove_empty_uu_park_dir(&self.uu_spool_root, job_id);
     }
 }

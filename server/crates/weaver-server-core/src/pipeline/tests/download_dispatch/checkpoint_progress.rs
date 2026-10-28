@@ -91,7 +91,12 @@ async fn checkpoint_deadline_is_consumed_when_capacity_pressure_or_pause_bypasse
 async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     let temp = tempfile::tempdir().unwrap();
     let mut pipeline = restored_with_parked_retries(&temp).await;
-    let queued = pipeline.jobs[&HOT].download_queue.len();
+    let queued = pipeline.jobs[&HOT]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len();
     pipeline.dispatch_downloads();
     let (old_id, segment_id) = pipeline.checkpoint_progress_articles[&HOT];
     let original = pipeline.download_lane_owners[&old_id].outstanding[&segment_id].clone();
@@ -101,7 +106,15 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     );
     pipeline.auto_pause_stalled_downloads();
     assert_eq!(pipeline.jobs[&HOT].status, JobStatus::Paused);
-    assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued);
+    assert_eq!(
+        pipeline.jobs[&HOT]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        queued
+    );
     assert_eq!(pipeline.active_downloads, 0);
     assert_eq!(pipeline.active_download_connections, 0);
     assert!(pipeline.rate_limit_reservations.is_empty());
@@ -109,7 +122,14 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     assert!(!pipeline.download_lane_owners.contains_key(&old_id));
     // Force reuse of the same segment to exercise the hardest stale-event
     // case; ordinary FIFO scheduling may select another queued article first.
-    let queue = &mut pipeline.jobs.get_mut(&HOT).unwrap().download_queue;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&HOT)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
     let returned = queue
         .pop_first_matching(|work| work.segment_id == segment_id)
         .unwrap();
@@ -117,7 +137,14 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
     queue.push(returned);
     pipeline.resume_job_runtime(HOT).unwrap();
     pipeline.dispatch_downloads();
-    pipeline.jobs.get_mut(&HOT).unwrap().download_queue = other_work;
+    pipeline
+        .jobs
+        .get_mut(&HOT)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = other_work;
     let (replacement, replacement_segment) = pipeline.checkpoint_progress_articles[&HOT];
     assert_ne!(replacement, old_id);
     assert_eq!(replacement_segment, segment_id);
@@ -180,7 +207,15 @@ async fn checkpoint_abandoned_lane_requeues_once_and_fences_late_events() {
         pipeline.checkpoint_progress_articles[&HOT],
         (replacement, segment_id)
     );
-    assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued - 1);
+    assert_eq!(
+        pipeline.jobs[&HOT]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        queued - 1
+    );
     assert_eq!(pipeline.pending_retries_by_job[&HOT], 130);
     assert_eq!(
         pipeline.download_lane_owners[&replacement].outstanding[&segment_id].retry_count,
@@ -307,7 +342,12 @@ async fn checkpoint_teardown_refunds_before_clearing_and_leaves_no_activity() {
 async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
     let temp = tempfile::tempdir().unwrap();
     let mut pipeline = restored_with_parked_retries(&temp).await;
-    let queued = pipeline.jobs[&HOT].download_queue.len();
+    let queued = pipeline.jobs[&HOT]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len();
     pipeline.dispatch_downloads();
     let (lane_id, segment_id) = pipeline.checkpoint_progress_articles[&HOT];
     pipeline.pause_job_runtime(HOT).unwrap();
@@ -350,7 +390,15 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
     // leases: retirement leaves it up with its connection booked.
     assert_eq!(pipeline.active_download_connections, 1);
     assert!(pipeline.download_lane_owners.contains_key(&lane_id));
-    assert_eq!(pipeline.jobs[&HOT].download_queue.len(), queued - 1);
+    assert_eq!(
+        pipeline.jobs[&HOT]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        queued - 1
+    );
     assert_eq!(
         pipeline.checkpoint_progress_articles[&HOT],
         (lane_id, segment_id)
@@ -397,6 +445,9 @@ fn park_one(pipeline: &mut Pipeline, delay: Option<Duration>) {
     let work = pipeline
         .jobs
         .get_mut(&HOT)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop_first_matching(|_| true)
@@ -474,12 +525,22 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
         .jobs
         .get_mut(&HOT)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop_first_matching(|_| true)
         .unwrap();
     recovery.is_recovery = true;
     recovery.completion_critical = true;
-    let queue = &mut pipeline.jobs.get_mut(&HOT).unwrap().download_queue;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&HOT)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
     let mut critical_primary = queue.pop_first_matching(|_| true).unwrap();
     critical_primary.completion_critical = true;
     queue.push(critical_primary);
@@ -487,10 +548,16 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
         .jobs
         .get_mut(&HOT)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .push(recovery);
     assert!(
         pipeline.jobs[&HOT]
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .peek_next_matching(|work| !work.is_recovery)
             .is_some(),
@@ -565,6 +632,9 @@ async fn checkpoint_progress_diagnostics_track_staggered_retries_and_cancel() {
     assert_eq!(pipeline.pending_retries_by_job.get(&HOT), Some(&131));
     assert_eq!(
         pipeline.jobs[&HOT]
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == ready_id && work.retry_count == 0),
         1

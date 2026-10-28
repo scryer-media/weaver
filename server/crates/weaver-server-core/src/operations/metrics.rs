@@ -77,10 +77,12 @@ pub enum SchedulerBlockClause {
     Checkpoint,
     // A higher-priority group can still supply this article.
     ProviderPriority,
+    // The job's articles are still being read back from its stored NZB.
+    Activation,
 }
 
 impl SchedulerBlockClause {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Propagation,
         Self::Retention,
@@ -90,6 +92,7 @@ impl SchedulerBlockClause {
         Self::UuCursor,
         Self::Checkpoint,
         Self::ProviderPriority,
+        Self::Activation,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -102,6 +105,7 @@ impl SchedulerBlockClause {
             Self::UuCursor => "uu_cursor",
             Self::Checkpoint => "checkpoint",
             Self::ProviderPriority => "provider_priority",
+            Self::Activation => "activation",
         }
     }
 

@@ -67,7 +67,10 @@ async fn insert_stalled_job(pipeline: &mut Pipeline, job_id: JobId, segments: us
     .await;
     let state = &pipeline.jobs[&job_id];
     assert_eq!(state.status, JobStatus::Downloading);
-    assert_eq!(state.download_queue.len(), segments);
+    assert_eq!(
+        state.articles.active().unwrap().download_queue.len(),
+        segments
+    );
 }
 
 // Parks one of the job's queued articles as an infrastructure retry with no
@@ -76,6 +79,9 @@ fn park_indefinite_infrastructure_retry(pipeline: &mut Pipeline, job_id: JobId) 
     let work = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .extract_matching(|work| work.segment_id.segment_number == 0)
@@ -142,14 +148,72 @@ async fn a_stall_explained_by_a_future_deadline_is_never_kicked() {
         .expect("the stall is being watched");
     assert_eq!(watch.since, durable_lead_ends);
     assert!(watch.kick.is_none());
-    assert_eq!(pipeline.jobs[&propagating].download_queue.len(), 2);
-    assert_eq!(pipeline.jobs[&durable_lead].download_queue.len(), 2);
+    assert_eq!(
+        pipeline.jobs[&propagating]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
+    assert_eq!(
+        pipeline.jobs[&durable_lead]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
     assert!(pipeline.propagation_ready_at.contains_key(&propagating));
     assert!(
         pipeline
             .download_restart_durable_lead_retry_after
             .contains_key(&durable_lead)
     );
+}
+
+// A job whose articles are being read waits on that read, which has no
+// deadline: however long it takes, the stall it leaves is never kicked.
+#[tokio::test]
+async fn a_stall_behind_a_job_whose_articles_are_being_read_is_never_kicked() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40010);
+    super::article_scheduler::add_queued_job(&mut pipeline, job_id, 3).await;
+    pipeline.db.set_nzb_admitted(job_id, true).unwrap();
+    pipeline.nzb_admitted.insert(job_id);
+    // The scheduler's first reach sends for the articles; the read is never
+    // delivered here.
+    pipeline.request_job_activation(job_id);
+    let t0 = Instant::now();
+    pipeline.dispatch_downloads_at(t0);
+    assert!(matches!(
+        pipeline.jobs[&job_id].articles,
+        crate::jobs::model::JobArticles::Activating(..)
+    ));
+    assert_eq!(pipeline.download_scheduler_eligible_jobs(), vec![job_id]);
+
+    let kick_due = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+    assert_eq!(
+        pipeline.earliest_explained_dispatch_wait(kick_due),
+        Some(kick_due)
+    );
+    for at in [
+        kick_due,
+        kick_due + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+        kick_due + 2 * DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
+    ] {
+        pipeline.dispatch_downloads_at(at);
+    }
+
+    assert_eq!(kicks(&pipeline), 0);
+    assert_eq!(releases(&pipeline), 0);
+    assert!(matches!(
+        pipeline.jobs[&job_id].articles,
+        crate::jobs::model::JobArticles::Activating(..)
+    ));
 }
 
 #[tokio::test]
@@ -162,7 +226,14 @@ async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
     // One queued article rotated off the server, another excluded from a
     // server that answered 430 for it.
     {
-        let queue = &mut pipeline.jobs.get_mut(&job_id).unwrap().download_queue;
+        let queue = &mut pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue;
         let mut works = queue.drain_all();
         works[0].avoid_server = Some(0);
         works[1].exclude_servers = vec![1];
@@ -184,7 +255,15 @@ async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
     pipeline.dispatch_downloads_at(before_kick);
     assert_eq!(kicks(&pipeline), 0);
     assert_eq!(pipeline.infrastructure_retries.len(), 1);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 2);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
     assert_eq!(
         pipeline.last_download_dispatch_stall_log_at,
         Some(before_kick)
@@ -195,7 +274,15 @@ async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
 
     assert_eq!(kicks(&pipeline), 1);
     assert_eq!(pipeline.infrastructure_retries.len(), 0);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
     assert!(
         !pipeline
             .download_restart_durable_lead_retry_after
@@ -203,7 +290,11 @@ async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
     );
     assert!(!pipeline.propagation_ready_at.contains_key(&job_id));
     // The hint is gone; the 430 exclusion is a fact and stays.
-    let queue = &pipeline.jobs[&job_id].download_queue;
+    let queue = &pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue;
     assert!(
         queue
             .peek_first_matching(|work| work.avoid_server.is_some())
@@ -230,7 +321,15 @@ async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
     pipeline.dispatch_downloads_at(kicked_at + Duration::from_secs(60));
     assert_eq!(kicks(&pipeline), 1);
     assert_eq!(releases(&pipeline), 0);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -247,6 +346,9 @@ async fn a_kicked_stall_whose_bytes_never_move_is_released() {
     let fetched = pipeline
         .jobs
         .get_mut(&wedged)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .extract_matching(|work| work.segment_id.segment_number >= 3);
@@ -265,20 +367,43 @@ async fn a_kicked_stall_whose_bytes_never_move_is_released() {
         kicked_at + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER - Duration::from_secs(1),
     );
     assert_eq!(releases(&pipeline), 0);
-    assert_eq!(pipeline.jobs[&wedged].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&wedged]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
 
     pipeline.dispatch_downloads_at(kicked_at + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER);
 
     assert_eq!(releases(&pipeline), 1);
     assert_eq!(kicks(&pipeline), 1);
-    assert!(pipeline.jobs[&wedged].download_queue.is_empty());
+    assert!(
+        pipeline.jobs[&wedged]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
     assert_eq!(
         pipeline.metrics.articles_not_found.load(Ordering::Relaxed) - not_found_before,
         3
     );
     assert_eq!(pipeline.jobs[&wedged].failed_bytes, 3 * 512);
     assert!(pipeline.pending_completion_checks.contains(&wedged));
-    assert_eq!(pipeline.jobs[&moving].download_queue.len(), 2);
+    assert_eq!(
+        pipeline.jobs[&moving]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
     assert_eq!(pipeline.jobs[&moving].failed_bytes, 0);
     assert!(!pipeline.pending_completion_checks.contains(&moving));
     assert!(pipeline.download_dispatch_stall.is_none());
@@ -320,7 +445,15 @@ async fn a_stall_with_no_server_to_dispatch_to_waits_for_one() {
     assert_eq!(kicks(&pipeline), 0);
     assert_eq!(releases(&pipeline), 0);
     assert_eq!(pipeline.infrastructure_retries.len(), 1);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 2);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
     assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
 
@@ -340,7 +473,15 @@ async fn a_stall_with_no_server_to_dispatch_to_waits_for_one() {
     assert_eq!(kicks(&pipeline), 1);
     assert_eq!(releases(&pipeline), 0);
     assert_eq!(pipeline.infrastructure_retries.len(), 0);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -372,7 +513,15 @@ async fn with_recovery_off_a_stall_is_only_logged() {
     assert_eq!(releases(&pipeline), 0);
     assert!(pipeline.download_dispatch_stall.is_none());
     assert_eq!(pipeline.infrastructure_retries.len(), 1);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 2);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
     assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);
     assert!(
         pipeline
@@ -468,7 +617,14 @@ fn verification_old_kick(pipeline: &mut Pipeline, jobs: &[JobId]) {
 }
 
 async fn verification_exclude_healthy_and_cool_remaining(pipeline: &mut Pipeline, job_id: JobId) {
-    let queue = &mut pipeline.jobs.get_mut(&job_id).unwrap().download_queue;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
     let mut works = queue.drain_all();
     for work in &mut works {
         work.exclude_servers = vec![0];
@@ -536,7 +692,15 @@ async fn mixed_stall_kick_preserves_another_jobs_propagation_hold() {
         .1;
     assert!(kicked.contains_key(&wedged));
     assert!(!kicked.contains_key(&waiting));
-    assert_eq!(pipeline.jobs[&waiting].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&waiting]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
     assert_eq!(
         pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
         0
@@ -563,7 +727,15 @@ async fn mixed_stall_release_rechecks_each_jobs_current_wait() {
         pipeline.metrics.articles_not_found.load(Ordering::Relaxed),
         3
     );
-    assert_eq!(pipeline.jobs[&waiting].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&waiting]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
     assert_eq!(pipeline.jobs[&waiting].failed_bytes, 0);
     assert_eq!(pipeline.propagation_ready_at[&waiting].0, hold);
 }
@@ -600,7 +772,15 @@ async fn operator_pause_and_resume_discard_pre_pause_stall_history() {
             .kick
             .is_none()
     );
-    assert_eq!(pipeline.jobs[&job].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&job]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -619,5 +799,13 @@ async fn a_valid_wait_after_kick_restarts_the_recovery_window() {
     assert!(watch.kick.is_none());
     assert_eq!(watch.since, ready_at);
     assert_eq!(releases(&pipeline), 0);
-    assert_eq!(pipeline.jobs[&job].download_queue.len(), 3);
+    assert_eq!(
+        pipeline.jobs[&job]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
 }

@@ -7,28 +7,14 @@ impl Pipeline {
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.queue_scripts_completed.remove(&job_id);
         self.added_script_holds.remove(&job_id);
+        self.release_job_articles(job_id);
         self.jobs.remove(&job_id);
-        self.forget_graph_repair(job_id);
         self.post_probes.forget(job_id);
-        if let Some(graph) = self.graph_jobs.get(&job_id) {
-            graph.request_stop();
-            if !graph.awaits_mail() {
-                self.graph_jobs.remove(&job_id);
-            }
-        }
         self.pipeline_failure_stages.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
         self.retire_stalled_download_lanes(job_id);
-        self.job_scheduling_memory.remove(&job_id);
-        self.repeated_articles.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
         self.remove_pending_completion_check(job_id);
-        self.pending_retries_by_job.remove(&job_id);
-        self.pending_retries_by_segment
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.transport_failure_streaks
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.cancel_infrastructure_retries_for_job(job_id);
         self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
@@ -46,8 +32,6 @@ impl Pipeline {
         self.clear_job_phase_progress_runtime(job_id);
         self.discard_stage_timers(job_id);
         self.clear_job_retention_excludes(job_id);
-        self.decode_retries
-            .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.rate_limit_reservations
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.update_queue_metrics();
@@ -160,7 +144,7 @@ impl Pipeline {
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.assembly.optional_recovery_bytes();
+            state.optional_recovery_bytes();
         let (failed_bytes, health, terminal_discards) = settled.unwrap_or_else(|| {
             (
                 state.failed_bytes,
@@ -195,7 +179,7 @@ impl Pipeline {
         };
 
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.assembly.optional_recovery_bytes();
+            state.optional_recovery_bytes();
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
         let finished = JobInfo {
@@ -224,7 +208,7 @@ impl Pipeline {
             failed_bytes,
             health,
             terminal_discards,
-            total_files: state.assembly.total_file_count() as u32,
+            total_files: state.total_file_count() as u32,
             completed_files: self.completed_file_count(state),
             remaining_par_files: 0,
             file_remaining_bytes: Vec::new(),

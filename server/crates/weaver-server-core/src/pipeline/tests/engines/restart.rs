@@ -184,10 +184,9 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
         if take_retry(&mut pipeline).await {
             continue;
         }
-        let queued = pipeline
-            .jobs
-            .get(&JOB)
-            .map_or(0, |state| state.download_queue.len());
+        let queued = pipeline.jobs.get(&JOB).map_or(0, |state| {
+            state.articles.active().unwrap().download_queue.len()
+        });
         if queued == 0 && requests.values().sum::<usize>() == before {
             quiet += 1;
             assert!(
@@ -224,7 +223,13 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
 // whose turn comes first, a turn of each named post at a time; the rest stay
 // queued.
 fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWork> {
-    let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&JOB)?
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
     if scenario.together.is_empty() && scenario.first.is_empty() {
         return queue.pop();
     }
@@ -835,7 +840,12 @@ async fn a_job_with_no_checkpoint_is_admitted_afresh_at_restore() {
         .await;
     assert!(!pipeline.blocked_restores.contains_key(&JOB));
     assert!(pipeline.graph_jobs.contains_key(&JOB));
-    let queued = pipeline.jobs[&JOB].download_queue.len();
+    let queued = pipeline.jobs[&JOB]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len();
     assert_eq!(queued, scenario.spec().files[0].segments.len());
 }
 
@@ -1498,7 +1508,8 @@ async fn an_unreadable_checkpoint_holds_the_job_paused_until_it_reads() {
         "{:?}",
         info.error
     );
-    assert!(pipeline.jobs[&JOB].download_queue.is_empty());
+    // A blocked job holds no articles until its restore goes through.
+    assert!(pipeline.jobs[&JOB].articles.active().is_none());
     pipeline.dispatch_downloads();
     assert_eq!(pipeline.active_downloads, 0);
     let row = pipeline
@@ -1514,6 +1525,10 @@ async fn an_unreadable_checkpoint_holds_the_job_paused_until_it_reads() {
     shift_root_facts_version(&pipeline, -1).await;
     pipeline.resume_restored_job(JOB).await.unwrap();
     assert!(!pipeline.blocked_restores.contains_key(&JOB));
+    // Restored as the paused job it was, it holds no articles; resumed, it
+    // is built from its checkpoint when it is next reached.
+    assert!(pipeline.jobs[&JOB].articles.active().is_none());
+    crate::pipeline::tests::activate_job(&mut pipeline, JOB).await;
     assert!(pipeline.graph_jobs.contains_key(&JOB));
     assert!(
         pipeline
@@ -1525,7 +1540,15 @@ async fn an_unreadable_checkpoint_holds_the_job_paused_until_it_reads() {
             .is_none()
     );
     // The four articles the checkpoint settled are not fetched again.
-    assert_eq!(pipeline.jobs[&JOB].download_queue.len(), 8);
+    assert_eq!(
+        pipeline.jobs[&JOB]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        8
+    );
     while let Some(work) = next_work(&mut pipeline, &scenario) {
         let article = (
             work.segment_id.file_id.file_index,
@@ -1543,6 +1566,288 @@ async fn an_unreadable_checkpoint_holds_the_job_paused_until_it_reads() {
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
     assert_eq!(files.into_values().collect::<Vec<_>>(), vec![body]);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A restart brings a job that was running back with its articles built and
+// charged, past a full ledger, and never held paused; a job that never
+// started comes back waiting its turn, holding nothing per article and
+// charged nothing.
+#[tokio::test]
+async fn a_restart_restores_a_running_job_with_its_articles_and_a_queued_job_without() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 80))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        scenario.prepare(&mut pipeline);
+        let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+        for _ in 0..4 {
+            let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+            let article = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            serve(&mut pipeline, &scenario, article).await;
+        }
+        pipeline.db.flush_write_queue().await.unwrap();
+        retire_pipeline_database(pipeline).await;
+        working_dir
+    };
+
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    pipeline.process_memory_budget =
+        std::sync::Arc::new(crate::pipeline::ProcessMemoryBudget::new(0));
+    pipeline
+        .restore_job(request_for(&scenario, working_dir, JobStatus::Downloading))
+        .await
+        .unwrap();
+    assert!(!pipeline.blocked_restores.contains_key(&JOB));
+    assert_ne!(pipeline.jobs[&JOB].status, JobStatus::Paused);
+    assert_eq!(
+        pipeline.jobs[&JOB]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        8
+    );
+    assert_eq!(
+        pipeline.process_memory_budget.reserved_bytes(),
+        scenario.spec().scheduling_memory_estimate()
+    );
+    assert!(
+        pipeline
+            .process_memory_budget
+            .try_reserve_retained(1)
+            .is_err()
+    );
+    retire_pipeline_database(pipeline).await;
+
+    let queued_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&queued_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    let working_dir = queued_dir.path().join("queued");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    pipeline
+        .restore_job(request_for(&scenario, working_dir, JobStatus::Queued))
+        .await
+        .unwrap();
+    let state = &pipeline.jobs[&JOB];
+    assert!(matches!(
+        state.articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+    assert!(state.spec.files.iter().all(|file| file.segments.is_empty()));
+    assert_eq!(state.articles.queued_download_len(), 12);
+    assert!(!pipeline.repeated_articles.contains_key(&JOB));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A paused job holds nothing per article and is charged nothing. Resumed,
+// it is activated afresh from its stored NZB and the checkpoint taken as it
+// paused, as a restart restores it: the articles it had in hand are not
+// fetched again.
+#[tokio::test]
+async fn a_paused_job_drops_its_articles_and_resumes_from_its_checkpoint() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 81))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    let mut served = Vec::new();
+    for _ in 0..4 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+        served.push(work.segment_id);
+    }
+    assert!(pipeline.process_memory_budget.reserved_bytes() > 0);
+
+    pipeline.pause_job_runtime(JOB).unwrap();
+    let state = &pipeline.jobs[&JOB];
+    assert!(matches!(
+        state.articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+    assert!(state.spec.files.iter().all(|file| file.segments.is_empty()));
+    assert!(!pipeline.job_article_memory.contains_key(&JOB));
+    assert!(!pipeline.graph_jobs.contains_key(&JOB));
+    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+
+    pipeline.resume_job_runtime(JOB).unwrap();
+    assert!(matches!(
+        pipeline.jobs[&JOB].articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+    crate::pipeline::tests::activate_job(&mut pipeline, JOB).await;
+    let queue = &pipeline.jobs[&JOB]
+        .articles
+        .active()
+        .expect("a resumed job is activated again")
+        .download_queue;
+    assert_eq!(queue.len(), 8);
+    let mut queued = std::collections::HashSet::new();
+    queue.extend_segment_ids(&mut queued);
+    assert!(served.iter().all(|segment| !queued.contains(segment)));
+    assert!(pipeline.graph_jobs.contains_key(&JOB));
+    assert_eq!(
+        pipeline.process_memory_budget.reserved_bytes(),
+        scenario.spec().scheduling_memory_estimate()
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+// A paused job counts as still to fetch only the articles its checkpoint
+// does not hold, while it holds nothing per article and again once a
+// restart has brought it back paused.
+#[tokio::test]
+async fn a_paused_job_counts_only_the_articles_its_checkpoint_does_not_hold_as_queued() {
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(1000 * ARTICLE, 82))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    for _ in 0..900 {
+        let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, &scenario, article).await;
+    }
+
+    pipeline.pause_job_runtime(JOB).unwrap();
+    let articles = &pipeline.jobs[&JOB].articles;
+    assert!(matches!(
+        articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+    assert_eq!(articles.queued_download_len(), 100);
+    pipeline.db.flush_write_queue().await.unwrap();
+    retire_pipeline_database(pipeline).await;
+
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    pipeline
+        .restore_job(request_for(&scenario, working_dir, JobStatus::Paused))
+        .await
+        .unwrap();
+    let articles = &pipeline.jobs[&JOB].articles;
+    assert!(matches!(
+        articles,
+        crate::jobs::model::JobArticles::Queued(_)
+    ));
+    assert_eq!(articles.queued_download_len(), 100);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job paused while its stream's run reads lets its articles go, and its
+// stopped run ends on its thread before the job may be built again. Resumed
+// with its NZB slot, the job is built from its checkpoint, and the restored
+// job's run starts as the job is installed, on the pipeline thread: what that
+// run says is heard, its end among it, and the job delivers the stream.
+#[tokio::test]
+async fn a_job_paused_while_its_stream_runs_resumes_and_its_restored_run_is_heard() {
+    use crate::pipeline::graph::engine::Heard;
+    let body = payload(40 * ARTICLE + 5, 74);
+    let scenario = Scenario::new(vec![Post::plain("beacon.bin.xz", xz(&body))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    while !pipeline.graph_jobs[&JOB].awaits_mail() {
+        let work =
+            next_work(&mut pipeline, &scenario).expect("the run starts before the post ends");
+        serve_work(&mut pipeline, &scenario, &work).await;
+    }
+
+    pipeline.pause_job_runtime(JOB).unwrap();
+    assert!(pipeline.jobs[&JOB].articles.active().is_none());
+    assert!(pipeline.retiring_graph_jobs.contains_key(&JOB));
+    pipeline.resume_job_runtime(JOB).unwrap();
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        // Not built over the stopped run.
+        pipeline.request_job_activation(JOB);
+        assert!(matches!(
+            pipeline.jobs[&JOB].articles,
+            crate::jobs::model::JobArticles::Queued(_)
+        ));
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the stopped run ends");
+        pipeline.graph_run_said(said);
+    }
+    // The pipeline's turns go on while the job's read is out, and hear
+    // every run's mail waiting, as the reply is taken.
+    pipeline.request_job_activation(JOB);
+    let read = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the read replies");
+    pipeline.hear_graph_runs();
+    pipeline.handle_job_activated(read);
+    assert!(pipeline.nzb_admitted.contains(&JOB));
+
+    let (mut emitted, mut ended) = (0, 0);
+    while !finished(&pipeline) {
+        if let Some(work) = next_work(&mut pipeline, &scenario) {
+            serve_work(&mut pipeline, &scenario, &work).await;
+            continue;
+        }
+        pipeline.check_job_completion(JOB).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.awaits_mail())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            if pipeline.graph_jobs[&JOB]
+                .runs()
+                .current(said.node, said.generation)
+            {
+                match said.heard {
+                    Heard::Emit(_) => emitted += 1,
+                    Heard::Ended => ended += 1,
+                    _ => {}
+                }
+            }
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        assert!(
+            take_retry(&mut pipeline).await,
+            "the resumed job stalled at {:?}",
+            job_status_for_assert(&pipeline, JOB)
+        );
+    }
+    assert!(emitted > 0, "the restored run's output is heard");
+    assert!(ended > 0, "the restored run's end is heard");
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    assert_eq!(
+        files.keys().cloned().collect::<Vec<_>>(),
+        vec!["lantern beacon/beacon.bin".to_string()]
+    );
+    assert!(files["lantern beacon/beacon.bin"] == body);
     retire_pipeline_database(pipeline).await;
 }
 

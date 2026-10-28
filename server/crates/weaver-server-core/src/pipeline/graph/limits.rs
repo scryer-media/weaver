@@ -539,20 +539,29 @@ impl crate::pipeline::Pipeline {
     // A graph job's budget: the pipeline's extraction limits, the operator's
     // policy as the database holds it now, and what the posts declared.
     pub(in crate::pipeline::graph) fn graph_caps(&self, files: &[RootFile]) -> Caps {
-        let policy = self
-            .db
-            .post_processing_settings()
-            .map(Arc::new)
-            .map_err(|error| format!("could not load unacceptable extension policy: {error}"));
-        let declared = files
-            .iter()
-            .map(|file| {
-                file.articles
-                    .iter()
-                    .map(|(_, bytes)| u64::from(*bytes))
-                    .sum()
-            })
-            .collect();
-        Caps::new(Arc::clone(&self.extraction_limits), policy, declared)
+        caps_for(&self.db, &self.extraction_limits, files)
     }
+}
+
+// A graph job's budget from the pipeline's extraction limits and the
+// database, for a caller off the pipeline thread.
+pub(in crate::pipeline::graph) fn caps_for(
+    db: &crate::Database,
+    extraction_limits: &Arc<ExtractionLimits>,
+    files: &[RootFile],
+) -> Caps {
+    let policy = db
+        .post_processing_settings()
+        .map(Arc::new)
+        .map_err(|error| format!("could not load unacceptable extension policy: {error}"));
+    let declared = files
+        .iter()
+        .map(|file| {
+            file.articles
+                .iter()
+                .map(|(_, bytes)| u64::from(*bytes))
+                .sum()
+        })
+        .collect();
+    Caps::new(Arc::clone(extraction_limits), policy, declared)
 }

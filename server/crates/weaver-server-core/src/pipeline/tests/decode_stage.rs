@@ -13,11 +13,6 @@ use crate::pipeline::orchestrator::{
 async fn pump_decode_queue_releases_bytes_for_inactive_job() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    assert_eq!(
-        pipeline.uu_spool_root,
-        temp_dir.path().join("intermediate").join(".uu-park")
-    );
-    assert!(!temp_dir.path().join("data/.uu-park").exists());
     let job_id = JobId(20027);
     insert_active_job(
         &mut pipeline,
@@ -1013,24 +1008,25 @@ async fn fail_job_clears_write_backlog_accounting() {
         truncation_suspected: false,
         expected_file_crc: None,
         segments: Vec::new(),
-        data: DecodedChunk::from(data),
+        data: DecodedChunk::from(Vec::<u8>::new()),
         yenc_name: "stalled.bin".to_string(),
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
     };
-    let parked_len = parked.data.len_bytes();
+    let parked_len = data.len();
     pipeline
         .unanchored_parked
         .entry(file_id)
         .or_default()
         .insert(
             1,
-            (
-                parked,
-                SegmentSource {
+            crate::pipeline::UnanchoredPart {
+                result: parked,
+                bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(data)),
+                source: SegmentSource {
                     source_server_idx: None,
                     exclude_servers: Vec::new(),
                 },
-            ),
+            },
         );
     pipeline.note_write_buffered(parked_len, 1);
 

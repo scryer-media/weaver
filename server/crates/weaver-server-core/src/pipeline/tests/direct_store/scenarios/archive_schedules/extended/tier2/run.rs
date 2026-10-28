@@ -281,7 +281,7 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             let (file, article) = (
                 work.segment_id.file_id.file_index,

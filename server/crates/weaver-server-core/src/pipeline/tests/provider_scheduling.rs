@@ -125,9 +125,9 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
             pipeline
                 .add_job(
                     JobId(id),
-                    spec,
+                    spec.clone(),
                     PathBuf::from(format!("scheduled-{id}.nzb")),
-                    sample_nzb_zstd(),
+                    nzb_zstd_for(&spec),
                     crate::jobs::AddJobOptions::default(),
                 )
                 .await
@@ -154,6 +154,13 @@ async fn twenty_four_providers_and_124_nzbs_dial_only_reserved_primary_work() {
                 }
             }
         });
+        // The admitted jobs' articles are built as their first handout
+        // builds them, so the dispatch below hands them out.
+        let mut admitted: Vec<JobId> = pipeline.nzb_admitted.iter().copied().collect();
+        admitted.sort_unstable();
+        for job_id in admitted {
+            activate_job(&mut pipeline, job_id).await;
+        }
         pipeline.dispatch_downloads();
         assert_eq!(
             pipeline.download_lane_owners.len(),
@@ -330,14 +337,15 @@ async fn a_server_out_of_quota_reads_blocked_while_a_lower_priority_server_takes
     pipeline
         .add_job(
             JobId(1),
-            spec,
+            spec.clone(),
             PathBuf::from("quota-fallback.nzb"),
-            sample_nzb_zstd(),
+            nzb_zstd_for(&spec),
             crate::jobs::AddJobOptions::default(),
         )
         .await
         .unwrap();
     assert!(!primary.snapshot().quota_blocked);
+    activate_job(&mut pipeline, JobId(1)).await;
 
     pipeline.dispatch_downloads();
     let (server, command) = loop {

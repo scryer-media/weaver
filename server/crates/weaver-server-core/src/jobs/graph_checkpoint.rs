@@ -17,7 +17,7 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::{Database, StateError};
 
 // Every table a checkpoint writes. A job's rows go with the job.
-pub(crate) const TABLES: [&str; 8] = [
+pub(crate) const TABLES: [&str; 9] = [
     "graph_nodes",
     "graph_members",
     "graph_coverage",
@@ -26,6 +26,7 @@ pub(crate) const TABLES: [&str; 8] = [
     "graph_recovery",
     "graph_holds",
     "graph_facts_parts",
+    "graph_held_parts",
 ];
 
 // Rows per statement: enough to keep a large change to a few statements,
@@ -42,6 +43,7 @@ pub(crate) struct GraphCheckpoint {
     pub(crate) crypt: Vec<CryptRow>,
     pub(crate) parts: Vec<PartRow>,
     pub(crate) holds: Vec<HoldRow>,
+    pub(crate) held_parts: Vec<HeldPartRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +125,40 @@ pub(crate) struct HoldRow {
     pub(crate) start: i64,
     pub(crate) end: i64,
     pub(crate) scratch_offset: i64,
+}
+
+// A part that arrived and waits to be placed, spooled to a file under the
+// job's working directory: a uuencode part ahead of its file's cursor, or an
+// article that declared no usable start ahead of the ordinal it follows.
+// `spool_path` is relative to the working directory. A held article keeps
+// the facts its decode found; a uuencode part keeps none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldPartRow {
+    pub(crate) file: i64,
+    pub(crate) ordinal: i64,
+    pub(crate) decoded_len: i64,
+    pub(crate) spool_path: String,
+    pub(crate) article: Option<HeldArticleRow>,
+}
+
+// What a held article's decode found, but its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldArticleRow {
+    pub(crate) raw_size: i64,
+    pub(crate) crc_valid: bool,
+    pub(crate) truncation_suspected: bool,
+    pub(crate) part_crc_verified: bool,
+    pub(crate) part_crc: i64,
+    pub(crate) expected_file_crc: Option<i64>,
+    pub(crate) file_size: i64,
+    pub(crate) part: Option<i64>,
+    pub(crate) total: Option<i64>,
+    pub(crate) begin: Option<i64>,
+    pub(crate) end: Option<i64>,
+    pub(crate) name: String,
+    // The decode pass's CRC32 segments, each as its offset, length and
+    // checksum, little-endian.
+    pub(crate) crc_segments: Vec<u8>,
 }
 
 // One sealed part of a node's facts. Its bytes are shared with the facts
@@ -388,6 +424,48 @@ impl Row for PartRow {
     }
 }
 
+impl Row for HeldPartRow {
+    type Key = (i64, i64);
+    const TABLE: &'static str = "graph_held_parts";
+    const KEY: &'static [&'static str] = &["file_index", "ordinal"];
+    const COLUMNS: &'static str = "job_id, file_index, ordinal, decoded_len, spool_path, \
+        raw_size, crc_valid, truncation_suspected, part_crc_verified, part_crc, \
+        expected_file_crc, file_size, yenc_part, yenc_total, yenc_begin, yenc_end, yenc_name, \
+        crc_segments";
+
+    fn key(&self) -> (i64, i64) {
+        (self.file, self.ordinal)
+    }
+
+    fn key_args(key: &(i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        let article = self.article.as_ref();
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.file),
+            SqlArg::I64(self.ordinal),
+            SqlArg::I64(self.decoded_len),
+            SqlArg::Text(self.spool_path.clone()),
+            SqlArg::OptI64(article.map(|article| article.raw_size)),
+            SqlArg::OptBool(article.map(|article| article.crc_valid)),
+            SqlArg::OptBool(article.map(|article| article.truncation_suspected)),
+            SqlArg::OptBool(article.map(|article| article.part_crc_verified)),
+            SqlArg::OptI64(article.map(|article| article.part_crc)),
+            SqlArg::OptI64(article.and_then(|article| article.expected_file_crc)),
+            SqlArg::OptI64(article.map(|article| article.file_size)),
+            SqlArg::OptI64(article.and_then(|article| article.part)),
+            SqlArg::OptI64(article.and_then(|article| article.total)),
+            SqlArg::OptI64(article.and_then(|article| article.begin)),
+            SqlArg::OptI64(article.and_then(|article| article.end)),
+            SqlArg::OptText(article.map(|article| article.name.clone())),
+            SqlArg::OptBytes(article.map(|article| article.crc_segments.clone())),
+        ]
+    }
+}
+
 // The rows of one table a checkpoint changes, by key: the row as it is now,
 // or `None` for one that went away.
 pub(crate) type Changes<R> = BTreeMap<<R as Row>::Key, Option<R>>;
@@ -405,6 +483,7 @@ pub(crate) struct Delta {
     pub(crate) crypt: Changes<CryptRow>,
     pub(crate) parts: Changes<PartRow>,
     pub(crate) holds: Changes<HoldRow>,
+    pub(crate) held_parts: Changes<HeldPartRow>,
 }
 
 impl Delta {
@@ -419,6 +498,7 @@ impl Delta {
         changes(&mut self.crypt, &before.crypt, &after.crypt);
         changes(&mut self.parts, &before.parts, &after.parts);
         changes(&mut self.holds, &before.holds, &after.holds);
+        changes(&mut self.held_parts, &before.held_parts, &after.held_parts);
     }
 
     // This change followed by `later`, as one.
@@ -434,6 +514,7 @@ impl Delta {
         self.crypt.extend(later.crypt);
         self.parts.extend(later.parts);
         self.holds.extend(later.holds);
+        self.held_parts.extend(later.held_parts);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -449,6 +530,7 @@ impl Delta {
             + self.crypt.len()
             + self.parts.len()
             + self.holds.len()
+            + self.held_parts.len()
     }
 
     // How many bytes of facts it writes.
@@ -543,6 +625,7 @@ async fn write_delta(tx: &mut SqlTx<'_>, job_id: JobId, delta: &Delta) -> Result
     write(tx, id, &delta.crypt).await?;
     write(tx, id, &delta.parts).await?;
     write(tx, id, &delta.holds).await?;
+    write(tx, id, &delta.held_parts).await?;
     Ok(())
 }
 
@@ -749,6 +832,44 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
+    let held_parts = tx
+        .fetch_all(
+            "SELECT file_index, ordinal, decoded_len, spool_path, raw_size, crc_valid, \
+             truncation_suspected, part_crc_verified, part_crc, expected_file_crc, file_size, \
+             yenc_part, yenc_total, yenc_begin, yenc_end, yenc_name, crc_segments \
+             FROM graph_held_parts WHERE job_id = {} ORDER BY file_index, ordinal",
+            &args,
+        )
+        .await?
+        .iter()
+        .map(|row| {
+            let article = match row.opt_i64("raw_size")? {
+                None => None,
+                Some(raw_size) => Some(HeldArticleRow {
+                    raw_size,
+                    crc_valid: row.bool("crc_valid")?,
+                    truncation_suspected: row.bool("truncation_suspected")?,
+                    part_crc_verified: row.bool("part_crc_verified")?,
+                    part_crc: row.i64("part_crc")?,
+                    expected_file_crc: row.opt_i64("expected_file_crc")?,
+                    file_size: row.i64("file_size")?,
+                    part: row.opt_i64("yenc_part")?,
+                    total: row.opt_i64("yenc_total")?,
+                    begin: row.opt_i64("yenc_begin")?,
+                    end: row.opt_i64("yenc_end")?,
+                    name: row.text("yenc_name")?,
+                    crc_segments: row.bytes("crc_segments")?,
+                }),
+            };
+            Ok(HeldPartRow {
+                file: row.i64("file_index")?,
+                ordinal: row.i64("ordinal")?,
+                decoded_len: row.i64("decoded_len")?,
+                spool_path: row.text("spool_path")?,
+                article,
+            })
+        })
+        .collect::<Result<_, StateError>>()?;
     Ok(Some(GraphCheckpoint {
         nodes,
         members,
@@ -757,5 +878,6 @@ async fn read_checkpoint(
         crypt,
         parts,
         holds,
+        held_parts,
     }))
 }

@@ -184,6 +184,21 @@ pub(crate) enum Reservation {
     Refused,
 }
 
+// A run's last word, said when the run's thread lets it go, however the run
+// returned.
+struct Ends {
+    mail: mpsc::Sender<Said>,
+    said: Option<Said>,
+}
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        if let Some(said) = self.said.take() {
+            let _ = self.mail.blocking_send(said);
+        }
+    }
+}
+
 // One job's runs, the slots they take, and the resident bytes they reserve.
 #[derive(Debug)]
 pub(crate) struct Runs {
@@ -370,6 +385,14 @@ impl Runs {
             heard,
         };
         tokio::task::spawn_blocking(move || {
+            // Said as the run returns, and as a run that panics unwinds, so
+            // a run always ends: its slot, its memory and a stopped job's
+            // graph are waiting on it. A closed channel means the pipeline is
+            // gone, and no one is left to tell.
+            let _ends = Ends {
+                mail: mail.clone(),
+                said: Some(said(Heard::Ended)),
+            };
             let reader = Arc::clone(&volumes);
             let mut sink = |emit: Emit| {
                 if matches!(emit, Emit::Member { .. }) {
@@ -387,9 +410,6 @@ impl Runs {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
             extracting_hook(&volumes);
-            // A closed channel means the pipeline is gone, and no one is
-            // left to tell.
-            let _ = mail.blocking_send(said(Heard::Ended));
         });
     }
 

@@ -332,7 +332,17 @@ async fn reprocess_rebuilds_from_history(job_id: JobId, name: &str, status: &str
             ),
         ]
     );
-    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.articles.queued_download_len(), 1);
+    activate_job(&mut pipeline, job_id).await;
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -12,7 +12,15 @@ use super::*;
 fn lease_to_new_lane(pipeline: &mut Pipeline, job_id: JobId, take: usize) -> DownloadBatchLease {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     let works: Vec<DownloadWork> = (0..take)
-        .map(|_| state.download_queue.pop().expect("the job has queued work"))
+        .map(|_| {
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .pop()
+                .expect("the job has queued work")
+        })
         .collect();
     lease_works_to_new_lane(pipeline, job_id, works)
 }
@@ -136,7 +144,15 @@ fn assert_gauges_match_lanes(pipeline: &Pipeline) {
 }
 
 fn queued(pipeline: &Pipeline, job_id: JobId) -> usize {
-    pipeline.jobs.get(&job_id).unwrap().download_queue.len()
+    pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len()
 }
 
 fn mark_idle_past_the_stall_threshold(pipeline: &mut Pipeline, job_id: JobId) {
@@ -195,6 +211,9 @@ async fn an_article_the_lane_does_not_hold_is_refused_without_moving_a_gauge() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -232,6 +251,9 @@ async fn a_lease_that_names_an_article_twice_owes_one_result() {
     let work = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -316,6 +338,9 @@ async fn a_stall_release_takes_back_the_tail_a_lane_carries_for_its_previous_job
             pipeline
                 .jobs
                 .get_mut(&next_job)
+                .unwrap()
+                .articles
+                .active_mut()
                 .unwrap()
                 .download_queue
                 .pop()
@@ -493,11 +518,12 @@ async fn a_job_whose_last_result_is_released_passes_its_gate_and_is_never_paused
     assert_gauges_match_lanes(&pipeline);
 }
 
-// T4: paused with an article on a lane, the result lands while the job is
-// paused, and the resume finds an empty queue and nothing held: the
-// completion check runs in the resume pass, with no restart.
+// T4: paused with an article on a lane, the job keeps its articles while the
+// article is out. The result lands while the job is paused and is taken, and
+// the resume finds an empty queue and nothing held: the completion check runs
+// in the resume pass, with no restart and nothing fetched again.
 #[tokio::test]
-async fn a_resume_with_nothing_queued_or_held_checks_completion_at_once() {
+async fn a_result_that_lands_while_paused_is_taken_and_the_resume_checks_completion_at_once() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(41711);
@@ -516,6 +542,7 @@ async fn a_resume_with_nothing_queued_or_held_checks_completion_at_once() {
     );
     pipeline.pause_job_runtime(job_id).unwrap();
     assert_eq!(in_flight(&pipeline, job_id), 1);
+    assert!(pipeline.jobs[&job_id].articles.active().is_some());
 
     pipeline
         .handle_download_done(decoded_whole_file(
@@ -527,6 +554,11 @@ async fn a_resume_with_nothing_queued_or_held_checks_completion_at_once() {
         .await;
     assert_eq!(in_flight(&pipeline, job_id), 0);
     assert_eq!(queued(&pipeline, job_id), 0);
+    assert_eq!(
+        pipeline.jobs[&job_id].downloaded_bytes,
+        payload.len() as u64,
+        "the result is taken"
+    );
     pipeline.pending_completion_checks.clear();
 
     pipeline.resume_job_runtime(job_id).unwrap();

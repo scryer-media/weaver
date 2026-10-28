@@ -240,8 +240,9 @@ impl Pipeline {
                 let wait = self.download_wait_by_job.get(job_id);
                 let checkpoint = self.checkpoint_admission(*job_id);
                 let next = state
-                    .download_queue
-                    .peek_first_matching(|work| !work.is_recovery);
+                    .articles
+                    .download_queue()
+                    .and_then(|queue| queue.peek_first_matching(|work| !work.is_recovery));
                 let (timed, indefinite, deadline) =
                     retries.get(job_id).copied().unwrap_or_default();
                 let group = next.and_then(|work| {
@@ -274,8 +275,8 @@ impl Pipeline {
                         .to_string()
                     }),
                     status: state.status.clone(),
-                    download_queue_len: state.download_queue.len(),
-                    recovery_queue_len: state.recovery_queue.len(),
+                    download_queue_len: state.articles.queued_download_len(),
+                    recovery_queue_len: state.articles.queued_recovery_len(),
                     active_downloads: self
                         .active_downloads_by_job
                         .get(job_id)

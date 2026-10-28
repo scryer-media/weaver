@@ -35,10 +35,7 @@ impl Pipeline {
                 };
                 row.report.moving = moving;
                 row.report.nzb_admitted = self.nzb_admitted.contains(&job_id);
-                if !self.nzb_admitted.contains(&job_id)
-                    && row.intents.paused == Some(false)
-                    && row.intents.cancelled.is_none()
-                {
+                if self.waits_for_nzb_slot(row) {
                     row.report.job.download_wait_reason =
                         Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON.into());
                     row.report.job.download_state = crate::DownloadState::Queued;
@@ -141,7 +138,7 @@ impl Pipeline {
         }
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.assembly.optional_recovery_bytes();
+            state.optional_recovery_bytes();
         let health = health_milli(total, state.failed_bytes);
         let status = if self.awaiting_queue_script_barrier(state.job_id)
             && state.status == JobStatus::Downloading
@@ -153,19 +150,27 @@ impl Pipeline {
         };
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
-        let remaining_par_files = state
-            .assembly
-            .files()
-            .filter(|file| {
-                matches!(
-                    file.role(),
-                    weaver_model::files::FileRole::Par2 {
-                        is_index: false,
-                        ..
-                    }
-                ) && !file.is_complete()
-            })
-            .count() as u32;
+        let is_par_volume = |role: &weaver_model::files::FileRole| {
+            matches!(
+                role,
+                weaver_model::files::FileRole::Par2 {
+                    is_index: false,
+                    ..
+                }
+            )
+        };
+        let remaining_par_files = match state.articles.assembly() {
+            Some(assembly) => assembly
+                .files()
+                .filter(|file| is_par_volume(file.role()) && !file.is_complete())
+                .count() as u32,
+            None => state
+                .spec
+                .files
+                .iter()
+                .filter(|file| is_par_volume(&file.role))
+                .count() as u32,
+        };
         let download_wait = self.download_wait_by_job.get(&state.job_id);
         Some(JobInfo {
             job_id: state.job_id,
@@ -202,7 +207,7 @@ impl Pipeline {
             health,
             terminal_discards: Vec::new(),
             total_files: self.blocked_restores.get(&state.job_id).map_or_else(
-                || state.assembly.total_file_count() as u32,
+                || state.total_file_count() as u32,
                 |request| request.spec.files.len() as u32,
             ),
             completed_files: if self.blocked_restores.contains_key(&state.job_id) {

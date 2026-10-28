@@ -388,6 +388,7 @@ fn held(delta: &Delta) -> GraphCheckpoint {
         crypt: of(&delta.crypt),
         parts: of(&delta.parts),
         holds: of(&delta.holds),
+        held_parts: of(&delta.held_parts),
     }
 }
 
@@ -395,11 +396,11 @@ fn held(delta: &Delta) -> GraphCheckpoint {
 fn a_step_writes_only_the_rows_and_parts_it_changed() {
     let (mut job, _dir) = long_post(40);
     let pending = Pending::default();
-    assert!(pending.put(&job));
+    assert!(pending.put(&job, Vec::new()));
     let first = pending.take().0.unwrap();
     assert!(first.whole);
     intake(&mut job, 40);
-    assert!(pending.put(&job));
+    assert!(pending.put(&job, Vec::new()));
     let step = pending.take().0.unwrap();
     assert!(!step.whole);
     // The arrival's chunk alone of the root's parts; the root row only names
@@ -416,12 +417,15 @@ fn a_step_writes_only_the_rows_and_parts_it_changed() {
         !step.nodes.contains_key(&i64::from(NodeId::ROOT.0)),
         "{step:?}"
     );
-    assert!(!pending.put(&job), "an unchanged job writes nothing");
+    assert!(
+        !pending.put(&job, Vec::new()),
+        "an unchanged job writes nothing"
+    );
     // The parts it wrote over the ones before are a fresh checkpoint's.
     let mut written: BTreeMap<i64, Option<Arc<[u8]>>> = root_parts(&first);
     written.extend(changed);
     let fresh = Pending::default();
-    assert!(fresh.put(&job));
+    assert!(fresh.put(&job, Vec::new()));
     assert_eq!(root_parts(&fresh.take().0.unwrap()), written);
 }
 
@@ -429,12 +433,12 @@ fn a_step_writes_only_the_rows_and_parts_it_changed() {
 fn a_pending_writes_what_the_database_does_not_hold() {
     let (job, _dir) = long_post(20);
     let pending = Pending::default();
-    assert!(pending.put(&job));
+    assert!(pending.put(&job, Vec::new()));
     let first = pending.take().0.unwrap();
     // A write that failed: the next checkpoint is the whole job again, every
     // root part with it.
     pending.forget();
-    assert!(pending.put(&job));
+    assert!(pending.put(&job, Vec::new()));
     let again = pending.take().0.unwrap();
     assert!(again.whole);
     assert_eq!(root_parts(&again), root_parts(&first));
@@ -443,7 +447,7 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     // writes nothing.
     let restored = Pending::default();
     restored.written(held(&first));
-    assert!(!restored.put(&job));
+    assert!(!restored.put(&job, Vec::new()));
     assert!(restored.take().0.is_none());
     // A root part the database holds and the root no longer has is deleted,
     // and only it.
@@ -456,7 +460,7 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     rows.parts.push(stale.clone());
     let restored = Pending::default();
     restored.written(rows);
-    assert!(restored.put(&job));
+    assert!(restored.put(&job, Vec::new()));
     let delta = restored.take().0.unwrap();
     assert_eq!(delta.rows(), 1, "{delta:?}");
     assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));

@@ -9,8 +9,6 @@ use std::io::{self, Read};
 use super::*;
 use tempfile::Builder;
 
-const UU_SPOOL_FILE_PREFIX: &str = "part-";
-
 // Where a uuencode part can go right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UuPlacement {
@@ -24,20 +22,6 @@ enum UuPlacement {
     // The cursor already shifted past this ordinal after it was booked failed,
     // so its bytes have no home and never will. Dropped terminally.
     Stale,
-}
-
-fn prepare_uu_spool_dir(path: &std::path::Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(io::Error::other(format!(
-                "UU spool directory is not a directory: {}",
-                path.display()
-            )))
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path),
-        Err(error) => Err(error),
-    }
 }
 
 #[derive(Debug)]
@@ -65,6 +49,20 @@ impl std::error::Error for SegmentWriteError {
 }
 
 impl Pipeline {
+    // Whether a download or decode result for the job is still taken: the job
+    // is here, has not ended, and is not publishing what it delivered. Once
+    // the final move begins, cleanup has chosen what the delivery holds, and
+    // a late duplicate must not make an input file again.
+    pub(in crate::pipeline) fn job_takes_results(&self, job_id: JobId) -> bool {
+        self.jobs.get(&job_id).is_some_and(|state| {
+            !is_terminal_status(&state.status)
+                && !matches!(
+                    state.status,
+                    JobStatus::Moving | JobStatus::QueuedPostProcessing | JobStatus::PostProcessing
+                )
+        })
+    }
+
     pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId, raw_bytes: u64) {
         self.active_decode_bytes.insert(segment_id, raw_bytes);
         let job_id = segment_id.file_id.job_id;
@@ -224,11 +222,7 @@ impl Pipeline {
     ) {
         let job_id = segment_id.file_id.job_id;
 
-        if self
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| is_terminal_status(&state.status))
-        {
+        if !self.job_takes_results(job_id) {
             debug!(
                 segment = %segment_id,
                 error,
@@ -368,7 +362,7 @@ impl Pipeline {
         let Some(file) = self
             .jobs
             .get_mut(&file_id.job_id)
-            .and_then(|state| state.assembly.file_mut(file_id))
+            .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
         else {
             return false;
         };
@@ -417,7 +411,8 @@ impl Pipeline {
 
         if !is_uu {
             let mut placed = segment_number;
-            while let Some((result, source)) = self.take_unanchored_successor(file_id, placed) {
+            while let Some((result, source)) = self.take_unanchored_successor(file_id, placed).await
+            {
                 placed = result.segment_id.segment_number;
                 self.handle_decode_success_inner(result, source).await;
             }
@@ -510,23 +505,7 @@ impl Pipeline {
         {
             let _cpu_scope =
                 crate::runtime::perf_probe::cpu_scope("download.handle_decode_success.pre_persist");
-            let Some(state) = self.jobs.get(&job_id) else {
-                debug!(
-                    job_id = job_id.0,
-                    segment = %segment_id,
-                    "discarding decode result for inactive job"
-                );
-                return;
-            };
-            // Cleanup has already selected the delivery contents before the
-            // final move starts. A late duplicate must not recreate an input
-            // file while that directory is being published.
-            if is_terminal_status(&state.status)
-                || matches!(
-                    state.status,
-                    JobStatus::Moving | JobStatus::QueuedPostProcessing | JobStatus::PostProcessing
-                )
-            {
+            if !self.job_takes_results(job_id) {
                 debug!(
                     job_id = job_id.0,
                     segment = %segment_id,
@@ -534,9 +513,11 @@ impl Pipeline {
                 );
                 return;
             }
+            let state = &self.jobs[&job_id];
             let expected_layout = state
-                .assembly
-                .file(file_id)
+                .articles
+                .assembly()
+                .and_then(|assembly| assembly.file(file_id))
                 .ok_or(AuthoritativeLayoutError::FileMissing)
                 .and_then(|file| expected_segment_layout(file, segment_id.segment_number));
             let expected_layout = match expected_layout {
@@ -650,7 +631,7 @@ impl Pipeline {
                     let file = self
                         .jobs
                         .get(&job_id)
-                        .and_then(|state| state.assembly.file(file_id));
+                        .and_then(|state| state.articles.assembly()?.file(file_id));
                     let anchor = file.and_then(|file| file.anchor_end_after(predecessor, settled));
                     // An anchor the part before it never placed is one read off
                     // bytes that are being kept only for repair — and it is
@@ -722,7 +703,7 @@ impl Pipeline {
             let held_damage = self
                 .jobs
                 .get(&job_id)
-                .and_then(|state| state.assembly.file(file_id))
+                .and_then(|state| state.articles.assembly()?.file(file_id))
                 .map(|file| {
                     (
                         file.segment_has_retained_damage(segment_id.segment_number),
@@ -746,7 +727,7 @@ impl Pipeline {
             let mut conflict = match self
                 .jobs
                 .get_mut(&job_id)
-                .and_then(|state| state.assembly.file_mut(file_id))
+                .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
             {
                 Some(file) => {
                     if retain_damage {
@@ -794,7 +775,7 @@ impl Pipeline {
                 conflict = self
                     .jobs
                     .get_mut(&job_id)
-                    .and_then(|state| state.assembly.file_mut(file_id))
+                    .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
                     .and_then(|file| {
                         let other = file.placement_conflict(
                             segment_id.segment_number,
@@ -870,7 +851,7 @@ impl Pipeline {
                 if let Some(file) = self
                     .jobs
                     .get_mut(&job_id)
-                    .and_then(|state| state.assembly.file_mut(file_id))
+                    .and_then(|state| state.articles.assembly_mut()?.file_mut(file_id))
                 {
                     file.note_retained_damage(
                         segment_id.segment_number,
@@ -937,7 +918,7 @@ impl Pipeline {
         let already_placed = self
             .jobs
             .get(&file_id.job_id)
-            .and_then(|state| state.assembly.file(file_id))
+            .and_then(|state| state.articles.assembly()?.file(file_id))
             .and_then(|file| file.placement_of(segment_number));
 
         let uu = self.uu_file(file_id);
@@ -989,27 +970,33 @@ impl Pipeline {
     // considers that segment finished; without a fresh fetch its data exists
     // nowhere, and the cursor would wedge permanently the moment it reached
     // that ordinal.
-    async fn spill_uu_segment(
+    async fn spill_parked_bytes(
         &self,
         file_id: NzbFileId,
         data: DecodedChunk,
-    ) -> Result<UuParkedEntry, SegmentWriteError> {
+    ) -> Result<ParkedBytes, SegmentWriteError> {
         let decoded_bytes = data.len_bytes();
-        let spool_dir = self.uu_spool_root.join(file_id.job_id.0.to_string());
+        let spool_dir = self
+            .jobs
+            .get(&file_id.job_id)
+            .map(|state| crate::pipeline::held::held_spool_dir(&state.working_dir))
+            .ok_or_else(|| {
+                SegmentWriteError::new(file_id, io::Error::other("the job has left the pipeline"))
+            })?;
         let entry = tokio::task::spawn_blocking(move || {
-            prepare_uu_spool_dir(&spool_dir)?;
-            // tempfile creates its file with owner-only permissions. Keep the
-            // TempPath alive in the park so every removal unlinks it.
+            crate::pipeline::held::prepare_held_spool_dir(&spool_dir)?;
+            // tempfile creates its file with owner-only permissions, under a
+            // name no other part has. A write that fails removes its file.
             let mut file = Builder::new()
-                .prefix(UU_SPOOL_FILE_PREFIX)
+                .prefix(crate::pipeline::held::HELD_SPOOL_PREFIX)
                 .tempfile_in(&spool_dir)?;
             data.write_to(file.as_file_mut())?;
-            // This is a transient reorder spool, not crash-durable storage.
-            // `into_temp_path` closes the completed file before publishing
-            // it to the park; readers therefore only observe a full write
-            // without serializing every ahead-of-cursor segment on `sync_all`.
-            Ok::<_, io::Error>(UuParkedEntry::Spilled {
-                path: file.into_temp_path(),
+            // The file is closed before it is published to the park, so a
+            // reader only observes a full write; it is not synced, and a
+            // restart reads back only a file of the length its row records.
+            let path = file.into_temp_path().keep().map_err(|error| error.error)?;
+            Ok::<_, io::Error>(ParkedBytes::Spilled {
+                path,
                 decoded_bytes,
             })
         })
@@ -1024,19 +1011,124 @@ impl Pipeline {
         Ok(entry)
     }
 
-    fn release_uu_parked_entry(&mut self, job_id: JobId, entry: UuParkedEntry) {
-        match entry {
-            UuParkedEntry::Memory(data) => self.release_write_buffered(data.len_bytes(), 1),
-            UuParkedEntry::Spilled {
+    fn release_uu_parked_entry(&mut self, entry: ParkedBytes) {
+        self.release_parked_bytes(entry);
+        self.release_uu_parked_segment();
+    }
+
+    // Spill to its spool every part a parking job holds in memory, releasing
+    // the memory ledger for what left it, then park the job, so its
+    // checkpoint names the parts spooled. A part the spool cannot admit
+    // stays in memory; a spill that fails to write fails the job, as any
+    // spool write does. A job resumed meanwhile keeps its parts where they
+    // are, and runs on.
+    pub(crate) async fn spill_parked_parts(&mut self) {
+        let spilling: Vec<JobId> = self.spilling_jobs.drain().collect();
+        for job_id in spilling {
+            let paused = self
+                .jobs
+                .get(&job_id)
+                .is_some_and(|state| state.run_state == crate::jobs::model::RunState::Paused);
+            if !paused {
+                continue;
+            }
+            match self.spill_job_parts(job_id).await {
+                Ok(()) => self.park_spilled_job(job_id),
+                Err(error) => self.fail_job_for_disk_write(error, "held part spool write failed"),
+            }
+        }
+    }
+
+    async fn spill_job_parts(&mut self, job_id: JobId) -> Result<(), SegmentWriteError> {
+        let uu: Vec<(NzbFileId, u32, usize)> = self
+            .uu_files
+            .iter()
+            .filter(|(file_id, _)| file_id.job_id == job_id)
+            .flat_map(|(file_id, uu)| {
+                uu.parked
+                    .iter()
+                    .filter_map(move |(ordinal, entry)| match entry {
+                        ParkedBytes::Memory(data) => Some((*file_id, *ordinal, data.len_bytes())),
+                        ParkedBytes::Spilled { .. } => None,
+                    })
+            })
+            .collect();
+        for (file_id, ordinal, bytes) in uu {
+            if !self.admit_spool_bytes(bytes) {
+                continue;
+            }
+            let Some(ParkedBytes::Memory(data)) = self
+                .uu_files
+                .get_mut(&file_id)
+                .and_then(|uu| uu.parked.remove(&ordinal))
+            else {
+                continue;
+            };
+            let spilled = self.spill_parked_bytes(file_id, data).await;
+            self.release_write_buffered(bytes, 1);
+            let Ok(spilled) = spilled else {
+                self.release_uu_parked_segment();
+                return spilled.map(|_| ());
+            };
+            self.note_uu_spooled(bytes, 1);
+            if let Some(uu) = self.uu_files.get_mut(&file_id) {
+                uu.parked.insert(ordinal, spilled);
+            }
+        }
+        let unanchored: Vec<(NzbFileId, u32, usize)> = self
+            .unanchored_parked
+            .iter()
+            .filter(|(file_id, _)| file_id.job_id == job_id)
+            .flat_map(|(file_id, parked)| {
+                parked
+                    .iter()
+                    .filter_map(move |(ordinal, part)| match &part.bytes {
+                        ParkedBytes::Memory(data) => Some((*file_id, *ordinal, data.len_bytes())),
+                        ParkedBytes::Spilled { .. } => None,
+                    })
+            })
+            .collect();
+        for (file_id, ordinal, bytes) in unanchored {
+            if !self.admit_spool_bytes(bytes) {
+                continue;
+            }
+            let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
+                continue;
+            };
+            let Some(mut part) = parked.remove(&ordinal) else {
+                continue;
+            };
+            let ParkedBytes::Memory(data) = part.bytes else {
+                continue;
+            };
+            let spilled = self.spill_parked_bytes(file_id, data).await;
+            self.release_write_buffered(bytes, 1);
+            part.bytes = spilled?;
+            self.note_uu_spooled(bytes, 1);
+            self.unanchored_parked
+                .entry(file_id)
+                .or_default()
+                .insert(ordinal, part);
+        }
+        Ok(())
+    }
+
+    // Drop a held part's bytes and release the ledger they were charged to.
+    pub(in crate::pipeline) fn release_parked_bytes(&mut self, bytes: ParkedBytes) {
+        match bytes {
+            ParkedBytes::Memory(data) => self.release_write_buffered(data.len_bytes(), 1),
+            ParkedBytes::Spilled {
                 path,
                 decoded_bytes,
             } => {
                 self.release_uu_spooled(decoded_bytes, 1);
-                drop(path);
-                remove_empty_uu_park_dir(&self.uu_spool_root, job_id);
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != io::ErrorKind::NotFound
+                {
+                    warn!(path = %path.display(), %error, "could not remove a held part's spool file");
+                }
             }
         }
-        self.release_uu_parked_segment();
     }
 
     // Store an ahead-of-cursor part after its memory-or-disk form has been
@@ -1066,9 +1158,9 @@ impl Pipeline {
             return Ok(vec![segment_number]);
         }
         let entry = if spills {
-            self.spill_uu_segment(file_id, data).await?
+            self.spill_parked_bytes(file_id, data).await?
         } else {
-            UuParkedEntry::Memory(data)
+            ParkedBytes::Memory(data)
         };
         let inserted_spilled = entry.is_spilled();
         let inserted_bytes = entry.decoded_bytes();
@@ -1100,10 +1192,10 @@ impl Pipeline {
         }
         self.note_uu_parked_segment();
         if let Some(entry) = replacement {
-            self.release_uu_parked_entry(file_id.job_id, entry);
+            self.release_uu_parked_entry(entry);
         }
         for entry in displaced_entries {
-            self.release_uu_parked_entry(file_id.job_id, entry);
+            self.release_uu_parked_entry(entry);
         }
         Ok(displaced)
     }
@@ -1151,9 +1243,10 @@ impl Pipeline {
     // commit path the moment it is — so an out-of-order arrival costs memory
     // for a while, not another fetch. The hold is bounded by the same soft
     // write threshold and per-file part count as the uuencode reorder park, and
-    // is never spilled: an article that does not fit is asked for again
-    // instead, without its retry budget.
-    fn park_or_requeue_unanchored(&mut self, result: DecodeResult, source: SegmentSource) {
+    // is not spilled while its job runs: an article that does not fit is
+    // asked for again instead, without its retry budget. A paused job's held
+    // articles spill to its spool as it parks.
+    fn park_or_requeue_unanchored(&mut self, mut result: DecodeResult, source: SegmentSource) {
         let segment_id = result.segment_id;
         let file_id = segment_id.file_id;
         let ordinal = segment_id.segment_number;
@@ -1171,11 +1264,14 @@ impl Pipeline {
             return;
         }
         let bytes = result.data.len_bytes();
-        let replaced_bytes = self
+        let replaced = self
             .unanchored_parked
             .get(&file_id)
             .and_then(|parked| parked.get(&ordinal))
-            .map(|(parked, _)| parked.data.len_bytes());
+            .map(|part| match &part.bytes {
+                ParkedBytes::Memory(data) => data.len_bytes(),
+                ParkedBytes::Spilled { .. } => 0,
+            });
         let parked_parts = self
             .unanchored_parked
             .get(&file_id)
@@ -1183,22 +1279,27 @@ impl Pipeline {
         let (_, _, write_soft, _) = self.download_pressure_limits();
         let resident = self
             .write_buffered_bytes
-            .saturating_sub(replaced_bytes.unwrap_or(0))
+            .saturating_sub(replaced.unwrap_or(0))
             .saturating_add(bytes);
         let fits = (resident as u64) < write_soft
-            && (replaced_bytes.is_some() || parked_parts < self.uu_park_max_segments);
+            && (replaced.is_some() || parked_parts < self.uu_park_max_segments);
         if !fits {
             self.requeue_segment_awaiting_predecessor(segment_id);
             return;
         }
-        if let Some(replaced_bytes) = replaced_bytes {
-            self.release_write_buffered(replaced_bytes, 1);
-        }
+        let data = std::mem::replace(&mut result.data, DecodedChunk::from(Vec::<u8>::new()));
         self.note_write_buffered(bytes, 1);
-        self.unanchored_parked
-            .entry(file_id)
-            .or_default()
-            .insert(ordinal, (result, source));
+        let replaced = self.unanchored_parked.entry(file_id).or_default().insert(
+            ordinal,
+            UnanchoredPart {
+                result,
+                bytes: ParkedBytes::Memory(data),
+                source,
+            },
+        );
+        if let Some(replaced) = replaced {
+            self.release_parked_bytes(replaced.bytes);
+        }
         debug!(
             segment = %segment_id,
             "article declared no usable start and its predecessor is unplaced; held until it is"
@@ -1209,7 +1310,9 @@ impl Pipeline {
     // `predecessor` has an end for it to start at: a placement, or — once no
     // further copy of it is coming — the extent its damaged bytes occupy. A
     // part that left neither behind anchors nothing and releases nothing.
-    fn take_unanchored_successor(
+    // A held article whose bytes cannot be read back from the spool fails
+    // its job, as any other spool read does.
+    async fn take_unanchored_successor(
         &mut self,
         file_id: NzbFileId,
         predecessor: u32,
@@ -1232,18 +1335,30 @@ impl Pipeline {
         let anchored = self
             .jobs
             .get(&file_id.job_id)
-            .and_then(|state| state.assembly.file(file_id))
+            .and_then(|state| state.articles.assembly()?.file(file_id))
             .is_some_and(|file| file.anchor_end_after(predecessor, settled).is_some());
         if !anchored {
             return None;
         }
         let parked = self.unanchored_parked.get_mut(&file_id)?;
-        let entry = parked.remove(&successor)?;
+        let UnanchoredPart {
+            mut result,
+            bytes,
+            source,
+        } = parked.remove(&successor)?;
         if parked.is_empty() {
             self.unanchored_parked.remove(&file_id);
         }
-        self.release_write_buffered(entry.0.data.len_bytes(), 1);
-        Some(entry)
+        match self.take_parked_bytes(file_id, bytes).await {
+            Ok(data) => {
+                result.data = data;
+                Some((result, source))
+            }
+            Err(error) => {
+                self.fail_job_for_disk_write(error, "held article spool read failed");
+                None
+            }
+        }
     }
 
     // Whether no further copy of the ordinal is coming: it was given up, or
@@ -1253,7 +1368,7 @@ impl Pipeline {
             || self
                 .jobs
                 .get(&segment_id.file_id.job_id)
-                .and_then(|state| state.assembly.file(segment_id.file_id))
+                .and_then(|state| state.articles.assembly()?.file(segment_id.file_id))
                 .is_some_and(|file| file.segment_has_retained_damage(segment_id.segment_number))
     }
 
@@ -1266,23 +1381,25 @@ impl Pipeline {
             return Vec::new();
         };
         let mut released = Vec::new();
-        let mut released_bytes = 0usize;
         let mut next = segment_id.segment_number;
         while let Some(ordinal) = next.checked_add(1) {
-            let Some((result, _)) = parked.remove(&ordinal) else {
+            let Some(part) = parked.remove(&ordinal) else {
                 break;
             };
-            released_bytes = released_bytes.saturating_add(result.data.len_bytes());
-            released.push(result.segment_id);
+            released.push(part);
             next = ordinal;
         }
         if parked.is_empty() {
             self.unanchored_parked.remove(&file_id);
         }
-        if !released.is_empty() {
-            self.release_write_buffered(released_bytes, released.len());
-        }
         released
+            .into_iter()
+            .map(|part| {
+                let segment_id = part.result.segment_id;
+                self.release_parked_bytes(part.bytes);
+                segment_id
+            })
+            .collect()
     }
 
     // Release the articles held behind an ordinal that has just settled for
@@ -1300,7 +1417,8 @@ impl Pipeline {
                 continue;
             }
             let mut anchor = settled.segment_number;
-            while let Some((result, source)) = self.take_unanchored_successor(file_id, anchor) {
+            while let Some((result, source)) = self.take_unanchored_successor(file_id, anchor).await
+            {
                 anchor = result.segment_id.segment_number;
                 self.handle_decode_success_inner(result, source).await;
             }
@@ -1333,7 +1451,7 @@ impl Pipeline {
         let placed = self
             .jobs
             .get(&segment_id.file_id.job_id)
-            .and_then(|state| state.assembly.file(segment_id.file_id))
+            .and_then(|state| state.articles.assembly()?.file(segment_id.file_id))
             .map_or(0, |file| file.placed_segment_count());
         let (attempts, seen_placed) = self
             .unanchored_requeues
@@ -1431,14 +1549,24 @@ impl Pipeline {
         let Some((index, entry)) = next else {
             return Ok(None);
         };
+        self.release_uu_parked_segment();
+        let data = self.take_parked_bytes(file_id, entry).await?;
+        Ok(Some((index, data)))
+    }
 
-        match entry {
-            UuParkedEntry::Memory(data) => {
+    // A held part's bytes, out of memory or read back from the spool, with
+    // the ledger they were charged to released.
+    async fn take_parked_bytes(
+        &mut self,
+        file_id: NzbFileId,
+        bytes: ParkedBytes,
+    ) -> Result<DecodedChunk, SegmentWriteError> {
+        match bytes {
+            ParkedBytes::Memory(data) => {
                 self.release_write_buffered(data.len_bytes(), 1);
-                self.release_uu_parked_segment();
-                Ok(Some((index, data)))
+                Ok(data)
             }
-            UuParkedEntry::Spilled {
+            ParkedBytes::Spilled {
                 path,
                 decoded_bytes,
             } => {
@@ -1446,7 +1574,6 @@ impl Pipeline {
                 // recorded decoded length, rather than file metadata, bounds
                 // allocation and validates the entire spool contents.
                 self.release_uu_spooled(decoded_bytes, 1);
-                self.release_uu_parked_segment();
                 let read_result = tokio::task::spawn_blocking(move || {
                     let read_result = (|| -> io::Result<DecodedChunk> {
                         let mut file = File::open(&path)?;
@@ -1467,9 +1594,9 @@ impl Pipeline {
                         }
                         Ok(bytes.into())
                     })();
-                    // Always remove the transient file, including after a
+                    // Always remove the spool file, including after a
                     // truncated, oversized, or missing-file read failure.
-                    let remove_result = path.close();
+                    let remove_result = std::fs::remove_file(&path);
                     match (read_result, remove_result) {
                         (Err(error), _) => Err(error),
                         (Ok(_), Err(error)) => Err(error),
@@ -1477,16 +1604,14 @@ impl Pipeline {
                     }
                 })
                 .await;
-                remove_empty_uu_park_dir(&self.uu_spool_root, file_id.job_id);
-                let data = read_result
+                read_result
                     .map_err(|error| {
                         SegmentWriteError::new(
                             file_id,
                             io::Error::other(format!("UU spool read task failed: {error}")),
                         )
                     })?
-                    .map_err(|error| SegmentWriteError::new(file_id, error))?;
-                Ok(Some((index, data)))
+                    .map_err(|error| SegmentWriteError::new(file_id, error))
             }
         }
     }

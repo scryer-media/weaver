@@ -146,8 +146,10 @@ async fn armed(scenario: &Scenario, port: u16) -> (tempfile::TempDir, Pipeline) 
     }
     assert!(pipeline.post_probes.out(JOB), "the losses arm a round");
     let state = pipeline.jobs.get_mut(&JOB).unwrap();
-    state.download_queue.extract_matching(|_| true);
-    state.recovery_queue.extract_matching(|_| true);
+    if let Some(active) = state.articles.active_mut() {
+        active.download_queue.extract_matching(|_| true);
+        active.recovery_queue.extract_matching(|_| true);
+    }
     (temp_dir, pipeline)
 }
 

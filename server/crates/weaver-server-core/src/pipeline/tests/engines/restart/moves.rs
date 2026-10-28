@@ -155,7 +155,8 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
         let queued = pipeline
             .jobs
             .get(&JOB)
-            .map_or(0, |state| state.download_queue.len());
+            .and_then(|state| state.articles.active())
+            .map_or(0, |active| active.download_queue.len());
         if queued == 0 && requests.values().sum::<usize>() == asked {
             quiet += 1;
             assert!(

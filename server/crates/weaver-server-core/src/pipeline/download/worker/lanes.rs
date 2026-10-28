@@ -163,7 +163,7 @@ impl Pipeline {
     fn segment_already_delivered(&self, seg_id: SegmentId) -> bool {
         self.jobs
             .get(&seg_id.file_id.job_id)
-            .and_then(|state| state.assembly.file(seg_id.file_id))
+            .and_then(|state| state.articles.assembly()?.file(seg_id.file_id))
             .is_some_and(|file| file.has_segment(seg_id.segment_number))
     }
 
@@ -196,7 +196,7 @@ impl Pipeline {
         }
         self.jobs
             .get(&seg_id.file_id.job_id)
-            .and_then(|state| state.assembly.file(seg_id.file_id))
+            .and_then(|state| state.articles.assembly()?.file(seg_id.file_id))
             .is_some_and(|file| file.anchor_end_after(seg_id.segment_number, true).is_some())
     }
 

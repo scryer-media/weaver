@@ -19,39 +19,28 @@ async fn delete_history_batch(
         .unwrap()
 }
 
+// Admission holds nothing back for memory: a job is added past a ledger
+// with no room, and waits its turn charged nothing.
 #[tokio::test]
-async fn scheduling_memory_admission_preserves_placements_and_counts_other_jobs() {
+async fn admission_reserves_nothing_per_article() {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    let mut spec = standalone_job_spec("Memory admission", &[("small.bin".to_string(), 16)]);
-    let single = spec.scheduling_memory_estimate();
-    let repeated = spec.files[0].clone();
-    spec.files.push(repeated);
-    assert_eq!(spec.scheduling_memory_estimate(), single * 2);
-    let required = spec.scheduling_memory_estimate();
-    pipeline.process_memory_budget = Arc::new(ProcessMemoryBudget::new(required));
-    let first = pipeline.check_job_memory_admission(&spec).unwrap();
-    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), required);
-    assert!(matches!(
-        pipeline.check_job_memory_admission(&spec),
-        Err(crate::SchedulerError::InvalidInput(_))
-    ));
-    drop(first);
+    let spec = standalone_job_spec("Memory admission", &[("small.bin".to_string(), 16)]);
+    pipeline.process_memory_budget = Arc::new(ProcessMemoryBudget::new(0));
+    let resources = pipeline.admission_resources();
+    let prepared = Pipeline::prepare_add(
+        &resources,
+        JobId(31001),
+        spec,
+        PathBuf::from("31001.nzb"),
+        sample_nzb_zstd(),
+        crate::jobs::AddJobOptions::default(),
+    )
+    .await
+    .unwrap();
+    pipeline.install_prepared_add(JobId(31001), prepared);
     assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
-    pipeline.process_memory_budget = Arc::new(ProcessMemoryBudget::new(required * 2));
-    insert_active_job(&mut pipeline, JobId(31001), spec.clone()).await;
-    let first = pipeline.check_job_memory_admission(&spec).unwrap();
-    pipeline.job_scheduling_memory.insert(JobId(31001), first);
-    assert!(pipeline.check_job_memory_admission(&spec).is_ok());
-    let competing_work = pipeline
-        .process_memory_budget
-        .try_reserve_retained(1)
-        .unwrap();
-    assert!(pipeline.check_job_memory_admission(&spec).is_err());
-    drop(competing_work);
-    pipeline.purge_terminal_job_runtime(JobId(31001));
-    assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
-    assert!(pipeline.check_job_memory_admission(&spec).is_ok());
+    retire_pipeline_database(pipeline).await;
 }
 
 #[tokio::test]
@@ -487,6 +476,7 @@ async fn record_job_history_retains_failed_job_nzb() {
         "Failed History Retention",
         &[("episode.mkv".to_string(), 123)],
     );
+    let stored_nzb = nzb_zstd_for(&spec);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let expected_nzb_path = pipeline
         .db
@@ -512,7 +502,7 @@ async fn record_job_history_retains_failed_job_nzb() {
         .load_history_job_persisted_nzb(job_id.0)
         .unwrap()
         .unwrap();
-    assert_eq!(nzb_zstd.unwrap(), sample_nzb_zstd());
+    assert_eq!(nzb_zstd.unwrap(), stored_nzb);
 }
 
 #[tokio::test]
@@ -524,6 +514,7 @@ async fn record_job_history_retains_complete_job_nzb() {
         "Complete History Retention",
         &[("episode.mkv".to_string(), 123)],
     );
+    let stored_nzb = nzb_zstd_for(&spec);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let expected_nzb_path = pipeline
         .db
@@ -547,7 +538,7 @@ async fn record_job_history_retains_complete_job_nzb() {
         .load_history_job_persisted_nzb(job_id.0)
         .unwrap()
         .unwrap();
-    assert_eq!(nzb_zstd.unwrap(), sample_nzb_zstd());
+    assert_eq!(nzb_zstd.unwrap(), stored_nzb);
 }
 
 // Park the serialized database writer until the returned sender is dropped, so

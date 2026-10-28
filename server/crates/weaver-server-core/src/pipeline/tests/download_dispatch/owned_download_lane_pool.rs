@@ -224,7 +224,12 @@ async fn a_handout_is_bounded_by_the_want_not_by_the_queue() {
         .expect("the hot job can serve this server");
     assert_eq!(lease.works.len(), want);
     assert_eq!(
-        pipeline.jobs[&job_id].download_queue.len(),
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         33 - want,
         "the rest of the tail stays queued for the lanes behind this one"
     );
@@ -291,8 +296,8 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -347,6 +352,9 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("transport retry should remain in the batched infrastructure queue");
@@ -398,6 +406,9 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -421,8 +432,8 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -459,6 +470,9 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("transport retry should requeue");
@@ -483,8 +497,8 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -520,6 +534,9 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
     let retry = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -569,8 +586,8 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -606,6 +623,9 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
     let retry = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -656,6 +676,9 @@ async fn fail_segment_on_transport(
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("transport retry should requeue");
@@ -682,8 +705,8 @@ async fn a_segment_that_keeps_breaking_connections_is_held_back_then_pays_for_re
     let spec = segmented_job_spec("Poison article", "poison.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
 
     let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
     assert!(
@@ -722,8 +745,8 @@ async fn an_outage_never_spends_article_retry_budget() {
     let spec = segmented_job_spec("Outage", "outage.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
 
     for _ in 0..6 {
         let (_, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
@@ -795,8 +818,8 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
     let spec = segmented_job_spec("Group discovery", "group.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
 
@@ -833,6 +856,9 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
     let retry = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -889,7 +915,14 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
         segmented_job_spec("Generation Batch", "retry.bin", &[128]),
     )
     .await;
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     pipeline.pending_retries_by_job.insert(job_id, RETRY_COUNT);
     pipeline.download_wait_by_job.insert(
         job_id,
@@ -960,7 +993,15 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
         Some("no_server")
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         RETRY_COUNT
     );
     assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
@@ -995,8 +1036,8 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
     .await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     pipeline.pool_generation = 2;
     hold_on_test_lane(&mut pipeline, &[segment_id]);
@@ -1023,7 +1064,12 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     assert_eq!(state.failed_bytes, 0);
-    let queued = state.download_queue.drain_all();
+    let queued = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].segment_id, segment_id);
     assert_eq!(queued[0].retry_count, MAX_SEGMENT_RETRIES + 10);
@@ -1116,8 +1162,8 @@ async fn terminal_accounting_is_idempotent() {
     .await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     pipeline.book_failed_segment(segment_id);
@@ -1133,6 +1179,7 @@ async fn terminal_accounting_is_idempotent() {
         };
     }
     pipeline.reprocess_job(job_id).await.unwrap();
+    activate_job(&mut pipeline, job_id).await;
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
 
@@ -1240,7 +1287,13 @@ async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
     pipeline.book_terminal_segment(segment(2), SegmentTerminalState::DecodeExhausted);
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let file = state.assembly.file_mut(file_id).unwrap();
+        let file = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .assembly
+            .file_mut(file_id)
+            .unwrap();
         file.commit_segment(1, 2_000).unwrap();
         file.commit_segment(3, 4_000).unwrap();
     }
@@ -1272,8 +1325,8 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -1369,8 +1422,8 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[large_segment, tail_segment]);
     pipeline.active_download_passes.insert(job_id);
@@ -1489,6 +1542,9 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("untested tail must re-enter the download queue");
@@ -1534,8 +1590,8 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -1615,8 +1671,8 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -1760,8 +1816,8 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -1868,8 +1924,8 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -2077,8 +2133,8 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -2141,7 +2197,14 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
     let job_id = JobId(40153);
     let spec = segmented_job_spec("Unservable Requeue", "solo.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     let segment_id = SegmentId {
         file_id: NzbFileId {
             job_id,
@@ -2172,10 +2235,13 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
         1
     );
     assert!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| state.download_queue.is_empty() && state.failed_bytes == 128),
+        pipeline.jobs.get(&job_id).is_none_or(|state| state
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+            && state.failed_bytes == 128),
         "the article must be booked missing, not queued (job may already be archived by health)"
     );
 }
@@ -2193,7 +2259,15 @@ async fn fully_retention_excluded_queue_is_retired_when_the_scheduler_is_asked()
     insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.nntp = std::sync::Arc::new(retention_client(&[5, 5]));
     age_job_days(&mut pipeline, job_id, 10);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 4);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        4
+    );
 
     let pressure = pipeline.refresh_download_pressure();
     let handout = pipeline.next_works(0, 4, None, pressure);
@@ -2209,10 +2283,13 @@ async fn fully_retention_excluded_queue_is_retired_when_the_scheduler_is_asked()
         4
     );
     assert!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| state.download_queue.is_empty() && state.failed_bytes == 512),
+        pipeline.jobs.get(&job_id).is_none_or(|state| state
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+            && state.failed_bytes == 512),
         "every article must be booked missing (job may already be archived by health)"
     );
 }
@@ -2229,8 +2306,8 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -2292,8 +2369,8 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -2363,8 +2440,8 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 2, 0)]);
@@ -2424,8 +2501,8 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -2520,26 +2597,31 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.status = JobStatus::Downloading;
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue.push(DownloadWork {
-            counters: None,
-            segment_id: SegmentId {
-                file_id: NzbFileId {
-                    job_id,
-                    file_index: 1,
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .recovery_queue
+            .push(DownloadWork {
+                counters: None,
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 1,
+                    },
+                    segment_number: 0,
                 },
-                segment_number: 0,
-            },
-            message_id: MessageId::new("recovery-0@example.com"),
-            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
-            priority: 1000,
-            byte_estimate: 128,
-            retry_count: 0,
-            is_recovery: true,
-            completion_critical: false,
-            exclude_servers: Vec::new(),
-            avoid_server: None,
-        });
+                message_id: MessageId::new("recovery-0@example.com"),
+                groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+                priority: 1000,
+                byte_estimate: 128,
+                retry_count: 0,
+                is_recovery: true,
+                completion_critical: false,
+                exclude_servers: Vec::new(),
+                avoid_server: None,
+            });
     }
 
     pipeline.active_download_passes.insert(job_id);
@@ -2560,7 +2642,15 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
         vec![job_id]
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().recovery_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .recovery_queue
+            .len(),
         1,
         "optional recovery files should stay parked until promoted"
     );
@@ -2670,8 +2760,8 @@ async fn article_not_found_exhausts_when_the_work_already_failed_elsewhere() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -2736,8 +2826,8 @@ async fn article_not_found_that_learns_no_new_server_books_instead_of_retrying()
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -2798,8 +2888,8 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -3020,7 +3110,15 @@ async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() 
             ],
         };
         insert_active_job(&mut pipeline, job_id, spec).await;
-        let queued = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
+        let queued = pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len();
         assert_eq!(queued, 8);
 
         // The namespace holds the payload an index to come will place: only
@@ -3038,7 +3136,15 @@ async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() 
             "{leased:?}"
         );
         assert_eq!(
-            pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+            pipeline
+                .jobs
+                .get(&job_id)
+                .unwrap()
+                .articles
+                .active()
+                .unwrap()
+                .download_queue
+                .len(),
             queued - 1
         );
         let graph = pipeline.graph_jobs.get_mut(&job_id).unwrap();
@@ -3286,8 +3392,8 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[segment_id]);
@@ -3354,6 +3460,9 @@ async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("generation wake should requeue parked infrastructure work");
@@ -3387,8 +3496,8 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[segment_id]);
@@ -3454,6 +3563,9 @@ async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure()
     let retry = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()

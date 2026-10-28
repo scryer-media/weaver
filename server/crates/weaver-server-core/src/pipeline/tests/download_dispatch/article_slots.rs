@@ -39,10 +39,16 @@ fn lease_slot(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(String, Vec<usize>
         return Vec::new();
     };
     let mut leased = state
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .extract_matching(|work| work.segment_id == segment_id);
     leased.extend(
         state
+            .articles
+            .active_mut()
+            .unwrap()
             .recovery_queue
             .extract_matching(|work| work.segment_id == segment_id),
     );

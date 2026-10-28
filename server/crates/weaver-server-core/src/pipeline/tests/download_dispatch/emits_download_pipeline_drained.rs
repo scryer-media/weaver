@@ -96,7 +96,15 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
         DownloadPressureReason::Decode.as_code()
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         files.len()
     );
 
@@ -182,7 +190,18 @@ async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_wo
         pipeline.active_downloads_by_job.get(&job_id),
         Some(&(segment_count as usize))
     );
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -246,7 +265,18 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
 
     assert_eq!(pipeline.active_downloads, 4);
     assert_eq!(pipeline.active_downloads_by_job.get(&job_id), Some(&4));
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 2);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -293,10 +323,13 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
         for file_index in 0..complete_files {
             let file_id = NzbFileId { job_id, file_index };
             state
+                .articles
+                .active_mut()
+                .unwrap()
                 .assembly
                 .file_mut(file_id)
                 .unwrap()
@@ -333,6 +366,9 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
     pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .push(next_work);
@@ -393,13 +429,19 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         avoid_server: None,
     };
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
     // The later segment is deliberately the queue head. Capped admission must
     // scan past it to fetch the ordinal that can release the parked prefix.
     state
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .push(work(1, "uu-later@example.invalid"));
     state
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .push(work(0, "uu-prefix@example.invalid"));
     pipeline.uu_files.insert(
@@ -418,9 +460,20 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
 
     assert_eq!(lease.works.len(), 1);
     assert_eq!(lease.works[0].segment_id.segment_number, 0);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 1);
     assert_eq!(
         pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .peek_next_matching(|_| true)
             .map(|work| work.segment_id.segment_number),
@@ -458,6 +511,9 @@ async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
         let first = pipeline
             .jobs
             .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
             .unwrap()
             .download_queue
             .pop()
@@ -759,7 +815,7 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
             state.download_state,
             crate::jobs::model::DownloadState::Complete
         );
-        assert_eq!(state.download_queue.len(), 1);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 1);
     }
 
     pipeline.dispatch_downloads();
@@ -770,7 +826,7 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
     for (job_id, status) in &cases {
         let state = pipeline.jobs.get(job_id).unwrap();
         assert_eq!(&state.status, status);
-        assert_eq!(state.download_queue.len(), 0);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 0);
         assert!(pipeline.active_download_passes.contains(job_id));
     }
 }
@@ -820,6 +876,9 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
     {
         let state = pipeline.jobs.get_mut(&low_job_id).unwrap();
         let in_flight = state
+            .articles
+            .active_mut()
+            .unwrap()
             .download_queue
             .pop()
             .expect("low-priority job should have an in-flight segment to drain");
@@ -836,13 +895,24 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
     assert_eq!(pipeline.active_downloads, 2);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
-        pipeline.jobs.get(&low_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&low_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1
     );
     assert_eq!(
         pipeline
             .jobs
             .get(&high_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -893,6 +963,9 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
         .jobs
         .get(&normal_job_id)
         .unwrap()
+        .articles
+        .active()
+        .unwrap()
         .download_queue
         .len();
     assert!(
@@ -933,6 +1006,9 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
             .jobs
             .get(&normal_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         normal_queued_before_priority_update,
@@ -942,6 +1018,9 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
         pipeline
             .jobs
             .get(&promoted_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -995,10 +1074,16 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
     {
         let state = pipeline.jobs.get_mut(&later_job_id).unwrap();
         let _ = state
+            .articles
+            .active_mut()
+            .unwrap()
             .download_queue
             .pop()
             .expect("later job should have one completed segment removed from queue");
         state
+            .articles
+            .active_mut()
+            .unwrap()
             .assembly
             .file_mut(NzbFileId {
                 job_id: later_job_id,
@@ -1017,6 +1102,9 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
             .jobs
             .get(&earlier_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         0
@@ -1025,6 +1113,9 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
         pipeline
             .jobs
             .get(&later_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -1130,13 +1221,23 @@ async fn a_lower_priority_critical_recovery_waits_behind_the_hot_jobs_regular_by
     .await;
     let critical_queued_before = {
         let state = pipeline.jobs.get_mut(&critical_job_id).unwrap();
-        let work = state.download_queue.drain_all();
+        let work = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all();
         for mut work in work {
             work.is_recovery = true;
             work.completion_critical = true;
-            state.download_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(work);
         }
-        state.download_queue.len()
+        state.articles.active().unwrap().download_queue.len()
     };
 
     pipeline.dispatch_downloads();
@@ -1157,6 +1258,9 @@ async fn a_lower_priority_critical_recovery_waits_behind_the_hot_jobs_regular_by
         pipeline
             .jobs
             .get(&critical_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -1206,11 +1310,21 @@ async fn the_hot_job_takes_the_only_connection_ahead_of_a_critical_recovery() {
     .await;
     {
         let state = pipeline.jobs.get_mut(&critical_job_id).unwrap();
-        let work = state.download_queue.drain_all();
+        let work = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all();
         for mut work in work {
             work.is_recovery = true;
             work.completion_critical = true;
-            state.download_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(work);
         }
     }
 
@@ -1427,10 +1541,21 @@ async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
     .await;
     for job_id in [critical_a, critical_b] {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        for mut work in state.download_queue.drain_all() {
+        for mut work in state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all()
+        {
             work.is_recovery = true;
             work.completion_critical = true;
-            state.download_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(work);
         }
     }
 
@@ -1445,7 +1570,15 @@ async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
     assert_eq!(pipeline.active_completion_critical_connections, 0);
     for job_id in [critical_a, critical_b] {
         assert_eq!(
-            pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+            pipeline
+                .jobs
+                .get(&job_id)
+                .unwrap()
+                .articles
+                .active()
+                .unwrap()
+                .download_queue
+                .len(),
             1,
             "a later job's critical article waits while the hot job can be served"
         );
@@ -1523,7 +1656,15 @@ async fn hot_clear_pressure_lane_leases_sequential_runway() {
         pipeline.download_refill_want(pipeline.download_lane_mode_for_server(0, pressure, true));
     assert_eq!(pipeline.active_downloads, want);
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         100 - want
     );
     assert_eq!(
@@ -1593,6 +1734,9 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
         .jobs
         .get(&peer_job_id)
         .unwrap()
+        .articles
+        .active()
+        .unwrap()
         .download_queue
         .len();
 
@@ -1613,6 +1757,9 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
         pipeline
             .jobs
             .get(&peer_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -1864,7 +2011,13 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
     )
     .await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let tail_work = state.download_queue.pop().unwrap();
+    let tail_work = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
     pipeline.hold_test_lane_works(vec![tail_work.clone()], false);
 
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -1892,7 +2045,18 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
             .pending_released_download_results_by_job
             .contains_key(&job_id)
     );
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 2);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
     assert!(ack_rx.try_recv().is_ok());
 }
 

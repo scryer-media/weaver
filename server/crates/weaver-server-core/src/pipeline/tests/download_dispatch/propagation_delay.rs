@@ -20,6 +20,9 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -74,6 +77,9 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -99,6 +105,9 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
     let work = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -157,6 +166,9 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
     let restored = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -220,13 +232,24 @@ async fn dispatch_downloads_shares_a_small_hot_job_across_both_lanes_before_the_
     // job beside a hot job it could still be fetching. The next job waits
     // for the first lane that finds the hot job drained.
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         0
     );
     assert_eq!(
         pipeline
             .jobs
             .get(&secondary_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -302,13 +325,24 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
             .contains_key(&secondary_job_id)
     );
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         2
     );
     assert_eq!(
         pipeline
             .jobs
             .get(&secondary_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -337,7 +371,15 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         2
     );
 
@@ -348,7 +390,15 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1
     );
 }
@@ -411,6 +461,9 @@ async fn dispatch_downloads_suppresses_the_spill_under_soft_byte_pressure() {
             .jobs
             .get(&secondary_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         1
@@ -472,10 +525,19 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     {
         let state = pipeline.jobs.get_mut(&leading_job_id).unwrap();
-        let _ = state.download_queue.pop().expect(
-            "leading low-priority job should have one completed segment removed from queue",
-        );
+        let _ = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .pop()
+            .expect(
+                "leading low-priority job should have one completed segment removed from queue",
+            );
         state
+            .articles
+            .active_mut()
+            .unwrap()
             .assembly
             .file_mut(NzbFileId {
                 job_id: leading_job_id,
@@ -497,6 +559,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .jobs
             .get(&leading_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         65 - want
@@ -505,6 +570,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
         pipeline
             .jobs
             .get(&promoted_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -529,6 +597,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .jobs
             .get(&leading_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         65 - want
@@ -537,6 +608,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
         pipeline
             .jobs
             .get(&promoted_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -575,7 +649,7 @@ async fn list_jobs_projects_downloading_while_extracting_with_active_download_wo
             state.download_state,
             crate::jobs::model::DownloadState::Complete
         );
-        assert_eq!(state.download_queue.len(), 1);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 1);
     }
 
     let info = pipeline
@@ -720,7 +794,7 @@ async fn a_started_download_with_only_queued_work_lists_as_downloading() {
     {
         let state = pipeline.jobs.get(&job_id).unwrap();
         assert_eq!(state.status, JobStatus::Downloading);
-        assert_eq!(state.download_queue.len(), 1);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 1);
     }
     assert!(
         !pipeline
@@ -1083,14 +1157,28 @@ async fn queued_work_behind_quota_blocked_fills_shows_the_server_quota_block() {
     pipeline.update_queue_metrics();
 
     assert!(pipeline.server_quota_parked.is_empty());
-    assert!(!pipeline.jobs[&job_id].download_queue.is_empty());
+    assert!(
+        !pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
     assert_eq!(
         pipeline.shared_state.download_block().kind,
         crate::jobs::handle::DownloadBlockKind::ServerQuota
     );
 
     // With nothing left queued, an exhausted pool holds nothing back.
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     pipeline.update_queue_metrics();
     assert_eq!(
         pipeline.shared_state.download_block().kind,
@@ -1136,7 +1224,18 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 1);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
     // The queue change re-derives the block from the pool, whose server has
     // quota, so the stale presentation gives way to the schedule beneath it.
     assert_eq!(
@@ -1384,7 +1483,7 @@ async fn redownload_job_rebuilds_failed_history_as_queued_download() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert_eq!(state.status, JobStatus::Queued);
-    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.articles.queued_download_len(), 1);
     assert_eq!(state.downloaded_bytes, 0);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert!(!working_dir.exists());
@@ -1439,7 +1538,7 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert_eq!(state.status, JobStatus::Queued);
-    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.articles.queued_download_len(), 1);
     assert_eq!(state.downloaded_bytes, 0);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert!(!working_dir.exists());
@@ -1478,7 +1577,7 @@ async fn redownload_job_uses_history_blob_when_history_path_is_stale() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert_eq!(state.status, JobStatus::Queued);
-    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.articles.queued_download_len(), 1);
     assert_eq!(state.downloaded_bytes, 0);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert!(!stale_nzb_path.exists());
@@ -1636,7 +1735,18 @@ async fn active_rate_limit_does_not_prelease_multiple_bodies() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 1);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 3);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -2132,7 +2242,15 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
     // half of what the gate promises.
     set_job_status_for_test(&mut pipeline, job_id, JobStatus::Queued);
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1,
         "one file, one segment, waiting to be issued"
     );
@@ -2144,7 +2262,15 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
         "a deferred job must not put an article on the wire"
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1,
         "and its segment must still be queued, not leased"
     );
@@ -2163,7 +2289,15 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
         "once the post has propagated the same pass dispatches it"
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         0,
         "and the segment leaves the queue"
     );
