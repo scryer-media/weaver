@@ -778,12 +778,12 @@ mod tests {
         }
 
         let (asked, built) = ask_at("127.0.0.1", "/admin", Ask::Announce).await;
-        let refused = asked.err().expect("loopback /admin was asked");
+        let refused = asked.expect_err("loopback /admin was asked");
         assert!(format!("{refused:#}").contains("SSRF"), "{refused:#}");
         assert!(!built);
 
         let (asked, built) = ask_at("169.254.1.1", "/announce", Ask::Announce).await;
-        let refused = asked.err().expect("169.254.1.1 was asked");
+        let refused = asked.expect_err("169.254.1.1 was asked");
         assert!(
             refused
                 .downcast_ref::<crate::tracker::tracker_comms::NotPublic>()
