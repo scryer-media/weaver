@@ -348,6 +348,10 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     let hex = working_dir.join(&posts[0].name);
     assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
     decode_all(&mut pipeline, job_id, &posts, 1).await;
+    // The volume still to come is the set's own from the post, so with the
+    // payload in, the set rules as its index is founded, before it is read;
+    // the bind that names the member follows once that run is heard.
+    hear_repair(&mut pipeline, job_id).await;
 
     let member = pipeline.graph_jobs[&job_id]
         .namespace()

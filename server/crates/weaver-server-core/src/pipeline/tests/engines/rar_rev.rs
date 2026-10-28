@@ -9,7 +9,7 @@
 use sha2::Digest;
 use weaver_graph::recovery::RepairOutcome;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run};
+use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run, run_holding};
 use super::rar::{delivered, posts};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::scenarios::{HeaderCheck, header_encrypted_store_set};
@@ -128,6 +128,136 @@ async fn rar_rev_rebuilds_one_absent_rar5_volume_from_one_recovery_volume() {
 async fn rar_rev_rebuilds_two_absent_rar5_volumes_from_two_recovery_volumes() {
     let (body, scenario) = rar5_set(&[1, 3], 2);
     assert_rebuilt(&run(&scenario).await, &body, 2);
+}
+
+// Two data volumes never posted and two recovery volumes, the server
+// holding the second's every article. The set, founded by the first, took
+// the second by its posted name and counts it as coming: one volume in hand
+// is short of the two it needs, so it waits rather than ruling short, and
+// the job reads as fetching repair data until the server lets it go.
+#[tokio::test]
+async fn rar_rev_held_recovery_volume_reads_as_fetching_repair_data() {
+    let (body, scenario) = rar5_set(&[1, 3], 2);
+    let last = scenario.posts.len() as u32 - 1;
+    assert!(scenario.posts[last as usize].name.ends_with(".part2.rev"));
+    let held = run_holding(&scenario, last).await;
+    assert_eq!(held.outcomes, vec![Some(RepairOutcome::Waiting)]);
+    assert_eq!(held.report.status, JobStatus::Downloading);
+    assert_eq!(held.report.post_state, crate::PostState::Idle);
+    assert!(held.report.fetching_repair_data, "not fetching while held");
+    assert!(
+        held.after.iter().all(|(_, fetching)| !fetching),
+        "still fetching once the volume came: {:?}",
+        held.after
+    );
+    assert_eq!(held.status, Some(JobStatus::Complete));
+    assert!(held.files[&delivered(MEMBER)] == body, "member bytes");
+}
+
+// A two-volume RAR5 set, its second volume damaged, beside the one
+// recovery volume RAR wrote for it, the server holding that volume's every
+// article. None of its bytes have come, so once the archive is founded the
+// `.rev` founds its own recovery set by its posted name, and that set counts
+// it as coming: it waits rather than ruling short, and the job reads as
+// fetching repair data until the server lets the volume go and the set
+// rebuilds the damaged volume.
+#[tokio::test]
+async fn rar_rev_lone_held_recovery_volume_reads_as_fetching_repair_data() {
+    let body = body();
+    let volumes = single_member_store_set(MEMBER, &body, 2);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let revs = rar5_revs("silver.horizon", &bytes, 1);
+    let scenario = Scenario::new(posted(volumes, &[], revs)).damaged(1, 1);
+    let last = scenario.posts.len() as u32 - 1;
+    assert_eq!(last, 2);
+    assert!(scenario.posts[last as usize].name.ends_with(".part1.rev"));
+    let held = run_holding(&scenario, last).await;
+    assert_eq!(held.outcomes, vec![Some(RepairOutcome::Waiting)]);
+    assert_eq!(held.report.status, JobStatus::Downloading);
+    assert_eq!(held.report.post_state, crate::PostState::Idle);
+    assert!(held.report.fetching_repair_data, "not fetching while held");
+    assert!(
+        held.after.iter().all(|(_, fetching)| !fetching),
+        "still fetching once the volume came: {:?}",
+        held.after
+    );
+    assert_eq!(held.status, Some(JobStatus::Complete));
+    assert!(held.files[&delivered(MEMBER)] == body, "member bytes");
+}
+
+// A RAR5 archive posted under a recovery volume's name, after another
+// archive. The other archive is founded first, and the `.rev` name, its
+// bytes not yet come, founds a recovery set. Its front then signs an
+// archive: bytes outrank names, so it leaves the set, opens as the archive
+// it is and delivers its member.
+#[tokio::test]
+async fn rar_rev_named_member_whose_bytes_are_an_archive_opens_as_one() {
+    let body = body();
+    let other = payload(3 * ARTICLE + 7, 67);
+    let mut posted: Vec<(String, Vec<u8>)> = single_member_store_set("other.bin", &other, 1)
+        .into_iter()
+        .map(|(_, bytes)| ("other.rar".to_owned(), bytes))
+        .collect();
+    posted.extend(
+        single_member_store_set(MEMBER, &body, 1)
+            .into_iter()
+            .map(|(_, bytes)| ("x.part1.rev".to_owned(), bytes)),
+    );
+    let outcome = run(&Scenario::new(posts(posted))).await;
+    assert!(
+        outcome.completed(),
+        "{:?} {:?}",
+        outcome.status,
+        outcome.failure
+    );
+    let mut names = outcome.files.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec![delivered(MEMBER), delivered("other.bin")]);
+    assert!(outcome.files[&delivered(MEMBER)] == body, "member bytes");
+    assert!(
+        outcome.files[&delivered("other.bin")] == other,
+        "other bytes"
+    );
+}
+
+// A whole two-volume RAR5 set beside its one real recovery volume,
+// `.part1.rev`, and a `.part2.rev` of the same stem whose bytes are a RAR4
+// archive of their own, which the RAR5 set's store does not claim. The recovery set, founded by the real one, is
+// offered the second by its name, but its front signs an archive: bytes
+// outrank names, so the set keeps only the first and rules clean, and the
+// second opens as the archive it is and delivers its member.
+#[tokio::test]
+async fn rar_rev_set_refuses_a_same_stem_member_whose_bytes_are_an_archive() {
+    let body = body();
+    let volumes = single_member_store_set(MEMBER, &body, 2);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let revs = rar5_revs("silver.horizon", &bytes, 1);
+    assert!(revs[0].name.ends_with(".part1.rev"));
+    let other = payload(3 * ARTICLE + 7, 73);
+    let archive = single_member_rar4_old_numbering_set("other", "other.bin", &other, 1)
+        .into_iter()
+        .map(|(_, bytes)| Post::plain("silver.horizon.part2.rev", with_rar4_header_crcs(bytes)));
+    let mut posted = posted(volumes, &[], revs);
+    posted.extend(archive);
+    let outcome = run(&Scenario::new(posted)).await;
+    assert!(
+        outcome.completed(),
+        "{:?} {:?}",
+        outcome.status,
+        outcome.failure
+    );
+    assert_eq!(
+        outcome.graph().rulings,
+        vec![("rar_recovery".to_owned(), Some(RepairOutcome::Clean))]
+    );
+    let mut names = outcome.files.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec![delivered(MEMBER), delivered("other.bin")]);
+    assert!(outcome.files[&delivered(MEMBER)] == body, "member bytes");
+    assert!(
+        outcome.files[&delivered("other.bin")] == other,
+        "other bytes"
+    );
 }
 
 #[tokio::test]

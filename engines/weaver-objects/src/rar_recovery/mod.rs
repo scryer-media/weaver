@@ -377,13 +377,22 @@ impl Object for RarRecovery {
     }
 
     // Every recovery volume of the set this one covers, numbered as it
-    // comes. The first is the one the object was built for.
+    // comes. The first is the one the object was built for. Bytes outrank
+    // names: a front that signs another kind is that kind's, whatever its
+    // name; one that signs nothing, as a RAR3 volume's does, is claimed by
+    // its name.
     fn claim(
         &mut self,
         name: &str,
         first_bytes: &[u8],
-        _length: Option<u64>,
+        length: Option<u64>,
     ) -> Option<VolumeIndex> {
+        if matches!(
+            weaver_graph::signed(first_bytes, length),
+            weaver_graph::Sniff::Object(kind) if kind != Kind::RarRecovery
+        ) {
+            return None;
+        }
         let rev = first_bytes.starts_with(REV5_SIGN) || naming::recovery_stem(name).is_some();
         (rev && !self.revs.is_empty()
             && self.stem.is_some()

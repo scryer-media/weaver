@@ -20,7 +20,7 @@ use par3_rs::creation::{CreationCodec, CreationOptions};
 
 use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, par2_set, par3_set,
-    par3_set_with, payload, repair_and_terminal_events, run,
+    par3_set_with, payload, repair_and_terminal_events, run, run_holding,
 };
 use super::rar::{delivered, posts};
 use crate::history::HistoryFailureKind;
@@ -648,4 +648,37 @@ async fn a_cauchy_and_an_fft_par3_set_each_repair_their_own_member() {
         &[("lantern.bin", &lantern), ("beacon.bin", &beacon)],
     );
     assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
+}
+
+// The server holds every article of the PAR3 set's one volume and serves
+// the rest. The payload lands with a block the set does not vouch for, and
+// the set, which took the volume by its posted name, waits on the blocks
+// it names rather than ruling short: while the volume is held the job
+// reads as fetching repair data, the root still downloading and the post
+// lane idle. Once the server lets the volume go the job repairs, no longer
+// fetching, and hands the file over whole.
+#[tokio::test]
+async fn par3_held_recovery_volume_reads_as_fetching_repair_data() {
+    let data = payload(8 * ARTICLE, 71);
+    let mut damaged = data.clone();
+    damaged[2 * ARTICLE..3 * ARTICLE].fill(0);
+    let mut posted = vec![Post::plain("lantern.bin", damaged)];
+    posted.extend(par3_set("lantern", &[("lantern.bin", &data)], 1));
+    assert_eq!(posted.len(), 3, "the file, the index, one volume");
+    assert!(posted[2].name.contains(".vol"), "{}", posted[2].name);
+    let held = run_holding(&Scenario::new(posted), 2).await;
+    assert_eq!(held.outcomes, vec![Some(RepairOutcome::Waiting)]);
+    assert_eq!(held.report.status, JobStatus::Downloading);
+    assert_eq!(held.report.post_state, crate::PostState::Idle);
+    assert!(held.report.fetching_repair_data, "not fetching while held");
+    assert!(
+        held.after.iter().all(|(_, fetching)| !fetching),
+        "still fetching once the volume came: {:?}",
+        held.after
+    );
+    assert_eq!(held.status, Some(JobStatus::Complete));
+    assert!(
+        held.files[&delivered("lantern.bin")] == data,
+        "not repaired"
+    );
 }
