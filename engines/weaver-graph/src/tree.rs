@@ -1629,6 +1629,15 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        // An owner of the kind the member's own name says it is, which may
+        // hold it by that name alone: it founded the owner, or the owner
+        // took it by name before any of its bytes came.
+        let named = self.child_of(node, member).filter(|(child, _)| {
+            self.namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .and_then(|record| crate::sniff::recovery_by_name(&record.name))
+                .is_some_and(|kind| self.kind(*child) == Some(kind))
+        });
         let Some(found) = self.nodes.get_mut(&node) else {
             return;
         };
@@ -1640,6 +1649,19 @@ impl Tree {
         // a front that stopped at a hole grows again when the hole fills.
         let front =
             usize::try_from(offset).is_ok_and(|at| at < found.namespace.first_bytes(member).len());
+        // Bytes outrank names: a front that signs another kind than that
+        // owner leaves it, and the member is asked again who owns it, from
+        // its bytes.
+        if front && let Some((child, volume)) = named {
+            let length = found.namespace.get(member).and_then(|record| record.length);
+            let signs = signed(found.namespace.first_bytes(member), length);
+            if matches!(signs, Sniff::Object(kind) if self.kind(child) != Some(kind)) {
+                self.release_named(node, child, (volume, member), builder, effects);
+            }
+        }
+        let Some(found) = self.nodes.get_mut(&node) else {
+            return;
+        };
         let undecided = found.undecided.contains(&member);
         if front && undecided {
             self.identify_again(node, member, builder, effects);
@@ -1781,33 +1803,83 @@ impl Tree {
                 found.undecided.remove(&member);
             }
             Sniff::Object(kind) => {
-                found.undecided.remove(&member);
-                // The member is the volume its new object places it at, the
-                // position its set gives it, whichever volume came first. A
-                // member given back is placed by what was parsed of it, and
-                // founds nothing where that places it nowhere: it waits for
-                // the set it continues.
-                let volumes = |object: &mut dyn Object, given: &Given| {
-                    let volume = match given.get(&(node, member)) {
-                        Some(carried) => object.reclaim(&name, carried)?,
-                        None => object
-                            .claim(&name, prefix, length)
-                            .unwrap_or(VolumeIndex(0)),
-                    };
-                    Some(BTreeMap::from([(volume, member)]))
-                };
-                match self.attach(node, kind, volumes, builder) {
-                    Ok(Some(child)) => {
-                        self.bound(node, member, kind, child, effects);
-                        self.offer_unowned(node, child, effects);
-                        if matches!(signed(prefix, length), Sniff::Object(_)) {
-                            self.take_named(node, child, effects);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(why) => effects.push(Effect::Refused { node, member, why }),
-                }
+                self.found(
+                    node,
+                    member,
+                    kind,
+                    (&name, prefix, length),
+                    builder,
+                    effects,
+                );
             }
+        }
+    }
+
+    // Build the object `member` founds, of `kind`, and bind the member to it.
+    // The member is the volume its new object places it at, the position its
+    // set gives it, whichever volume came first. A member given back is
+    // placed by what was parsed of it, and founds nothing where that places
+    // it nowhere: it waits for the set it continues. The new object is
+    // offered every member with no owner, and then a recovery volume none
+    // took, its bytes not yet come, founds the set its name says it is.
+    fn found(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        kind: Kind,
+        (name, prefix, length): (&str, &[u8], Option<u64>),
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(found) = self.nodes.get_mut(&node) {
+            found.undecided.remove(&member);
+        }
+        let volumes = |object: &mut dyn Object, given: &Given| {
+            let volume = match given.get(&(node, member)) {
+                Some(carried) => object.reclaim(name, carried)?,
+                None => object.claim(name, prefix, length).unwrap_or(VolumeIndex(0)),
+            };
+            Some(BTreeMap::from([(volume, member)]))
+        };
+        match self.attach(node, kind, volumes, builder) {
+            Ok(Some(child)) => {
+                self.bound(node, member, kind, child, effects);
+                self.offer_unowned(node, child, effects);
+                if matches!(signed(prefix, length), Sniff::Object(_)) {
+                    self.take_named(node, child, effects);
+                }
+                self.found_by_name(node, builder, effects);
+            }
+            Ok(None) => {}
+            Err(why) => effects.push(Effect::Refused { node, member, why }),
+        }
+    }
+
+    // A recovery volume of the post whose bytes have not come, that no
+    // object of its namespace took by its name, founds the set its name
+    // says it is: the set counts it as coming from the moment the post is
+    // known, as a set already there would. Its hold is its name's: when its
+    // own front comes and signs another kind, the member leaves the set and
+    // its bytes say what it is; otherwise an object another member's bytes
+    // found takes it where its own claim places it, as from any object
+    // founded on names.
+    fn found_by_name(
+        &mut self,
+        node: NodeId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let named = self.namespace(node).and_then(|namespace| {
+            namespace
+                .members()
+                .filter(|record| self.undecided_recovery(node, record.id))
+                .find_map(|record| {
+                    let kind = crate::sniff::recovery_by_name(&record.name)?;
+                    Some((record.id, record.name.clone(), record.length, kind))
+                })
+        });
+        if let Some((member, name, length, kind)) = named {
+            self.found(node, member, kind, (&name, &[], length), builder, effects);
         }
     }
 
@@ -1934,24 +2006,46 @@ impl Tree {
     }
 
     // Offer every member of `node`'s namespace that has no owner to the
-    // object bound at `child`, by the one offer a new member gets.
+    // object bound at `child`, by the one offer a new member gets. A
+    // recovery volume whose bytes have not said what it is yet is offered
+    // too, by its posted name, as it would have been had it been announced
+    // after the object: a set counts it as coming from the moment the post
+    // is known, and its bytes bind it for real when they come.
     fn offer_unowned(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
+        let offered = |tree: &Self, member: MemberId| {
+            tree.unowned(node, member) || tree.undecided_recovery(node, member)
+        };
         let unowned: Vec<(MemberId, Vec<u8>)> = self
             .namespace(node)
             .map(|namespace| {
                 namespace
                     .members()
-                    .filter(|record| self.unowned(node, record.id))
+                    .filter(|record| offered(self, record.id))
                     .map(|record| (record.id, namespace.first_bytes(record.id).to_vec()))
                     .collect()
             })
             .unwrap_or_default();
         for (member, front) in unowned {
             // A take can take others with it: offer only what is left.
-            if self.unowned(node, member) {
+            if offered(self, member) {
                 self.offer(node, member, &front, &[child], effects);
             }
         }
+    }
+
+    // A member whose bytes have not yet said what it is, no object holds,
+    // and whose posted name says it is recovery data.
+    fn undecided_recovery(&self, node: NodeId, member: MemberId) -> bool {
+        self.nodes.get(&node).is_some_and(|found| {
+            found.namespace.copy_of(member).is_none()
+                && found.undecided.contains(&member)
+                && !found.children.contains_key(&member)
+                && !self.nodes.retired().contains_key(&(node, member))
+                && found
+                    .namespace
+                    .get(member)
+                    .is_some_and(|record| crate::sniff::names_recovery(&record.name))
+        })
     }
 
     // The one offer of a member with no owner to objects of its namespace,

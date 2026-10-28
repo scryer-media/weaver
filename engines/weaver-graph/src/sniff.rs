@@ -315,8 +315,9 @@ fn named(name: &str) -> Option<Kind> {
 
 // Whether a posted name is a recovery volume's, as PAR creators spell them:
 // `.par2` and `.par3`, indexes and `.vol<start>+<count>` volumes alike, and
-// the older numbered `.p<N>` and `.par<N>`. A member whose bytes never said
-// what it is, its first article lost, is recovery data by its name alone.
+// the older numbered `.p<N>` and `.par<N>`; and as RAR spells its own,
+// `.rev`. A member whose bytes never said what it is, its first article
+// lost or not yet come, is recovery data by its name alone.
 pub fn names_recovery(name: &str) -> bool {
     let name = trimmed(name).to_ascii_lowercase();
     let Some((stem, extension)) = name.rsplit_once('.') else {
@@ -326,9 +327,18 @@ pub fn names_recovery(name: &str) -> bool {
         .strip_prefix("par")
         .or_else(|| extension.strip_prefix('p'));
     !stem.is_empty()
-        && digits.is_some_and(|digits| {
-            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        && (extension == "rev"
+            || digits.is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            }))
+}
+
+// The set a recovery volume founds by its posted name alone, before any
+// of its bytes: a volume that carries its set's description beside its
+// blocks, as RAR's `.rev` does. A PAR2 or PAR3 volume names no set it can
+// found: its index does.
+pub fn recovery_by_name(name: &str) -> Option<Kind> {
+    names_recovery(name).then(|| named(name)).flatten()
 }
 
 // A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
@@ -405,6 +415,9 @@ mod tests {
             "a.p01",
             "a.par1",
             "a.par2\"",
+            "a.rev",
+            "a.part1.rev",
+            "A.PART01.REV",
         ] {
             assert!(names_recovery(name), "{name}");
         }
@@ -416,8 +429,27 @@ mod tests {
             "a.par",
             "a.pdf",
             "a.7z.001",
+            "rev",
+            "a.revs",
         ] {
             assert!(!names_recovery(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn only_a_volume_that_carries_its_sets_description_founds_it_by_name() {
+        for name in ["a.rev", "a.part1.rev", "A1.REV"] {
+            assert_eq!(recovery_by_name(name), Some(Kind::RarRecovery), "{name}");
+        }
+        for name in [
+            "a.par2",
+            "a.vol0+4.par2",
+            "a.par3",
+            "a.p01",
+            "a.rar",
+            "a.revs",
+        ] {
+            assert_eq!(recovery_by_name(name), None, "{name}");
         }
     }
 

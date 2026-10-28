@@ -7,7 +7,7 @@ use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
     ARTICLE, Claim, Post, Scenario, assert_fetched_once, one_block_article, par2_set, par2_volumes,
-    payload, repair_and_terminal_events, run, try_run,
+    payload, repair_and_terminal_events, run, run_holding, try_run,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
@@ -426,4 +426,37 @@ fn undescribed(data: Vec<u8>, lose_payload: bool) -> Scenario {
         }
     }
     scenario
+}
+
+// The server holds every article of the recovery volume and serves the rest.
+// The payload lands with a slice the set does not vouch for, and the set,
+// which took the volume by its posted name, waits on the blocks it names
+// rather than ruling short: while the volume is held the job reads as
+// fetching repair data. The root reads as still downloading, so the post
+// lane is idle, one of the lanes the queue item shows the state in. Once
+// the server lets the volume go the job repairs, no longer fetching, and
+// hands the file over whole.
+#[tokio::test]
+async fn a_held_recovery_volume_reads_as_fetching_repair_data() {
+    let data = payload(8 * ARTICLE, 47);
+    let mut posted = data.clone();
+    posted[2 * ARTICLE..3 * ARTICLE].fill(0);
+    let mut posts = vec![Post::plain("lantern.bin", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    assert!(posts[2].name.contains(".vol"));
+    let held = run_holding(&Scenario::new(posts), 2).await;
+    assert_eq!(held.outcomes, vec![Some(RepairOutcome::Waiting)]);
+    assert_eq!(held.report.status, JobStatus::Downloading);
+    assert_eq!(held.report.post_state, crate::PostState::Idle);
+    assert!(held.report.fetching_repair_data, "not fetching while held");
+    assert!(
+        held.after.iter().all(|(_, fetching)| !fetching),
+        "still fetching once the volume came: {:?}",
+        held.after
+    );
+    assert_eq!(held.status, Some(JobStatus::Complete));
+    assert!(
+        held.files["lantern beacon/lantern.bin"] == data,
+        "not repaired"
+    );
 }

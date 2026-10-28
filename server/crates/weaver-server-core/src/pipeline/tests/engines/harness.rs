@@ -1351,3 +1351,139 @@ fn collect_empty(root: &Path, dir: &Path, empty: &mut BTreeSet<String>) {
         empty.insert(format!("{name}/"));
     }
 }
+
+// Where a job stood while the server held every article of one post, and
+// how it ended once the server let them go.
+pub(in crate::pipeline::tests) struct Held {
+    // The job's report once nothing moved while the post was held.
+    pub(in crate::pipeline::tests) report: crate::JobInfo,
+    // What its recovery sets had ruled then.
+    pub(in crate::pipeline::tests) outcomes: Vec<Option<RepairOutcome>>,
+    // Its status, and whether it read as fetching repair data, at each
+    // round after the release.
+    pub(in crate::pipeline::tests) after: Vec<(JobStatus, bool)>,
+    pub(in crate::pipeline::tests) status: Option<JobStatus>,
+    pub(in crate::pipeline::tests) files: BTreeMap<String, Vec<u8>>,
+}
+
+// Plays the server, holding every article of post `held` as a server holds
+// an article a worker asked for: the worker has it out, and no answer comes.
+// Once nothing moves the job is looked at; then the held articles are
+// answered and the job runs to its end.
+pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u32) -> Held {
+    // Every article the queue hands out is served but the held post's, and
+    // the job's checks, steps and mail run, until nothing is left to serve.
+    async fn settle(
+        pipeline: &mut Pipeline,
+        scenario: &Scenario,
+        held: u32,
+        out: &mut Vec<DownloadWork>,
+    ) {
+        loop {
+            while let Some(work) = pipeline
+                .jobs
+                .get_mut(&JOB)
+                .and_then(|state| state.download_queue.pop())
+            {
+                let article = (
+                    work.segment_id.file_id.file_index,
+                    work.segment_id.segment_number,
+                );
+                if article.0 == held {
+                    *pipeline.active_downloads_by_job.entry(JOB).or_insert(0) += 1;
+                    out.push(work);
+                    continue;
+                }
+                serve(pipeline, scenario, article).await;
+                if pipeline.job_decode_stage_drained(JOB) {
+                    pipeline.maybe_finish_download_pass(JOB);
+                }
+            }
+            if finished(pipeline) {
+                return;
+            }
+            pipeline.check_job_completion(JOB).await;
+            pump_pipeline_runtime_queues(pipeline).await;
+            if pipeline
+                .graph_jobs
+                .get(&JOB)
+                .is_some_and(|graph| graph.awaits_mail())
+            {
+                let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+                pipeline.graph_run_said(said);
+                continue;
+            }
+            if pipeline
+                .jobs
+                .get(&JOB)
+                .is_none_or(|state| state.download_queue.is_empty())
+            {
+                return;
+            }
+        }
+    }
+    // A round that leaves the job where it stood twice over is a stall.
+    fn look(pipeline: &Pipeline) -> String {
+        let report = pipeline.job_report(JOB);
+        format!(
+            "{:?} {:?} {:?} {}",
+            report.as_ref().map(|report| &report.status),
+            report.as_ref().map(|report| report.post_state),
+            pipeline
+                .graph_jobs
+                .get(&JOB)
+                .map(crate::pipeline::graph::job::GraphJob::recovery_summary),
+            pipeline.inflight_moves.contains(&JOB),
+        )
+    }
+
+    let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
+    let mut out = Vec::new();
+    settle(&mut pipeline, scenario, held, &mut out).await;
+    assert!(!out.is_empty(), "the held post was never asked for");
+    let report = pipeline
+        .job_report(JOB)
+        .expect("the job waits on the held post");
+    let outcomes = pipeline.graph_jobs[&JOB]
+        .recovery_summary()
+        .iter()
+        .map(|set| set.outcome)
+        .collect();
+
+    pipeline.active_downloads_by_job.insert(JOB, 0);
+    for work in std::mem::take(&mut out) {
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, scenario, article).await;
+    }
+    if pipeline.job_decode_stage_drained(JOB) {
+        pipeline.maybe_finish_download_pass(JOB);
+    }
+    let mut after = Vec::new();
+    let mut stalled = None;
+    while !finished(&pipeline) {
+        if let Some(report) = pipeline.job_report(JOB) {
+            after.push((report.status.clone(), report.fetching_repair_data));
+        }
+        let before = look(&pipeline);
+        settle(&mut pipeline, scenario, held, &mut out).await;
+        let now = look(&pipeline);
+        if before == now && stalled.replace(now.clone()) == Some(now.clone()) {
+            panic!("the job stalled: {now}");
+        }
+    }
+    assert!(out.is_empty(), "the held post was asked for again");
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    Held {
+        report,
+        outcomes,
+        after,
+        status,
+        files,
+    }
+}
