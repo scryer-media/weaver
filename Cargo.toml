@@ -273,8 +273,10 @@ opt-level = 3
 [profile.matrix]
 inherits = "test"
 opt-level = 3
-debug-assertions = true
-overflow-checks = true
+debug-assertions = false
+overflow-checks = false
+codegen-units = 2
+lto = "thin"
 
 # Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
 # pin to the authenticated-scanner and source-change fixes.
