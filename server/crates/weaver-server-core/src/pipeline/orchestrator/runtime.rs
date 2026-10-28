@@ -804,10 +804,20 @@ impl Pipeline {
             self.reconcile_job_progress(job_id).await;
         }
 
+        // One watch for the pool's life, so a server's recovery that changes
+        // at any point after a dispatch pass, even while the loop is busy with
+        // another arm, wakes the next wait.
+        let mut server_health = self.nntp.pool().server_health_changes();
         loop {
             let mut turn_timer = crate::operations::instrumentation::TurnTimer::new(
                 &turn_metrics.pipeline_histograms.turn_duration,
             );
+            // A replaced pool brings its own servers; watch those, and give
+            // their waiting work a pass.
+            if !server_health.follows(self.nntp.pool()) {
+                server_health = self.nntp.pool().server_health_changes();
+                self.download_dispatch_wake = true;
+            }
             if queue.read(|inner| inner.globals.shutting_down) {
                 // Readmission can wait for cancellation cleanup, whose terminal
                 // completion event releases the last script cancellation sender.
@@ -898,6 +908,13 @@ impl Pipeline {
                 tokio::time::sleep_until(infrastructure_retry_deadline.unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
                 }));
+            // A held server admits work again on its own at this instant.
+            let connection_hold_deadline = self.nntp.pool().next_connection_hold_deadline();
+            let connection_hold_sleep =
+                tokio::time::sleep_until(connection_hold_deadline.map_or_else(
+                    || tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+                    tokio::time::Instant::from_std,
+                ));
 
             self.drain_ready_lane_control_messages();
             if self.take_download_dispatch_wake() {
@@ -1003,6 +1020,14 @@ impl Pipeline {
                     _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
                         turn_timer.resume();
                         self.requeue_due_infrastructure_retries();
+                    }
+                    () = server_health.changed() => {
+                        turn_timer.resume();
+                        self.download_dispatch_wake = true;
+                    }
+                    _ = connection_hold_sleep, if connection_hold_deadline.is_some() => {
+                        turn_timer.resume();
+                        self.download_dispatch_wake = true;
                     }
                     _ = tune_interval.tick() => {
                         turn_timer.resume();

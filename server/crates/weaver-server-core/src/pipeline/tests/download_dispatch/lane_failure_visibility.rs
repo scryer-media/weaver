@@ -206,3 +206,67 @@ async fn lanes_under_their_cap_are_reported_only_when_it_persists() {
     pipeline.log_download_lanes_under_cap(later + Duration::from_secs(2), 8);
     assert!(pipeline.download_lanes_under_cap_since.is_none());
 }
+
+// Work whose only server is waiting on its recovery probe parks in its queue:
+// no dispatch pass leases it to a lane that could only come back refused, so
+// no refusal requeues it for the next pass to send again. The probe's answer
+// is the one wake, and after it the server seats new work.
+#[tokio::test]
+async fn work_whose_server_waits_on_its_probe_parks_until_the_probe_answers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    // The one server is a listener this test owns. It never answers, so a
+    // lane seated after the probe's answer dials it and waits, here, on this
+    // machine, for the rest of the test.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut server = weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        tls: false,
+        ..Default::default()
+    });
+    server.max_connections = 2;
+    pipeline.nntp = std::sync::Arc::new(weaver_nntp::client::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(1),
+        },
+    ));
+    pipeline.tuner.set_connection_limit(2);
+    let job_id = JobId(41503);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Held Server", &many_standalone_files("held", 4)),
+    )
+    .await;
+    let queued = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
+    assert!(queued > 0, "the fixture job has queued work");
+
+    let probe = pipeline.nntp.pool().take_recovery_probe_for_test(0);
+    let mut health = pipeline.nntp.pool().server_health_changes();
+    for _ in 0..3 {
+        pipeline.dispatch_downloads();
+    }
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        queued,
+        "no pass leases work to a server whose new connections are held"
+    );
+    assert_eq!(pipeline.active_download_connections, 0);
+    assert!(pipeline.download_lane_owners.is_empty());
+
+    probe.answer();
+    health.changed().await;
+    assert_eq!(pipeline.nntp.pool().connection_hold(0, true), None);
+
+    pipeline.dispatch_downloads();
+    assert!(
+        pipeline.jobs.get(&job_id).unwrap().download_queue.len() < queued,
+        "the answered server seats the waiting work"
+    );
+    drop(listener);
+}

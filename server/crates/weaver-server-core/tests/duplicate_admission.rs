@@ -513,6 +513,16 @@ fn score_admission_keeps_ties_parked_and_promotes_higher_scores() {
     let superseded = db.semantic_candidate_snapshot(first).unwrap().unwrap();
     assert_eq!(superseded.state, SemanticCandidateState::Parked);
     assert!(superseded.source_stored);
+    let summaries = db.duplicate_summaries(&[first, upgraded]).unwrap();
+    let parked = summaries[&first].semantic.as_ref().unwrap();
+    assert_eq!(parked.state, SemanticCandidateState::Parked);
+    assert!(parked.source_stored);
+    assert_eq!(
+        summaries[&first].fingerprints,
+        db.duplicate_summaries(&[first]).unwrap()[&first].fingerprints
+    );
+    assert!(!summaries[&first].fingerprints.is_empty());
+    assert!(summaries[&upgraded].semantic.is_some());
     assert!(db.semantic_candidate_snapshot(upgraded).unwrap().is_some());
 }
 
