@@ -11,6 +11,7 @@ use super::harness::{
     ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload, run,
 };
 use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
 
 fn ember() -> Vec<u8> {
     payload(9 * ARTICLE + 21, 61)
@@ -336,4 +337,147 @@ async fn a_stream_member_gives_the_naming_plan_no_checksum() {
     );
     assert!(files.iter().all(|file| file.crc32.is_none()), "{files:?}");
     assert!(crate::pipeline::completion::finalize::member_crc32_by_path(files).is_empty());
+}
+
+// A single archive or compressed stream posted under `name` with no
+// recovery, which ends with nothing usable: an object opened it and got
+// nothing whole from it, or nothing opened it and it is left as it was
+// posted, which is no file the user opens. With nothing else usable the job
+// fails, never Partial and never Complete.
+async fn assert_a_single_archive_with_nothing_usable_fails(name: &str, bytes: Vec<u8>) {
+    let graph = run(&Scenario::new(vec![Post::plain(name, bytes)])).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{name}: {:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+}
+
+fn unopened() -> Vec<u8> {
+    payload(6 * ARTICLE + 7, 63)
+}
+
+// Text a compressor codes rather than stores, so damage to it lands in
+// coded data the decoder reads.
+fn prose() -> Vec<u8> {
+    b"a lantern by the quill, an ember in the beacon; "
+        .iter()
+        .copied()
+        .cycle()
+        .take(12 * ARTICLE + 9)
+        .collect()
+}
+
+// The bytes with a run in their middle arrived wrong under a good article
+// checksum: the signature still opens them and the damage lies past it.
+fn damaged_in_the_middle(mut bytes: Vec<u8>) -> Vec<u8> {
+    let at = bytes.len() / 2;
+    for byte in &mut bytes[at..at + 16] {
+        *byte ^= 0x5a;
+    }
+    bytes
+}
+
+// A tar whose one header arrived wrong under a good article checksum: the
+// ustar magic still opens it, and the header's own checksum fails.
+fn tar_with_a_damaged_header() -> Vec<u8> {
+    let mut bytes = tar(&[("lantern.mkv", prose())]);
+    bytes[0] ^= 0x5a;
+    bytes
+}
+
+#[tokio::test]
+async fn a_single_tar_whose_header_is_damaged_fails() {
+    assert_a_single_archive_with_nothing_usable_fails("lantern.tar", tar_with_a_damaged_header())
+        .await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_tar_gz_fails() {
+    let bytes = damaged_in_the_middle(gzip(&tar(&[("lantern.mkv", prose())])));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.gz", bytes).await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_tar_bz2_fails() {
+    let bytes = damaged_in_the_middle(bzip2(&tar(&[("lantern.mkv", prose())])));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.bz2", bytes).await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_tar_xz_fails() {
+    let bytes = damaged_in_the_middle(xz(&tar(&[("lantern.mkv", prose())])));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.xz", bytes).await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_gz_fails() {
+    let bytes = damaged_in_the_middle(gzip(&prose()));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.gz", bytes).await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_deflate_fails() {
+    let bytes = damaged_in_the_middle(deflate(&prose()));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.deflate", bytes).await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_brotli_fails() {
+    let bytes = damaged_in_the_middle(brotli(&prose()));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.br", bytes).await;
+}
+
+// A zstd frame carrying its content checksum, as the command-line tool
+// writes it: a frame without one decodes damaged bytes as if whole.
+fn zstd_checked(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+    encoder.include_checksum(true).unwrap();
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[tokio::test]
+async fn a_single_damaged_zstd_fails() {
+    let bytes = damaged_in_the_middle(zstd_checked(&prose()));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.zst", bytes).await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_bzip2_fails() {
+    let bytes = damaged_in_the_middle(bzip2(&prose()));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.bz2", bytes).await;
+}
+
+#[tokio::test]
+async fn a_single_damaged_xz_fails() {
+    let bytes = damaged_in_the_middle(xz(&prose()));
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.xz", bytes).await;
+}
+
+#[tokio::test]
+async fn an_unopened_single_tar_gz_fails() {
+    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.gz", unopened()).await;
+}
+
+#[tokio::test]
+async fn an_unopened_single_tar_xz_fails() {
+    assert_a_single_archive_with_nothing_usable_fails("lantern.tar.xz", unopened()).await;
+}
+
+#[tokio::test]
+async fn an_unopened_single_gz_fails() {
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.gz", unopened()).await;
+}
+
+#[tokio::test]
+async fn an_unopened_single_zstd_fails() {
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.zst", unopened()).await;
+}
+
+#[tokio::test]
+async fn an_unopened_single_xz_fails() {
+    assert_a_single_archive_with_nothing_usable_fails("lantern.mkv.xz", unopened()).await;
 }

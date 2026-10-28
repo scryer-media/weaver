@@ -249,9 +249,10 @@ pub(crate) fn declares_recovery(file: &FileSpec) -> bool {
     }
 }
 
-// Whether a file's name makes it a piece of something else: an archive
-// volume, a split part, or recovery data, classified as the feed classifies
-// the post's files. Whole or not, such a file is never one the user opens.
+// Whether a file's name makes it a piece of something else: an archive or
+// one of its volumes, a compressed stream, a split part, or recovery data,
+// classified as the feed classifies the post's files. Whole or not, such a
+// file is never one the user opens.
 pub(crate) fn names_a_piece(name: &str) -> bool {
     let role = FileRole::from_filename(name);
     name.to_ascii_lowercase().ends_with(".rev")
@@ -260,7 +261,19 @@ pub(crate) fn names_a_piece(name: &str) -> bool {
             FileRole::Par2 { .. }
                 | FileRole::Par3 { .. }
                 | FileRole::RarVolume { .. }
+                | FileRole::SevenZipArchive
                 | FileRole::SevenZipSplit { .. }
+                | FileRole::ZipArchive
+                | FileRole::TarArchive
+                | FileRole::TarGzArchive
+                | FileRole::TarBz2Archive
+                | FileRole::TarXzArchive
+                | FileRole::GzArchive
+                | FileRole::DeflateArchive
+                | FileRole::BrotliArchive
+                | FileRole::ZstdArchive
+                | FileRole::Bzip2Archive
+                | FileRole::XzArchive
                 | FileRole::SplitFile { .. }
         )
 }

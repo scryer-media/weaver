@@ -298,8 +298,11 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
-    // A file member's announcement and its header's checksum, leaving it
-    // open.
+    // A file member's announcement, leaving it open. It states no checksum:
+    // the header it announces from carries only the first part's CRC, which
+    // for a member split across volumes is not the member's. The decoder
+    // verifies the whole member itself as it ends, a failure there being
+    // damage.
     fn announce(&mut self, info: &unrar_rs::MemberInfo) -> Result<MemberId, Stop> {
         let member = MemberId(self.next);
         self.next += 1;
@@ -308,12 +311,6 @@ impl Walk<'_, '_> {
             name: unrar_rs::sanitize_path(&info.raw_name),
             length: info.unpacked_size,
         })?;
-        // An encrypted member's checksum may be keyed, so it says none.
-        if !info.is_encrypted
-            && let Some(crc32) = info.crc32
-        {
-            self.say(Emit::Checksum { member, crc32 })?;
-        }
         self.open = Some(Open {
             member,
             encrypted: info.is_encrypted,

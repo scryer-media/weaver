@@ -446,3 +446,29 @@ async fn a_zip_holding_an_empty_directory_delivers_it() {
         assert_fetched_once(&graph);
     }
 }
+
+// A single stored zip, with no recovery, whose every entry's data arrived
+// wrong under a good article checksum behind a whole directory: the store
+// opens it and every entry fails its CRC, so nothing in it is usable and the
+// job fails, never Partial and never Complete.
+#[tokio::test]
+async fn a_single_zip_whose_every_entry_fails_its_crc_fails() {
+    let mut bytes = archive(stored());
+    for (_, member) in members() {
+        let at = bytes
+            .windows(32)
+            .position(|window| window == &member[..32])
+            .expect("the entry's data");
+        for byte in &mut bytes[at + member.len() / 2..][..16] {
+            *byte ^= 0x5a;
+        }
+    }
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.zip", bytes)])).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "graph: {:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+}

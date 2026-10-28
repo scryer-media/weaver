@@ -510,16 +510,16 @@ impl Pipeline {
             unrepaired,
             |node, member| job.writer().refused(node, member),
             // Read by the name the member is delivered under, so a file a
-            // recovery set renamed to what it is counts as that.
+            // recovery set renamed to what it is counts as that. A piece is
+            // no usable file at any depth: a joined split or an archive an
+            // archive held is a piece as much as a posted volume is.
             |node, member| {
-                node == NodeId::ROOT
-                    && job
-                        .tree()
-                        .namespace(node)
-                        .and_then(|ns| ns.get(member))
-                        .is_some_and(|member| {
-                            crate::pipeline::post_health::names_a_piece(&member.output_name)
-                        })
+                job.tree()
+                    .namespace(node)
+                    .and_then(|ns| ns.get(member))
+                    .is_some_and(|member| {
+                        crate::pipeline::post_health::names_a_piece(&member.output_name)
+                    })
             },
         );
         Some((delivery, failure))
