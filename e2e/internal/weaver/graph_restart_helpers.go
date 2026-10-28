@@ -4,12 +4,14 @@
 package weaver
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -146,17 +148,42 @@ func (ctx *restartCaseContext) submitScenarioWithoutPassword(slug string) (int, 
 	return submitOneNZBWithOptions(ctx.weaverURL, &scenario, submitNZBOptions{})
 }
 
-// withStateDB opens the case's state database for one read or write.
-func withStateDB(dbPath string, use func(*sql.DB) error) error {
+// stateConn is one connection to the case's state database. Statements are
+// written with `?` placeholders and rebound to the datastore's own, and every
+// statement runs on the same connection, so a temporary table one statement
+// makes is there for the next.
+type stateConn struct {
+	conn      *sql.Conn
+	datastore weaverDatastore
+}
+
+func (c *stateConn) Query(query string, args ...any) (*sql.Rows, error) {
+	return c.conn.QueryContext(context.Background(), rebindWeaverSQL(c.datastore, query), args...)
+}
+
+func (c *stateConn) QueryRow(query string, args ...any) *sql.Row {
+	return c.conn.QueryRowContext(context.Background(), rebindWeaverSQL(c.datastore, query), args...)
+}
+
+func (c *stateConn) Exec(query string, args ...any) (sql.Result, error) {
+	return c.conn.ExecContext(context.Background(), rebindWeaverSQL(c.datastore, query), args...)
+}
+
+// withStateDB opens the case's state database for one read or write, on one
+// connection of its own. The Postgres pool is shared, so the connection is
+// taken from it rather than the pool narrowed.
+func withStateDB(dbPath string, use func(*stateConn) error) error {
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
 		return err
 	}
 	defer closeWeaverStateDB(db, datastore)
-	// One connection, so a temporary table one statement makes is there for
-	// the next.
-	db.SetMaxOpenConns(1)
-	return use(db)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return use(&stateConn{conn: conn, datastore: datastore})
 }
 
 // admissionRow is what the active row says of one job's NZB admission.
@@ -168,7 +195,7 @@ type admissionRow struct {
 
 func readAdmissionRows(dbPath string, ids []int) (map[int]admissionRow, error) {
 	out := map[int]admissionRow{}
-	err := withStateDB(dbPath, func(db *sql.DB) error {
+	err := withStateDB(dbPath, func(db *stateConn) error {
 		rows, err := db.Query(`SELECT job_id, status, nzb_admitted, COALESCE(error, '') FROM active_jobs`)
 		if err != nil {
 			return err
@@ -264,15 +291,19 @@ func (trace *admissionTrace) summary() string {
 // graphNodeRows is how many checkpoint nodes the job has written.
 func graphNodeRows(dbPath string, jobID int) (int, error) {
 	count := 0
-	err := withStateDB(dbPath, func(db *sql.DB) error {
+	err := withStateDB(dbPath, func(db *stateConn) error {
 		return db.QueryRow(`SELECT COUNT(*) FROM graph_nodes WHERE job_id = ?`, jobID).Scan(&count)
 	})
 	return count, err
 }
 
 // existingTables is every table the database has.
-func existingTables(db *sql.DB) (map[string]bool, error) {
-	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type = 'table'`)
+func existingTables(db *stateConn) (map[string]bool, error) {
+	query := `SELECT name FROM sqlite_master WHERE type = 'table'`
+	if db.datastore == weaverDatastorePostgres {
+		query = `SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'`
+	}
+	rows, err := db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +322,7 @@ func existingTables(db *sql.DB) (map[string]bool, error) {
 // deleteGraphCheckpoint removes every checkpoint row of the job: the job then
 // stands as one stopped before its first checkpoint was written.
 func deleteGraphCheckpoint(dbPath string, jobID int) error {
-	return withStateDB(dbPath, func(db *sql.DB) error {
+	return withStateDB(dbPath, func(db *stateConn) error {
 		tables, err := existingTables(db)
 		if err != nil {
 			return err
@@ -310,7 +341,7 @@ func deleteGraphCheckpoint(dbPath string, jobID int) error {
 
 // execAll runs the statements in order on one connection.
 func execAll(dbPath string, statements []string) error {
-	return withStateDB(dbPath, func(db *sql.DB) error {
+	return withStateDB(dbPath, func(db *stateConn) error {
 		for _, statement := range statements {
 			if _, err := db.Exec(statement); err != nil {
 				return fmt.Errorf("%s: %w", statement, err)
@@ -366,18 +397,36 @@ type columnAdd struct {
 	Definition string
 }
 
-// tableDDL is a table an older schema carried, as that schema created it.
+// tableDDL is a table an older schema carried, as that schema created it on
+// SQLite.
 type tableDDL struct {
 	Name string
 	DDL  string
 }
 
-// schemaShape is what a database holds now: its tables, each table's
-// columns, and each table's index definitions.
+var (
+	sqliteIntegerType = regexp.MustCompile(`\bINTEGER\b`)
+	sqliteBlobType    = regexp.MustCompile(`\bBLOB\b`)
+)
+
+// in is the table's DDL in the datastore's dialect. Postgres held the same
+// tables with BIGINT for INTEGER, BYTEA for BLOB, and no WITHOUT ROWID.
+func (table tableDDL) in(datastore weaverDatastore) string {
+	if datastore != weaverDatastorePostgres {
+		return table.DDL
+	}
+	ddl := strings.ReplaceAll(table.DDL, " WITHOUT ROWID", "")
+	ddl = sqliteIntegerType.ReplaceAllString(ddl, "BIGINT")
+	return sqliteBlobType.ReplaceAllString(ddl, "BYTEA")
+}
+
+// schemaShape is what a database holds now: its datastore, its tables, each
+// table's columns, and each table's index definitions.
 type schemaShape struct {
-	Tables  map[string]bool
-	Columns map[string]map[string]bool
-	Indexes map[string]map[string]string
+	Datastore weaverDatastore
+	Tables    map[string]bool
+	Columns   map[string]map[string]bool
+	Indexes   map[string]map[string]string
 }
 
 // schemaRewind turns a database into the shape an older build left: the
@@ -420,7 +469,7 @@ func (rewind schemaRewind) plan(shape schemaShape) []string {
 	}
 	for _, table := range rewind.RestoreTables {
 		if !shape.Tables[table.Name] {
-			statements = append(statements, table.DDL)
+			statements = append(statements, table.in(shape.Datastore))
 		}
 	}
 	for _, add := range rewind.AddColumns {
@@ -433,12 +482,12 @@ func (rewind schemaRewind) plan(shape schemaShape) []string {
 }
 
 // readSchemaShape reads the shape of the tables the rewind touches.
-func readSchemaShape(db *sql.DB, rewind schemaRewind) (schemaShape, error) {
+func readSchemaShape(db *stateConn, rewind schemaRewind) (schemaShape, error) {
 	tables, err := existingTables(db)
 	if err != nil {
 		return schemaShape{}, err
 	}
-	shape := schemaShape{Tables: tables, Columns: map[string]map[string]bool{}, Indexes: map[string]map[string]string{}}
+	shape := schemaShape{Datastore: db.datastore, Tables: tables, Columns: map[string]map[string]bool{}, Indexes: map[string]map[string]string{}}
 	touched := map[string]bool{}
 	for _, drop := range rewind.DropColumns {
 		touched[drop.Table] = true
@@ -451,7 +500,11 @@ func readSchemaShape(db *sql.DB, rewind schemaRewind) (schemaShape, error) {
 			continue
 		}
 		columns := map[string]bool{}
-		rows, err := db.Query(fmt.Sprintf(`SELECT name FROM pragma_table_info('%s')`, table))
+		columnQuery := fmt.Sprintf(`SELECT name FROM pragma_table_info('%s')`, table)
+		if db.datastore == weaverDatastorePostgres {
+			columnQuery = fmt.Sprintf(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '%s'`, table)
+		}
+		rows, err := db.Query(columnQuery)
 		if err != nil {
 			return schemaShape{}, err
 		}
@@ -466,6 +519,12 @@ func readSchemaShape(db *sql.DB, rewind schemaRewind) (schemaShape, error) {
 		rows.Close()
 		shape.Columns[table] = columns
 		indexes := map[string]string{}
+		shape.Indexes[table] = indexes
+		// Postgres drops every index on a column with the column, so only
+		// SQLite's have to be named and dropped first.
+		if db.datastore == weaverDatastorePostgres {
+			continue
+		}
 		rows, err = db.Query(`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`, table)
 		if err != nil {
 			return schemaShape{}, err
@@ -479,7 +538,6 @@ func readSchemaShape(db *sql.DB, rewind schemaRewind) (schemaShape, error) {
 			indexes[name] = definition
 		}
 		rows.Close()
-		shape.Indexes[table] = indexes
 	}
 	return shape, nil
 }
@@ -487,7 +545,7 @@ func readSchemaShape(db *sql.DB, rewind schemaRewind) (schemaShape, error) {
 // applySchemaRewind rewinds the database and then runs the statements that
 // plant what the older build would have left in it.
 func applySchemaRewind(dbPath string, rewind schemaRewind, plant []string) error {
-	return withStateDB(dbPath, func(db *sql.DB) error {
+	return withStateDB(dbPath, func(db *stateConn) error {
 		shape, err := readSchemaShape(db, rewind)
 		if err != nil {
 			return err
@@ -563,18 +621,38 @@ var rewindToPreGraphEngine = schemaRewind{
 // download.
 func cloneHistoryRow(from, to int) []string {
 	return []string{
-		`DROP TABLE IF EXISTS temp.e2e_history_clone`,
+		`DROP TABLE IF EXISTS e2e_history_clone`,
 		fmt.Sprintf(`CREATE TEMP TABLE e2e_history_clone AS SELECT * FROM job_history WHERE job_id = %d`, from),
 		fmt.Sprintf(`UPDATE e2e_history_clone SET job_id = %d`, to),
 		`INSERT INTO job_history SELECT * FROM e2e_history_clone`,
-		`DROP TABLE temp.e2e_history_clone`,
+		`DROP TABLE e2e_history_clone`,
+	}
+}
+
+// refuseArchive is the statements that make the database refuse the job's
+// history row, as a write that cannot land would, and the statements that
+// lift the refusal, in the current datastore's dialect.
+func refuseArchive(jobID int) (refuse, lift []string) {
+	if currentWeaverDatastore() == weaverDatastorePostgres {
+		return []string{
+			fmt.Sprintf(`CREATE FUNCTION e2e_refuse_archive() RETURNS trigger AS $body$ BEGIN IF NEW.job_id = %d THEN RAISE EXCEPTION 'e2e injected archive failure'; END IF; RETURN NEW; END $body$ LANGUAGE plpgsql`, jobID),
+			`CREATE TRIGGER e2e_refuse_archive BEFORE INSERT ON job_history FOR EACH ROW EXECUTE FUNCTION e2e_refuse_archive()`,
+		}, []string{
+			`DROP TRIGGER e2e_refuse_archive ON job_history`,
+			`DROP FUNCTION e2e_refuse_archive()`,
+		}
+	}
+	return []string{
+		fmt.Sprintf(`CREATE TRIGGER e2e_refuse_archive BEFORE INSERT ON job_history WHEN NEW.job_id = %d BEGIN SELECT RAISE(ABORT, 'e2e injected archive failure'); END`, jobID),
+	}, []string{
+		`DROP TRIGGER e2e_refuse_archive`,
 	}
 }
 
 // migrationVersions is every version the ledger records as applied.
 func migrationVersions(dbPath string) (map[int]bool, error) {
 	out := map[int]bool{}
-	err := withStateDB(dbPath, func(db *sql.DB) error {
+	err := withStateDB(dbPath, func(db *stateConn) error {
 		rows, err := db.Query(`SELECT version FROM _sqlx_migrations WHERE success`)
 		if err != nil {
 			return err
@@ -596,7 +674,7 @@ func migrationVersions(dbPath string) (map[int]bool, error) {
 // dropped holds none.
 func plantedRowsLeft(dbPath string, jobIDs []int) (map[string]int, error) {
 	out := map[string]int{}
-	err := withStateDB(dbPath, func(db *sql.DB) error {
+	err := withStateDB(dbPath, func(db *stateConn) error {
 		tables, err := existingTables(db)
 		if err != nil {
 			return err

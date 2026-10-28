@@ -204,11 +204,27 @@ func cmdAdversarial(args []string) {
 			}
 		}
 		restore()
+		if err := keepAdversarialGroupLog(group.Name); err != nil {
+			log.Printf("warning: keep the %s group's weaver log: %v", group.Name, err)
+		}
 	}
 	fmt.Printf("\nADVERSARIAL SUMMARY: %d case(s), %d failure(s)\n", len(cases), failures)
 	if failures > 0 {
 		os.Exit(1)
 	}
+}
+
+// keepAdversarialGroupLog stops the group's Weaver and keeps its whole log
+// beside the shared one as weaver-<group>.log: every group starts a fresh
+// Weaver that writes the shared log from empty, so without the copy only the
+// last group's log would survive the run.
+func keepAdversarialGroupLog(group string) error {
+	killWeaver()
+	data, err := os.ReadFile(localWeaverLogPath())
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(filepath.Dir(localWeaverLogPath()), "weaver-"+group+".log"), data, 0o644)
 }
 
 // startAdversarialGroup starts a fresh Weaver under the group's caps and
