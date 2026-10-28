@@ -62,6 +62,8 @@ pub(crate) trait RootJob {
     // A repair of the job is out on a thread: the set it was lent from has
     // its ruling still to come, whatever it said as it left.
     fn repair_out(&self) -> bool;
+    // A member's file still waits to move to its name.
+    fn moves_waiting(&self) -> bool;
 }
 
 // The job's own seams. GraphJob repairs inside its article path, once the
@@ -118,6 +120,10 @@ impl RootJob for GraphJob {
     fn repair_out(&self) -> bool {
         GraphJob::repair_out(self)
     }
+
+    fn moves_waiting(&self) -> bool {
+        GraphJob::moves_waiting(self)
+    }
 }
 
 // What an advance came to.
@@ -164,6 +170,9 @@ pub(crate) fn drive(
     }
     match job.phase() {
         RootPhase::Extracting => Step::Wait,
+        // The delivery takes every file from its name, so it waits for
+        // each file still moving there.
+        _ if job.moves_waiting() => Step::Wait,
         _ => Step::Deliver,
     }
 }

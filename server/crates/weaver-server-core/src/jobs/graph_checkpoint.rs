@@ -74,6 +74,9 @@ pub(crate) struct MemberRow {
     pub(crate) buried: bool,
     pub(crate) undecided: bool,
     pub(crate) has_file: bool,
+    // The name the member's file sits at while it waits to move to its
+    // output name; `None` once it sits there.
+    pub(crate) on_disk: Option<String>,
     pub(crate) refused: Option<String>,
     pub(crate) copy_of: Option<i64>,
 }
@@ -97,6 +100,9 @@ pub(crate) struct EnvelopeRow {
     pub(crate) provenance: String,
     pub(crate) closed: Option<i64>,
     pub(crate) settled: bool,
+    // The file the envelope sits in, when not the one its node and volume
+    // name.
+    pub(crate) file: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,7 +214,7 @@ impl Row for MemberRow {
     const KEY: &'static [&'static str] = &["node_id", "member_id"];
     const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, crc32, \
          length, closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
-         given_up_volume, buried, undecided, has_file, refused, copy_of";
+         given_up_volume, buried, undecided, has_file, on_disk, refused, copy_of";
 
     fn key(&self) -> (i64, i64) {
         (self.node, self.member)
@@ -238,6 +244,7 @@ impl Row for MemberRow {
             SqlArg::Bool(self.buried),
             SqlArg::Bool(self.undecided),
             SqlArg::Bool(self.has_file),
+            SqlArg::OptText(self.on_disk.clone()),
             SqlArg::OptText(self.refused.clone()),
             SqlArg::OptI64(self.copy_of),
         ]
@@ -277,7 +284,7 @@ impl Row for EnvelopeRow {
     const TABLE: &'static str = "graph_envelopes";
     const KEY: &'static [&'static str] = &["node_id", "volume", "range_start"];
     const COLUMNS: &'static str =
-        "job_id, node_id, volume, range_start, range_end, provenance, closed, settled";
+        "job_id, node_id, volume, range_start, range_end, provenance, closed, settled, file";
 
     fn key(&self) -> (i64, i64, i64) {
         (self.node, self.volume, self.start)
@@ -297,6 +304,7 @@ impl Row for EnvelopeRow {
             SqlArg::Text(self.provenance.clone()),
             SqlArg::OptI64(self.closed),
             SqlArg::Bool(self.settled),
+            SqlArg::OptText(self.file.clone()),
         ]
     }
 }
@@ -623,7 +631,7 @@ async fn read_checkpoint(
         .fetch_all(
             "SELECT node_id, member_id, name, output_name, crc32, length, closed, bound_node_id, \
              owner_node_id, owner_volume, given_up_node_id, given_up_volume, buried, \
-             undecided, has_file, refused, copy_of \
+             undecided, has_file, on_disk, refused, copy_of \
              FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
             &args,
         )
@@ -644,6 +652,7 @@ async fn read_checkpoint(
                 buried: row.bool("buried")?,
                 undecided: row.bool("undecided")?,
                 has_file: row.bool("has_file")?,
+                on_disk: row.opt_text("on_disk")?,
                 refused: row.opt_text("refused")?,
                 copy_of: row.opt_i64("copy_of")?,
             })
@@ -670,7 +679,7 @@ async fn read_checkpoint(
         .collect::<Result<_, StateError>>()?;
     let envelopes = tx
         .fetch_all(
-            "SELECT node_id, volume, range_start, range_end, provenance, closed, settled \
+            "SELECT node_id, volume, range_start, range_end, provenance, closed, settled, file \
              FROM graph_envelopes WHERE job_id = {} ORDER BY node_id, volume, range_start",
             &args,
         )
@@ -685,6 +694,7 @@ async fn read_checkpoint(
                 provenance: row.text("provenance")?,
                 closed: row.opt_i64("closed")?,
                 settled: row.bool("settled")?,
+                file: row.opt_text("file")?,
             })
         })
         .collect::<Result<_, StateError>>()?;

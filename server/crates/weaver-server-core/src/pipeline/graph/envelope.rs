@@ -284,11 +284,7 @@ impl Shelf {
         match state.kept.entry(envelope) {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
-                let name = format!(
-                    "{}/graph-envelope-{}-{envelope}",
-                    weaver_graph::names::INTERNAL_DIR,
-                    self.node.0
-                );
+                let name = free_envelope_name(&self.dir, self.node, envelope);
                 let mut leaf = Leaf::at(&self.dir, &name);
                 leaf.truncate()?;
                 Ok(free.insert(Kept {
@@ -352,4 +348,29 @@ impl Shelf {
             state.generation
         })
     }
+}
+
+// The file an envelope of `node` numbered `envelope` sits in, unless a
+// checkpoint says another.
+pub(crate) fn envelope_name(node: NodeId, envelope: u32) -> String {
+    format!(
+        "{}/graph-envelope-{}-{envelope}",
+        weaver_graph::names::INTERNAL_DIR,
+        node.0
+    )
+}
+
+// The file a new envelope starts in: the one its node and number name, or,
+// while a member given back from an envelope of that number still sits
+// there waiting to move, the first free one after it. Nothing is written
+// over a file a member sits at.
+fn free_envelope_name(dir: &Path, node: NodeId, envelope: u32) -> String {
+    let name = envelope_name(node, envelope);
+    if !dir.join(&name).exists() {
+        return name;
+    }
+    (1u32..)
+        .map(|again| format!("{name}-{again}"))
+        .find(|again| !dir.join(again).exists())
+        .expect("an unbounded counter finds a free name")
 }

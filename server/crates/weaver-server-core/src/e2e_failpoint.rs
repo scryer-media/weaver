@@ -17,6 +17,9 @@ pub const STATUS_ENTER_EXTRACTING: &str = "status.enter_extracting";
 // An engine run over an object's volumes, on its blocking thread, as it
 // finds each member.
 pub const EXTRACT_MEMBER_START: &str = "extract.member_start";
+// A member's file has moved to the name a committed checkpoint recorded for
+// it, and the checkpoint that says it moved has not yet been written.
+pub const EXTRACT_AFTER_RENAME_BEFORE_RECORD: &str = "extract.after_rename_before_record";
 // A recovery set's repair, on its blocking thread, before it reads anything.
 pub const REPAIR_TASK_START: &str = "repair.task_start";
 

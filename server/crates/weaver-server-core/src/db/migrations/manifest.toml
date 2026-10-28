@@ -914,3 +914,20 @@ kind = "sql"
 file = "migrations/0075_graph_member_crc32/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 77
+description = "a graph checkpoint keeps where a member's or an envelope's file sits"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_graph_file_on_disk/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_graph_file_on_disk/postgres.sql"
+engine = "postgres"
+scope = "all"

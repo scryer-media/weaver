@@ -85,6 +85,7 @@ mod partial;
 mod password;
 mod perf;
 mod plain_par2;
+mod post_health_seats;
 mod rar;
 mod rar_engine;
 mod rar_rev;

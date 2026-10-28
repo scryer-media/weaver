@@ -714,8 +714,15 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn reset_owned_download_lanes(&mut self) {
-        for lease in self.owned_download_lane_pool.reset() {
+        let stopped = self.owned_download_lane_pool.reset();
+        for lease in stopped.leases {
             self.restore_stopped_owned_lane_lease(lease);
+        }
+        // A probe batch no worker started was never asked: it waits for a
+        // seat again, on the lanes the reset leaves.
+        if !stopped.probes.is_empty() {
+            self.post_probes.waiting.extend(stopped.probes);
+            self.download_dispatch_wake = true;
         }
     }
 

@@ -97,6 +97,9 @@ pub(crate) struct GraphJob {
     reported: Option<RootPhase>,
     // The checkpoint waiting for the database, if one is.
     pending: Pending,
+    // A member's file waits to move on a checkpoint the database has not
+    // said it committed, and the run mail will say when it has.
+    mail_owed: bool,
     // What the job did since the pipeline last asked, for its events.
     notes: Vec<Note>,
 }
@@ -189,6 +192,7 @@ impl GraphJob {
             passwords: Passwords::default(),
             reported: None,
             pending: Pending::default(),
+            mail_owed: false,
             notes: Vec::new(),
         }
     }
@@ -217,7 +221,49 @@ impl GraphJob {
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
     pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
-        self.runs.in_flight() || self.loans.out()
+        self.runs.in_flight() || self.loans.out() || self.mail_owed
+    }
+
+    // The checkpoint `stamp` records every name the job's files want and
+    // every name they left so far.
+    pub(crate) fn recorded(&mut self, stamp: u64) {
+        self.writer.recorded(stamp);
+    }
+
+    // Whether a member's file still waits to move, or a name a file left
+    // waits to be free: the job is not done until every file sits at its
+    // name.
+    pub(crate) fn moves_waiting(&self) -> bool {
+        self.writer.moves_waiting()
+    }
+
+    // The checkpoint whose commit lets every waiting move run.
+    pub(crate) fn awaited(&self) -> u64 {
+        self.writer.awaited()
+    }
+
+    // The run mail will say when the awaited checkpoint commits. True when
+    // it was not owed already, so no write queued yet is sure to say it.
+    pub(crate) fn owe_mail(&mut self) -> bool {
+        !std::mem::replace(&mut self.mail_owed, true)
+    }
+
+    // The checkpoints through `stamp` have committed: every move they
+    // record runs, and the names the files left are free in the ledger.
+    // True when the next checkpoint has something to record.
+    pub(crate) fn committed(&mut self, stamp: u64) -> Result<bool, WriteError> {
+        self.writer.commit_moves(&mut self.tree, stamp)
+    }
+
+    // The database's word on the checkpoints a move waited on: committed
+    // through `stamp`, or a write failed and the next checkpoint carries
+    // them again.
+    pub(crate) fn written(&mut self, stamp: Option<u64>) -> Result<(), GraphError> {
+        self.mail_owed = false;
+        if let Some(stamp) = stamp {
+            self.committed(stamp)?;
+        }
+        Ok(())
     }
 
     // Keep ownership until stopped workers report that they ended.

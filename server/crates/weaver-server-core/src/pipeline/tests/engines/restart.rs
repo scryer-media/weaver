@@ -1743,3 +1743,5 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
     );
     retire_pipeline_database(pipeline).await;
 }
+
+mod moves;

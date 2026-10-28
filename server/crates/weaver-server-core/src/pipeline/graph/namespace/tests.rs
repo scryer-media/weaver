@@ -527,6 +527,19 @@ impl Job {
         std::fs::read(self.dir.path().join(name)).expect("leaf file")
     }
 
+    // Commit checkpoints as the write lane would, until no move waits: each
+    // records what is wanted, and its commit runs the moves it covers and
+    // frees the names they left.
+    fn commit(&mut self) {
+        while self.writer.moves_waiting() {
+            let stamp = self.writer.committed + 1;
+            self.writer.recorded(stamp);
+            self.writer
+                .commit_moves(&mut self.tree, stamp)
+                .expect("moves");
+        }
+    }
+
     fn root(&self) -> &weaver_graph::Namespace {
         self.tree.namespace(NodeId::ROOT).expect("root")
     }
@@ -970,10 +983,79 @@ fn a_rename_moves_the_file_and_the_name_allocation() {
         )
         .expect("rename");
     assert_eq!(renamed, "show.part01.rar");
+    // The file stays where it sat until a checkpoint records the name.
+    assert_eq!(job.file("3f9a.bin"), b"data");
+    job.commit();
     assert_eq!(job.file("show.part01.rar"), b"data");
     assert!(!job.dir.path().join("3f9a.bin").exists());
     let next = job.member("3f9a.bin", None);
     assert_eq!(job.root().get(next).unwrap().output_name, "3f9a.bin");
+}
+
+// A member renamed and then discarded before its file moved leaves its old
+// name once the checkpoint that says the file is gone has committed: the
+// member kept off the name meanwhile takes it.
+#[test]
+fn a_name_a_discarded_file_sat_at_is_free_once_its_checkpoint_commits() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("3f9a.bin", Some(4));
+    job.send(member, 0, b"data", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, member, "show.mkv")
+        .expect("rename");
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .remove(&member)
+        .expect("leaf");
+    job.writer.discard(leaf).expect("discard");
+    let next = job.member("3f9a.bin", None);
+    assert_eq!(job.root().get(next).unwrap().output_name, "3f9a (1).bin");
+    job.commit();
+    assert_eq!(job.root().get(next).unwrap().output_name, "3f9a.bin");
+    assert!(!job.writer.moves_waiting());
+}
+
+// One file wants the name another still sits at, and the checkpoint that
+// says the other leaves it comes later: the earlier commit moves nothing
+// onto the name, the later one moves the other file off it, and the first
+// moves on only once the checkpoint that records that move has committed.
+// No file lands on bytes still written under the name, whatever the file
+// system folds.
+#[test]
+fn a_file_waits_off_a_name_another_file_still_sits_at() {
+    let mut job = Job::new(PLENTY);
+    let (first, second) = (MemberId(1), MemberId(2));
+    for (member, name, bytes) in [(first, "x.bin", b"alpha"), (second, "y.bin", b"bravo")] {
+        std::fs::write(job.dir.path().join(name), bytes).expect("file");
+        let leaf = Leaf::at(job.dir.path(), name);
+        job.writer
+            .files_mut(NodeId::ROOT)
+            .leaves
+            .insert(member, leaf);
+    }
+    job.writer.intend(NodeId::ROOT, first, "y.bin");
+    job.writer.recorded(1);
+    job.writer.intend(NodeId::ROOT, second, "z.bin");
+    job.writer.recorded(2);
+
+    let moved = job.writer.commit_moves(&mut job.tree, 1).expect("commit");
+    assert!(!moved);
+    assert_eq!(job.file("x.bin"), b"alpha");
+    assert_eq!(job.file("y.bin"), b"bravo");
+
+    let moved = job.writer.commit_moves(&mut job.tree, 2).expect("commit");
+    assert!(moved);
+    assert_eq!(job.file("z.bin"), b"bravo");
+    assert_eq!(job.file("x.bin"), b"alpha");
+    assert!(!job.dir.path().join("y.bin").exists());
+
+    job.commit();
+    assert_eq!(job.file("y.bin"), b"alpha");
+    assert_eq!(job.file("z.bin"), b"bravo");
+    assert!(!job.dir.path().join("x.bin").exists());
 }
 
 #[test]
@@ -1189,6 +1271,7 @@ fn a_shallower_member_that_claims_a_written_name_moves_the_deeper_file_aside() {
     assert_eq!(renamed, "INNER.bin");
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
     assert_eq!(inner.output_name, "inner (1).bin");
+    job.commit();
     assert_eq!(job.file("INNER.bin"), b"data");
     assert_eq!(job.file("inner (1).bin"), b"hello");
     assert!(!job.dir.path().join("3f9a.bin").exists());
@@ -1221,8 +1304,9 @@ fn a_recovery_object_in_the_tree_is_fed_and_its_renames_move_the_file() {
     // The member's front changed, so the object matched again and
     // recognised the member by what has arrived of it.
     assert_eq!(job.root().get(member).unwrap().output_name, "show.mkv");
-    assert!(!job.dir.path().join("3f9a.bin").exists());
     job.send(member, 4, b"more", Provenance::Fresh);
+    job.commit();
+    assert!(!job.dir.path().join("3f9a.bin").exists());
     assert_eq!(job.file("show.mkv"), b"datamore");
 }
 

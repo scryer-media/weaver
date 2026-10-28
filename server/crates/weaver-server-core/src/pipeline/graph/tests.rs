@@ -24,7 +24,7 @@ use crate::pipeline::tests::engines::harness::{
     ARTICLE, Post, par2_set, par2_volumes, payload, spec,
 };
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline, retire_pipeline_database, segment_id,
+    hear_graph_mail, insert_active_job, new_direct_pipeline, retire_pipeline_database, segment_id,
 };
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
@@ -350,8 +350,13 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     // The volume still to come is the set's own from the post, so with the
     // payload in, the set rules as its index is founded, before it is read;
-    // the bind that names the member follows once that run is heard.
+    // the bind that names the member follows once that run is heard. The
+    // file moves once the checkpoint that records its name has committed.
     hear_repair(&mut pipeline, job_id).await;
+    assert!(pipeline.graph_jobs[&job_id].moves_waiting());
+    assert!(hex.exists());
+    hear_graph_mail(&mut pipeline, job_id).await;
+    assert!(!pipeline.graph_jobs[&job_id].moves_waiting());
 
     let member = pipeline.graph_jobs[&job_id]
         .namespace()

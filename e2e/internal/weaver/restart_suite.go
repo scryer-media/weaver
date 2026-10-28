@@ -242,10 +242,10 @@ func restartCases() []restartCase {
 		},
 		{
 			Name:        "rar_finalize_rediscovers_after_rename",
-			Description: "Finalize-after-rename may be retried, but restart should rediscover durable archive files and complete",
-			Slugs:       []string{"rar5-multi-member"},
+			Description: "A file moved to the name its committed checkpoint recorded before the move itself was recorded: restart should adopt it there, fetch nothing it held, and complete",
+			Slugs:       []string{renameRestartSlug},
 			Timeout:     20 * time.Minute,
-			Run:         runRarFinalizeReconcilesAfterRename,
+			Run:         runRenamedFileAdoptedAfterRestart,
 		},
 		{
 			Name:        "stale_active_extracted_rows_validate_after_restart",
@@ -2860,27 +2860,46 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 	), nil
 }
 
-func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("extract.after_finalize_rename_before_record", 8); err != nil {
+// renameRestartSlug posts one payload under an obfuscated hex name beside
+// the PAR3 set that names it. The set recognises the file by the bytes that
+// have arrived of it, so the file is on disk under the hex name when the set
+// renames it, and moves to the set's name.
+const renameRestartSlug = "par3-obfuscated-names"
+
+// The process dies right after the file moved to the name a committed
+// checkpoint recorded for it, before the checkpoint that says it moved. The
+// restart finds the file at that name and adopts it: the job completes, the
+// fixture's expected output is delivered, and no article the checkpoint held
+// whole is fetched again.
+func runRenamedFileAdoptedAfterRestart(ctx *restartCaseContext) (restartCaseResult, error) {
+	segments, err := nzbSegments(renameRestartSlug)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	jobID, err := ctx.submitSlug("rar5-multi-member")
+	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := ctx.startWeaverWithOptions("extract.after_rename_before_record", 8); err != nil {
+		return restartCaseResult{}, err
+	}
+	jobID, err := ctx.submitSlug(renameRestartSlug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := ctx.waitForCrash(12*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
-	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
+	_, _, preMetrics, err := ctx.captureEvidence("pre_crash", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	memberName, stagedPath, stagedSize, ok := stagingMemberFromSnapshot(preFS, jobID, false)
-	if !ok {
-		return restartCaseResult{}, fmt.Errorf("no staged finalized member found before crash")
+	covered, err := archiveCheckpointAtCrash(ctx, jobID, segments, ranges)
+	if err != nil {
+		return restartCaseResult{}, err
 	}
-	if stagedSize <= 0 {
-		return restartCaseResult{}, fmt.Errorf("staged finalized member %s was empty before restart", stagedPath)
+	if len(covered) == 0 {
+		return restartCaseResult{}, fmt.Errorf("the checkpoint held no whole article when the file moved")
 	}
 
 	if err := ctx.restartWeaver(); err != nil {
@@ -2890,20 +2909,27 @@ func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseRe
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	_, postFS, metrics, err := ctx.captureEvidence("post_restart", "")
+	dbPath := caseDBPath(ctx)
+	if err := waitForJobArchived(dbPath, jobID); err != nil {
+		return restartCaseResult{}, err
+	}
+	_, _, metrics, err := ctx.captureEvidence("post_restart", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
-	memberPresent := completeSnapshotContainsMember(postFS, memberName)
-	pass := statuses[jobID] == "COMPLETE" && memberPresent && refetchedIDs == 0
+	fetchedAfter, _ := bodyFetchesSinceRestartPoint(preMetrics, metrics)
+	refetched := refetchedArticles(covered, preMetrics, metrics)
+	digestErr := assertOutputBLAKE3(dbPath, jobID, ctx.Scenarios[renameRestartSlug].ExpectedOutputBLAKE3)
+	detail := fmt.Sprintf("covered_at_crash=%d of %d articles fetched_after_restart=%d refetched_covered=%d output=%v final=%s",
+		len(covered), len(segments), fetchedAfter, len(refetched), digestErr, statuses[jobID])
+	pass := statuses[jobID] == "COMPLETE" && digestErr == nil && len(refetched) == 0
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf("finalize-after-rename restart rediscovered durable archive files and completed %s (staged=%s size=%d refetched articles %d bodies %d)", memberName, stagedPath, stagedSize, refetchedIDs, refetchedBodies),
+		"restart after a file moved ahead of its record adopted it and delivered the expected output: "+detail,
 		false,
 		"",
-		fmt.Sprintf("finalize-after-rename restart failed (member=%s present=%v refetched articles %d bodies %d final=%s)", memberName, memberPresent, refetchedIDs, refetchedBodies, statuses[jobID]),
+		fmt.Sprintf("restart after a file moved ahead of its record: %s refetched covered ids: %v", detail, refetched),
 	), nil
 }
 

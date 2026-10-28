@@ -315,15 +315,7 @@ impl Pipeline {
         headroom_at_pass_start: &mut HashMap<usize, usize>,
         ranked_this_pass: &mut Option<Vec<usize>>,
     ) -> DispatchAttempt {
-        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
-        for server in self
-            .owned_download_lane_pool
-            .idle_lane_servers()
-            .into_iter()
-            .flatten()
-        {
-            *idle_by_server.entry(server).or_default() += 1;
-        }
+        let idle_by_server = self.idle_download_lanes_by_server();
         let backfill_flags = self.nntp.pool().server_backfill_flags();
         let mut servers: Vec<usize> = match self.rank_servers_for_pass(ranked_this_pass.is_none()) {
             Some(order) => {
@@ -365,29 +357,12 @@ impl Pipeline {
             }
         }
         servers.retain(|server| {
-            let idle = idle_by_server.get(server).copied().unwrap_or(0);
-            // A server holding new connections back (a quarantine waiting on
-            // its one probe, or the delay after a failed dial) seats only the
-            // connections it already has, and one whose probe is due seats
-            // one more, the probe. A lease past those would only come back
-            // refused, and every refusal would put the work back for the next
-            // pass to send again. The work waits in its queue instead, and the
-            // run loop wakes dispatch on the server's recovery or on the
-            // hold's deadline.
-            let available = self.nntp.pool().new_connection_seats(*server);
-            // The seat count is read once per server per pass, the first time
-            // the pass looks at it and so before it has sent anything there.
-            // Re-reading it would charge each lease twice: once as a lease in
-            // `sent`, and again as the permit its lane has meanwhile taken —
-            // the lane worker runs on its own thread, so how much of that has
-            // happened by the next iteration is a matter of thread scheduling.
-            // A pass that measured itself that way stopped around half its
-            // configured capacity, and stopped at a different place each run.
-            let seats = *headroom_at_pass_start
-                .entry(*server)
-                .or_insert(idle + available);
-            let sent = sent_this_pass.get(server).copied().unwrap_or(0);
-            seats > sent
+            self.pass_has_seat(
+                *server,
+                &idle_by_server,
+                sent_this_pass,
+                headroom_at_pass_start,
+            )
         });
         for server_idx in servers {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
@@ -428,6 +403,55 @@ impl Pipeline {
             return DispatchAttempt::Dispatched(job_id);
         }
         DispatchAttempt::NoWork
+    }
+
+    // The servers of the connections idle workers are keeping, and how many
+    // each keeps.
+    pub(in crate::pipeline) fn idle_download_lanes_by_server(&self) -> HashMap<usize, usize> {
+        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
+        for server in self
+            .owned_download_lane_pool
+            .idle_lane_servers()
+            .into_iter()
+            .flatten()
+        {
+            *idle_by_server.entry(server).or_default() += 1;
+        }
+        idle_by_server
+    }
+
+    // Whether `server` can still seat one more connection this pass: an idle
+    // connection or a free permit beyond what the pass has already sent it.
+    pub(in crate::pipeline) fn pass_has_seat(
+        &self,
+        server: usize,
+        idle_by_server: &HashMap<usize, usize>,
+        sent_this_pass: &HashMap<usize, usize>,
+        headroom_at_pass_start: &mut HashMap<usize, usize>,
+    ) -> bool {
+        let idle = idle_by_server.get(&server).copied().unwrap_or(0);
+        // A server holding new connections back (a quarantine waiting on
+        // its one probe, or the delay after a failed dial) seats only the
+        // connections it already has, and one whose probe is due seats
+        // one more, the probe. A lease past those would only come back
+        // refused, and every refusal would put the work back for the next
+        // pass to send again. The work waits in its queue instead, and the
+        // run loop wakes dispatch on the server's recovery or on the
+        // hold's deadline.
+        let available = self.nntp.pool().new_connection_seats(server);
+        // The seat count is read once per server per pass, the first time
+        // the pass looks at it and so before it has sent anything there.
+        // Re-reading it would charge each lease twice: once as a lease in
+        // `sent`, and again as the permit its lane has meanwhile taken —
+        // the lane worker runs on its own thread, so how much of that has
+        // happened by the next iteration is a matter of thread scheduling.
+        // A pass that measured itself that way stopped around half its
+        // configured capacity, and stopped at a different place each run.
+        let seats = *headroom_at_pass_start
+            .entry(server)
+            .or_insert(idle + available);
+        let sent = sent_this_pass.get(&server).copied().unwrap_or(0);
+        seats > sent
     }
 
     // Open the connections a barred job is about to need, while it is barred.
@@ -678,6 +702,13 @@ impl Pipeline {
         if self.nntp_handoff_draining {
             return;
         }
+        // The pass's seat ledger. Health probe batches are seated first: a
+        // batch is a few round trips on a seat and asks for no bytes, so byte
+        // pressure does not hold it back, and a seat it takes is one no lease
+        // below may take as well.
+        let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
+        let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
+        self.seat_waiting_probes(&mut sent_this_pass, &mut headroom_at_pass_start);
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
             self.update_queue_metrics();
@@ -725,7 +756,8 @@ impl Pipeline {
         // Eligibility changes only through job state, which every path that
         // changes it follows with a turn of its own; work that is eligible
         // but could not be placed is retried on the tick.
-        self.download_dispatch_retry = !eligible.is_empty();
+        // A probe batch still waiting for a seat is retried the same way.
+        self.download_dispatch_retry = !eligible.is_empty() || !self.post_probes.waiting.is_empty();
         if eligible.is_empty() && self.active_downloads == 0 {
             // Collected rather than logged in place: the warning is throttled
             // per job, and the throttle needs `&mut self` while this walk
@@ -848,8 +880,6 @@ impl Pipeline {
             return;
         }
         let active_connections_before_dispatch = self.active_download_connections;
-        let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
-        let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
         let mut ranked_this_pass: Option<Vec<usize>> = None;
         let mut leased_jobs: Vec<JobId> = Vec::new();
         while self.active_download_connections < max

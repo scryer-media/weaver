@@ -21,8 +21,12 @@ use crate::pipeline::graph::leaf::Leaf;
 impl NamespaceWriter {
     pub(crate) fn file_state(&self, node: NodeId, member: MemberId) -> FileState {
         let files = self.files.get(&node);
+        let leaf = files.and_then(|files| files.leaves.get(&member));
         FileState {
-            has_file: files.is_some_and(|files| files.leaves.contains_key(&member)),
+            has_file: leaf.is_some(),
+            on_disk: leaf
+                .filter(|leaf| leaf.wants().is_some())
+                .map(|leaf| leaf.name().to_owned()),
             refused: files.and_then(|files| files.refused.get(&member).copied()),
         }
     }
@@ -139,21 +143,24 @@ impl NamespaceWriter {
         self.envelopes.changed_since(at)
     }
 
-    // A member's file as it was left. Nothing on disk is touched: the file
-    // opens on the next write or read, and counts against the job's budget
-    // as far as the tree's coverage of it reaches.
+    // A member's file as it was left, where the checkpoint says it sits.
+    // Nothing on disk is touched: the file opens on the next write or read,
+    // and counts against the job's budget as far as the tree's coverage of
+    // it reaches.
     pub(crate) fn restore_file(
         &mut self,
         tree: &Tree,
         node: NodeId,
         member: MemberId,
-        state: FileState,
+        state: &FileState,
     ) -> Result<(), WriteError> {
         let Some(record) = tree.namespace(node).and_then(|found| found.get(member)) else {
             return Ok(());
         };
         if state.has_file {
-            self.leaf(node, member, &record.output_name)?;
+            let leaf =
+                self.restored_leaf(node, member, &record.output_name, state.on_disk.as_deref());
+            self.files_mut(node).leaves.insert(member, leaf);
             self.caps.restore(tree, node, member);
         }
         if let Some(why) = state.refused {
