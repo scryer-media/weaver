@@ -777,11 +777,8 @@ const SPLIT_LZ: [&[u8]; 4] = [
 const SPLIT_LZ_MEMBER_LEN: u64 = 226_943;
 const SPLIT_LZ_MEMBER_CRC: u32 = 0x06b1_9020;
 
-// The engine states no checksum: the header it announces from carries only
-// the first part's CRC, and the decoder verifies the member itself. A split
-// compressed member whose parts carry distinct CRCs comes out whole.
-#[test]
-fn a_split_compressed_member_is_delivered_whole_with_no_checksum_said() {
+// A run over `volumes` of the four-part set, everything it said.
+fn split_lz(volumes: &[&[u8]]) -> Vec<Emit> {
     let mut engine = named(&[
         "rar4_lz_four.part01.rar",
         "rar4_lz_four.part02.rar",
@@ -794,11 +791,21 @@ fn a_split_compressed_member_is_delivered_whole_with_no_checksum_said() {
         true
     };
     engine.start().run(
-        Gate::whole(SPLIT_LZ.iter().map(|volume| volume.to_vec()).collect()),
+        Gate::whole(volumes.iter().map(|volume| volume.to_vec()).collect()),
         &mut sink,
         weaver_graph::Budget::default(),
     );
-    assert_eq!(checksums(&emits), Vec::new());
+    emits
+}
+
+// A split compressed member states the checksum its final part's header
+// gives, once decoding has read that header: after its last bytes, before
+// it closes, and equal to the CRC32 of the bytes it delivered. The first
+// part's header carries only that part's packed-bytes CRC, which names
+// nothing about the member and is never said.
+#[test]
+fn a_split_compressed_member_states_its_own_checksum_once_decoded() {
+    let emits = split_lz(&SPLIT_LZ);
     let said = said(&emits);
     let bytes: Vec<u8> = said
         .iter()
@@ -811,7 +818,41 @@ fn a_split_compressed_member_is_delivered_whole_with_no_checksum_said() {
         .collect();
     assert_eq!(bytes.len() as u64, SPLIT_LZ_MEMBER_LEN);
     assert_eq!(crc32(&bytes), SPLIT_LZ_MEMBER_CRC);
-    assert!(said.contains(&Said::Closed(0)), "{:?}", said.len());
+    assert_eq!(checksums(&emits), vec![(0, crc32(&bytes))]);
+    let at = |wanted: fn(&Emit) -> bool| emits.iter().rposition(wanted).unwrap();
+    let stated = at(|emit| matches!(emit, Emit::Checksum { .. }));
+    assert!(at(|emit| matches!(emit, Emit::Bytes { .. })) < stated);
+    assert_eq!(stated + 1, at(|emit| matches!(emit, Emit::MemberClosed(_))));
+}
+
+// A member whose final part never arrives is never decoded whole, so the
+// header that states its checksum is never read and none is said.
+#[test]
+fn a_split_member_whose_final_part_is_never_read_states_no_checksum() {
+    let emits = split_lz(&SPLIT_LZ[..3]);
+    assert_eq!(checksums(&emits), Vec::new());
+    assert!(!said(&emits).contains(&Said::Closed(0)));
+}
+
+// An encrypted RAR5 member's header states a keyed CRC32, which is not the
+// member's own, so the run says none for it.
+#[test]
+fn an_encrypted_rar5_member_states_no_keyed_checksum() {
+    let mut engine = named(&["locked.rar"]);
+    let mut out = Vec::new();
+    engine.offer_password("testpass123", &mut out);
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    engine.start().run(
+        Gate::whole(vec![ENCRYPTED.to_vec()]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    assert!(said(&emits).contains(&Said::Closed(0)));
+    assert_eq!(checksums(&emits), Vec::new());
 }
 
 // The volumes, recording where every read a run makes of them starts.
@@ -978,6 +1019,16 @@ fn the_files_of_a_set_that_is_not_solid_decode_side_by_side_and_are_said_in_orde
         .collect();
     assert_eq!(ids, (0..6).collect::<Vec<_>>());
     assert!(alone.said.contains(&Said::Closed(5)));
+    // Each file states the CRC32 of the bytes it delivered.
+    let delivered: Vec<(u32, u32)> = alone
+        .said
+        .iter()
+        .filter_map(|said| match said {
+            Said::Bytes(id, bytes) => Some((*id, crc32(bytes))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(alone.sums, delivered);
     assert_eq!(beside.said, alone.said);
     assert_eq!(beside.sums, alone.sums);
     // In each volume the first two files decoded side by side on the lent
