@@ -302,6 +302,10 @@ async fn extraction_pause_uses_current_download_activity() {
         crate::jobs::model::RunState::Paused
     );
 
+    // The article out on a lane kept the paused job's articles. It comes
+    // back, and the job resumes before a turn parks it: it still holds its
+    // articles, with nothing left to fetch.
+    assert!(pipeline.jobs[&id].articles.active().is_some());
     pipeline.active_downloads_by_job.remove(&id);
     handle.resume_job(id).await.unwrap();
     pipeline.apply_queue_intents().await;
@@ -524,8 +528,13 @@ async fn extraction_with_queued_download_work_can_pause_without_current_activity
         crate::jobs::model::RunState::Paused
     );
 
+    // Nothing was out, so the pause let the articles go at once: the resumed
+    // job is built again from its stored NZB, and its queue emptied as the
+    // fixture's was.
+    assert!(pipeline.jobs[&id].articles.active().is_none());
     handle.resume_job(id).await.unwrap();
     pipeline.apply_queue_intents().await;
+    crate::pipeline::tests::activate_job(&mut pipeline, id).await;
     pipeline
         .jobs
         .get_mut(&id)

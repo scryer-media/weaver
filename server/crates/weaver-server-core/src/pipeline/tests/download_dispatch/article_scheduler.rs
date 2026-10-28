@@ -1166,7 +1166,11 @@ async fn a_checkpoint_held_hot_job_is_passed_without_reading_its_queue() {
 
 // Add a job through admission as a submitted NZB is added, so it waits its
 // turn with its NZB stored. Returns the job's spec as read from that NZB.
-async fn add_queued_job(pipeline: &mut Pipeline, job_id: JobId, articles: usize) -> JobSpec {
+pub(super) async fn add_queued_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    articles: usize,
+) -> JobSpec {
     let segments: String = (1..=articles)
         .map(|number| {
             format!(
@@ -1268,7 +1272,7 @@ async fn a_queued_job_is_built_on_its_first_handout_and_charged() {
     );
     assert!(matches!(
         pipeline.jobs[&job].articles,
-        crate::jobs::model::JobArticles::Activating(_)
+        crate::jobs::model::JobArticles::Activating(..)
     ));
     assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
 
@@ -1331,6 +1335,65 @@ async fn a_built_job_drops_its_articles_and_charge_when_it_ends() {
     assert!(!pipeline.jobs.contains_key(&cancelled));
     assert!(!pipeline.job_article_memory.contains_key(&cancelled));
     assert_eq!(pipeline.process_memory_budget.reserved_bytes(), 0);
+}
+
+// A read of a job's articles answers only the activation that sent it. A
+// job cancelled while its read was out and added again under the same id
+// is built from its own read, never from the one sent before the cancel.
+#[tokio::test]
+async fn a_reply_to_an_earlier_activation_of_the_same_id_is_dropped() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job = JobId(71251);
+    add_queued_job(&mut pipeline, job, 8).await;
+    pipeline.request_job_activation(job);
+    crate::pipeline::tests::cancel_one_job(
+        &mut pipeline,
+        job,
+        crate::jobs::handle::CancellationOrigin::User,
+    )
+    .await
+    .unwrap();
+    assert!(!pipeline.jobs.contains_key(&job));
+    add_queued_job(&mut pipeline, job, 8).await;
+    pipeline.request_job_activation(job);
+    let crate::jobs::model::JobArticles::Activating(_, current) = pipeline.jobs[&job].articles
+    else {
+        panic!("the job added again must be activating");
+    };
+
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        replies.push(
+            pipeline
+                .job_activated_rx
+                .recv()
+                .await
+                .expect("the activation channel stays open"),
+        );
+    }
+    replies.sort_by_key(|reply| reply.activation == current);
+    let [earlier, own] = <[_; 2]>::try_from(replies).ok().unwrap();
+    assert_ne!(earlier.activation, current);
+    assert_eq!(own.activation, current);
+
+    pipeline.handle_job_activated(earlier);
+    assert!(matches!(
+        pipeline.jobs[&job].articles,
+        crate::jobs::model::JobArticles::Activating(_, activation) if activation == current
+    ));
+    assert!(!pipeline.job_article_memory.contains_key(&job));
+
+    pipeline.handle_job_activated(own);
+    assert_eq!(
+        pipeline.jobs[&job]
+            .articles
+            .active()
+            .expect("the job's own read builds it")
+            .download_queue
+            .len(),
+        8
+    );
 }
 
 // A job whose stored NZB cannot be read back ends Failed through the

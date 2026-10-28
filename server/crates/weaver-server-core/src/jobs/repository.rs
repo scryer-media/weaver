@@ -31,7 +31,7 @@ impl OrphanActiveStateCounts {
     }
 }
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 13] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
@@ -45,6 +45,7 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 13] = [
     "graph_recovery",
     "graph_holds",
     "graph_facts_parts",
+    "graph_held_parts",
 ];
 
 async fn delete_orphan_rows(tx: &mut SqlTx<'_>, table: &'static str) -> Result<usize, StateError> {

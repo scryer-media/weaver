@@ -964,3 +964,312 @@ async fn a_bad_extent_that_arrives_first_fails_alone_and_its_neighbours_place() 
     }
     assert_only_the_bad_part_is_fetched_again(&mut pipeline, file_id, &path).await;
 }
+
+// An article held for the one before it is kept across a pause, as every
+// article that arrived is: it spills to the job's spool as the job parks, is
+// not asked for again when the job is resumed and built afresh, and is placed
+// behind its predecessor when that arrives.
+#[tokio::test]
+async fn an_article_held_across_a_pause_is_placed_without_being_fetched_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(40240);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("yenc compatibility", "sample.bin", &[8, 8]),
+    )
+    .await;
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let held = SegmentId {
+        file_id,
+        segment_number: 1,
+    };
+    let head = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    // The held article came back from its connection; its predecessor is
+    // still queued.
+    let _ = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .extract_matching(|work| work.segment_id == held);
+    let buffered = pipeline.write_buffered_bytes;
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    assert!(pipeline.unanchored_parked[&file_id].contains_key(&1));
+
+    pipeline.pause_job_runtime(job_id).unwrap();
+    pipeline.spill_parked_parts().await;
+    assert!(pipeline.jobs[&job_id].articles.active().is_none());
+    assert!(matches!(
+        pipeline.unanchored_parked[&file_id][&1].bytes,
+        crate::pipeline::ParkedBytes::Spilled { .. }
+    ));
+    assert_eq!(pipeline.write_buffered_bytes, buffered);
+    assert_eq!(pipeline.uu_spooled_bytes, 4);
+
+    pipeline.resume_job_runtime(job_id).unwrap();
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    let mut asked = std::collections::HashSet::new();
+    pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .extend_segment_ids(&mut asked);
+    assert_eq!(asked, std::collections::HashSet::from([head]));
+
+    let _ = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
+    deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.write_buffered_bytes, buffered);
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    crate::pipeline::tests::engines::harness::collect(&complete_dir, &complete_dir, &mut files);
+    assert_eq!(
+        files.into_values().collect::<Vec<_>>(),
+        vec![b"headtail".to_vec()]
+    );
+}
+
+// An article held for the one before it survives a restart: it spills to
+// the job's spool as the job parks, the park's checkpoint names it, the
+// restarted pipeline takes it back from there, and it is placed behind its
+// predecessor without being asked for again.
+#[tokio::test]
+async fn an_article_held_across_a_restart_is_placed_without_being_fetched_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(40241);
+    let spec = || segmented_job_spec("yenc compatibility", "sample.bin", &[8, 8]);
+    insert_active_job(&mut pipeline, job_id, spec()).await;
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let held = SegmentId {
+        file_id,
+        segment_number: 1,
+    };
+    let head = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    // The held article came back from its connection; its predecessor is
+    // still queued.
+    let _ = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .extract_matching(|work| work.segment_id == held);
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    pipeline.pause_job_runtime(job_id).unwrap();
+    pipeline.spill_parked_parts().await;
+    let spool = match &pipeline.unanchored_parked[&file_id][&1].bytes {
+        crate::pipeline::ParkedBytes::Spilled { path, .. } => path.clone(),
+        crate::pipeline::ParkedBytes::Memory(_) => {
+            panic!("the held article spills as its job parks")
+        }
+    };
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+
+    // The process goes down; a new one stands up over the same database and
+    // directories and restores the job from its checkpoint.
+    retire_pipeline_database(pipeline).await;
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp).await;
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: spec(),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Paused,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: Some(JobStatus::Downloading),
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&spool).unwrap(), b"tail");
+
+    pipeline.resume_job_runtime(job_id).unwrap();
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    let mut asked = std::collections::HashSet::new();
+    pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .extend_segment_ids(&mut asked);
+    assert_eq!(asked, std::collections::HashSet::from([head]));
+    assert_eq!(pipeline.uu_spooled_bytes, 4);
+
+    let _ = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
+    let buffered = pipeline.write_buffered_bytes;
+    deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
+    assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.uu_spooled_bytes, 0);
+    assert_eq!(pipeline.write_buffered_bytes, buffered);
+    assert!(!spool.exists());
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    );
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut files = std::collections::BTreeMap::new();
+    crate::pipeline::tests::engines::harness::collect(&complete_dir, &complete_dir, &mut files);
+    assert_eq!(
+        files.into_values().collect::<Vec<_>>(),
+        vec![b"headtail".to_vec()]
+    );
+}
+
+// A held article restored into a running job is named by the checkpoint
+// that job takes as it starts, so a second restart before its predecessor
+// arrives still finds its row and its spool file, and asks only for the
+// predecessor.
+#[tokio::test]
+async fn an_article_held_across_two_restarts_keeps_its_checkpoint_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(40242);
+    let spec = || segmented_job_spec("yenc compatibility", "sample.bin", &[8, 8]);
+    let request = |status: JobStatus, working_dir: PathBuf| crate::RestoreJobRequest {
+        job_id,
+        job_hash: [0; 32],
+        spec: spec(),
+        detected_archives: Default::default(),
+        file_identities: Default::default(),
+        status,
+        download_state: None,
+        post_state: None,
+        run_state: None,
+        queued_repair_at_epoch_ms: None,
+        queued_extract_at_epoch_ms: None,
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+        working_dir,
+    };
+    insert_active_job(&mut pipeline, job_id, spec()).await;
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+    let held = SegmentId {
+        file_id,
+        segment_number: 1,
+    };
+    let head = SegmentId {
+        file_id,
+        segment_number: 0,
+    };
+    let _ = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .extract_matching(|work| work.segment_id == held);
+    deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
+    pipeline.pause_job_runtime(job_id).unwrap();
+    pipeline.spill_parked_parts().await;
+    let spool = match &pipeline.unanchored_parked[&file_id][&1].bytes {
+        crate::pipeline::ParkedBytes::Spilled { path, .. } => path.clone(),
+        crate::pipeline::ParkedBytes::Memory(_) => {
+            panic!("the held article spills as its job parks")
+        }
+    };
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+
+    // The first restart restores the job as running, and the job takes its
+    // first checkpoint as its graph starts.
+    retire_pipeline_database(pipeline).await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
+    pipeline
+        .restore_job(request(JobStatus::Downloading, working_dir.clone()))
+        .await
+        .unwrap();
+
+    // The second restart comes before the predecessor arrives.
+    retire_pipeline_database(pipeline).await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));
+    let rows = pipeline
+        .db
+        .load_graph_checkpoint(job_id)
+        .unwrap()
+        .expect("the running job left a checkpoint");
+    assert_eq!(
+        rows.held_parts
+            .iter()
+            .map(|row| (row.file, row.ordinal, row.decoded_len))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 4)]
+    );
+    pipeline
+        .restore_job(request(JobStatus::Downloading, working_dir))
+        .await
+        .unwrap();
+    let mut asked = std::collections::HashSet::new();
+    pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .extend_segment_ids(&mut asked);
+    assert_eq!(asked, std::collections::HashSet::from([head]));
+    assert_eq!(std::fs::read(&spool).unwrap(), b"tail");
+}

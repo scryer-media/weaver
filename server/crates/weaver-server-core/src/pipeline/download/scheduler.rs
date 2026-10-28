@@ -383,7 +383,7 @@ impl Pipeline {
     fn job_articles_built(&mut self, job_id: JobId) -> Result<(), BlockedBy> {
         match self.jobs.get(&job_id).map(|state| &state.articles) {
             None | Some(JobArticles::Active(_)) => Ok(()),
-            Some(JobArticles::Activating(_)) => {
+            Some(JobArticles::Activating(..)) => {
                 Err(BlockedBy::only(SchedulerBlockClause::Activation))
             }
             Some(JobArticles::Queued(_)) => {

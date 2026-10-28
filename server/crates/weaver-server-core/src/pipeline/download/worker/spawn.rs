@@ -325,11 +325,7 @@ impl Pipeline {
         let mut available_decode_slots = decode_limit.saturating_sub(active_decodes);
         while let Some(work) = self.pending_decode.pop_front() {
             let job_id = work.segment_id.file_id.job_id;
-            if self
-                .jobs
-                .get(&job_id)
-                .is_none_or(|state| is_terminal_status(&state.status))
-            {
+            if !self.job_takes_results(job_id) {
                 self.metrics
                     .note_decode_work_released(work.raw.len() as u64);
                 debug!(

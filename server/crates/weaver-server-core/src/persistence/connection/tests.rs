@@ -1161,6 +1161,87 @@ async fn try_queue_write_full_queue_resend_is_covered_by_flush() {
     );
 }
 
+// A write queued while earlier writes wait for room in the full queue runs
+// after them, even though the queue has room again by the time it is queued.
+// That holds for a job's archive and its events too. The writer runs on the
+// runtime's workers, so the test may block on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_never_overtakes_the_writes_waiting_for_room_in_a_full_queue() {
+    let db = Database::open_in_memory().unwrap();
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let job_id = crate::jobs::ids::JobId(7171);
+    // What the last waiting write saw of the job's archive and events.
+    let seen_by_last = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    // The first op holds the writer until it is released, so the queue
+    // fills and the rest wait for room.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    db.try_queue_write("gate", move |_db| {
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(())
+    })
+    .unwrap();
+    let (first_ran_tx, first_ran_rx) = std::sync::mpsc::channel::<()>();
+    let total = 400usize;
+    for i in 0..total {
+        let order = order.clone();
+        let first_ran = (i == 0).then(|| first_ran_tx.clone());
+        let seen = (i + 1 == total).then(|| seen_by_last.clone());
+        db.try_queue_write("waiting", move |db| {
+            order.lock().unwrap().push(i);
+            if let Some(seen) = seen {
+                *seen.lock().unwrap() = Some((
+                    db.get_job_history(job_id.0).unwrap().is_some(),
+                    db.get_job_events(job_id.0).unwrap().len(),
+                ));
+            }
+            if let Some(first_ran) = first_ran {
+                let _ = first_ran.send(());
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // The writer takes the first waiting write off the queue, so the queue
+    // has room while the writes past its end still wait for it.
+    release_tx.send(()).unwrap();
+    first_ran_rx.recv().unwrap();
+    let late = order.clone();
+    db.try_queue_write("late", move |_db| {
+        late.lock().unwrap().push(total);
+        Ok(())
+    })
+    .unwrap();
+    db.queue_archive_job(job_id, postgres_sample_history(job_id))
+        .await
+        .unwrap();
+    db.queue_job_events(vec![JobEvent {
+        job_id: job_id.0,
+        timestamp: 1,
+        kind: "late".to_string(),
+        message: "queued behind the waiting writes".to_string(),
+        file_id: None,
+    }])
+    .await
+    .unwrap();
+
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        *order.lock().unwrap(),
+        (0..=total).collect::<Vec<_>>(),
+        "every write ran in the order it was queued"
+    );
+    assert_eq!(
+        *seen_by_last.lock().unwrap(),
+        Some((false, 0)),
+        "the archive and the events queued behind the waiting writes ran after them"
+    );
+    assert!(db.get_job_history(job_id.0).unwrap().is_some());
+    assert_eq!(db.get_job_events(job_id.0).unwrap().len(), 1);
+}
+
 // Drives the Postgres lane writer directly. The ops below never touch the
 // database, so an in-memory SQLite handle stands in for the one they receive;
 // what is under test is only when each op is allowed to run.

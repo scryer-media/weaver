@@ -197,17 +197,25 @@ impl Pipeline {
     // one the bytes are refused and the part is requeued, which keeps the
     // spool from writing blind into a filesystem it cannot measure.
     pub(in crate::pipeline) fn admit_uu_spill(&mut self, spilled_bytes: usize) -> bool {
-        let available = self.uu_spool_capacity().best_available_bytes();
-        let admitted =
-            available.is_some() && !self.uu_spool_limits_reached(spilled_bytes, available);
-        if admitted {
-            self.uu_spool_debits.debit(spilled_bytes as u64);
-        } else {
+        let admitted = self.admit_spool_bytes(spilled_bytes);
+        if !admitted {
             self.uu_spool_blocked_spill_bytes = Some(
                 self.uu_spool_blocked_spill_bytes
                     .unwrap_or(0)
                     .max(spilled_bytes),
             );
+        }
+        admitted
+    }
+
+    // Admit `spilled_bytes` of spool against its limits and the measured free
+    // space, debiting the reading when they fit. A refusal changes nothing.
+    pub(in crate::pipeline) fn admit_spool_bytes(&mut self, spilled_bytes: usize) -> bool {
+        let available = self.uu_spool_capacity().best_available_bytes();
+        let admitted =
+            available.is_some() && !self.uu_spool_limits_reached(spilled_bytes, available);
+        if admitted {
+            self.uu_spool_debits.debit(spilled_bytes as u64);
         }
         admitted
     }

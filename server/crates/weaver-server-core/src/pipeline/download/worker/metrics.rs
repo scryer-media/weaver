@@ -64,10 +64,12 @@ impl Pipeline {
     // download work. Its wait is the earliest future deadline among the
     // holds the scheduler keeps on it — a propagation deferral, a restart
     // durable-lead retry, a timed infrastructure retry of one of its
-    // articles — or the soft byte-pressure delay every job shares. A stalled
-    // job with none of these is waiting on nothing anyone scheduled, and the
-    // stall is unexplained: `None`. Otherwise the earliest wait across the
-    // stalled jobs, which is when the stall starts counting.
+    // articles — or the soft byte-pressure delay every job shares. A job
+    // whose articles are being built waits until now, so the stall counts
+    // from now while that lasts. A stalled job with none of these is waiting
+    // on nothing anyone scheduled, and the stall is unexplained: `None`.
+    // Otherwise the earliest wait across the stalled jobs, which is when the
+    // stall starts counting.
     //
     // Retries that sleep in their own task (a body-lane or blocked-server
     // recheck, a server quota wait) keep no deadline here, so they do not
@@ -100,6 +102,13 @@ impl Pipeline {
         }
         let mut waits = HashMap::new();
         for job_id in self.download_scheduler_eligible_jobs() {
+            // A job whose articles are being built waits on that, which has
+            // no deadline: the clock restarts while it lasts, as under a
+            // quota, and a slow read never kicks the other jobs.
+            if self.awaits_job_articles(job_id) {
+                waits.insert(job_id, now);
+                continue;
+            }
             let job_wait = [
                 self.propagation_ready_at
                     .get(&job_id)

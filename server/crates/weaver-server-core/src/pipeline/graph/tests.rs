@@ -460,25 +460,32 @@ async fn a_turn_hears_all_the_run_mail_waiting() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A paused graph job with nothing out lets its articles and its graph go at
+// once. Resumed while it holds its NZB slot, it is built again from its
+// checkpoint and installed. Its graph starts no run while the slot is taken
+// away, and once the slot is back the articles are written.
 #[tokio::test]
-async fn paused_graph_work_stays_queued_until_resume_has_nzb_admission() {
+async fn paused_graph_work_is_rebuilt_on_resume_and_runs_only_with_nzb_admission() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_100);
     let body = payload(2 * ARTICLE + 9, 8);
     let posts = vec![echo_volume(0, &body)];
     let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
-    echo_engines(&mut pipeline, job_id, 1);
     pipeline.pause_job_runtime(job_id).unwrap();
-    // An already-issued decode may finish after pause, but cannot start
-    // an extraction worker while the job drains its admission.
+    assert!(pipeline.jobs[&job_id].articles.active().is_none());
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+
+    assert!(pipeline.nzb_admitted.contains(&job_id));
+    pipeline.resume_job_runtime(job_id).unwrap();
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    echo_engines(&mut pipeline, job_id, 1);
+    pipeline.nzb_admitted.remove(&job_id);
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     assert!(!pipeline.graph_jobs[&job_id].awaits_mail());
     assert!(!working_dir.join("echo-0.bin").exists());
-    pipeline.nzb_admitted.remove(&job_id);
-    pipeline.resume_graph_work(job_id);
-    assert!(!pipeline.graph_jobs[&job_id].awaits_mail());
     pipeline.nzb_admitted.insert(job_id);
-    pipeline.resume_job_runtime(job_id).unwrap();
+    pipeline.resume_graph_work(job_id);
     assert!(pipeline.graph_jobs[&job_id].awaits_mail());
     drain_runs(&mut pipeline, job_id).await;
     assert_eq!(read(&working_dir.join("echo-0.bin")), body);
@@ -495,9 +502,10 @@ async fn terminal_graph_runtime_is_retained_until_its_worker_stops() {
     decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
     assert!(pipeline.graph_jobs[&job_id].awaits_mail());
     pipeline.purge_terminal_job_runtime(job_id);
-    assert!(pipeline.graph_jobs[&job_id].awaits_mail());
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
     assert!(pipeline.nzb_admitted.contains(&job_id));
-    while pipeline.graph_jobs.contains_key(&job_id) {
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
     }

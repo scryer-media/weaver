@@ -187,13 +187,24 @@ impl JobSpec {
     }
 
     // Takes every file's article list out of the spec, leaving what a job
-    // waiting its turn keeps, and returns what the lists held.
+    // waiting its turn keeps, and returns what the lists held, with none of
+    // their articles in hand.
     pub fn drop_article_lists(&mut self) -> FileSummaries {
+        self.drop_article_lists_with_in_hand(|_, _| false)
+    }
+
+    // As `drop_article_lists`, counting as still to fetch only the articles
+    // `in_hand` does not hold, by file index and ordinal.
+    pub fn drop_article_lists_with_in_hand(
+        &mut self,
+        in_hand: impl Fn(u32, u32) -> bool,
+    ) -> FileSummaries {
         FileSummaries(
             self.files
                 .iter_mut()
-                .map(|file| {
-                    let summary = FileSummary::of(file);
+                .zip(0u32..)
+                .map(|(file, file_index)| {
+                    let summary = FileSummary::left(file, |ordinal| in_hand(file_index, ordinal));
                     file.segments = Vec::new();
                     summary
                 })
@@ -792,15 +803,22 @@ pub struct JobState {
 }
 
 // One file of a job as a job waiting its turn knows it: how many articles
-// it has and what they add up to.
+// it has, what they add up to, and how many of them are still to fetch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileSummary {
     pub articles: u32,
     pub bytes: u64,
+    pub remaining: u32,
 }
 
 impl FileSummary {
+    // A file with none of its articles in hand.
     pub fn of(file: &FileSpec) -> Self {
+        Self::left(file, |_| false)
+    }
+
+    // A file holding in hand the articles `in_hand` names by ordinal.
+    pub fn left(file: &FileSpec, in_hand: impl Fn(u32) -> bool) -> Self {
         Self {
             articles: file.segments.len() as u32,
             bytes: file
@@ -808,7 +826,18 @@ impl FileSummary {
                 .iter()
                 .map(|segment| u64::from(segment.bytes))
                 .sum(),
+            remaining: file
+                .segments
+                .iter()
+                .filter(|segment| !in_hand(segment.ordinal))
+                .count() as u32,
         }
+    }
+
+    // Whether two summaries describe the same article list, whatever of it
+    // is in hand.
+    pub fn same_list(&self, other: &Self) -> bool {
+        self.articles == other.articles && self.bytes == other.bytes
     }
 }
 
@@ -833,11 +862,14 @@ pub struct ActiveArticles {
 // say what the lists held. When the scheduler first reaches it the job is
 // activating while its article lists are read back from the stored NZB, off
 // the pipeline thread. Once they are in, the job is active and holds its
-// article lists, assembly and queues until it leaves the pipeline. A job
-// never goes back.
+// article lists, assembly and queues while it runs. A paused job goes back to
+// waiting, holding its summaries again, and is activated afresh from its
+// stored NZB and checkpoint when it is next reached.
 pub enum JobArticles {
     Queued(FileSummaries),
-    Activating(FileSummaries),
+    // The number tells this read from any earlier one of the same job: only
+    // the reply that carries it builds the job's articles.
+    Activating(FileSummaries, u64),
     Active(Box<ActiveArticles>),
 }
 
@@ -845,14 +877,14 @@ impl JobArticles {
     pub fn active(&self) -> Option<&ActiveArticles> {
         match self {
             Self::Active(active) => Some(active),
-            Self::Queued(_) | Self::Activating(_) => None,
+            Self::Queued(_) | Self::Activating(..) => None,
         }
     }
 
     pub fn active_mut(&mut self) -> Option<&mut ActiveArticles> {
         match self {
             Self::Active(active) => Some(active),
-            Self::Queued(_) | Self::Activating(_) => None,
+            Self::Queued(_) | Self::Activating(..) => None,
         }
     }
 
@@ -882,11 +914,12 @@ impl JobArticles {
     }
 
     // Articles still waiting in the primary queue. A job whose articles are
-    // not built yet has every one of them still to fetch.
+    // not built yet has every article not in hand still to fetch, which is
+    // what its queue holds once they are built.
     pub fn queued_download_len(&self) -> usize {
         match self {
-            Self::Queued(summaries) | Self::Activating(summaries) => {
-                summaries.0.iter().map(|file| file.articles as usize).sum()
+            Self::Queued(summaries) | Self::Activating(summaries, _) => {
+                summaries.0.iter().map(|file| file.remaining as usize).sum()
             }
             Self::Active(active) => active.download_queue.len(),
         }
@@ -911,7 +944,7 @@ impl JobState {
     // or only their summary.
     pub fn file_summary(&self, file_index: usize) -> FileSummary {
         match &self.articles {
-            JobArticles::Queued(summaries) | JobArticles::Activating(summaries) => {
+            JobArticles::Queued(summaries) | JobArticles::Activating(summaries, _) => {
                 summaries.0.get(file_index).copied().unwrap_or_default()
             }
             JobArticles::Active(_) => self

@@ -174,6 +174,48 @@ async fn a_stall_explained_by_a_future_deadline_is_never_kicked() {
     );
 }
 
+// A job whose articles are being read waits on that read, which has no
+// deadline: however long it takes, the stall it leaves is never kicked.
+#[tokio::test]
+async fn a_stall_behind_a_job_whose_articles_are_being_read_is_never_kicked() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    let job_id = JobId(40010);
+    super::article_scheduler::add_queued_job(&mut pipeline, job_id, 3).await;
+    pipeline.db.set_nzb_admitted(job_id, true).unwrap();
+    pipeline.nzb_admitted.insert(job_id);
+    // The scheduler's first reach sends for the articles; the read is never
+    // delivered here.
+    pipeline.request_job_activation(job_id);
+    let t0 = Instant::now();
+    pipeline.dispatch_downloads_at(t0);
+    assert!(matches!(
+        pipeline.jobs[&job_id].articles,
+        crate::jobs::model::JobArticles::Activating(..)
+    ));
+    assert_eq!(pipeline.download_scheduler_eligible_jobs(), vec![job_id]);
+
+    let kick_due = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+    assert_eq!(
+        pipeline.earliest_explained_dispatch_wait(kick_due),
+        Some(kick_due)
+    );
+    for at in [
+        kick_due,
+        kick_due + DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+        kick_due + 2 * DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
+    ] {
+        pipeline.dispatch_downloads_at(at);
+    }
+
+    assert_eq!(kicks(&pipeline), 0);
+    assert_eq!(releases(&pipeline), 0);
+    assert!(matches!(
+        pipeline.jobs[&job_id].articles,
+        crate::jobs::model::JobArticles::Activating(..)
+    ));
+}
+
 #[tokio::test]
 async fn an_unexplained_stall_is_kicked_once_at_the_kick_window() {
     let temp_dir = tempfile::tempdir().unwrap();

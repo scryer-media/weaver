@@ -158,13 +158,6 @@ impl Pipeline {
             intermediate_dir.clone(),
             complete_dir.clone(),
         ));
-        let uu_spool_root = intermediate_dir.join(".uu-park");
-        let cleanup_root = uu_spool_root.clone();
-        if let Err(error) =
-            tokio::task::spawn_blocking(move || clear_stale_uu_park_root(&cleanup_root)).await?
-        {
-            warn!(path = %uu_spool_root.display(), error = %error, "failed to clear the stale UU spool");
-        }
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
             profile_tuning.extraction_memory_bytes,
@@ -241,6 +234,7 @@ impl Pipeline {
             metrics,
             jobs: HashMap::new(),
             graph_jobs: HashMap::new(),
+            retiring_graph_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
             graph_runs: Default::default(),
@@ -289,7 +283,6 @@ impl Pipeline {
             intermediate_dir,
             complete_dir,
             nzb_dir: data_dir.join(".weaver-nzbs"),
-            uu_spool_root,
             uu_spool_max_bytes: compute_uu_spool_max_bytes(write_backlog_budget_bytes),
             uu_spool_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
             uu_park_max_segments: compute_uu_spool_max_segments(write_buf_max_pending),
@@ -391,6 +384,9 @@ impl Pipeline {
             extraction_limits,
             process_memory_budget,
             job_article_memory: HashMap::new(),
+            next_activation: 0,
+            parking_jobs: HashSet::new(),
+            spilling_jobs: HashSet::new(),
             repeated_articles: HashMap::new(),
             decode_retries: HashMap::new(),
             phase_progress: HashMap::new(),
@@ -882,6 +878,8 @@ impl Pipeline {
             }
 
             self.consume_due_checkpoint_rechecks();
+            self.park_drained_jobs();
+            self.spill_parked_parts().await;
             // A pass over the eligible jobs follows only something that could
             // change its answer: activity, a wake, live transfers, or a gate
             // that lifts with time. An idle turn would find what the last one

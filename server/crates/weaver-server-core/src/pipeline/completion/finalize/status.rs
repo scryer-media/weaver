@@ -396,6 +396,7 @@ impl Pipeline {
         self.transition_postprocessing_status(job_id, JobStatus::Paused, Some("paused"));
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
+        self.park_job_articles(job_id);
         Ok(())
     }
 

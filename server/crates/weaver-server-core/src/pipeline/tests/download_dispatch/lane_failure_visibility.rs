@@ -262,7 +262,15 @@ async fn work_whose_server_waits_on_its_probe_parks_until_the_probe_answers() {
         standalone_job_spec("Held Server", &many_standalone_files("held", 4)),
     )
     .await;
-    let queued = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
+    let queued = pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len();
     assert!(queued > 0, "the fixture job has queued work");
 
     let probe = pipeline.nntp.pool().take_recovery_probe_for_test(0);
@@ -272,7 +280,15 @@ async fn work_whose_server_waits_on_its_probe_parks_until_the_probe_answers() {
     }
 
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         queued,
         "no pass leases work to a server whose new connections are held"
     );
@@ -285,7 +301,16 @@ async fn work_whose_server_waits_on_its_probe_parks_until_the_probe_answers() {
 
     pipeline.dispatch_downloads();
     assert!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len() < queued,
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len()
+            < queued,
         "the answered server seats the waiting work"
     );
     drop(listener);

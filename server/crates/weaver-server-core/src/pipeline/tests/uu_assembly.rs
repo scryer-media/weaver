@@ -188,6 +188,22 @@ fn mixed_encoding_job_spec(
 // until that sampler's first probe lands the reading is unknown. A spill with
 // no reading is refused and the part requeued, so a test that expects a part
 // to spill must not race the sampler: it seeds the reading it wants instead.
+// How many held parts' spool files the job's working directory holds.
+fn held_spool_files(pipeline: &Pipeline, job_id: JobId) -> usize {
+    let dir = crate::pipeline::held::held_spool_dir(&pipeline.jobs[&job_id].working_dir);
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(crate::pipeline::held::HELD_SPOOL_PREFIX)
+            })
+            .count()
+    })
+}
+
 fn seed_uu_spool_headroom(pipeline: &mut Pipeline) {
     pipeline.uu_spool_available_bytes_for_test =
         Some(Some(pipeline.uu_spool_min_free_bytes + 64 * 1024 * 1024));
@@ -300,7 +316,7 @@ async fn uu_segments_park_until_their_prefix_arrives() {
         pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
         0
     );
-    assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
+    assert_eq!(held_spool_files(&pipeline, job_id), 0);
 }
 
 #[tokio::test]
@@ -375,7 +391,7 @@ async fn uu_spills_reassemble_in_order_once_the_prefix_lands() {
         .get(&payload_file_id)
         .and_then(|uu| uu.parked.get(&1))
     {
-        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("part 1 must spill while the prefix is missing"),
     };
     let second_spool = match pipeline
@@ -383,7 +399,7 @@ async fn uu_spills_reassemble_in_order_once_the_prefix_lands() {
         .get(&payload_file_id)
         .and_then(|uu| uu.parked.get(&2))
     {
-        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("part 2 must spill while the prefix is missing"),
     };
     assert_eq!(std::fs::read(&first_spool).unwrap(), parts[1]);
@@ -439,11 +455,11 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
     let parked = pipeline.uu_files.get(&file_id).expect("UU park");
     assert!(matches!(
         parked.parked.get(&2),
-        Some(UuParkedEntry::Memory(_))
+        Some(ParkedBytes::Memory(_))
     ));
     assert!(matches!(
         parked.parked.get(&1),
-        Some(UuParkedEntry::Spilled { .. })
+        Some(ParkedBytes::Spilled { .. })
     ));
     assert_eq!(pipeline.write_buffered_bytes, parts[2].len());
     assert_eq!(pipeline.uu_spooled_bytes, parts[1].len());
@@ -481,7 +497,7 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
     assert_eq!(pipeline.uu_spooled_bytes, 0);
     assert_eq!(pipeline.uu_spooled_segments, 0);
     assert_eq!(pipeline.uu_parked_segments, 0);
-    assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
+    assert_eq!(held_spool_files(&pipeline, job_id), 0);
     assert_eq!(
         pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
         0
@@ -524,9 +540,10 @@ async fn uu_park_admission_requeues_ahead_parts_at_byte_segment_and_disk_limits(
         assert_eq!(pipeline.uu_spooled_bytes, 0, "{case}");
         assert_eq!(pipeline.uu_spooled_segments, 0, "{case}");
         assert_eq!(pipeline.uu_parked_segments, 0, "{case}");
-        assert!(
-            !pipeline.uu_spool_root.join(job_id.0.to_string()).exists(),
-            "{case} admission cap must not create a spool directory"
+        assert_eq!(
+            held_spool_files(&pipeline, job_id),
+            0,
+            "{case} admission cap must not write a spool file"
         );
     }
 }
@@ -594,7 +611,7 @@ async fn uu_park_refuses_to_spill_when_free_space_is_unknown() {
     );
     assert_eq!(pipeline.uu_spooled_segments, 0);
     assert_eq!(pipeline.uu_parked_segments, 0);
-    assert!(!pipeline.uu_spool_root.join(job_id.0.to_string()).exists());
+    assert_eq!(held_spool_files(&pipeline, job_id), 0);
     assert!(
         !pipeline.uu_spool_admission_capped(0),
         "an unknown reading must not refuse memory parking"
@@ -703,7 +720,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
         .get(&file_id)
         .and_then(|uu| uu.parked.get(&1))
     {
-        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected spilled ordinal 1"),
     };
 
@@ -721,7 +738,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
         .get(&file_id)
         .and_then(|uu| uu.parked.get(&1))
     {
-        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected replacement spool"),
     };
     pipeline.clear_job_write_backlog(job_id);
@@ -733,7 +750,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
     assert_eq!(pipeline.uu_spooled_segments, 0);
 
     // Lower the bound in an independent job. Parking ordinal 1 after ordinal
-    // 2 evicts the farthest entry and removes its TempPath immediately.
+    // 2 evicts the farthest entry and removes its spool file immediately.
     pipeline.uu_park_max_segments = 1;
     let displaced_job_id = JobId(20172);
     insert_active_job(
@@ -752,7 +769,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
         .get(&displaced_file_id)
         .and_then(|uu| uu.parked.get(&2))
     {
-        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected spilled ordinal 2"),
     };
     submit_uu_segment(&mut pipeline, displaced_file_id, 1, &parts[1], false, false).await;
@@ -765,40 +782,18 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
             .uu_files
             .get(&displaced_file_id)
             .and_then(|uu| uu.parked.get(&1)),
-        Some(UuParkedEntry::Spilled { .. })
+        Some(ParkedBytes::Spilled { .. })
     ));
     assert_eq!(pipeline.uu_spooled_bytes, parts[1].len());
     assert_eq!(pipeline.uu_spooled_segments, 1);
     pipeline.clear_job_write_backlog(displaced_job_id);
     assert_eq!(pipeline.uu_spooled_bytes, 0);
     assert_eq!(pipeline.uu_spooled_segments, 0);
-    assert!(
-        !pipeline
-            .uu_spool_root
-            .join(displaced_job_id.0.to_string())
-            .exists()
-    );
+    assert_eq!(held_spool_files(&pipeline, displaced_job_id), 0);
     assert_eq!(
         pipeline.metrics.write_pending_bytes.load(Ordering::Relaxed),
         0
     );
-}
-
-#[test]
-fn uu_spool_startup_cleanup_stays_inside_reserved_root() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let spool_root = temp_dir.path().join("intermediate").join(".uu-park");
-    let stale_job = spool_root.join("20173");
-    std::fs::create_dir_all(&stale_job).unwrap();
-    std::fs::write(stale_job.join("part-stale"), b"stale").unwrap();
-    std::fs::write(spool_root.join("orphan"), b"stale").unwrap();
-    let outside = temp_dir.path().join("outside");
-    std::fs::write(&outside, b"keep").unwrap();
-
-    clear_stale_uu_park_root(&spool_root).unwrap();
-
-    assert_eq!(std::fs::read_dir(&spool_root).unwrap().count(), 0);
-    assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
 }
 
 #[tokio::test]
@@ -826,7 +821,7 @@ async fn uu_missing_spool_file_fails_job_without_leaking_accounting() {
         .get(&file_id)
         .and_then(|uu| uu.parked.get(&1))
     {
-        Some(UuParkedEntry::Spilled { path, .. }) => path.to_path_buf(),
+        Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected a spilled UU part"),
     };
     std::fs::remove_file(&spool_path).unwrap();

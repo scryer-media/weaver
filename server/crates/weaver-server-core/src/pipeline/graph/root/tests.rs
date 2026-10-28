@@ -665,6 +665,7 @@ fn a_job_is_queued_in_posted_order_at_one_neutral_priority() {
         job_id,
         &spec("lantern posted", files),
         &HashSet::new(),
+        &HashSet::new(),
     );
 
     // Nothing is ranked by its role: the recovery volume waits in the
@@ -1201,7 +1202,7 @@ async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
         let working_dir = insert_active_job(&mut pipeline, restored_id, lantern.clone()).await;
         let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
         let pending = checkpoint::Pending::default();
-        assert!(pending.put(&admitted));
+        assert!(pending.put(&admitted, Vec::new()));
         pipeline
             .db
             .save_graph_checkpoint(restored_id, Arc::new(pending.take().unwrap()))

@@ -642,11 +642,13 @@ impl Pipeline {
     // The job's assembly and its download queue. Every article starts at the
     // one neutral priority, in posted order: the job's root is the only
     // ranker, and its classes raise what it wants and park what its objects
-    // defer. The articles in `skip` are already in hand.
+    // defer. The articles in `skip` are already in hand, and those in `held`
+    // arrived and wait to be placed: neither is queued.
     pub(crate) fn build_job_assembly(
         job_id: JobId,
         spec: &JobSpec,
         skip: &HashSet<SegmentId>,
+        held: &HashSet<SegmentId>,
     ) -> (JobAssembly, DownloadQueue) {
         let mut assembly = JobAssembly::new(job_id);
         let mut download_queue = DownloadQueue::new();
@@ -677,7 +679,7 @@ impl Pipeline {
                 };
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
-                } else {
+                } else if !held.contains(&segment_id) {
                     download_queue.push(DownloadWork {
                         counters: None,
                         segment_id,
@@ -964,8 +966,8 @@ impl Pipeline {
                 .iter()
                 .position(|id| *id == job_id)
                 .unwrap_or(self.job_order.len());
+            self.release_job_articles(job_id);
             self.jobs.remove(&job_id);
-            self.graph_jobs.remove(&job_id);
             self.job_order.retain(|id| *id != job_id);
             self.install_restored_job(request).await?;
             self.job_order.retain(|id| *id != job_id);
@@ -1028,17 +1030,24 @@ impl Pipeline {
         // articles are on disk, so the queue skips exactly those. A job with
         // no checkpoint has nothing that says what its files hold: it is
         // admitted afresh from its spec and fetches from the start.
-        let (graph_restore, skip) = match self.restore_graph_job(job_id, &spec, &working_dir).await
-        {
-            Ok(restored) => (Some(restored.job), restored.skip),
-            Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => {
-                (None, HashSet::new())
-            }
-            Err(error) => return Err(crate::SchedulerError::Internal(error.to_string())),
-        };
+        let (graph_restore, skip, held_parts) =
+            match self.restore_graph_job(job_id, &spec, &working_dir).await {
+                Ok(restored) => (Some(restored.job), restored.skip, restored.held),
+                Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => {
+                    (None, HashSet::new(), Vec::new())
+                }
+                Err(error) => return Err(crate::SchedulerError::Internal(error.to_string())),
+            };
+        // The parts that arrived and wait to be placed are in hand too, but
+        // not yet on the job's files.
+        let held: HashSet<SegmentId> = held_parts
+            .iter()
+            .map(crate::pipeline::held::HeldPart::segment_id)
+            .collect();
         // A job that never started waits its turn again holding nothing per
         // article: no checkpoint, and nothing that says it was ever handed
-        // work. Every other job comes back holding its articles, as it ran.
+        // work. Every other job is built as it ran, and a paused one then
+        // lets its articles go, as a pause does.
         let waits_its_turn = graph_restore.is_none()
             && match &status {
                 JobStatus::Queued => true,
@@ -1057,10 +1066,11 @@ impl Pipeline {
                     .segments
                     .iter()
                     .filter(|seg| {
-                        !skip.contains(&SegmentId {
+                        let segment_id = SegmentId {
                             file_id: NzbFileId { job_id, file_index },
                             segment_number: seg.ordinal,
-                        })
+                        };
+                        !skip.contains(&segment_id) && !held.contains(&segment_id)
                     })
                     .count()
             })
@@ -1139,14 +1149,31 @@ impl Pipeline {
             .job_lifecycle
             .category_bytes_counter(spec.category.as_deref());
         let par2_bytes = spec.par2_bytes();
-        // Built below, once the job is in place, unless it waits its turn.
-        let articles = if waits_its_turn {
-            JobArticles::Queued(spec.drop_article_lists())
-        } else {
-            JobArticles::Activating(FileSummaries(
-                spec.files.iter().map(FileSummary::of).collect(),
-            ))
+        // A job that waits its turn holds only its summaries. Any other is
+        // built from the lists its spec holds the moment it is in place
+        // below, by the same call that builds an activated job, so what it
+        // holds until then is never read. Either way the articles the
+        // checkpoint settled are in hand, and the rest are still to fetch.
+        let in_hand = |file_index, ordinal| {
+            let segment_id = SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number: ordinal,
+            };
+            skip.contains(&segment_id) || held.contains(&segment_id)
         };
+        let articles = JobArticles::Queued(if waits_its_turn {
+            spec.drop_article_lists_with_in_hand(in_hand)
+        } else {
+            FileSummaries(
+                spec.files
+                    .iter()
+                    .zip(0u32..)
+                    .map(|(file, file_index)| {
+                        FileSummary::left(file, |ordinal| in_hand(file_index, ordinal))
+                    })
+                    .collect(),
+            )
+        });
         let mut state = JobState {
             job_id,
             job_hash,
@@ -1246,7 +1273,16 @@ impl Pipeline {
         };
         self.jobs.insert(job_id, state);
         if !waits_its_turn {
-            self.activate_job_articles(job_id, &skip, graph_restore, repeated);
+            self.activate_job_articles(job_id, &skip, graph_restore, repeated, held_parts);
+        }
+        // A paused job holds nothing per article, restored as it was paused:
+        // with nothing out, it parks at once.
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.run_state == crate::jobs::model::RunState::Paused)
+        {
+            self.park_job_articles(job_id);
         }
         self.restore_download_finalization_runtime(job_id).await;
         self.note_download_activity(job_id);
@@ -1380,7 +1416,7 @@ mod tests {
         let job_id = JobId(41);
         let spec = sparse_segment_job_spec();
         let (assembly, mut download_queue) =
-            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), &HashSet::new());
 
         let mut queued = Vec::new();
         while let Some(work) = download_queue.pop() {
@@ -1405,13 +1441,14 @@ mod tests {
     fn sparse_article_numbers_do_not_overflow_committed_assembly() {
         let job_id = JobId(42);
         let spec = sparse_segment_job_spec();
-        let (_, mut queue) = Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        let (_, mut queue) =
+            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), &HashSet::new());
         let mut committed = HashSet::new();
         while let Some(work) = queue.pop() {
             committed.insert(work.segment_id);
         }
         let (assembly, mut download_queue) =
-            Pipeline::build_job_assembly(job_id, &spec, &committed);
+            Pipeline::build_job_assembly(job_id, &spec, &committed, &HashSet::new());
 
         assert!(download_queue.pop().is_none());
         assert!(

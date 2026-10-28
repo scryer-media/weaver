@@ -8,25 +8,13 @@ impl Pipeline {
         self.queue_scripts_completed.remove(&job_id);
         self.added_script_holds.remove(&job_id);
         self.release_job_articles(job_id);
-        self.forget_graph_repair(job_id);
+        self.jobs.remove(&job_id);
         self.post_probes.forget(job_id);
-        if let Some(graph) = self.graph_jobs.get(&job_id) {
-            graph.request_stop();
-            if !graph.awaits_mail() {
-                self.graph_jobs.remove(&job_id);
-            }
-        }
         self.pipeline_failure_stages.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
         self.retire_stalled_download_lanes(job_id);
         self.job_order.retain(|id| *id != job_id);
         self.remove_pending_completion_check(job_id);
-        self.pending_retries_by_job.remove(&job_id);
-        self.pending_retries_by_segment
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.transport_failure_streaks
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.cancel_infrastructure_retries_for_job(job_id);
         self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
@@ -45,8 +33,6 @@ impl Pipeline {
         self.clear_job_phase_progress_runtime(job_id);
         self.discard_stage_timers(job_id);
         self.clear_job_retention_excludes(job_id);
-        self.decode_retries
-            .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.rate_limit_reservations
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.update_queue_metrics();

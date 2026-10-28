@@ -914,3 +914,20 @@ kind = "sql"
 file = "migrations/0075_graph_member_crc32/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 76
+description = "a graph checkpoint keeps the parts that arrived and wait to be placed"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_graph_held_parts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_graph_held_parts/postgres.sql"
+engine = "postgres"
+scope = "all"

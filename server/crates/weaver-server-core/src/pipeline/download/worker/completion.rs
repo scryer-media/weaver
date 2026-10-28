@@ -614,11 +614,7 @@ impl Pipeline {
 
     async fn process_download_done_inner(&mut self, result: DownloadResult) {
         let job_id = result.job_id;
-        if self
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| is_terminal_status(&state.status))
-        {
+        if !self.job_takes_results(job_id) {
             debug!(
                 job_id = job_id.0,
                 segment = %result.segment_id,
