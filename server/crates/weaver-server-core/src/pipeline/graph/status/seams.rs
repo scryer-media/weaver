@@ -269,8 +269,8 @@ impl Pipeline {
         self.graph_jobs.get(&job_id).is_some_and(RootJob::unpacked)
     }
 
-    // A job going away gives back the repair slot it holds, a repair still
-    // out among them, and its place in the queue for one.
+    // A job going away gives back an idle repair slot and its place in the
+    // queue. A repair still out keeps its ticket until retirement hears it.
     pub(in crate::pipeline) fn forget_graph_repair(&mut self, job_id: JobId) {
         if let Some(ticket) = self
             .graph_jobs

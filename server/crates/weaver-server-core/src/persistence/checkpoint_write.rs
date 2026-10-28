@@ -5,7 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use crate::jobs::graph_checkpoint::Delta;
 use crate::jobs::ids::JobId;
@@ -69,6 +69,7 @@ impl CheckpointWrite {
         job_id: JobId,
         db: &Database,
         shutdown: watch::Receiver<bool>,
+        permits: &Arc<Semaphore>,
     ) -> Result<bool, String> {
         let delta = self.delta;
         let result = replay(
@@ -77,8 +78,18 @@ impl CheckpointWrite {
             || {
                 let db = db.clone();
                 let delta = delta.clone();
+                let permits = Arc::clone(permits);
+                let control = self.control.clone();
                 async move {
                     let Some(delta) = delta else { return Ok(()) };
+                    // The ordered lane stays owned across retries, while the
+                    // SQL execution slot belongs only to this attempt.
+                    let _permit = permits.acquire_owned().await.map_err(|error| {
+                        StateError::Database(format!("checkpoint execution stopped: {error}"))
+                    })?;
+                    if control.cancelled() {
+                        return Ok(());
+                    }
                     tokio::task::spawn_blocking(move || db.save_graph_checkpoint(job_id, delta))
                         .await
                         .map_err(|error| {

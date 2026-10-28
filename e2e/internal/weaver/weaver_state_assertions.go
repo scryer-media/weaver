@@ -366,6 +366,29 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 		log.Printf("  %s: state mismatch after %s: %v", slug, status, err)
 		return "DB_STATE_ERROR", err.Error()
 	}
+	if err == nil && scenario.ExpectedFailureKind != "" {
+		kindErr := withStateDB(dbPath, func(db *stateConn) error {
+			var kind string
+			if err := db.QueryRow(`SELECT COALESCE(failure_kind, '') FROM job_history WHERE job_id = ?`, jobID).Scan(&kind); err != nil {
+				return err
+			}
+			if !strings.EqualFold(kind, scenario.ExpectedFailureKind) {
+				return fmt.Errorf("job %d failure kind %q, expected %q", jobID, kind, scenario.ExpectedFailureKind)
+			}
+			return nil
+		})
+		if kindErr != nil {
+			return "FAILURE_KIND_ERROR", kindErr.Error()
+		}
+	}
+	if err == nil && scenario.ExpectedRetainedOutputBLAKE3 != nil {
+		if !strings.EqualFold(scenario.expectedHistoryStatus(status), "FAILED") {
+			return "RETAINED_OUTPUT_ERROR", "retained-output contract requires a Failed job, not a usable delivery"
+		}
+		if retainedErr := assertRetainedOutputBLAKE3(dbPath, jobID, scenario.ExpectedRetainedOutputBLAKE3); retainedErr != nil {
+			return "RETAINED_OUTPUT_ERROR", retainedErr.Error()
+		}
+	}
 	if scenario.deliveredOn(status) {
 		if err == nil && len(scenario.RequiredJobEvents) > 0 {
 			if err := assertRequiredJobEvents(dbPath, jobID, scenario.RequiredJobEvents); err != nil {
@@ -389,6 +412,11 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 			if err := assertOutputBLAKE3(dbPath, jobID, scenario.ExpectedOutputBLAKE3); err != nil {
 				log.Printf("  %s: output digest mismatch after %s: %v", slug, status, err)
 				return "OUTPUT_DIGEST_ERROR", err.Error()
+			}
+		}
+		if err == nil && scenario.ExactOutputFiles {
+			if exactErr := assertExactOutputBLAKE3(dbPath, jobID, scenario.ExpectedOutputBLAKE3, false); exactErr != nil {
+				return "OUTPUT_LEFTOVER_ERROR", exactErr.Error()
 			}
 		}
 		if err == nil && len(scenario.ForbiddenOutputPaths) > 0 {

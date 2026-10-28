@@ -254,7 +254,8 @@ impl Leaf {
         let had_file = self.file.take().is_some() || self.path.exists();
         if had_file && path != self.path {
             create_parent(&path)?;
-            std::fs::rename(&self.path, &path).map_err(LeafError::io(&self.path))?;
+            crate::runtime::fs::rename_path_exclusive(&self.path, &path)
+                .map_err(LeafError::io(&self.path))?;
         }
         self.path = path;
         self.wants = None;

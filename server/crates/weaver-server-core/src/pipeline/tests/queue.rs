@@ -293,6 +293,15 @@ async fn retry_waits_for_cancelled_directory_cleanup_before_readmission() {
 
 #[tokio::test]
 async fn an_explicit_redownload_clears_the_committed_feed_verdict() {
+    redownload_clears_the_committed_feed_verdict(false).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_dead_post_redownload_clears_the_committed_feed_verdict() {
+    redownload_clears_the_committed_feed_verdict(true).await;
+}
+
+async fn redownload_clears_the_committed_feed_verdict(cancel: bool) {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
     let handle = handle(&pipeline);
@@ -326,8 +335,17 @@ async fn an_explicit_redownload_clears_the_committed_feed_verdict() {
         Some(verdict)
     );
 
-    pipeline.fail_job(id, "fixture feed refusal".into());
-    settle_failed_releases(&mut pipeline).await;
+    if cancel {
+        handle.cancel_job_keeping_files(id).await.unwrap();
+        pipeline.apply_queue_intents().await;
+        finish_cancel_jobs(&mut pipeline).await;
+        while pipeline.retiring_graph_jobs.contains_key(&id) {
+            hear_graph_mail(&mut pipeline, id).await;
+        }
+    } else {
+        pipeline.fail_job(id, "fixture feed refusal".into());
+        settle_failed_releases(&mut pipeline).await;
+    }
     pipeline.db.flush_write_queue().await.unwrap();
     assert!(pipeline.db.get_job_history(id.0).unwrap().is_some());
     handle.redownload_job(id).await.unwrap();

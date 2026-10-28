@@ -306,6 +306,7 @@ pub(in crate::pipeline) fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
 // Build a waiting job's articles as its first handout would, and wait for
 // them: the read is sent for and its result delivered on the actor's turn.
 pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: JobId) {
+    let retiring = pipeline.retiring_graph_jobs.contains_key(&job_id);
     while pipeline.retiring_graph_jobs.contains_key(&job_id) {
         let said = pipeline
             .graph_runs
@@ -313,6 +314,11 @@ pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: J
             .await
             .expect("the retiring owner acknowledges completion");
         pipeline.graph_run_said(said);
+    }
+    if retiring {
+        // The next actor turn installs an admission that waited for these
+        // ACKs; requesting activation before that turn has no job to activate.
+        pipeline.apply_queue_intents().await;
     }
     pipeline.request_job_activation(job_id);
     let done = pipeline
@@ -762,6 +768,7 @@ pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id
     while pipeline
         .graph_jobs
         .get(&job_id)
+        .or_else(|| pipeline.retiring_graph_jobs.get(&job_id))
         .is_some_and(|job| job.awaits_mail())
     {
         let said = pipeline.graph_runs.recv().await.unwrap();
@@ -1599,7 +1606,7 @@ async fn cancel_one_job(
     }
 }
 
-// Hands the actor the archive outcome of the one cancel batch in flight.
+// Hand the actor the archive outcome, then hear its cancelled workers out.
 async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
     match pipeline
         .terminal_post_processing_done_rx
@@ -1609,6 +1616,15 @@ async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
     {
         TerminalPostProcessingEvent::CancelJobsDone(done) => pipeline.handle_cancel_jobs_done(done),
         _ => panic!("expected the cancel's archive done event"),
+    }
+    while pipeline.pending_graph_terminals.values().any(|terminal| {
+        matches!(
+            terminal,
+            super::health::PendingGraphTerminal::Cancelled { .. }
+        )
+    }) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
     }
 }
 
@@ -1965,7 +1981,7 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
 // Hands the actor every failed job's working-directory release in flight,
 // so each records its history as the orchestrator records it.
 pub(in crate::pipeline) async fn settle_failed_releases(pipeline: &mut Pipeline) {
-    while !pipeline.pending_graph_failures.is_empty() {
+    while !pipeline.pending_graph_terminals.is_empty() {
         let said = pipeline
             .graph_runs
             .recv()

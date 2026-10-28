@@ -1,0 +1,14 @@
+{
+  "slug": "split-gzip-damaged",
+  "title": "E2E.Test.split.gzip.damaged.2026-TESTGRP",
+  "description": "One corrupted byte in a numbered stream must retain the joined compressed bytes and fail without a usable output.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "lantern.bin.gz": "324c16aea5247a4e39e2e6205030d44efe54362ad8afbb7f7d0065e08434d855"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "lantern.bin"
+  ]
+}

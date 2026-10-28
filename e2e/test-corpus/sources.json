@@ -7,15 +7,21 @@
       "toolchains": [
         "ffmpeg-7.1-ubuntu2404",
         "go-andybalholm-brotli@v1.2.3",
+        "go-andybalholm-brotli@v1.2.7",
         "go-archive-tar",
+        "go-archive-tar@go1.27.3",
         "go-archive-zip",
         "go-archive-zip@go1.27.3",
         "go-compress-flate",
+        "go-compress-flate@go1.27.3",
         "go-compress-gzip",
+        "go-compress-gzip@go1.27.3",
         "go-dsnet-bzip2@v0.0.1",
+        "go-dsnet-bzip2@v0.0.1@go1.27.3",
         "go-fixture-bytes",
         "go-fixture-bytes@go1.27.3",
         "go-klauspost-zstd@v1.19.2",
+        "go-klauspost-zstd@v1.20.3",
         "par2cmdline-turbo-1.4.0",
         "par3cmdline-2971702e",
         "rarlab-4.20",
@@ -609,6 +615,19 @@
         ],
         "inputs": [
           "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/bzip2-corrupted/灯火.bin.bz2",
+      "size": 133654,
+      "blake3": "111b59a3d815560af5659070a1bd12829e5d8ddd0e363e5f25cff43d66a31d01",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-dsnet-bzip2@v0.0.1@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
         ]
       }
     },
@@ -3569,6 +3588,30 @@
       }
     },
     {
+      "path": "testdata/feed-verdict-restart/broken.bin",
+      "size": 65536,
+      "blake3": "2b04d7dada1d621f604dd37071ea6a6064617acf0c100c39fd18e18ad9500b78",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/feed-verdict-restart/survivor.bin",
+      "size": 65536,
+      "blake3": "8dee7011d1ca0d3360dd391ba9382aec193a6960f09785955f916732a1d67666",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
       "path": "testdata/gzip-corrupted/test-media.mkv.gz",
       "size": 84066940,
       "blake3": "64ed4b55a7bffeb801200b88ed3f04eaacb9ed891d0d46ad2b64742ef35cdea6",
@@ -3618,6 +3661,662 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.001",
+      "size": 12425,
+      "blake3": "6911d51c41fe0ddbcd0d903c4c8961a29876829433d79c80d5ab75411294a4b7",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.002",
+      "size": 12400,
+      "blake3": "e0c8b484a2891766fe243a157824149035ef8f2f7e1ab59b3b0a8bdf3a06af06",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.003",
+      "size": 12400,
+      "blake3": "4cb3d072e2f41501884d52819f7e59b5227441b63da1bc935137f112273dab82",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.004",
+      "size": 12400,
+      "blake3": "9e11c062270bd3375bc4629584fbbe94aa60682b56b1caa6dd108be8e0506d59",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.005",
+      "size": 12400,
+      "blake3": "aa695bbef1e05e29049d6dde4bf635033da802569ac8a33d06f0e5e394b08277",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.006",
+      "size": 12400,
+      "blake3": "3c21fee22c8cf9311bfb41feb046994a0131845f510c57d45960c76cf1b6f27d",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.007",
+      "size": 12400,
+      "blake3": "ce8db862549fcb060644905ba3d06f9d898e36ed6b71324b1760cbbaf10ae8dd",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.008",
+      "size": 12400,
+      "blake3": "abb62d50390c5e606675801f4e7dc43447a23e5290649d66c6df5bc5b466368c",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.009",
+      "size": 12400,
+      "blake3": "f3f9fa49972b8d23def7134bfec1bf548c5e73e1f10ae3902fb237d9fe61401a",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.010",
+      "size": 12400,
+      "blake3": "938659e378df6943a4daf67f9ffe6c898f4dea37e1efa325b38ebb1ba4397fcf",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.011",
+      "size": 12400,
+      "blake3": "b0dc90a410ff818951fcb903988a909947af37189bd61396450b410f5eee08bd",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.012",
+      "size": 12400,
+      "blake3": "43ce522186bbb955352a5e57eedee158585f83cdbb76f5a4f57339438b28f661",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.013",
+      "size": 12400,
+      "blake3": "62aac7ec59db63d0ad482981f66a9279559a36cbcac516e7643572925ee0cf0f",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.014",
+      "size": 12400,
+      "blake3": "7a6fc1f0842cb201cbff951f0c1675d68ef1893ad16216d4201b3a1264d24881",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/held-plain.bin.015",
+      "size": 6996,
+      "blake3": "069366843d19747728525464e203c44589c5f746cbaeebe1546becc18681dc7f",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-plain-uu/uu/plan.json",
+      "size": 1819,
+      "blake3": "25aede180d1027193207da5e02d42bad00c55706e81dfa764cd655faf80d6108",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.001",
+      "size": 12419,
+      "blake3": "f688546991dbbb03317014b23071e08f3e7f36175f5c1b183a2cd3914cbc452b",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.002",
+      "size": 12400,
+      "blake3": "03d3043655cec41dad310cc89dbe9c520f3634696dc36455d2cf126723948125",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.003",
+      "size": 12400,
+      "blake3": "2eba6e3bfa7a83982c987839f6cae43cb89899ef266c85f277da50653b9d2819",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.004",
+      "size": 12400,
+      "blake3": "eb55da02f7cb8a8e0da4fb73decb8885b8347efce2c4e1c2e3f52d0f57be324c",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.005",
+      "size": 12400,
+      "blake3": "d2d74476c04269c0fa5c88d39273385ad426b34f85584595348322e2784e2b08",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.006",
+      "size": 12400,
+      "blake3": "fb50fe01a1bd4d57eaa45d3a840d8e8324d859c869b8ed3c5216ed20bd57f448",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.007",
+      "size": 12400,
+      "blake3": "8d4829b311b0684b3b26ae3bbe6c7f23d051a016e3559ed87243801cb1c3e3e5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.008",
+      "size": 12400,
+      "blake3": "83b1314d3bc821df14b33031a60abfc92b383d917694260e756740d3938d2d82",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.009",
+      "size": 12400,
+      "blake3": "69b7bd7f586d1180ebb27cc76d155f18f5c039b41edea08036a6be09ff69f3b3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.010",
+      "size": 12400,
+      "blake3": "cd5eb835ec38842b4b38315d237171f8c2af8204f2884121d89435abe222cfd2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.011",
+      "size": 12400,
+      "blake3": "dd633e3a13eb0c119836ffc5c94912fa7d559cd55cc026b3f87ff4c08f279214",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.012",
+      "size": 12400,
+      "blake3": "9343ad6e90b560ae65d337faa8c3d1a590b9350fd9f68464d0b5ef367b070379",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.013",
+      "size": 12400,
+      "blake3": "f6ce619611d8dce28252c65b9123295f5229c115c1adb489a6e4807f2a0716a5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.014",
+      "size": 12400,
+      "blake3": "b8f84a0d54abbbef7d5893b774584b9d32d12ea99af8ed33806a2b2c018f5c2d",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/held.rar.015",
+      "size": 7194,
+      "blake3": "faec564b7c6674bbe43883db1c6935bda75784c64890bcfcbb6fcb74f3ca3257",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-rar-uu/uu/plan.json",
+      "size": 1723,
+      "blake3": "f5f776dff24404c1399ea6900a73a040dd63de6e2fbdf8d2e992a15f09643104",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/plan.json",
+      "size": 2047,
+      "blake3": "91103b8d6b9222602b7241f7376bb482851c118ada2ae41b870e6b956ac5ba17",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.001.001",
+      "size": 12428,
+      "blake3": "f9901876537926c888b5074b1e75245eb40addee51641603cc3a0923298177a0",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.001.002",
+      "size": 12400,
+      "blake3": "d19d6ce8064809216174c0fa8315f1d512eb353f33ad18fa3917e6188dbe89d1",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.001.003",
+      "size": 12400,
+      "blake3": "7d4fa58a367337deffbbad485b81e8f4a6de4d99588a5eef17bcb850d1aec8e0",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.001.004",
+      "size": 12400,
+      "blake3": "27acd096bfc25c2a076c60240a77e0a731b75d9bc0fbc150c0464b4e485e90c6",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.001.005",
+      "size": 10634,
+      "blake3": "149faab9937cf68cac0a6e000b8fd024d2c85c08c7039a9f92f23ce464633577",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.002.001",
+      "size": 12428,
+      "blake3": "0012e50b4ae1843422cd46acf67184351da5780a1b931932eb5735a7a9f9f68f",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.002.002",
+      "size": 12400,
+      "blake3": "e0fb92e97c641f5c63030cc0148448e853209ca32720e89f85914fa01f298186",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.002.003",
+      "size": 12400,
+      "blake3": "f721e008b85ad19d43f6945bb5adbff9ee25a4d14479b3c54af998768ae936cf",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.002.004",
+      "size": 12400,
+      "blake3": "d2847546b2062246e373bdce6e91dc2dfca82ddac29b2f44f0aa90d9bd936af6",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.002.005",
+      "size": 10634,
+      "blake3": "23e3aede81e07ee596c57da94417060b6b3530903ba29fc18fc0d3d4691c0261",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.003.001",
+      "size": 12428,
+      "blake3": "530c4d515b967257561bdcc83eeca5b44a7f21b35b33a2409cc9315a05a3af8a",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.003.002",
+      "size": 12400,
+      "blake3": "57fbad1620f22fc5cbb5f9e50f647df7dd6b66ed652475d76324b60cb5af1035",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.003.003",
+      "size": 12400,
+      "blake3": "cb656cf2fa7566fd3a898f630fceaf5a5ee9db70b6ae3a7bb8b76baf1a2d02c3",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.003.004",
+      "size": 12400,
+      "blake3": "7df36ad8e5bc4973c4713beb7176a127215ce79b7480e95e0c392e142e0f4c49",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
+        ]
+      }
+    },
+    {
+      "path": "testdata/held-stream-uu/uu/灯火.bin.xz.003.005",
+      "size": 10634,
+      "blake3": "f6abb6e1f9124a1f65d64f534b2a4431f652ae510f60aa581c677dc5ad21da5c",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02",
+          "uudeview-0.5.20"
         ]
       }
     },
@@ -4094,6 +4793,48 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-describes-unposted/ember.bin.xz",
+      "size": 131136,
+      "blake3": "993853e8b3990280ee6710f28527df11718dfec2db62cfa1998d9993c5409f23",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-describes-unposted/tinder.par2",
+      "size": 1052,
+      "blake3": "34e29de02be1e817bcfa35484d300c45ea363876d0a494c1648d4984bce065f7",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-describes-unposted/tinder.vol0+2.par2",
+      "size": 10324,
+      "blake3": "835befec547e400927c1f1e63743db3df21944dd3fba67bc23dcf729867654ab",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
         ]
       }
     },
@@ -5512,6 +6253,58 @@
       }
     },
     {
+      "path": "testdata/par2-namespace-restart/00-keep.bin",
+      "size": 8192,
+      "blake3": "5f4c8b6c3f705367c42ceb3627b8685639b79019f9ce938eebb4094a0d9290bf",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-namespace-restart/b.bin",
+      "size": 8192,
+      "blake3": "b321ea74f3bf6de2920ed1b2743edab6139d88f7ef76f08a2cae6976a06c6211",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-namespace-restart/set.par2",
+      "size": 752,
+      "blake3": "6e7f25cf9873dce4a63e3612e3db57b82b6e662e41ba31f74bd5341dd54a38d6",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-namespace-restart/set.vol0+4.par2",
+      "size": 18696,
+      "blake3": "c1ce6c571332e19709ce83f80cf8ddebceef0d58c250798e28b9a068c35daa94",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
       "path": "testdata/par2-obfuscated-rar-rewrite/archive.rar.par2",
       "size": 41052,
       "blake3": "0be5aee9192da6cde86bd3b242599c669b52f687a6f146419f5f69b14a399e1e",
@@ -6666,6 +7459,101 @@
         "inputs": [
           "testdata/single-mkv/test-media.mkv",
           "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-unicode-names/回復.par2",
+      "size": 1072,
+      "blake3": "8abd7bbad483f119f9cae1bd3dae1451b90bc8b4e84c113f219bd753146da163",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-unicode-names/回復.vol0+4.par2",
+      "size": 19656,
+      "blake3": "3e6d464cc719b80cb5290242b3a1ac88484246ff57e5fe48ea9c5902786a4ec9",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-unicode-names/灯火-café-данные.bin",
+      "size": 131072,
+      "blake3": "806c3d1207d534eff3a7784f471dfb35b8e6fd5f0710edd152be18fde3283b65",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-unrelated-set/record.rar",
+      "size": 184292,
+      "blake3": "f04dbed33fe8cd702fa215659d7f17eca53271ac2ed5461d47ec5ecb323feb89",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-unrelated-set/unrelated.bin",
+      "size": 8192,
+      "blake3": "a96a54844a6ac70ad6a2441eb39cb61edb33c96923f402157eb26ee5dca17c82",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-unrelated-set/unrelated.par2",
+      "size": 456,
+      "blake3": "ff2653a55a4f0f64f7f764b4b10a483b2b234879421ef322a30969b3aed63d88",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par2-unrelated-set/unrelated.vol0+2.par2",
+      "size": 9132,
+      "blake3": "47faf25e5f0fd42cf32a41ebb09e1344dc8cd18d5408f1d90117161d960e1a0d",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
         ]
       }
     },
@@ -8805,6 +9693,71 @@
       }
     },
     {
+      "path": "testdata/par3-rename-chain/00-keep.bin",
+      "size": 8192,
+      "blake3": "5f4c8b6c3f705367c42ceb3627b8685639b79019f9ce938eebb4094a0d9290bf",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rename-chain/BEACON.BIN",
+      "size": 16384,
+      "blake3": "ed870755b06e5a635173b51d4f15e392c90dd0dce24a954ab0067d5625106198",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rename-chain/a07d5e19c4b26f83",
+      "size": 8192,
+      "blake3": "a5ff5c388e63367d61522fbfe45fc4d20f1fa2c61579c234727486adc212360d",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rename-chain/set.par3",
+      "size": 765,
+      "blake3": "c571f705798b6d3ac71c0a1a559f2b98c4521d85a982c1bcee1aa26d1f7e2813",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-rename-chain/set.vol0+4.par3",
+      "size": 18801,
+      "blake3": "6b18d1cf718e875f18669c2c2c2d39604246d95b0899bb7e10833335caaa0052",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
       "path": "testdata/par3-sliding-dedup/lumen.tract.s02e08.mkv",
       "size": 4194427,
       "blake3": "a5f6b3bfecd213c4a47e6e7ea67ba25f15b298f63c31318d93b6535a5a2934d0",
@@ -9285,6 +10238,45 @@
       }
     },
     {
+      "path": "testdata/par3-unicode-names/回復.par3",
+      "size": 1290,
+      "blake3": "bd4a35a1c3b72779baa5bffba4bfeafd3ec8186c15ed131a4668130410e8db3c",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-unicode-names/回復.vol0+4.par3",
+      "size": 20376,
+      "blake3": "f73ab4ecf1d775aac85236c165435eaa55e15245c4a3843a8b28dfee9bcf5dc1",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
+      "path": "testdata/par3-unicode-names/灯火-café-данные.bin",
+      "size": 131072,
+      "blake3": "f2efb731acdcc97ff90b4596724b25e860503bc1c9440b6efb3c0a197c125cc0",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par3cmdline-2971702e"
+        ]
+      }
+    },
+    {
       "path": "testdata/par3-withheld-file/birch.quarry.s01.par3",
       "size": 4233,
       "blake3": "ee9ccf2a82a1889ce9d198e1efc26760c1bf8e134abc21b438e62b75bab684cb",
@@ -9515,6 +10507,62 @@
       }
     },
     {
+      "path": "testdata/rar-par2-case-collision/archive.rar",
+      "size": 8330,
+      "blake3": "4d57a6524f1d0494dc5997ef9d6aee3673acf6891b0b3461d520648d75738ec2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar-par2-case-collision/beacon.bin",
+      "size": 12288,
+      "blake3": "10e354094930ee5149532d09bf541e7032157ae41991ed724c7f54ebe2087cfe",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar-par2-case-collision/set.par2",
+      "size": 472,
+      "blake3": "3de80cd059cd63fdd4427882be41ec4f8428fb0a2f05af187bc4517e47f417cd",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar-par2-case-collision/set.vol0+1.par2",
+      "size": 4636,
+      "blake3": "a36c9f5ca3d3f4e71b2986b50aefaac44a7feed4a292d28067ef4aa4fa2b5214",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
       "path": "testdata/rar4-corrupted/archive.rar",
       "size": 85923175,
       "blake3": "686342c794b6692f044b3d53c6dae1b01bc4c7e6117ef9e0f8d6243b1e24e246",
@@ -9709,6 +10757,58 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar4-record-and-volume-repair/record.part1.rar",
+      "size": 65536,
+      "blake3": "31ebb9de3244abedd3e77f2a3ab437867daf3ab189f8f6b297240cbc50ca5722",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar4-record-and-volume-repair/record.part1.rev",
+      "size": 65536,
+      "blake3": "67067aa57ca9e9f86c622a7a79890929a62e41e63881ac80dc92a91e82a8dd6b",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar4-record-and-volume-repair/record.part3.rar",
+      "size": 28608,
+      "blake3": "9d62b6220649a428add4fa825490efcbb0b75b6e7153bbb04c58e58fc9869ba7",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar4-record-repair/record.rar",
+      "size": 158333,
+      "blake3": "42886fe643f97f31eb1f8e01ca072a10430df5d42d6efda00dbe3c678db46f6f",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-6.24"
         ]
       }
     },
@@ -10161,6 +11261,58 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar5-record-and-volume-repair/record.part1.rar",
+      "size": 65536,
+      "blake3": "a9e08f4bb5d266005a33b899c128f125128765a3dc18c50a8749f50955b8f441",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar5-record-and-volume-repair/record.part1.rev",
+      "size": 65599,
+      "blake3": "e6625f0376801aad9a5816f69bc6754ed9a5ff71d07dbe96646032d4b7e500e2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar5-record-and-volume-repair/record.part3.rar",
+      "size": 38178,
+      "blake3": "fae433194724bb2fc5beeebd1119a767bb4fdae2687a874efdf926d49fc3db46",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23"
+        ]
+      }
+    },
+    {
+      "path": "testdata/rar5-record-repair/record.rar",
+      "size": 184292,
+      "blake3": "f1c2db15e3ea3ddf6fac714df0a7d089d31cb48d677939c96455a8d77781b8ad",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "rarlab-7.23"
         ]
       }
     },
@@ -10895,6 +12047,22 @@
       }
     },
     {
+      "path": "testdata/sniff-trailing-names/streams.zip",
+      "size": 13521,
+      "blake3": "5060ab692ad35ee8a022e6a8f64dee20edb6ffd1906331a976557dc13f443c48",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-andybalholm-brotli@v1.2.7",
+          "go-archive-tar@go1.27.3",
+          "go-archive-zip@go1.27.3",
+          "go-compress-flate@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
       "path": "testdata/speed-test-100mb/par-files.par2",
       "size": 41108,
       "blake3": "3e59da2b9a250bd908cafb37c5ea1dfa6609c4668d1e5a65c25aa8f1d058a4cd",
@@ -11252,6 +12420,123 @@
       }
     },
     {
+      "path": "testdata/split-bzip2/灯火.bin.bz2.001",
+      "size": 44552,
+      "blake3": "a41e4a817d389f5e6dc81535054333bab8d3af25d336b2da596a206af21a8176",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-dsnet-bzip2@v0.0.1@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-bzip2/灯火.bin.bz2.002",
+      "size": 44552,
+      "blake3": "8bead96d268c7ce75915879fc0aac30ecfc1ad41f86f298c07d80aec07b68e5b",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-dsnet-bzip2@v0.0.1@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-bzip2/灯火.bin.bz2.003",
+      "size": 44550,
+      "blake3": "6ff3ebd89a168f886842388ac3926797f015c15f420304d10cae2ad7ed8fbef4",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-dsnet-bzip2@v0.0.1@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-gzip-damaged/lantern.bin.gz.001",
+      "size": 43707,
+      "blake3": "90e8bf3f750fb6f89bef18fafc27119273ffe4dd8d6c369a34efca3e66412c74",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-gzip-damaged/lantern.bin.gz.002",
+      "size": 43707,
+      "blake3": "ce81a9a67ad2092ca44f8d49caa411167e992d1e7081cb0168203b08bf73460c",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-gzip-damaged/lantern.bin.gz.003",
+      "size": 43705,
+      "blake3": "191cb69a8830f50d7c8cf71a66235c6de01b767598ced657d6a38ae14582bb20",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-gzip/lantern.bin.gz.001",
+      "size": 43707,
+      "blake3": "90e8bf3f750fb6f89bef18fafc27119273ffe4dd8d6c369a34efca3e66412c74",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-gzip/lantern.bin.gz.002",
+      "size": 43707,
+      "blake3": "75752f0fe43ee4de846c881751a9d70ad9df5c08e9f6db5b51797cc9edeb2b08",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-gzip/lantern.bin.gz.003",
+      "size": 43705,
+      "blake3": "191cb69a8830f50d7c8cf71a66235c6de01b767598ced657d6a38ae14582bb20",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
       "path": "testdata/split-plain-mkv/test-media.mkv.001",
       "size": 262144,
       "blake3": "ec06d83df0e3ce9c3acb8edb401f529d26a53a1f5a1df49d4e9b3465bc1d2269",
@@ -11370,6 +12655,236 @@
       }
     },
     {
+      "path": "testdata/split-xz-damaged-par2/回復.par2",
+      "size": 1552,
+      "blake3": "fefc49dd51991fb2f22e09ac484df1f7ea87e6d490b0e129474d09115d9ad7e5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-damaged-par2/回復.vol00+16.par2",
+      "size": 73952,
+      "blake3": "51431222ca70f5d20fa4d0e3bf2714868a33794257ab74306c71bc2b17284c90",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-damaged-par2/灯火.bin.xz.001",
+      "size": 43712,
+      "blake3": "44a2664b053a8bccf69641d995bf4dfd6a582a1a8344bbb7348d1a3524550c62",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-damaged-par2/灯火.bin.xz.002",
+      "size": 43712,
+      "blake3": "c27a441ab45a6af4eac8d7f40f3aaad72f461b9b4cf215158419df9fd782cede",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-damaged-par2/灯火.bin.xz.003",
+      "size": 43712,
+      "blake3": "c0517ab8c41b9ad71c7b39a99752fc24bde5d72a490e8bda3229784fe815012e",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-damaged/灯火.bin.xz.001",
+      "size": 43712,
+      "blake3": "44a2664b053a8bccf69641d995bf4dfd6a582a1a8344bbb7348d1a3524550c62",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-damaged/灯火.bin.xz.002",
+      "size": 43712,
+      "blake3": "c27a441ab45a6af4eac8d7f40f3aaad72f461b9b4cf215158419df9fd782cede",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-damaged/灯火.bin.xz.003",
+      "size": 43712,
+      "blake3": "c0517ab8c41b9ad71c7b39a99752fc24bde5d72a490e8bda3229784fe815012e",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing-article/灯火.bin.xz.001",
+      "size": 43712,
+      "blake3": "44a2664b053a8bccf69641d995bf4dfd6a582a1a8344bbb7348d1a3524550c62",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing-article/灯火.bin.xz.002",
+      "size": 43712,
+      "blake3": "f12ea4e0ee70e5201d3b2d0cf6a3325c824cb1b46dc3b7112a5aef19383cf928",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing-article/灯火.bin.xz.003",
+      "size": 43712,
+      "blake3": "c0517ab8c41b9ad71c7b39a99752fc24bde5d72a490e8bda3229784fe815012e",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing-par2/回復.par2",
+      "size": 1552,
+      "blake3": "fefc49dd51991fb2f22e09ac484df1f7ea87e6d490b0e129474d09115d9ad7e5",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing-par2/回復.vol00+16.par2",
+      "size": 73952,
+      "blake3": "51431222ca70f5d20fa4d0e3bf2714868a33794257ab74306c71bc2b17284c90",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing-par2/灯火.bin.xz.001",
+      "size": 43712,
+      "blake3": "44a2664b053a8bccf69641d995bf4dfd6a582a1a8344bbb7348d1a3524550c62",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing-par2/灯火.bin.xz.003",
+      "size": 43712,
+      "blake3": "c0517ab8c41b9ad71c7b39a99752fc24bde5d72a490e8bda3229784fe815012e",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing/灯火.bin.xz.001",
+      "size": 43712,
+      "blake3": "44a2664b053a8bccf69641d995bf4dfd6a582a1a8344bbb7348d1a3524550c62",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-xz-missing/灯火.bin.xz.003",
+      "size": 43712,
+      "blake3": "c0517ab8c41b9ad71c7b39a99752fc24bde5d72a490e8bda3229784fe815012e",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
       "path": "testdata/split-xz/test-media.mkv.xz.001",
       "size": 2097152,
       "blake3": "3bdd42a751745ada9604ef7ff3e42da799adfe256f514f6bff1f8dd1c02f9afc",
@@ -11420,6 +12935,45 @@
         ],
         "inputs": [
           "testdata/mixed-archive/sample-preview.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-zstd/灯火.bin.zst.001",
+      "size": 43697,
+      "blake3": "44a891c6e77c4e1d82a9c47649798722cfef51efcb9094b86cbfe61af9e4043a",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "go-klauspost-zstd@v1.20.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-zstd/灯火.bin.zst.002",
+      "size": 43697,
+      "blake3": "f1436c2f0d227ea3c91558cabd9480059722600d7d42213e0e15bda6650261f8",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "go-klauspost-zstd@v1.20.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/split-zstd/灯火.bin.zst.003",
+      "size": 43697,
+      "blake3": "79a2b9908f86ee1e5f42966abccb30bd0853d76e705f78cdd3823f6254ca3f28",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "go-klauspost-zstd@v1.20.3"
         ]
       }
     },
@@ -11532,6 +13086,34 @@
         ],
         "inputs": [
           "testdata/single-mkv/test-media.mkv"
+        ]
+      }
+    },
+    {
+      "path": "testdata/tarxz-corrupted-empty/bundle.tar.xz",
+      "size": 66676,
+      "blake3": "7ba2cb1792c92d71fc96acdb6484fca3e54eea1bcc02efb9084793b2cce7b361",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/tarxz-corrupted-partial/bundle.tar.xz",
+      "size": 66688,
+      "blake3": "bc9daaa299429a2c6d95607836213bac8cebaea1af20531c6d9ea123e0fd0a05",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
         ]
       }
     },
@@ -12096,6 +13678,19 @@
       }
     },
     {
+      "path": "testdata/xz-corrupted/灯火.bin.xz",
+      "size": 131136,
+      "blake3": "8ed047de2748bfa544878b0770dcc8173bf82f94e26154bfab2427a4e98b1c60",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
       "path": "testdata/xz-text/readme.txt.xz",
       "size": 96,
       "blake3": "cf9a7140828ac939c667a8f3d5eae2daac047115f11acb0fa02d8639d9b55b2d",
@@ -12220,6 +13815,19 @@
         "toolchains": [
           "go-archive-zip@go1.27.3",
           "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/zstd-corrupted/灯火.bin.zst",
+      "size": 131091,
+      "blake3": "3814e630ea11ad96a5072317ac7c3a6de24f5da5b2f85b0761930c3b74765370",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "go-klauspost-zstd@v1.20.3"
         ]
       }
     },

@@ -349,7 +349,7 @@ async fn restart_heard(
     );
     assert!(
         pipeline.graph_jobs.contains_key(&JOB)
-            || (pipeline.pending_graph_failures.contains_key(&JOB)
+            || (pipeline.pending_graph_terminals.contains_key(&JOB)
                 && pipeline.retiring_graph_jobs.contains_key(&JOB))
             || matches!(
                 job_status_for_assert(&pipeline, JOB),
@@ -2176,3 +2176,4 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
 }
 
 mod moves;
+mod restore_envelopes;

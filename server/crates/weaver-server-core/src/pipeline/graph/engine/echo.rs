@@ -28,6 +28,37 @@ pub(crate) struct Echoes {
     pub(crate) bids: Arc<Mutex<Vec<Seek>>>,
     // The window each engine declares it holds resident while it runs.
     pub(crate) window: u64,
+    pub(crate) gate: Option<Arc<RunGate>>,
+}
+
+// Hold a real worker across actor-side cancellation without relying on its
+// scheduling speed. The gate opens only when the test has checked ownership.
+#[derive(Default)]
+pub(crate) struct RunGate {
+    started: tokio::sync::Notify,
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+impl RunGate {
+    pub(crate) async fn started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+
+    fn enter(&self) {
+        self.started.notify_one();
+        let released = self.released.lock().unwrap();
+        drop(
+            self.wake
+                .wait_while(released, |released| !*released)
+                .unwrap(),
+        );
+    }
 }
 
 impl Builder for Echoes {
@@ -41,6 +72,7 @@ impl Builder for Echoes {
             volumes: self.volumes,
             bids: Arc::clone(&self.bids),
             window: self.window,
+            gate: self.gate.clone(),
         }))
     }
 
@@ -60,6 +92,7 @@ struct Echo {
     volumes: u32,
     bids: Arc<Mutex<Vec<Seek>>>,
     window: u64,
+    gate: Option<Arc<RunGate>>,
 }
 
 impl Object for Echo {
@@ -112,6 +145,7 @@ impl Engine for Echo {
     fn start(&mut self) -> Box<dyn Extraction> {
         Box::new(EchoRun {
             volumes: self.volumes,
+            gate: self.gate.clone(),
         })
     }
     fn bid(&self, reached: VolumeIndex, out: &mut Vec<Seek>) {
@@ -132,6 +166,7 @@ impl Engine for Echo {
 
 struct EchoRun {
     volumes: u32,
+    gate: Option<Arc<RunGate>>,
 }
 
 impl Extraction for EchoRun {
@@ -141,6 +176,9 @@ impl Extraction for EchoRun {
         sink: &mut Sink<'_>,
         _: weaver_graph::Budget,
     ) {
+        if let Some(gate) = &self.gate {
+            gate.enter();
+        }
         for index in 0..self.volumes {
             let (volume, member) = (VolumeIndex(index), MemberId(index));
             let announced = Emit::Member {

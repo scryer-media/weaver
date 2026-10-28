@@ -8,6 +8,16 @@ pub(crate) struct PendingGraphFailure {
     pub(super) extraction_rejected: bool,
 }
 
+// The one terminal continuation for a graph whose workers still own files.
+// An accepted cancellation replaces a pending failure after its archive commits.
+pub(super) enum PendingGraphTerminal {
+    Failed(PendingGraphFailure),
+    Cancelled {
+        cleanup: super::orchestrator::CancelledJobCleanup,
+        keep_files: bool,
+    },
+}
+
 impl Pipeline {
     pub(crate) fn critical_health_milli(total: u64, par2_bytes: u64) -> u32 {
         if par2_bytes == 0 {
@@ -106,12 +116,12 @@ impl Pipeline {
                 active.download_queue = DownloadQueue::new();
                 active.recovery_queue = DownloadQueue::new();
             }
-            self.pending_graph_failures.insert(
+            self.pending_graph_terminals.insert(
                 job_id,
-                PendingGraphFailure {
+                PendingGraphTerminal::Failed(PendingGraphFailure {
                     error,
                     extraction_rejected,
-                },
+                }),
             );
             return;
         }
@@ -125,7 +135,7 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn job_failure_started(&self, job_id: JobId) -> bool {
-        self.pending_graph_failures.contains_key(&job_id)
+        self.pending_graph_terminals.contains_key(&job_id)
             || self.releasing_failed_jobs.contains(&job_id)
             || (self.inflight_terminal_post_processing.contains(&job_id)
                 && self.pipeline_failure_stages.contains_key(&job_id))

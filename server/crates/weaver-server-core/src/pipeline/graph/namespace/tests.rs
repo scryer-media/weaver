@@ -1018,6 +1018,165 @@ fn a_name_a_discarded_file_sat_at_is_free_once_its_checkpoint_commits() {
     assert!(!job.writer.moves_waiting());
 }
 
+#[test]
+fn a_new_repair_leaf_cannot_outlive_its_uncommitted_name_during_a_move() {
+    let mut job = Job::new(PLENTY);
+    let donor = job.member("b.bin", Some(5));
+    job.send(donor, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, donor, "a.bin")
+        .unwrap();
+    let repair = job.member("b.bin", Some(5));
+    assert_eq!(job.root().get(repair).unwrap().output_name, "b (1).bin");
+    let recorded_repair = job.root().get(repair).unwrap().clone();
+    let donor_file = job.writer.file_state(NodeId::ROOT, donor);
+    let repair_file = job.writer.file_state(NodeId::ROOT, repair);
+    assert!(donor_file.has_file);
+    assert_eq!(donor_file.on_disk.as_deref(), Some("b.bin"));
+    assert!(!repair_file.has_file);
+    job.writer.recorded(1);
+
+    // Repair returns after this checkpoint was captured. Its first file
+    // must stay unpublished until a checkpoint also records its ownership.
+    job.send(repair, 0, b"bravo", Provenance::Repaired);
+    assert!(job.writer.commit_moves(&mut job.tree, 1).unwrap());
+    assert_eq!(job.file("a.bin"), b"alpha");
+    assert!(
+        !job.dir.path().join("b (1).bin").exists(),
+        "a crash must not strand a repair at an uncommitted temporary name"
+    );
+
+    // Restore exactly the captured member and file facts. The newer repair
+    // bytes are not adopted; the recorded donor is found after its move.
+    *job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(repair)
+        .unwrap() = recorded_repair;
+    job.tree.rebuild_names();
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, donor, &donor_file)
+        .unwrap();
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, repair, &repair_file)
+        .unwrap();
+    for (node, member, name) in job.writer.waiting() {
+        job.tree.leaving(node, member, &name);
+    }
+    let mut settled = Vec::new();
+    job.tree.settle_names(&mut settled);
+    job.writer.moved(&mut job.tree, &settled).unwrap();
+    let mut uncommitted = Vec::new();
+    assert!(
+        !job.writer
+            .read_posted(&job.tree, repair, ByteRange::new(0, 5), &mut uncommitted)
+    );
+    job.send(repair, 0, b"bravo", Provenance::Repaired);
+    job.commit();
+    assert_eq!(job.file("a.bin"), b"alpha");
+    assert_eq!(job.file("b.bin"), b"bravo");
+    assert!(!job.dir.path().join("b (1).bin").exists());
+}
+
+#[test]
+fn a_new_repair_leaf_waits_while_only_a_vacated_name_is_uncommitted() {
+    let mut job = Job::new(PLENTY);
+    let donor = job.member("b.bin", Some(5));
+    job.send(donor, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, donor, "a.bin")
+        .unwrap();
+    job.writer.recorded(1);
+    assert!(job.writer.commit_moves(&mut job.tree, 1).unwrap());
+    assert!(job.writer.moves.is_empty());
+    assert!(!job.writer.left.is_empty());
+
+    let repair = job.member("b.bin", Some(5));
+    assert_eq!(job.root().get(repair).unwrap().output_name, "b (1).bin");
+    job.send(repair, 0, b"bravo", Provenance::Repaired);
+    assert!(!job.dir.path().join("b (1).bin").exists());
+    let pending = job.writer.file_state(NodeId::ROOT, repair);
+    assert!(pending.has_file);
+    let pending_name = format!(
+        "{}/graph-waiting-0-{}",
+        weaver_graph::names::INTERNAL_DIR,
+        repair.0
+    );
+    assert_eq!(pending.on_disk.as_deref(), Some(pending_name.as_str()));
+    job.commit();
+    assert_eq!(job.file("a.bin"), b"alpha");
+    assert_eq!(job.file("b.bin"), b"bravo");
+    assert!(!job.dir.path().join("b (1).bin").exists());
+}
+
+#[test]
+fn a_committed_leaf_move_rejects_an_unowned_destination() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("source.bin", Some(5));
+    job.send(member, 0, b"owned", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(
+            &mut job.tree,
+            &mut build,
+            NodeId::ROOT,
+            member,
+            "target.bin",
+        )
+        .expect("rename intent");
+    job.writer.recorded(2);
+    std::fs::write(job.dir.path().join("target.bin"), b"unrelated").unwrap();
+    assert!(!job.writer.commit_moves(&mut job.tree, 1).unwrap());
+    let error = job.writer.commit_moves(&mut job.tree, 2).unwrap_err();
+    assert!(
+        matches!(error, WriteError::Leaf(LeafError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists)
+    );
+    assert_eq!(job.file("source.bin"), b"owned");
+    assert_eq!(job.file("target.bin"), b"unrelated");
+    assert_eq!(
+        job.writer.waiting(),
+        vec![(NodeId::ROOT, member, "source.bin".into())]
+    );
+    assert_eq!(job.root().get(member).unwrap().output_name, "target.bin");
+    // Removing the obstruction is an explicit storage repair. The failed
+    // move kept the same recorded source and intent for a later retry.
+    std::fs::remove_file(job.dir.path().join("target.bin")).unwrap();
+    assert!(job.writer.commit_moves(&mut job.tree, 2).unwrap());
+    assert_eq!(job.file("target.bin"), b"owned");
+}
+
+#[test]
+fn an_exclusive_leaf_move_preserves_case_only_renaming() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("BEACON.BIN"), b"owned").unwrap();
+    let mut leaf = Leaf::at(directory.path(), "BEACON.BIN");
+    // The name ledger intentionally keeps an already-equivalent spelling.
+    // Exercise the filesystem operation with an actual leaf move intent.
+    leaf.intend("beacon.bin");
+    assert_eq!(
+        leaf.move_on(directory.path()).unwrap(),
+        Some("BEACON.BIN".into())
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("beacon.bin")).unwrap(),
+        b"owned"
+    );
+    let names: Vec<_> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(names.iter().any(|name| name == "beacon.bin"));
+    assert!(!names.iter().any(|name| name == "BEACON.BIN"));
+}
+
 // One file wants the name another still sits at, and the checkpoint that
 // says the other leaves it comes later: the earlier commit moves nothing
 // onto the name, the later one moves the other file off it, and the first

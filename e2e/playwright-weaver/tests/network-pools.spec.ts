@@ -252,15 +252,28 @@ test("P11 changing a pool's members prewarms the newcomer and drops the leaver",
 
 test("P12 a slower handshake on the pin raises its connect time while delivery holds", async ({ request }) => {
   test.setTimeout(0);
-  const { view, connect1 } = await latencyPool(request);
+  const connections = 4;
+  const { view, connect1 } = await latencyPool(request, { connections });
   const download = await world.pacedDownload("p12-slow-handshake");
-  const before = await pinned(request, view, connect1.id, "connect1 pinned");
+  const before = await flowAfter(request, await flowMark(request), flow => {
+    const pool = view(flow);
+    const current = member(pool, connect1.id);
+    return pool?.pinnedMember === connect1.id && current?.open === connections && current.opening === 0;
+  }, "connect1 pinned after every initial dial has settled");
   const baseline = member(view(before), connect1.id)!.connectMs!;
   await addLatency(request, "connect1", 500);
+  const reconnectMark = await fixtureMark(request);
+  const flowStart = await flowMark(request);
   // Re-dial after the latency change instead of waiting for a random drop
   // after an arbitrarily long BODY. Keep the route available to reconnect.
   await controlRoute(request, { route: "connect1", cut: true });
-  const slower = await flowAfter(request, before.sampledAt, flow => (member(view(flow), connect1.id)?.connectMs ?? 0) > baseline, "connect1 connect time rose");
+  await waitFixtureEvents(request, reconnectMark,
+    events => events.filter(event => event.kind === "attempt" && event.route === "connect1").length >= connections,
+    "every cut connection has a replacement dial");
+  const slower = await flowAfter(request, flowStart, flow => {
+    const current = member(view(flow), connect1.id);
+    return current?.open === connections && current.opening === 0 && (current.connectMs ?? 0) > baseline;
+  }, "replacement dials settled with a higher connect time");
   // Until a race runs (P03, P04) the pin holds and delivery continues.
   expect(view(slower)!.pinnedMember).toBe(connect1.id);
   expect(await download.release()).toBe("COMPLETED");

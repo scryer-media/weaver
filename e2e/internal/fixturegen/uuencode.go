@@ -166,17 +166,23 @@ func encodeUUFile(
 	if err != nil {
 		return UUPlanFileEntry{}, err
 	}
+	// The encoder replaces the input extension with .001, .002, ... . A
+	// numbered source would otherwise overwrite itself before being read.
+	encoded := filepath.Join(work, "encoded")
+	if err := os.MkdirAll(encoded, 0o755); err != nil {
+		return UUPlanFileEntry{}, err
+	}
 
 	arguments := []string{"uuenview", "-u"}
 	if spec.LinesPerPart > 0 {
 		arguments = append(arguments, "-"+strconv.Itoa(spec.LinesPerPart))
 	}
-	arguments = append(arguments, "-od", ".", spec.Name)
+	arguments = append(arguments, "-od", "encoded", spec.Name)
 	if err := env.Docker.Run(ctx, toolchain, env.Work, relative, arguments...); err != nil {
 		return UUPlanFileEntry{}, err
 	}
 
-	produced, err := uuEncoderParts(work, spec.Name)
+	produced, err := uuEncoderParts(encoded, "")
 	if err != nil {
 		return UUPlanFileEntry{}, err
 	}

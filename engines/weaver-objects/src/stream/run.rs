@@ -19,7 +19,7 @@ use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
 
 use super::{Decoder, Front};
 
-const MEMBER: MemberId = MemberId(0);
+pub(super) const MEMBER: MemberId = MemberId(0);
 
 // How much decoded output is handed on at once.
 pub(super) const CHUNK: usize = 64 << 10;

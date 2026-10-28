@@ -37,9 +37,10 @@ impl GraphJob {
         walked
     }
 
-    // The repair slot the job holds, for a job going away.
+    // A retiring job releases an idle slot. An outstanding repair keeps
+    // its loan and ticket until its matching completion acknowledgment.
     pub(crate) fn forget_slot(&mut self) -> Option<Ticket> {
-        self.loans.forget()
+        self.loans.give_back()
     }
 
     // Walk the namespaces in node order, which puts every parent before its

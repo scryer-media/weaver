@@ -1,0 +1,19 @@
+{
+  "slug": "par2-describes-unposted",
+  "title": "E2E.Test.PAR2.Describes.Unposted.2026-TESTGRP",
+  "description": "PAR2 describes only unposted tinder.bin and cannot reconstruct it. An unrelated XZ preserves its magic but has an invalid stream-header checksum, so recognition succeeds and decoding fails before producing usable bytes. The result must be Failed with a Repair reason, retaining only the exact posted files and ownership marker.",
+  "category": "2000",
+  "expected_outcome": "repair_failure",
+  "expectedFailureKind": "repair",
+  "expectedErrorContains": "PAR2 recovery failed",
+  "expectedRetainedOutputBLAKE3": {
+    "ember.bin.xz": "993853e8b3990280ee6710f28527df11718dfec2db62cfa1998d9993c5409f23",
+    "tinder.par2": "34e29de02be1e817bcfa35484d300c45ea363876d0a494c1648d4984bce065f7",
+    "tinder.vol0+2.par2": "835befec547e400927c1f1e63743db3df21944dd3fba67bc23dcf729867654ab"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "ember.bin",
+    "tinder.bin"
+  ]
+}

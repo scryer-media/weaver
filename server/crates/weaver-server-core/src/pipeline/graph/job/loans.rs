@@ -82,12 +82,6 @@ impl Loans {
         self.ticket.take()
     }
 
-    // The slot, whatever holds it: the job is going away.
-    pub(crate) fn forget(&mut self) -> Option<Ticket> {
-        self.out = None;
-        self.ticket.take()
-    }
-
     // A lender over these loans that asks `slots` for a slot when it holds
     // none, or, without slots, lends only under the one it holds.
     pub(crate) fn lending<'a>(
@@ -109,6 +103,11 @@ impl Lender for Lending<'_> {
     fn admit(&mut self) -> bool {
         let loans = &mut *self.loans;
         if loans.out.is_some() || loans.hardware.shutdown().started() {
+            return false;
+        }
+        // A retained ticket still belongs to the retiring or paused job,
+        // but a zero-slot grant may not start another repair under it.
+        if self.slots.as_ref().is_some_and(|(_, limit)| *limit == 0) {
             return false;
         }
         if loans.ticket.is_some() {

@@ -65,6 +65,7 @@
   },
   "par3_generator": {
     "id": "par3cmdline-2971702e",
+    "utf8_locale": true,
     "image": "weaver-e2e-par3cmdline:2971702e",
     "platform": "linux/amd64",
     "url": "https://github.com/Parchive/par3cmdline/archive/2971702e501f1350b1c7b9d11369af9157d6ed56.tar.gz",

@@ -534,6 +534,42 @@ async fn a_checkpoint_error_queued_before_resume_cannot_pause_the_resumed_job() 
 }
 
 #[tokio::test]
+async fn a_closed_checkpoint_writer_pauses_with_an_actionable_error() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_105);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+    // Generic writes receive the writer's detached handle: SQL is available,
+    // but its command queue is closed. Exercise that actual queue refusal.
+    let (sent, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .db
+        .try_queue_write("capture_detached_writer", move |db| {
+            assert!(sent.send(db.clone()).is_ok());
+            Ok(())
+        })
+        .unwrap();
+    let db = std::mem::replace(&mut pipeline.db, received.await.unwrap());
+    pipeline.recover_cancelled_graph_checkpoint(job_id);
+    while pipeline.jobs[&job_id].status != JobStatus::Paused {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(
+        pipeline.jobs[&job_id]
+            .failure_error
+            .as_deref()
+            .unwrap()
+            .contains("Checkpoint could not be persisted")
+    );
+    assert!(working_dir.exists());
+    pipeline.db = db;
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
 async fn terminal_graph_runtime_is_retained_until_its_worker_stops() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_101);
@@ -550,6 +586,128 @@ async fn terminal_graph_runtime_is_retained_until_its_worker_stops() {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
     }
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn nonterminal_retirement_keeps_a_repair_only_worker_without_applying_its_output() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_109);
+    let data = payload(4 * ARTICLE, 5);
+    let mut posts = vec![Post::plain("lantern.bin", data)];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &posts[0].bytes)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    for ordinal in [0, 2, 3] {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    pipeline.book_terminal_segment(segment_id(job_id, 0, 1), SegmentTerminalState::Missing);
+    hear_repair(&mut pipeline, job_id).await;
+    let volume_articles = posts[2].articles(ARTICLE).count() as u32;
+    for ordinal in 1..volume_articles {
+        decode(&mut pipeline, job_id, &posts, 2, ordinal, true).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let before = read(&working_dir.join("lantern.bin"));
+    pipeline.retire_graph_job(job_id);
+    assert!(pipeline.retiring_graph_jobs[&job_id].repair_out());
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert_eq!(read(&working_dir.join("lantern.bin")), before);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn failure_keeps_a_repair_only_worker_and_its_slot_until_acknowledged() {
+    repair_only_retirement(false).await;
+}
+
+#[tokio::test]
+async fn cancellation_keeps_a_repair_only_worker_and_its_slot_until_acknowledged() {
+    repair_only_retirement(true).await;
+}
+
+async fn repair_only_retirement(cancel: bool) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_107);
+    let data = payload(3 * ARTICLE, 6);
+    let mut posts = vec![Post::plain("8d1f0c2a9b7e4f6013a5c7e9", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let waiter_job = JobId(job_id.0 + 1);
+    insert_active_job(
+        &mut pipeline,
+        waiter_job,
+        spec(
+            "waiting repair",
+            &[Post::plain("waiting.bin", payload(ARTICLE, 9))],
+            ARTICLE,
+        ),
+    )
+    .await;
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    assert!(!pipeline.graph_jobs[&job_id].runs().in_flight());
+    let waiter = weaver_graph::slots::AskerId(waiter_job.0);
+    assert!(pipeline.graph_status.repairs.admit(waiter, 1).is_none());
+    let mut events = pipeline.event_tx.subscribe();
+    if cancel {
+        pipeline.report_all_for_test();
+        let handle =
+            crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+        handle.cancel_job_keeping_files(job_id).await.unwrap();
+        pipeline.apply_queue_intents().await;
+        match pipeline
+            .terminal_post_processing_done_rx
+            .recv()
+            .await
+            .unwrap()
+        {
+            crate::pipeline::TerminalPostProcessingEvent::CancelJobsDone(done) => {
+                pipeline.handle_cancel_jobs_done(done);
+            }
+            _ => panic!("expected cancellation archive reply"),
+        }
+    } else {
+        pipeline.fail_job(job_id, "namespace move collision".into());
+    }
+    assert!(
+        pipeline.retiring_graph_jobs.contains_key(&job_id),
+        "a repair reply remains owned even when no decoder run is active"
+    );
+    assert!(pipeline.retiring_graph_jobs[&job_id].repair_out());
+    assert!(pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(!pipeline.graph_status.repairs.handed(waiter));
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(working_dir.exists());
+    pipeline.remove_pending_completion_check(waiter_job);
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(pipeline.graph_status.repairs.handed(waiter));
+    assert!(pipeline.pending_completion_checks.contains(&waiter_job));
+    pipeline.graph_status.repairs.forget(waiter);
+    if cancel {
+        assert!(!pipeline.jobs.contains_key(&job_id));
+    } else {
+        crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
+    }
+    pipeline.db.flush_write_queue().await.unwrap();
+    let terminals = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| {
+            matches!(event,
+            PipelineEvent::JobCancelled { job_id: id }
+            | PipelineEvent::JobFailed { job_id: id, .. } if *id == job_id)
+        })
+        .count();
+    assert_eq!(terminals, 1);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -579,7 +737,7 @@ async fn repeated_failure_keeps_worker_ownership_and_releases_once() {
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
-    assert!(pipeline.pending_graph_failures.contains_key(&job_id));
+    assert!(pipeline.pending_graph_terminals.contains_key(&job_id));
     assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
     assert!(working_dir.exists());
     assert_eq!(
@@ -600,7 +758,7 @@ async fn repeated_failure_keeps_worker_ownership_and_releases_once() {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
     }
-    assert!(!pipeline.pending_graph_failures.contains_key(&job_id));
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
     assert!(pipeline.releasing_failed_jobs.contains(&job_id));
     pipeline.fail_job(job_id, "cleanup raced".into());
     crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
@@ -617,6 +775,178 @@ async fn repeated_failure_keeps_worker_ownership_and_releases_once() {
         !working_dir.join("echo-0.bin").exists(),
         "late worker output must not be published"
     );
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn cancellation_keeps_worker_files_and_blocks_same_id_retry_until_ack() {
+    cancel_held_failure(false).await;
+}
+
+#[tokio::test]
+async fn shutdown_hears_cancelled_graph_workers_before_finishing_cancellation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_106);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let gate = std::sync::Arc::new(super::engine::echo::RunGate::default());
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(Echoes {
+            volumes: 1,
+            gate: Some(gate.clone()),
+            ..Default::default()
+        }));
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    gate.started().await;
+    pipeline.report_all_for_test();
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+    handle.cancel_job_keeping_files(job_id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    match pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    {
+        crate::pipeline::TerminalPostProcessingEvent::CancelJobsDone(done) => {
+            pipeline.handle_cancel_jobs_done(done)
+        }
+        _ => panic!("expected cancellation archive reply"),
+    }
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+    assert!(pipeline.jobs.contains_key(&job_id));
+    assert!(working_dir.exists());
+    handle.shutdown().await.unwrap();
+    gate.release();
+    // The production shutdown branch must receive the final graph ACK, not
+    // wait exclusively for an archive reply that it has already processed.
+    pipeline.run().await;
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.retiring_graph_jobs.contains_key(&job_id));
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    let mut cancelled = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, PipelineEvent::JobCancelled { job_id: id } if id == job_id) {
+            cancelled += 1;
+        }
+    }
+    assert_eq!(cancelled, 1);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn cancellation_wins_failure_when_worker_ack_precedes_archive_reply() {
+    cancel_held_failure(true).await;
+}
+
+async fn cancel_held_failure(ack_before_archive: bool) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_104);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let gate = std::sync::Arc::new(super::engine::echo::RunGate::default());
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(Echoes {
+            volumes: 1,
+            gate: Some(gate.clone()),
+            ..Default::default()
+        }));
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    gate.started().await;
+    pipeline.fail_job(job_id, "failure before operator cancellation".into());
+    pipeline.report_all_for_test();
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+    handle.cancel_job(job_id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    if ack_before_archive {
+        gate.release();
+        while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+            hear_graph_mail(&mut pipeline, job_id).await;
+        }
+        assert!(pipeline.pending_graph_terminals.contains_key(&job_id));
+        assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    }
+    match pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    {
+        crate::pipeline::TerminalPostProcessingEvent::CancelJobsDone(done) => {
+            pipeline.handle_cancel_jobs_done(done);
+        }
+        _ => panic!("expected cancellation archive reply"),
+    }
+    if !ack_before_archive {
+        assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+        assert!(pipeline.jobs.contains_key(&job_id));
+        assert!(working_dir.exists());
+        assert!(
+            !pipeline
+                .shared_state
+                .queue
+                .read(|inner| inner.pending_cleanup.contains(&job_id))
+        );
+        assert!(matches!(
+            handle.redownload_job(job_id).await,
+            Err(crate::SchedulerError::Conflict(_))
+        ));
+        pipeline.apply_queue_intents().await;
+        assert!(pipeline.jobs.contains_key(&job_id));
+        assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+        gate.release();
+        while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+            hear_graph_mail(&mut pipeline, job_id).await;
+        }
+    }
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    let mut cancelled = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, PipelineEvent::JobCancelled { job_id: id } if id == job_id) {
+            cancelled += 1;
+        }
+        assert!(!matches!(event, PipelineEvent::JobFailed { job_id: id, .. } if id == job_id));
+    }
+    assert_eq!(cancelled, 1);
+    assert_eq!(
+        pipeline
+            .db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    handle.redownload_job(job_id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+    assert!(pipeline.jobs[&job_id].working_dir.exists());
+    assert!(pipeline.failed_release_rx.try_recv().is_err());
     retire_pipeline_database(pipeline).await;
 }
 

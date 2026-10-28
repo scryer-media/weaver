@@ -2,9 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Which member each described file is. Within one set a member is the file
-// its first 16 KiB and its length say it is; only while its front cannot
-// tell is it the file its name says, since a posted name can lie, swapped
-// with another file's, where the bytes cannot. A name that answers to two
+// its first 16 KiB and its length say it is. An exact described name can
+// distinguish matching fronts; otherwise a content tie stays unbound.
+// With no content match, its name may identify it. A name that answers to two
 // descriptions binds nothing, unless the member's length rules out all but
 // one, and two members that answer to one description both go unbound. A
 // member that answers in two sets is the first set's: the others count it
@@ -136,7 +136,15 @@ pub(super) fn bind_sets(
 fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId> {
     match by_content(index, candidate) {
         ContentMatch::Unique(file) => return Some(file),
-        ContentMatch::Ambiguous => return None,
+        ContentMatch::Ambiguous(files) => {
+            let mut named = files.into_iter().filter(|file| {
+                index
+                    .file_description(file)
+                    .is_some_and(|description| description.filename == candidate.name)
+            });
+            let file = named.next();
+            return file.filter(|_| named.next().is_none());
+        }
         ContentMatch::Inconclusive => {}
     }
     let mut matches = described(index, |description| description.filename == candidate.name);
@@ -178,7 +186,7 @@ fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId
 enum ContentMatch {
     Unique(FileId),
     Inconclusive,
-    Ambiguous,
+    Ambiguous(Vec<FileId>),
 }
 
 fn by_content(index: &Par2FileSet, candidate: &Candidate<'_>) -> ContentMatch {
@@ -190,7 +198,7 @@ fn by_content(index: &Par2FileSet, candidate: &Candidate<'_>) -> ContentMatch {
     match matches.as_slice() {
         [(file, _)] => ContentMatch::Unique(*file),
         [] => ContentMatch::Inconclusive,
-        _ => ContentMatch::Ambiguous,
+        _ => ContentMatch::Ambiguous(matches.into_iter().map(|(file, _)| file).collect()),
     }
 }
 

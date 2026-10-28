@@ -19,7 +19,7 @@ use weaver_graph::{ByteRange, Segment, VolumeIndex};
 use super::intake::Decoded;
 use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
-use crate::jobs::model::JobState;
+use crate::jobs::model::{JobState, JobStatus};
 use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
@@ -303,7 +303,9 @@ impl Pipeline {
             return;
         }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
-            if self.pending_graph_failures.contains_key(&job_id) {
+            if self.pending_graph_terminals.contains_key(&job_id)
+                || matches!(&said.heard, Heard::Repaired(_))
+            {
                 if let Err(error) = graph.drain_failed_run(said) {
                     warn!(job_id = job_id.0, %error, "failed to discard a stopped graph worker's output");
                 }
@@ -311,15 +313,51 @@ impl Pipeline {
                 let _ = graph.run_said(said, &mut self.graph_status.repairs, 0);
             }
             if !graph.awaits_mail() {
-                let graph = self.retiring_graph_jobs.remove(&job_id);
-                if let Some(failure) = self.pending_graph_failures.remove(&job_id) {
-                    if let Some(graph) = graph {
-                        self.graph_jobs.insert(job_id, graph);
+                let mut graph = self.retiring_graph_jobs.remove(&job_id);
+                if let Some(ticket) = graph.as_mut().and_then(GraphJob::forget_slot) {
+                    self.graph_status.repairs.release(ticket);
+                }
+                match self.pending_graph_terminals.remove(&job_id) {
+                    Some(crate::pipeline::health::PendingGraphTerminal::Failed(failure)) => {
+                        let cancelling = self.shared_state.queue.read(|inner| {
+                            inner
+                                .jobs
+                                .iter()
+                                .any(|row| row.id == job_id && row.intents.cancelled.is_some())
+                        });
+                        // Retirement blocks readmission; never apply an old
+                        // failure to a job that no longer has its failed state.
+                        if self.jobs.get(&job_id).is_some_and(|state| {
+                            matches!(&state.status, JobStatus::Failed { error } if error == &failure.error)
+                        }) {
+                            if let Some(graph) = graph {
+                                self.graph_jobs.insert(job_id, graph);
+                            }
+                            if cancelling {
+                                // The archive reply decides whether cancellation
+                                // wins. Worker completion must not race it into
+                                // failure cleanup or a second history write.
+                                self.pending_graph_terminals.insert(
+                                    job_id,
+                                    crate::pipeline::health::PendingGraphTerminal::Failed(failure),
+                                );
+                            } else {
+                                self.continue_job_failure(job_id, failure);
+                            }
+                        }
                     }
-                    self.continue_job_failure(job_id, failure);
+                    Some(crate::pipeline::health::PendingGraphTerminal::Cancelled {
+                        cleanup,
+                        keep_files,
+                    }) => {
+                        drop(graph);
+                        self.finish_cancelled_job(cleanup, keep_files);
+                    }
+                    None => {}
                 }
                 self.download_dispatch_wake = true;
             }
+            self.wake_repair_waiters();
             return;
         }
         let limit = self.graph_job_slot_limit(job_id);

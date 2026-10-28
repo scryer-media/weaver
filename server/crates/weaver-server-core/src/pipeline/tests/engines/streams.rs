@@ -189,6 +189,72 @@ async fn a_numbered_stream_missing_a_piece_without_recovery_fails() {
     assert!(graph.graph().delivery.files.iter().all(|file| !file.whole));
 }
 
+#[tokio::test]
+async fn a_numbered_stream_with_an_unposted_middle_piece_retains_the_original_pieces() {
+    let mut scenario = unicode_numbered_stream(false);
+    scenario.posts.remove(1);
+    assert_unposted_middle_preserves_pieces(scenario).await;
+}
+
+#[tokio::test]
+async fn an_unposted_middle_piece_cannot_publish_an_accidentally_valid_decoded_join() {
+    let compressed = xz(&ember());
+    let (first, last) = compressed.split_at(compressed.len() / 2);
+    // Concatenating these inputs happens to make a valid complete XZ. The
+    // ordinal gap still has no known length and cannot be silently erased.
+    let scenario = Scenario::new(vec![
+        Post::plain("灯火.bin.xz.001", first.to_vec()),
+        Post::plain("灯火.bin.xz.003", last.to_vec()),
+    ]);
+    assert_unposted_middle_preserves_pieces(scenario).await;
+}
+
+#[tokio::test]
+async fn a_numbered_stream_with_an_unposted_middle_piece_recovers_with_par2() {
+    let mut scenario = unicode_numbered_stream(true);
+    scenario.posts.remove(1);
+    let graph = run(&scenario).await;
+    assert_delivered(&graph, &[("灯火.bin", ember())]);
+}
+
+async fn assert_unposted_middle_preserves_pieces(scenario: Scenario) {
+    let originals: std::collections::BTreeMap<_, _> = scenario
+        .posts
+        .iter()
+        .map(|post| (post.name.clone(), post.bytes.clone()))
+        .collect();
+    let graph = run(&scenario).await;
+    assert!(matches!(graph.status, Some(JobStatus::Failed { .. })));
+    let listed: Vec<_> = graph
+        .graph()
+        .delivery
+        .files
+        .iter()
+        .map(|file| (file.name.as_str(), file.depth, file.whole))
+        .collect();
+    assert_eq!(
+        listed,
+        [("灯火.bin.xz.001", 0, false), ("灯火.bin.xz.003", 0, false)]
+    );
+    for (name, bytes) in originals {
+        let retained = graph
+            .retained_files
+            .iter()
+            .find(|(path, _)| std::path::Path::new(path).file_name().unwrap() == name.as_str())
+            .map(|(_, bytes)| bytes);
+        assert_eq!(retained, Some(&bytes), "original piece {name} was changed");
+    }
+    assert_eq!(
+        graph
+            .retained_files
+            .keys()
+            .filter(|path| { std::path::Path::new(path).file_name().unwrap() != ".weaver-job-dir" })
+            .count(),
+        2
+    );
+    assert!(graph.files.is_empty(), "a decoded descendant was published");
+}
+
 // A damaged stream gives back the join's one member, preserving the posted
 // compressed bytes. Nothing usable came out, so the job fails.
 #[tokio::test]

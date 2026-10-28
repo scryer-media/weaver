@@ -400,7 +400,7 @@ impl Pipeline {
             body_fetch_failure_log_throttle: Default::default(),
             inflight_moves: HashSet::new(),
             releasing_failed_jobs: HashSet::new(),
-            pending_graph_failures: HashMap::new(),
+            pending_graph_terminals: HashMap::new(),
             deferred_moves: HashSet::new(),
             reserved_complete_destinations: HashMap::new(),
             shared_state,
@@ -858,6 +858,7 @@ impl Pipeline {
                         Some(event) = self.terminal_post_processing_done_rx.recv() => {
                             self.handle_terminal_post_processing_event(event).await;
                         }
+                        Some(said) = self.graph_runs.recv() => self.graph_run_said(said),
                     }
                 }
                 self.apply_queue_intents().await;
@@ -869,10 +870,12 @@ impl Pipeline {
                         .iter()
                         .any(|row| row.intents.cancelled.is_some() && row.report.retiring)
                 }) {
-                    let Some(event) = self.terminal_post_processing_done_rx.recv().await else {
-                        break;
-                    };
-                    self.handle_terminal_post_processing_event(event).await;
+                    tokio::select! {
+                        Some(event) = self.terminal_post_processing_done_rx.recv() => {
+                            self.handle_terminal_post_processing_event(event).await;
+                        }
+                        Some(said) = self.graph_runs.recv() => self.graph_run_said(said),
+                    }
                 }
                 break;
             }

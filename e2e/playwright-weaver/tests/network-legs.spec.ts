@@ -120,13 +120,27 @@ test("L05 Hold parks a dead leg's share instead of moving it", async ({ request 
   const subscription = await FlowSubscription.open();
   try {
     await controlRoute(request, { route: "connect1", up: false, cut: true });
-    const flow = await flowAfter(request, cut, sample => legOn(sample, serverKey(server), b.id)?.state === "DOWN", "leg B Down");
+    // The API also reports Down while every rung cools after its first
+    // failure, before the leg's two-failure policy parks its allocation.
+    const parked = (sample: NetworkFlow) => {
+      const leg = legOn(sample, serverKey(server), b.id);
+      return leg?.state === "DOWN" && leg.target === 0 && leg.open === 0 && leg.opening === 0;
+    };
+    const flow = await flowAfter(request, cut,
+      sample => parked(sample) && legOn(sample, serverKey(server), a.id)?.target === 2,
+      "leg B parked with its share held and leg A still targeting two seats");
     expect(legOn(flow, serverKey(server), a.id)?.target).toBe(2);
     expect(legOn(flow, serverKey(server), b.id)?.target).toBe(0);
     const downSince = flow.sampledAt;
-    await subscription.next(downSince, () => true, "a sample after leg B went Down");
-    const after = subscription.since(downSince).map(sample => openOn(sample, serverKey(server)));
-    expect(after.filter(open => open > 2), "open connections while leg B is held Down").toEqual([]);
+    await subscription.next(downSince, parked, "another sample with leg B's allocation parked");
+    // A recovery probe may temporarily use a seat; only parked Down samples
+    // describe the hold whose unused share must not be donated to leg A.
+    const after = subscription.since(downSince).filter(parked);
+    expect(after.length).toBeGreaterThan(0);
+    for (const sample of after) {
+      expect(legOn(sample, serverKey(server), a.id)?.target).toBe(2);
+      expect(openOn(sample, serverKey(server)), "open connections while leg B is held Down").toBeLessThanOrEqual(2);
+    }
   } finally {
     subscription.close();
   }

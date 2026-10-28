@@ -1638,7 +1638,7 @@ pub struct Pipeline {
     // Failed jobs whose working directory is being released; each records
     // its history when the release comes back.
     pub(super) releasing_failed_jobs: HashSet<JobId>,
-    pub(super) pending_graph_failures: HashMap<JobId, health::PendingGraphFailure>,
+    pending_graph_terminals: HashMap<JobId, health::PendingGraphTerminal>,
     // Final moves admitted after the post-processing hold is lifted.
     pub(super) deferred_moves: HashSet<JobId>,
     // Complete destinations reserved for in-flight moves so concurrent jobs do not collide.

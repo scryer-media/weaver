@@ -439,6 +439,36 @@ impl Pipeline {
         }
     }
 
+    // Called only after the ordered archive command answered: every old
+    // checkpoint and its completion callback has relinquished this job.
+    pub(in crate::pipeline) fn recover_cancelled_graph_checkpoint(&mut self, job_id: JobId) {
+        let held = self.held_part_rows(job_id);
+        let Some(graph) = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .or_else(|| self.retiring_graph_jobs.get_mut(&job_id))
+        else {
+            return;
+        };
+        let pending = graph.pending().clone();
+        // Cancellation deliberately did not acknowledge the old delta. Take
+        // a new full snapshot rather than revive that obsolete replay payload.
+        pending.forget();
+        pending.control().resume();
+        let queue = pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
+        let stamp = pending.stamp();
+        graph.recorded(stamp);
+        if pending
+            .await_commit(stamp, job_id.0, &self.graph_runs.written())
+            .is_none()
+        {
+            graph.owe_mail(stamp);
+        }
+        if queue {
+            self.queue_graph_checkpoint(job_id, pending);
+        }
+    }
+
     pub(in crate::pipeline) fn pause_graph_checkpoint(
         &mut self,
         job_id: JobId,
@@ -595,6 +625,9 @@ impl Pipeline {
         });
         if let Err(error) = queued {
             pending.forget();
+            // No writer owns this command. Forget its delta, but keep the
+            // failure actionable rather than masking it as cancellation.
+            pending.control().resume();
             let _ = mail.send(Said {
                 scope: job_id.0,
                 node: NodeId::ROOT,

@@ -183,7 +183,7 @@ func cmdRestartTest(args []string) {
 }
 
 func restartCases() []restartCase {
-	return append([]restartCase{
+	cases := append([]restartCase{
 		{
 			Name:        "download_completed_file_survives_restart",
 			Description: "Completed archive files should survive a crash/restart without redownloading",
@@ -338,6 +338,10 @@ func restartCases() []restartCase {
 			Run:         runRepairDataWaitReadsFetchingRepairData,
 		},
 	}, graphRestartCases()...)
+	cases = append(cases, heldPartRestartCases()...)
+	cases = append(cases, feedVerdictRestartCases()...)
+	cases = append(cases, namespaceRestartCases()...)
+	return append(cases, probeLaneRestartCases()...)
 }
 
 func selectRestartCases(requested []string) []restartCase {
@@ -1911,7 +1915,7 @@ func (ctx *restartCaseContext) waitForAllTerminal(jobIDs []int, timeout time.Dur
 		for _, jobID := range jobIDs {
 			status := ctx.pollJobOnce(jobID)
 			statuses[jobID] = status
-			if status != "COMPLETE" && status != "FAILED" {
+			if !facadeTerminalStatus(status) {
 				complete = false
 			}
 		}

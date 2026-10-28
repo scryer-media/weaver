@@ -12,7 +12,7 @@ mod runtime;
 mod scripts;
 mod state;
 
-pub(super) use commands::CancelJobsDone;
+pub(super) use commands::{CancelJobsDone, CancelledJobCleanup};
 pub(crate) use runtime::is_terminal_status;
 pub(super) use runtime::timestamp_secs;
 #[cfg(test)]

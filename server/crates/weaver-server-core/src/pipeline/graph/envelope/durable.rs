@@ -67,9 +67,20 @@ impl Envelopes {
             .clone()
             .unwrap_or_else(|| envelope_name(record.node, record.envelope));
         let leaf = Leaf::at(&shelf.dir, &name);
+        // The checkpoint owns this path, but its file may have been lost
+        // or shortened since. Missing bytes must wait for refetch before
+        // a run starts: stale coverage would let it fail on an absent
+        // file, then never restart when fresh bytes replace that coverage.
+        let length = match leaf.len() {
+            Ok(length) => length,
+            Err(LeafError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
         let mut coverage = Coverage::new();
         for run in &record.runs {
-            coverage.write(run.range, run.provenance);
+            if let Some(range) = run.range.intersect(weaver_graph::ByteRange::new(0, length)) {
+                coverage.write(range, run.provenance);
+            }
         }
         shelf.update(|state| {
             state.kept.insert(
@@ -86,3 +97,6 @@ impl Envelopes {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

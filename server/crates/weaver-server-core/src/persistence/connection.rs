@@ -782,16 +782,15 @@ enum DbWriteCommand {
         events: Vec<crate::history::JobEvent>,
     },
     // A generic ordered write. Same-key state transitions land in enqueue
-    // order: on SQLite every command is awaited before the next, and on
-    // Postgres writes on one lane keep their order and a write with no lane
-    // is a barrier.
+    // order: writes on one lane keep their order and a write with no lane
+    // is a barrier. SQLite additionally serializes SQL execution.
     // `op` runs on a
     // `Database` clone the writer task holds, letting it call methods that
     // live on `Database` (e.g. `set_active_job_runtime` / `update_active_job`)
     // without duplicating them onto `DatabaseWriterExecutor`.
     Write {
         label: &'static str,
-        // The lane this write extends. On Postgres writes on one lane keep
+        // The lane this write extends. Writes on one lane keep
         // their order while other lanes' writes run alongside; `None` makes
         // the write a barrier against every other queued write.
         lane: Option<WriteLane>,
@@ -868,7 +867,15 @@ async fn execute_write_command(
     command: DbWriteCommand,
     writer: &DatabaseWriterExecutor,
     writer_db: &Database,
+    permits: &Arc<Semaphore>,
 ) {
+    // Checkpoints acquire a slot per SQL attempt, releasing it while paused.
+    // Every other command executes once under one slot.
+    let _permit = if matches!(&command, DbWriteCommand::GraphCheckpoint { .. }) {
+        None
+    } else {
+        Some(permits.clone().acquire_owned().await)
+    };
     match command {
         DbWriteCommand::ArchiveJob {
             job_id,
@@ -904,10 +911,15 @@ async fn execute_write_command(
                 true
             })
             .await;
-            if matches!(archived, Ok(true))
-                && let Some(committed) = committed
-            {
-                let _ = committed.send(());
+            if matches!(archived, Ok(true)) {
+                // An archived job no longer needs its cancelled checkpoint.
+                // Keep the failure until this transaction actually succeeds.
+                writer_db.checkpoint_failures.send_modify(|failures| {
+                    failures.remove(&job_id);
+                });
+                if let Some(committed) = committed {
+                    let _ = committed.send(());
+                }
             }
         }
         DbWriteCommand::ArchiveJobs {
@@ -916,6 +928,7 @@ async fn execute_write_command(
             committed,
         } => {
             let writer = writer.clone();
+            let archived_jobs: Vec<_> = jobs.iter().map(|(job_id, _)| *job_id).collect();
             let failed = tokio::task::spawn_blocking(move || {
                 let mut failed = BTreeMap::new();
                 for (job_id, history) in jobs {
@@ -943,6 +956,13 @@ async fn execute_write_command(
             })
             .await;
             if let Ok(failed) = failed {
+                writer_db.checkpoint_failures.send_modify(|failures| {
+                    for job_id in archived_jobs {
+                        if !failed.contains_key(&job_id) {
+                            failures.remove(&job_id);
+                        }
+                    }
+                });
                 let _ = committed.send(failed);
             }
         }
@@ -981,7 +1001,12 @@ async fn execute_write_command(
                 blocked(revision, error);
             });
             let result = write
-                .run(job_id, writer_db, writer_db.checkpoint_shutdown.subscribe())
+                .run(
+                    job_id,
+                    writer_db,
+                    writer_db.checkpoint_shutdown.subscribe(),
+                    permits,
+                )
                 .await;
             writer_db
                 .checkpoint_failures
@@ -1001,17 +1026,13 @@ async fn execute_write_command(
     }
 }
 
-// The SQLite writer: one command at a time, each awaited before the next.
-// SQLite has a single writer connection, so there is nothing to overlap.
+// SQLite shares ordered lanes, but only one SQL command executes at a time.
 async fn run_serial_writes(
-    mut rx: mpsc::Receiver<QueuedWrite>,
+    rx: mpsc::Receiver<QueuedWrite>,
     writer: DatabaseWriterExecutor,
     writer_db: Database,
 ) {
-    while let Some(QueuedWrite { queued_at, command }) = rx.recv().await {
-        let _executed = writer_command_scope(&command, queued_at);
-        execute_write_command(command, &writer, &writer_db).await;
-    }
+    run_postgres_write_lanes(rx, writer, writer_db, 1, SQLITE_WRITE_QUEUE_CAPACITY).await;
 }
 
 // Ordered writes a Postgres writer runs at once: half the pool, so queued
@@ -1025,9 +1046,9 @@ fn postgres_write_lane_concurrency() -> usize {
 // fills and senders see it full, as on the serial writer.
 const POSTGRES_WRITES_TAKEN_PER_LANE_SLOT: usize = 4;
 
-// The Postgres writer. Postgres has no single-writer limit, so ordered writes
-// for different jobs run at once, up to `concurrency`, while each lane keeps
-// submission order:
+// The ordered lane writer, shared by both datastores. SQL execution is
+// limited by `concurrency`, while each lane keeps submission order even
+// when its checkpoint is paused between attempts:
 //
 // - a job's writes apply one after another, in the order they were queued;
 // - an archive also waits for every event batch and every server attribution
@@ -1050,8 +1071,8 @@ async fn run_postgres_write_lanes(
     // The completion signal of the last command taken on each lane.
     let mut tails: HashMap<WriteLane, watch::Receiver<bool>> = HashMap::new();
     loop {
-        // Every taken command's predecessors were taken before it, and none
-        // holds a permit while it waits, so the oldest one always finishes.
+        // Bound ownership of taken commands as well as the incoming queue.
+        // A paused checkpoint retains its lane until resumed or cancelled.
         while in_flight.len() >= max_taken {
             in_flight.join_next().await;
         }
@@ -1061,10 +1082,27 @@ async fn run_postgres_write_lanes(
         while in_flight.try_join_next().is_some() {}
         prune_finished_lane_tails(&mut tails);
         let Some((also_after, lane)) = command.lanes() else {
-            while in_flight.join_next().await.is_some() {}
+            let mut command = command;
+            let abandoned = if let DbWriteCommand::Flush { reply } = &mut command {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = reply.closed() => break true,
+                        joined = in_flight.join_next() => {
+                            if joined.is_none() { break false; }
+                        }
+                    }
+                }
+            } else {
+                while in_flight.join_next().await.is_some() {}
+                false
+            };
+            if abandoned {
+                continue;
+            }
             tails.clear();
             let _executed = writer_command_scope(&command, queued_at);
-            execute_write_command(command, &writer, &writer_db).await;
+            execute_write_command(command, &writer, &writer_db, &permits).await;
             continue;
         };
         let waits: Vec<watch::Receiver<bool>> = std::iter::once(&lane)
@@ -1084,9 +1122,8 @@ async fn run_postgres_write_lanes(
             }
             // Taken only once the predecessors are done, so a write waiting
             // on its lane never holds a permit a predecessor needs.
-            let _permit = permits.acquire_owned().await;
             let _executed = writer_command_scope(&command, queued_at);
-            execute_write_command(command, &writer, &writer_db).await;
+            execute_write_command(command, &writer, &writer_db, &permits).await;
             let _ = done_tx.send(true);
         });
     }
@@ -1601,8 +1638,8 @@ impl Database {
     }
 
     // [`Self::try_queue_write`] for a write that belongs to one job. It keeps
-    // its order against that job's other queued writes and its archive, and on
-    // Postgres runs alongside other jobs' writes instead of behind them.
+    // its order against that job's other queued writes and its archive.
+    // Other jobs can advance while this job's checkpoint awaits resume.
     pub fn try_queue_job_write(
         &self,
         job_id: crate::jobs::ids::JobId,

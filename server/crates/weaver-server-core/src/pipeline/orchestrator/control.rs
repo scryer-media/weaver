@@ -61,11 +61,7 @@ impl Pipeline {
                     .filter(|row| {
                         // A history retry can reuse the ID while the previous
                         // graph run is still draining its terminal workers.
-                        self.jobs.contains_key(&row.id)
-                            || !self
-                                .graph_jobs
-                                .get(&row.id)
-                                .is_some_and(|graph| graph.awaits_mail())
+                        !self.awaits_job_articles(row.id)
                     })
                     .filter_map(|row| row.admission.take().map(|job| (row.id, job)))
                     .collect::<Vec<_>>(),

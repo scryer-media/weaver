@@ -1,0 +1,14 @@
+{
+  "slug": "split-xz-missing-par2",
+  "title": "E2E.Test.split.xz.missing.par2.2026-TESTGRP",
+  "description": "PAR2 repairs a missing numbered XZ piece with non-ASCII data and recovery names before decoding.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "灯火.bin": "953810107f892f110fa01643569e6361f39e737aee2aca22c522b4f6f0152f26"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}
