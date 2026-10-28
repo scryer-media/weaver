@@ -281,3 +281,17 @@ test("download paths ignore the query string and the non-NZB body is served", as
     assert.match(await junk.text(), /not an nzb/);
   } finally { await fixture.close(); }
 });
+
+test("the state reports each route's service as the control last set it", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", routes: ["connect1"], ports: { ...zeroPorts, connect1: 0 } });
+  try {
+    const normal = { up: true, hold: false, connectStatus: null, socksReply: null };
+    assert.deepEqual((await control(fixture, "/")).body.routes.connect1, normal);
+    await control(fixture, "/", { route: "connect1", up: false, cut: true, connectStatus: 503 });
+    assert.deepEqual((await control(fixture, "/")).body.routes.connect1, { ...normal, up: false, connectStatus: 503 });
+    await control(fixture, "/", { route: "connect1", up: true, connectStatus: null });
+    const state = (await control(fixture, "/")).body;
+    assert.deepEqual(state.routes.connect1, normal);
+    assert.deepEqual(Object.keys(state.routes).sort(), ["connect1", "direct", "primary", "secondary", "tertiary"]);
+  } finally { await fixture.close(); }
+});

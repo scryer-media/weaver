@@ -4,58 +4,90 @@
 package weaver
 
 import (
-	"bytes"
+	"path/filepath"
 	"testing"
 )
 
-func TestDecodeFileCoverageReadsWhatWeaverWrites(t *testing.T) {
-	// rmp_serde's encoding of vec![(4u32, 2u32, 40u64, 60u64), (5, 1, 60, 70)].
-	body := []byte{0x92, 0x94, 0x04, 0x02, 0x28, 0x3c, 0x94, 0x05, 0x01, 0x3c, 0x46}
-	blob := append([]byte{'W', 'F', 'C', 'V', 0x01, 0x00}, body...)
-	coverage, err := decodeFileCoverage(blob)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	want := []fileCoverageRun{{4, 2, 40, 60}, {5, 1, 60, 70}}
-	if len(coverage.Runs) != len(want) {
-		t.Fatalf("runs = %+v", coverage.Runs)
-	}
-	for i := range want {
-		if coverage.Runs[i] != want[i] {
-			t.Fatalf("run %d = %+v, want %+v", i, coverage.Runs[i], want[i])
-		}
-	}
-	if got := coverage.CoveredBytes(); got != 30 {
+func TestFileCoverageCoversOnlyWhatItsRunsHold(t *testing.T) {
+	coverage := fileCoverage{Runs: []fileCoverageRun{{60, 70, "fresh"}, {40, 60, "fresh"}, {100, 120, "damaged"}}}
+	if got := coverage.CoveredBytes(); got != 50 {
 		t.Fatalf("covered = %d", got)
 	}
-	if !coverage.Contains(5) || coverage.Contains(6) || coverage.Contains(3) {
-		t.Fatalf("contains is wrong for %+v", coverage.Runs)
-	}
-	if again := encodeFileCoverage(coverage, fileCoverageSchemaVersion); !bytes.Equal(again, blob) {
-		t.Fatalf("encode = %x, want %x", again, blob)
-	}
-}
-
-func TestDecodeFileCoverageWideIntegersRoundTrip(t *testing.T) {
-	coverage := fileCoverage{Runs: []fileCoverageRun{{0, 300, 0, 1 << 33}, {70000, 1, 1<<33 + 5, 1<<33 + 700000}}}
-	decoded, err := decodeFileCoverage(encodeFileCoverage(coverage, fileCoverageSchemaVersion))
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(decoded.Runs) != 2 || decoded.Runs[0] != coverage.Runs[0] || decoded.Runs[1] != coverage.Runs[1] {
-		t.Fatalf("round trip = %+v", decoded.Runs)
-	}
-}
-
-func TestDecodeFileCoverageRefusesAnotherSchema(t *testing.T) {
-	for name, blob := range map[string][]byte{
-		"truncated": []byte("WFC"),
-		"magic":     []byte("XXXX\x01\x00\x90"),
-		"version":   encodeFileCoverage(fileCoverage{}, 2),
-		"trailing":  append(encodeFileCoverage(fileCoverage{}, 1), 0x00),
+	for _, tc := range []struct {
+		start, end uint64
+		want       bool
+	}{
+		{40, 70, true},
+		{45, 50, true},
+		{100, 120, true},
+		{30, 50, false},
+		{60, 101, false},
+		{70, 100, false},
+		{50, 50, true},
 	} {
-		if _, err := decodeFileCoverage(blob); err == nil {
-			t.Fatalf("%s: decoded", name)
+		if got := coverage.Covers(tc.start, tc.end); got != tc.want {
+			t.Fatalf("covers [%d, %d) = %t, want %t", tc.start, tc.end, got, tc.want)
 		}
+	}
+}
+
+func TestReadFileCoverageRowsReadsTheArticleRoot(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "weaver.db")
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+
+	// No graph tables: a database that has never held a graph checkpoint.
+	rows, err := readFileCoverageRows(db, weaverDatastoreSQLite)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rows = %+v, err = %v", rows, err)
+	}
+
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE graph_members (job_id INTEGER NOT NULL, node_id INTEGER NOT NULL, member_id INTEGER NOT NULL, name TEXT NOT NULL, length INTEGER)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE graph_coverage (job_id INTEGER NOT NULL, node_id INTEGER NOT NULL, member_id INTEGER NOT NULL, range_start INTEGER NOT NULL, range_end INTEGER NOT NULL, provenance TEXT NOT NULL)`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_members VALUES
+		(7, 0, 0, 'a.rar', 300),
+		(7, 0, 1, 'b.rar', NULL),
+		(7, 0, 2, 'c.rar', 100),
+		(7, 3, 0, 'inner.mkv', 100),
+		(8, 0, 0, 'a.rar', 100)`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES
+		(7, 0, 0, 200, 300, 'fresh'),
+		(7, 0, 0, 0, 100, 'fresh'),
+		(7, 0, 1, 0, 50, 'fresh'),
+		(7, 3, 0, 0, 100, 'fresh'),
+		(8, 0, 0, 0, 100, 'repaired')`)
+
+	rows, err = readFileCoverageRows(db, weaverDatastoreSQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("rows = %+v, want the four root members", rows)
+	}
+	first := rows[0]
+	if first.JobID != 7 || first.FileIndex != 0 || first.Name != "a.rar" || first.Length == nil || *first.Length != 300 {
+		t.Fatalf("first row = %+v", first)
+	}
+	if first.Coverage.CoveredBytes() != 200 || first.Whole() || first.Coverage.Covers(50, 250) {
+		t.Fatalf("a member with a hole reads as whole: %+v", first)
+	}
+	if rows[1].Length != nil || rows[1].Whole() || rows[1].Coverage.CoveredBytes() != 50 {
+		t.Fatalf("a member of unknown length = %+v", rows[1])
+	}
+	if rows[2].Coverage.CoveredBytes() != 0 || rows[2].Whole() {
+		t.Fatalf("a member with no runs = %+v", rows[2])
+	}
+	if rows[3].JobID != 8 || !rows[3].Whole() || rows[3].Coverage.Runs[0].Provenance != "repaired" {
+		t.Fatalf("another job's member = %+v", rows[3])
+	}
+
+	// Its last hole filled, the first member is whole.
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES (7, 0, 0, 100, 200, 'fresh')`)
+	rows, err = readFileCoverageRows(db, weaverDatastoreSQLite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows[0].Whole() {
+		t.Fatalf("first row = %+v, want whole", rows[0])
 	}
 }

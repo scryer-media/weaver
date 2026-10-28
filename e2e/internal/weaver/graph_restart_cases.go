@@ -735,10 +735,10 @@ func runUnarchivableRowDoesNotStopStartup(ctx *restartCaseContext) (restartCaseR
 	// A row that stopped between its terminal status and its history row is
 	// archived at start; the trigger makes the database refuse that one
 	// archive, as a write that cannot land would.
-	if err := execAll(dbPath, []string{
+	refuse, lift := refuseArchive(refused)
+	if err := execAll(dbPath, append([]string{
 		fmt.Sprintf(`UPDATE active_jobs SET status = 'complete' WHERE job_id = %d`, refused),
-		fmt.Sprintf(`CREATE TRIGGER e2e_refuse_archive BEFORE INSERT ON job_history WHEN NEW.job_id = %d BEGIN SELECT RAISE(ABORT, 'e2e injected archive failure'); END`, refused),
-	}); err != nil {
+	}, refuse...)); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := ctx.restartWeaver(); err != nil {
@@ -757,7 +757,7 @@ func runUnarchivableRowDoesNotStopStartup(ctx *restartCaseContext) (restartCaseR
 	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := execAll(dbPath, []string{`DROP TRIGGER e2e_refuse_archive`}); err != nil {
+	if err := execAll(dbPath, lift); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := ctx.restartWeaver(); err != nil {
