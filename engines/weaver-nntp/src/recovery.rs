@@ -271,6 +271,17 @@ impl ConnectionHealth {
         true
     }
 
+    // The connection's demanded command was answered with a 2xx status line.
+    // For the quarantine's probe that answer is the server's recovery: the
+    // gate lifts here, not when the transfer behind the answer finishes, so a
+    // long BODY on a slow server does not hold every other connection back.
+    // The health tracker reads a lifted gate as the recovery when the
+    // connection's outcome is recorded. Any other connection's answer changes
+    // nothing.
+    pub(crate) fn answered(&self) {
+        self.complete_recovery();
+    }
+
     pub(crate) fn current(&self) -> bool {
         self.id >= self.gate.first_current_id.load(Ordering::Acquire)
     }

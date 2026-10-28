@@ -36,8 +36,9 @@ pub struct NntpClientConfig {
     // before failing over to the next server. A value of 1 means try once,
     // then retry once (2 total attempts per server).
     pub max_retries_per_server: u32,
-    // Per-article active-time budget. Deliberate local rate-limit waits are
-    // excluded; exceeding the budget triggers failover to the next server.
+    // Per-article inactivity budget: how long a BODY may go without bytes
+    // arriving. Deliberate local rate-limit waits do not count; exhausting
+    // the budget triggers failover to the next server.
     // This is separate from the connection-level `command_timeout`.
     pub soft_timeout: Duration,
 }
@@ -67,7 +68,7 @@ pub struct NntpClient {
     pool: Arc<NntpPool>,
     work_guard: Option<Arc<dyn Fn(ServerId) -> bool + Send + Sync>>,
     max_retries_per_server: u32,
-    // Per-article active-time budget, excluding deliberate local rate waits.
+    // Per-article inactivity budget, excluding deliberate local rate waits.
     soft_timeout: Duration,
 }
 
@@ -3602,8 +3603,8 @@ impl NntpClient {
     // errors up to `max_retries_per_server` times.
     //
     // Connection acquisition, group setup, and retry delay are bounded by a
-    // per-attempt soft timeout. BODY payload reads use an active-time budget
-    // that excludes deliberate transfer-policy waits.
+    // per-attempt soft timeout. BODY payload reads use an inactivity budget
+    // that restarts whenever bytes arrive or a transfer-policy wait ends.
     async fn fetch_from_server_with_groups(
         &self,
         server: ServerId,
@@ -4077,8 +4078,8 @@ impl NntpClient {
     // Fetch from a specific server, retrying on transient errors.
     //
     // Connection acquisition and retry delay are bounded by a per-attempt
-    // soft timeout. BODY payload reads use an active-time budget that excludes
-    // deliberate transfer-policy waits.
+    // soft timeout. BODY payload reads use an inactivity budget that restarts
+    // whenever bytes arrive or a transfer-policy wait ends.
     async fn fetch_from_server(
         &self,
         server: ServerId,

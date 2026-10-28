@@ -186,8 +186,11 @@ impl Pipeline {
             || has_pending_decode
     }
 
-    // The completion gate: an admitted job that is not retiring and whose
-    // post-processing is not paused hands its next step to its graph.
+    // The completion gate: an admitted job that is not retiring hands its
+    // next step to its graph. A post-processing pause does not stop here:
+    // the job's own delivery goes on, and the pause holds what comes after
+    // it (the repair and extraction slots the graph asks for, and the final
+    // move).
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
         if !self.nzb_admitted.contains(&job_id) {
             return;
@@ -201,10 +204,6 @@ impl Pipeline {
                 .iter()
                 .any(|row| row.id == job_id && row.report.retiring)
         }) {
-            return;
-        }
-        if self.shared_state.is_post_processing_paused() {
-            self.deferred_post_processing.insert(job_id);
             return;
         }
         // A part parked behind an ordinal that has settled is written before

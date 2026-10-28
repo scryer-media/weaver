@@ -58,9 +58,7 @@ impl GraphError {
                 ExtractionError::from_io(message, source)
             }
             WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
-            WriteError::Leaf(_) | WriteError::UnknownMember { .. } => {
-                ExtractionError::terminal(message)
-            }
+            WriteError::UnknownMember { .. } => ExtractionError::terminal(message),
         }
     }
 }
@@ -286,6 +284,12 @@ impl GraphJob {
     // in the post's file order.
     pub(crate) fn remaining_bytes(&self) -> Vec<u64> {
         self.root.map.remaining()
+    }
+
+    // Seam for status: how many posted files the download has brought
+    // whole, every article in hand.
+    pub(crate) fn whole_file_count(&self) -> usize {
+        self.root.map.whole_count()
     }
 
     // Seam for status: the job is fetching repair data. Its payload is in,

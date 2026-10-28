@@ -28,11 +28,6 @@ enum TestArticle {
     },
     // Never answers the BODY: only the client's own budget ends the read.
     Silent,
-    // Sends the article a line at a time and never terminates it.
-    Trickle {
-        data: Vec<u8>,
-        line_delay: Duration,
-    },
     Truncated {
         data: Vec<u8>,
         wait_for_next_request: bool,
@@ -257,23 +252,6 @@ fn spawn_tls_nntp_server_with_upgrade(
                                 }
                             }
                             Some(TestArticle::Silent) => {}
-                            Some(TestArticle::Trickle { data, line_delay }) => {
-                                stream
-                                    .get_mut()
-                                    .write_all(
-                                        format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
-                                    )
-                                    .await?;
-                                let encoded = yenc_body(data);
-                                for line in encoded.split_inclusive(|byte| *byte == b'\n') {
-                                    tokio::time::sleep(*line_delay).await;
-                                    if stream.get_mut().write_all(line).await.is_err()
-                                        || stream.get_mut().flush().await.is_err()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-                            }
                             Some(TestArticle::Truncated {
                                 data,
                                 wait_for_next_request,
@@ -1317,33 +1295,6 @@ fn blocking_rustls_reports_truncated_response() {
 }
 
 #[test]
-fn blocking_rustls_remote_trickle_consumes_active_budget() {
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<trickle@test>",
-        TestArticle::Trickle {
-            data: vec![b'A'; 2_560],
-            line_delay: Duration::from_millis(20),
-        },
-    )]);
-    let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
-    conn.select_group("alt.test").unwrap();
-    let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
-
-    let error = conn
-        .stream_yenc_article_with_active_budget("<trickle@test>", 0, &mut budget)
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        FusedYencError::Nntp(NntpError::SoftTimeout(_))
-    ));
-    assert!(conn.poisoned);
-    drop(conn);
-    handle.join().unwrap();
-    let _ = std::fs::remove_file(ca_path);
-}
-
-#[test]
 fn blocking_rustls_delayed_initial_consumes_active_budget() {
     let (config, handle, ca_path) =
         spawn_tls_nntp_server(vec![("<delayed@test>", TestArticle::Silent)]);
@@ -1402,51 +1353,6 @@ fn blocking_rustls_rate_wait_is_excluded_from_active_budget() {
 }
 
 #[test]
-fn expired_active_budget_does_not_enter_blocking_rate_wait() {
-    let decoded = vec![b'A'; 1_200];
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<expired-budget@test>",
-        TestArticle::Body(decoded.clone()),
-    )]);
-    let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
-    let control = crate::transfer::ServerTransferRegistry::new().configure(
-        StableServerId(105),
-        crate::transfer::ServerTransferConfig {
-            rate_bytes_per_sec: 1_000,
-            quota: None,
-        },
-    );
-    conn.set_transfer_control(Some(control.clone()));
-    conn.select_group("alt.test").unwrap();
-    conn.reserve_body(0).unwrap();
-    let initial = conn
-        .send_command(&Command::Body(ArticleId::MessageId(
-            "<expired-budget@test>".to_string(),
-        )))
-        .unwrap();
-    let mut buffered_body = yenc_body(&decoded);
-    buffered_body.extend_from_slice(b".\r\n");
-    conn.read_buf = BytesMut::from(buffered_body.as_slice());
-    let mut budget = ActiveTransferBudget::new(Duration::ZERO);
-
-    let error = conn
-        .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        FusedYencError::Nntp(NntpError::SoftTimeout(_))
-    ));
-    assert!(conn.poisoned);
-    let snapshot = control.snapshot();
-    assert!(snapshot.lifetime_body_bytes >= decoded.len() as u64);
-    assert_eq!(snapshot.throttle_wait, Duration::ZERO);
-    drop(conn);
-    handle.join().unwrap();
-    let _ = std::fs::remove_file(ca_path);
-}
-
-#[test]
 fn blocking_rustls_pipeline_failure_drains_transfer_permits() {
     tls_pipeline_failure_drains_permits_before_any_reuse(NntpTlsBackend::ManualRustls);
 }
@@ -1491,35 +1397,6 @@ fn blocking_s2n_fd_reports_missing_article() {
 fn blocking_s2n_fd_reports_truncated_response() {
     let _guard = s2n_test_guard();
     tls_lane_reports_truncated_response(NntpTlsBackend::S2n);
-}
-
-#[cfg(not(windows))]
-#[test]
-fn blocking_s2n_remote_trickle_consumes_active_budget() {
-    let _guard = s2n_test_guard();
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<trickle@test>",
-        TestArticle::Trickle {
-            data: vec![b'A'; 2_560],
-            line_delay: Duration::from_millis(20),
-        },
-    )]);
-    let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
-    conn.select_group("alt.test").unwrap();
-    let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
-
-    let error = conn
-        .stream_yenc_article_with_active_budget("<trickle@test>", 0, &mut budget)
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        FusedYencError::Nntp(NntpError::SoftTimeout(_))
-    ));
-    assert!(conn.poisoned);
-    drop(conn);
-    handle.join().unwrap();
-    let _ = std::fs::remove_file(ca_path);
 }
 
 #[cfg(not(windows))]

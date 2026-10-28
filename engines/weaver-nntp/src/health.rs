@@ -476,6 +476,18 @@ impl ServerHealth {
         self.state = ServerState::Disabled { until, reason };
     }
 
+    // A lifted gate with the recovery still pending here is a probe that was
+    // answered (see [`crate::recovery::ConnectionHealth::answered`]): the
+    // server is up from that answer, whatever the outcome being recorded now.
+    fn settle_answered_recovery(&mut self) {
+        if self.recovery_pending && !self.recovery.quarantined() {
+            self.recovery_pending = false;
+            self.recovery_attempts = 0;
+            self.state = ServerState::Healthy;
+            self.ratio_window_started = None;
+        }
+    }
+
     pub(crate) fn record_connection_outcome(
         &mut self,
         ticket: &crate::recovery::ConnectionHealth,
@@ -495,13 +507,10 @@ impl ServerHealth {
             return;
         }
         if success {
-            if ticket.complete_recovery() || (self.recovery_pending && !self.recovery.quarantined())
-            {
-                self.recovery_pending = false;
-                self.recovery_attempts = 0;
-                self.state = ServerState::Healthy;
-                self.ratio_window_started = None;
-            }
+            ticket.complete_recovery();
+        }
+        self.settle_answered_recovery();
+        if success {
             self.record_success();
         } else {
             if ticket.probing() {
@@ -654,6 +663,7 @@ impl HealthTracker {
             self.servers[idx].failure_count += 1;
             return;
         }
+        self.servers[idx].settle_answered_recovery();
         if ticket.probing() {
             Self::warn_probe_failed(idx, &self.servers[idx]);
             self.servers[idx].recovery_pending = true;

@@ -20,7 +20,6 @@ use crate::operations::instrumentation::StageOutcomeKind;
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::extraction::ExtractionError;
 use crate::pipeline::graph::job::{GraphJob, Note};
-use crate::pipeline::graph::limits;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
 use crate::post_processing::model::PipelineFailureStage;
@@ -46,7 +45,7 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     if pipeline.graph_status.repairs.handed(asker(job_id)) {
         pipeline.lend_graph_repairs(job_id);
     }
-    let limit = limits::slots(&pipeline.tuner);
+    let limit = pipeline.graph_job_slot_limit(job_id);
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;
     };

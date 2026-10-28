@@ -34,7 +34,6 @@ impl Pipeline {
         self.terminal_reconciliations.remove(&job_id);
         self.inflight_moves.remove(&job_id);
         self.deferred_moves.remove(&job_id);
-        self.deferred_post_processing.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
@@ -226,7 +225,7 @@ impl Pipeline {
             health,
             terminal_discards,
             total_files: state.assembly.total_file_count() as u32,
-            completed_files: state.assembly.complete_file_count() as u32,
+            completed_files: self.completed_file_count(state),
             remaining_par_files: 0,
             file_remaining_bytes: Vec::new(),
             password: state.spec.password.clone(),

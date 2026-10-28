@@ -17,6 +17,7 @@ use super::super::{
 use super::harness::{
     ARTICLE, JOB, Post, Scenario, admit, admit_with, collect, payload, serve_job,
 };
+use super::streams::xz;
 use crate::jobs::ids::JobId;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::{
@@ -577,5 +578,123 @@ async fn the_job_snapshot_says_what_of_each_file_is_still_to_come() {
     assert_eq!(
         snapshot(&pipeline),
         vec![alpha[1..].iter().sum::<u64>(), beta.iter().sum::<u64>()]
+    );
+}
+
+// Paused post-processing holds the final move and nothing of the download:
+// every file is delivered and counted while the job waits at its move, and
+// the job completes once post-processing resumes.
+#[tokio::test]
+async fn paused_post_processing_holds_the_move_but_not_the_delivery() {
+    let scenario = Scenario::new(vec![
+        Post::plain("ember.bin", payload(3 * ARTICLE, 81)),
+        Post::plain("ember.idx", payload(ARTICLE, 82)),
+    ]);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let handle = handle(&pipeline);
+    handle.pause_post_processing().await.unwrap();
+    pipeline.apply_queue_intents().await;
+
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.deferred_moves.contains(&JOB)
+    })
+    .await;
+    assert!(
+        pipeline.deferred_moves.contains(&JOB),
+        "the move was not held; status {:?}",
+        job_status_for_assert(&pipeline, JOB)
+    );
+    let info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == JOB)
+        .expect("the held job is still listed");
+    assert_eq!(info.total_files, 2);
+    assert_eq!(info.completed_files, info.total_files);
+    assert!(!ended(&pipeline, JOB));
+
+    handle.resume_post_processing().await.unwrap();
+    pipeline.apply_queue_intents().await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let mut files = std::collections::BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    for name in ["ember.bin", "ember.idx"] {
+        assert!(
+            files.keys().any(|path| path.ends_with(name)),
+            "{name} not delivered: {:?}",
+            files.keys()
+        );
+    }
+}
+
+// The record a graph job leaves when it completes counts every file it
+// brought whole, as the live report did.
+#[tokio::test]
+async fn the_history_record_of_a_complete_graph_job_counts_every_file() {
+    let scenario = Scenario::new(vec![
+        Post::plain("ember.bin", payload(3 * ARTICLE, 83)),
+        Post::plain("ember.idx", payload(ARTICLE, 84)),
+    ]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let mut events = pipeline.event_tx.subscribe();
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobCompleted { job_id } if *job_id == JOB),
+    )
+    .await;
+
+    let finished = pipeline
+        .shared_state
+        .list_jobs()
+        .into_iter()
+        .find(|info| info.job_id == JOB)
+        .expect("the finished job is listed");
+    assert_eq!(finished.status, JobStatus::Complete);
+    assert_eq!(finished.total_files, 2);
+    assert_eq!(finished.completed_files, finished.total_files);
+}
+
+// A pause and a resume of post-processing that both land before the
+// pipeline's next intent turn hold nothing: the pause was never applied, so
+// no run of the job waits on a resume walk that never comes, and the job
+// completes.
+#[tokio::test]
+async fn a_pause_and_resume_between_intent_turns_leaves_no_run_held() {
+    let body = payload(3 * ARTICLE + 7, 85);
+    let scenario = Scenario::new(vec![Post::plain("ember.bin.xz", xz(&body))]);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let handle = handle(&pipeline);
+    handle.pause_post_processing().await.unwrap();
+    // Every article decoded into the graph while the pause is written and
+    // not yet applied: the stream's run is asked for in that window.
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|graph| graph.remaining_bytes().iter().all(|left| *left == 0))
+    })
+    .await;
+    handle.resume_post_processing().await.unwrap();
+    pipeline.apply_queue_intents().await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let mut files = std::collections::BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    assert!(
+        files
+            .iter()
+            .any(|(name, bytes)| name.ends_with("ember.bin") && *bytes == body),
+        "{:?}",
+        files.keys()
     );
 }

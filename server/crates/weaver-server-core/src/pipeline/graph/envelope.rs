@@ -284,7 +284,7 @@ impl Shelf {
                     weaver_graph::names::INTERNAL_DIR,
                     self.node.0
                 );
-                let mut leaf = Leaf::at(&self.dir, &name)?;
+                let mut leaf = Leaf::at(&self.dir, &name);
                 leaf.truncate()?;
                 Ok(free.insert(Kept {
                     leaf,

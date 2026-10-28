@@ -1625,3 +1625,121 @@ async fn a_job_blocked_on_its_checkpoint_resumes_into_the_status_its_lanes_name(
         retire_pipeline_database(pipeline).await;
     }
 }
+
+// Post-processing applied as paused, or resumed, as the pipeline's next
+// intent turn applies it.
+async fn set_post_processing_paused(pipeline: &mut Pipeline, paused: bool) {
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    if paused {
+        handle.pause_post_processing().await.unwrap();
+    } else {
+        handle.resume_post_processing().await.unwrap();
+    }
+    pipeline.apply_queue_intents().await;
+}
+
+fn awaits_mail(pipeline: &Pipeline) -> bool {
+    pipeline
+        .graph_jobs
+        .get(&JOB)
+        .is_some_and(|job| job.awaits_mail())
+}
+
+// A job restored while post-processing is paused rebuilds its tree but
+// starts no extraction run: the pause holds its runs across the restart as
+// it held them before it, and the job completes once post-processing
+// resumes.
+#[tokio::test]
+async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume() {
+    let body = payload(3 * ARTICLE + 7, 92);
+    let scenario = Scenario::new(vec![Post::plain("ember.bin.xz", xz(&body))]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    set_post_processing_paused(&mut pipeline, true).await;
+    while let Some(work) = next_work(&mut pipeline, &scenario) {
+        serve_work(&mut pipeline, &scenario, &work).await;
+    }
+    assert!(
+        !awaits_mail(&pipeline),
+        "a run started under the pause before the restart"
+    );
+    let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    let db = pipeline.db.clone();
+    retire_pipeline_database(pipeline).await;
+    drop(db);
+
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    set_post_processing_paused(&mut pipeline, true).await;
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id: JOB,
+            job_hash: [0; 32],
+            spec: scenario.spec(),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+    assert!(pipeline.graph_jobs.contains_key(&JOB));
+    pipeline.check_job_completion(JOB).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    assert!(
+        !awaits_mail(&pipeline),
+        "the restored job started a run under the pause"
+    );
+    assert!(!finished(&pipeline));
+
+    set_post_processing_paused(&mut pipeline, false).await;
+    let mut quiet = 0;
+    loop {
+        if finished(&pipeline) {
+            break;
+        }
+        pipeline.check_job_completion(JOB).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        if awaits_mail(&pipeline) {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            quiet = 0;
+            continue;
+        }
+        quiet += 1;
+        assert!(
+            quiet < 3,
+            "the resumed job stalled at {:?}",
+            job_status_for_assert(&pipeline, JOB)
+        );
+    }
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    assert!(
+        files
+            .iter()
+            .any(|(name, bytes)| name.ends_with("ember.bin") && *bytes == body),
+        "{:?}",
+        files.keys()
+    );
+    retire_pipeline_database(pipeline).await;
+}

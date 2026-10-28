@@ -354,3 +354,101 @@ fn a_recovery_refusal_reports_its_own_kind() {
     );
     assert!(recovering.nntp_error().is_none());
 }
+
+// The probe proves the server is up the moment it answers the demanded BODY
+// with its 2xx status line. The quarantine lifts while the body is still
+// streaming, however long the rest of the transfer then takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_probe_clears_the_quarantine_on_its_answer_before_the_body_ends() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (finish, mut finish_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        writer.write_all(b"200 ready\r\n").await.unwrap();
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line == "CAPABILITIES" {
+                writer
+                    .write_all(b"101 capabilities\r\nVERSION 2\r\nPIPELINING\r\n.\r\n")
+                    .await
+                    .unwrap();
+            } else {
+                assert!(line.starts_with("BODY "));
+                writer
+                    .write_all(b"222 1 <probe@test>\r\n=ybegin line=128 size=2 name=x\r\nk\r\n")
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+                finish_rx.recv().await.unwrap();
+                writer
+                    .write_all(b"k\r\n=yend size=2\r\n.\r\n")
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![ServerPoolConfig {
+            server: ServerConfig {
+                host: address.ip().to_string(),
+                port: address.port(),
+                tls: false,
+                ..Default::default()
+            },
+            stable_id: StableServerId(8),
+            max_connections: 2,
+            ..Default::default()
+        }],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        // No runner waits this long: the body's hold ends only when the
+        // test releases it. `Duration::MAX` itself overflows the lane's
+        // acquire deadline.
+        soft_timeout: Duration::from_secs(365 * 24 * 60 * 60),
+    });
+    let pool = client.pool();
+    for _ in 0..10 {
+        pool.health.lock().await.record_failure(0, false);
+    }
+    assert!(pool.requires_recovery(0));
+    pool.recovery_gates[0].expire_now();
+    let mut changes = pool.recovery_gates[0].subscribe();
+    let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+    assert!(pool.requires_recovery(0), "handshake is insufficient");
+    let fetch = tokio::spawn(async move {
+        let mut decoded = None;
+        lane.fetch_decoded_pipeline(&["<probe@test>"], 1, |_, trace, _| {
+            decoded = Some(trace.result.is_ok());
+            async {}
+        })
+        .await;
+        (lane, decoded)
+    });
+
+    while pool.requires_recovery(0) {
+        changes.changed().await.unwrap();
+    }
+    assert!(
+        !fetch.is_finished(),
+        "the quarantine lifted on the answer, before the body ended"
+    );
+    assert!(
+        pool.try_acquire_blocking_permit_for_work(ServerId(0), false)
+            .is_ok(),
+        "a lifted quarantine admits ordinary work again"
+    );
+
+    finish.send(()).await.unwrap();
+    let (lane, decoded) = fetch.await.unwrap();
+    assert_eq!(decoded, Some(true));
+    assert!(!pool.requires_recovery(0));
+    assert_eq!(
+        *pool.health.lock().await.server(0).state(),
+        crate::health::ServerState::Healthy
+    );
+    drop(lane);
+    pool.drain_all_idle().await;
+    server.await.unwrap();
+}

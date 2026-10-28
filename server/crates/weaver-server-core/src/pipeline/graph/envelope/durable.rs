@@ -63,7 +63,7 @@ impl Envelopes {
             record.node.0,
             record.envelope
         );
-        let leaf = Leaf::at(&shelf.dir, &name)?;
+        let leaf = Leaf::at(&shelf.dir, &name);
         let mut coverage = Coverage::new();
         for run in &record.runs {
             coverage.write(run.range, run.provenance);

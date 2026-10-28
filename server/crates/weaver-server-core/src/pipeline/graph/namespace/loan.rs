@@ -169,7 +169,7 @@ impl Repaired {
         );
         Ok(Self {
             runs: Vec::new(),
-            output: Leaf::at(working_dir, &name)?,
+            output: Leaf::at(working_dir, &name),
             written: 0,
             failed: None,
         })
