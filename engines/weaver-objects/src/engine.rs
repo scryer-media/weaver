@@ -66,6 +66,10 @@ pub trait Format: Send + Sync {
         None
     }
     fn run(password: Option<String>) -> Box<dyn Extraction>;
+
+    fn reserve() -> u64 {
+        0
+    }
 }
 
 // A volume bound, as far as it places the others: what its front states,
@@ -334,6 +338,10 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 impl<F: Format + 'static> Engine for EngineObject<F> {
     fn start(&mut self) -> Box<dyn Extraction> {
         F::run(self.password.clone())
+    }
+
+    fn reserve(&self) -> Option<u64> {
+        Some(F::reserve())
     }
 
     // The volumes after the one the run is on, the nearest first: weighed

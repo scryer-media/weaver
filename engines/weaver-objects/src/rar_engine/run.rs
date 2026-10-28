@@ -41,6 +41,15 @@ impl Run {
     }
 }
 
+fn limits(budget: &Budget) -> unrar_rs::Limits {
+    let mut limits = unrar_rs::Limits::default();
+    if let Some(memory) = budget.memory_bytes {
+        limits.max_dict_size = limits.max_dict_size.min(memory);
+        limits.max_ppmd_arena_size = limits.max_ppmd_arena_size.min(memory);
+    }
+    limits
+}
+
 impl Extraction for Run {
     fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>, budget: Budget) {
         let mut walk = Walk {
@@ -112,6 +121,7 @@ impl Walk<'_, '_> {
         let mut archive =
             RarArchive::open_prefix(self.input.reader(first), password, NonZeroUsize::MIN)
                 .map_err(|error| self.fail(error))?;
+        archive.set_limits(limits(&self.budget));
         // Bytes may catch up with a large member as it decodes; adaptive
         // decoding picks inline or batched work from what it measures.
         archive.set_decode_mode(unrar_rs::DecodeMode::Adaptive);
@@ -244,6 +254,7 @@ impl Walk<'_, '_> {
         let taken = AtomicUsize::new(0);
         let halted = AtomicBool::new(false);
         let (input, kdf, start) = (&self.input, &self.kdf, batch.start);
+        let decode_limits = limits(&self.budget);
         let work = || {
             let Some(headers) = headers.lock().unwrap_or_else(PoisonError::into_inner).pop() else {
                 return;
@@ -253,6 +264,7 @@ impl Walk<'_, '_> {
                 password.map(str::to_owned),
                 Arc::clone(kdf),
             );
+            own.set_limits(decode_limits.clone());
             own.set_decode_mode(unrar_rs::DecodeMode::Adaptive);
             own.set_verify(true);
             // Members are taken in archive order, so every one not taken

@@ -19,6 +19,7 @@ use ::zip::read::{ArchiveOffset, Config};
 use ::zip::result::ZipResult;
 use weaver_graph::Why;
 
+use super::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
 use crate::engine::Joined;
 use crate::zip::records::{
     self, END, END_LEN, END64, END64_LEN, End, Grow, LOCATOR, LOCATOR_LEN, TAIL,
@@ -48,7 +49,7 @@ pub(super) struct Image {
 impl Image {
     // Once every volume has its length: the directory is at the tail, and
     // every place in a spanned set is the length of the volumes before it.
-    pub(super) fn open(joined: Joined) -> Result<Image, Unopened> {
+    pub(super) fn open(joined: Joined, budget: &weaver_graph::Budget) -> Result<Image, Unopened> {
         let lengths = joined.closed_lens()?;
         let total: u64 = lengths.iter().sum();
         let whole = |joined| Image {
@@ -91,6 +92,14 @@ impl Image {
         // The end record is on the last disk; a set that disagrees is not
         // the set bound.
         if end.this_disk as usize + 1 != lengths.len() {
+            return Err(Unopened::Refused(Why::Unsupported));
+        }
+        let directory_limit = budget
+            .memory_or(MAX_DIRECTORY_BYTES * 8)
+            .checked_div(8)
+            .unwrap_or(0)
+            .min(MAX_DIRECTORY_BYTES);
+        if end.size > directory_limit || end.entries > MAX_DIRECTORY_ENTRIES {
             return Err(Unopened::Refused(Why::Unsupported));
         }
         // A directory runs no further than the records after it.

@@ -260,6 +260,24 @@ fn a_zip_extracts_its_files_in_directory_order_and_skips_the_rest() {
 }
 
 #[test]
+fn a_directory_larger_than_the_run_memory_budget_is_refused() {
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    ZipEngine::new().start().run(
+        Gate::whole(vec![plain()]),
+        &mut sink,
+        weaver_graph::Budget {
+            memory_bytes: Some(1),
+            ..Default::default()
+        },
+    );
+    assert!(matches!(emits.as_slice(), [Emit::Refuse(Why::Unsupported)]));
+}
+
+#[test]
 fn a_run_waits_for_the_volume_to_close_and_extracts_once_it_has() {
     let archive = plain();
     let gate = Gate::new(vec![archive.clone()], vec![archive.len() / 2]);
@@ -577,7 +595,10 @@ fn run_far(set: Sparse) -> Vec<Said> {
 // The rewritten directory, as the store's own reader reads it, for a set
 // whose image opens.
 fn rewritten(set: Sparse) -> Vec<records::Central> {
-    let image = match super::image::Image::open(crate::engine::Joined::new(Arc::new(set))) {
+    let image = match super::image::Image::open(
+        crate::engine::Joined::new(Arc::new(set)),
+        &weaver_graph::Budget::default(),
+    ) {
         Ok(image) => image,
         Err(_) => panic!("the set opens as an image"),
     };

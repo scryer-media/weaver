@@ -169,6 +169,11 @@ func AdversarialRecipes() []Recipe {
 			Notes: "Fifteen hundred stored members. The lane runs it with the entry cap at a thousand, so the extraction budget refuses it.",
 			Build: writeAdversarialZip("entries.zip", manyMemberEntries(1500)),
 		},
+		{
+			Slug: "adv-zip-directory-memory", Family: "adversarial", ByteReproducible: true,
+			Notes: "A valid zip with a central directory over eight MiB, built from large per-entry comments. Its tiny empty members must not make the directory allocation escape the run's memory reservation.",
+			Build: writeAdversarialZip("directory.zip", oversizedDirectoryEntries()),
+		},
 	}
 	for _, lie := range adversarialPAR2Lies {
 		recipes = append(recipes, Recipe{
@@ -200,8 +205,9 @@ func AdversarialRecipes() []Recipe {
 type rawZipEntry struct {
 	// Name is the local header's name. CentralName, when set, is the name
 	// the central directory record gives instead.
-	Name        string
-	CentralName string
+	Name           string
+	CentralName    string
+	CentralComment string
 	// Method is 0 for stored, 8 for deflated; Body is the bytes after the
 	// local header, already compressed when Method says so.
 	Method uint16
@@ -317,12 +323,13 @@ func encodeRawZip(entries []rawZipEntry) ([]byte, error) {
 		put32(size)
 		put16(uint16(len(name)))
 		put16(0)
-		put16(0)
+		put16(uint16(len(entry.CentralComment)))
 		put16(0)
 		put16(0)
 		put32(0o100644 << 16)
 		put32(offsets[index])
 		out.WriteString(name)
+		out.WriteString(entry.CentralComment)
 	}
 	if len(entries) > 0xFFFF {
 		return nil, fmt.Errorf("%d entries need zip64", len(entries))
@@ -337,6 +344,20 @@ func encodeRawZip(entries []rawZipEntry) ([]byte, error) {
 	put32(uint32(directory))
 	put16(0)
 	return out.Bytes(), nil
+}
+
+func oversizedDirectoryEntries() []rawZipEntry {
+	comment := strings.Repeat("x", 0xFFFF)
+	entries := make([]rawZipEntry, 144)
+	for index := range entries {
+		entries[index] = storedEntry(fmt.Sprintf("f%03d", index), nil)
+		entries[index].CentralComment = comment
+	}
+	// A deflated first member forces the streaming store to hand the set to
+	// the ZIP engine before it can deliver any stored members.
+	entries[0].Method = 8
+	entries[0].Body = []byte{0x03, 0x00}
+	return entries
 }
 
 func writeAdversarialZip(output string, entries []rawZipEntry) func(context.Context, *Env) error {

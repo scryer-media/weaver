@@ -59,6 +59,30 @@ fn archive() -> Vec<u8> {
     write(&entries)
 }
 
+fn oversized_directory() -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..129 {
+        writer.start_file(format!("f{index:03}"), stored()).unwrap();
+    }
+    let original = writer.finish().unwrap().into_inner();
+    let end = records::find_end(&original).unwrap();
+    let offset = end.offset as usize;
+    let directory = &original[offset..offset + end.size as usize];
+    let centrals = records::directory(directory, end.entries).unwrap();
+    let comment = vec![b'x'; u16::MAX as usize];
+    let mut archive = original[..offset].to_vec();
+    for central in centrals {
+        let mut record = directory[central.span].to_vec();
+        record[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        archive.extend(record);
+        archive.extend(&comment);
+    }
+    let mut ending = original[offset + end.size as usize..].to_vec();
+    ending[12..16].copy_from_slice(&u32::try_from(archive.len() - offset).unwrap().to_le_bytes());
+    archive.extend(ending);
+    archive
+}
+
 fn has(owner: &Owner, wanted: &Emit) -> bool {
     owner.said.contains(wanted)
 }
@@ -114,6 +138,14 @@ fn a_stored_archive_says_the_same_whole_in_four_kib_frames_and_a_byte_at_a_time(
     let whole = transcript(usize::MAX >> 1);
     assert_eq!(transcript(4096), whole);
     assert_eq!(transcript(1), whole);
+}
+
+#[test]
+fn an_oversized_directory_is_handed_to_the_bounded_engine_before_it_is_read() {
+    let mut owner = Owner::single(Zip::new(), oversized_directory());
+    owner.whole(usize::MAX >> 1);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+    assert!(owner.members.is_empty());
 }
 
 #[test]

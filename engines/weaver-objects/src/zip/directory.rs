@@ -14,6 +14,7 @@ use super::map::{Entry, Map, Out};
 use super::records::{self, Central, END64_LEN, LOCAL_LEN, LOCATOR_LEN, Shape, TAIL};
 use super::{Zip, refusal};
 use crate::grid::crc32;
+use crate::zip_engine::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
 
 impl Zip {
     // Keep and bid for a range the directory read needs; its bytes once they
@@ -71,6 +72,9 @@ impl Zip {
             end = wide;
             after = start;
             read.extend([range, record]);
+        }
+        if end.size > MAX_DIRECTORY_BYTES || end.entries > MAX_DIRECTORY_ENTRIES {
+            return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
         }
         // A directory the volumes bound cannot hold is not one this store
         // reads: prepended bytes, or a set whose last volume is misplaced.

@@ -467,6 +467,20 @@
       }
     },
     {
+      "path": "testdata/adv-zip-directory-memory/directory.zip",
+      "size": 9449160,
+      "blake3": "7ada62eadfd3e8d60b4f562e1d2f20b97400d8eafab5bac7a17963966ac6ff49",
+      "format": "zip",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-zip",
+          "go-fixture-bytes"
+        ]
+      }
+    },
+    {
       "path": "testdata/adv-zip-duplicate-names/duplicates.zip",
       "size": 279,
       "blake3": "a280d663b58ee0586ba91187b5fc3bfd5dc4359525d9e07a3c3e7844e0f730f4",

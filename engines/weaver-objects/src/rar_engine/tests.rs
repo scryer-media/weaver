@@ -1006,6 +1006,25 @@ fn on_threads(volumes: Vec<Vec<u8>>, threads: usize) -> OnThreads {
 }
 
 #[test]
+fn a_compressed_member_larger_than_the_run_memory_budget_is_refused() {
+    let archive = include_bytes!(
+        "../../../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar5_lz.rar"
+    );
+    let result = on_budget(vec![archive.to_vec()], Some(1), 1);
+    assert!(
+        result.said.contains(&Said::Refuse(Why::Unsupported)),
+        "{} events",
+        result.said.len()
+    );
+    assert!(
+        !result
+            .said
+            .iter()
+            .any(|said| matches!(said, Said::Bytes(_, _)))
+    );
+}
+
+#[test]
 fn the_files_of_a_set_that_is_not_solid_decode_side_by_side_and_are_said_in_order() {
     let alone = on_threads(six_files(0), 1);
     let beside = on_threads(six_files(0), 4);
