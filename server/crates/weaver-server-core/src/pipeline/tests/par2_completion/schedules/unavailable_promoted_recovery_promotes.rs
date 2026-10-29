@@ -77,7 +77,7 @@ async fn most_articles_missing_without_par2_fails_with_no_file_whole() {
     }
     row(
         &scenario,
-        Expect::Failed(HistoryFailureKind::Unpack),
+        Expect::Failed(HistoryFailureKind::Health),
         "six of ten missing",
     )
     .await;

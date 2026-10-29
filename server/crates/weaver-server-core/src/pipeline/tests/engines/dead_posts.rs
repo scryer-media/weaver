@@ -9,6 +9,7 @@
 // refused rules impossible, and the job ends on its words.
 
 use super::harness::*;
+use super::restart::run_restarting;
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 
@@ -618,4 +619,24 @@ async fn the_feed_forgets_its_probe_when_the_job_leaves_the_root() {
     assert!(pipeline.jobs.contains_key(&JOB));
     assert!(!pipeline.post_probes.states.contains_key(&JOB));
     retire_pipeline_database(pipeline).await;
+}
+
+// A post below its critical line is as dead after a restart as before one:
+// the articles a run before the restart lost count against it, as the root
+// was restored holding them, so a job restarted after every article fails
+// on its health as a job that never restarted does.
+#[tokio::test]
+async fn a_post_dead_on_its_health_is_dead_after_a_restart() {
+    let scenario = (2..8u32).fold(
+        Scenario::new(vec![Post::plain("lantern.bin", payload(10 * ARTICLE, 174))]),
+        |scenario, ordinal| scenario.lost(0, ordinal),
+    );
+    let whole = run(&scenario).await;
+    let failure = whole.failure.as_deref().unwrap_or_default();
+    assert!(failure.contains("below critical"), "{failure}");
+    assert_eq!(whole.failure_kind, Some(HistoryFailureKind::Health));
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert!(restarted.restarts > 1, "the run restarted");
+    assert_eq!(restarted.status, whole.status);
+    assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
 }
