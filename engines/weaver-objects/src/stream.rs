@@ -244,7 +244,7 @@ impl<D: Decoder> Object for Stream<D> {
         self.pieces.insert(volume.0);
     }
 
-    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+    fn renamed(&mut self, volume: VolumeIndex, name: &str, _out: &mut Vec<Emit>) {
         if volume == VolumeIndex(0) {
             name.clone_into(&mut self.name);
         }

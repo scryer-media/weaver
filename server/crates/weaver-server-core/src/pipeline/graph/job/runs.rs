@@ -31,6 +31,9 @@ impl GraphJob {
                 self.loans.returned(said.node, said.generation);
                 replayed.remove().map_err(WriteError::from)?;
             }
+            Heard::Verified(_) => {
+                self.loans.returned(said.node, said.generation);
+            }
             Heard::Written { stamp, control } => {
                 if self.pending.control().same(&control) {
                     self.acknowledge_checkpoint(stamp.unwrap_or(said.generation));
@@ -64,6 +67,22 @@ impl GraphJob {
                     &mut *self.builder,
                     &self.root,
                     *replayed,
+                    &mut out,
+                )?;
+                self.heard(out)?;
+                self.step_runs(Vec::new(), limit)?;
+                return self.lend(slots, limit);
+            }
+            Heard::Verified(verified) => {
+                if !self.loans.returned(node, said.generation) {
+                    return Ok(());
+                }
+                let mut out = Vec::new();
+                self.writer.verified(
+                    &mut self.tree,
+                    &mut *self.builder,
+                    &self.root,
+                    *verified,
                     &mut out,
                 )?;
                 self.heard(out)?;

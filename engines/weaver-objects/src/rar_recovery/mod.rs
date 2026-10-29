@@ -416,7 +416,7 @@ impl Object for RarRecovery {
         rev.take(0, front);
     }
 
-    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+    fn renamed(&mut self, volume: VolumeIndex, name: &str, _out: &mut Vec<Emit>) {
         self.rev(volume).name = name.to_owned();
     }
 

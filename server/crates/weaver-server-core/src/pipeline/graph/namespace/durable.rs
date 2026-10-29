@@ -148,8 +148,9 @@ impl NamespaceWriter {
     // job's budget as far as the tree's coverage of it reaches. A member
     // with a stated CRC takes back its fold, so its check at close reads
     // nothing: one closed whole and undamaged passed that check as it
-    // closed, and one still open reads what it holds back here, off the
-    // pipeline thread, as a restore reads.
+    // closed, unless verification was still pending. Pending checks keep
+    // no assumed fold and resume through the worker. One still open reads
+    // what it holds back here, off the pipeline thread, as a restore reads.
     pub(crate) fn restore_file(
         &mut self,
         tree: &Tree,
@@ -166,12 +167,14 @@ impl NamespaceWriter {
             if let Some(stated) = record.crc32 {
                 match record.length {
                     Some(length)
-                        if record.closed
+                        if !self.verifications.contains(&(node, member))
+                            && record.closed
                             && record.coverage.covered(ByteRange::new(0, length))
                             && !record.coverage.damaged(ByteRange::new(0, length)) =>
                     {
                         leaf.fold_passed(length, stated);
                     }
+                    _ if self.verifications.contains(&(node, member)) => {}
                     _ => leaf.fold_back(
                         record
                             .coverage

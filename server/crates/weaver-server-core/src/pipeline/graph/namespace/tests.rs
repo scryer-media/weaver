@@ -17,6 +17,7 @@ use crate::pipeline::graph::lines::Lines;
 mod recovery;
 mod replay;
 mod streams;
+mod verification;
 mod windows;
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";

@@ -126,6 +126,7 @@ fn full() -> Snapshot {
             next_node: 3,
         },
         root: RootFacts {
+            pending_verifications: Vec::new(),
             next_node: 3,
             posted: vec!["alpha.part1.rar".to_owned(), "alpha.par2".to_owned()],
             volumes: vec![
@@ -246,6 +247,7 @@ fn encoding(facts: &RootFacts) -> Encoding {
         facts.next_node,
         facts.read_backs,
         facts.reported,
+        facts.pending_verifications.clone(),
     )
 }
 

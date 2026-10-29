@@ -320,7 +320,8 @@ impl GraphJob {
         let extracting = phase::extracting(&self.tree)
             || self.runs.live()
             || self.writer.rechecks_waiting()
-            || self.loans.replaying();
+            || self.writer.verifications_waiting()
+            || self.loans.reading();
         RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
     }
 
@@ -747,3 +748,6 @@ impl SeekUp for Recorder<'_> {
         Pull::Moved(0)
     }
 }
+
+#[cfg(test)]
+mod verification_tests;

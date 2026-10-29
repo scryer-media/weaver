@@ -539,6 +539,44 @@ fn a_volume_named_first_yields_the_place_its_own_front_rules_out() {
 }
 
 #[test]
+fn a_volume_held_by_its_name_goes_back_when_a_rename_places_it_elsewhere() {
+    let volumes = write(&items(), &split_encrypted(Version::Rar5, true));
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+    let mut object = store();
+    object.bound(VolumeIndex(0), "3c9e1f.rar", &front(&volumes[1]), None);
+    object.bound(VolumeIndex(1), "3c9e1f.r00", &front(&volumes[0]), None);
+    let mut out = Vec::new();
+    object.renamed(VolumeIndex(1), "3c9e1f.r00", &mut out);
+    assert!(out.is_empty());
+    object.renamed(VolumeIndex(0), "alpha.part2.rar", &mut out);
+    assert!(out.contains(&Emit::GiveBack(VolumeIndex(0))), "{out:?}");
+    let carried = object.give_back(VolumeIndex(0)).unwrap();
+    let mut receiver = store();
+    receiver.bound(VolumeIndex(0), "alpha.part1.rar", &front(&volumes[0]), None);
+    assert_eq!(
+        receiver.reclaim(
+            "alpha.part2.rar",
+            &front(&volumes[1]),
+            None,
+            carried.as_ref()
+        ),
+        Some(VolumeIndex(1))
+    );
+}
+
+#[test]
+fn a_volume_contributing_output_cannot_transfer_its_parse() {
+    let volumes = write(&items(), &split(Version::Rar5));
+    let mut owner = Owner::named(store(), volumes);
+    owner.whole(4096);
+    no_trouble(&owner);
+    assert!(!owner.members.is_empty());
+    assert!(owner.object.carried(VolumeIndex(0)).is_none());
+    assert!(owner.object.give_back(VolumeIndex(0)).is_none());
+    posted_whole(&owner);
+}
+
+#[test]
 fn a_solid_set_asks_for_an_engine_before_any_member() {
     for version in [Version::Rar5, Version::Rar4] {
         let mut options = Options::new(version);

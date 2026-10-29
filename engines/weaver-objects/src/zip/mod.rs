@@ -524,7 +524,7 @@ impl Object for Zip {
     }
 
     // The name a recovery set gave the volume is the set's numbering now.
-    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+    fn renamed(&mut self, volume: VolumeIndex, name: &str, _out: &mut Vec<Emit>) {
         self.names.remove(&volume.0);
         let first = self.names.values().next();
         if let Some(parsed) = ZipFormat::parse(name)

@@ -90,6 +90,7 @@ impl GraphJob {
         )
         .capped(storage.caps)
         .metered(storage.metrics);
+        writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
         for ((node, member), state) in &snapshot.files {
             if tree

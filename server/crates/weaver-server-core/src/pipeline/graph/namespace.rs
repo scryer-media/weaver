@@ -22,7 +22,7 @@
 // The tree records coverage and routes; this file is where bytes touch
 // disk. It takes a node everywhere and never assumes the root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -124,6 +124,8 @@ pub(crate) struct NamespaceWriter {
     // Rejected members waiting for their input dependencies to be staged
     // off the loop, before coverage or inverse mappings can be changed.
     rechecks: BTreeMap<NodeId, Vec<(VolumeIndex, ByteRange)>>,
+    // Sparse durable obligations, retained until a current verification answers.
+    verifications: BTreeSet<(NodeId, MemberId)>,
     // Whether the job's holds have been paged out for a stop. Only then do
     // the holds on scratch go in the checkpoint: scratch space is reused
     // once nothing lives on it, so a row written mid-run could name bytes a
@@ -162,6 +164,7 @@ impl NamespaceWriter {
             files: Marked::default(),
             read_backs: 0,
             rechecks: BTreeMap::new(),
+            verifications: BTreeSet::new(),
             stopped: false,
             renamed: Vec::new(),
             moves: Vec::new(),
@@ -1335,11 +1338,12 @@ impl NamespaceWriter {
     // Whether the member's file, every byte of it in and none damaged,
     // fails the CRC32 its object's headers state for it. Every such member
     // is checked, from the CRC the leaf folded as its writes landed, which
-    // a rewrite, a cut and a restore keep, so nothing is read back here. A
+    // a rewrite, a cut and a restore keep. A missing fold queues a worker
+    // and keeps a sparse durable obligation; nothing is read back here. A
     // member with no stated checksum, or one already short or damaged, has
     // nothing more for the check to say.
     fn fails_its_checksum(
-        &self,
+        &mut self,
         tree: &Tree,
         node: NodeId,
         member: MemberId,
@@ -1364,7 +1368,16 @@ impl NamespaceWriter {
         else {
             return Ok(false);
         };
-        Ok(leaf.crc32(length)? != stated)
+        match leaf.folded(length) {
+            Some(actual) => {
+                self.verifications.remove(&(node, member));
+                Ok(actual != stated)
+            }
+            None => {
+                self.verifications.insert((node, member));
+                Ok(false)
+            }
+        }
     }
 
     // The member's file reaches `end`, by a write or by taking its length.
@@ -1841,6 +1854,9 @@ mod loan;
 mod moves;
 mod recovery;
 mod refusal;
+mod verification;
+
+pub(crate) use verification::{Verification, Verified};
 
 pub(crate) use loan::replay::{Replay, Replayed};
 pub(crate) use loan::{Loan, Returned};

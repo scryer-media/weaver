@@ -268,7 +268,7 @@ fn a_place_whose_front_came_is_held_after_a_restore() {
 #[test]
 fn a_piece_a_recovery_set_names_takes_the_place_its_number_gives() {
     let (mut object, pieces) = unnamed_middles();
-    object.renamed(VolumeIndex(0), "alpha.7z.001");
+    object.renamed(VolumeIndex(0), "alpha.7z.001", &mut Vec::new());
     for (volume, name) in [(2, "alpha.7z.003"), (1, "alpha.7z.002")] {
         let piece = &pieces[volume].1;
         let (front, length) = (&piece[..32], Some(piece.len() as u64));

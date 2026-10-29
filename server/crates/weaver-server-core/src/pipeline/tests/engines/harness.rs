@@ -1128,7 +1128,17 @@ pub(in crate::pipeline::tests) async fn run_unprompted(
             .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            let replayed = matches!(
+                &said.heard,
+                crate::pipeline::graph::engine::Heard::Replayed(_)
+            );
             pipeline.graph_run_said(said);
+            if replayed {
+                assert!(
+                    pipeline.pending_completion_checks.contains(&JOB),
+                    "replay acknowledgment must schedule completion without an idle look"
+                );
+            }
             look(&pipeline, &mut outcomes);
             continue;
         }

@@ -69,6 +69,7 @@ pub(crate) enum Heard {
     // the set's node, under the loan's number for a generation.
     Repaired(Box<Returned>),
     Replayed(Box<super::namespace::Replayed>),
+    Verified(Box<super::namespace::Verified>),
     // The job's checkpoints committed through this stamp, or a write of
     // them failed (`None`), while a member's file waited on them to move.
     // Addressed to the root, under no run's generation.

@@ -179,16 +179,28 @@ impl RarStore {
         self.claim_as(name, format, self.front_facts(first_bytes).as_ref())
     }
 
-    // A volume a store beside this one gave back, placed by the headers that
-    // store read of it: nothing of the member is read again.
-    pub(super) fn reclaim_volume(&self, name: &str, given: &Volume) -> Option<Placed> {
+    // A transferable volume is judged by its parsed headers, or by the
+    // retained front and name while those headers say nothing. Both are
+    // the same evidence an unowned member offers, without reading it again.
+    pub(super) fn reclaim_volume(
+        &self,
+        name: &str,
+        front: &[u8],
+        given: &Volume,
+    ) -> Option<Placed> {
         let facts = given
             .walk
             .facts
             .as_ref()
-            .or(given.front.as_ref())
-            .filter(|facts| facts.is_volume)?;
-        self.claim_as(name, facts.archive_format(), Some(facts))
+            .filter(|_| given.walk.in_set().is_some())
+            .or(given.front.as_ref());
+        match facts {
+            Some(facts) if facts.is_volume => {
+                self.claim_as(name, facts.archive_format(), Some(facts))
+            }
+            Some(_) => None,
+            None => self.claim_volume(name, front),
+        }
     }
 
     // One past every volume the set holds.

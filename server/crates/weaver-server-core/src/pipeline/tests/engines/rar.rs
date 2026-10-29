@@ -456,6 +456,91 @@ async fn nameless_header_encrypted_volumes_under_par2_posted_first_deliver() {
     assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
 }
 
+// The encrypted fronts are claimed under swapped names before metadata
+// supplies their real names. The password is offered only after those
+// provisional claims exist; the verified names must correct the layout.
+#[tokio::test]
+async fn verified_renames_reassign_swapped_held_volumes() {
+    use super::refused_then_repaired::{drive_to_finish, serve_posts, serve_queued};
+    use crate::pipeline::tests::pump_pipeline_runtime_queues;
+    use weaver_graph::{MemberId, NodeId, VolumeIndex};
+
+    let body = payload(48 * 1024 + 13, 51);
+    let volumes = header_encrypted_store_set(MEMBER, &body, 2, SECRET, HeaderCheck::For(SECRET));
+    let files: Vec<_> = volumes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posted = vec![
+        Post::plain("3c9e1f.rar", volumes[1].1.clone()),
+        Post::plain("3c9e1f.r00", volumes[0].1.clone()),
+    ];
+    posted.extend(par2_set("silver.horizon", &files, 2));
+    let scenario = Scenario::new(posted).framed(16 * 1024);
+    let (_temp, mut pipeline, complete_dir) = admit(&scenario).await;
+    for file in 0..2 {
+        serve_queued(&mut pipeline, &scenario, (file, 0)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    let tree = pipeline.graph_jobs[&JOB].tree();
+    let (owner, index) = tree.child_of(NodeId::ROOT, MemberId(0)).unwrap();
+    assert_eq!(
+        index,
+        VolumeIndex(0),
+        "the wrong posted name must first claim index zero"
+    );
+    assert_eq!(
+        tree.child_of(NodeId::ROOT, MemberId(1)),
+        Some((owner, VolumeIndex(1)))
+    );
+    let job = pipeline.graph_jobs.remove(&JOB).unwrap();
+    pipeline
+        .graph_jobs
+        .insert(JOB, job.offering(vec![SECRET.to_owned()]));
+    serve_posts(&mut pipeline, &scenario, 2..scenario.posts.len() as u32).await;
+    loop {
+        let job = &pipeline.graph_jobs[&JOB];
+        let tree = job.tree();
+        if let Some((owner, VolumeIndex(0))) = tree.child_of(NodeId::ROOT, MemberId(1))
+            && tree.child_of(NodeId::ROOT, MemberId(0)) == Some((owner, VolumeIndex(1)))
+        {
+            break;
+        }
+        assert!(job.awaits_mail(), "verified volumes must be reassigned");
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the owning worker answers");
+        pipeline.graph_run_said(said);
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    let tree = pipeline.graph_jobs[&JOB].tree();
+    assert_eq!(
+        tree.namespace(NodeId::ROOT)
+            .unwrap()
+            .get(MemberId(0))
+            .unwrap()
+            .name,
+        volumes[1].0
+    );
+    let (owner, index) = tree
+        .child_of(NodeId::ROOT, MemberId(1))
+        .expect("verified first volume is bound");
+    assert_eq!(index, VolumeIndex(0));
+    assert_eq!(
+        tree.child_of(NodeId::ROOT, MemberId(0)),
+        Some((owner, VolumeIndex(1)))
+    );
+    drive_to_finish(&mut pipeline, &scenario).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut delivered_files = std::collections::BTreeMap::new();
+    super::harness::collect(&complete_dir, &complete_dir, &mut delivered_files);
+    retire_pipeline_database(pipeline).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    assert_eq!(delivered_files.get(&delivered(MEMBER)), Some(&body));
+}
+
 // Nameless and posted last volume first, so the store is built on the
 // set's last volume and every earlier one arrives after it, and nothing but
 // the headers says where each goes. A named set is fetched in its names'
