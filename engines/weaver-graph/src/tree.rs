@@ -886,12 +886,13 @@ impl Tree {
     }
 
     // A recovery object repaired the member, a leaf of `node`'s namespace:
-    // a refusal of it was a verdict on bytes it no longer holds. Every
-    // object that refused it goes whole, as a buried node does when its
-    // volumes are read again: the reader offered them makes every member
-    // over. Each of its volumes is a member no object owns, asked again who
-    // owns it as a member whose front has just spoken. Returns those
-    // volumes; none when nothing refused the member.
+    // a refusal of it was a verdict on bytes it no longer holds, and so was
+    // its own front's word that no object owns it. Every object that
+    // refused it goes whole, as a buried node does when its volumes are
+    // read again: the reader offered them makes every member over. Each of
+    // its volumes is a member no object owns, asked again who owns it as a
+    // member whose front has just spoken, and so is the member itself.
+    // Returns those members; none when an object owns the member.
     pub fn reopen(
         &mut self,
         node: NodeId,
@@ -902,18 +903,32 @@ impl Tree {
         if self.child_of(node, member).is_some() {
             return Vec::new();
         }
+        // The objects that refused for want of bytes the rewrite may have
+        // changed: those holding the member, and those that gave up for a
+        // volume of the namespace they could not place or whose first bytes
+        // never came, which the rewritten member may be.
         let refusers: Vec<NodeId> = self
             .refused_below(node)
             .into_iter()
             .filter(|object| {
                 self.volumes(*object)
                     .is_some_and(|(_, volumes)| volumes.values().any(|bound| *bound == member))
+                    || self.nodes.get(object).is_some_and(|refuser| {
+                        matches!(refuser.refused, Some(Why::FirstBytesLost | Why::Unmapped))
+                    })
             })
             .collect();
-        let mut reopened = Vec::new();
+        if refusers.is_empty() && !self.unowned(node, member) {
+            return Vec::new();
+        }
+        let mut reopened = vec![member];
         for refuser in refusers {
             if let Some((_, volumes)) = self.volumes(refuser) {
-                reopened.extend(volumes.values().copied());
+                for volume in volumes.values().copied() {
+                    if !reopened.contains(&volume) {
+                        reopened.push(volume);
+                    }
+                }
             }
             self.drop_subtree(refuser, effects);
             self.remove_node(refuser, effects);
