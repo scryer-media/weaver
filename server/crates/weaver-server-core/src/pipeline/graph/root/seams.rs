@@ -316,7 +316,10 @@ impl Pipeline {
         }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
             if self.pending_graph_terminals.contains_key(&job_id)
-                || matches!(&said.heard, Heard::Repaired(_) | Heard::Replayed(_))
+                || matches!(
+                    &said.heard,
+                    Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
+                )
             {
                 if let Err(error) = graph.drain_failed_run(said) {
                     warn!(job_id = job_id.0, %error, "failed to discard a stopped graph worker's output");
@@ -378,7 +381,7 @@ impl Pipeline {
         };
         let ended = matches!(
             said.heard,
-            Heard::Ended | Heard::Repaired(_) | Heard::Replayed(_)
+            Heard::Ended | Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
         );
         let moving = graph.moves_waiting();
         let result = graph.run_said(said, &mut self.graph_status.repairs, limit);

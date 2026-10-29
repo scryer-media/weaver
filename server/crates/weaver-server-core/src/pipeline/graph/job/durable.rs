@@ -82,8 +82,13 @@ impl GraphJob {
     // The root's facts, with the job's count of repair reads and the phase
     // it last reported, encoded into `encoded`.
     pub(crate) fn encode_root(&self, encoded: &mut Encoded, next_node: u32) -> Encoding {
-        self.root
-            .encode(encoded, next_node, self.writer.read_backs(), self.reported)
+        self.root.encode(
+            encoded,
+            next_node,
+            self.writer.read_backs(),
+            self.reported,
+            self.writer.pending_verifications(),
+        )
     }
 
     // The post's encoded bytes of the articles the root's facts say this

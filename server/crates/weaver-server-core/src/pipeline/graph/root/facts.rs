@@ -37,12 +37,16 @@ pub(crate) struct RootFacts {
     // change from it. A checkpoint written before this was kept has none.
     #[serde(default)]
     pub(crate) reported: Option<RootPhase>,
+    // Namespace members whose whole-file verification has not been acknowledged.
+    #[serde(default)]
+    pub(crate) pending_verifications: Vec<(u32, u32)>,
 }
 
 impl RootFacts {
     // 3: each volume's lists shelved a chunk of articles to a part.
     // 4: a sealed value encodes as nothing, numbered by its owner's walk.
-    pub(crate) const VERSION: u16 = 4;
+    // 5: sparse outstanding namespace checksum checks in the root row.
+    pub(crate) const VERSION: u16 = 5;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +130,8 @@ pub(crate) struct Encoded {
     volumes: Vec<EncodedVolume>,
     read_backs: u64,
     reported: Option<RootPhase>,
+    #[serde(default)]
+    pending_verifications: Vec<(u32, u32)>,
     // The generation of each of its sealed values when its parts were last
     // taken, by number in the walk.
     #[serde(skip)]
@@ -215,6 +221,7 @@ impl Encoded {
             volumes: self.volumes.iter().map(EncodedVolume::facts).collect(),
             read_backs: self.read_backs,
             reported: self.reported,
+            pending_verifications: self.pending_verifications.clone(),
         }
     }
 }
@@ -257,10 +264,12 @@ impl ArticleRoot {
         next_node: u32,
         read_backs: u64,
         reported: Option<RootPhase>,
+        pending_verifications: Vec<(u32, u32)>,
     ) -> Encoding {
         encoded.next_node = next_node;
         encoded.read_backs = read_backs;
         encoded.reported = reported;
+        encoded.pending_verifications = pending_verifications;
         let read = encoded.volumes.len() == self.map.volume_count()
             && encoded.volumes.iter().all(|volume| volume.read.is_some());
         let done = match read {
@@ -384,7 +393,7 @@ pub(crate) fn decode(
     bytes: &[u8],
     parts: &[Part],
 ) -> Result<RootFacts, RootFactsError> {
-    if version != RootFacts::VERSION {
+    if version != 4 && version != RootFacts::VERSION {
         return Err(RootFactsError::Version(version));
     }
     decode_parts::<Encoded>(bytes, parts)

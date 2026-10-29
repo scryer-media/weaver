@@ -59,7 +59,7 @@ impl Loans {
         self.out.is_some()
     }
 
-    pub(crate) fn replaying(&self) -> bool {
+    pub(crate) fn reading(&self) -> bool {
         self.out.as_ref().is_some_and(|out| out.stop.is_some())
     }
 
@@ -181,6 +181,29 @@ impl Lender for Lending<'_> {
 }
 
 impl Lending<'_> {
+    pub(crate) fn verify(&mut self, check: super::super::namespace::Verification) {
+        let loans = &mut *self.loans;
+        loans.serial += 1;
+        let (scope, node, serial) = (loans.scope, check.node, loans.serial);
+        loans.out = Some(Out {
+            set: node,
+            serial,
+            state: None,
+            stop: Some(Arc::clone(&check.stop)),
+        });
+        let mail = loans.mail.clone();
+        let shutdown = loans.hardware.shutdown().clone();
+        tokio::task::spawn_blocking(move || {
+            let checked = check.run(&shutdown);
+            let _ = mail.blocking_send(Said {
+                scope,
+                node,
+                generation: serial,
+                heard: Heard::Verified(Box::new(checked)),
+            });
+        });
+    }
+
     // Reconstruction shares admission and the completion acknowledgment
     // with repair work; it never borrows a live object's delivery queue.
     pub(crate) fn replay(&mut self, replay: Replay) {

@@ -304,35 +304,13 @@ impl Leaf {
     // The CRC32 of the member's `length` bytes as the fold holds them,
     // when one run covers exactly them.
     pub(crate) fn folded(&self, length: u64) -> Option<u32> {
+        if length == 0 {
+            return Some(0);
+        }
         match self.written.iter().next() {
             Some((0, run)) if self.written.len() == 1 && run.end == length => Some(run.crc32),
             _ => None,
         }
-    }
-
-    // The CRC32 of the member's `length` bytes: from the fold, which a
-    // rewrite, a cut and a restore all keep, and read back from the file
-    // only for bytes that came to it some other way.
-    pub(crate) fn crc32(&self, length: u64) -> Result<u32, LeafError> {
-        if let Some(folded) = self.folded(length) {
-            return Ok(folded);
-        }
-        let mut crc = 0u32;
-        let mut at = 0u64;
-        let mut chunk = Vec::new();
-        while at < length {
-            let take = (length - at).min(READ_BACK);
-            chunk.clear();
-            self.read(at, index(take), &mut chunk)?;
-            let part = crc32(&chunk);
-            crc = if at == 0 {
-                part
-            } else {
-                combine(crc, part, take)
-            };
-            at += take;
-        }
-        Ok(crc)
     }
 
     // Create the file in the directory it lies in, which must already be

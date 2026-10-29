@@ -64,6 +64,18 @@ impl GraphJob {
                 return Ok(());
             }
         }
+        if self.writer.verifications_waiting() {
+            let mut lending = self
+                .loans
+                .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
+            if !lending.admit() {
+                return Ok(());
+            }
+            if let Some(check) = self.writer.take_verification(&self.tree) {
+                lending.verify(check);
+                return Ok(());
+            }
+        }
         let mut walked = None;
         while let Some(node) = self.tree.next_live(walked) {
             walked = Some(node);
@@ -148,6 +160,7 @@ impl GraphJob {
             && !self.runs.live()
             && !self.loans.out()
             && !self.writer.rechecks_waiting()
+            && !self.writer.verifications_waiting()
             && self.writer.all_ruled(&self.tree)
     }
 

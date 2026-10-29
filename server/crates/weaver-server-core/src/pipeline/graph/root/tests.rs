@@ -1004,7 +1004,7 @@ fn encodes_whole(
     step: usize,
 ) {
     use super::facts::{Encoded, Parts};
-    let encoding = root.encode(encoded, 9, 2, Some(RootPhase::Done));
+    let encoding = root.encode(encoded, 9, 2, Some(RootPhase::Done), Vec::new());
     match encoding.parts {
         Parts::All(parts) => *held = self::held(parts),
         Parts::Changed(parts) => {
@@ -1016,7 +1016,13 @@ fn encodes_whole(
             }
         }
     }
-    let whole = root.encode(&mut Encoded::default(), 9, 2, Some(RootPhase::Done));
+    let whole = root.encode(
+        &mut Encoded::default(),
+        9,
+        2,
+        Some(RootPhase::Done),
+        Vec::new(),
+    );
     assert_eq!(
         (encoding.version, &encoding.bytes),
         (whole.version, &whole.bytes),
@@ -1131,12 +1137,12 @@ fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
     let changed = |articles: usize| {
         let mut root = ArticleRoot::new(&[file("a.bin", &vec![70; articles])]);
         let mut encoded = Encoded::default();
-        root.encode(&mut encoded, 9, 2, None);
+        root.encode(&mut encoded, 9, 2, None, Vec::new());
         root.receive(with_segments(
             decoded(0, 5, 300, &[1; 60], None),
             &[(300, 330, 1), (330, 360, 2)],
         ));
-        let Parts::Changed(parts) = root.encode(&mut encoded, 9, 2, None).parts else {
+        let Parts::Changed(parts) = root.encode(&mut encoded, 9, 2, None, Vec::new()).parts else {
             panic!("an encoding after the first is of what changed");
         };
         parts
@@ -1285,4 +1291,49 @@ fn a_deferral_never_lowers_a_raised_article_and_is_never_lost() {
             .seek(VolumeIndex(9), ByteRange::new(0, 100), Some(Class::Parked)),
         Pull::Moved(0)
     );
+}
+
+#[test]
+fn pending_verification_changes_only_the_small_root_record() {
+    use super::facts::{Encoded, Parts, decode};
+    let root = ArticleRoot::new(&[file("payload.bin", &vec![70; 400])]);
+    let mut encoded = Encoded::default();
+    let first = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    let Parts::All(parts) = first.parts else {
+        panic!("first encoding is whole");
+    };
+    let pending = vec![(3, 7), (9, 2)];
+    let check = root.encode(&mut encoded, 9, 0, None, pending.clone());
+    assert!(matches!(&check.parts, Parts::Changed(changes) if changes.is_empty()));
+    assert_eq!(
+        decode(check.version, &check.bytes, &parts)
+            .unwrap()
+            .pending_verifications,
+        pending
+    );
+    let same = root.encode(&mut encoded, 9, 0, None, pending);
+    assert_eq!(same.bytes, check.bytes);
+    assert!(matches!(&same.parts, Parts::Changed(changes) if changes.is_empty()));
+    let done = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    assert!(matches!(&done.parts, Parts::Changed(changes) if changes.is_empty()));
+    assert_eq!(done.bytes, first.bytes);
+}
+
+#[test]
+fn previous_root_facts_without_pending_verification_still_decode() {
+    use super::facts::{Encoded, Parts, decode};
+    let root = ArticleRoot::new(&[file("payload.bin", &[70])]);
+    let mut encoded = Encoded::default();
+    let encoding = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    let Parts::All(parts) = encoding.parts else {
+        panic!("first encoding is whole");
+    };
+    let mut legacy = encoding.bytes;
+    // Version four was the same MessagePack tuple without the trailing list.
+    assert_eq!(legacy[0], 0x96);
+    assert_eq!(legacy.pop(), Some(0x90));
+    legacy[0] = 0x95;
+    let restored = decode(4, &legacy, &parts).unwrap();
+    assert!(restored.pending_verifications.is_empty());
+    assert_eq!(restored.posted, vec!["payload.bin"]);
 }
