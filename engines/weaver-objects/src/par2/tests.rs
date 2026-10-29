@@ -76,6 +76,32 @@ fn damaged_member(
 }
 
 #[test]
+fn missing_checksums_wait_for_open_carriers_but_not_exhausted_ones() {
+    let data = payload(1, 5000);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
+    let key = *job.object.sets.keys().next().unwrap();
+    job.object
+        .sets
+        .get_mut(&key)
+        .unwrap()
+        .index
+        .as_mut()
+        .unwrap()
+        .slice_checksums
+        .clear();
+    assert!(!job.object.awaiting_checksums(&key));
+    job.object.volumes[0].closed = false;
+    assert!(job.object.awaiting_checksums(&key));
+    assert!(job.object.waits(&key, 0));
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Waiting));
+    let mut wants = Vec::new();
+    Recovery::wants(&job.object, &mut wants);
+    assert!(!wants.is_empty());
+    job.object.volumes[0].closed = true;
+    assert!(!job.object.awaiting_checksums(&key));
+}
+
+#[test]
 fn binds_by_its_described_name_without_renaming() {
     let data = payload(1, 5000);
     let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));

@@ -285,7 +285,22 @@ impl Par2 {
 
     // Whether a set whose last repair came up short still waits: the blocks
     // it needs are not all in hand, and its volumes may bring more.
+    fn awaiting_checksums(&self, key: &[u8; 16]) -> bool {
+        self.sets[key].usable().is_some_and(|index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .any(|file| index.file_checksums(file).is_none())
+        }) && self
+            .volumes
+            .iter()
+            .any(|volume| !volume.closed && volume.serves(key))
+    }
+
     fn waits(&self, key: &[u8; 16], needed: u64) -> bool {
+        if self.awaiting_checksums(key) {
+            return true;
+        }
         let state = &self.sets[key];
         if state.usable().is_none() {
             return self.describing(Some(key)).is_some() && self.undescribed_damage();
@@ -350,12 +365,16 @@ impl Par2 {
                     hash,
                     packet,
                 } => {
-                    self.sets
+                    let changed = self
+                        .sets
                         .entry(set)
                         .or_insert_with(|| SetState::new((volume, at)))
                         .take_metadata(hash, packet, self.output_limit);
                     self.volume(volume).sets.insert(set);
-                    self.fold_set(set);
+                    if changed {
+                        self.evidence.retain(|(key, _), _| *key != set);
+                        self.fold_set(set);
+                    }
                 }
                 Found::Recovery {
                     set,
@@ -736,6 +755,15 @@ impl Recovery for Par2 {
         }
         for key in self.ordered() {
             let state = &self.sets[&key];
+            if self.awaiting_checksums(&key) {
+                if let Some(index) = self.describing(Some(&key))
+                    && !asked[index]
+                {
+                    asked[index] = true;
+                    self.volumes[index].ask(VolumeIndex(index as u32), out);
+                }
+                continue;
+            }
             if state.usable().is_none() {
                 if state.short_of().is_some()
                     && self.undescribed_damage()
@@ -792,6 +820,10 @@ impl Recovery for Par2 {
         let damage = self.undescribed_damage();
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
+            if self.awaiting_checksums(&key) {
+                outcome = combine(outcome, RepairOutcome::Waiting);
+                continue;
+            }
             if let Some(short) = self.refused_short(&key) {
                 outcome = combine(outcome, short);
                 continue;
@@ -843,6 +875,10 @@ impl Recovery for Par2 {
         }
         let mut outcome = RepairOutcome::Unread;
         for key in self.ordered() {
+            if self.awaiting_checksums(&key) {
+                outcome = combine(outcome, RepairOutcome::Waiting);
+                continue;
+            }
             if let Some(short) = self.refused_short(&key) {
                 outcome = combine(outcome, short);
                 continue;

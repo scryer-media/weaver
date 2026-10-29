@@ -82,20 +82,23 @@ impl SetState {
     // metadata is a few packets per file, so rebuilding is cheaper than
     // keeping two ways of growing it. A set whose geometry is past the
     // limits has no index.
-    pub(super) fn take_metadata(&mut self, hash: [u8; 16], packet: Packet, output_limit: u64) {
+    pub(super) fn take_metadata(
+        &mut self,
+        hash: [u8; 16],
+        packet: Packet,
+        output_limit: u64,
+    ) -> bool {
         if !self.hashes.insert(hash) {
-            return;
+            return false;
         }
-        let described = self.usable().is_some();
         self.packets.change(|packets| packets.0.push(packet));
         self.index = index_of(&self.packets.get().0, output_limit);
         self.whole = whole_of(self.index.as_ref());
         self.alike = alike_of(self.index.as_ref());
-        // A ruling made with no description was on nothing: the set rules
-        // again on what it now describes.
-        if !described && self.usable().is_some() {
-            self.last = None;
-        }
+        // New metadata can change verification even when every file was
+        // already described, notably when its slice checksums arrive later.
+        self.last = None;
+        true
     }
 
     // A set as a checkpoint recorded it: the index is rebuilt from its
