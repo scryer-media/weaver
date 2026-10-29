@@ -9,7 +9,7 @@ use weaver_graph::{
 };
 
 use super::Par2;
-use crate::testing::{Job, par2_set, payload, segments};
+use crate::testing::{Job, par2_set, par2_set_from, payload, segments};
 
 const OWN: ObjectId = ObjectId(7);
 const BLOCK: u64 = 512;
@@ -1841,6 +1841,47 @@ fn a_loss_in_an_open_volume_rules_nothing_short_before_it_closes() {
         job.object
             .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: damaged }
+    );
+    assert!(job.store.members[&member] == data);
+}
+
+// Not every choice of as many blocks as slices are damaged rebuilds them.
+// The constants of slices 0 and 8 have equal 4369th powers, so blocks 0
+// and 4369 cannot tell those two slices apart. The repair reads another
+// block, and rebuilds both.
+#[test]
+fn a_repair_reads_another_block_when_those_read_do_not_rebuild() {
+    let constants = par2_rs::input_slice_constants(9);
+    assert_eq!(
+        par2_rs::gf_pow(constants[0], 4369),
+        par2_rs::gf_pow(constants[8], 4369)
+    );
+    let data = payload(44, 9 * BLOCK as usize);
+    let described = [("payload.bin", data.as_slice())];
+    let low = par2_set_from("set", &described, BLOCK, 0, 1, 1);
+    let high = par2_set_from("set", &described, BLOCK, 4369, 2, 1);
+    let files = [low[0].clone(), low[1].clone(), high[1].clone()];
+    let mut wrong = data.clone();
+    for slice in [0, 8] {
+        wrong[(slice * BLOCK) as usize] ^= 0x5A;
+    }
+    let mut job = job(&files);
+    let member = job.member("payload.bin", &wrong);
+    for slice in [0, 8] {
+        let at = slice * BLOCK / ARTICLE * ARTICLE;
+        let article = ByteRange::new(at, (at + ARTICLE).min(data.len() as u64));
+        job.arrive(
+            member,
+            article.start,
+            &wrong[article.start as usize..article.end as usize],
+            Provenance::Damaged,
+        );
+    }
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 2 }
     );
     assert!(job.store.members[&member] == data);
 }

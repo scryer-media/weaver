@@ -15,8 +15,8 @@ use std::io;
 
 use par2_rs::verify::FileAccess;
 use par2_rs::{
-    FileHashState, FileId, FileStatus, FileVerification, Packet, Par2FileSet, RecoverySlice,
-    RepairOptions, Repairability, SliceChecksumState, VerificationResult,
+    FileHashState, FileId, FileStatus, FileVerification, Packet, Par2Error, Par2FileSet,
+    RecoverySlice, RepairOptions, Repairability, SliceChecksumState, VerificationResult,
     execute_repair_with_options, parse_packet, plan_repair_with_memory_limit,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
@@ -131,7 +131,6 @@ pub(super) fn repair_set(
         };
     }
     let damaged: u64 = validity.iter().map(|(_, valid)| invalid(valid)).sum();
-    let slices = spend(state, slice_size, damaged as usize, access);
     // Short with every block it holds read, or with enough that would not
     // rebuild: another has to come before it is worth trying again.
     let needed = damaged.max(state.recovery.len() as u64 + 1);
@@ -154,19 +153,32 @@ pub(super) fn repair_set(
             needed,
         }
     };
-    if (slices.len() as u64) < damaged {
-        return short(slices.len() as u64, access);
-    }
     let Some(index) = state.usable() else {
         return SetRepair::clean(read);
     };
-    let mut set = index.clone();
-    set.recovery_slices = slices;
-    let verification = verification(&set, &validity, damaged);
-    let available = set.recovery_slices.len() as u64;
-    let Ok(plan) = plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) else {
-        return short(available, access);
+    let mut set = Par2FileSet {
+        recovery_slices: BTreeMap::new(),
+        ..index.clone()
     };
+    // As many blocks as slices are damaged, and more while those read do
+    // not solve for them: not every choice of blocks does.
+    let mut wanted = damaged;
+    let plan = loop {
+        spend(state, slice_size, wanted, &mut set.recovery_slices, access);
+        let available = set.recovery_slices.len() as u64;
+        if available < wanted {
+            return short(available, access);
+        }
+        let verification = verification(&set, &validity, damaged);
+        match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
+            Ok(plan) => break plan,
+            Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
+                wanted = available + u64::from(deficit);
+            }
+            Err(_) => return short(available, access),
+        }
+    };
+    let available = set.recovery_slices.len() as u64;
     let members: BTreeMap<FileId, MemberId> = state.members().clone();
     let mut files = Files {
         access: RefCell::new(access),
@@ -487,19 +499,23 @@ fn read_slice(
 }
 
 // Read recovery packets back from the volumes, in exponent order, until
-// `wanted` pass their hash. The scan checked it; the volume is read again
-// here, so it is checked again. One that fails is forgotten.
+// `wanted` pass their hash, on from the last already read. The scan checked it;
+// the volume is read again here, so it is checked again. One that fails is
+// forgotten.
 fn spend(
     state: &mut SetState,
     slice_size: u64,
-    wanted: usize,
+    wanted: u64,
+    slices: &mut BTreeMap<u32, RecoverySlice>,
     access: &mut dyn MemberAccess,
-) -> BTreeMap<u32, RecoverySlice> {
-    let mut slices = BTreeMap::new();
+) {
     let mut bad = Vec::new();
     let mut buffer = Vec::new();
-    for (&exponent, location) in &state.recovery {
-        if slices.len() >= wanted {
+    let from = slices
+        .last_key_value()
+        .map_or(0, |(&exponent, _)| exponent + 1);
+    for (&exponent, location) in state.recovery.range(from..) {
+        if slices.len() as u64 >= wanted {
             break;
         }
         buffer.clear();
@@ -514,7 +530,6 @@ fn spend(
     for exponent in bad {
         state.recovery.remove(&exponent);
     }
-    slices
 }
 
 fn recovery_slice(packet: &[u8], slice_size: u64) -> Option<par2_rs::RecoverySliceData> {

@@ -109,6 +109,18 @@ pub(crate) fn par2_set(
     recovery: u32,
     volumes: u32,
 ) -> Vec<(String, Vec<u8>)> {
+    par2_set_from(stem, files, block, 0, recovery, volumes)
+}
+
+// The same, its recovery blocks numbered from `first`.
+pub(crate) fn par2_set_from(
+    stem: &str,
+    files: &[(&str, &[u8])],
+    block: u64,
+    first: u32,
+    recovery: u32,
+    volumes: u32,
+) -> Vec<(String, Vec<u8>)> {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
 
     let dir = tempfile::tempdir().unwrap();
@@ -121,6 +133,7 @@ pub(crate) fn par2_set(
     options.block_sizing = BlockSizing::Bytes(block);
     options.recovery_amount = RecoveryAmount::Count(recovery);
     options.volume_count = Some(volumes);
+    options.first_exponent = first;
     let creator = Par2Creator::new(options);
     let created = creator.create(&creator.plan().unwrap()).unwrap();
     read_outputs(&created.output_paths)
