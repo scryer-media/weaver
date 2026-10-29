@@ -25,12 +25,15 @@ mod rebuild;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use par3_rs::layout::{BlockLayout, FileLayout};
 use par3_rs::runtime::ExecutionOptions;
-use par3_rs::{HEADER_SIZE, MAGIC, Packet, PacketHeader, PacketType, Par3Set, ScanLimits};
+use par3_rs::{
+    ChunkDescription, Fingerprint, HEADER_SIZE, MAGIC, Packet, PacketHeader, PacketType, Par3File,
+    Par3Set, ScanLimits,
+};
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
@@ -240,32 +243,48 @@ impl Par3 {
         self.volumes.iter().any(|volume| !volume.closed)
     }
 
-    // The whole blocks of the bound files a refused range touches. A
-    // file's last, partial block may be packed with another file's, so it
-    // is left out: the count never runs ahead of the blocks really lost.
+    // The input blocks whose whole-block extents in the bound files a
+    // refused range touches, each once. A file's last, partial block may be
+    // packed with another file's, so it is left out: the count never runs
+    // ahead of the blocks really lost. Nor is a block whose fingerprint a
+    // whole block of a bound file nothing refused carries: equal
+    // fingerprints are equal bytes, and the rebuild copies them.
     fn count_refused(&mut self, sets: &[Par3Set]) {
         let mut blocks = 0u64;
         for set in sets {
-            let block = set.block_size();
-            if block == 0 {
+            let size = set.block_size();
+            if size == 0 {
                 continue;
             }
-            for file in set.files() {
-                let Some(ranges) = self
-                    .bound
-                    .get(file.path())
-                    .and_then(|member| self.shown.refusals.get(member))
-                else {
-                    continue;
-                };
-                let whole = file.size() / block;
-                let touched: std::collections::BTreeSet<u64> = ranges
-                    .iter()
-                    .filter_map(|range| range.intersect(ByteRange::new(0, whole * block)))
-                    .flat_map(|range| range.start / block..=(range.end - 1) / block)
-                    .collect();
-                blocks += touched.len() as u64;
+            let refused = |member: &MemberId, range: ByteRange| {
+                self.shown.refusals.get(member).is_some_and(|ranges| {
+                    ranges
+                        .iter()
+                        .any(|refused| refused.intersect(range).is_some_and(|at| !at.is_empty()))
+                })
+            };
+            let fingerprint = |index: u64| set.block_checksum(index).map(|sum| sum.fingerprint);
+            let (lost, kept): (Vec<_>, Vec<_>) = set
+                .files()
+                .iter()
+                .filter_map(|file| Some((self.bound.get(file.path())?, file)))
+                .flat_map(|(member, file)| {
+                    whole_blocks(file, size).map(move |(range, index)| (member, range, index))
+                })
+                .partition(|(member, range, _)| refused(member, *range));
+            if lost.is_empty() {
+                continue;
             }
+            let held: BTreeSet<Fingerprint> = kept
+                .iter()
+                .filter_map(|(_, _, index)| fingerprint(*index))
+                .collect();
+            let lost: BTreeSet<u64> = lost
+                .iter()
+                .map(|(_, _, index)| *index)
+                .filter(|index| fingerprint(*index).is_none_or(|sum| !held.contains(&sum)))
+                .collect();
+            blocks += lost.len() as u64;
         }
         self.refused_blocks = blocks;
     }
@@ -475,6 +494,25 @@ fn scan(bytes: &[u8], into: &mut Vec<Packet>) {
     }
 }
 
+// The whole blocks a file's chunks map, each as its range in the file and
+// its input block index.
+fn whole_blocks(file: &Par3File, size: u64) -> impl Iterator<Item = (ByteRange, u64)> + '_ {
+    let mut at = 0;
+    file.chunks().iter().flat_map(move |chunk| {
+        let start = at;
+        at += chunk.length();
+        let (count, first) = match chunk {
+            ChunkDescription::Protected {
+                length,
+                first_block_index: Some(first),
+                ..
+            } => (length / size, *first),
+            _ => (0, 0),
+        };
+        (0..count).map(move |step| (ByteRange::at(start + step * size, size), first + step))
+    })
+}
+
 // Every set the packets describe; a job of more sets than the limit has none.
 fn sets(packets: Vec<Packet>) -> Vec<Par3Set> {
     let sets = Par3Set::from_packets(packets).unwrap_or_default();
@@ -675,13 +713,8 @@ impl Recovery for Par3 {
         // A member the set repaired whose good bytes reach past its
         // description is recognised: they arrived shifted along, and the
         // rebuilt file takes the described path and length. One bound
-        // under its own name keeps it, and takes the described length when
-        // it holds damage and reached less, or the set repaired it: a
-        // member posted short closes at the length its articles reached,
-        // and the file the set rebuilds is the length the set describes.
-        // One longer than its description with no good bytes past it takes
-        // the described length too: what lies past was booked for articles
-        // that never came.
+        // under its own name keeps it, and takes the described length as
+        // `Namespace::take_described` says.
         let repaired = matches!(
             self.last,
             Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
@@ -701,17 +734,12 @@ impl Recovery for Par3 {
                     .coverage
                     .overlapping(ByteRange::new(size, u64::MAX))
                     .any(|run| run.provenance.is_verified());
-            let short = record.length.is_some_and(|length| length < size)
-                && (repaired || !record.coverage.is_clean());
             if shifted {
                 if namespace.recognise(*member, path, size).is_some() {
                     renamed.push(*member);
                 }
-            } else if short {
-                let name = record.name.clone();
-                namespace.recognise(*member, &name, size);
-            } else if repaired {
-                namespace.trim_booked(*member, size);
+            } else {
+                namespace.take_described(*member, size, repaired);
             }
         }
         if learned || bound != self.bound {

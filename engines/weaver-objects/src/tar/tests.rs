@@ -585,6 +585,31 @@ fn a_header_that_will_never_arrive_refuses_the_archive() {
     assert_eq!(out, [Emit::Refuse(Why::Unrepairable)]);
 }
 
+// A loss told again, as a quiet job tells every loss each time it settles,
+// is the one the archive holds: it is held once.
+#[test]
+fn a_loss_told_again_is_held_once() {
+    let writer = mixed();
+    let at = writer.data[2] as u64;
+    let mut owner = Owner::new(writer.bytes.clone());
+    owner.deliver(ByteRange::new(0, at));
+    let mut out = Vec::new();
+    owner
+        .tar
+        .volume_lost(VolumeIndex(0), ByteRange::at(at, 100), &mut out);
+    owner
+        .tar
+        .volume_lost(VolumeIndex(0), ByteRange::at(at, 100), &mut out);
+    owner
+        .tar
+        .volume_lost(VolumeIndex(0), ByteRange::at(at + 20, 50), &mut out);
+    assert_eq!(
+        Vec::from(owner.tar.lost.clone()),
+        vec![ByteRange::at(at, 100)]
+    );
+    assert!(out.is_empty());
+}
+
 #[test]
 fn a_members_bytes_lie_where_its_entry_put_them() {
     let writer = mixed();

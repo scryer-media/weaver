@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use weaver_model::files::FileRole;
+use weaver_model::files::{FileRole, archive_base_name};
 use weaver_nntp::client::ProbeBatchResult;
 use weaver_nntp::pool::ServerId;
 
@@ -47,6 +47,10 @@ use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec};
 use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
+
+mod given_up;
+
+pub(in crate::pipeline) use given_up::GivenUp;
 
 // The fewest files a first-article verdict is worth taking. One article per
 // file is a sample, and a sample of a handful of files says very little: a
@@ -382,6 +386,40 @@ pub(crate) fn names_a_piece(name: &str) -> bool {
         )
 }
 
+// The place a posted file's name gives it: the set its stem names and its
+// number in that set, when the name numbers it as an archive volume or a
+// split part. Two files named into one place are one volume posted twice,
+// however each pads its number: `part01` and `part1`, `.7z.001` and
+// `.7z.0001`.
+pub(crate) fn names_a_place(name: &str) -> Option<Place> {
+    let role = FileRole::from_filename(name);
+    let number = match role {
+        FileRole::RarVolume { volume_number } => volume_number,
+        FileRole::SevenZipSplit { number } | FileRole::SplitFile { number } => number,
+        _ => return None,
+    };
+    let stem = archive_base_name(name, &role)?;
+    Some(Place {
+        kind: std::mem::discriminant(&role),
+        stem,
+        number,
+    })
+}
+
+// Whether a file's name says nothing of what the file is: no role and no
+// extension, such as a name that is a hash alone.
+pub(crate) fn names_nothing(name: &str) -> bool {
+    FileRole::from_filename(name) == FileRole::Unknown
+        && std::path::Path::new(name).extension().is_none()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Place {
+    kind: std::mem::Discriminant<FileRole>,
+    stem: String,
+    number: u32,
+}
+
 // The bytes of every file the post names as recovery data, its indexes
 // among them: what the critical line is drawn from.
 pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
@@ -565,12 +603,11 @@ impl Pipeline {
     // The files the post names as payload that lost at least one article.
     // A lost recovery volume is not damage to the release.
     fn failing_files(&self, job_id: JobId, spec: &JobSpec) -> usize {
-        let failing: BTreeSet<u32> = self
-            .articles_missing(job_id)
-            .map(|segment| segment.file_id.file_index)
-            .collect();
-        failing
-            .into_iter()
+        let Some(given_up) = self.given_up.get(&job_id) else {
+            return 0;
+        };
+        given_up
+            .missing_files()
             .filter(|index| {
                 spec.files.get(*index as usize).is_some_and(|file| {
                     file.role.counts_toward_health() && !declares_recovery(file)
@@ -630,7 +667,7 @@ impl Pipeline {
             .get(&job_id)
             .copied()
             .unwrap_or_default();
-        let total = spec.total_bytes;
+        let total = self.post_bytes(job_id, spec);
         let lost = self.missing_bytes(job_id);
         let failed = probe.decided(lost);
         let health = health_milli(total, failed);
@@ -666,7 +703,7 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
-        let total = state.spec.total_bytes;
+        let total = self.post_bytes(job_id, &state.spec);
         if total == 0 || !state.status.in_progress() {
             return;
         }
@@ -943,7 +980,7 @@ impl Pipeline {
             self.post_probes.retire(job_id);
             return;
         };
-        let total = state.spec.total_bytes;
+        let total = self.post_bytes(job_id, &state.spec);
         let recovery = declared_recovery_bytes(&state.spec);
         let tracked = total.saturating_sub(recovery);
         let critical = Self::critical_health_milli(total, recovery);
@@ -995,47 +1032,17 @@ impl Pipeline {
         }
     }
 
-    // The post's articles that will never arrive, each with the end this
-    // run saw it come to: `None` for one that ended in a run before a
-    // restart, which the root was restored holding as lost.
-    pub(in crate::pipeline) fn articles_given_up(
-        &self,
-        job_id: JobId,
-    ) -> impl Iterator<Item = (SegmentId, Option<SegmentTerminalState>)> + '_ {
-        self.jobs
-            .get(&job_id)
-            .into_iter()
-            .flat_map(move |state| {
-                state
-                    .spec
-                    .files
-                    .iter()
-                    .zip(0u32..)
-                    .flat_map(move |(file, file_index)| {
-                        file.segments.iter().map(move |segment| SegmentId {
-                            file_id: NzbFileId { job_id, file_index },
-                            segment_number: segment.ordinal,
-                        })
-                    })
-            })
-            .filter(|segment| self.graph_article_given_up(*segment))
-            .map(|segment| (segment, self.segment_terminal_states.get(&segment).copied()))
+    // The bytes of the post the servers said are gone, in this run or one
+    // before a restart.
+    pub(in crate::pipeline) fn missing_bytes(&self, job_id: JobId) -> u64 {
+        self.given_up.get(&job_id).map_or(0, GivenUp::missing_bytes)
     }
 
-    // The post's articles every server said are gone, in this run or one
-    // before a restart. An article no server may fetch, or one the feed
-    // stopped asking for, is not one.
-    fn articles_missing(&self, job_id: JobId) -> impl Iterator<Item = SegmentId> + '_ {
-        self.articles_given_up(job_id)
-            .filter(|(_, state)| state.is_none_or(|state| state == SegmentTerminalState::Missing))
-            .map(|(segment, _)| segment)
-    }
-
-    // The bytes of the post the servers said are gone.
-    fn missing_bytes(&self, job_id: JobId) -> u64 {
-        self.articles_missing(job_id)
-            .map(|segment| self.health_counted_segment_bytes(segment))
-            .sum()
+    // The size the post's health is a share of: what it declares, each
+    // volume it posts again counted once.
+    fn post_bytes(&self, job_id: JobId, spec: &JobSpec) -> u64 {
+        spec.total_bytes
+            .saturating_sub(self.given_up.get(&job_id).map_or(0, GivenUp::again_bytes))
     }
 
     // The feed gives the post up. Below its recovery line nothing can
@@ -1067,12 +1074,10 @@ impl Pipeline {
             .cloned()
             .unwrap_or_else(|| crate::jobs::feed_verdict::FeedVerdict::new(reason));
         let mut lost: BTreeSet<u32> = self
-            .segment_terminal_states
-            .iter()
-            .filter(|(segment, state)| {
-                segment.file_id.job_id == job_id && **state == SegmentTerminalState::Missing
-            })
-            .map(|(segment, _)| segment.file_id.file_index)
+            .given_up
+            .get(&job_id)
+            .into_iter()
+            .flat_map(GivenUp::missing_files)
             .collect();
         lost.extend(verdict.abandoned_files.iter().copied());
         let Some(active) = self

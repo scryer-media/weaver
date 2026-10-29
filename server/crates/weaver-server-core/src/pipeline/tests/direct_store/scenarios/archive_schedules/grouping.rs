@@ -245,11 +245,13 @@ impl Naming {
     }
 
     // Whether the posted names place the set, so a lost offset-zero article
-    // leaves no volume without a set.
+    // leaves no volume without a set. A repost's copies are numbered as the
+    // volumes they repeat.
     pub(super) fn names_place(self) -> bool {
         matches!(
             self,
             Self::Conventional
+                | Self::Reposted
                 | Self::ConventionalFour
                 | Self::Single
                 | Self::MixedCase

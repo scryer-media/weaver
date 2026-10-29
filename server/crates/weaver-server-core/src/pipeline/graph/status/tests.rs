@@ -6,7 +6,7 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
 use weaver_graph::{ByteRange, Kind, Member, MemberId, Namespace, NodeId, Provenance, Why};
 
-use super::claims::{Claim, ClaimedMember, refused};
+use super::claims::{Claim, ClaimedMember, Delivered, Unarrived, refused};
 use super::{
     Delivery, RecoverySummary, RepairSlots, RootJob, SetSummary, Step, drive, failure, shown_status,
 };
@@ -494,8 +494,7 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         whole: names(whole),
         damaged: names(damaged),
         unrepaired: names(unrepaired),
-        withheld: Vec::new(),
-        files: Vec::new(),
+        ..Delivery::default()
     };
     let error = "PAR2 recovery failed for 1 set(s)";
     assert_eq!(
@@ -533,6 +532,109 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         delivery(&[], &["ember.dat"], &[]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
+        }
+    );
+}
+
+// A posted file none of whose bytes arrived is what its name says it was.
+// Another posting of a volume a file that arrived is named into is no file
+// at all. One whose name says nothing may have been anything: beside a
+// whole file the job completes, and alone it is short and the job fails.
+// One whose name says what it is stays short.
+#[test]
+fn a_posted_file_that_never_arrived_is_what_its_name_says() {
+    let mut tree = weaver_graph::Tree::new();
+    let mut objects = weaver_objects::Objects::default();
+    let mut effects = Vec::new();
+    let names = ["ember.bin", "lantern.part01.rar", "d1c70000", "notes.txt"];
+    let members: Vec<MemberId> = names
+        .iter()
+        .map(|name| tree.announce_root(name, Some(64), &mut effects))
+        .collect();
+    let arrival = weaver_graph::Posted {
+        offset: 0,
+        bytes: bytes::Bytes::from(vec![b'e'; 64]),
+        provenance: Provenance::Fresh,
+    };
+    tree.deliver(
+        NodeId::ROOT,
+        members[0],
+        arrival,
+        &mut objects,
+        &mut effects,
+    );
+    tree.close(NodeId::ROOT, members[0], &mut objects, &mut effects);
+    let unarrived = |member: MemberId| match member.0 {
+        1 => Unarrived::Again,
+        2 => Unarrived::Unnamed,
+        _ => Unarrived::Short,
+    };
+    let delivery = Delivery::read(
+        &tree,
+        |_| true,
+        |_| false,
+        |_, _| false,
+        |_, _| None,
+        |_, _| false,
+        unarrived,
+    );
+    assert_eq!(delivery.whole, vec!["ember.bin".to_string()]);
+    assert_eq!(delivery.unnamed, vec!["d1c70000".to_string()]);
+    assert_eq!(delivery.damaged, vec!["notes.txt".to_string()]);
+    assert!(
+        delivery
+            .files
+            .iter()
+            .all(|file| file.name != "lantern.part01.rar"),
+        "{:?}",
+        delivery.files
+    );
+    assert_eq!(delivery.status(None), JobStatus::Partial);
+    // A whole file at `depth`: a set extracted it below the post, or at
+    // zero it is one of the post's own files.
+    let unnamed = |whole: &[(&str, u32)]| Delivery {
+        whole: whole.iter().map(|(name, _)| name.to_string()).collect(),
+        unnamed: vec!["d1c70000".to_string()],
+        files: whole
+            .iter()
+            .map(|(name, depth)| Delivered {
+                name: name.to_string(),
+                from: name.to_string(),
+                depth: *depth,
+                whole: true,
+                crc32: None,
+            })
+            .collect(),
+        ..Delivery::default()
+    };
+    assert_eq!(
+        unnamed(&[("ember.bin", 1)]).status(None),
+        JobStatus::Complete
+    );
+    // Beside the post's own files alone, the file that never came may have
+    // been any file of the post, which lacks it.
+    assert_eq!(
+        unnamed(&[("ember.bin", 0)]).status(None),
+        JobStatus::Partial
+    );
+    // The feed gave the post up over the file that never came: its words
+    // rule nothing, and the delivery is still complete.
+    let feed = super::Failure::post_given_up("health 75.0% below critical 85.0%".to_string());
+    assert_eq!(
+        unnamed(&[("ember.bin", 1)]).status(Some(&feed)),
+        JobStatus::Complete
+    );
+    assert_eq!(delivery.status(Some(&feed)), JobStatus::Partial);
+    assert_eq!(
+        unnamed(&[]).status(None),
+        JobStatus::Failed {
+            error: "no file was delivered whole; 1 short: d1c70000".to_string()
+        }
+    );
+    assert_eq!(
+        unnamed(&[]).status(Some(&feed)),
+        JobStatus::Failed {
+            error: "health 75.0% below critical 85.0%".to_string()
         }
     );
 }
@@ -629,6 +731,7 @@ fn a_broken_7z_is_refused_and_no_usable_file() {
             |_, _| false,
             |_, _| None,
             |_, _| false,
+            |_| Unarrived::Short,
         )
     };
     let alone = read(&["lantern.7z"]);
@@ -734,9 +837,7 @@ fn a_short_delivery_names_the_repair_when_a_recovery_object_ruled_though_it_boun
     let delivery = Delivery {
         whole: Vec::new(),
         damaged: vec!["ember.bin".to_string()],
-        unrepaired: Vec::new(),
-        withheld: Vec::new(),
-        files: Vec::new(),
+        ..Delivery::default()
     };
     let message = "PAR2 recovery failed for 1 set(s)";
     assert_eq!(

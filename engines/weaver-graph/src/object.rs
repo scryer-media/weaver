@@ -294,9 +294,14 @@ pub trait Object: Send + Sync {
     );
 
     // My volume has no more bytes coming: everything that could arrive has.
+    // A close may be told again, as a loss may: a restore tells every close
+    // again. A close told again is the one already heard.
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>);
 
     // This range of my volume will never arrive and no recovery covers it.
+    // A range may be told again, alone or inside a wider run: a restore tells
+    // every loss again, and a quiet job tells its data objects every loss
+    // each time it settles. A loss told again is the one already held.
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>);
 
     // The job is quiet: nothing more will arrive and no repair will come,

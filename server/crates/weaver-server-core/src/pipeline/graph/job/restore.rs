@@ -132,6 +132,10 @@ impl GraphJob {
         }
         let refetched = job.read_back()?;
         job.mark_damage()?;
+        let mut effects = Vec::new();
+        job.tree
+            .close_again(&mut job.writer.placing(&mut *job.builder), &mut effects);
+        job.settle(effects)?;
         for volume in 0..job.root.map.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
         }

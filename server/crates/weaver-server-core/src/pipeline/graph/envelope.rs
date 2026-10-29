@@ -75,6 +75,10 @@ impl Kept {
     pub(crate) fn path(&self) -> &Path {
         self.leaf.path()
     }
+
+    pub(crate) fn into_leaf(self) -> Leaf {
+        self.leaf
+    }
 }
 
 impl Envelopes {
@@ -187,11 +191,11 @@ impl Envelopes {
     // An envelope the object at `node` gave back with its volume leaves the
     // shelf, file and all: the file, at the volume's own offsets, is what
     // the object kept of the volume. Nothing is read or copied.
-    pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Leaf> {
+    pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Kept> {
         let shelf = self.shelves.get(&node)?;
         let kept = shelf.update(|state| state.kept.remove(&envelope))?;
         self.marks.mark(node);
-        Some(kept.leaf)
+        Some(kept)
     }
 
     // Change the node's shelf as `change` says it did, which marks the node

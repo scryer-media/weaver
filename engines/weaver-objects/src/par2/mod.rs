@@ -22,8 +22,8 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
-use par2_rs::Par2FileSet;
 use par2_rs::packet::{HEADER_SIZE, MAGIC};
+use par2_rs::{FileId, Par2FileSet};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
     ByteRange, Delivery, Emit, Extent, Kind, Located, MemberId, Namespace, Object, ObjectId,
@@ -126,46 +126,67 @@ impl Par2 {
             .min()
     }
 
-    // Recovery blocks still to come from the volumes that serve the set.
+    // The most recovery blocks the volumes that serve the set may still
+    // bring. Nothing is ruled short while they may.
     fn coming(&self, set: &[u8; 16]) -> u64 {
-        let packet = self.smallest_packet();
         self.volumes
             .iter()
             .filter(|volume| volume.serves(set))
-            .map(|volume| volume.coming(packet))
+            .map(Volume::left)
             .sum()
     }
 
     // The slices of the set's members that a refused range touches: each
-    // will never come, so each needs a block of its own.
+    // will never come, so each needs a block of its own, unless a slice of
+    // a member it binds that is neither refused nor came damaged carries
+    // the same checksums. A slice is its bytes, and the repair copies them
+    // from there.
     fn refused_slices(&self, key: &[u8; 16]) -> u64 {
         let state = &self.sets[key];
         let Some(index) = state.usable().filter(|index| index.slice_size > 0) else {
             return 0;
         };
         let slice = index.slice_size;
-        state
+        let refused: BTreeSet<(FileId, u64)> = state
             .members()
             .iter()
             .filter_map(|(file, member)| {
                 let length = index.file_description(file)?.length;
-                Some((length, self.shown.refusals.get(member)?))
+                Some((*file, length, self.shown.refusals.get(member)?))
             })
-            .map(|(length, ranges)| {
+            .flat_map(|(file, length, ranges)| {
                 ranges
                     .iter()
-                    .filter_map(|range| range.intersect(ByteRange::new(0, length)))
+                    .filter_map(move |range| range.intersect(ByteRange::new(0, length)))
                     .filter(|range| !range.is_empty())
-                    .flat_map(|range| range.start / slice..=(range.end - 1) / slice)
-                    .collect::<BTreeSet<u64>>()
-                    .len() as u64
+                    .flat_map(move |range| {
+                        (range.start / slice..=(range.end - 1) / slice).map(move |at| (file, at))
+                    })
             })
-            .sum()
+            .collect();
+        let holds = |file: FileId, at: u64| {
+            state.members().get(&file).is_some_and(|member| {
+                !refused.contains(&(file, at))
+                    && self.evidence.get(&(*key, *member)).is_none_or(|evidence| {
+                        evidence.vetoed().nth(at as usize) != Some(SliceVerdict::Damaged)
+                    })
+            })
+        };
+        refused
+            .iter()
+            .filter(|&&(file, at)| {
+                !state
+                    .alike(file, at)
+                    .iter()
+                    .any(|&(other, slice)| holds(other, slice))
+            })
+            .count() as u64
     }
 
-    // The blocks the set can still reach: those in hand and those its open
-    // volumes are named to bring. `None` while an open volume that may
-    // serve it does not say how many it carries.
+    // The blocks the set can still reach: those in hand and the most its
+    // open volumes may bring, so the reach never falls short of the blocks
+    // really there. `None` while an open volume that may serve it does not
+    // say how many it carries.
     fn reach(&self, key: &[u8; 16]) -> Option<u64> {
         let unknown = self.volumes.iter().any(|volume| {
             // Claimed by its name and nothing of it read yet: what it
@@ -288,7 +309,7 @@ impl Par2 {
 
     // Whether no volume of the object has been read through.
     fn unread_through(&self) -> bool {
-        !self.volumes.iter().any(|volume| volume.closed)
+        !self.volumes.iter().any(Volume::read_through)
     }
 
     // The volumes, those that name the fewest blocks first.
@@ -403,15 +424,18 @@ impl Object for Par2 {
         self.ask_again(out);
     }
 
-    // A loss told again, as a restore tells every loss, is one it holds.
+    // A loss told again, as a restore tells every loss, adds only what of
+    // it the volume did not hold.
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
         let mut found = Vec::new();
         let state = self.volume(volume);
-        if state.lost.iter().any(|lost| lost.covers(range)) {
+        let fresh = state.lost.hold(range);
+        if fresh.is_empty() {
             return;
         }
-        state.lost.push(range);
-        state.walker.lose(range, &mut found);
+        for piece in fresh {
+            state.walker.lose(piece, &mut found);
+        }
         // A recovery packet whose bytes are lost cannot be read back.
         for state in self.sets.values_mut() {
             state
@@ -443,11 +467,7 @@ impl Object for Par2 {
         };
         state.arrived.erase(range);
         state.closed = false;
-        state.lost = state
-            .lost
-            .iter()
-            .flat_map(|lost| walker::minus(*lost, range))
-            .collect();
+        state.lost.erase(range);
         state.walker.unposted(range, &mut found);
         let mut forgotten = 0;
         for set in self.sets.values_mut() {
@@ -541,15 +561,9 @@ impl Recovery for Par2 {
         // along, and the rebuilt file ends at the length the set describes.
         // A length booked for articles that never came is not bytes, and
         // proves nothing. One bound under its own name keeps it, and takes
-        // the description's length when it holds damage and reached less: a
-        // member posted without positions closes at the length its articles
-        // reached, short of what a lost one took, and the file the set
-        // rebuilds is the length the set describes. So does one the set
-        // repaired that is longer than its description with no good bytes
-        // past it: the length was booked for articles that never came, and
-        // the rebuilt file is the length the set describes. A member longer
-        // than its description by bytes that arrived keeps its length: its
-        // posting carries more than the described file.
+        // the description's length as `Namespace::take_described` says. A
+        // member longer than its description by bytes that arrived keeps its
+        // length: its posting carries more than the described file.
         for state in self.sets.values() {
             let Some(index) = state.usable() else {
                 continue;
@@ -579,19 +593,7 @@ impl Recovery for Par2 {
                     }
                     continue;
                 }
-                let Some(record) = namespace.get(*member) else {
-                    continue;
-                };
-                let short = record
-                    .length
-                    .is_some_and(|length| length < description.length)
-                    && (repaired || !record.coverage.is_clean());
-                if short {
-                    let name = record.name.clone();
-                    namespace.recognise(*member, &name, description.length);
-                } else if repaired {
-                    namespace.trim_booked(*member, description.length);
-                }
+                namespace.take_described(*member, description.length, repaired);
             }
         }
         let lengths: BTreeMap<MemberId, u64> = self

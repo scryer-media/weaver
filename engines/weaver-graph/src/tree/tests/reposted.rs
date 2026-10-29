@@ -181,3 +181,36 @@ fn a_copy_whose_front_disagrees_is_not_folded() {
     assert_eq!(tree.child_of(NodeId::ROOT, copy), None);
     assert_eq!(listed(&tree), vec![MemberId(0), second, copy]);
 }
+
+#[test]
+fn a_volume_whose_bytes_come_late_folds_into_the_copy_that_took_its_place() {
+    let (mut tree, child, second) = held(&[]);
+    let (copy, effects) = post(&mut tree, "again.r00", &[(0, b"world", Provenance::Fresh)]);
+    assert_eq!(
+        tree.child_of(NodeId::ROOT, copy),
+        Some((child, VolumeIndex(1))),
+        "{effects:?}"
+    );
+    assert_eq!(tree.child_of(NodeId::ROOT, second), None, "a name held it");
+    let mut effects = Vec::new();
+    tree.deliver(
+        NodeId::ROOT,
+        second,
+        Posted {
+            offset: 0,
+            bytes: Bytes::from_static(b"world"),
+            provenance: Provenance::Fresh,
+        },
+        &mut Build,
+        &mut effects,
+    );
+    assert!(
+        effects.contains(&Effect::Folded {
+            node: NodeId::ROOT,
+            copy: second,
+            into: copy,
+        }),
+        "{effects:?}"
+    );
+    assert_eq!(listed(&tree), vec![MemberId(0), copy]);
+}

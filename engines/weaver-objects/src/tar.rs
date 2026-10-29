@@ -29,6 +29,7 @@ use weaver_graph::{
 
 use crate::grid::crc32;
 use crate::kept::Kept;
+use crate::lost::Lost;
 use header::{Body, Read};
 
 // The one envelope, in the volume's own coordinates.
@@ -99,7 +100,7 @@ pub struct Tar {
     end: Option<End>,
     length: Option<u64>,
     reached: u64,
-    lost: Vec<ByteRange>,
+    lost: Lost,
     gone: bool,
 }
 
@@ -161,7 +162,7 @@ impl Tar {
     }
 
     fn wait(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.lost.iter().any(|lost| lost.intersect(range).is_some()) {
+        if self.lost.meets(range) {
             return self.give_up(Why::Unrepairable, out);
         }
         self.ahead = Some(range);
@@ -396,7 +397,7 @@ impl Object for Tar {
         if volume != VOLUME {
             return;
         }
-        self.lost.push(range);
+        self.lost.hold(range);
         if self.end.is_none()
             && self
                 .ahead

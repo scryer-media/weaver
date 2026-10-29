@@ -460,34 +460,34 @@ impl Recovery for RarRecovery {
             else {
                 continue;
             };
-            if let std::collections::btree_map::Entry::Vacant(slot) = bound.entry(volume.index()) {
-                slot.insert(member.id);
+            // A volume posted twice is whole where either posting is: the
+            // set binds a whole one when there is one.
+            let taken = bound.get(&volume.index()).copied();
+            if taken.is_none_or(|taken| {
+                member.is_whole() && !namespace.get(taken).is_some_and(|held| held.is_whole())
+            }) {
+                if let Some(taken) = taken {
+                    names.remove(&taken);
+                }
+                bound.insert(volume.index(), member.id);
                 names.insert(member.id, member.name.clone());
             }
         }
-        // A volume takes the size its table gives when it holds damage and
-        // reached less, or the set rebuilt it: a volume posted short closes
-        // at the length its articles reached, and the volume the set
-        // rebuilds is the size the table gives. One the set repaired that
-        // is longer than its table gives, with no good bytes past that
-        // size, takes the table's size too: what lies past was booked for
-        // articles that never came.
+        // A volume takes the size its table gives as any described member
+        // does (`Namespace::take_described`). A RAR3 footer states no size,
+        // only the width the volumes share, which a volume that reached less
+        // may rightly fall short of: it only trims what was booked past it.
         let repaired = matches!(
             self.last,
             Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
         );
         let stated = self.states_sizes();
         for (index, size) in self.described_sizes() {
-            let Some(record) = bound.get(&index).and_then(|member| namespace.get(*member)) else {
+            let Some(member) = bound.get(&index).copied() else {
                 continue;
             };
-            let member = record.id;
-            let short = stated
-                && record.length.is_some_and(|length| length < size)
-                && (repaired || !record.coverage.is_clean());
-            if short {
-                let name = record.name.clone();
-                namespace.recognise(member, &name, size);
+            if stated {
+                namespace.take_described(member, size, repaired);
             } else if repaired {
                 namespace.trim_booked(member, size);
             }

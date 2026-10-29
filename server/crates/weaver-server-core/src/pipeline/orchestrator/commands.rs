@@ -549,6 +549,7 @@ impl Pipeline {
         self.download_wait_by_job.remove(&job_id);
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.given_up.remove(&job_id);
         self.rate_limit_reservations
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.job_last_download_activity.remove(&job_id);

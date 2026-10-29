@@ -6,7 +6,8 @@
 // header bytes: the signature, then whatever the walk ran short at, as far as
 // the point it says the next header reaches. Bytes that arrived damaged are
 // kept out of the walk until the volume closes, because a header's own CRC
-// only warns and a damaged name would be read as a real one.
+// only warns and a damaged name would be read as a real one. Where the set
+// ends is never read from them at all: the store gives volumes back on it.
 
 use std::sync::Arc;
 
@@ -49,7 +50,9 @@ pub(super) enum Step {
 #[derive(Debug)]
 pub(super) struct Walk {
     pub(super) facts: Option<RarVolumeFacts>,
-    short_at: Option<u64>,
+    // What the end record says of a volume after this one, once the walk
+    // read an end record that arrived whole.
+    more: Option<bool>,
     pub(super) ended: bool,
     pub(super) blocks: Vec<Block>,
     pub(super) locked: Option<RarVolumeHeaderEncryption>,
@@ -60,7 +63,7 @@ impl Default for Walk {
     fn default() -> Self {
         Self {
             facts: None,
-            short_at: None,
+            more: None,
             ended: false,
             blocks: Vec::new(),
             locked: None,
@@ -103,6 +106,13 @@ fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
         at = range.end;
     }
     at
+}
+
+// Whether a byte past `from` arrived damaged.
+fn damaged_past(kept: &Kept, from: u64) -> bool {
+    kept.runs()
+        .into_iter()
+        .any(|(range, _, provenance)| provenance == Provenance::Damaged && range.end > from)
 }
 
 // The damaged run a byte sits in.
@@ -238,15 +248,12 @@ impl Walk {
     }
 
     // Whether a volume follows this one: never, for an archive that is no
-    // set; otherwise what the end record says, once the walk has read it.
+    // set; otherwise what the end record says, once the walk has read it
+    // whole.
     pub(super) fn successor(&self) -> Option<bool> {
         match self.in_set()? {
             false => Some(false),
-            true => self
-                .facts
-                .as_ref()
-                .filter(|_| self.ended && self.short_at.is_none())
-                .map(|facts| facts.more_volumes),
+            true => self.more,
         }
     }
 
@@ -343,7 +350,11 @@ impl Walk {
             let end = length.map_or(short_at, |length| short_at.min(length));
             kept.want(ByteRange::new(reach, end.max(reach)));
         }
-        let moved = self.facts.as_ref() != Some(&facts) || self.ended != ended;
+        // The end record lies past the last data area: a damaged byte there
+        // may be its own.
+        let more =
+            (walk.short_at.is_none() && !damaged_past(kept, reach)).then_some(facts.more_volumes);
+        let moved = self.facts.as_ref() != Some(&facts) || self.ended != ended || self.more != more;
         self.blocks = facts
             .members
             .iter()
@@ -352,7 +363,7 @@ impl Walk {
             })
             .collect();
         self.facts = Some(facts);
-        self.short_at = walk.short_at;
+        self.more = more;
         self.ended = ended;
         match damaged {
             Some(range) => Step::Walked {

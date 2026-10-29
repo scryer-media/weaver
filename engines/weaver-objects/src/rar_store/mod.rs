@@ -324,6 +324,7 @@ impl RarStore {
             }
             self.give_back_misplaced(volume, out);
         }
+        self.give_back_past_last(out);
     }
 
     // A volume read to its close whose own headers say it is not where the
@@ -361,6 +362,29 @@ impl RarStore {
                 .collect(),
             false => vec![volume],
         };
+        self.give_back_held(going, out);
+    }
+
+    // A set ends at the volume whose headers say no volume follows it. A
+    // volume held past it was claimed on a number every set states alike:
+    // it goes back at its close, as a misplaced one does, for the store
+    // whose set it is to claim.
+    fn give_back_past_last(&mut self, out: &mut Vec<Emit>) {
+        let Some(last) = self.last() else {
+            return;
+        };
+        let going: Vec<VolumeIndex> = self
+            .volumes
+            .iter()
+            .filter(|(index, found)| **index > last && found.closed)
+            .map(|(index, _)| *index)
+            .collect();
+        if !going.is_empty() {
+            self.give_back_held(going, out);
+        }
+    }
+
+    fn give_back_held(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
         for index in going {
             if let Some(found) = self.volumes.remove(&index) {
                 self.giving.insert(index, found);

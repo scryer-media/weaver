@@ -133,6 +133,16 @@ impl Pipeline {
                 slot.insert(terminal_state);
             }
         }
+        let jobs = &self.jobs;
+        self.given_up
+            .entry(job_id)
+            .or_insert_with(|| {
+                jobs.get(&job_id)
+                    .map_or_else(crate::pipeline::post_health::GivenUp::default, |state| {
+                        crate::pipeline::post_health::GivenUp::new(&state.spec)
+                    })
+            })
+            .give_up(seg_id, Some(terminal_state), declared_bytes);
         self.note_gap_support_fact(seg_id, terminal_state);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
@@ -207,9 +217,9 @@ impl Pipeline {
     // is what settlement re-derives against rather than trusting the running
     // figure it is about to persist forever.
     pub(in crate::pipeline) fn derived_failed_bytes(&self, job_id: JobId) -> u64 {
-        self.articles_given_up(job_id)
-            .map(|(seg_id, _)| self.health_counted_segment_bytes(seg_id))
-            .sum()
+        self.given_up
+            .get(&job_id)
+            .map_or(0, crate::pipeline::post_health::GivenUp::bytes)
     }
 
     // The failed bytes to write into the terminal record, pinned to what the
@@ -243,16 +253,6 @@ impl Pipeline {
             return total_bytes;
         }
         failed_bytes
-    }
-
-    // The declared bytes of this file's segments that reached a terminal
-    // state without arriving.
-    pub(in crate::pipeline) fn file_terminal_failed_bytes(&self, file_id: NzbFileId) -> u64 {
-        self.segment_terminal_states
-            .keys()
-            .filter(|seg_id| seg_id.file_id == file_id)
-            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
-            .sum()
     }
 
     // Unwedge a uuencode file whose cursor is waiting on a part that will
@@ -298,6 +298,7 @@ impl Pipeline {
         self.clear_gap_support_facts(job_id);
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.given_up.remove(&job_id);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = 0;
         }

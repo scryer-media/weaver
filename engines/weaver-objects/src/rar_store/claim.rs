@@ -9,7 +9,10 @@
 // a set numbered by its names alone. A posted name is a label a recovery set
 // may change later, so the headers outrank it, and a name they contradict
 // places nothing. A volume that neither places goes after the held volume
-// whose last member it continues. The
+// whose last member it continues. A number every set states alike joins a
+// set only where a held volume beside it judges it, or where the volume's
+// name is not another set's, and no set takes a volume past the one that
+// says no volume follows it. The
 // store's first volume is placed the same way, with nothing held yet, and a
 // front that places it nowhere founds the store with it first. That claim is
 // provisional: a volume whose own headers, read to its close, say it is not
@@ -200,12 +203,10 @@ impl RarStore {
         facts: Option<&RarVolumeFacts>,
     ) -> Option<Placed> {
         if self.volumes.values().any(|ours| {
-            ours.walk.in_set() == Some(false)
-                || ours
-                    .walk
-                    .facts
-                    .as_ref()
-                    .is_some_and(|facts| facts.archive_format() != format)
+            ours.walk
+                .facts
+                .as_ref()
+                .is_some_and(|facts| facts.archive_format() != format)
         }) {
             return None;
         }
@@ -213,14 +214,18 @@ impl RarStore {
         // is bound, the one this member's own name gives.
         let wanted = naming::parse(name);
         let unnamed = self.volumes.values().all(|volume| volume.name.is_none());
-        let named = wanted.as_ref().is_some_and(|wanted| {
-            unnamed
-                || self
-                    .volumes
-                    .values()
-                    .filter_map(|volume| volume.name.as_deref().and_then(naming::parse))
-                    .any(|bound| bound.same_set(wanted))
-        });
+        let numbered: Vec<_> = self
+            .volumes
+            .values()
+            .filter_map(|volume| volume.name.as_deref().and_then(naming::parse))
+            .collect();
+        let ours = wanted
+            .as_ref()
+            .map(|wanted| numbered.iter().any(|bound| bound.same_set(wanted)));
+        let named = wanted.is_some() && (unnamed || ours == Some(true));
+        // The name gives the volume to another set: it and the bound names
+        // number sets, and not the same one.
+        let elsewhere = ours == Some(false) && !numbered.is_empty();
         // A position is what states it: the position the headers give,
         // else the name in the set's numbering. Only a volume that neither
         // places is placed by the members that link it to those held, which
@@ -232,13 +237,23 @@ impl RarStore {
             .filter(|_| named)
             .map(|wanted| VolumeIndex(wanted.index()))
             .filter(|index| !facts.is_some_and(|facts| misplaced(*index, facts)));
+        // A number is one every set states alike, so a position the headers
+        // state is the volume's only where a held volume beside it judged
+        // it, or where nothing gives the volume to another set.
+        let (headers, judged) = facts.map_or((None, false), |facts| self.claim_by_headers(facts));
+        let headers = headers.filter(|_| judged || !elsewhere);
         // A position held already is answered all the same: the volume
         // posted again is that volume.
-        match (facts.and_then(|facts| self.claim_by_headers(facts)), named) {
+        let placed = match (headers, named) {
             (Some(placed), _) if stated => Some(placed),
             (_, Some(named)) => Some(Placed::At(named)),
             (linked, None) => linked,
-        }
+        };
+        // A set ends at the volume that says no volume follows it.
+        placed.filter(|placed| match placed {
+            Placed::At(at) => self.last().is_none_or(|last| *at <= last),
+            Placed::Unordered => true,
+        })
     }
 
     // What a front states, read with the store's own keys.
@@ -256,7 +271,8 @@ impl RarStore {
     // header, what its front stated when it was bound: a walk short of the
     // main header states nothing, as one that read nothing does. A volume
     // held where its own headers do not place it places nothing beside it.
-    fn claim_by_headers(&self, facts: &RarVolumeFacts) -> Option<Placed> {
+    // With it, whether a held volume beside it judged that position.
+    fn claim_by_headers(&self, facts: &RarVolumeFacts) -> (Option<Placed>, bool) {
         let held = self
             .volumes
             .iter()
@@ -275,8 +291,26 @@ impl RarStore {
                 (!facts.is_some_and(|facts| misplaced(*index, facts))).then_some((index.0, held))
             })
             .collect();
-        place(facts, &held)
+        (place(facts, &held), judged(facts, &held))
     }
+}
+
+// Whether the held volumes judged where a volume's headers place it: the
+// position they state is held, and whether the volume is its holder posted
+// again its bytes say, which the tree compares; or one beside it had its
+// headers read. A volume that states no position is placed only by the held
+// volumes its members link it to, which judged it so.
+fn judged(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> bool {
+    Nameless { facts }.position().is_none_or(|stated| {
+        held.contains_key(&stated)
+            || [stated.checked_sub(1), stated.checked_add(1)]
+                .into_iter()
+                .flatten()
+                .any(|index| {
+                    held.get(&index)
+                        .is_some_and(|beside| beside.facts.is_some())
+                })
+    })
 }
 
 // Whether a volume's headers state its position: a number, or the first

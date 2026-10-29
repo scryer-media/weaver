@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use weaver_graph::holds::{Reserve, ScratchHold};
-use weaver_graph::{MemberId, NodeId, Tree};
+use weaver_graph::{ByteRange, MemberId, NodeId, Tree};
 
 use super::{NamespaceWriter, WriteError, scratch_name};
 use crate::pipeline::graph::checkpoint::{FileState, HoldRecord};
@@ -144,9 +144,12 @@ impl NamespaceWriter {
     }
 
     // A member's file as it was left, where the checkpoint says it sits.
-    // Nothing on disk is touched: the file opens on the next write or read,
-    // and counts against the job's budget as far as the tree's coverage of
-    // it reaches.
+    // The file opens on the next write or read, and counts against the
+    // job's budget as far as the tree's coverage of it reaches. A member
+    // with a stated CRC takes back its fold, so its check at close reads
+    // nothing: one closed whole and undamaged passed that check as it
+    // closed, and one still open reads what it holds back here, off the
+    // pipeline thread, as a restore reads.
     pub(crate) fn restore_file(
         &mut self,
         tree: &Tree,
@@ -158,8 +161,25 @@ impl NamespaceWriter {
             return Ok(());
         };
         if state.has_file {
-            let leaf =
+            let mut leaf =
                 self.restored_leaf(node, member, &record.output_name, state.on_disk.as_deref());
+            if let Some(stated) = record.crc32 {
+                match record.length {
+                    Some(length)
+                        if record.closed
+                            && record.coverage.covered(ByteRange::new(0, length))
+                            && !record.coverage.damaged(ByteRange::new(0, length)) =>
+                    {
+                        leaf.fold_passed(length, stated);
+                    }
+                    _ => leaf.fold_back(
+                        record
+                            .coverage
+                            .runs()
+                            .map(|run| (run.range.start, run.range.end)),
+                    ),
+                }
+            }
             self.files_mut(node).leaves.insert(member, leaf);
             self.caps.restore(tree, node, member);
         }

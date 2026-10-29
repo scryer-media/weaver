@@ -15,8 +15,8 @@ use std::io;
 
 use par2_rs::verify::FileAccess;
 use par2_rs::{
-    FileHashState, FileId, FileStatus, FileVerification, Packet, Par2FileSet, RecoverySlice,
-    RepairOptions, Repairability, SliceChecksumState, VerificationResult,
+    FileHashState, FileId, FileStatus, FileVerification, Packet, Par2Error, Par2FileSet,
+    RecoverySlice, RepairOptions, Repairability, SliceChecksumState, VerificationResult,
     execute_repair_with_options, parse_packet, plan_repair_with_memory_limit,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
@@ -97,7 +97,7 @@ pub(super) fn repair_set(
     // set found: damage only the set's checksums can see arrived marked
     // clean.
     let mut proven = Vec::new();
-    let validity: Vec<(FileId, Vec<bool>)> = index
+    let mut validity: Vec<(FileId, Vec<bool>)> = index
         .recovery_file_ids
         .iter()
         .map(|file| {
@@ -105,6 +105,12 @@ pub(super) fn repair_set(
             (*file, valid)
         })
         .collect();
+    let copied = copy_held(state, index, &mut validity, access);
+    proven.retain(|(member, range)| {
+        !copied.iter().any(|(into, slice)| {
+            into == member && slice.start <= range.start && range.end <= slice.end
+        })
+    });
     let invalid = |valid: &Vec<bool>| valid.iter().filter(|valid| !**valid).count() as u64;
     // Only damage in a bound member starts a repair; a described file no
     // member is bound to yet is missing in the arithmetic of one that does.
@@ -114,10 +120,17 @@ pub(super) fn repair_set(
         .map(|(_, valid)| invalid(valid))
         .sum();
     if own == 0 {
-        return SetRepair::clean(read);
+        return match copied.len() as u64 {
+            0 => SetRepair::clean(read),
+            slices => SetRepair {
+                outcome: RepairOutcome::Repaired { slices },
+                damaged: 0,
+                read: true,
+                needed: 0,
+            },
+        };
     }
     let damaged: u64 = validity.iter().map(|(_, valid)| invalid(valid)).sum();
-    let slices = spend(state, slice_size, damaged as usize, access);
     // Short with every block it holds read, or with enough that would not
     // rebuild: another has to come before it is worth trying again.
     let needed = damaged.max(state.recovery.len() as u64 + 1);
@@ -140,19 +153,32 @@ pub(super) fn repair_set(
             needed,
         }
     };
-    if (slices.len() as u64) < damaged {
-        return short(slices.len() as u64, access);
-    }
     let Some(index) = state.usable() else {
         return SetRepair::clean(read);
     };
-    let mut set = index.clone();
-    set.recovery_slices = slices;
-    let verification = verification(&set, &validity, damaged);
-    let available = set.recovery_slices.len() as u64;
-    let Ok(plan) = plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) else {
-        return short(available, access);
+    let mut set = Par2FileSet {
+        recovery_slices: BTreeMap::new(),
+        ..index.clone()
     };
+    // As many blocks as slices are damaged, and more while those read do
+    // not solve for them: not every choice of blocks does.
+    let mut wanted = damaged;
+    let plan = loop {
+        spend(state, slice_size, wanted, &mut set.recovery_slices, access);
+        let available = set.recovery_slices.len() as u64;
+        if available < wanted {
+            return short(available, access);
+        }
+        let verification = verification(&set, &validity, damaged);
+        match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
+            Ok(plan) => break plan,
+            Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
+                wanted = available + u64::from(deficit);
+            }
+            Err(_) => return short(available, access),
+        }
+    };
+    let available = set.recovery_slices.len() as u64;
     let members: BTreeMap<FileId, MemberId> = state.members().clone();
     let mut files = Files {
         access: RefCell::new(access),
@@ -167,11 +193,82 @@ pub(super) fn repair_set(
         return short(available, files.access.into_inner());
     }
     SetRepair {
-        outcome: RepairOutcome::Repaired { slices: damaged },
+        outcome: RepairOutcome::Repaired {
+            slices: damaged + copied.len() as u64,
+        },
         damaged,
         read,
         needed,
     }
+}
+
+// A slice is its bytes: an invalid slice of a bound member whose checksums
+// an intact slice of the set shares is those bytes, copied from it, and
+// needs no recovery block. Each is marked valid, and its member range
+// returned. Equal checksums are equal bytes once padded to the slice size,
+// so a copy longer than the slice it fills ends in that padding.
+fn copy_held(
+    state: &SetState,
+    index: &Par2FileSet,
+    validity: &mut [(FileId, Vec<bool>)],
+    access: &mut dyn MemberAccess,
+) -> Vec<(MemberId, ByteRange)> {
+    let intact = |validity: &[(FileId, Vec<bool>)], file: FileId, slice: u64| {
+        validity
+            .iter()
+            .find(|(described, _)| *described == file)
+            .and_then(|(_, valid)| valid.get(slice as usize).copied())
+            .unwrap_or(false)
+    };
+    let held: Vec<(usize, u64, FileId, u64)> = validity
+        .iter()
+        .enumerate()
+        .filter(|(_, (file, _))| state.members().contains_key(file))
+        .flat_map(|(at, (file, valid))| {
+            valid
+                .iter()
+                .enumerate()
+                .filter(|(_, valid)| !**valid)
+                .map(move |(slice, _)| (at, *file, slice as u64))
+        })
+        .filter_map(|(at, file, slice)| {
+            let &(from, from_slice) = state
+                .alike(file, slice)
+                .iter()
+                .find(|&&(other, other_slice)| intact(validity, other, other_slice))?;
+            Some((at, slice, from, from_slice))
+        })
+        .collect();
+    let mut copied = Vec::new();
+    let mut buffer = Vec::new();
+    for (at, slice, from, from_slice) in held {
+        let file = validity[at].0;
+        let (Some(&into), Some(&holder), Some(target), Some(source)) = (
+            state.members().get(&file),
+            state.members().get(&from),
+            described_slice(index, file, slice),
+            described_slice(index, from, from_slice),
+        ) else {
+            continue;
+        };
+        buffer.clear();
+        if !access.read(holder, source, &mut buffer) || buffer.len() as u64 != source.len() {
+            continue;
+        }
+        buffer.resize(target.len() as usize, 0);
+        access.write_repaired(into, target.start, &buffer);
+        validity[at].1[slice as usize] = true;
+        copied.push((into, target));
+    }
+    copied
+}
+
+// One slice's share of the described file.
+fn described_slice(index: &Par2FileSet, file: FileId, slice: u64) -> Option<ByteRange> {
+    let described = index.file_description(&file)?.length;
+    let start = slice * index.slice_size;
+    let end = (start + index.slice_size).min(described);
+    (start < end).then(|| ByteRange::new(start, end))
 }
 
 // Which slices of a described file are good, reading back only the ones the
@@ -402,19 +499,23 @@ fn read_slice(
 }
 
 // Read recovery packets back from the volumes, in exponent order, until
-// `wanted` pass their hash. The scan checked it; the volume is read again
-// here, so it is checked again. One that fails is forgotten.
+// `wanted` pass their hash, on from the last already read. The scan checked it;
+// the volume is read again here, so it is checked again. One that fails is
+// forgotten.
 fn spend(
     state: &mut SetState,
     slice_size: u64,
-    wanted: usize,
+    wanted: u64,
+    slices: &mut BTreeMap<u32, RecoverySlice>,
     access: &mut dyn MemberAccess,
-) -> BTreeMap<u32, RecoverySlice> {
-    let mut slices = BTreeMap::new();
+) {
     let mut bad = Vec::new();
     let mut buffer = Vec::new();
-    for (&exponent, location) in &state.recovery {
-        if slices.len() >= wanted {
+    let from = slices
+        .last_key_value()
+        .map_or(0, |(&exponent, _)| exponent + 1);
+    for (&exponent, location) in state.recovery.range(from..) {
+        if slices.len() as u64 >= wanted {
             break;
         }
         buffer.clear();
@@ -429,7 +530,6 @@ fn spend(
     for exponent in bad {
         state.recovery.remove(&exponent);
     }
-    slices
 }
 
 fn recovery_slice(packet: &[u8], slice_size: u64) -> Option<par2_rs::RecoverySliceData> {

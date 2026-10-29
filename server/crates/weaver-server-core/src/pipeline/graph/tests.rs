@@ -1007,6 +1007,7 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
         Some(Delivery {
             whole: vec!["echo-0.bin".to_string(), "echo-1.bin".to_string()],
             damaged: vec!["lantern.dat".to_string()],
+            unnamed: Vec::new(),
             unrepaired: Vec::new(),
             withheld: Vec::new(),
             files: vec![

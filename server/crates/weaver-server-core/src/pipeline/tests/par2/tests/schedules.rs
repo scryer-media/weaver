@@ -12,7 +12,7 @@
 // delivered byte for byte when the set holds the blocks, and never a file
 // claimed whole that is not when it does not.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
@@ -329,27 +329,29 @@ fn judge(fixture: &Fixture, whole: &Outcome, sufficient: bool, context: &str) {
         }
         return;
     }
-    // A file the job counts whole is byte for byte the described one; a
-    // file it does not is delivered as it stands, short of its bytes.
-    let counted = &whole.graph().delivery.whole;
-    let mut any = false;
-    for (_, (name, original)) in fixture.posted() {
-        let Some(bytes) = delivered(&whole.files, name) else {
-            continue;
-        };
-        if counted
-            .iter()
-            .any(|counted| counted.rsplit('/').next() == Some(name))
-        {
-            assert!(
-                bytes == original,
-                "{context}: {name} counted whole, delivered damaged"
-            );
-            any = true;
-        } else {
-            assert!(bytes != original, "{context}: {name} whole, not counted");
-        }
-    }
+    // Which described files came out whole is read from the bytes: those
+    // delivered byte for byte as described. The job counts exactly those
+    // whole, and every other it delivers is delivered as it stands.
+    let base = |name: &str| name.rsplit('/').next().unwrap_or(name).to_string();
+    let bytes_whole: BTreeSet<String> = fixture
+        .posted()
+        .filter(|(_, (name, original))| delivered(&whole.files, name) == Some(original))
+        .map(|(_, (name, _))| base(name))
+        .collect();
+    let described: BTreeSet<String> = fixture.posted().map(|(_, (name, _))| base(name)).collect();
+    let counted: BTreeSet<String> = whole
+        .graph()
+        .delivery
+        .whole
+        .iter()
+        .map(|path| base(path))
+        .filter(|name| described.contains(name))
+        .collect();
+    assert_eq!(
+        counted, bytes_whole,
+        "{context}: the files counted whole are not the files delivered whole"
+    );
+    let any = !bytes_whole.is_empty();
     match &whole.status {
         Some(JobStatus::Failed { .. }) => {
             assert!(!any, "{context}: a failed job delivered a file");

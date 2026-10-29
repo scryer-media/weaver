@@ -484,12 +484,16 @@ impl ArticleMap {
         })
     }
 
-    // Whether every server failed the article.
-    pub(crate) fn article_lost(&self, volume: VolumeIndex, ordinal: u32) -> bool {
-        self.volumes.get(volume.0 as usize).is_some_and(|found| {
-            found
-                .index(ordinal)
-                .is_some_and(|index| matches!(found.articles[index].state, State::Lost { .. }))
+    // Every article every server failed, with the encoded size the post
+    // declares for it.
+    pub(crate) fn lost_articles(&self) -> impl Iterator<Item = (VolumeIndex, u32, u64)> + '_ {
+        self.volumes.iter().zip(0u32..).flat_map(|(found, volume)| {
+            (0..found.articles.len())
+                .filter(|at| matches!(found.articles[*at].state, State::Lost { .. }))
+                .map(move |at| {
+                    let size = found.encoded_at(at + 1) - found.encoded_at(at);
+                    (VolumeIndex(volume), found.articles[at].ordinal, size)
+                })
         })
     }
 

@@ -464,6 +464,22 @@ impl Source for Lent {
         self.members.get(&(node, member))?.bound
     }
 
+    // The one recovery object a repair takes along is its set.
+    fn recovers(&self, child: NodeId) -> bool {
+        child == self.set
+    }
+
+    // The one binding a repair takes along is its set's.
+    fn in_member(&self, child: NodeId, range: ByteRange) -> Option<ByteRange> {
+        if child != self.set {
+            return None;
+        }
+        match self.window {
+            Some(window) => range.in_window(window),
+            None => Some(range),
+        }
+    }
+
     fn posted(
         &self,
         child: NodeId,
@@ -582,11 +598,10 @@ impl MemberAccess for Lent {
         let Some(&(parent, member)) = self.volumes.get(&volume) else {
             return false;
         };
-        let within = match self.window {
-            Some(window) => range.in_window(window),
-            None => Some(range),
-        };
-        let Some(within) = within.filter(|within| within.len() == range.len()) else {
+        let Some(within) = self
+            .in_member(self.set, range)
+            .filter(|within| within.len() == range.len())
+        else {
             return false;
         };
         let start = into.len();

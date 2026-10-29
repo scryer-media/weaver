@@ -664,6 +664,31 @@ impl Tree {
         self.reach(child, Told::Closed { volume, length }, builder, effects);
     }
 
+    // A restore tells every object the close of each of its volumes
+    // again, as it tells every loss again: an object lent out when the
+    // checkpoint was taken comes back as it was when it left, and a close
+    // that reached it meanwhile went down with the run.
+    pub fn close_again(&mut self, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
+        for node in self.live() {
+            let closed: Vec<MemberId> = self.nodes.get(&node).map_or_else(Vec::new, |found| {
+                found
+                    .namespace
+                    .records()
+                    .filter(|record| record.closed)
+                    .map(|record| record.id)
+                    .collect()
+            });
+            for member in closed {
+                if self.awaiting(node, member).is_none() {
+                    self.volume_closed(node, member, builder, effects);
+                }
+                for window in self.windows_on(node, member) {
+                    self.close_window(window, builder, effects);
+                }
+            }
+        }
+    }
+
     fn windows_on(&self, node: NodeId, member: MemberId) -> Vec<NodeId> {
         self.nodes
             .get(&node)
@@ -903,19 +928,37 @@ impl Tree {
         if self.child_of(node, member).is_some() {
             return Vec::new();
         }
-        // The objects that refused for want of bytes the rewrite may have
-        // changed: those holding the member, and those that gave up for a
-        // volume of the namespace they could not place or whose first bytes
-        // never came, which the rewritten member may be.
+        // The objects whose refusal the rewrite answers: those holding the
+        // member, and those that take the member as a volume of theirs by
+        // their own answer to its rewritten front, as `offer` asks it: a set
+        // that gave up for want of a volume it never had, which the member
+        // is.
+        let Some((name, length, front)) = self
+            .namespace(node)
+            .and_then(|namespace| Some((namespace.get(member)?, namespace.first_bytes(member))))
+            .map(|(record, front)| (record.name.clone(), record.length, front.to_vec()))
+        else {
+            return Vec::new();
+        };
         let refusers: Vec<NodeId> = self
             .refused_below(node)
             .into_iter()
             .filter(|object| {
-                self.volumes(*object)
-                    .is_some_and(|(_, volumes)| volumes.values().any(|bound| *bound == member))
-                    || self.nodes.get(object).is_some_and(|refuser| {
-                        matches!(refuser.refused, Some(Why::FirstBytesLost | Why::Unmapped))
-                    })
+                let holds = self
+                    .volumes(*object)
+                    .is_some_and(|(_, volumes)| volumes.values().any(|bound| *bound == member));
+                holds
+                    || self
+                        .nodes
+                        .get_mut(object)
+                        .filter(|refuser| {
+                            refuser
+                                .binding
+                                .as_ref()
+                                .is_some_and(|binding| binding.window.is_none())
+                        })
+                        .and_then(|refuser| refuser.object.as_mut())
+                        .is_some_and(|refuser| refuser.claim(&name, &front, length).is_some())
             })
             .collect();
         if refusers.is_empty() && !self.unowned(node, member) {
@@ -1389,6 +1432,21 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        let empty = self.release(node, child, (volume, member), effects);
+        self.forget_empty(child, empty, effects);
+        self.identify_again(node, member, builder, effects);
+    }
+
+    // `member` leaves the object at `child`, where only its name held it as
+    // `volume`: the object holds nothing of it from here, and the member's
+    // file is its own, nothing copied. Whether the object holds no volume.
+    fn release(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        (volume, member): (VolumeIndex, MemberId),
+        effects: &mut Vec<Effect>,
+    ) -> bool {
         let mut empty = false;
         if let Some(found) = self.nodes.get_mut(&child) {
             if let Some(binding) = found.binding.as_mut() {
@@ -1410,8 +1468,7 @@ impl Tree {
             from: child,
             volume,
         });
-        self.forget_empty(child, empty, effects);
-        self.identify_again(node, member, builder, effects);
+        empty
     }
 
     // The object at `node` gives volumes back, every one it named in one
@@ -1656,35 +1713,23 @@ impl Tree {
         let Some(found) = self.nodes.get_mut(&node) else {
             return;
         };
-        // Clean bytes over damage, or where a member nothing more arrives
-        // for has none, replace what was there, whichever posting or repair
-        // brings them.
-        let mends = provenance.is_verified()
-            && found
-                .namespace
-                .get(found.namespace.resolve(posting))
-                .is_some_and(|record| {
-                    record.coverage.damaged(range)
-                        || record.closed && !record.coverage.covered(range)
-                });
         let (member, taken) = found.namespace.arrive(posting, range, provenance);
         for part in taken {
             let from = (part.start - offset) as usize;
             let piece = bytes.slice(from..from + part.len() as usize);
             let arrived = (part.start, piece, provenance);
-            self.take(node, member, arrived, mends, builder, effects);
+            self.take(node, member, arrived, builder, effects);
         }
     }
 
     // What a member took of a delivery: kept at its front, handed to its
-    // owner or written as a leaf. A member that took clean bytes over
-    // damage is asked again who owns it when they reach its front.
+    // owner or written as a leaf. A member with no owner is asked again who
+    // owns it when bytes reach its front.
     fn take(
         &mut self,
         node: NodeId,
         member: MemberId,
         (offset, bytes, provenance): (u64, Bytes, Provenance),
-        mends: bool,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
@@ -1785,9 +1830,11 @@ impl Tree {
                     bytes,
                     provenance,
                 });
-                // Damage at the front may have hidden what the member is;
-                // clean bytes there let it say, once they are in its file.
-                if front && !undecided && mends {
+                // A front that grew may say what the member is: one that
+                // came late, as one a restart fetches again, or clean bytes
+                // over damage that hid it. It says, once they are in its
+                // file.
+                if front && !undecided {
                     self.identify_again(node, member, builder, effects);
                 }
             }
@@ -1954,6 +2001,13 @@ impl Tree {
         })
     }
 
+    // A member whose front never came: a name is all that holds it as any
+    // object's volume, and a member whose front came outranks it.
+    fn held_by_name(&self, node: NodeId, member: MemberId) -> bool {
+        self.namespace(node)
+            .is_some_and(|namespace| namespace.first_bytes(member).is_empty())
+    }
+
     // An object founded on nothing but names: none of its volumes' fronts
     // signs anything, so its hold on each is its name's.
     fn founded_by_name(&self, node: NodeId) -> bool {
@@ -2016,42 +2070,30 @@ impl Tree {
                 };
                 // A place the object holds already: the member is another
                 // posting of the one there, or stays where its name put it.
+                // A member whose front never came, at a place the object
+                // holds by bytes, is a volume of neither: a name was all
+                // that held it, and it is a member no object owns.
                 let holder = self
                     .nodes
                     .get(&child)
                     .and_then(|found| found.binding.as_ref())
                     .and_then(|binding| binding.volumes.get(&place))
                     .copied();
-                if holder.is_some_and(|into| {
-                    !self
-                        .namespace(node)
+                let folds = holder.is_none_or(|into| {
+                    self.namespace(node)
                         .is_some_and(|namespace| namespace.folds(member, into))
-                }) {
+                });
+                let outranked =
+                    holder.is_some_and(|into| front.is_empty() && !self.held_by_name(node, into));
+                if !folds && !outranked {
                     continue;
                 }
-                if let Some(found) = self.nodes.get_mut(&sibling) {
-                    if let Some(binding) = found.binding.as_mut() {
-                        binding.volumes.remove(&volume);
-                        binding.awaiting.remove(&volume);
-                    }
-                    if let Some(object) = found.object.as_mut() {
-                        object.taken(volume);
-                    }
-                }
-                if let Some(found) = self.nodes.get_mut(&node) {
-                    found.children.remove(&member);
-                    found.namespace.unbind(member);
-                }
-                effects.push(Effect::GivenBack {
-                    node,
-                    member,
-                    from: sibling,
-                    volume,
-                });
+                self.release(node, sibling, (volume, member), effects);
                 match holder {
-                    Some(into) => {
+                    Some(into) if folds => {
                         self.fold(node, member, into, effects);
                     }
+                    Some(_) => {}
                     None => self.join(node, member, (child, place), (&name, &front), effects),
                 }
             }
@@ -2157,8 +2199,14 @@ impl Tree {
                 if into != member && self.fold(node, member, into, effects) {
                     return true;
                 }
-                let yields = into != member
-                    && refused.is_none()
+                let contested = into != member && refused.is_none();
+                // A holder whose front never came holds its place by its
+                // name alone, which the claimant's bytes outrank: it leaves
+                // the object as a volume a founded sibling takes does, and
+                // is a member no object owns, as it would be had the
+                // claimant come first.
+                let named = contested && !prefix.is_empty() && self.held_by_name(node, into);
+                let yields = contested
                     && self
                         .nodes
                         .get(child)
@@ -2166,10 +2214,13 @@ impl Tree {
                         .is_some_and(|object| {
                             object.provisional(volume, prefix, self.given.get(&(node, member)))
                         });
-                if !yields {
+                if named {
+                    self.release(node, *child, (volume, into), effects);
+                } else if yields {
+                    self.displace(node, (*child, volume), into, effects);
+                } else {
                     continue;
                 }
-                self.displace(node, (*child, volume), into, effects);
             }
             match refused {
                 None => self.join(node, member, (*child, volume), (&name, prefix), effects),
@@ -3294,6 +3345,7 @@ mod tests {
 
     mod again;
     mod lift;
+    mod reopen;
     mod reposted;
     mod sets;
     mod windows;

@@ -246,6 +246,22 @@ fn two_middle_pieces_nothing_orders_refuse_the_set_at_quiet() {
     );
 }
 
+// A place whose piece's front came is held across a restore: a piece of
+// the same length that no name places takes the one place left.
+#[test]
+fn a_place_whose_front_came_is_held_after_a_restore() {
+    let (mut object, pieces) = unnamed_middles();
+    let (name, piece) = &pieces[1];
+    let (front, length) = (&piece[..32], Some(piece.len() as u64));
+    object.bound(VolumeIndex(1), name, front, length);
+    let mut restored =
+        crate::restore(&object.facts(), weaver_graph::Budget::default()).expect("restores");
+    let (name, piece) = &pieces[2];
+    let (front, length) = (&piece[..32], Some(piece.len() as u64));
+    assert_eq!(object.claim(name, front, length), Some(VolumeIndex(2)));
+    assert_eq!(restored.claim(name, front, length), Some(VolumeIndex(2)));
+}
+
 // A recovery set that gives the pieces their real names orders them: once
 // the first piece carries its own, each middle piece takes the place its
 // number gives, and nothing is left beside the set to refuse it for.
@@ -379,6 +395,34 @@ fn an_encrypted_folder_streams_out_of_order_once_its_password_proves() {
     no_trouble(&owner);
     streamed(&owner);
     // Re-enciphering the members gives back the bytes as posted.
+    assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
+}
+
+// The arrival that completes the proof opens the folder in the same call:
+// the proof's bytes reach the member once, through the cipher once, so the
+// member comes out whole and enciphers back to the bytes as posted.
+#[test]
+fn the_arrival_that_proves_the_password_goes_through_the_cipher_once() {
+    let lone = payload(4, 40_000);
+    let bytes = write(aes(), false, &[(None, Entry::File("alpha.bin", &lone))]);
+    let mut owner = Owner::single(store(), bytes.clone());
+    // Bytes come in the order sent, never pulled ahead.
+    owner.pull = Pull::Moved(0);
+    owner.offer(PASSWORD);
+    // The end header first, so the proof is chosen before the folder comes;
+    // its last piece lies mid-folder, off the cipher's blocks.
+    let tail = end_header(&bytes).start;
+    let last = ByteRange::new(tail / 2 + 5, tail / 2 + 1005);
+    owner.deliver(0, ByteRange::new(0, 32));
+    owner.deliver(0, ByteRange::new(tail, bytes.len() as u64));
+    owner.deliver(0, ByteRange::new(32, last.start));
+    owner.deliver(0, ByteRange::new(last.end, tail));
+    owner.deliver(0, last);
+    owner.close(0);
+    no_trouble(&owner);
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert_eq!(got.bytes, lone);
     assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
 }
 

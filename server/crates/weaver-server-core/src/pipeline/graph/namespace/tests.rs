@@ -1394,6 +1394,77 @@ fn a_deleted_output_does_not_hide_the_surviving_committed_envelope() {
     );
 }
 
+// A restore brings an envelope back as far as its file reaches, and the
+// member's coverage as far as what arrived. Given back after that, the
+// envelope is the member's file, and what it lacks is not in hand: the
+// coverage gives it up to come again, so replaying the file reads only
+// what the file holds.
+#[test]
+fn a_member_given_back_after_a_restore_holds_only_what_its_envelope_kept() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", None);
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let (child, volume) = job
+        .tree
+        .child_of(NodeId::ROOT, member)
+        .expect("bound to the store");
+    let kept = job.writer.envelopes.records(child);
+    assert_eq!(kept.len(), 1);
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    let envelope = job
+        .dir
+        .path()
+        .join(crate::pipeline::graph::envelope::envelope_name(
+            child,
+            kept[0].envelope,
+        ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&envelope)
+        .and_then(|file| file.set_len(3))
+        .expect("the crash left three bytes");
+    job.writer.restore_kept(&kept[0]).unwrap();
+
+    let mut build = job.build();
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::GiveBack(volume),
+            &mut job.out,
+        )
+        .expect("give back");
+    let replayed = job.writer.replay_file(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        NodeId::ROOT,
+        member,
+        &mut job.out,
+    );
+    assert!(replayed.is_ok(), "{replayed:?}");
+    let coverage = &job
+        .tree
+        .namespace(NodeId::ROOT)
+        .and_then(|namespace| namespace.get(member))
+        .expect("the member")
+        .coverage;
+    assert!(coverage.covered(ByteRange::new(0, 3)));
+    assert!(!coverage.covered(ByteRange::new(3, 4)), "{coverage:?}");
+    let access = job.writer.access(&job.tree);
+    let mut posted = Vec::new();
+    assert!(access.read_at(NodeId::ROOT, member, ByteRange::new(0, 3), &mut posted));
+    assert_eq!(posted, &SIGNATURE[..3]);
+    assert!(!access.read_at(NodeId::ROOT, member, ByteRange::new(3, 4), &mut posted));
+}
+
 // A retracted member has no file: what comes back is written anew, under
 // the name it keeps.
 #[test]

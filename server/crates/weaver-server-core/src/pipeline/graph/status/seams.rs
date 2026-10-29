@@ -10,8 +10,8 @@ use weaver_graph::{MemberId, NodeId};
 
 use super::claims::{self, Claim, ClaimedMember};
 use super::{
-    Delivery, Failure, RecoverySummary, RootJob, Step, drive, failure, metrics, repaired_slices,
-    shown_status,
+    Delivery, Failure, RecoverySummary, RootJob, Step, Unarrived, drive, failure, metrics,
+    repaired_slices, shown_status,
 };
 use crate::events::model::PipelineEvent;
 use crate::jobs::ids::{JobId, NzbFileId};
@@ -21,6 +21,7 @@ use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::extraction::ExtractionError;
 use crate::pipeline::graph::job::{GraphJob, Note};
 use crate::pipeline::graph::root::phase::RootPhase;
+use crate::pipeline::post_health::{names_a_place, names_nothing};
 use crate::pipeline::{Pipeline, TerminalReconciliation, health_milli};
 use crate::post_processing::model::PipelineFailureStage;
 
@@ -312,15 +313,13 @@ impl Pipeline {
                     par2_damage_ignorable(&member.output_name, &ignore),
                 );
                 // An article the feed stopped asking for was never lost.
-                row.lost_articles = self
-                    .segment_terminal_states
-                    .iter()
-                    .filter(|(segment, state)| {
-                        segment.file_id == file_id
-                            && **state != crate::pipeline::SegmentTerminalState::Abandoned
-                    })
-                    .count();
-                row.lost_bytes = self.file_terminal_failed_bytes(file_id);
+                let losses = self
+                    .given_up
+                    .get(&job_id)
+                    .map(|given_up| given_up.file(file_id.file_index))
+                    .unwrap_or_default();
+                row.lost_articles = losses.lost;
+                row.lost_bytes = losses.bytes;
                 row.declared_bytes = file.segments.iter().map(|s| u64::from(s.bytes)).sum();
                 Some(row)
             })
@@ -517,6 +516,46 @@ impl Pipeline {
                     *namespace == node && job.writer().covers(job.tree(), *set, member)
                 })
         };
+        // A posted file that is not whole, read by the name it was posted
+        // under once the feed gave up every byte the post declared for it:
+        // another posting of the place a posted file that brought clean
+        // bytes is named into, or a name that says no kind of file. A file
+        // that brought anything is short of the rest.
+        let arrived: Vec<_> = job
+            .tree()
+            .namespace(NodeId::ROOT)
+            .into_iter()
+            .flat_map(|namespace| namespace.members())
+            .filter(|member| {
+                member.coverage.bytes_covered()
+                    > member
+                        .coverage
+                        .damaged_ranges()
+                        .map(|range| range.len())
+                        .sum()
+            })
+            .filter_map(|member| names_a_place(&member.name))
+            .collect();
+        let given_up = self.given_up.get(&job_id);
+        let unarrived = |member: MemberId| {
+            let Some(file) = state.spec.files.get(member.0 as usize) else {
+                return Unarrived::Short;
+            };
+            let declared: u64 = file
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.bytes))
+                .sum();
+            let lost = given_up.map_or(0, |given_up| given_up.file(member.0).bytes);
+            if declared == 0 || lost < declared {
+                return Unarrived::Short;
+            }
+            match names_a_place(&file.filename) {
+                Some(place) if arrived.contains(&place) => Unarrived::Again,
+                _ if names_nothing(&file.filename) => Unarrived::Unnamed,
+                _ => Unarrived::Short,
+            }
+        };
         let delivery = Delivery::read(
             job.tree(),
             payload,
@@ -535,6 +574,7 @@ impl Pipeline {
                         crate::pipeline::post_health::names_a_piece(&member.output_name)
                     })
             },
+            unarrived,
         );
         Some((delivery, failure))
     }
