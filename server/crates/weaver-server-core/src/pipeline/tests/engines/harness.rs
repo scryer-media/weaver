@@ -658,6 +658,11 @@ impl Scenario {
 // The job `posts` make posted under `name`, each cut into articles of
 // `article` bytes.
 pub(in crate::pipeline) fn spec(name: &str, posts: &[Post], article: usize) -> JobSpec {
+    // A file with no article is no file of a job: a post never lists one.
+    assert!(
+        posts.iter().all(|post| !post.bytes.is_empty()),
+        "a post with no article"
+    );
     JobSpec {
         name: name.to_string(),
         password: None,

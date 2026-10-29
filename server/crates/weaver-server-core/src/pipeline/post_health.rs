@@ -601,7 +601,6 @@ impl Pipeline {
             .files
             .iter()
             .zip(0u32..)
-            .filter(|(file, _)| !file.segments.is_empty())
             .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
         let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));

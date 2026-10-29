@@ -144,8 +144,20 @@ impl Fixture {
         par2_volumes_sliced("lantern", &described, self.block as u64, recovery, volumes)
     }
 
-    fn articles(&self, file: usize) -> u32 {
-        self.files[file].1.len().div_ceil(ARTICLE) as u32
+    // The articles of the posted file at `post`.
+    fn articles(&self, post: usize) -> u32 {
+        self.posted()
+            .nth(post)
+            .map_or(0, |(_, (_, bytes))| bytes.len().div_ceil(ARTICLE) as u32)
+    }
+
+    // The described files the job posts, by their place in the job: a file
+    // with no bytes has no article, so no post carries it.
+    fn posted(&self) -> impl Iterator<Item = (usize, &(String, Vec<u8>))> {
+        self.files
+            .iter()
+            .filter(|(_, bytes)| !bytes.is_empty())
+            .enumerate()
     }
 
     // The job as posted under `damage`: the source files, then the set. An
@@ -157,9 +169,7 @@ impl Fixture {
             (self.recovery, self.volumes)
         };
         let mut posts: Vec<Post> = self
-            .files
-            .iter()
-            .enumerate()
+            .posted()
             .map(|(i, (name, original))| {
                 let posted = name.rsplit('/').next().unwrap();
                 match damage {
@@ -176,11 +186,11 @@ impl Fixture {
             .collect();
         posts.extend(self.set(recovery, volumes));
         let mut scenario = Scenario::new(posts);
-        for (i, (_, original)) in self.files.iter().enumerate() {
+        for (i, (_, original)) in self.posted() {
             let file = i as u32;
             let articles = self.articles(i);
             match damage {
-                Damage::Corrupt if !original.is_empty() => {
+                Damage::Corrupt => {
                     // The wide fixture damages bytes beyond the 16 KiB quick
                     // hash.
                     let at = if original.len() > 16 * 1024 {
@@ -213,15 +223,16 @@ impl Fixture {
         } else {
             self.volumes as usize
         };
-        let first = self.files.len() + 1;
+        let first = self.posted().count() + 1;
         first..first + volumes
     }
 
     // A seeded schedule: each source file in two halves, each volume's
     // first article then the rest of it, and two restarts, interleaved.
     fn schedule(&self, seed: u64, damage: Damage) -> Vec<Event> {
-        let mut chains: Vec<Vec<Event>> = (0..self.files.len())
-            .map(|i| vec![Event::Source(i, 1), Event::Source(i, 2)])
+        let mut chains: Vec<Vec<Event>> = self
+            .posted()
+            .map(|(i, _)| vec![Event::Source(i, 1), Event::Source(i, 2)])
             .collect();
         for i in 0..self.volume_posts(damage).len() {
             chains.push(vec![Event::Recovery(i, 0), Event::Recovery(i, 1)]);
@@ -286,8 +297,15 @@ fn delivered<'a>(files: &'a BTreeMap<String, Vec<u8>>, name: &str) -> Option<&'a
 // The run in posting order came to what the damage and the recovery say:
 // every described file whole when the set can mend it, else a job that is
 // not complete, delivers no described file but byte for byte, and fails as
-// a repair when it delivers none.
+// a repair when it delivers none. A file listed with no bytes
+// was never a file of the job, and is never delivered.
 fn judge(fixture: &Fixture, whole: &Outcome, sufficient: bool, context: &str) {
+    for (name, _) in fixture.files.iter().filter(|(_, bytes)| bytes.is_empty()) {
+        assert!(
+            delivered(&whole.files, name).is_none(),
+            "{context}: {name} was listed with no article and delivered"
+        );
+    }
     if sufficient {
         assert_eq!(
             whole.status,
@@ -296,7 +314,7 @@ fn judge(fixture: &Fixture, whole: &Outcome, sufficient: bool, context: &str) {
             whole.failure,
             whole.files.keys().collect::<Vec<_>>()
         );
-        for (name, original) in &fixture.files {
+        for (_, (name, original)) in fixture.posted() {
             let got = delivered(&whole.files, name);
             assert!(
                 got == Some(original),
@@ -312,10 +330,10 @@ fn judge(fixture: &Fixture, whole: &Outcome, sufficient: bool, context: &str) {
         return;
     }
     let mut any = false;
-    for (name, original) in &fixture.files {
+    for (_, (name, original)) in fixture.posted() {
         if let Some(bytes) = delivered(&whole.files, name) {
             assert!(bytes == original, "{context}: {name} delivered damaged");
-            any |= !original.is_empty();
+            any = true;
         }
     }
     match &whole.status {
