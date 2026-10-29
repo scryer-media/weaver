@@ -13,7 +13,7 @@ use super::super::scenarios::encrypted_store_set;
 use super::super::single_member_store_set;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::engines::harness::{
-    ARTICLE, Outcome, Post, Scenario, par2_volumes, payload, run,
+    ARTICLE, Outcome, Post, Scenario, par2_volumes, payload, run, without_slice_checksums,
 };
 use crate::pipeline::tests::engines::restart::{Down, Restarted, run_restarting_at};
 
@@ -31,25 +31,6 @@ enum Coverage {
 }
 
 const COVERAGES: [Coverage; 3] = [Coverage::Prefix, Coverage::Hole, Coverage::Whole];
-
-// The PAR2 packet type of a slice-checksum packet.
-const SLICE_CHECKSUMS: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
-
-// The packets of a PAR2 file with every slice-checksum packet left out.
-fn without_slice_checksums(bytes: &[u8]) -> Vec<u8> {
-    const HEADER: usize = 64;
-    let mut kept = Vec::new();
-    let mut at = 0;
-    while at + HEADER <= bytes.len() {
-        assert_eq!(&bytes[at..at + 8], b"PAR2\0PKT", "a packet at {at}");
-        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
-        if &bytes[at + 48..at + 64] != SLICE_CHECKSUMS {
-            kept.extend_from_slice(&bytes[at..at + length]);
-        }
-        at += length;
-    }
-    kept
-}
 
 struct Fixture {
     member: Vec<u8>,

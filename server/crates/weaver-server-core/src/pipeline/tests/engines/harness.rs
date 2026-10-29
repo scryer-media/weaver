@@ -267,6 +267,24 @@ pub(in crate::pipeline::tests) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> 
     blocks
 }
 
+// The packets of a PAR2 file with every slice-checksum packet left out: a
+// set that hashes its files whole and no finer.
+pub(in crate::pipeline::tests) fn without_slice_checksums(bytes: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 64;
+    const SLICE_CHECKSUMS: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+    let mut kept = Vec::new();
+    let mut at = 0;
+    while at + HEADER <= bytes.len() {
+        assert_eq!(&bytes[at..at + 8], b"PAR2\0PKT", "a packet at {at}");
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+        if &bytes[at + 48..at + 64] != SLICE_CHECKSUMS {
+            kept.extend_from_slice(&bytes[at..at + length]);
+        }
+        at += length;
+    }
+    kept
+}
+
 // The bytes of a volume's one recovery packet, cut from it.
 pub(in crate::pipeline::tests) fn recovery_packet(volume: &Post) -> Vec<u8> {
     const HEADER: usize = 64;

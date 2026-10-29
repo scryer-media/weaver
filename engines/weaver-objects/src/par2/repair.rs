@@ -15,9 +15,9 @@ use std::io;
 
 use par2_rs::verify::FileAccess;
 use par2_rs::{
-    FileId, FileStatus, FileVerification, Packet, Par2FileSet, RecoverySlice, RepairOptions,
-    Repairability, SliceChecksumState, VerificationResult, execute_repair_with_options,
-    parse_packet, plan_repair_with_memory_limit,
+    FileHashState, FileId, FileStatus, FileVerification, Packet, Par2FileSet, RecoverySlice,
+    RepairOptions, Repairability, SliceChecksumState, VerificationResult,
+    execute_repair_with_options, parse_packet, plan_repair_with_memory_limit,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{ByteRange, MemberId, SliceVerdict};
@@ -177,7 +177,10 @@ pub(super) fn repair_set(
 // Which slices of a described file are good, reading back only the ones the
 // evidence did not settle; `read` says one was. The member range of each
 // slice its bytes proved bad, by the evidence or the read, goes in `proven`;
-// one that could not be read is not proven anything.
+// one that could not be read is not proven anything. A file the set carries
+// no slice checksums for is checked whole, against the hash its description
+// carries: every slice is good when it matches, and none is known good
+// otherwise, so the set rebuilds them all.
 fn slice_validity(
     index: &Par2FileSet,
     state: &SetState,
@@ -193,6 +196,17 @@ fn slice_validity(
     let Some(member) = state.members().get(&file).copied() else {
         return vec![false; count];
     };
+    if index.file_checksums(&file).is_none() {
+        *read = true;
+        let whole = whole_file_matches(index, file, member, access);
+        if whole == Some(false)
+            && let Some(described) = index.file_description(&file).map(|d| d.length)
+            && described > 0
+        {
+            proven.push((member, ByteRange::new(0, described)));
+        }
+        return vec![whole == Some(true); count];
+    }
     let evidence = Evidence::of(
         grid,
         index,
@@ -322,6 +336,37 @@ fn slice_range(
     let start = slice as u64 * index.slice_size;
     let end = (start + index.slice_size).min(described).min(length?);
     (start < end).then(|| ByteRange::new(start, end))
+}
+
+// Read the member back whole and check it against the described file's
+// hash: `None` when it is not the described length or could not be read,
+// so nothing is proven of it.
+fn whole_file_matches(
+    index: &Par2FileSet,
+    file: FileId,
+    member: MemberId,
+    access: &mut dyn MemberAccess,
+) -> Option<bool> {
+    const CHUNK: u64 = 1 << 20;
+    let description = index.file_description(&file)?;
+    if access.length(member) != Some(description.length) {
+        return None;
+    }
+    let mut hasher = FileHashState::new();
+    let mut buffer = Vec::new();
+    let mut at = 0;
+    while at < description.length {
+        let end = (at + CHUNK).min(description.length);
+        buffer.clear();
+        if !access.read(member, ByteRange::new(at, end), &mut buffer)
+            || buffer.len() as u64 != end - at
+        {
+            return None;
+        }
+        hasher.update(&buffer);
+        at = end;
+    }
+    Some(hasher.finalize() == description.hash_full)
 }
 
 // Read one slice back and check it against both of its checksums: `None`
