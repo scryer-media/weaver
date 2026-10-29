@@ -7531,8 +7531,7 @@
     },
     {
       "path": "testdata/par2-unrelated-set/record.rar",
-      "size": 184292,
-      "blake3": "f04dbed33fe8cd702fa215659d7f17eca53271ac2ed5461d47ec5ecb323feb89",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -10790,8 +10789,7 @@
     },
     {
       "path": "testdata/rar4-record-and-volume-repair/record.part1.rar",
-      "size": 65536,
-      "blake3": "31ebb9de3244abedd3e77f2a3ab437867daf3ab189f8f6b297240cbc50ca5722",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -10803,8 +10801,7 @@
     },
     {
       "path": "testdata/rar4-record-and-volume-repair/record.part1.rev",
-      "size": 65536,
-      "blake3": "67067aa57ca9e9f86c622a7a79890929a62e41e63881ac80dc92a91e82a8dd6b",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -10816,8 +10813,7 @@
     },
     {
       "path": "testdata/rar4-record-and-volume-repair/record.part3.rar",
-      "size": 28608,
-      "blake3": "9d62b6220649a428add4fa825490efcbb0b75b6e7153bbb04c58e58fc9869ba7",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -10829,8 +10825,7 @@
     },
     {
       "path": "testdata/rar4-record-repair/record.rar",
-      "size": 158333,
-      "blake3": "42886fe643f97f31eb1f8e01ca072a10430df5d42d6efda00dbe3c678db46f6f",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -11294,8 +11289,7 @@
     },
     {
       "path": "testdata/rar5-record-and-volume-repair/record.part1.rar",
-      "size": 65536,
-      "blake3": "a9e08f4bb5d266005a33b899c128f125128765a3dc18c50a8749f50955b8f441",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -11307,8 +11301,7 @@
     },
     {
       "path": "testdata/rar5-record-and-volume-repair/record.part1.rev",
-      "size": 65599,
-      "blake3": "e6625f0376801aad9a5816f69bc6754ed9a5ff71d07dbe96646032d4b7e500e2",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -11320,8 +11313,7 @@
     },
     {
       "path": "testdata/rar5-record-and-volume-repair/record.part3.rar",
-      "size": 38178,
-      "blake3": "fae433194724bb2fc5beeebd1119a767bb4fdae2687a874efdf926d49fc3db46",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -11333,8 +11325,7 @@
     },
     {
       "path": "testdata/rar5-record-repair/record.rar",
-      "size": 184292,
-      "blake3": "f1c2db15e3ea3ddf6fac714df0a7d089d31cb48d677939c96455a8d77781b8ad",
+      "salted": true,
       "source": {
         "kind": "generated",
         "generator": "fixturegen",

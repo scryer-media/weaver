@@ -37,7 +37,10 @@ func boundaryRARRecordRecipe(format RARFormat, volumes bool) Recipe {
 		writer = RAR4Writer
 	}
 	return Recipe{
-		Slug: slug, Family: "RAR recovery record", ByteReproducible: true,
+		// RAR4 stamps the recovery header with the current time; RAR5's
+		// recovery data varies even with identical payloads and timestamps.
+		// Recovery volumes inherit those differences from the archives.
+		Slug: slug, Family: "RAR recovery record", ByteReproducible: false,
 		Notes: "One damaged data block covered by RARLAB's own recovery record. The volume variant also withholds a second volume and supplies only one .rev, requiring record repair before volume recovery can finish.",
 		Build: func(ctx context.Context, env *Env) error {
 			if err := WritePRNG(env.StagePath("record.bin"), "graph-boundary/rar-record", boundaryPayloadSize); err != nil {
@@ -130,7 +133,9 @@ func validateUnicodeRecoveryOutputs(env *Env, version int, payload string) error
 
 func boundaryUnrelatedPAR2Recipe() Recipe {
 	return Recipe{
-		Slug: "par2-unrelated-set", Family: "recovery identity", ByteReproducible: true,
+		// The RAR inherits the recovery record's variable bytes. The loose
+		// payload and its unrelated PAR2 set remain digest-pinned.
+		Slug: "par2-unrelated-set", Family: "recovery identity", ByteReproducible: false,
 		Notes: "A damaged RAR protected only by its embedded recovery record, beside an unrelated PAR2 set over a healthy loose file. The unrelated set must neither claim the RAR nor delay its record repair.",
 		Build: func(ctx context.Context, env *Env) error {
 			if err := boundaryRARRecordRecipe(RAR5, false).Build(ctx, env); err != nil {

@@ -15,10 +15,10 @@ import (
 // byte-reproducible.
 //
 // A salted entry buys out of content verification entirely: present is the only
-// check it ever gets. That is the right answer for a writer that draws a random
-// salt — 7-Zip's AES chains have no switch to fix theirs — and the wrong answer
-// for everything else, because it is also the easiest way to silence a genuine
-// reproducibility failure. Tying the escape hatch to `ByteReproducible: false`
+// check its bytes get. This covers random salts and variable recovery records:
+// RAR4 records the current time, and RAR5 recovery data varies between runs.
+// It must not silence a genuine reproducibility failure in a deterministic
+// writer. Tying the escape hatch to `ByteReproducible: false`
 // means using it requires admitting, in the recipe, that the bytes cannot be
 // pinned.
 //
