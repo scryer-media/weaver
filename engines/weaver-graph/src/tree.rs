@@ -664,6 +664,31 @@ impl Tree {
         self.reach(child, Told::Closed { volume, length }, builder, effects);
     }
 
+    // A restore tells every object the close of each of its volumes
+    // again, as it tells every loss again: an object lent out when the
+    // checkpoint was taken comes back as it was when it left, and a close
+    // that reached it meanwhile went down with the run.
+    pub fn close_again(&mut self, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
+        for node in self.live() {
+            let closed: Vec<MemberId> = self.nodes.get(&node).map_or_else(Vec::new, |found| {
+                found
+                    .namespace
+                    .records()
+                    .filter(|record| record.closed)
+                    .map(|record| record.id)
+                    .collect()
+            });
+            for member in closed {
+                if self.awaiting(node, member).is_none() {
+                    self.volume_closed(node, member, builder, effects);
+                }
+                for window in self.windows_on(node, member) {
+                    self.close_window(window, builder, effects);
+                }
+            }
+        }
+    }
+
     fn windows_on(&self, node: NodeId, member: MemberId) -> Vec<NodeId> {
         self.nodes
             .get(&node)

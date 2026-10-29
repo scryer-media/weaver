@@ -294,6 +294,8 @@ pub trait Object: Send + Sync {
     );
 
     // My volume has no more bytes coming: everything that could arrive has.
+    // A close may be told again, as a loss may: a restore tells every close
+    // again. A close told again is the one already heard.
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>);
 
     // This range of my volume will never arrive and no recovery covers it.
