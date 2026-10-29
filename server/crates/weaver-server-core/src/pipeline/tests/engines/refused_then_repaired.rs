@@ -292,8 +292,10 @@ const FOUR: [&str; 4] = [
     "rar5_lz_four.part04.rar",
 ];
 const SLICE: usize = 1024;
-// Bytes inside the second volume's file header.
-const ZEROED: std::ops::Range<usize> = 60..80;
+// The size, type and flags of the second volume's file header: with them
+// gone no reader finds the continuation there. A spoiled name or checksum
+// alone does not stop a read; the volume's data is still taken.
+const ZEROED: std::ops::Range<usize> = 30..34;
 
 fn profile(name: &str) -> Vec<u8> {
     std::fs::read(format!(

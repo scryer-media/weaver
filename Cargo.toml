@@ -165,7 +165,9 @@ par3-rs = { version = "=0.8.1", default-features = false }
 # the `RARPAR_CRC32_VPCLMUL` override; `CRC_TURBO_TIER` pins the tier instead.
 # 0.14.3 states a split member's checksum only once its final part's header
 # has been read, and an extraction merges the continuation headers it read.
-unrar-rs = { version = "0.14.3", default-features = false, features = ["crypto-aws-lc"] }
+# 0.15.0 states a RAR5 member's hash-MAC flag, opens `rar rc`-rebuilt RAR4 -hp
+# volumes, and chains continuation volumes by split header, not by name.
+unrar-rs = { version = "0.15.0", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
