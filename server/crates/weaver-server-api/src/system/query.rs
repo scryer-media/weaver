@@ -153,16 +153,8 @@ impl SystemQuery {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
         let items: Vec<QueueItem> = handle
-            .list_jobs()
+            .queue_jobs()
             .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Partial
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
             .map(|info| queue_item_from_job(&info))
             .collect();
         let metrics = handle.get_metrics();

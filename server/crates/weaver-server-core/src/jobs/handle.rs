@@ -160,6 +160,13 @@ impl SharedPipelineState {
         })
     }
 
+    // The queue's own rows, whatever their status: a job retiring into
+    // history stays here until its archive commits, and history hides it
+    // until then.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.queue.read(|inner| inner.visible_jobs().collect())
+    }
+
     // How many published jobs are in each status, counted under the read
     // lock without copying a job.
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
@@ -1164,6 +1171,11 @@ impl SchedulerHandle {
     // List all jobs (reads from shared state, no channel round-trip).
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         self.state.list_jobs()
+    }
+
+    // The queue's jobs, a job retiring into history included.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.state.queue_jobs()
     }
 
     // History excludes every row still owned by the queue, even after it is hidden.

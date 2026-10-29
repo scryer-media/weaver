@@ -444,6 +444,37 @@ async fn a_retiring_job_refuses_mutations_until_its_history_commits() {
     assert_eq!(history(&mut pipeline, JOB).await.status, "complete");
 }
 
+// History hides a job the queue still holds, so a job retiring into history
+// stays in the queue until its archive commits. Its terminal event finds it
+// gone from the queue and its history row readable.
+#[tokio::test]
+async fn a_retiring_job_stays_in_the_queue_until_its_history_commits() {
+    let scenario = delivered();
+    let (_temp_dir, mut pipeline, _) = at_the_move(&scenario).await;
+    let handle = handle(&pipeline);
+    let mut events = handle.subscribe_events();
+    let release = hold_database_writer(&pipeline);
+    settle_inflight_moves(&mut pipeline).await;
+
+    assert!(handle.queued_job_ids().contains(&JOB));
+    let queued = handle
+        .queue_jobs()
+        .into_iter()
+        .find(|job| job.job_id == JOB)
+        .expect("the retiring job is in the queue");
+    assert_eq!(queued.status, JobStatus::Complete);
+
+    drop(release);
+    wait_for_job_event(
+        &mut events,
+        |event| matches!(event, PipelineEvent::JobCompleted { job_id } if *job_id == JOB),
+    )
+    .await;
+    assert!(!handle.queue_jobs().iter().any(|job| job.job_id == JOB));
+    assert!(!handle.queued_job_ids().contains(&JOB));
+    assert!(pipeline.db.get_job_history(JOB.0).unwrap().is_some());
+}
+
 // The final move cannot be made: the job fails with the move's reason, and
 // nothing is delivered.
 #[tokio::test]

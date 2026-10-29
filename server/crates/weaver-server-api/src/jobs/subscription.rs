@@ -114,16 +114,8 @@ impl JobsSubscription {
                         memo.last = Some((state.clone(), max_download_speed));
                     }
                     let mut items: Vec<QueueItem> = handle
-                        .list_jobs()
+                        .queue_jobs()
                         .into_iter()
-                        .filter(|info| {
-                            !matches!(
-                                info.status,
-                                weaver_server_core::JobStatus::Complete
-                                    | weaver_server_core::JobStatus::Partial
-                                    | weaver_server_core::JobStatus::Failed { .. }
-                            )
-                        })
                         .map(|info| queue_item_from_job(&info))
                         .filter(|item| {
                             matches_queue_filter_prepared(item, prepared_filter.as_ref())
