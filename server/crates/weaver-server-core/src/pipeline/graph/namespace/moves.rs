@@ -183,12 +183,10 @@ impl NamespaceWriter {
             if let Some(left) = left {
                 self.left.insert(key(&left), None);
                 moved = true;
+                // Select the actual moved payload, before recording its new location.
+                crate::e2e_failpoint::fire_rename(&wants);
             }
             self.moves.remove(at);
-            // A move has run and the checkpoint that says so has not: the
-            // moment a restore must find the file where the database says
-            // it is wanted.
-            crate::e2e_failpoint::fire(crate::e2e_failpoint::EXTRACT_AFTER_RENAME_BEFORE_RECORD);
         }
         Ok(moved)
     }

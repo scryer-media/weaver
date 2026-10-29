@@ -170,7 +170,10 @@ func checkAdversarialVerdict(tc adversarialCase, settled adversarialSettled) []e
 				problems = append(problems, fmt.Errorf("failed but published %s", name))
 			}
 		}
-	case "COMPLETE":
+	case "COMPLETE", "PARTIAL":
+		if settled.Status == "PARTIAL" && len(expected) == 0 {
+			problems = append(problems, errors.New("partial delivery has no exact usable-output oracle"))
+		}
 		if len(expected) > 0 {
 			if err := assertOutputBLAKE3(localWeaverDBPath(), settled.JobID, expected); err != nil {
 				problems = append(problems, err)

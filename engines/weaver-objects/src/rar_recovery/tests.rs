@@ -429,3 +429,37 @@ fn a_deferral_is_said_again_after_a_restart() {
     back.wants(&mut again);
     assert_eq!(again, wants(&job.object));
 }
+
+#[test]
+fn repaired_data_reopens_an_impossible_volume_recovery() {
+    let mut job = job();
+    rev(&mut job, "lantern.part1.rev", &rev5(2, 1, 2, &[300, 300]));
+    let member = data(&mut job, "lantern.part01.rar");
+    bind(&mut job);
+    let impossible = RepairOutcome::Impossible {
+        damaged: 1,
+        reachable: 1,
+    };
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        impossible
+    );
+    let mut segment = Segment {
+        range: ByteRange::new(0, 16),
+        crc32: 0,
+        verified: false,
+    };
+    job.object.feed(member, &[segment]);
+    assert_eq!(job.object.outcome(), Some(impossible));
+    segment.verified = true;
+    job.object.feed(MemberId(u32::MAX), &[segment]);
+    assert_eq!(job.object.outcome(), Some(impossible));
+    job.object.feed(member, &[segment]);
+    assert_eq!(job.object.outcome(), None);
+    for ruling in [RepairOutcome::Clean, RepairOutcome::Repaired { slices: 1 }] {
+        job.object.last = Some(Ruling::Reached(ruling));
+        job.object.feed(member, &[segment]);
+        assert_eq!(job.object.outcome(), Some(ruling));
+    }
+}

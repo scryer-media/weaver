@@ -205,3 +205,42 @@ pub fn maybe_trip(name: &str) {
     tracing::warn!(failpoint = name, "tripping e2e failpoint");
     std::process::abort();
 }
+
+// A rename crash can select exact destinations after `@`, separated by `|`.
+// Unrelated recovery-volume moves must not consume a payload crash hook.
+pub fn fire_rename(destination: &str) {
+    if let Some(configured) = configured_failpoint().as_ref()
+        && rename_target_matches(&configured.name, destination)
+    {
+        fire(&configured.name);
+    }
+    fire(EXTRACT_AFTER_RENAME_BEFORE_RECORD);
+}
+
+fn rename_target_matches(configured: &str, destination: &str) -> bool {
+    configured
+        .strip_prefix(EXTRACT_AFTER_RENAME_BEFORE_RECORD)
+        .and_then(|suffix| suffix.strip_prefix('@'))
+        .is_some_and(|targets| targets.split('|').any(|target| target == destination))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_crash_selects_only_the_requested_payloads() {
+        let configured =
+            format!("{EXTRACT_AFTER_RENAME_BEFORE_RECORD}@lantern.bin|beacon.bin|beacon (1).bin");
+        for name in ["lantern.bin", "beacon.bin", "beacon (1).bin"] {
+            assert!(rename_target_matches(&configured, name));
+        }
+        for name in ["set.vol0+4.par3", "00-keep.bin", "lantern.bin.par3"] {
+            assert!(!rename_target_matches(&configured, name));
+        }
+        assert!(!rename_target_matches(
+            EXTRACT_AFTER_RENAME_BEFORE_RECORD,
+            "lantern.bin"
+        ));
+    }
+}

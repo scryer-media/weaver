@@ -261,7 +261,11 @@ func runNamespaceRestart(ctx *restartCaseContext, slug, movedName string, remove
 	if len(held) == 0 || len(held) == len(segments) {
 		return restartCaseResult{}, fmt.Errorf("namespace fixture must contain sentinel and recovery inputs")
 	}
-	if err := ctx.startWeaverWithOptions("extract.after_rename_before_record", 8); err != nil {
+	targets := movedName
+	if chain {
+		targets = "lantern.bin|beacon.bin|beacon (1).bin"
+	}
+	if err := ctx.startWeaverWithOptions("extract.after_rename_before_record@"+targets, 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := setNntpChaos("hold_ids=" + strings.Join(held, ";")); err != nil {

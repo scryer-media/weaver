@@ -533,9 +533,22 @@ impl Recovery for RarRecovery {
         self.bound.values().any(|bound| *bound == member)
     }
 
-    // A volume is checked whole, by the restore; nothing is folded as
-    // bytes pass.
-    fn feed(&mut self, _member: MemberId, _segments: &[Segment]) {}
+    // A record or another set can repair a data volume after this set
+    // found it unusable. Rule again on the new bytes, while preserving a
+    // successful ruling when our own repair is written back.
+    fn feed(&mut self, member: MemberId, segments: &[Segment]) {
+        if self.covers(member)
+            && segments
+                .iter()
+                .any(|segment| segment.verified && !segment.range.is_empty())
+            && matches!(
+                self.last,
+                Some(Ruling::Short { .. } | Ruling::Reached(RepairOutcome::Impossible { .. }))
+            )
+        {
+            self.last = None;
+        }
+    }
 
     // One slice per volume.
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>) {
