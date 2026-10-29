@@ -68,6 +68,7 @@ pub(crate) enum Heard {
     // A recovery set's repair, lent off the loop, came back: addressed to
     // the set's node, under the loan's number for a generation.
     Repaired(Box<Returned>),
+    Replayed(Box<super::namespace::Replayed>),
     // The job's checkpoints committed through this stamp, or a write of
     // them failed (`None`), while a member's file waited on them to move.
     // Addressed to the root, under no run's generation.

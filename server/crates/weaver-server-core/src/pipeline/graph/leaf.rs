@@ -39,6 +39,10 @@ impl LeafError {
 
 #[derive(Debug)]
 pub(crate) struct Leaf {
+    // Runtime identity and content revision for in-flight readers. Neither
+    // survives a restart, when no worker from this process can return.
+    identity: u64,
+    revision: u64,
     path: PathBuf,
     // The name the file sits at, as `path` joins it under the directory.
     name: String,
@@ -59,6 +63,7 @@ pub(crate) struct Leaf {
 
 // How much of a file is read back at a time when its CRC is not in the fold.
 const READ_BACK: u64 = 1 << 20;
+static NEXT_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // A contiguous run of written bytes and their CRC32.
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +77,8 @@ impl Leaf {
     // first byte arrives.
     pub(crate) fn at(dir: &Path, output_name: &str) -> Self {
         Self {
+            identity: NEXT_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            revision: 0,
             path: dir.join(relative_path(output_name)),
             name: output_name.to_owned(),
             wants: None,
@@ -79,6 +86,10 @@ impl Leaf {
             file: None,
             written: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn revision(&self) -> (u64, u64) {
+        (self.identity, self.revision)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -119,6 +130,7 @@ impl Leaf {
         bytes: &[u8],
         length: Option<u64>,
     ) -> Result<(), LeafError> {
+        self.revision += 1;
         self.open(length)?;
         let replaced = self.replaced(offset, bytes.len() as u64)?;
         let file = self.file.as_ref().expect("opened above");
@@ -375,6 +387,7 @@ impl Leaf {
         if self.directory {
             return self.create_directory();
         }
+        self.revision += 1;
         self.open(Some(length))?;
         self.cut(length)?;
         let file = self.file.as_ref().expect("opened above");
@@ -386,6 +399,7 @@ impl Leaf {
     // The member starts over: the file stays, so the name stays reserved on
     // disk, but none of its bytes do.
     pub(crate) fn truncate(&mut self) -> Result<(), LeafError> {
+        self.revision += 1;
         self.written.clear();
         if self.file.is_none() && !self.path.exists() {
             return Ok(());

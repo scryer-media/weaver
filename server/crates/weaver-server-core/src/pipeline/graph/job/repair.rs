@@ -15,6 +15,7 @@ use weaver_graph::slots::Ticket;
 use weaver_graph::{MemberId, NodeId, VolumeIndex};
 
 use super::{GraphError, GraphJob};
+use crate::pipeline::graph::namespace::{Lender, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
 impl GraphJob {
@@ -47,6 +48,22 @@ impl GraphJob {
     // children, and ask each to rule its sets. A namespace the walk's own
     // repairs bring into being is walked too.
     fn walk(&mut self, mut slots: Option<(&mut RepairSlots, usize)>) -> Result<(), GraphError> {
+        if self.writer.rechecks_waiting() {
+            let mut lending = self
+                .loans
+                .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
+            if !lending.admit() {
+                return Ok(());
+            }
+            if let Some(replay) = self
+                .writer
+                .take_replay(&self.tree)
+                .map_err(WriteError::from)?
+            {
+                lending.replay(replay);
+                return Ok(());
+            }
+        }
         let mut walked = None;
         while let Some(node) = self.tree.next_live(walked) {
             walked = Some(node);
@@ -130,6 +147,7 @@ impl GraphJob {
         !self.payload_waiting()
             && !self.runs.live()
             && !self.loans.out()
+            && !self.writer.rechecks_waiting()
             && self.writer.all_ruled(&self.tree)
     }
 

@@ -13,6 +13,8 @@
 // back together, and the namespace applies them as one repair. What the
 // repair rebuilt waits on disk until then, never in memory.
 
+pub(super) mod replay;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -133,8 +135,11 @@ struct Taken {
     coverage: Coverage,
     length: Option<u64>,
     path: Option<PathBuf>,
+    revision: Option<(u64, u64)>,
+    scratch_revision: Option<(u64, u64)>,
     // The bytes held for it, in offset order.
-    held: Vec<(ByteRange, Bytes)>,
+    held: Vec<(ByteRange, Location)>,
+    scratch: Option<File>,
     bound: Option<(NodeId, VolumeIndex)>,
 }
 
@@ -150,6 +155,10 @@ impl Lent {
 struct Lent {
     namespace: NodeId,
     set: NodeId,
+    recovery: Option<NodeId>,
+    // Replay validates all node revisions on return, so it can defer reads
+    // of reusable scratch spans. Recovery snapshots retain their copies.
+    defer_holds: bool,
     // The directory the repair's scratch and output lie in, made when the
     // repair is lent. The repair never makes it again: once it is gone, the
     // job's working directory was released under the repair.
@@ -234,6 +243,10 @@ impl Repaired {
         self.failed.take()
     }
 
+    pub(crate) fn members(&self) -> impl Iterator<Item = MemberId> + '_ {
+        self.runs.iter().map(|(member, _, _)| *member)
+    }
+
     // Every run in the order written, a slice at a time, so no more than a
     // slice of it is in memory at once.
     pub(crate) fn slices(
@@ -271,6 +284,8 @@ impl NamespaceWriter {
         let mut access = Lent {
             namespace,
             set,
+            recovery: Some(set),
+            defer_holds: false,
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
             postings: BTreeMap::new(),
@@ -374,7 +389,21 @@ impl NamespaceWriter {
         };
         let files = self.files.get(&node);
         let held = files
-            .map(|files| self.held_pieces(files, member))
+            .map(|files| {
+                if access.defer_holds {
+                    files
+                        .holds
+                        .peek(held_volume(member), ALL)
+                        .into_iter()
+                        .map(|piece| (piece.range, piece.location))
+                        .collect()
+                } else {
+                    self.held_pieces(files, member)
+                        .into_iter()
+                        .map(|(range, bytes)| (range, Location::Ram(bytes)))
+                        .collect()
+                }
+            })
             .unwrap_or_default();
         let bound = tree
             .child_of(node, member)
@@ -387,7 +416,17 @@ impl NamespaceWriter {
                 path: files
                     .and_then(|files| files.leaves.get(&member))
                     .map(|leaf| leaf.path().to_path_buf()),
+                revision: files
+                    .and_then(|files| files.leaves.get(&member))
+                    .map(Leaf::revision),
+                scratch_revision: files
+                    .and_then(|files| files.scratch.as_ref())
+                    .map(Leaf::revision),
                 held,
+                scratch: files
+                    .and_then(|files| files.scratch.as_ref())
+                    .filter(|_| access.defer_holds)
+                    .and_then(|leaf| File::open(leaf.path()).ok()),
                 bound,
             },
         );
@@ -466,12 +505,12 @@ impl Source for Lent {
 
     // The one recovery object a repair takes along is its set.
     fn recovers(&self, child: NodeId) -> bool {
-        child == self.set
+        self.recovery == Some(child)
     }
 
     // The one binding a repair takes along is its set's.
     fn in_member(&self, child: NodeId, range: ByteRange) -> Option<ByteRange> {
-        if child != self.set {
+        if self.recovery != Some(child) {
             return None;
         }
         match self.window {
@@ -517,19 +556,37 @@ impl Source for Lent {
         let pieces: Vec<(ByteRange, Location)> = taken
             .held
             .iter()
-            .filter_map(|(held, bytes)| {
+            .filter_map(|(held, location)| {
                 let inside = held.intersect(range)?;
-                let from = index(inside.start - held.start);
-                let slice = bytes.slice(from..from + index(inside.len()));
-                Some((inside, Location::Ram(slice)))
+                let from = inside.start - held.start;
+                let location = match location {
+                    Location::Ram(bytes) => {
+                        Location::Ram(bytes.slice(index(from)..index(from + inside.len())))
+                    }
+                    Location::Scratch { offset, .. } => Location::Scratch {
+                        offset: offset + from,
+                        len: inside.len(),
+                    },
+                };
+                Some((inside, location))
             })
             .collect();
-        // Nothing it holds is on scratch: that was copied out when it left.
         read_pieces(
             pieces.iter().map(|(piece, location)| (*piece, location)),
             range,
             into,
-            |_, _, _| false,
+            |offset, len, into| {
+                let Some(file) = &taken.scratch else {
+                    return false;
+                };
+                let start = into.len();
+                into.resize(start + index(len), 0);
+                if read_exact_at(file, offset, &mut into[start..]).is_err() {
+                    into.truncate(start);
+                    return false;
+                }
+                true
+            },
         )
     }
 }

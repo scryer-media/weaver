@@ -2982,22 +2982,96 @@ impl Tree {
     // object's headers state for them. Which bytes are wrong is not known,
     // so the whole member is damaged, and the damage descends as any other.
     pub fn checksum_failed(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
-        let Some(length) = self
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
-            .and_then(|record| record.length)
-        else {
+        let Some(found) = self.nodes.get_mut(&node) else {
             return;
         };
-        let mut pending = Vec::new();
-        self.mark(
+        let member = found.namespace.resolve(member);
+        let Some(record) = found.namespace.get_mut(member) else {
+            return;
+        };
+        let Some(length) = record.length else {
+            return;
+        };
+        let range = ByteRange::new(0, length);
+        // This checks the assembled member itself, not one posting's
+        // report of damage. A parent's repair proves its input bytes;
+        // it cannot overrule the derived member's own failed checksum.
+        record.coverage.write(range, Provenance::Damaged);
+        effects.push(Effect::Damaged {
             node,
             member,
-            ByteRange::new(0, length),
-            effects,
-            &mut pending,
-        );
+            range,
+        });
+        let pending = found
+            .children
+            .get(&member)
+            .map(|&(child, volume)| (child, volume, range))
+            .into_iter()
+            .collect();
         self.descend(pending, effects);
+    }
+
+    // Capture the complete input dependencies of checksummed, damaged
+    // outputs before a repair's partial deliveries erase that evidence.
+    // This is a repair transition, not a payload-delivery query. Engine
+    // objects restart through their run generation; stores replay through
+    // the same inverse map used when they ask for bytes again.
+    pub fn rejected_inputs(
+        &self,
+        parent: NodeId,
+        rewritten: impl IntoIterator<Item = MemberId>,
+    ) -> Vec<(NodeId, Vec<(VolumeIndex, ByteRange)>)> {
+        let mut pending: Vec<_> = rewritten
+            .into_iter()
+            .filter_map(|member| self.child_of(parent, member).map(|(node, _)| node))
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut rejected = Vec::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            let Some(found) = self.nodes.get(&node).filter(|found| !found.retired) else {
+                continue;
+            };
+            let Some(object) = found.object.as_ref() else {
+                continue;
+            };
+            if object.engine().is_some() {
+                continue;
+            }
+            pending.extend(self.bound_below(node));
+            let mut extents = Vec::new();
+            for member in found.namespace.members() {
+                let Some(length) = member.length.filter(|_| member.crc32.is_some()) else {
+                    continue;
+                };
+                if member
+                    .coverage
+                    .runs()
+                    .any(|run| run.provenance == Provenance::Damaged)
+                {
+                    object.extent(member.id, ByteRange::new(0, length), &mut extents);
+                }
+            }
+            extents.sort_by_key(|extent| (extent.volume, extent.range.start));
+            let mut ranges: Vec<(VolumeIndex, ByteRange)> = Vec::new();
+            for extent in extents {
+                if let Some((volume, range)) = ranges.last_mut()
+                    && *volume == extent.volume
+                    && extent.range.start <= range.end
+                {
+                    range.end = range.end.max(extent.range.end);
+                } else {
+                    ranges.push((extent.volume, extent.range));
+                }
+            }
+            if !ranges.is_empty() {
+                rejected.push((node, ranges));
+            }
+        }
+        rejected.sort_by_key(|(node, _)| *node);
+        rejected
     }
 
     // An object found its own volume bad: a header checksum failed. The
@@ -3195,6 +3269,45 @@ impl Tree {
             };
             self.deliver_to_object(node, &arrived, length, builder, effects);
         }
+    }
+
+    // One piece whose posted bytes the owner staged before uncovering the
+    // replay's ranges. The owner drains its effects before the next piece,
+    // so neither replay input nor derived output accumulates in memory.
+    pub fn replay_piece(
+        &mut self,
+        node: NodeId,
+        volume: VolumeIndex,
+        posted: Posted,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((parent, member)) = self
+            .volumes(node)
+            .and_then(|(parent, volumes)| Some((parent, *volumes.get(&volume)?)))
+        else {
+            return;
+        };
+        let length = self
+            .namespace(parent)
+            .and_then(|namespace| namespace.get(member))
+            .and_then(|member| member.length);
+        effects.push(Effect::Reached {
+            node: parent,
+            member,
+            child: node,
+            volume,
+            offset: posted.offset,
+            bytes: posted.bytes.clone(),
+            provenance: posted.provenance,
+        });
+        let arrived = Arrived {
+            volume,
+            offset: posted.offset,
+            bytes: posted.bytes,
+            provenance: posted.provenance,
+        };
+        self.deliver_to_object(node, &arrived, length, builder, effects);
     }
 
     // Each member the ranges of the nodes' volumes landed in, by the node's
@@ -4002,6 +4115,94 @@ mod tests {
         assert_eq!(
             inner.coverage.damaged_ranges().collect::<Vec<_>>(),
             vec![ByteRange::new(3, 6)]
+        );
+    }
+
+    #[test]
+    fn rejected_inputs_follow_bindings_and_deduplicate_rewritten_volumes() {
+        let (mut tree, first, child, _) = bound_tree();
+        let unrelated = tree.announce_root("unrelated.bin", Some(6), &mut Vec::new());
+        let record = tree
+            .nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap();
+        record.length = Some(6);
+        record.crc32 = Some(0);
+        record
+            .coverage
+            .write(ByteRange::new(0, 6), Provenance::Damaged);
+        assert!(tree.rejected_inputs(NodeId::ROOT, [unrelated]).is_empty());
+        assert_eq!(
+            tree.rejected_inputs(NodeId::ROOT, [first, first]),
+            vec![(
+                child,
+                vec![(VolumeIndex(0), ByteRange::new(HEADER, HEADER + 6))]
+            )]
+        );
+        tree.nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap()
+            .coverage
+            .write(ByteRange::new(0, 6), Provenance::Repaired);
+        assert!(tree.rejected_inputs(NodeId::ROOT, [first]).is_empty());
+    }
+
+    #[test]
+    fn a_members_own_checksum_can_reject_repaired_bytes() {
+        let (mut tree, first, child, _) = bound_tree();
+        let range = ByteRange::new(0, 6);
+        let record = tree
+            .nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap();
+        record.length = Some(range.end);
+        record.coverage.write(range, Provenance::Repaired);
+        let mut effects = Vec::new();
+        // An upstream damage report cannot take back a repair.
+        tree.damage(child, VolumeIndex(0), ByteRange::new(7, 13), &mut effects);
+        assert!(
+            tree.namespace(child)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .coverage
+                .verified(range)
+        );
+        effects.clear();
+        tree.checksum_failed(child, MemberId(0), &mut effects);
+        assert_eq!(
+            effects,
+            vec![Effect::Damaged {
+                node: child,
+                member: MemberId(0),
+                range
+            }]
+        );
+        assert!(
+            tree.namespace(child)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .coverage
+                .damaged(range)
+        );
+        assert!(
+            !tree
+                .namespace(NodeId::ROOT)
+                .unwrap()
+                .get(first)
+                .unwrap()
+                .coverage
+                .damaged(ByteRange::new(7, 13))
         );
     }
 

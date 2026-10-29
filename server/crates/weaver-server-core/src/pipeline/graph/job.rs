@@ -275,6 +275,7 @@ impl GraphJob {
     // Keep ownership until stopped workers report that they ended.
     pub(in crate::pipeline) fn request_stop(&self) {
         self.runs.request_stop();
+        self.loans.request_stop();
     }
 
     // The pipeline is going down. Every run stops where it stands and keeps
@@ -282,6 +283,7 @@ impl GraphJob {
     // its shelf, and the restored job reads it again. A repair out on its
     // thread still comes back through the mail.
     pub(in crate::pipeline) fn stop_runs(&mut self, limit: usize) {
+        self.loans.request_stop();
         self.runs.stop(limit);
     }
 
@@ -315,7 +317,10 @@ impl GraphJob {
     // Seam for completion, status and health: where the job stands, read
     // off the tree. Stable.
     pub(crate) fn phase(&self) -> RootPhase {
-        let extracting = phase::extracting(&self.tree) || self.runs.live();
+        let extracting = phase::extracting(&self.tree)
+            || self.runs.live()
+            || self.writer.rechecks_waiting()
+            || self.loans.replaying();
         RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
     }
 

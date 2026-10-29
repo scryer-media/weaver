@@ -121,6 +121,9 @@ pub(crate) struct NamespaceWriter {
     envelopes: Envelopes,
     // Member reads the recovery objects made while repairing.
     read_backs: u64,
+    // Rejected members waiting for their input dependencies to be staged
+    // off the loop, before coverage or inverse mappings can be changed.
+    rechecks: BTreeMap<NodeId, Vec<(VolumeIndex, ByteRange)>>,
     // Whether the job's holds have been paged out for a stop. Only then do
     // the holds on scratch go in the checkpoint: scratch space is reused
     // once nothing lives on it, so a row written mid-run could name bytes a
@@ -158,6 +161,7 @@ impl NamespaceWriter {
             caps: Caps::unbounded(),
             files: Marked::default(),
             read_backs: 0,
+            rechecks: BTreeMap::new(),
             stopped: false,
             renamed: Vec::new(),
             moves: Vec::new(),
@@ -1838,6 +1842,7 @@ mod moves;
 mod recovery;
 mod refusal;
 
+pub(crate) use loan::replay::{Replay, Replayed};
 pub(crate) use loan::{Loan, Returned};
 pub(crate) use recovery::{Lender, SetState};
 #[cfg(test)]

@@ -75,6 +75,98 @@ fn damaged_member(
     (member, article)
 }
 
+// Descriptions arrive before IFSC, either in the same carrier or another.
+// Only two slices are wrong: whole-file fallback would exhaust the two
+// recovery blocks before the metadata that identifies those slices arrives.
+#[test]
+fn delayed_slice_checksums_repair_with_only_the_needed_blocks() {
+    for later_carrier in [false, true] {
+        let data = payload(1, 5000);
+        let mut files = par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1);
+        let mut checksums = None;
+        for (_, bytes) in &mut files {
+            let mut kept = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                let len = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+                assert!(len >= 64 && at + len <= bytes.len());
+                let packet = &bytes[at..at + len];
+                if packet[48..64].starts_with(b"PAR 2.0\0IFSC") {
+                    checksums.get_or_insert_with(|| packet.to_vec());
+                } else {
+                    kept.extend_from_slice(packet);
+                }
+                at += len;
+            }
+            *bytes = kept;
+        }
+        let checksums = checksums.expect("fixture carries IFSC");
+        let delayed = if later_carrier { files.len() - 1 } else { 0 };
+        let boundary = files[delayed].1.len();
+        files[delayed].1.extend_from_slice(&checksums);
+        let mut job = Job::new(Par2::new(OWN), OWN);
+        let mut wrong = data.clone();
+        wrong[7] ^= 0x5a;
+        wrong[BLOCK as usize + 7] ^= 0x5a;
+        let member = job.member("payload.bin", &wrong);
+        let bad = ByteRange::new(0, 2 * BLOCK);
+        job.arrive(member, 0, &wrong[..bad.end as usize], Provenance::Damaged);
+        let volumes: Vec<_> = files
+            .iter()
+            .map(|(name, bytes)| job.name(name, bytes))
+            .collect();
+        for (index, (_, bytes)) in files.iter().enumerate() {
+            let end = if index == delayed {
+                boundary
+            } else {
+                bytes.len()
+            };
+            job.object.deliver(
+                weaver_graph::Delivery {
+                    volume: volumes[index],
+                    offset: 0,
+                    bytes: &bytes[..end],
+                    provenance: Provenance::Fresh,
+                },
+                &mut |_, _| false,
+                &mut Vec::new(),
+            );
+            if index != delayed {
+                job.object.volume_closed(volumes[index], &mut Vec::new());
+            }
+        }
+        bind(&mut job);
+        feed(&mut job, member, &wrong, Some(bad));
+        assert_eq!(
+            job.object
+                .repair(&mut job.store, weaver_graph::Budget::default()),
+            RepairOutcome::Waiting
+        );
+        assert_eq!(job.store.members[&member], wrong);
+        let mut wants = Vec::new();
+        Recovery::wants(&job.object, &mut wants);
+        assert!(!wants.is_empty());
+        job.object.deliver(
+            weaver_graph::Delivery {
+                volume: volumes[delayed],
+                offset: boundary as u64,
+                bytes: &checksums,
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut Vec::new(),
+        );
+        job.object.volume_closed(volumes[delayed], &mut Vec::new());
+        bind(&mut job);
+        assert!(matches!(
+            job.object
+                .repair(&mut job.store, weaver_graph::Budget::default()),
+            RepairOutcome::Repaired { .. }
+        ));
+        assert_eq!(job.store.members[&member], data);
+    }
+}
+
 #[test]
 fn binds_by_its_described_name_without_renaming() {
     let data = payload(1, 5000);

@@ -130,7 +130,12 @@ impl GraphJob {
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
         }
+        let rejected = job.tree.rejected_inputs(
+            NodeId::ROOT,
+            job.namespace().members().map(|member| member.id),
+        );
         let refetched = job.read_back()?;
+        job.writer.queue_rechecks(rejected);
         job.mark_damage()?;
         let mut effects = Vec::new();
         job.tree

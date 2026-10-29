@@ -924,3 +924,55 @@ fn a_decode_holds_to_the_memory_it_was_granted() {
         own.max_header_unpacked_bytes
     );
 }
+
+#[test]
+fn corrected_piece_geometry_preserves_the_old_inverse_map_until_handoff() {
+    let bytes = archive(copy(), false);
+    let volumes = split(&bytes, 3);
+    let mut owner = Owner::new(store(), volumes.clone());
+    owner.whole(4096);
+    streamed(&owner);
+    let before = owner.object.geometry;
+    let mut out = Vec::new();
+    owner
+        .object
+        .sized(VolumeIndex(0), volumes[0].1.len() as u64 + 17, &mut out);
+    assert_eq!(out, vec![Emit::NeedsEngine(Why::OrderUnknown)]);
+    assert_eq!(
+        owner.object.geometry, before,
+        "old placement coordinates remain readable"
+    );
+    for (volume, (_, expected)) in volumes.iter().enumerate() {
+        assert_eq!(owner.posted(volume).as_ref(), Some(expected));
+    }
+    out.clear();
+    owner
+        .object
+        .sized(VolumeIndex(0), volumes[0].1.len() as u64 + 17, &mut out);
+    assert!(out.is_empty(), "the handoff is requested once");
+}
+
+#[test]
+fn unchanged_piece_geometry_does_not_restart_the_store() {
+    let bytes = archive(copy(), false);
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.whole(4096);
+    let mut out = Vec::new();
+    owner
+        .object
+        .sized(VolumeIndex(0), bytes.len() as u64, &mut out);
+    assert!(out.is_empty());
+    // More bytes after a single-volume container do not move any member.
+    owner
+        .object
+        .sized(VolumeIndex(0), bytes.len() as u64 + 17, &mut out);
+    assert!(
+        !out.iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_)))
+    );
+    assert_eq!(
+        owner.object.lengths[&VolumeIndex(0)],
+        bytes.len() as u64 + 17
+    );
+    streamed(&owner);
+}
