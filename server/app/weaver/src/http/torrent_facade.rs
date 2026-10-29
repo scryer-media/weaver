@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -27,11 +27,15 @@ use weaver_server_core::categories::{
     CategoryConfig, completion_parent, validate_category_path_component,
 };
 use weaver_server_core::ingest::{Kind, classify};
+use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+use weaver_server_core::operations::probe_disk_space;
 use weaver_server_core::proxies::{Bandwidth, ResolvedBy, TorrentScope};
+use weaver_server_core::proxies::{DiscoveredInterface, InterfaceSource, SystemInterfaceSource};
+use weaver_server_core::rss::RssService;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
-    SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentLimit,
+    SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentLimit,
     TorrentPeerProtocol, resolve_seeding_policy,
 };
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
@@ -43,14 +47,16 @@ use weaver_server_core::torrents::{
     TorrentTracker, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
-use weaver_server_core::{Database, SchedulerHandle};
+use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
 
 use super::auth::{LoginRateLimiter, login_client_id, same_origin_request};
 
+mod api;
 #[cfg(test)]
 mod tests;
 
-pub(super) const WEBAPI_VERSION: &str = "2.11.0";
+pub(super) use api::Api;
+
 const BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_CAP: usize = 1024;
 // The client's "unknown" ETA: 100 days.
@@ -76,6 +82,11 @@ struct Inner {
     sessions: Mutex<SessionTable>,
     rid: AtomicU64,
     categories: tokio::sync::Mutex<()>,
+    rss: RssService,
+    // The API version the facade answers as.
+    api: Api,
+    // When this listener started, in seconds since the epoch.
+    launched: i64,
 }
 
 #[derive(Default)]
@@ -114,6 +125,8 @@ impl TorrentFacadeContext {
         security: RuntimeSecurityConfig,
         watch_folder: WatchFolderService,
         torrents: Option<TorrentService>,
+        rss: RssService,
+        api: Api,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -126,10 +139,24 @@ impl TorrentFacadeContext {
                 security,
                 watch_folder,
                 torrents,
+                rss,
+                api,
                 sessions: Mutex::new(SessionTable::default()),
                 rid: AtomicU64::new(0),
                 categories: tokio::sync::Mutex::new(()),
+                launched: now_secs(),
             }),
+        }
+    }
+
+    fn api(&self) -> Api {
+        self.inner.api
+    }
+
+    async fn count(&self) -> usize {
+        match &self.inner.torrents {
+            Some(torrents) => torrents.torrents(None).await.len(),
+            None => 0,
         }
     }
 
@@ -313,11 +340,12 @@ fn basic_password(headers: &HeaderMap) -> Option<String> {
     Some(password.trim().to_owned()).filter(|password| !password.is_empty())
 }
 
-// A request's parameters: the query string, then the form body over it.
+// A request's parameters: the query string, then the form body over it,
+// and each file the body uploads with its name.
 #[derive(Default)]
 struct Params {
     fields: HashMap<String, String>,
-    files: Vec<Vec<u8>>,
+    files: Vec<(String, Vec<u8>)>,
 }
 
 impl Params {
@@ -328,6 +356,16 @@ impl Params {
     fn flag(&self, name: &str) -> Option<bool> {
         self.get(name)
             .map(|value| value.trim().eq_ignore_ascii_case("true"))
+    }
+
+    // A flag that is only read when it is `true` or `false`
+    // (qBittorrent `parseBool`).
+    fn flag_value(&self, name: &str) -> Option<bool> {
+        match self.get(name)?.trim() {
+            value if value.eq_ignore_ascii_case("true") => Some(true),
+            value if value.eq_ignore_ascii_case("false") => Some(false),
+            _ => None,
+        }
     }
 
     async fn read(request: Request) -> Result<Self, Response> {
@@ -354,10 +392,10 @@ impl Params {
                 .map_err(IntoResponse::into_response)?
             {
                 let name = field.name().unwrap_or_default().to_owned();
-                let is_file = field.file_name().is_some();
+                let file_name = field.file_name().map(str::to_owned);
                 let bytes = field.bytes().await.map_err(IntoResponse::into_response)?;
-                if name == "torrents" && is_file {
-                    params.files.push(bytes.to_vec());
+                if let Some(file_name) = file_name {
+                    params.files.push((file_name, bytes.to_vec()));
                 } else {
                     params
                         .fields
@@ -388,11 +426,26 @@ fn ok() -> Response {
     text(StatusCode::OK, "")
 }
 
+// A feature of the client Weaver does not have.
+fn unavailable(what: &str) -> Response {
+    text(
+        StatusCode::CONFLICT,
+        format!("{what} is not available in Weaver"),
+    )
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
 fn forbidden() -> Response {
     text(StatusCode::FORBIDDEN, "Forbidden")
 }
 
-// A failure inside weaver: logged, never shown to the caller.
 // Whether a `hashes` parameter names every torrent.
 fn names_all(params: &Params) -> bool {
     params.get("hashes").unwrap_or_default().trim() == "all"
@@ -405,6 +458,7 @@ fn held(result: Result<(), weaver_server_core::SchedulerError>) -> Response {
     }
 }
 
+// A failure inside weaver: logged, never shown to the caller.
 fn internal(error: impl std::fmt::Display) -> Response {
     tracing::warn!(%error, "torrent client compatibility request failed");
     text(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
@@ -414,33 +468,159 @@ fn internal(error: impl std::fmt::Display) -> Response {
 enum Need {
     Read,
     Control,
+    // What the GraphQL API keeps to administrators: the RSS feeds and rules,
+    // and the server's directories.
+    Admin,
 }
 
+// The groups qBittorrent 5.3.0 registers (`WebApplication::sessionStart`).
+const GROUPS: [&str; 10] = [
+    "app",
+    "auth",
+    "clientdata",
+    "log",
+    "rss",
+    "search",
+    "sync",
+    "torrentcreator",
+    "torrents",
+    "transfer",
+];
+
+// Every action of qBittorrent 5.3.0 outside `auth`, by what it needs.
 fn need(group: &str, action: &str) -> Option<Need> {
+    use Need::{Admin, Control, Read};
     Some(match (group, action) {
-        ("app", "version" | "webapiVersion" | "buildInfo" | "preferences" | "defaultSavePath")
-        | (
+        (
+            "app",
+            "webapiVersion"
+            | "version"
+            | "buildInfo"
+            | "processInfo"
+            | "preferences"
+            | "defaultSavePath"
+            | "getFreeSpaceAtPath"
+            | "cookies"
+            | "networkInterfaceList"
+            | "networkInterfaceAddressList",
+        ) => Read,
+        ("app", "getDirectoryContent") => Admin,
+        (
+            "app",
+            "shutdown" | "setPreferences" | "sendTestEmail" | "setCookies" | "rotateAPIKey"
+            | "deleteAPIKey",
+        ) => Control,
+        ("clientdata", "load") => Read,
+        ("clientdata", "store") => Control,
+        ("log", "main" | "peers") => Read,
+        ("rss", "items" | "rules" | "matchingArticles" | "exportRules") => Read,
+        (
+            "rss",
+            "addFolder"
+            | "addFeed"
+            | "setFeedURL"
+            | "setFeedRefreshInterval"
+            | "removeItem"
+            | "moveItem"
+            | "markAsRead"
+            | "refreshItem"
+            | "setRule"
+            | "importRules"
+            | "renameRule"
+            | "cloneRule"
+            | "removeRule",
+        ) => Admin,
+        ("search", "status" | "results" | "plugins") => Read,
+        (
+            "search",
+            "start" | "stop" | "delete" | "downloadTorrent" | "installPlugin" | "uninstallPlugin"
+            | "enablePlugin" | "updatePlugins",
+        ) => Control,
+        ("sync", "maindata" | "torrentPeers") => Read,
+        ("torrentcreator", "status" | "torrentFile") => Read,
+        ("torrentcreator", "addTask" | "deleteTask") => Control,
+        (
             "torrents",
-            "info" | "properties" | "files" | "trackers" | "categories" | "tags" | "uploadLimit"
-            | "downloadLimit",
-        )
-        | ("sync", "maindata" | "torrentPeers")
-        | ("transfer", "info")
-        | ("log", "main") => Need::Read,
-        ("transfer", "banPeers") => Need::Control,
-        ("app", "setPreferences")
-        | (
+            "count" | "info" | "properties" | "trackers" | "webseeds" | "files" | "pieceHashes"
+            | "pieceStates" | "pieceAvailability" | "uploadLimit" | "downloadLimit" | "categories"
+            | "tags" | "export" | "SSLParameters" | "downloadFile",
+        ) => Read,
+        (
             "torrents",
-            "add" | "delete" | "pause" | "stop" | "resume" | "start" | "setCategory"
-            | "setForceStart" | "createCategory" | "setLocation" | "setShareLimits" | "topPrio"
-            | "addTags" | "removeTags" | "recheck" | "reannounce" | "setUploadLimit"
-            | "setDownloadLimit" | "addTrackers" | "editTracker" | "removeTrackers",
-        )
-        | ("torrents", "filePrio" | "toggleSequentialDownload" | "toggleFirstLastPiecePrio") => {
-            Need::Control
-        }
+            "add"
+            | "addWebSeeds"
+            | "editWebSeed"
+            | "removeWebSeeds"
+            | "addTrackers"
+            | "editTracker"
+            | "removeTrackers"
+            | "addPeers"
+            | "stop"
+            | "start"
+            | "filePrio"
+            | "setUploadLimit"
+            | "setDownloadLimit"
+            | "setShareLimits"
+            | "toggleSequentialDownload"
+            | "toggleFirstLastPiecePrio"
+            | "setSuperSeeding"
+            | "setForceStart"
+            | "delete"
+            | "increasePrio"
+            | "decreasePrio"
+            | "topPrio"
+            | "bottomPrio"
+            | "setLocation"
+            | "setSavePath"
+            | "setDownloadPath"
+            | "rename"
+            | "setComment"
+            | "setAutoManagement"
+            | "recheck"
+            | "reannounce"
+            | "setCategory"
+            | "createCategory"
+            | "editCategory"
+            | "removeCategories"
+            | "addTags"
+            | "setTags"
+            | "removeTags"
+            | "createTags"
+            | "deleteTags"
+            | "renameFile"
+            | "renameFolder"
+            | "setSSLParameters"
+            | "fetchMetadata"
+            | "parseMetadata"
+            | "saveMetadata",
+        ) => Control,
+        (
+            "transfer",
+            "info" | "uploadLimit" | "downloadLimit" | "getSpeedLimits" | "speedLimitsMode",
+        ) => Read,
+        (
+            "transfer",
+            "setUploadLimit"
+            | "setDownloadLimit"
+            | "setSpeedLimits"
+            | "toggleSpeedLimitsMode"
+            | "setSpeedLimitsMode"
+            | "banPeers"
+            | "pauseSession"
+            | "resumeSession",
+        ) => Control,
         _ => return None,
     })
+}
+
+// An action qBittorrent does not have: an unknown group is the server's
+// 404, an unknown action in a known group the API's.
+fn no_endpoint(api: Api, group: &str) -> Response {
+    if GROUPS.contains(&group) {
+        api.no_action()
+    } else {
+        text(StatusCode::NOT_FOUND, "Not Found")
+    }
 }
 
 async fn handle(
@@ -450,37 +630,45 @@ async fn handle(
     axum::extract::Path((group, action)): axum::extract::Path<(String, String)>,
     request: Request,
 ) -> Response {
-    match (group.as_str(), action.as_str()) {
-        ("auth", "login") => {
-            let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
-            let client_id = login_client_id(&ctx.inner.security, request.headers(), peer);
-            return match Params::read(request).await {
-                Ok(params) => login(&ctx, &login_limiter, &client_id, &params).await,
-                Err(response) => response,
-            };
+    if group == "auth" {
+        // A request sent with an API key may not log in or out (qBittorrent
+        // `WebApplication::processRequest`).
+        if bearer(request.headers()) {
+            return forbidden();
         }
-        ("auth", "logout") => {
-            if let Some(sid) = cookie(request.headers(), "SID") {
-                if !same_origin_request(request.headers()) {
-                    return forbidden();
+        return match action.as_str() {
+            "login" => {
+                let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
+                let client_id = login_client_id(&ctx.inner.security, request.headers(), peer);
+                match Params::read(request).await {
+                    Ok(params) => login(&ctx, &login_limiter, &client_id, &params).await,
+                    Err(response) => response,
                 }
-                ctx.sessions().keys.remove(&sid);
             }
-            return ok();
-        }
-        _ => {}
+            "logout" => {
+                if let Some(sid) = cookie(request.headers(), "SID") {
+                    if !same_origin_request(request.headers()) {
+                        return forbidden();
+                    }
+                    ctx.sessions().keys.remove(&sid);
+                }
+                ok()
+            }
+            _ => no_endpoint(ctx.api(), &group),
+        };
     }
     // The caller is known before any of the body is read.
     let Ok(caller) = ctx.caller(request.headers()).await else {
         return forbidden();
     };
     let Some(need) = need(&group, &action) else {
-        return text(StatusCode::NOT_FOUND, "Not Found");
+        return no_endpoint(ctx.api(), &group);
     };
     let scope = caller.scope;
     let allowed = match need {
         Need::Read => scope.can_read(),
         Need::Control => caller.may_change(request.headers()),
+        Need::Admin => scope.is_admin() && caller.may_change(request.headers()),
     };
     if !allowed {
         return forbidden();
@@ -489,15 +677,98 @@ async fn handle(
         Ok(params) => params,
         Err(response) => return response,
     };
-    match (group.as_str(), action.as_str()) {
-        ("app", "version") => text(StatusCode::OK, format!("v{}", env!("CARGO_PKG_VERSION"))),
-        ("app", "webapiVersion") => text(StatusCode::OK, WEBAPI_VERSION),
-        ("app", "buildInfo") => axum::Json(json!({
+    match group.as_str() {
+        "app" => app(&ctx, &action, &params).await,
+        "torrents" => torrents(&ctx, &action, params, scope).await,
+        "transfer" => transfer_action(&ctx, &action, &params).await,
+        "sync" if action == "maindata" => maindata(&ctx, scope).await,
+        "sync" => torrent_peers(&ctx, &params).await,
+        "rss" => rss(&ctx, &action, &params).await,
+        // Weaver keeps no log the client's shape fits.
+        "log" => axum::Json(json!([])).into_response(),
+        // Nothing of the client's WebUI is kept.
+        "clientdata" if action == "load" => axum::Json(json!({})).into_response(),
+        "clientdata" => unavailable("Client data"),
+        "search" => unavailable("Search"),
+        _ => unavailable("Torrent creation"),
+    }
+}
+
+// Whether the request carries an API key as a bearer token.
+fn bearer(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_whitespace().next())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+}
+
+// The parameters an action cannot do without (qBittorrent
+// `APIController::requireParams`).
+fn require(params: &Params, names: &[&str]) -> Result<(), Response> {
+    let missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| params.get(name).is_none())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(text(
+        StatusCode::BAD_REQUEST,
+        format!("Missing required parameters: {}", missing.join(", ")),
+    ))
+}
+
+// qBittorrent `AuthController::loginAction`: a session for the key the
+// password holds, with its cookie.
+async fn login(
+    ctx: &TorrentFacadeContext,
+    login_limiter: &LoginRateLimiter,
+    client_id: &str,
+    params: &Params,
+) -> Response {
+    let username = params.get("username").unwrap_or_default();
+    if login_limiter.too_many_failures(username, client_id) {
+        return text(
+            StatusCode::FORBIDDEN,
+            "Your IP address has been banned after too many failed authentication attempts.",
+        );
+    }
+    let password = params.get("password").unwrap_or_default().trim();
+    if password.is_empty() || ctx.resolve(password).await.is_err() {
+        login_limiter.record_failure(username, client_id);
+        return ctx.api().login_refused();
+    }
+    login_limiter.record_success(username, client_id);
+    let sid = ctx.sessions().issue(hash_api_key(password));
+    let mut response = ctx.api().logged_in();
+    let secure = if ctx.inner.security.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "SID={sid}; HttpOnly; SameSite=Strict; path=/{secure}"
+    )) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+}
+
+// The `app` group (qBittorrent `AppController`).
+async fn app(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
+    match action {
+        "version" => text(StatusCode::OK, format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "webapiVersion" => text(StatusCode::OK, ctx.api().version()),
+        "buildInfo" => axum::Json(json!({
             "qt": "", "libtorrent": "", "boost": "", "openssl": "", "zlib": "",
             "bitness": 64,
+            "platform": platform(),
         }))
         .into_response(),
-        ("app", "preferences") => {
+        "processInfo" => axum::Json(json!({ "launch_time": ctx.inner.launched })).into_response(),
+        "preferences" => {
             let config = ctx.inner.config.read().await;
             let mut dht = false;
             if let Some(torrents) = ctx.inner.torrents.as_ref() {
@@ -515,153 +786,274 @@ async fn handle(
             }
             axum::Json(preferences(&config, dht)).into_response()
         }
-        ("app", "setPreferences") => set_preferences(&ctx, &params).await,
-        ("app", "defaultSavePath") => {
-            text(StatusCode::OK, ctx.inner.config.read().await.complete_dir())
-        }
-        ("torrents", "info") => torrents_info(&ctx, &params).await,
-        ("torrents", "properties") => properties(&ctx, &params).await,
-        ("torrents", "files") => files(&ctx, &params).await,
-        ("torrents", "trackers") => trackers(&ctx, &params, scope).await,
-        ("torrents", "add") => add(&ctx, params).await,
-        ("torrents", "delete") => delete(&ctx, &params).await,
+        "setPreferences" => set_preferences(ctx, params).await,
+        "defaultSavePath" => text(StatusCode::OK, ctx.inner.config.read().await.complete_dir()),
+        "getFreeSpaceAtPath" => free_space(params).await,
+        "getDirectoryContent" => directory_content(params).await,
+        // Weaver keeps no cookies: a url is fetched with the cookie its add
+        // names.
+        "cookies" => axum::Json(json!([])).into_response(),
+        "setCookies" => set_cookies(params),
+        "networkInterfaceList" => interface_list().await,
+        "networkInterfaceAddressList" => interface_addresses(params).await,
+        // Weaver's process and its API keys are its own to manage.
+        "shutdown" => unavailable("Shutting down"),
+        "sendTestEmail" => unavailable("Email"),
+        "rotateAPIKey" | "deleteAPIKey" => unavailable("The client's API key"),
+        _ => no_endpoint(ctx.api(), "app"),
+    }
+}
+
+fn platform() -> &'static str {
+    match std::env::consts::OS {
+        os @ ("linux" | "macos" | "windows") => os,
+        _ => "unknown",
+    }
+}
+
+// The parameters each `torrents` action requires (qBittorrent
+// `TorrentsController`). `setShareLimits` takes mode and action as
+// optional, as the clients that predate them send none.
+fn torrents_required(action: &str) -> &'static [&'static str] {
+    match action {
+        "properties" | "trackers" | "webseeds" | "files" | "export" => &["hash"],
+        "addTrackers" | "removeTrackers" => &["hash", "urls"],
+        "filePrio" => &["hash", "id", "priority"],
+        "stop"
+        | "start"
+        | "uploadLimit"
+        | "downloadLimit"
+        | "toggleSequentialDownload"
+        | "toggleFirstLastPiecePrio"
+        | "increasePrio"
+        | "decreasePrio"
+        | "topPrio"
+        | "bottomPrio"
+        | "recheck"
+        | "reannounce"
+        | "removeTags" => &["hashes"],
+        "setUploadLimit" | "setDownloadLimit" => &["hashes", "limit"],
+        "setShareLimits" => &[
+            "hashes",
+            "ratioLimit",
+            "seedingTimeLimit",
+            "inactiveSeedingTimeLimit",
+        ],
+        "setSuperSeeding" | "setForceStart" => &["hashes", "value"],
+        "delete" => &["hashes", "deleteFiles"],
+        "setLocation" => &["hashes", "location"],
+        "setSavePath" | "setDownloadPath" => &["id", "path"],
+        "setAutoManagement" => &["hashes", "enable"],
+        "setCategory" => &["hashes", "category"],
+        "createCategory" | "editCategory" => &["category"],
+        "removeCategories" => &["categories"],
+        "addTags" | "setTags" => &["hashes", "tags"],
+        "createTags" | "deleteTags" => &["tags"],
+        _ => &[],
+    }
+}
+
+// The `torrents` group (qBittorrent `TorrentsController`).
+async fn torrents(
+    ctx: &TorrentFacadeContext,
+    action: &str,
+    params: Params,
+    scope: CallerScope,
+) -> Response {
+    if let Err(response) = require(&params, torrents_required(action)) {
+        return response;
+    }
+    if action == "add" {
+        return add(ctx, params).await;
+    }
+    let params = &params;
+    match action {
+        "count" => text(StatusCode::OK, ctx.count().await.to_string()),
+        "info" => torrents_info(ctx, params, scope).await,
+        "properties" => properties(ctx, params).await,
+        "trackers" => trackers(ctx, params, scope).await,
+        // Weaver fetches from no web seed.
+        "webseeds" => match ctx.by_hash(params.get("hash").unwrap_or_default()).await {
+            Some(_) => axum::Json(json!([])).into_response(),
+            None => not_found(),
+        },
+        "files" => files(ctx, params).await,
+        "export" => export(ctx, params).await,
+        "delete" => delete(ctx, params).await,
         // Every torrent at once is one hold, which leaves each torrent's
-        // own pause or resume standing; named torrents are each paused.
-        ("torrents", "pause" | "stop") if names_all(&params) => {
-            held(ctx.inner.handle.pause_torrents().await)
-        }
-        ("torrents", "resume" | "start") if names_all(&params) => {
-            held(ctx.inner.handle.resume_torrents().await)
-        }
-        ("torrents", "pause" | "stop") => {
-            each(&ctx, &params, |torrents, view| async move {
+        // own stop or start standing; named torrents are each stopped.
+        "stop" if names_all(params) => held(ctx.inner.handle.pause_torrents().await),
+        "start" if names_all(params) => held(ctx.inner.handle.resume_torrents().await),
+        "stop" => {
+            each(ctx, params, |torrents, view| async move {
                 torrents.pause(view.job_id).await
             })
             .await
         }
-        ("torrents", "resume" | "start") => {
-            each(&ctx, &params, |torrents, view| async move {
+        "start" => {
+            each(ctx, params, |torrents, view| async move {
                 torrents.resume(view.job_id).await
             })
             .await
         }
-        ("torrents", "setForceStart") => {
+        "setForceStart" => {
             let forced = params.flag("value").unwrap_or(false);
-            each(&ctx, &params, move |torrents, view| async move {
+            each(ctx, params, move |torrents, view| async move {
                 torrents.set_forced(view.job_id, forced).await
             })
             .await
         }
-        ("torrents", "filePrio") => file_prio(&ctx, &params).await,
-        ("torrents", "toggleSequentialDownload") => {
-            each(&ctx, &params, |torrents, view| async move {
+        "filePrio" => file_prio(ctx, params).await,
+        "toggleSequentialDownload" => {
+            each(ctx, params, |torrents, view| async move {
                 torrents.set_sequential(view.job_id, !view.sequential).await
             })
             .await
         }
-        ("torrents", "toggleFirstLastPiecePrio") => {
-            each(&ctx, &params, |torrents, view| async move {
+        "toggleFirstLastPiecePrio" => {
+            each(ctx, params, |torrents, view| async move {
                 torrents
                     .set_first_last_piece_first(view.job_id, !view.first_last_piece_first)
                     .await
             })
             .await
         }
-        ("torrents", "setCategory") => {
+        "setCategory" => {
             let category = params
                 .get("category")
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned);
-            each(&ctx, &params, move |torrents, view| {
+            each(ctx, params, move |torrents, view| {
                 let category = category.clone();
                 async move { torrents.set_category(view.job_id, category).await }
             })
             .await
         }
-        ("torrents", "recheck") => {
-            each(&ctx, &params, |torrents, view| async move {
+        "recheck" => {
+            each(ctx, params, |torrents, view| async move {
                 torrents.recheck(view.job_id).await
             })
             .await
         }
-        ("torrents", "categories") => {
-            axum::Json(categories(&*ctx.inner.config.read().await)).into_response()
+        "reannounce" => reannounce(ctx, params).await,
+        "categories" => axum::Json(categories(&*ctx.inner.config.read().await)).into_response(),
+        "createCategory" => create_category(ctx, params, scope).await,
+        "editCategory" => edit_category(ctx, params, scope).await,
+        // A category is removed in Weaver's settings, beside what it routes.
+        "removeCategories" => unavailable("Removing a category"),
+        "setShareLimits" => set_share_limits(ctx, params).await,
+        "uploadLimit" => rate_limits(ctx, params, |view| view.upload_limit).await,
+        "downloadLimit" => rate_limits(ctx, params, |view| view.download_limit).await,
+        "setUploadLimit" => set_rate_limit(ctx, params, Direction::Upload).await,
+        "setDownloadLimit" => set_rate_limit(ctx, params, Direction::Download).await,
+        "increasePrio" | "decreasePrio" | "topPrio" | "bottomPrio" => {
+            text(StatusCode::CONFLICT, "Torrent queueing must be enabled")
         }
-        ("torrents", "createCategory") => create_category(&ctx, &params).await,
-        ("torrents", "setShareLimits") => set_share_limits(&ctx, &params).await,
-        ("torrents", "uploadLimit") => rate_limits(&ctx, &params, |view| view.upload_limit).await,
-        ("torrents", "downloadLimit") => {
-            rate_limits(&ctx, &params, |view| view.download_limit).await
+        "setLocation" => set_location(ctx, params, "hashes", "location").await,
+        "setSavePath" => set_location(ctx, params, "id", "path").await,
+        // A torrent is written where it is saved: no download path is
+        // all a client can ask.
+        "setDownloadPath" if params.get("path").unwrap_or_default().is_empty() => ok(),
+        "setDownloadPath" => unavailable("A download path"),
+        "setAutoManagement" if params.flag("enable") == Some(true) => {
+            unavailable("Automatic torrent management")
         }
-        ("torrents", "setUploadLimit") => set_rate_limit(&ctx, &params, Direction::Upload).await,
-        ("torrents", "setDownloadLimit") => {
-            set_rate_limit(&ctx, &params, Direction::Download).await
-        }
-        ("torrents", "topPrio") => text(StatusCode::CONFLICT, "queueing is off"),
-        ("torrents", "setLocation") => {
-            let Some(location) = params
-                .get("location")
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(str::to_owned)
-            else {
-                return text(StatusCode::BAD_REQUEST, "Save path cannot be empty");
-            };
-            each(&ctx, &params, move |torrents, view| {
-                let location = location.clone();
-                async move { torrents.set_location(view.job_id, location).await }
-            })
-            .await
-        }
-        ("torrents", "addTrackers") => add_trackers(&ctx, &params).await,
-        ("torrents", "editTracker") => edit_tracker(&ctx, &params).await,
-        ("torrents", "removeTrackers") => remove_trackers(&ctx, &params).await,
-        ("torrents", "reannounce") => reannounce(&ctx, &params).await,
+        "setSuperSeeding" if params.flag("value") == Some(true) => unavailable("Super seeding"),
+        "setAutoManagement" | "setSuperSeeding" => ok(),
+        "addTrackers" => ctx.api().without_result(add_trackers(ctx, params).await),
+        "editTracker" => ctx.api().edited_tracker(edit_tracker(ctx, params).await),
+        "removeTrackers" => ctx.api().without_result(remove_trackers(ctx, params).await),
         // Tags are not kept.
-        ("torrents", "addTags" | "removeTags") => ok(),
-        ("torrents", "tags") | ("log", "main") => axum::Json(json!([])).into_response(),
-        ("sync", "maindata") => maindata(&ctx).await,
-        ("sync", "torrentPeers") => torrent_peers(&ctx, &params).await,
-        ("transfer", "banPeers") => ban_peers(&ctx, &params).await,
-        ("transfer", "info") => {
-            let views = ctx.views().await;
-            let upload = ctx.inner.config.read().await.bandwidth.upload_bps;
-            axum::Json(transfer(&views, ctx.torrent_download_limit(), upload)).into_response()
+        "addTags" | "removeTags" | "createTags" | "deleteTags" => ok(),
+        "setTags" => ctx.api().no_result(),
+        "tags" => axum::Json(json!([])).into_response(),
+        "addWebSeeds" | "editWebSeed" | "removeWebSeeds" => unavailable("Web seeds"),
+        "addPeers" => unavailable("Adding peers"),
+        "pieceHashes" | "pieceStates" | "pieceAvailability" => unavailable("Piece detail"),
+        // A torrent keeps the names its metainfo gives it and its files.
+        "rename" | "renameFile" | "renameFolder" => unavailable("Renaming"),
+        "setComment" => unavailable("Editing a comment"),
+        "SSLParameters" | "setSSLParameters" => unavailable("SSL torrents"),
+        "fetchMetadata" | "parseMetadata" | "saveMetadata" => {
+            unavailable("Reading metadata before adding")
         }
-        _ => text(StatusCode::NOT_FOUND, "Not Found"),
+        "downloadFile" => unavailable("Downloading one file"),
+        _ => no_endpoint(ctx.api(), "torrents"),
     }
 }
 
-async fn login(
-    ctx: &TorrentFacadeContext,
-    login_limiter: &LoginRateLimiter,
-    client_id: &str,
-    params: &Params,
-) -> Response {
-    let username = params.get("username").unwrap_or_default();
-    if login_limiter.too_many_failures(username, client_id) {
-        return super::error_response(StatusCode::TOO_MANY_REQUESTS, "too many login attempts");
-    }
-    let password = params.get("password").unwrap_or_default().trim();
-    if password.is_empty() || ctx.resolve(password).await.is_err() {
-        login_limiter.record_failure(username, client_id);
-        return text(StatusCode::OK, "Fails.");
-    }
-    login_limiter.record_success(username, client_id);
-    let sid = ctx.sessions().issue(hash_api_key(password));
-    let mut response = text(StatusCode::OK, "Ok.");
-    let secure = if ctx.inner.security.secure_cookies {
-        "; Secure"
-    } else {
-        ""
+// The `transfer` group (qBittorrent `TransferController`). Weaver has one
+// set of global limits: the alternative limits are 0, none, and stay off.
+async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
+    let required: &[&str] = match action {
+        "setUploadLimit" | "setDownloadLimit" => &["limit"],
+        "setSpeedLimits" => &["up_limit", "dl_limit", "alt_up_limit", "alt_dl_limit"],
+        "setSpeedLimitsMode" => &["mode"],
+        "banPeers" => &["peers"],
+        _ => &[],
     };
-    if let Ok(value) = HeaderValue::from_str(&format!(
-        "SID={sid}; HttpOnly; SameSite=Strict; path=/{secure}"
-    )) {
-        response.headers_mut().insert(header::SET_COOKIE, value);
+    if let Err(response) = require(params, required) {
+        return response;
     }
-    response
+    let bandwidth = ctx.inner.config.read().await.bandwidth;
+    // A global limit as qBittorrent reads one: 0 is none.
+    let reading = |bps: Option<u64>| bps.unwrap_or(0);
+    // A limit as qBittorrent takes one: 0 or less is none.
+    let taken = |name: &str| {
+        let limit = params
+            .get(name)
+            .unwrap_or_default()
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(0);
+        u64::try_from(limit).ok().filter(|limit| *limit > 0)
+    };
+    match action {
+        "info" => {
+            let views = ctx.views().await;
+            axum::Json(transfer(
+                &views,
+                ctx.torrent_download_limit(),
+                bandwidth.upload_bps,
+            ))
+            .into_response()
+        }
+        "uploadLimit" => text(StatusCode::OK, reading(bandwidth.upload_bps).to_string()),
+        "downloadLimit" => text(StatusCode::OK, reading(bandwidth.download_bps).to_string()),
+        "setUploadLimit" => save_rates(ctx, None, Some(taken("limit"))).await,
+        "setDownloadLimit" => save_rates(ctx, Some(taken("limit")), None).await,
+        "getSpeedLimits" => axum::Json(json!({
+            "up_limit": reading(bandwidth.upload_bps),
+            "dl_limit": reading(bandwidth.download_bps),
+            "alt_up_limit": 0,
+            "alt_dl_limit": 0,
+        }))
+        .into_response(),
+        "setSpeedLimits" if taken("alt_up_limit").is_some() || taken("alt_dl_limit").is_some() => {
+            unavailable("Alternative speed limits")
+        }
+        "setSpeedLimits" => ctx.api().without_result(
+            save_rates(ctx, Some(taken("dl_limit")), Some(taken("up_limit"))).await,
+        ),
+        "speedLimitsMode" => text(StatusCode::OK, "0"),
+        "setSpeedLimitsMode" => {
+            match params.get("mode").unwrap_or_default().trim().parse::<i64>() {
+                Ok(0) => ok(),
+                Ok(_) => unavailable("Alternative speed limits"),
+                Err(_) => text(StatusCode::BAD_REQUEST, "'mode': invalid argument"),
+            }
+        }
+        "toggleSpeedLimitsMode" => unavailable("Alternative speed limits"),
+        "banPeers" => ban_peers(ctx, params).await,
+        "pauseSession" => ctx
+            .api()
+            .without_result(held(ctx.inner.handle.pause_torrents().await)),
+        "resumeSession" => ctx
+            .api()
+            .without_result(held(ctx.inner.handle.resume_torrents().await)),
+        _ => no_endpoint(ctx.api(), "transfer"),
+    }
 }
 
 /// The client state a torrent's weaver state reads as.
@@ -709,8 +1101,9 @@ fn eta(view: &TorrentView) -> u64 {
 }
 
 // The torrent's share limits (`-2` where it inherits the global policy the
-// preferences report) and the limits in force; `-1` is no goal.
-fn share_limits(view: &TorrentView) -> [(&'static str, Value); 6] {
+// preferences report) and the limits in force; `-1` is no goal. Mode and
+// action read `Default` while the torrent inherits them.
+fn share_limits(view: &TorrentView) -> [(&'static str, Value); 8] {
     let policy = &view.seeding_policy;
     let minutes = |value: Option<u32>| json!(value.map_or(-1, i64::from));
     let (ratio, seeding, inactive) = (
@@ -720,24 +1113,120 @@ fn share_limits(view: &TorrentView) -> [(&'static str, Value); 6] {
         minutes(policy.seed_time_goal_minutes),
         minutes(policy.inactive_goal_minutes),
     );
-    let own = |value: &Value| match view.seeding_source {
-        SeedingSource::Global => json!(-2),
-        SeedingSource::Torrent | SeedingSource::TrackerRule(_) | SeedingSource::Category => {
-            value.clone()
-        }
+    let inherits = matches!(view.seeding_source, SeedingSource::Global);
+    let own = |value: &Value| if inherits { json!(-2) } else { value.clone() };
+    let (mode, action) = if inherits {
+        ("Default", "Default")
+    } else {
+        (
+            limits_mode_name(policy.mode),
+            limit_action_name(policy.action),
+        )
     };
     [
         ("ratio_limit", own(&ratio)),
         ("seeding_time_limit", own(&seeding)),
         ("inactive_seeding_time_limit", own(&inactive)),
+        ("share_limits_mode", json!(mode)),
+        ("share_limit_action", json!(action)),
         ("max_ratio", ratio),
         ("max_seeding_time", seeding),
         ("max_inactive_seeding_time", inactive),
     ]
 }
 
-pub(super) fn info(view: &TorrentView) -> Value {
+// qBittorrent's `ShareLimitsMode` and `ShareLimitAction` names
+// (`Utils::String::fromEnum`).
+fn limits_mode_name(mode: SeedingGoalMode) -> &'static str {
+    match mode {
+        SeedingGoalMode::Any => "MatchAny",
+        SeedingGoalMode::All => "MatchAll",
+    }
+}
+
+fn limit_action_name(action: SeedingAction) -> &'static str {
+    match action {
+        SeedingAction::Stop => "Stop",
+        SeedingAction::Remove => "Remove",
+        SeedingAction::RemoveWithData => "RemoveWithContent",
+    }
+}
+
+// A time the torrent may not have, in seconds since the epoch, -1 without
+// one (qBittorrent `Utils::DateTime::toSecsSinceEpoch`).
+fn when(ms: Option<i64>) -> i64 {
+    ms.map_or(-1, secs)
+}
+
+// The bytes of the files it fetches, and of those the bytes it lacks
+// (qBittorrent `wantedSize`, `remainingSize`).
+fn wanted_and_left(view: &TorrentView) -> (u64, u64) {
+    if view.files.is_empty() {
+        return (
+            view.total_bytes,
+            view.total_bytes.saturating_sub(view.have_bytes),
+        );
+    }
+    view.files
+        .iter()
+        .filter(|file| file.selected())
+        .fold((0, 0), |(wanted, left), file| {
+            let have = view
+                .file_have
+                .get(file.index as usize)
+                .copied()
+                .unwrap_or(0);
+            (
+                wanted + file.length,
+                left + file.length.saturating_sub(have),
+            )
+        })
+}
+
+// The ratio per month active (qBittorrent `TorrentImpl::popularity`).
+fn popularity(view: &TorrentView) -> f64 {
+    const MONTH_SECS: f64 = 2_629_746.0;
+    let months = view.active_seconds as f64 / MONTH_SECS;
+    if months > 0.0 {
+        view.ratio / months
+    } else {
+        0.0
+    }
+}
+
+// Seconds seeding: the time active since it completed. Weaver keeps the
+// time active whole, so a torrent stopped while seeding reads that time too.
+fn seeding_time(view: &TorrentView, now: i64) -> u64 {
+    view.completed_at_ms.map_or(0, |completed| {
+        let since = u64::try_from(now - secs(completed)).unwrap_or(0);
+        since.min(view.active_seconds)
+    })
+}
+
+// When it last moved data: now while it does, else when it completed or
+// was added.
+fn last_activity(view: &TorrentView, now: i64) -> i64 {
+    if view.download_bps > 0 || view.upload_bps > 0 {
+        now
+    } else {
+        secs(view.completed_at_ms.unwrap_or(view.added_at_ms))
+    }
+}
+
+// The folder holding a torrent of many files, empty for one file
+// (qBittorrent `TorrentImpl::rootPath`).
+fn root_path(view: &TorrentView) -> String {
+    let (_, content) = view.paths();
+    let single = matches!(view.files.as_slice(), [file] if file.path == view.name);
+    if single { String::new() } else { content }
+}
+
+// A torrent as `torrents/info` lists it (qBittorrent `serialize`).
+pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
+    let now = now_secs();
     let (save_path, content_path) = view.paths();
+    let (wanted, left) = wanted_and_left(view);
+    let has_metadata = view.pieces.is_some();
     let mut fields = object([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         (
@@ -749,44 +1238,86 @@ pub(super) fn info(view: &TorrentView) -> Value {
             json!(view.infohash_v2.clone().unwrap_or_default()),
         ),
         ("name", json!(view.name)),
-        ("size", json!(view.total_bytes)),
+        ("has_metadata", json!(has_metadata)),
+        (
+            "created_by",
+            json!(view.created_by.clone().unwrap_or_default()),
+        ),
+        ("creation_date", json!(when(view.created_at_ms))),
+        (
+            "private",
+            if has_metadata {
+                json!(view.private)
+            } else {
+                Value::Null
+            },
+        ),
         ("total_size", json!(view.total_bytes)),
+        (
+            "pieces_num",
+            json!(view.pieces.map_or(-1, |pieces| i64::from(pieces.count))),
+        ),
+        (
+            "piece_size",
+            json!(view.pieces.map_or(-1, |pieces| pieces.size as i64)),
+        ),
+        ("magnet_uri", json!(view.magnet)),
+        ("size", json!(wanted)),
         ("progress", json!(view.progress.clamp(0.0, 1.0))),
+        ("total_wasted", json!(view.wasted_bytes)),
+        (
+            "pieces_have",
+            json!(view.pieces.map_or(0, |pieces| pieces.have)),
+        ),
         ("dlspeed", json!(view.download_bps)),
         ("upspeed", json!(view.upload_bps)),
+        // Queueing is off: no torrent has a place in a queue.
         ("priority", json!(0)),
         ("num_seeds", json!(view.seeds)),
+        (
+            "num_complete",
+            json!(view.swarm_seeds.unwrap_or(view.seeds)),
+        ),
         ("num_leechs", json!(view.leechers)),
-        ("num_complete", json!(view.seeds)),
-        ("num_incomplete", json!(view.leechers)),
-        ("ratio", json!(view.ratio)),
-        ("eta", json!(eta(view))),
+        (
+            "num_incomplete",
+            json!(view.swarm_leechers.unwrap_or(view.leechers)),
+        ),
         ("state", json!(state(view))),
-        ("category", json!(view.category.clone().unwrap_or_default())),
-        ("tags", json!("")),
-        ("added_on", json!(secs(view.added_at_ms))),
-        (
-            "completion_on",
-            json!(view.completed_at_ms.map_or(-1, secs)),
-        ),
-        ("save_path", json!(save_path)),
-        ("content_path", json!(content_path)),
-        ("download_path", json!("")),
-        ("downloaded", json!(view.downloaded_bytes)),
-        ("uploaded", json!(view.uploaded_bytes)),
-        ("completed", json!(view.have_bytes)),
-        (
-            "amount_left",
-            json!(view.total_bytes.saturating_sub(view.have_bytes)),
-        ),
-        ("force_start", json!(view.forced)),
-        ("private", json!(view.private)),
-        ("auto_tmm", json!(false)),
-        ("super_seeding", json!(false)),
+        ("eta", json!(eta(view))),
         ("seq_dl", json!(view.sequential)),
         ("f_l_piece_prio", json!(view.first_last_piece_first)),
-        ("tracker", json!("")),
-        ("magnet_uri", json!(view.magnet)),
+        ("category", json!(view.category.clone().unwrap_or_default())),
+        ("tags", json!("")),
+        ("super_seeding", json!(false)),
+        ("force_start", json!(view.forced)),
+        ("save_path", json!(save_path)),
+        ("download_path", json!("")),
+        ("content_path", json!(content_path)),
+        ("root_path", json!(root_path(view))),
+        ("added_on", json!(secs(view.added_at_ms))),
+        ("completion_on", json!(when(view.completed_at_ms))),
+        ("tracker", json!(current_tracker(view, scope))),
+        ("trackers_count", json!(view.trackers.len())),
+        ("downloaded", json!(view.downloaded_bytes)),
+        ("uploaded", json!(view.uploaded_bytes)),
+        ("downloaded_session", json!(view.downloaded_bytes)),
+        ("uploaded_session", json!(view.uploaded_bytes)),
+        ("amount_left", json!(left)),
+        ("completed", json!(view.have_bytes)),
+        ("connections_count", json!(view.peers)),
+        ("connections_limit", json!(view.max_peers)),
+        ("ratio", json!(view.ratio)),
+        ("popularity", json!(popularity(view))),
+        ("seen_complete", json!(when(view.last_seen_complete_ms))),
+        ("auto_tmm", json!(false)),
+        ("time_active", json!(view.active_seconds)),
+        ("seeding_time", json!(seeding_time(view, now))),
+        ("last_activity", json!(last_activity(view, now))),
+        // Weaver does not count the copies the swarm holds.
+        ("availability", json!(-1)),
+        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
+        ("comment", json!(view.comment.clone().unwrap_or_default())),
     ]);
     // The limits as the client keeps them, 0 for none.
     fields = with_limits(
@@ -807,57 +1338,190 @@ pub(super) fn info(view: &TorrentView) -> Value {
     fields
 }
 
+// What `sync/maindata` adds to a torrent's row: whether a tracker answered
+// with a warning, failed, or could not be reached (qBittorrent
+// `addAnnounceStats`).
+fn announce_stats(view: &TorrentView) -> [(&'static str, Value); 3] {
+    let any = |pick: fn(&TorrentTracker) -> bool| json!(view.trackers.iter().any(pick));
+    [
+        (
+            "has_tracker_warning",
+            any(|tracker| {
+                tracker.status == TrackerStatus::Working
+                    && tracker
+                        .message
+                        .as_deref()
+                        .is_some_and(|message| !message.is_empty())
+            }),
+        ),
+        (
+            "has_tracker_error",
+            any(|tracker| tracker.status == TrackerStatus::TrackerError),
+        ),
+        (
+            "has_other_announce_error",
+            any(|tracker| {
+                matches!(
+                    tracker.status,
+                    TrackerStatus::NotWorking | TrackerStatus::Unreachable
+                )
+            }),
+        ),
+    ]
+}
+
+// Whether a torrent passes a `torrents/info` status filter (qBittorrent
+// `TorrentFilter::matchStatus`); a filter the client does not define is
+// all of them.
 fn wanted(view: &TorrentView, filter: &str) -> bool {
     let state = state(view);
-    let complete = view.completed_at_ms.is_some();
     let active = view.download_bps > 0 || view.upload_bps > 0;
+    let stopped = matches!(state, "stoppedDL" | "stoppedUP");
     match filter {
-        "" | "all" => true,
-        "downloading" => !complete && !matches!(state, "stoppedDL" | "error"),
+        "downloading" => matches!(
+            state,
+            "downloading"
+                | "metaDL"
+                | "forcedMetaDL"
+                | "stalledDL"
+                | "checkingDL"
+                | "stoppedDL"
+                | "queuedDL"
+                | "forcedDL"
+        ),
         "seeding" => matches!(
             state,
-            "uploading" | "stalledUP" | "forcedUP" | "queuedUP" | "checkingUP"
+            "uploading" | "stalledUP" | "checkingUP" | "queuedUP" | "forcedUP"
         ),
-        "completed" => complete,
-        "paused" | "stopped" => matches!(state, "stoppedDL" | "stoppedUP"),
-        "resumed" | "running" => !matches!(state, "stoppedDL" | "stoppedUP"),
+        "completed" => matches!(
+            state,
+            "uploading" | "stalledUP" | "checkingUP" | "stoppedUP" | "queuedUP" | "forcedUP"
+        ),
+        "stopped" => stopped,
+        "running" => !stopped,
         "active" => active,
         "inactive" => !active,
         "stalled" => matches!(state, "stalledDL" | "stalledUP"),
         "stalled_uploading" => state == "stalledUP",
         "stalled_downloading" => state == "stalledDL",
-        "checking" => matches!(state, "checkingDL" | "checkingUP"),
-        "errored" => state == "error",
+        "checking" => matches!(state, "checkingDL" | "checkingUP" | "checkingResumeData"),
+        "moving" => state == "moving",
+        "errored" => matches!(state, "error" | "missingFiles"),
+        _ => true,
+    }
+}
+
+// qBittorrent's order of two values of a column: by number, text or flag,
+// and none between values of different kinds.
+fn less(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            left.as_f64().unwrap_or(0.0) < right.as_f64().unwrap_or(0.0)
+        }
+        (Value::String(left), Value::String(right)) => left < right,
+        (Value::Bool(left), Value::Bool(right)) => left < right,
         _ => false,
     }
 }
 
-async fn torrents_info(ctx: &TorrentFacadeContext, params: &Params) -> Response {
-    let views = ctx.views().await;
-    let hashes: Option<Vec<&str>> = params
+// qBittorrent `infoAction`: the torrents the filters pass, sorted by a
+// column and paged when asked.
+async fn torrents_info(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    scope: CallerScope,
+) -> Response {
+    let hashes: Vec<&str> = params
         .get("hashes")
-        .map(|hashes| hashes.split('|').map(str::trim).collect());
-    let filter = params.get("filter").unwrap_or_default();
-    let list: Vec<Value> = views
-        .iter()
-        .filter(|view| match params.get("category") {
-            None => true,
-            Some(name) => view
-                .category
-                .as_deref()
-                .unwrap_or_default()
-                .eq_ignore_ascii_case(name),
-        })
-        .filter(|view| {
-            hashes.as_ref().is_none_or(|hashes| {
-                hashes
-                    .iter()
-                    .any(|hash| view.infohash.eq_ignore_ascii_case(hash))
-            })
-        })
-        .filter(|view| wanted(view, filter))
-        .map(info)
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
         .collect();
+    let filter = params.get("filter").unwrap_or_default();
+    let private = params.flag_value("private");
+    // Tags are not kept: every torrent is untagged.
+    let tagged = params.get("tag").is_some_and(|tag| !tag.trim().is_empty());
+    let with_files = params.flag("includeFiles").unwrap_or(false);
+    let with_trackers = params.flag("includeTrackers").unwrap_or(false);
+    let mut list: Vec<Value> = Vec::new();
+    for view in ctx.views().await {
+        let passes = !tagged
+            && wanted(&view, filter)
+            && (hashes.is_empty()
+                || hashes
+                    .iter()
+                    .any(|hash| view.infohash.eq_ignore_ascii_case(hash)))
+            && params.get("category").is_none_or(|name| {
+                let category = view.category.as_deref().unwrap_or_default();
+                category.eq_ignore_ascii_case(name)
+                    || category
+                        .get(..name.len() + 1)
+                        .is_some_and(|parent| parent.eq_ignore_ascii_case(&format!("{name}/")))
+            })
+            && private.is_none_or(|private| view.private == private);
+        if !passes {
+            continue;
+        }
+        let mut row = info(&view, scope);
+        if with_files && view.pieces.is_some() {
+            row["files"] = json!(file_list(&view, 0..view.files.len()));
+        }
+        if with_trackers {
+            row["trackers"] = json!(
+                view.trackers
+                    .iter()
+                    .map(|tracker| tracker_json(tracker, scope, ctx.api()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        list.push(row);
+    }
+    if let Some(column) = params.get("sort").filter(|column| !column.is_empty()) {
+        if list.first().is_some_and(|row| row.get(column).is_none()) {
+            return text(StatusCode::BAD_REQUEST, "'sort' parameter is invalid");
+        }
+        let reverse = params.flag("reverse").unwrap_or(false);
+        list.sort_by(|left, right| {
+            let (left, right) = (&left[column], &right[column]);
+            let (left, right) = if reverse {
+                (right, left)
+            } else {
+                (left, right)
+            };
+            if less(left, right) {
+                std::cmp::Ordering::Less
+            } else if less(right, left) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+    }
+    let number = |name: &str| {
+        params
+            .get(name)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    let (limit, mut offset) = (number("limit"), number("offset"));
+    let size = i64::try_from(list.len()).unwrap_or(i64::MAX);
+    // A negative offset counts back from the end; a limit of 0 or less is
+    // none.
+    if offset < 0 {
+        offset += size;
+    }
+    if limit > 0 || offset > 0 {
+        let start = offset.clamp(0, size);
+        let end = if limit > 0 {
+            start.saturating_add(limit).min(size)
+        } else {
+            size
+        };
+        list = list
+            .drain(usize::try_from(start).unwrap_or(0)..usize::try_from(end).unwrap_or(0))
+            .collect();
+    }
     axum::Json(list).into_response()
 }
 
@@ -871,16 +1535,34 @@ fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
 }
 
 fn not_found() -> Response {
-    text(StatusCode::NOT_FOUND, "Torrent hash was not found")
+    text(StatusCode::NOT_FOUND, "Not Found")
 }
 
+// A ratio as qBittorrent reports one: -1 from its cap up
+// (`Torrent::MAX_RATIO`).
+fn capped(ratio: f64) -> f64 {
+    const MAX_RATIO: f64 = 9999.0;
+    if ratio >= MAX_RATIO { -1.0 } else { ratio }
+}
+
+// qBittorrent `propertiesAction`.
 async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
         return not_found();
     };
-    let (save_path, content_path) = view.paths();
+    let now = now_secs();
+    let (save_path, _) = view.paths();
+    let seeding = seeding_time(&view, now);
+    let has_metadata = view.pieces.is_some();
+    // The average rates over the time spent downloading and the time active.
+    let average = |bytes: u64, secs: u64| {
+        if secs > 0 {
+            json!(bytes / secs)
+        } else {
+            json!(-1)
+        }
+    };
     let fields = object([
-        ("hash", json!(view.infohash.to_ascii_lowercase())),
         (
             "infohash_v1",
             json!(view.infohash_v1.clone().unwrap_or_default()),
@@ -890,16 +1572,47 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             json!(view.infohash_v2.clone().unwrap_or_default()),
         ),
         ("name", json!(view.name)),
-        ("save_path", json!(save_path)),
-        ("content_path", json!(content_path)),
-        ("download_path", json!("")),
-        ("is_private", json!(view.private)),
-        ("comment", json!(view.comment.clone().unwrap_or_default())),
+        ("hash", json!(view.infohash.to_ascii_lowercase())),
+        ("time_elapsed", json!(view.active_seconds)),
+        ("seeding_time", json!(seeding)),
+        ("eta", json!(eta(&view))),
+        ("nb_connections", json!(view.peers)),
+        ("nb_connections_limit", json!(view.max_peers)),
+        ("total_downloaded", json!(view.downloaded_bytes)),
+        ("total_downloaded_session", json!(view.downloaded_bytes)),
+        ("total_uploaded", json!(view.uploaded_bytes)),
+        ("total_uploaded_session", json!(view.uploaded_bytes)),
+        ("dl_speed", json!(view.download_bps)),
         (
-            "created_by",
-            json!(view.created_by.clone().unwrap_or_default()),
+            "dl_speed_avg",
+            average(
+                view.downloaded_bytes,
+                view.active_seconds.saturating_sub(seeding),
+            ),
         ),
-        ("creation_date", json!(view.created_at_ms.map_or(-1, secs))),
+        ("up_speed", json!(view.upload_bps)),
+        (
+            "up_speed_avg",
+            average(view.uploaded_bytes, view.active_seconds),
+        ),
+        ("total_wasted", json!(view.wasted_bytes)),
+        ("seeds", json!(view.seeds)),
+        ("seeds_total", json!(view.swarm_seeds.unwrap_or(view.seeds))),
+        ("peers", json!(view.leechers)),
+        (
+            "peers_total",
+            json!(view.swarm_leechers.unwrap_or(view.leechers)),
+        ),
+        ("share_ratio", json!(capped(view.ratio))),
+        ("popularity", json!(capped(popularity(&view)))),
+        // Weaver does not count the copies the swarm holds.
+        ("availability", json!(-1)),
+        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
+        ("total_size", json!(view.total_bytes)),
+        (
+            "pieces_num",
+            json!(view.pieces.map_or(-1, |pieces| i64::from(pieces.count))),
+        ),
         (
             "piece_size",
             json!(view.pieces.map_or(-1, |pieces| pieces.size as i64)),
@@ -909,78 +1622,111 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
             json!(view.pieces.map_or(-1, |pieces| i64::from(pieces.have))),
         ),
         (
-            "pieces_num",
-            json!(view.pieces.map_or(-1, |pieces| i64::from(pieces.count))),
+            "created_by",
+            json!(view.created_by.clone().unwrap_or_default()),
         ),
-        ("total_size", json!(view.total_bytes)),
-        ("total_wasted", json!(view.wasted_bytes)),
-        ("total_uploaded", json!(view.uploaded_bytes)),
-        ("total_uploaded_session", json!(view.uploaded_bytes)),
-        ("total_downloaded", json!(view.downloaded_bytes)),
-        ("total_downloaded_session", json!(view.downloaded_bytes)),
-        ("time_elapsed", json!(view.active_seconds)),
-        ("nb_connections", json!(view.peers)),
-        ("nb_connections_limit", json!(view.max_peers)),
-        ("share_ratio", json!(view.ratio)),
+        ("is_private", json!(view.private)),
+        (
+            "private",
+            if has_metadata {
+                json!(view.private)
+            } else {
+                Value::Null
+            },
+        ),
         ("addition_date", json!(secs(view.added_at_ms))),
-        (
-            "completion_date",
-            json!(view.completed_at_ms.map_or(-1, secs)),
-        ),
-        (
-            "last_seen",
-            json!(view.last_seen_complete_ms.map_or(-1, secs)),
-        ),
-        ("dl_speed", json!(view.download_bps)),
-        ("dl_speed_avg", json!(view.download_avg_bps)),
-        ("up_speed", json!(view.upload_bps)),
-        ("up_speed_avg", json!(view.upload_avg_bps)),
-        ("eta", json!(eta(&view))),
-        ("peers", json!(view.leechers)),
-        (
-            "peers_total",
-            json!(view.swarm_leechers.unwrap_or(view.leechers)),
-        ),
-        ("seeds", json!(view.seeds)),
-        ("seeds_total", json!(view.swarm_seeds.unwrap_or(view.seeds))),
-        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
-        ("seq_dl", json!(view.sequential)),
-        ("f_l_piece_prio", json!(view.first_last_piece_first)),
+        ("last_seen", json!(when(view.last_seen_complete_ms))),
+        ("completion_date", json!(when(view.completed_at_ms))),
+        ("creation_date", json!(when(view.created_at_ms))),
+        ("save_path", json!(save_path)),
+        ("download_path", json!("")),
+        ("comment", json!(view.comment.clone().unwrap_or_default())),
+        ("has_metadata", json!(has_metadata)),
+        ("progress", json!(view.progress.clamp(0.0, 1.0))),
     ]);
     // The properties read no limit as -1, where the list reads it as 0.
     let fields = with_limits(
         fields,
         -1,
         [
-            ("up_limit", view.upload_limit),
             ("dl_limit", view.download_limit),
+            ("up_limit", view.upload_limit),
         ],
     );
     axum::Json(fields).into_response()
 }
 
+// qBittorrent `filesAction`: the torrent's files, or those `indexes`
+// names, `|`-separated.
 async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let Some(view) = ctx.by_hash(params.get("hash").unwrap_or_default()).await else {
         return not_found();
     };
-    let list: Vec<Value> = view
+    if view.pieces.is_none() {
+        return axum::Json(json!([])).into_response();
+    }
+    let Some(wanted) = params.get("indexes") else {
+        return axum::Json(file_list(&view, 0..view.files.len())).into_response();
+    };
+    let mut indexes = Vec::new();
+    for index in wanted.split('|') {
+        match index.trim().parse::<usize>() {
+            Ok(index) if index < view.files.len() => indexes.push(index),
+            Ok(_) => {
+                return text(
+                    StatusCode::CONFLICT,
+                    format!("Index {index} is out of bounds."),
+                );
+            }
+            Err(_) => {
+                return text(
+                    StatusCode::CONFLICT,
+                    format!("\"{index}\" is not a valid file index."),
+                );
+            }
+        }
+    }
+    axum::Json(file_list(&view, indexes)).into_response()
+}
+
+// The files at `indexes` (qBittorrent `getFiles`), the first saying
+// whether the torrent is done.
+fn file_list(view: &TorrentView, indexes: impl IntoIterator<Item = usize>) -> Vec<Value> {
+    // The pieces each file spans, from where it starts in the torrent.
+    let piece_size = view
+        .pieces
+        .map_or(1, |pieces| u64::from(pieces.size).max(1));
+    let mut start = 0u64;
+    let ranges: Vec<[u64; 2]> = view
         .files
         .iter()
         .map(|file| {
-            let progress = view.file_progress(file);
+            let first = start / piece_size;
+            let last = (start + file.length.max(1) - 1) / piece_size;
+            start += file.length;
+            [first, last]
+        })
+        .collect();
+    let mut list: Vec<Value> = indexes
+        .into_iter()
+        .map(|index| {
+            let file = &view.files[index];
             json!({
                 "index": file.index,
                 "name": file.path,
                 "size": file.length,
-                "progress": progress,
+                "progress": view.file_progress(file),
                 "priority": qbt_priority(file.priority),
-                "is_seed": view.completed_at_ms.is_some(),
-                "piece_range": [0, 0],
+                "piece_range": ranges[index],
+                // Weaver does not count the copies the swarm holds.
                 "availability": -1,
             })
         })
         .collect();
-    axum::Json(list).into_response()
+    if let Some(first) = list.first_mut() {
+        first["is_seed"] = json!(view.completed_at_ms.is_some());
+    }
+    list
 }
 
 // A file's level as the client numbers it.
@@ -1035,15 +1781,22 @@ async fn file_prio(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     }
 }
 
-// qBittorrent `TrackerEndpointState`, and 0 for a row that is off.
-fn tracker_status(status: TrackerStatus) -> u8 {
-    match status {
-        TrackerStatus::Disabled => 0,
-        TrackerStatus::NotContacted => 1,
-        TrackerStatus::Working => 2,
-        TrackerStatus::NotWorking => 4,
-        TrackerStatus::TrackerError => 5,
-        TrackerStatus::Unreachable => 6,
+// qBittorrent `TorrentImpl::currentTracker`: libtorrent's `current_tracker`,
+// the tracker that last answered (`torrent::status`), else the first one
+// listed. Weaver keeps each tracker's latest outcome only, so the one that
+// last answered is the working one announced to most recently. The URL is
+// redacted for a caller that only reads, as in `torrents/trackers`.
+fn current_tracker(view: &TorrentView, scope: CallerScope) -> String {
+    let current = view
+        .trackers
+        .iter()
+        .filter(|tracker| tracker.status == TrackerStatus::Working)
+        .max_by_key(|tracker| tracker.last_announce_ms)
+        .or_else(|| view.trackers.first());
+    match current {
+        None => String::new(),
+        Some(tracker) if scope.can_control() => tracker.url.clone(),
+        Some(tracker) => redacted_tracker_url(&tracker.url),
     }
 }
 
@@ -1074,7 +1827,7 @@ async fn trackers(ctx: &TorrentFacadeContext, params: &Params, scope: CallerScop
     list.extend(
         view.trackers
             .iter()
-            .map(|tracker| tracker_json(tracker, scope)),
+            .map(|tracker| tracker_json(tracker, scope, ctx.api())),
     );
     axum::Json(list).into_response()
 }
@@ -1117,7 +1870,7 @@ fn sticky_trackers(
 // qBittorrent `getTrackers`, each time in seconds since the epoch and -1
 // for a count the tracker has not given. A caller that may change trackers
 // sees the whole URL; one that only reads, its scheme, host and port.
-fn tracker_json(tracker: &TorrentTracker, scope: CallerScope) -> Value {
+fn tracker_json(tracker: &TorrentTracker, scope: CallerScope, api: Api) -> Value {
     let count = |value: Option<u32>| value.map_or(-1, i64::from);
     let seconds = |ms: Option<i64>| ms.map_or(0, |ms| ms / 1000);
     let url = if scope.can_control() {
@@ -1133,7 +1886,7 @@ fn tracker_json(tracker: &TorrentTracker, scope: CallerScope) -> Value {
             NamedBy::Operator => "OPERATOR",
         },
         "updating": tracker.updating,
-        "status": tracker_status(tracker.status),
+        "status": api.tracker_status(tracker.status),
         "msg": tracker.message.clone().unwrap_or_default(),
         "num_peers": count(tracker.peers),
         "num_seeds": count(tracker.seeders),
@@ -1213,8 +1966,13 @@ async fn add_trackers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
 // `torrents/editTracker` (qBittorrent `editTrackerAction`): a new URL or
 // tier for one tracker, then an announce to every tracker.
 async fn edit_tracker(ctx: &TorrentFacadeContext, params: &Params) -> Response {
-    let (Some(hash), Some(url)) = (params.get("hash"), params.get("url")) else {
-        return text(StatusCode::BAD_REQUEST, "Missing parameter: hash, url");
+    // The tracker is `url` from 2.13.0, `origUrl` before it.
+    let url = params.get("url").or_else(|| params.get("origUrl"));
+    let (Some(hash), Some(url)) = (params.get("hash"), url) else {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "Missing required parameters: hash, url",
+        );
     };
     let url = url.trim();
     let Some(torrents) = &ctx.inner.torrents else {
@@ -1314,10 +2072,41 @@ async fn reannounce(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     .await
 }
 
+// qBittorrent `addAction`: every file and url added with the same terms.
+// A url is fetched when it is added, over the one leg of the route its
+// torrent takes, with the client's cookie; one that cannot be fetched, or
+// a torrent already added, is a failure.
 async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
     let Some(torrents) = &ctx.inner.torrents else {
         return text(StatusCode::CONFLICT, "torrents are not enabled");
     };
+    let urls: Vec<&str> = params
+        .get("urls")
+        .unwrap_or_default()
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    // Weaver reads no metadata before a torrent is added, so no file has a
+    // level before it is.
+    if !params
+        .get("filePriorities")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        let refusal = if urls.len() > 1 {
+            "Cannot specify filePriorities when adding multiple torrents"
+        } else if !params.files.is_empty() {
+            "Cannot specify filePriorities when uploading torrent files"
+        } else {
+            "`filePriorities` may only be specified when metadata has already been fetched"
+        };
+        return text(StatusCode::BAD_REQUEST, refusal);
+    }
+    if !params.get("rename").unwrap_or_default().trim().is_empty() {
+        return unavailable("Renaming");
+    }
     let category = params
         .get("category")
         .map(str::trim)
@@ -1325,86 +2114,105 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .map(str::to_owned);
     let policy_override = {
         let config = ctx.inner.config.read().await;
-        match share_policy(&params, inherited(&config, category.as_deref()), None) {
+        match share_policy(
+            &params,
+            inherited(&config, category.as_deref()),
+            None,
+            false,
+        ) {
             Ok(policy) => policy,
             Err(response) => return response,
         }
     };
-    // Each file, and each url's text, is read for what it is. A url is
-    // fetched over the one leg of the route its torrent takes, with the\n    // client's cookie.
-    let mut bodies = params.files.clone();
-    for line in params
-        .get("urls")
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let Kind::Url(url) = classify(line.as_bytes()) else {
-            bodies.push(line.as_bytes().to_vec());
-            continue;
-        };
-        let Some(runtime) = ctx.inner.handle.proxy_runtime() else {
-            return text(StatusCode::CONFLICT, "torrent request has no route");
-        };
-        match torrents
-            .fetch_url(&runtime, category.as_deref(), &url, params.get("cookie"))
-            .await
-        {
-            Ok(body) => bodies.push(body),
-            Err(error) => return text(StatusCode::CONFLICT, error),
-        }
-    }
-    let mut sources = Vec::with_capacity(bodies.len());
-    for body in bodies {
-        match classify(&body).torrent(body) {
-            Ok(source) => sources.push(source),
-            Err(_) => return text(StatusCode::UNSUPPORTED_MEDIA_TYPE, "not a torrent"),
-        }
-    }
-    if sources.is_empty() {
-        return text(StatusCode::BAD_REQUEST, "no torrents or urls");
-    }
-    let paused = params
-        .flag("stopped")
-        .or_else(|| params.flag("paused"))
-        .unwrap_or(false);
     let (upload_limit, download_limit) =
         match (add_limit(&params, "upLimit"), add_limit(&params, "dlLimit")) {
             (Ok(upload), Ok(download)) => (upload, download),
             (Err(response), _) | (_, Err(response)) => return response,
         };
-    let mut added = 0usize;
-    let mut refusal: Option<Response> = None;
-    for source in sources {
-        let request = AddRequest {
-            source,
-            category: category.clone(),
-            policy_override,
-            paused,
-            forced: false,
-            unpack: None,
-            metadata: Vec::new(),
-            upload_limit,
-            download_limit,
-        };
-        match torrents.add(request).await {
-            Ok(_) => added += 1,
-            Err(AddError::Duplicate(_)) => {}
-            Err(error) => {
-                refusal.get_or_insert_with(|| match error {
-                    AddError::Invalid(message) => text(StatusCode::UNSUPPORTED_MEDIA_TYPE, message),
-                    AddError::State(error) => internal(error),
-                    refused => text(StatusCode::CONFLICT, refused.to_string()),
-                });
+    let mut sources = Vec::with_capacity(params.files.len() + urls.len());
+    for (name, body) in &params.files {
+        match classify(body).torrent(body.clone()) {
+            Ok(source) => sources.push(Ok(source)),
+            Err(_) => {
+                return text(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    format!("Error: '{name}' is not a valid torrent file."),
+                );
             }
         }
     }
-    match refusal {
-        Some(response) => response,
-        None if added == 0 => text(StatusCode::OK, "Fails."),
-        None => text(StatusCode::OK, "Ok."),
+    for line in urls {
+        let body = match classify(line.as_bytes()) {
+            Kind::Url(url) => match ctx.inner.handle.proxy_runtime() {
+                Some(runtime) => torrents
+                    .fetch_url(&runtime, category.as_deref(), &url, params.get("cookie"))
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Err("torrent request has no route".to_owned()),
+            },
+            _ => Ok(line.as_bytes().to_vec()),
+        };
+        sources.push(body.and_then(|body| {
+            classify(&body)
+                .torrent(body)
+                .map_err(|_| format!("{line} is not a torrent"))
+        }));
     }
+    let stopped = params
+        .flag("stopped")
+        .or_else(|| params.flag("paused"))
+        .unwrap_or(false);
+    let sequential = params.flag("sequentialDownload").unwrap_or(false);
+    let first_last = params.flag("firstLastPiecePrio").unwrap_or(false);
+    let mut ids = Vec::new();
+    let mut failed = 0usize;
+    let mut refusal: Option<String> = None;
+    for source in sources {
+        let added = match source {
+            Ok(source) => torrents
+                .add(AddRequest {
+                    source,
+                    category: category.clone(),
+                    policy_override,
+                    paused: stopped,
+                    forced: params.flag("forced").unwrap_or(false),
+                    unpack: None,
+                    metadata: Vec::new(),
+                    upload_limit,
+                    download_limit,
+                })
+                .await
+                .map_err(|error| match error {
+                    AddError::State(error) => Err(error),
+                    refused => Ok(refused.to_string()),
+                }),
+            Err(error) => Err(Ok(error)),
+        };
+        match added {
+            Ok(job_id) => {
+                if sequential && let Err(error) = torrents.set_sequential(job_id, true).await {
+                    tracing::warn!(%error, "added torrent did not take sequential download");
+                }
+                if first_last
+                    && let Err(error) = torrents.set_first_last_piece_first(job_id, true).await
+                {
+                    tracing::warn!(%error, "added torrent did not take first and last pieces first");
+                }
+                if let Some(view) = torrents.torrent(job_id).await {
+                    ids.push(view.infohash.to_ascii_lowercase());
+                }
+            }
+            Err(Ok(why)) => {
+                failed += 1;
+                refusal.get_or_insert(why);
+            }
+            Err(Err(error)) => return internal(error),
+        }
+    }
+    if ids.is_empty() && failed == 0 {
+        return text(StatusCode::BAD_REQUEST, "no torrents or urls");
+    }
+    ctx.api().added(&ids, failed, refusal)
 }
 
 // The seeding policy a torrent added to `category` inherits before its
@@ -1451,13 +2259,61 @@ fn share_limit(
     }
 }
 
-// A torrent's seeding override from the client's share limits, over its
-// current override. Mode and action stay those of the policy in force.
+// A share-limit mode or action by its qBittorrent name: absent leaves it as
+// it is, and `Default` takes the one inherited. A name the client does not
+// define is refused where `strict` (`applyShareLimitsParams`), else read
+// as `Default` (`setShareLimitsAction`).
+fn share_named<T>(
+    params: &Params,
+    name: &str,
+    of: fn(&str) -> Option<Option<T>>,
+    strict: bool,
+) -> Result<Option<Option<T>>, Response> {
+    let Some(value) = params.get(name) else {
+        return Ok(None);
+    };
+    match of(value.trim()) {
+        Some(named) => Ok(Some(named)),
+        None if strict => Err(text(
+            StatusCode::BAD_REQUEST,
+            format!("'{name}' parameter has invalid value"),
+        )),
+        None => Ok(Some(None)),
+    }
+}
+
+fn limits_mode_of(name: &str) -> Option<Option<SeedingGoalMode>> {
+    match name {
+        "Default" => Some(None),
+        "MatchAny" => Some(Some(SeedingGoalMode::Any)),
+        "MatchAll" => Some(Some(SeedingGoalMode::All)),
+        _ => None,
+    }
+}
+
+fn limit_action_of(name: &str) -> Option<Option<SeedingAction>> {
+    match name {
+        "Default" => Some(None),
+        "Stop" => Some(Some(SeedingAction::Stop)),
+        "Remove" => Some(Some(SeedingAction::Remove)),
+        "RemoveWithContent" => Some(Some(SeedingAction::RemoveWithData)),
+        _ => None,
+    }
+}
+
+// A seeding override from the client's share limits, over the current
+// override: a torrent's, or a category's over the global policy.
 fn share_policy(
     params: &Params,
     inherited: Option<SeedingPolicy>,
     current: Option<SeedingPolicy>,
+    strict: bool,
 ) -> Result<Option<SeedingPolicy>, Response> {
+    if params.get("shareLimitAction").map(str::trim) == Some("EnableSuperSeeding") {
+        return Err(unavailable("Super seeding"));
+    }
+    let mode = share_named(params, "shareLimitsMode", limits_mode_of, strict)?;
+    let action = share_named(params, "shareLimitAction", limit_action_of, strict)?;
     let field = |pick: fn(&SeedingPolicy) -> Option<f64>| {
         (
             current.as_ref().and_then(pick),
@@ -1471,18 +2327,29 @@ fn share_policy(
     let (now, from) = field(|policy| policy.inactive_goal_minutes.map(f64::from));
     let inactive = share_limit(params, "inactiveSeedingTimeLimit", now, from)?;
     let max_upload_bps = current.as_ref().and_then(|policy| policy.max_upload_bps);
-    if ratio.is_none() && seeding.is_none() && inactive.is_none() && max_upload_bps.is_none() {
+    // The most specific policy's mode and action rule (`resolve_seeding_policy`).
+    let base = current.or(inherited).unwrap_or_default();
+    let from = inherited.unwrap_or_default();
+    let mode = mode.map_or(base.mode, |mode| mode.unwrap_or(from.mode));
+    let action = action.map_or(base.action, |action| action.unwrap_or(from.action));
+    if ratio.is_none()
+        && seeding.is_none()
+        && inactive.is_none()
+        && max_upload_bps.is_none()
+        && mode == from.mode
+        && action == from.action
+    {
         return Ok(None);
     }
     let minutes =
         |value: Option<f64>| value.map(|value| value.round().min(f64::from(u32::MAX)) as u32);
-    let base = current.or(inherited).unwrap_or_default();
     Ok(Some(SeedingPolicy {
         ratio_goal: ratio.map(|ratio| ratio as f32),
         seed_time_goal_minutes: minutes(seeding),
         inactive_goal_minutes: minutes(inactive),
+        mode,
+        action,
         max_upload_bps,
-        ..base
     }))
 }
 
@@ -1491,10 +2358,11 @@ async fn set_share_limits(ctx: &TorrentFacadeContext, params: &Params) -> Respon
         return ok();
     };
     for view in ctx.targets(params).await {
-        let policy = match share_policy(params, view.seeding_inherited, view.seeding_override) {
-            Ok(policy) => policy,
-            Err(response) => return response,
-        };
+        let policy =
+            match share_policy(params, view.seeding_inherited, view.seeding_override, false) {
+                Ok(policy) => policy,
+                Err(response) => return response,
+            };
         match torrents.set_policy_override(view.job_id, policy).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
             Err(error @ ActionError::Invalid(_)) => {
@@ -1852,24 +2720,9 @@ async fn set_preferences(ctx: &TorrentFacadeContext, params: &Params) -> Respons
         Ok(torrent) => torrent,
         Err(error) => return text(StatusCode::BAD_REQUEST, error),
     };
-    let (download, upload) = (rate("dl_limit"), rate("up_limit"));
-    if download.is_some() || upload.is_some() {
-        let current = inner.config.read().await.bandwidth;
-        let bandwidth = Bandwidth {
-            download_bps: download.unwrap_or(current.download_bps),
-            upload_bps: upload.unwrap_or(current.upload_bps),
-            ..current
-        };
-        if bandwidth.validate().is_err() {
-            return text(StatusCode::BAD_REQUEST, "limit too large");
-        }
-        if let Err(error) = inner
-            .handle
-            .save_bandwidth(&inner.db, &inner.config, bandwidth)
-            .await
-        {
-            return internal(error);
-        }
+    let saved = save_rates(ctx, rate("dl_limit"), rate("up_limit")).await;
+    if saved.status() != StatusCode::OK {
+        return saved;
     }
     if torrent != current {
         let db = inner.db.clone();
@@ -1918,19 +2771,38 @@ impl TorrentFacadeContext {
             torrents.set_settings(settings).await;
         }
     }
+
+    // What follows a category added or changed here.
+    async fn categories_changed(&self) {
+        self.refresh_settings().await;
+        if let Err(error) = self.inner.watch_folder.reconcile_from_config().await {
+            tracing::warn!(%error, "watch folder did not take the category");
+        }
+    }
 }
 
+// Each category with its folder and share limits (qBittorrent
+// `categoriesAction`, `CategoryOptions::toJSON`): `-2` where a limit is
+// inherited, and `Default` for a mode and action the category does not set.
 pub(super) fn categories(config: &Config) -> Value {
     let map: Map<String, Value> = config
         .categories
         .iter()
         .map(|category| {
+            let seeding = category.seeding.as_ref();
+            let limit = |value: Option<f64>| value.map_or(json!(-2), |value| json!(value));
+            let minutes = |value: Option<u32>| json!(value.map_or(-2, i64::from));
             (
                 category.name.clone(),
                 json!({
                     "name": category.name,
                     "savePath": category_dir(config, Some(&category.name)).to_string_lossy(),
                     "download_path": Value::Null,
+                    "ratio_limit": limit(seeding.and_then(|policy| policy.ratio_goal.map(f64::from))),
+                    "seeding_time_limit": minutes(seeding.and_then(|policy| policy.seed_time_goal_minutes)),
+                    "inactive_seeding_time_limit": minutes(seeding.and_then(|policy| policy.inactive_goal_minutes)),
+                    "share_limit_action": seeding.map_or("Default", |policy| limit_action_name(policy.action)),
+                    "share_limits_mode": seeding.map_or("Default", |policy| limits_mode_name(policy.mode)),
                 }),
             )
         })
@@ -1938,32 +2810,95 @@ pub(super) fn categories(config: &Config) -> Value {
     Value::Object(map)
 }
 
-async fn create_category(ctx: &TorrentFacadeContext, params: &Params) -> Response {
-    let Ok(name) = validate_category_path_component(params.get("category").unwrap_or_default())
-    else {
-        return text(StatusCode::BAD_REQUEST, "Invalid category name");
+// The parameters of `createCategory` and `editCategory` past the name. In
+// Weaver a category's folder and goals are an administrator's to set.
+const CATEGORY_OPTIONS: [&str; 7] = [
+    "savePath",
+    "downloadPathEnabled",
+    "ratioLimit",
+    "seedingTimeLimit",
+    "inactiveSeedingTimeLimit",
+    "shareLimitsMode",
+    "shareLimitAction",
+];
+
+// A category's folder and seeding goals with the options the request sets
+// applied: an empty `savePath` is the category's default folder, a
+// relative one is under the complete folder.
+fn category_options(
+    config: &Config,
+    params: &Params,
+    scope: CallerScope,
+    current: Option<&CategoryConfig>,
+) -> Result<(Option<String>, Option<SeedingPolicy>), Response> {
+    if CATEGORY_OPTIONS
+        .iter()
+        .any(|name| params.get(name).is_some())
+        && !scope.is_admin()
+    {
+        return Err(forbidden());
+    }
+    if params.flag("downloadPathEnabled") == Some(true) {
+        return Err(unavailable("A download path"));
+    }
+    let dest_dir = match params.get("savePath").map(str::trim) {
+        None => current.and_then(|category| category.dest_dir.clone()),
+        Some("") => None,
+        Some(path) if Path::new(path).is_absolute() => Some(path.to_owned()),
+        Some(path) => Some(
+            Path::new(&config.complete_dir())
+                .join(path)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    };
+    let seeding = share_policy(
+        params,
+        config.seeding,
+        current.and_then(|category| category.seeding),
+        true,
+    )?;
+    Ok((dest_dir, seeding))
+}
+
+// qBittorrent `createCategoryAction`.
+async fn create_category(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    scope: CallerScope,
+) -> Response {
+    let name = params.get("category").unwrap_or_default();
+    if name.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "Category cannot be empty");
+    }
+    let Ok(name) = validate_category_path_component(name) else {
+        return text(StatusCode::CONFLICT, "Incorrect category name");
     };
     let inner = &ctx.inner;
     let _guard = inner.categories.lock().await;
-    if inner
-        .config
-        .read()
-        .await
-        .categories
-        .iter()
-        .any(|category| category.name.eq_ignore_ascii_case(&name))
-    {
-        return text(StatusCode::CONFLICT, "Unable to create category");
-    }
+    let (dest_dir, seeding) = {
+        let config = inner.config.read().await;
+        if config
+            .categories
+            .iter()
+            .any(|category| category.name.eq_ignore_ascii_case(&name))
+        {
+            return text(StatusCode::CONFLICT, "Unable to create category");
+        }
+        match category_options(&config, params, scope, None) {
+            Ok(options) => options,
+            Err(response) => return response,
+        }
+    };
     let db = inner.db.clone();
     let candidate = name.clone();
     let created = tokio::task::spawn_blocking(move || {
         let category = CategoryConfig {
             id: db.next_category_id()?,
             name: candidate,
-            dest_dir: None,
+            dest_dir,
             aliases: String::new(),
-            seeding: None,
+            seeding,
             torrent_route: false,
             unpack: None,
         };
@@ -1976,10 +2911,58 @@ async fn create_category(ctx: &TorrentFacadeContext, params: &Params) -> Respons
         Err(error) => return internal(error),
     };
     inner.config.write().await.categories.push(category);
-    ctx.refresh_settings().await;
-    if let Err(error) = inner.watch_folder.reconcile_from_config().await {
-        tracing::warn!(%error, "watch folder did not take the new category");
+    ctx.categories_changed().await;
+    ok()
+}
+
+// qBittorrent `editCategoryAction`: the category's folder and goals.
+async fn edit_category(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    scope: CallerScope,
+) -> Response {
+    let name = params.get("category").unwrap_or_default();
+    if name.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "Category cannot be empty");
     }
+    let inner = &ctx.inner;
+    let _guard = inner.categories.lock().await;
+    let edited = {
+        let config = inner.config.read().await;
+        let Some(current) = config
+            .categories
+            .iter()
+            .find(|category| category.name == name)
+        else {
+            return text(StatusCode::NOT_FOUND, "Category does not exist");
+        };
+        match category_options(&config, params, scope, Some(current)) {
+            Ok((dest_dir, seeding)) => CategoryConfig {
+                dest_dir,
+                seeding,
+                ..current.clone()
+            },
+            Err(response) => return response,
+        }
+    };
+    let db = inner.db.clone();
+    let persisted = edited.clone();
+    match tokio::task::spawn_blocking(move || db.update_category(&persisted)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return internal(error),
+        Err(error) => return internal(error),
+    }
+    if let Some(category) = inner
+        .config
+        .write()
+        .await
+        .categories
+        .iter_mut()
+        .find(|category| category.id == edited.id)
+    {
+        *category = edited;
+    }
+    ctx.categories_changed().await;
     ok()
 }
 
@@ -1991,6 +2974,9 @@ fn transfer(views: &[TorrentView], download: Option<u64>, upload: Option<u64>) -
         "dl_info_data": views.iter().map(|view| view.downloaded_bytes).sum::<u64>(),
         "up_info_speed": views.iter().map(|view| view.upload_bps).sum::<u64>(),
         "up_info_data": views.iter().map(|view| view.uploaded_bytes).sum::<u64>(),
+        // Weaver does not learn its external address from peers.
+        "last_external_address_v4": "",
+        "last_external_address_v6": "",
         "dht_nodes": 0,
         "connection_status": "connected",
     });
@@ -2001,17 +2987,20 @@ fn transfer(views: &[TorrentView], download: Option<u64>, upload: Option<u64>) -
     )
 }
 
-async fn maindata(ctx: &TorrentFacadeContext) -> Response {
+async fn maindata(ctx: &TorrentFacadeContext, scope: CallerScope) -> Response {
     let rid = ctx.inner.rid.fetch_add(1, Ordering::Relaxed) + 1;
     let views = ctx.views().await;
     let config = ctx.inner.config.read().await;
     let torrents: Map<String, Value> = views
         .iter()
         .map(|view| {
-            let mut entry = info(view);
+            let mut entry = info(view, scope);
             let hash = entry
                 .as_object_mut()
-                .and_then(|entry| entry.remove("hash"))
+                .and_then(|entry| {
+                    entry.extend(announce_stats(view).map(|(key, value)| (key.to_owned(), value)));
+                    entry.remove("hash")
+                })
                 .and_then(|hash| hash.as_str().map(str::to_owned))
                 .unwrap_or_default();
             (hash, entry)
@@ -2022,10 +3011,61 @@ async fn maindata(ctx: &TorrentFacadeContext) -> Response {
         ctx.torrent_download_limit(),
         config.bandwidth.upload_bps,
     );
+    let save_path = PathBuf::from(config.complete_dir());
+    let free = tokio::task::spawn_blocking(move || probe_disk_space(&save_path))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map_or(-1, |space| {
+            i64::try_from(space.available_bytes).unwrap_or(i64::MAX)
+        });
+    // Weaver keeps no totals past its torrents: the all-time figures are
+    // those of the torrents it has.
+    let downloaded = views.iter().map(|view| view.downloaded_bytes).sum::<u64>();
+    let uploaded = views.iter().map(|view| view.uploaded_bytes).sum::<u64>();
+    let ratio = if downloaded > 0 && uploaded > 0 {
+        format!("{:.2}", uploaded as f64 / downloaded as f64)
+    } else {
+        "-".to_owned()
+    };
+    let holds = ctx.inner.handle.state().holds();
+    let session_paused = [HoldOrigin::Manual, HoldOrigin::Scheduled]
+        .into_iter()
+        .any(|origin| holds.held_by(origin, HoldOwner::Torrents));
     if let Some(state) = server_state.as_object_mut() {
-        state.insert("queueing".into(), Value::Bool(false));
-        state.insert("use_alt_speed_limits".into(), Value::Bool(false));
-        state.insert("refresh_interval".into(), json!(1500));
+        state.extend(
+            [
+                ("free_space_on_disk", json!(free)),
+                ("alltime_dl", json!(downloaded)),
+                ("alltime_ul", json!(uploaded)),
+                (
+                    "total_wasted_session",
+                    json!(views.iter().map(|view| view.wasted_bytes).sum::<u64>()),
+                ),
+                ("global_ratio", json!(ratio)),
+                (
+                    "total_peer_connections",
+                    json!(views.iter().map(|view| u64::from(view.peers)).sum::<u64>()),
+                ),
+                // Weaver has no disk cache or announce queue to report.
+                ("read_cache_hits", json!("0")),
+                ("read_cache_overload", json!("0")),
+                ("write_cache_overload", json!("0")),
+                ("total_buffers_size", json!(0)),
+                ("queued_io_jobs", json!(0)),
+                ("average_time_queue", json!(0)),
+                ("total_queued_size", json!(0)),
+                ("request_latency", json!(0)),
+                ("queued_tracker_announces", json!(0)),
+                ("queueing", json!(false)),
+                ("use_alt_speed_limits", json!(false)),
+                // Gone from 2.15.0; a category name holds no `/`.
+                ("use_subcategories", json!(false)),
+                ("refresh_interval", json!(1500)),
+                ("session_state", json!(session_paused)),
+            ]
+            .map(|(key, value)| (key.to_owned(), value)),
+        );
     }
     axum::Json(json!({
         "rid": rid,
@@ -2217,4 +3257,605 @@ async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         }
     }
     failed.unwrap_or_else(ok)
+}
+
+// qBittorrent `getFreeSpaceAtPathAction`: the bytes free on the filesystem
+// holding `path`, -1 where that cannot be read.
+async fn free_space(params: &Params) -> Response {
+    if let Err(response) = require(params, &["path"]) {
+        return response;
+    }
+    let path = PathBuf::from(params.get("path").unwrap_or_default());
+    let free = tokio::task::spawn_blocking(move || probe_disk_space(&path))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map_or(-1, |space| {
+            i64::try_from(space.available_bytes).unwrap_or(i64::MAX)
+        });
+    text(StatusCode::OK, free.to_string())
+}
+
+// qBittorrent `getDirectoryContentAction`: what an absolute directory
+// holds, hidden entries left out, as paths or, with `withMetadata`, as
+// entries.
+async fn directory_content(params: &Params) -> Response {
+    if let Err(response) = require(params, &["dirPath"]) {
+        return response;
+    }
+    let dir = params.get("dirPath").unwrap_or_default();
+    if dir.is_empty() || dir.starts_with(':') || !Path::new(dir).is_absolute() {
+        return text(StatusCode::BAD_REQUEST, "Invalid directory path");
+    }
+    let dir = PathBuf::from(dir);
+    let mode = params.get("mode").unwrap_or("all").to_owned();
+    let with_metadata = params.flag("withMetadata").unwrap_or(false);
+    tokio::task::spawn_blocking(move || list_directory(&dir, &mode, with_metadata))
+        .await
+        .unwrap_or_else(internal)
+}
+
+fn list_directory(dir: &Path, mode: &str, with_metadata: bool) -> Response {
+    if !dir.is_dir() {
+        return text(StatusCode::NOT_FOUND, "Directory does not exist");
+    }
+    let (dirs, files) = match mode {
+        "all" => (true, true),
+        "dirs" => (true, false),
+        "files" => (false, true),
+        _ => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                "Invalid mode, allowed values: all, dirs, files",
+            );
+        }
+    };
+    let since_epoch = |at: std::io::Result<std::time::SystemTime>| {
+        at.ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(-1, |since| {
+                i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+            })
+    };
+    let mut listed: Vec<(String, Value)> = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        // A link is listed as what it leads to; one that leads nowhere is
+        // left out.
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        let is_dir = metadata.is_dir();
+        if !((is_dir && dirs) || (metadata.is_file() && files)) {
+            continue;
+        }
+        let value = if with_metadata {
+            let mut fields = object([
+                ("name", json!(name)),
+                ("type", json!(if is_dir { "dir" } else { "file" })),
+                ("creation_date", json!(since_epoch(metadata.created()))),
+                ("last_access_date", json!(since_epoch(metadata.accessed()))),
+                (
+                    "last_modification_date",
+                    json!(since_epoch(metadata.modified())),
+                ),
+            ]);
+            if !is_dir {
+                fields["size"] = json!(metadata.len());
+            }
+            fields
+        } else {
+            json!(entry.path().to_string_lossy())
+        };
+        listed.push((name, value));
+    }
+    listed.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let listed: Vec<Value> = listed.into_iter().map(|(_, value)| value).collect();
+    axum::Json(listed).into_response()
+}
+
+// qBittorrent `setCookiesAction`. Weaver keeps no cookies of its own, so
+// an empty jar is all a client can set.
+fn set_cookies(params: &Params) -> Response {
+    if let Err(response) = require(params, &["cookies"]) {
+        return response;
+    }
+    match serde_json::from_str::<Value>(params.get("cookies").unwrap_or_default().trim()) {
+        Err(error) => text(StatusCode::BAD_REQUEST, error.to_string()),
+        Ok(Value::Array(cookies)) if cookies.is_empty() => ok(),
+        Ok(Value::Array(_)) => unavailable("A cookie jar"),
+        Ok(_) => text(StatusCode::BAD_REQUEST, "cookies must be array"),
+    }
+}
+
+async fn interfaces() -> Result<Vec<DiscoveredInterface>, Response> {
+    tokio::task::spawn_blocking(|| SystemInterfaceSource.interfaces())
+        .await
+        .map_err(internal)?
+        .map_err(internal)
+}
+
+// qBittorrent `networkInterfaceListAction`: each interface with an address.
+async fn interface_list() -> Response {
+    match interfaces().await {
+        Ok(found) => {
+            let list: Vec<Value> = found
+                .iter()
+                .filter(|iface| !iface.addresses.is_empty())
+                .map(|iface| json!({ "name": iface.name, "value": iface.name }))
+                .collect();
+            axum::Json(list).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+// qBittorrent `networkInterfaceAddressListAction`: the addresses of the
+// interface `iface` names, of every interface where it names none.
+async fn interface_addresses(params: &Params) -> Response {
+    if let Err(response) = require(params, &["iface"]) {
+        return response;
+    }
+    let wanted = params.get("iface").unwrap_or_default();
+    match interfaces().await {
+        Ok(found) => {
+            let list: Vec<String> = found
+                .iter()
+                .filter(|iface| wanted.is_empty() || iface.name == wanted)
+                .flat_map(|iface| iface.addresses.iter())
+                .map(|address| address.address.to_string())
+                .collect();
+            axum::Json(list).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+// Move each torrent the `ids` parameter names to the folder `path` names
+// (qBittorrent `setLocationAction`, `setSavePathAction`).
+async fn set_location(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    ids: &str,
+    path: &str,
+) -> Response {
+    let Some(location) = params
+        .get(path)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+    else {
+        return text(StatusCode::BAD_REQUEST, "Save path cannot be empty");
+    };
+    let views = ctx.named(params.get(ids).unwrap_or_default()).await;
+    each_of(ctx, views, move |torrents, view| {
+        let location = location.clone();
+        async move { torrents.set_location(view.job_id, location).await }
+    })
+    .await
+}
+
+// qBittorrent `exportAction`: the torrent's metainfo as it was added. A
+// torrent added by magnet whose metadata has not come has none.
+async fn export(ctx: &TorrentFacadeContext, params: &Params) -> Response {
+    let Some(torrents) = &ctx.inner.torrents else {
+        return text(StatusCode::NOT_FOUND, "Not Found");
+    };
+    let hash = params.get("hash").unwrap_or_default();
+    let Some(view) = ctx.by_hash(hash).await else {
+        return text(StatusCode::NOT_FOUND, "Not Found");
+    };
+    let Some(metainfo) = torrents
+        .support(view.job_id)
+        .await
+        .and_then(|support| support.metainfo)
+    else {
+        return text(
+            StatusCode::CONFLICT,
+            "Unable to export torrent file. Error: the torrent has no metadata yet",
+        );
+    };
+    let name: String = view
+        .name
+        .chars()
+        .filter(|c| {
+            !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control()
+        })
+        .collect();
+    let name = if name.trim().is_empty() {
+        view.infohash.to_ascii_lowercase()
+    } else {
+        name
+    };
+    let disposition = format!("attachment; filename=\"{}.torrent\"", name.replace('"', ""));
+    let mut response = (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-bittorrent")],
+        metainfo,
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+// Save the global limits: `None` leaves one as it is, `Some(None)` lifts
+// it.
+async fn save_rates(
+    ctx: &TorrentFacadeContext,
+    download: Option<Option<u64>>,
+    upload: Option<Option<u64>>,
+) -> Response {
+    if download.is_none() && upload.is_none() {
+        return ok();
+    }
+    let inner = &ctx.inner;
+    let current = inner.config.read().await.bandwidth;
+    let bandwidth = Bandwidth {
+        download_bps: download.unwrap_or(current.download_bps),
+        upload_bps: upload.unwrap_or(current.upload_bps),
+        ..current
+    };
+    if bandwidth.validate().is_err() {
+        return text(StatusCode::BAD_REQUEST, "limit too large");
+    }
+    match inner
+        .handle
+        .save_bandwidth(&inner.db, &inner.config, bandwidth)
+        .await
+    {
+        Ok(_) => ok(),
+        Err(error) => internal(error),
+    }
+}
+
+// The articles of a feed the client is shown, as many as qBittorrent keeps
+// by default (`RSS::Session::maxArticlesPerFeed`).
+const RSS_ARTICLES: u32 = 50;
+// The refresh interval of a feed added without one.
+const RSS_REFRESH_SECS: u32 = 900;
+
+// The `rss` group (qBittorrent `RSSController`). Weaver's feeds are one
+// flat list: a feed's path is its name, and there are no folders. A feed's
+// articles are the items Weaver has seen, each already acted on, so each
+// reads as read.
+async fn rss(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
+    let required: &[&str] = match action {
+        "addFolder" | "removeItem" => &["path"],
+        "addFeed" | "setFeedURL" => &["url", "path"],
+        "setFeedRefreshInterval" => &["path", "refreshInterval"],
+        "moveItem" => &["itemPath", "destPath"],
+        "markAsRead" | "refreshItem" => &["itemPath"],
+        _ => &[],
+    };
+    if let Err(response) = require(params, required) {
+        return response;
+    }
+    let get = |name: &str| params.get(name).unwrap_or_default();
+    match action {
+        "items" => rss_items(ctx, params.flag("withData").unwrap_or(false)).await,
+        "addFolder" => unavailable("RSS folders"),
+        "addFeed" => add_feed(ctx, get("url"), get("path"), get("refreshInterval")).await,
+        "setFeedURL" => {
+            let url = get("url").trim().to_owned();
+            edit_feed(ctx, get("path"), move |feed, feeds| {
+                feed_url(&url)?;
+                if feeds
+                    .iter()
+                    .any(|other| other.id != feed.id && other.url == url)
+                {
+                    return Err(format!("RSS feed with given URL already exists: {url}."));
+                }
+                feed.url = url;
+                Ok(())
+            })
+            .await
+        }
+        "setFeedRefreshInterval" => match get("refreshInterval").trim().parse::<i64>() {
+            Ok(secs) if secs >= 0 => {
+                let secs = refresh_secs(secs);
+                ctx.api().without_result(
+                    edit_feed(ctx, get("path"), move |feed, _| {
+                        feed.poll_interval_secs = secs;
+                        Ok(())
+                    })
+                    .await,
+                )
+            }
+            _ => text(StatusCode::BAD_REQUEST, "Invalid 'refreshInterval' value"),
+        },
+        "removeItem" => remove_feed(ctx, get("path")).await,
+        "moveItem" => move_feed(ctx, get("itemPath"), get("destPath")).await,
+        "markAsRead" => ok(),
+        "refreshItem" => {
+            let path = get("itemPath");
+            if path.is_empty() {
+                ctx.inner.rss.request_background_sync();
+            } else if let Ok(Some(feed)) = feed_by_name(ctx, path).await {
+                let rss = ctx.inner.rss.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = rss.run_feed_sync(feed.id).await {
+                        tracing::warn!(%error, feed = feed.id, "RSS feed refresh failed");
+                    }
+                });
+            }
+            ok()
+        }
+        // Weaver's rules belong to one feed each and match by pattern; the
+        // client's are named and span feeds.
+        "rules" | "setRule" | "renameRule" | "cloneRule" | "removeRule" | "matchingArticles"
+        | "exportRules" | "importRules" => unavailable("The client's RSS download rules"),
+        _ => no_endpoint(ctx.api(), "rss"),
+    }
+}
+
+// A refresh interval as the client gives one: 0 is the default.
+fn refresh_secs(secs: i64) -> u32 {
+    match u32::try_from(secs) {
+        Ok(0) => RSS_REFRESH_SECS,
+        Ok(secs) => secs,
+        Err(_) => u32::MAX,
+    }
+}
+
+// A feed's url, which Weaver fetches over http or https.
+fn feed_url(url: &str) -> Result<(), String> {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(()),
+        _ => Err(format!("Invalid RSS feed URL: {url}.")),
+    }
+}
+
+// A feed's id as the client's item uid.
+fn feed_uid(id: u32) -> String {
+    format!("{{00000000-0000-0000-0000-{id:012x}}}")
+}
+
+async fn feeds(ctx: &TorrentFacadeContext) -> Result<Vec<RssFeedRow>, Response> {
+    let db = ctx.inner.db.clone();
+    match tokio::task::spawn_blocking(move || db.list_rss_feeds()).await {
+        Ok(Ok(feeds)) => Ok(feeds),
+        Ok(Err(error)) => Err(internal(error)),
+        Err(error) => Err(internal(error)),
+    }
+}
+
+async fn feed_by_name(
+    ctx: &TorrentFacadeContext,
+    name: &str,
+) -> Result<Option<RssFeedRow>, Response> {
+    Ok(feeds(ctx).await?.into_iter().find(|feed| feed.name == name))
+}
+
+// qBittorrent `itemsAction`: the root folder, each feed by its name.
+async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool) -> Response {
+    let feeds = match feeds(ctx).await {
+        Ok(feeds) => feeds,
+        Err(response) => return response,
+    };
+    let mut root = Map::new();
+    for feed in feeds {
+        let mut item = Map::new();
+        item.insert("uid".to_owned(), json!(feed_uid(feed.id)));
+        item.insert("url".to_owned(), json!(feed.url));
+        item.insert("refreshInterval".to_owned(), json!(feed.poll_interval_secs));
+        if with_data {
+            let db = ctx.inner.db.clone();
+            let id = feed.id;
+            let seen = match tokio::task::spawn_blocking(move || {
+                db.list_rss_seen_items(Some(id), Some(RSS_ARTICLES))
+            })
+            .await
+            {
+                Ok(Ok(seen)) => seen,
+                Ok(Err(error)) => return internal(error),
+                Err(error) => return internal(error),
+            };
+            let articles: Vec<Value> = seen
+                .iter()
+                .map(|article| {
+                    let date = chrono::DateTime::from_timestamp(
+                        article.published_at.unwrap_or(article.seen_at),
+                        0,
+                    )
+                    .map(|date| date.to_rfc2822())
+                    .unwrap_or_default();
+                    let url = article.item_url.clone().unwrap_or_default();
+                    json!({
+                        "id": article.item_id,
+                        "date": date,
+                        "title": article.item_title,
+                        "author": "",
+                        "description": "",
+                        "torrentURL": url,
+                        "link": url,
+                        "isRead": true,
+                    })
+                })
+                .collect();
+            item.insert("title".to_owned(), json!(feed.name));
+            item.insert("lastBuildDate".to_owned(), json!(""));
+            item.insert("isLoading".to_owned(), json!(false));
+            item.insert("hasError".to_owned(), json!(feed.last_error.is_some()));
+            item.insert("articles".to_owned(), json!(articles));
+        }
+        root.insert(feed.name, Value::Object(item));
+    }
+    axum::Json(Value::Object(root)).into_response()
+}
+
+// Change the feeds under the network runtime's lock, which a feed's route
+// is read through, and have the runtime read them again.
+async fn feeds_changed<T>(
+    ctx: &TorrentFacadeContext,
+    change: impl FnOnce(&Database) -> Result<Result<T, String>, weaver_server_core::StateError>
+    + Send
+    + 'static,
+) -> Result<T, Response>
+where
+    T: Send + 'static,
+{
+    let runtime = ctx.inner.handle.proxy_runtime();
+    let _guard = match &runtime {
+        Some(runtime) => Some(runtime.mutations.lock().await),
+        None => None,
+    };
+    let db = ctx.inner.db.clone();
+    let changed = match tokio::task::spawn_blocking(move || change(&db)).await {
+        Ok(Ok(Ok(changed))) => changed,
+        Ok(Ok(Err(refusal))) => return Err(text(StatusCode::CONFLICT, refusal)),
+        Ok(Err(error)) => return Err(internal(error)),
+        Err(error) => return Err(internal(error)),
+    };
+    if let Some(runtime) = &runtime
+        && let Err(error) = runtime.reload().await
+    {
+        tracing::warn!(%error, "network runtime did not take the RSS feed change");
+    }
+    Ok(changed)
+}
+
+// qBittorrent `addFeedAction`: a feed named by its path, else its url.
+async fn add_feed(ctx: &TorrentFacadeContext, url: &str, path: &str, every: &str) -> Response {
+    let url = url.trim().to_owned();
+    let name = if path.is_empty() {
+        url.clone()
+    } else {
+        path.to_owned()
+    };
+    if name.contains('\\') {
+        return unavailable("RSS folders");
+    }
+    let every = refresh_secs(every.trim().parse::<i64>().unwrap_or(0).max(0));
+    let added = feeds_changed(ctx, move |db| {
+        if let Err(refusal) = feed_url(&url) {
+            return Ok(Err(refusal));
+        }
+        let feeds = db.list_rss_feeds()?;
+        if feeds.iter().any(|feed| feed.url == url) {
+            return Ok(Err(format!(
+                "RSS feed with given URL already exists: {url}."
+            )));
+        }
+        if feeds.iter().any(|feed| feed.name == name) {
+            return Ok(Err(format!(
+                "RSS item with given path already exists: {name}."
+            )));
+        }
+        let row = RssFeedRow {
+            scripts: Vec::new(),
+            id: db.next_rss_feed_id()?,
+            name,
+            url,
+            enabled: true,
+            poll_interval_secs: every,
+            username: None,
+            password: None,
+            default_category: None,
+            default_metadata: Vec::new(),
+            etag: None,
+            last_modified: None,
+            last_polled_at: None,
+            last_success_at: None,
+            last_error: None,
+            consecutive_failures: 0,
+        };
+        db.insert_rss_feed_with_routing(&row, None).map(Ok)
+    })
+    .await;
+    match added {
+        Ok(()) => ok(),
+        Err(response) => response,
+    }
+}
+
+// Change the feed `path` names; the change sees every feed.
+async fn edit_feed(
+    ctx: &TorrentFacadeContext,
+    path: &str,
+    edit: impl FnOnce(&mut RssFeedRow, &[RssFeedRow]) -> Result<(), String> + Send + 'static,
+) -> Response {
+    let path = path.to_owned();
+    let edited = feeds_changed(ctx, move |db| {
+        let feeds = db.list_rss_feeds()?;
+        let Some(mut feed) = feeds.iter().find(|feed| feed.name == path).cloned() else {
+            return Ok(Err(format!("Feed doesn't exist: {path}.")));
+        };
+        if let Err(refusal) = edit(&mut feed, &feeds) {
+            return Ok(Err(refusal));
+        }
+        db.update_rss_feed_with_routing(&feed, None).map(Ok)
+    })
+    .await;
+    match edited {
+        Ok(()) => ok(),
+        Err(response) => response,
+    }
+}
+
+// qBittorrent `removeItemAction`.
+async fn remove_feed(ctx: &TorrentFacadeContext, path: &str) -> Response {
+    if path.is_empty() {
+        return text(StatusCode::CONFLICT, "Cannot delete root folder.");
+    }
+    let path = path.to_owned();
+    let removed = feeds_changed(ctx, move |db| {
+        let Some(feed) = db
+            .list_rss_feeds()?
+            .into_iter()
+            .find(|feed| feed.name == path)
+        else {
+            return Ok(Err(format!("Item doesn't exist: {path}.")));
+        };
+        db.delete_rss_feed(feed.id).map(|_| Ok(()))
+    })
+    .await;
+    match removed {
+        Ok(()) => ok(),
+        Err(response) => response,
+    }
+}
+
+// qBittorrent `moveItemAction`: with no folders, a move is a rename.
+async fn move_feed(ctx: &TorrentFacadeContext, from: &str, to: &str) -> Response {
+    if from.is_empty() {
+        return text(StatusCode::CONFLICT, "Cannot move root folder.");
+    }
+    if to.contains('\\') {
+        return unavailable("RSS folders");
+    }
+    if to.is_empty() {
+        return text(
+            StatusCode::CONFLICT,
+            format!("Incorrect RSS Item path: {to}."),
+        );
+    }
+    let (from, to) = (from.to_owned(), to.to_owned());
+    let moved = feeds_changed(ctx, move |db| {
+        let feeds = db.list_rss_feeds()?;
+        let Some(mut feed) = feeds.iter().find(|feed| feed.name == from).cloned() else {
+            return Ok(Err(format!("Item doesn't exist: {from}.")));
+        };
+        if feeds
+            .iter()
+            .any(|other| other.id != feed.id && other.name == to)
+        {
+            return Ok(Err(format!(
+                "RSS item with given path already exists: {to}."
+            )));
+        }
+        feed.name = to;
+        db.update_rss_feed_with_routing(&feed, None).map(Ok)
+    })
+    .await;
+    match moved {
+        Ok(()) => ok(),
+        Err(response) => response,
+    }
 }

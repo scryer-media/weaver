@@ -204,11 +204,11 @@ func torrentScenarios() []torrentScenario {
 		{
 			Name: "client-facade",
 			Asserts: []string{
-				"auth/login with an API key returns Ok. and a SID cookie; app/webapiVersion answers 2.11.0",
-				"torrents/add by file and by magnet answer Ok. and the torrents seed (uploading or stalledUP)",
-				"a duplicate add answers 200 Fails.; an unwanted torrent 409; a non-magnet URL 415",
-				"pause reads stoppedUP, resume reads a seeding state, delete removes it",
-				"after five bad logins the next answers 429",
+				"auth/login with an API key answers 204 and a SID cookie; app/webapiVersion answers 2.16.2",
+				"torrents/add by file and by magnet each answer success_count 1 and the torrents seed (uploading or stalledUP)",
+				"a duplicate add, an unwanted torrent and a URL that is no torrent each answer 409",
+				"stop reads stoppedUP, start reads a seeding state, delete removes it",
+				"five bad logins answer 401 Unauthorized and the next 403",
 			},
 			Run: scenarioFacade,
 		},
@@ -1198,6 +1198,17 @@ func (lane *torrentLane) addFacadeFile(client *facadeClient, fixture *torrentFix
 
 var facadeSeedingStates = []string{"uploading", "stalledUP", "forcedUP"}
 
+// facadeAddedOne reports whether a torrents/add answer counts one torrent
+// added and none failed.
+func facadeAddedOne(status int, body string) bool {
+	var counts struct {
+		Success int `json:"success_count"`
+		Failure int `json:"failure_count"`
+	}
+	return status == http.StatusOK && json.Unmarshal([]byte(body), &counts) == nil &&
+		counts.Success == 1 && counts.Failure == 0
+}
+
 func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 	var key struct {
 		CreateApiKey struct{ RawKey string } `json:"createApiKey"`
@@ -1212,7 +1223,7 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	evidence["login"] = fmt.Sprintf("%d %s", status, body)
-	if status != http.StatusOK || body != "Ok." {
+	if status != http.StatusNoContent {
 		return fmt.Errorf("login: %d %q", status, body)
 	}
 	for _, cookie := range resp.Cookies() {
@@ -1228,7 +1239,7 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	evidence["webapiVersion"] = body
-	if status != http.StatusOK || body != "2.11.0" {
+	if status != http.StatusOK || body != "2.16.2" {
 		return fmt.Errorf("webapiVersion: %d %q", status, body)
 	}
 
@@ -1238,7 +1249,7 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	evidence["add_file"] = fmt.Sprintf("%d %s", status, body)
-	if status != http.StatusOK || body != "Ok." {
+	if !facadeAddedOne(status, body) {
 		return fmt.Errorf("add by file: %d %q", status, body)
 	}
 	status, body, err = client.form("torrents/add", map[string]string{"urls": magnetFixture.Magnet})
@@ -1246,7 +1257,7 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	evidence["add_magnet"] = fmt.Sprintf("%d %s", status, body)
-	if status != http.StatusOK || body != "Ok." {
+	if !facadeAddedOne(status, body) {
 		return fmt.Errorf("add by magnet: %d %q", status, body)
 	}
 	defer func() {
@@ -1264,8 +1275,8 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	evidence["add_duplicate"] = fmt.Sprintf("%d %s", status, body)
-	if status != http.StatusOK || body != "Fails." {
-		return fmt.Errorf("duplicate add: %d %q, want 200 Fails.", status, body)
+	if status != http.StatusConflict {
+		return fmt.Errorf("duplicate add: %d %q, want 409", status, body)
 	}
 	status, body, err = lane.addFacadeFile(client, lane.fixture("facade-refused"))
 	if err != nil {
@@ -1280,23 +1291,23 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 		return err
 	}
 	evidence["add_url"] = fmt.Sprintf("%d %s", status, body)
-	if status != http.StatusUnsupportedMediaType {
-		return fmt.Errorf("non-magnet url: %d %q, want 415", status, body)
+	if status != http.StatusConflict {
+		return fmt.Errorf("non-magnet url: %d %q, want 409", status, body)
 	}
 
 	hash := fileFixture.Infohash
-	if status, body, err = client.form("torrents/pause", map[string]string{"hashes": hash}); err != nil || status != http.StatusOK {
-		return fmt.Errorf("pause: %d %q %v", status, body, err)
+	if status, body, err = client.form("torrents/stop", map[string]string{"hashes": hash}); err != nil || status != http.StatusOK {
+		return fmt.Errorf("stop: %d %q %v", status, body, err)
 	}
-	if state, err := client.waitState(hash, "facade pause", "stoppedUP"); err != nil {
+	if state, err := client.waitState(hash, "facade stop", "stoppedUP"); err != nil {
 		return err
 	} else {
 		evidence["paused_state"] = state
 	}
-	if status, body, err = client.form("torrents/resume", map[string]string{"hashes": hash}); err != nil || status != http.StatusOK {
-		return fmt.Errorf("resume: %d %q %v", status, body, err)
+	if status, body, err = client.form("torrents/start", map[string]string{"hashes": hash}); err != nil || status != http.StatusOK {
+		return fmt.Errorf("start: %d %q %v", status, body, err)
 	}
-	if state, err := client.waitState(hash, "facade resume", facadeSeedingStates...); err != nil {
+	if state, err := client.waitState(hash, "facade start", facadeSeedingStates...); err != nil {
 		return err
 	} else {
 		evidence["resumed_state"] = state
@@ -1323,12 +1334,12 @@ func scenarioFacade(lane *torrentLane, evidence map[string]any) error {
 	}
 	evidence["bad_logins"] = answers
 	for index, answer := range answers[:5] {
-		if answer != "200 Fails." {
-			return fmt.Errorf("bad login %d: %s, want 200 Fails.", index+1, answer)
+		if answer != "401 Unauthorized" {
+			return fmt.Errorf("bad login %d: %s, want 401 Unauthorized", index+1, answer)
 		}
 	}
-	if !strings.HasPrefix(answers[5], "429") {
-		return fmt.Errorf("sixth bad login: %s, want 429", answers[5])
+	if !strings.HasPrefix(answers[5], "403") {
+		return fmt.Errorf("sixth bad login: %s, want 403", answers[5])
 	}
 	return nil
 }
@@ -1428,7 +1439,7 @@ func (lane *torrentLane) facadeLogin(keyName string) (*facadeClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	if status != http.StatusOK || body != "Ok." {
+	if status != http.StatusNoContent {
 		return nil, fmt.Errorf("facade login: %d %q", status, body)
 	}
 	for _, cookie := range resp.Cookies() {

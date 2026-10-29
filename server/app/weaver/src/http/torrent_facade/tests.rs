@@ -156,7 +156,26 @@ async fn rig_from(
     security: RuntimeSecurityConfig,
     handle: SchedulerHandle,
 ) -> Rig {
-    rig_on(torrents_on, security, handle, Offline::default()).await
+    rig_on(
+        torrents_on,
+        security,
+        handle,
+        Offline::default(),
+        Api::LATEST,
+    )
+    .await
+}
+
+// A rig that answers as the client of `api`.
+async fn rig_as(api: Api) -> Rig {
+    rig_on(
+        true,
+        RuntimeSecurityConfig::default(),
+        scheduler(),
+        Offline::default(),
+        api,
+    )
+    .await
 }
 
 async fn rig_on(
@@ -164,6 +183,7 @@ async fn rig_on(
     security: RuntimeSecurityConfig,
     handle: SchedulerHandle,
     routes: Offline,
+    api: Api,
 ) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory().unwrap();
@@ -211,8 +231,10 @@ async fn rig_on(
         keys.clone(),
         super::super::SessionToken(Arc::new("browser-session-token".to_owned())),
         security,
-        WatchFolderService::new(db.clone(), handle, config.clone()),
+        WatchFolderService::new(db.clone(), handle.clone(), config.clone()),
         torrents,
+        RssService::new(handle, config.clone(), db.clone()),
+        api,
     );
     Rig {
         app: build_torrent_facade_routes(context.clone())
@@ -458,9 +480,17 @@ fn a_trackers_status_reads_as_the_clients_number() {
         TrackerStatus::Unreachable,
     ]
     .into_iter()
-    .map(|status| tracker_json(&tracker(status), CallerScope::Admin)["status"].clone())
+    .map(|status| tracker_json(&tracker(status), CallerScope::Admin, Api::LATEST)["status"].clone())
     .collect();
     assert_eq!(numbers, [0, 1, 2, 4, 5, 6]);
+    // Before 5.2 a failed tracker is only not working.
+    let numbers: Vec<Value> = [TrackerStatus::TrackerError, TrackerStatus::Unreachable]
+        .into_iter()
+        .map(|status| {
+            tracker_json(&tracker(status), CallerScope::Admin, Api::V5_1)["status"].clone()
+        })
+        .collect();
+    assert_eq!(numbers, [4, 4]);
 
     let working = tracker_json(
         &TorrentTracker {
@@ -475,6 +505,7 @@ fn a_trackers_status_reads_as_the_clients_number() {
             ..tracker(TrackerStatus::Working)
         },
         CallerScope::Admin,
+        Api::LATEST,
     );
     assert_eq!(
         working,
@@ -501,6 +532,7 @@ fn a_trackers_status_reads_as_the_clients_number() {
             ..tracker(TrackerStatus::NotWorking)
         },
         CallerScope::Admin,
+        Api::LATEST,
     );
     assert_eq!(
         (
@@ -522,6 +554,7 @@ fn a_trackers_status_reads_as_the_clients_number() {
             ..tracker(TrackerStatus::Working)
         },
         CallerScope::Admin,
+        Api::LATEST,
     );
     assert_eq!(added["source"], "OPERATOR");
 }
@@ -626,7 +659,7 @@ fn file(index: u32, path: &str) -> TorrentFile {
 
 #[test]
 fn content_path_is_the_output_and_save_path_holds_it() {
-    let info = info(&view(TorrentState::Downloading));
+    let info = info(&view(TorrentState::Downloading), CallerScope::Admin);
     assert_eq!(info["content_path"], "/complete/tv/a");
     assert_eq!(info["save_path"], "/complete/tv");
     assert_eq!(info["hash"], "ab".repeat(20));
@@ -643,7 +676,7 @@ fn a_one_file_torrent_reads_as_its_file_and_a_folder_as_its_folder() {
         files: vec![file(0, "a.mkv")],
         ..view(TorrentState::Seeding)
     };
-    let info_one = info(&one);
+    let info_one = info(&one, CallerScope::Admin);
     assert_eq!(info_one["content_path"], "/complete/tv/a/a.mkv");
     assert_eq!(info_one["save_path"], "/complete/tv/a");
 
@@ -658,7 +691,7 @@ fn a_one_file_torrent_reads_as_its_file_and_a_folder_as_its_folder() {
             files,
             ..view(TorrentState::Seeding)
         };
-        let info = info(&folder);
+        let info = info(&folder, CallerScope::Admin);
         assert_eq!(info["content_path"], "/complete/tv/Folder");
         assert_eq!(info["save_path"], "/complete/tv");
     }
@@ -672,7 +705,7 @@ fn a_magnet_name_shapes_no_path_before_weaver_places_it() {
         storage_dir: None,
         ..view(TorrentState::FetchingMetadata)
     };
-    let info = info(&magnet);
+    let info = info(&magnet, CallerScope::Admin);
     assert_eq!(info["content_path"], "");
     assert_eq!(info["save_path"], "");
     assert_eq!(info["name"], "../../x");
@@ -685,26 +718,99 @@ fn share_limits_report_the_policy_in_force_and_where_it_comes_from() {
         seed_time_goal_minutes: Some(60),
         ..SeedingPolicy::default()
     };
-    let global = info(&TorrentView {
-        seeding_policy: policy,
-        ..view(TorrentState::Seeding)
-    });
+    let global = info(
+        &TorrentView {
+            seeding_policy: policy,
+            ..view(TorrentState::Seeding)
+        },
+        CallerScope::Admin,
+    );
     assert_eq!(global["ratio_limit"], -2);
     assert_eq!(global["seeding_time_limit"], -2);
     assert_eq!(global["max_ratio"], 2.0);
     assert_eq!(global["max_seeding_time"], 60);
     assert_eq!(global["max_inactive_seeding_time"], -1);
-    let own = info(&TorrentView {
-        seeding_policy: policy,
-        seeding_source: SeedingSource::Category,
-        ..view(TorrentState::Seeding)
-    });
+    let own = info(
+        &TorrentView {
+            seeding_policy: policy,
+            seeding_source: SeedingSource::Category,
+            ..view(TorrentState::Seeding)
+        },
+        CallerScope::Admin,
+    );
     assert_eq!(own["ratio_limit"], 2.0);
     assert_eq!(own["seeding_time_limit"], 60);
     assert_eq!(own["inactive_seeding_time_limit"], -1);
-    // No counter for these is kept, so they are not claimed.
-    assert!(own.get("seeding_time").is_none());
-    assert!(own.get("last_activity").is_none());
+    // Not yet complete: no time seeding, and last active when added.
+    assert_eq!(own["seeding_time"], 0);
+    assert_eq!(own["last_activity"], 1_700_000_000);
+}
+
+// `tracker` names the tracker that last answered, else the first one
+// listed, else nothing; a caller that only reads gets it redacted.
+#[test]
+fn the_current_tracker_is_the_one_that_last_answered() {
+    let tracker = |url: &str, status: TrackerStatus, last: Option<i64>| TorrentTracker {
+        tier: 0,
+        url: url.into(),
+        named_by: weaver_server_core::torrents::NamedBy::Torrent,
+        status,
+        updating: false,
+        last_announce_ms: last,
+        next_announce_ms: None,
+        min_announce_ms: None,
+        message: None,
+        seeders: None,
+        leechers: None,
+        downloaded: None,
+        peers: None,
+        fails: 0,
+        resolved_by: None,
+    };
+    let current = |trackers: Vec<TorrentTracker>, scope| {
+        info(
+            &TorrentView {
+                trackers,
+                ..view(TorrentState::Seeding)
+            },
+            scope,
+        )["tracker"]
+            .clone()
+    };
+    let (a, b, c) = (
+        "http://a.invalid/announce?pk=1",
+        "http://b.invalid/pk/announce",
+        "http://c.invalid/announce",
+    );
+    assert_eq!(
+        current(
+            vec![
+                tracker(a, TrackerStatus::Working, Some(1_000)),
+                tracker(b, TrackerStatus::Working, Some(2_000)),
+                tracker(c, TrackerStatus::NotWorking, Some(3_000)),
+            ],
+            CallerScope::Admin,
+        ),
+        b
+    );
+    assert_eq!(
+        current(
+            vec![
+                tracker(a, TrackerStatus::NotContacted, None),
+                tracker(c, TrackerStatus::TrackerError, Some(3_000)),
+            ],
+            CallerScope::Admin,
+        ),
+        a
+    );
+    assert_eq!(current(Vec::new(), CallerScope::Admin), "");
+    assert_eq!(
+        current(
+            vec![tracker(b, TrackerStatus::Working, Some(2_000))],
+            CallerScope::Read,
+        ),
+        "http://b.invalid:80/…"
+    );
 }
 
 #[tokio::test]
@@ -734,12 +840,15 @@ async fn login_issues_a_cookie_that_logout_ends() {
     let failed = rig.send(login("wrong")).await;
     assert_eq!(
         (failed.status, failed.body.as_str()),
-        (StatusCode::OK, "Fails.")
+        (StatusCode::UNAUTHORIZED, "Unauthorized")
     );
     assert!(failed.cookie.is_none());
 
     let signed_in = rig.send(login(ADMIN)).await;
-    assert_eq!(signed_in.body, "Ok.");
+    assert_eq!(
+        (signed_in.status, signed_in.body.as_str()),
+        (StatusCode::NO_CONTENT, "")
+    );
     let cookie = signed_in.cookie.unwrap();
     let sid = cookie.split(';').next().unwrap().to_owned();
     assert!(sid.starts_with("SID="));
@@ -753,7 +862,7 @@ async fn login_issues_a_cookie_that_logout_ends() {
     let version = rig.send(with_cookie("/api/v2/app/webapiVersion")).await;
     assert_eq!(
         (version.status, version.body.as_str()),
-        (StatusCode::OK, WEBAPI_VERSION)
+        (StatusCode::OK, Api::LATEST.version().as_str())
     );
     let app = rig.send(with_cookie("/api/v2/app/version")).await;
     assert_eq!(app.body, format!("v{}", env!("CARGO_PKG_VERSION")));
@@ -784,17 +893,19 @@ async fn repeated_failed_logins_from_one_client_are_throttled() {
         let failed = rig.send(login_from(client, "any", "wrong")).await;
         assert_eq!(
             (failed.status, failed.body.as_str()),
-            (StatusCode::OK, "Fails.")
+            (StatusCode::UNAUTHORIZED, "Unauthorized")
         );
     }
 
     // Throttled before the key is checked: even the right key is refused,
-    // with the status and body the first-party login answers.
+    // as qBittorrent refuses a banned address.
     let throttled = rig.send(login_from(client, "any", ADMIN)).await;
-    assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
-        throttled.json(),
-        serde_json::json!({ "error": "too many login attempts" })
+        (throttled.status, throttled.body.as_str()),
+        (
+            StatusCode::FORBIDDEN,
+            "Your IP address has been banned after too many failed authentication attempts."
+        )
     );
     assert!(throttled.cookie.is_none());
 
@@ -802,7 +913,7 @@ async fn repeated_failed_logins_from_one_client_are_throttled() {
     let other = rig
         .send(login_from([198, 51, 100, 8], "other", ADMIN))
         .await;
-    assert_eq!(other.body, "Ok.");
+    assert_eq!(other.status, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
@@ -812,24 +923,42 @@ async fn a_successful_login_clears_the_failures_counted_against_it() {
     let below_limit = super::super::auth::LOGIN_MAX_FAILURES - 1;
     for _ in 0..below_limit {
         assert_eq!(
-            rig.send(login_from(client, "any", "wrong")).await.body,
-            "Fails."
+            rig.send(login_from(client, "any", "wrong")).await.status,
+            StatusCode::UNAUTHORIZED
         );
     }
-    assert_eq!(rig.send(login_from(client, "any", ADMIN)).await.body, "Ok.");
+    assert_eq!(
+        rig.send(login_from(client, "any", ADMIN)).await.status,
+        StatusCode::NO_CONTENT
+    );
 
     // Had the success not cleared the count, these would reach the limit.
     for _ in 0..below_limit {
         assert_eq!(
-            rig.send(login_from(client, "any", "wrong")).await.body,
-            "Fails."
+            rig.send(login_from(client, "any", "wrong")).await.status,
+            StatusCode::UNAUTHORIZED
         );
     }
     let signed_in = rig.send(login_from(client, "any", ADMIN)).await;
+    assert_eq!(signed_in.status, StatusCode::NO_CONTENT);
+    assert!(signed_in.cookie.is_some());
+}
+
+// Before 2.14 a login answers 200 either way, its body saying which.
+#[tokio::test]
+async fn a_login_answers_in_its_body_before_5_2() {
+    let rig = rig_as(Api::V5_1).await;
+    let failed = rig.send(login_from([203, 0, 113, 9], "any", "wrong")).await;
+    assert_eq!(
+        (failed.status, failed.body.as_str()),
+        (StatusCode::OK, "Fails.")
+    );
+    let signed_in = rig.send(login_from([203, 0, 113, 9], "any", ADMIN)).await;
     assert_eq!(
         (signed_in.status, signed_in.body.as_str()),
         (StatusCode::OK, "Ok.")
     );
+    assert!(signed_in.cookie.is_some());
 }
 
 #[tokio::test]
@@ -846,16 +975,33 @@ async fn basic_auth_carries_the_key_and_a_read_key_cannot_change_anything() {
         .await;
     assert_eq!((read.status, read.body.as_str()), (StatusCode::OK, "[]"));
     let refused = rig
-        .post_as("/api/v2/torrents/pause", "hashes=all", READER)
+        .post_as("/api/v2/torrents/stop", "hashes=all", READER)
         .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    // 5.x has no `pause`: a signed-in client is told it does not exist.
+    let gone = rig
+        .post_as("/api/v2/torrents/pause", "hashes=all", READER)
+        .await;
+    assert_eq!(
+        (gone.status, gone.body.as_str()),
+        (StatusCode::NOT_FOUND, "Endpoint does not exist")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_added_torrent_is_listed_with_its_paths_and_state() {
     let rig = rig().await;
     let added = rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
-    assert_eq!((added.status, added.body.as_str()), (StatusCode::OK, "Ok."));
+    assert_eq!(added.status, StatusCode::OK);
+    let counts = added.json();
+    assert_eq!(
+        (
+            &counts["success_count"],
+            &counts["failure_count"],
+            &counts["pending_count"]
+        ),
+        (&json!(1), &json!(0), &json!(0))
+    );
 
     let torrents = rig.torrents().await;
     assert_eq!(torrents.len(), 1);
@@ -905,7 +1051,8 @@ async fn an_added_torrent_is_listed_with_its_paths_and_state() {
             &properties["dl_speed_avg"],
             &properties["up_speed_avg"],
         ],
-        [&json!(0), &json!(0), &json!(-1), &json!(0), &json!(0)]
+        // No time active, so no average (qBittorrent `propertiesAction`).
+        [&json!(0), &json!(0), &json!(-1), &json!(-1), &json!(-1)]
     );
     assert_eq!(
         properties["nb_connections_limit"],
@@ -973,6 +1120,7 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
             stream_only: Some(TorrentScope::TrackerRule(1)),
             ..Default::default()
         },
+        Api::LATEST,
     )
     .await;
     let torrents = rig.context.inner.torrents.as_ref().unwrap();
@@ -1087,6 +1235,7 @@ async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
             up: true,
             ..Default::default()
         },
+        Api::LATEST,
     )
     .await;
 
@@ -1097,7 +1246,8 @@ async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
             &format!("urls={url}&cookie=uid%3D1%3B%20pass%3D2"),
         )
         .await;
-    assert_eq!((added.status, added.body.as_str()), (StatusCode::OK, "Ok."));
+    assert_eq!(added.status, StatusCode::OK);
+    assert_eq!(added.json()["success_count"], 1);
     let requests = server.await.unwrap();
     assert!(
         requests[0].contains("cookie: uid=1; pass=2"),
@@ -1113,9 +1263,11 @@ async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
     let refused = rig
         .post("/api/v2/torrents/add", &format!("urls={url}"))
         .await;
-    assert_eq!(
-        (refused.status, refused.body.as_str()),
-        (StatusCode::UNSUPPORTED_MEDIA_TYPE, "not a torrent")
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert!(
+        refused.body.ends_with("is not a torrent"),
+        "{}",
+        refused.body
     );
     let requests = server.await.unwrap();
     assert!(!requests[0].contains("cookie:"), "{requests:?}");
@@ -1130,12 +1282,10 @@ async fn a_url_is_fetched_with_the_cookie_and_read_for_what_it_is() {
 async fn a_duplicate_fails_and_a_refusal_conflicts() {
     let rig = rig().await;
     let bytes = metainfo("one.mkv", 3000, false);
-    assert_eq!(rig.add_file(&bytes, &[]).await.body, "Ok.");
+    assert_eq!(rig.add_file(&bytes, &[]).await.json()["success_count"], 1);
+    // A torrent already added is a failure, and none added conflicts.
     let again = rig.add_file(&bytes, &[]).await;
-    assert_eq!(
-        (again.status, again.body.as_str()),
-        (StatusCode::OK, "Fails.")
-    );
+    assert_eq!(again.status, StatusCode::CONFLICT);
 
     rig.db
         .save_post_processing_settings(&PostProcessingSettings {
@@ -1184,10 +1334,10 @@ async fn stop_start_and_force_change_the_state() {
         StatusCode::OK
     );
     assert_ne!(rig.torrents().await[0]["state"], "stoppedDL");
-    rig.post("/api/v2/torrents/pause", &format!("hashes={hash}"))
+    rig.post("/api/v2/torrents/stop", &format!("hashes={hash}"))
         .await;
     assert_eq!(rig.torrents().await[0]["state"], "stoppedDL");
-    rig.post("/api/v2/torrents/resume", &format!("hashes={hash}"))
+    rig.post("/api/v2/torrents/start", &format!("hashes={hash}"))
         .await;
     rig.post(
         "/api/v2/torrents/setForceStart",
@@ -1271,25 +1421,30 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
     };
     let one = named(&rig.torrents().await, "one.mkv", "hash");
 
-    // A pause of one hash is that torrent's own and sets no hold.
+    // A stop of one hash is that torrent's own and sets no hold.
     send(
-        "/api/v2/torrents/pause",
+        "/api/v2/torrents/stop",
         format!("hashes={one}"),
         (true, false),
     )
     .await;
     assert!(!held());
 
-    for (pause, resume) in [
-        ("/api/v2/torrents/pause", "/api/v2/torrents/resume"),
-        ("/api/v2/torrents/stop", "/api/v2/torrents/start"),
-    ] {
-        send(pause, "hashes=all".to_owned(), (true, true)).await;
-        assert!(held());
-        // The torrent paused on its own stays paused once the hold lifts.
-        send(resume, "hashes=all".to_owned(), (true, false)).await;
-        assert!(!held());
-    }
+    send(
+        "/api/v2/torrents/stop",
+        "hashes=all".to_owned(),
+        (true, true),
+    )
+    .await;
+    assert!(held());
+    // The torrent stopped on its own stays stopped once the hold lifts.
+    send(
+        "/api/v2/torrents/start",
+        "hashes=all".to_owned(),
+        (true, false),
+    )
+    .await;
+    assert!(!held());
     let two = named(&rig.torrents().await, "two.mkv", "hash");
     for (hash, intent) in [
         (
@@ -1323,7 +1478,7 @@ async fn a_private_torrent_short_of_its_goal_needs_confirmation_to_delete() {
     let removed = rig
         .post(
             "/api/v2/torrents/delete",
-            &format!("hashes={hash}&confirmUnmetGoal=true"),
+            &format!("hashes={hash}&deleteFiles=false&confirmUnmetGoal=true"),
         )
         .await;
     assert_eq!(removed.status, StatusCode::OK);
@@ -1346,7 +1501,10 @@ async fn categories_are_created_listed_and_assigned() {
     let invalid = rig
         .post("/api/v2/torrents/createCategory", "category=a/b")
         .await;
-    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        (invalid.status, invalid.body.as_str()),
+        (StatusCode::CONFLICT, "Incorrect category name")
+    );
 
     let categories = rig.get("/api/v2/torrents/categories").await.json();
     let complete = rig.config.read().await.complete_dir();
@@ -1634,9 +1792,7 @@ async fn without_a_torrent_client_the_lists_are_empty_and_adds_conflict() {
     let added = rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
     assert_eq!(added.status, StatusCode::CONFLICT);
     assert_eq!(
-        rig.post("/api/v2/torrents/pause", "hashes=all")
-            .await
-            .status,
+        rig.post("/api/v2/torrents/stop", "hashes=all").await.status,
         StatusCode::OK
     );
 }
@@ -1757,7 +1913,7 @@ async fn share_limits_are_set_on_add_and_after() {
     // No goal where none is inherited.
     rig.post(
         "/api/v2/torrents/setShareLimits",
-        &limits("ratioLimit=-1&seedingTimeLimit=30"),
+        &limits("ratioLimit=-1&seedingTimeLimit=30&inactiveSeedingTimeLimit=-2"),
     )
     .await;
     let torrent = &rig.torrents().await[0];
@@ -1778,11 +1934,17 @@ async fn share_limits_are_set_on_add_and_after() {
         .set_settings(settings)
         .await;
     let refused = rig
-        .post("/api/v2/torrents/setShareLimits", &limits("ratioLimit=-1"))
+        .post(
+            "/api/v2/torrents/setShareLimits",
+            &limits("ratioLimit=-1&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2"),
+        )
         .await;
     assert_eq!(refused.status, StatusCode::CONFLICT);
     let invalid = rig
-        .post("/api/v2/torrents/setShareLimits", &limits("ratioLimit=-3"))
+        .post(
+            "/api/v2/torrents/setShareLimits",
+            &limits("ratioLimit=-3&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2"),
+        )
         .await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
 }
@@ -1980,7 +2142,7 @@ async fn the_stub_endpoints_answer_and_a_url_must_be_a_magnet() {
     let top = rig.post("/api/v2/torrents/topPrio", "hashes=all").await;
     assert_eq!(
         (top.status, top.body.as_str()),
-        (StatusCode::CONFLICT, "queueing is off")
+        (StatusCode::CONFLICT, "Torrent queueing must be enabled")
     );
     for action in ["addTags", "removeTags"] {
         let reply = rig
@@ -2219,12 +2381,6 @@ async fn file_levels_and_picking_toggles_are_set_and_reported() {
     };
     let picking = async || {
         let info = rig.torrents().await[0].clone();
-        let properties = rig
-            .get(&format!("/api/v2/torrents/properties?hash={hash}"))
-            .await
-            .json();
-        assert_eq!(info["seq_dl"], properties["seq_dl"]);
-        assert_eq!(info["f_l_piece_prio"], properties["f_l_piece_prio"]);
         (info["seq_dl"].clone(), info["f_l_piece_prio"].clone())
     };
     assert_eq!(level().await, 1);
@@ -2342,7 +2498,7 @@ async fn trackers_are_added_edited_removed_and_reannounced() {
             ),
         )
         .await;
-    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
     let private = "This torrent is private".to_owned();
     let row = |tier: i64, url: &str| (tier, url.to_owned(), 1, String::new());
     assert_eq!(
@@ -2398,7 +2554,7 @@ async fn trackers_are_added_edited_removed_and_reannounced() {
         url_encode("http://d.invalid/announce")
     ))
     .await;
-    assert_eq!(moved.status, StatusCode::OK);
+    assert_eq!(moved.status, StatusCode::NO_CONTENT);
     assert_eq!(
         listed().await[3..],
         [row(0, b), row(1, c), row(3, "http://d.invalid/announce")]
@@ -2414,7 +2570,7 @@ async fn trackers_are_added_edited_removed_and_reannounced() {
             ),
         )
         .await;
-    assert_eq!(removed.status, StatusCode::OK);
+    assert_eq!(removed.status, StatusCode::NO_CONTENT);
     assert_eq!(listed().await[3..], [row(3, "http://d.invalid/announce")]);
 
     for form in [
@@ -2454,7 +2610,7 @@ async fn a_read_key_sees_no_trackers_passkey() {
             &format!("hash={hash}&urls={}", url_encode(PRIVATE)),
         )
         .await;
-    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
     let urls = |key: &'static str| {
         let (rig, hash) = (&rig, &hash);
         async move {
@@ -2499,7 +2655,7 @@ async fn a_cookie_changes_nothing_from_another_origin() {
         async move { rig.send(request).await.status }
     };
     let by_cookie = || (header::COOKIE.as_str(), sid.clone());
-    let pause = "/api/v2/torrents/pause?hashes=all";
+    let pause = "/api/v2/torrents/stop?hashes=all";
     let read = "/api/v2/torrents/info";
     let cases: [(&str, &[(&str, &str)], StatusCode); 9] = [
         (
@@ -2567,4 +2723,213 @@ async fn a_cookie_changes_nothing_from_another_origin() {
         StatusCode::OK
     );
     assert_eq!(send(read, by_cookie(), &[]).await, StatusCode::FORBIDDEN);
+}
+
+// Each 5.x line answers as its own client where a later API changed the
+// answer: a no-result action's status, an add's body, an unknown action's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_release_line_answers_as_its_client() {
+    for (api, version, counts, no_result, unknown) in [
+        (Api::V5_0, "2.11.2", false, StatusCode::OK, "Not Found"),
+        (Api::V5_1, "2.11.4", false, StatusCode::OK, "Not Found"),
+        (
+            Api::V5_2,
+            "2.15.1",
+            true,
+            StatusCode::NO_CONTENT,
+            "Endpoint does not exist",
+        ),
+        (
+            Api::V5_3,
+            "2.16.2",
+            true,
+            StatusCode::NO_CONTENT,
+            "Endpoint does not exist",
+        ),
+    ] {
+        let rig = rig_as(api).await;
+        assert_eq!(rig.get("/api/v2/app/webapiVersion").await.body, version);
+
+        let bytes = metainfo("one.mkv", 3000, false);
+        let added = rig.add_file(&bytes, &[]).await;
+        let again = rig.add_file(&bytes, &[]).await;
+        if counts {
+            assert_eq!(added.json()["success_count"], 1, "{version}");
+            assert_eq!(again.status, StatusCode::CONFLICT, "{version}");
+        } else {
+            assert_eq!(
+                [
+                    (added.status, added.body.as_str()),
+                    (again.status, again.body.as_str())
+                ],
+                [(StatusCode::OK, "Ok."), (StatusCode::OK, "Fails.")],
+                "{version}"
+            );
+        }
+
+        let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+        let tracker = rig
+            .post(
+                "/api/v2/torrents/addTrackers",
+                &format!(
+                    "hash={hash}&urls={}",
+                    url_encode("http://a.invalid/announce")
+                ),
+            )
+            .await;
+        assert_eq!(tracker.status, no_result, "{version}");
+
+        let missing = rig.get("/api/v2/torrents/nope").await;
+        assert_eq!(
+            (missing.status, missing.body.as_str()),
+            (StatusCode::NOT_FOUND, unknown),
+            "{version}"
+        );
+    }
+}
+
+// `sync/maindata` carries each torrent's announce flags and the session's
+// state, which follows the hold over every torrent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maindata_carries_the_announce_flags_and_the_session_state() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let data = rig.get("/api/v2/sync/maindata").await.json();
+    let torrent = data["torrents"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    for key in [
+        "has_tracker_warning",
+        "has_tracker_error",
+        "has_other_announce_error",
+    ] {
+        assert_eq!(torrent[key], false, "{key}");
+    }
+    let state = &data["server_state"];
+    assert_eq!(state["session_state"], false);
+    assert_eq!(state["global_ratio"], "-");
+    assert_eq!(state["alltime_ul"], 0);
+    assert_eq!(state["last_external_address_v4"], "");
+    assert_eq!(state["use_subcategories"], false);
+    assert!(state["free_space_on_disk"].is_i64());
+
+    let paused = rig.post("/api/v2/transfer/pauseSession", "").await;
+    assert_eq!(paused.status, StatusCode::NO_CONTENT);
+    let data = rig.get("/api/v2/sync/maindata").await.json();
+    assert_eq!(data["server_state"]["session_state"], true);
+}
+
+// Weaver's feeds read as the client's: flat, each at the path of its name.
+#[tokio::test]
+async fn rss_feeds_are_added_listed_renamed_and_removed() {
+    let rig = rig().await;
+    let url = "http://feeds.invalid/a.xml";
+    let add = |path: &'static str| {
+        let rig = &rig;
+        async move {
+            rig.post(
+                "/api/v2/rss/addFeed",
+                &format!("url={}&path={path}", url_encode(url)),
+            )
+            .await
+        }
+    };
+    assert_eq!(add("one").await.status, StatusCode::OK);
+    let again = add("two").await;
+    assert_eq!(
+        (again.status, again.body.as_str()),
+        (
+            StatusCode::CONFLICT,
+            "RSS feed with given URL already exists: http://feeds.invalid/a.xml."
+        )
+    );
+    let nested = rig
+        .post(
+            "/api/v2/rss/addFeed",
+            &format!(
+                "url={}&path=a%5Cb",
+                url_encode("http://feeds.invalid/b.xml")
+            ),
+        )
+        .await;
+    assert_eq!(
+        (nested.status, nested.body.as_str()),
+        (
+            StatusCode::CONFLICT,
+            "RSS folders is not available in Weaver"
+        )
+    );
+
+    let items = rig.get("/api/v2/rss/items").await.json();
+    assert_eq!(
+        items,
+        json!({ "one": {
+            "uid": "{00000000-0000-0000-0000-000000000001}",
+            "url": url,
+            "refreshInterval": 900,
+        }})
+    );
+    let every = rig
+        .post(
+            "/api/v2/rss/setFeedRefreshInterval",
+            "path=one&refreshInterval=60",
+        )
+        .await;
+    assert_eq!(every.status, StatusCode::NO_CONTENT);
+
+    let moved = rig
+        .post("/api/v2/rss/moveItem", "itemPath=one&destPath=renamed")
+        .await;
+    assert_eq!(moved.status, StatusCode::OK);
+    let items = rig.get("/api/v2/rss/items?withData=true").await.json();
+    assert_eq!(items["renamed"]["refreshInterval"], 60);
+    assert_eq!(items["renamed"]["title"], "renamed");
+    assert_eq!(items["renamed"]["articles"], json!([]));
+
+    let root = rig.post("/api/v2/rss/removeItem", "path=").await;
+    assert_eq!(
+        (root.status, root.body.as_str()),
+        (StatusCode::CONFLICT, "Cannot delete root folder.")
+    );
+    let removed = rig.post("/api/v2/rss/removeItem", "path=renamed").await;
+    assert_eq!(removed.status, StatusCode::OK);
+    assert_eq!(rig.get("/api/v2/rss/items").await.json(), json!({}));
+}
+
+// A category's save path and share limits are set where it is created and
+// edited, and read back as the client reads them.
+#[tokio::test]
+async fn a_categorys_options_are_set_and_read_back() {
+    let rig = rig().await;
+    let created = rig
+        .post(
+            "/api/v2/torrents/createCategory",
+            "category=tv&savePath=%2Fmedia%2Ftv&ratioLimit=2&shareLimitAction=Stop",
+        )
+        .await;
+    assert_eq!(created.status, StatusCode::OK);
+    let tv = &rig.get("/api/v2/torrents/categories").await.json()["tv"];
+    assert_eq!(tv["savePath"], "/media/tv");
+    assert_eq!(tv["ratio_limit"], 2.0);
+    assert_eq!(tv["seeding_time_limit"], -2);
+    assert_eq!(tv["share_limit_action"], "Stop");
+
+    let edited = rig
+        .post("/api/v2/torrents/editCategory", "category=tv&ratioLimit=-2")
+        .await;
+    assert_eq!(edited.status, StatusCode::OK);
+    let tv = &rig.get("/api/v2/torrents/categories").await.json()["tv"];
+    assert_eq!(tv["ratio_limit"], -2);
+    assert_eq!(tv["savePath"], "/media/tv");
+
+    let missing = rig
+        .post("/api/v2/torrents/editCategory", "category=film")
+        .await;
+    assert_eq!(
+        (missing.status, missing.body.as_str()),
+        (StatusCode::NOT_FOUND, "Category does not exist")
+    );
 }
