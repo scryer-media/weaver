@@ -1334,9 +1334,9 @@ impl NamespaceWriter {
         if let Some(leaf) = self
             .files
             .get_mut(&node)
-            .and_then(|files| files.leaves.get_mut(&member))
+            .and_then(|files| files.leaves.remove(&member))
         {
-            leaf.truncate()?;
+            self.discard(leaf)?;
         }
         self.caps.forget(tree, node, member);
         Ok(())

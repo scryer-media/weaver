@@ -1394,8 +1394,10 @@ fn a_deleted_output_does_not_hide_the_surviving_committed_envelope() {
     );
 }
 
+// A retracted member has no file: what comes back is written anew, under
+// the name it keeps.
 #[test]
-fn a_retraction_truncates_the_leaf_and_keeps_its_name_for_what_comes_back() {
+fn a_retraction_discards_the_leaf_and_keeps_its_name_for_what_comes_back() {
     let mut job = Job::new(PLENTY);
     let (member, child) = bound_store(&mut job);
     job.send(member, 12, b"RETRACT", Provenance::Fresh);
@@ -1403,7 +1405,7 @@ fn a_retraction_truncates_the_leaf_and_keeps_its_name_for_what_comes_back() {
         node: child,
         member: MemberId(0),
     }));
-    assert_eq!(job.file("inner.bin"), b"");
+    assert!(!job.dir.path().join("inner.bin").exists());
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
     assert_eq!(inner.output_name, "inner.bin");
     assert_eq!(inner.coverage.bytes_covered(), 0);
