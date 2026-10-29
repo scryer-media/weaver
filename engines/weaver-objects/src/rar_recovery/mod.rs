@@ -211,6 +211,13 @@ impl RarRecovery {
             .collect()
     }
 
+    // Whether the set's header states each volume's size: a RAR5 table
+    // does, and a RAR3 footer gives only the width the volumes share, which
+    // says nothing of a volume that reached less.
+    fn states_sizes(&self) -> bool {
+        self.header().is_some_and(|header| header.last_described)
+    }
+
     // Every data volume of the set, by index: as many as the header counts,
     // or as the names reach.
     fn slots(&self) -> u32 {
@@ -458,22 +465,31 @@ impl Recovery for RarRecovery {
                 names.insert(member.id, member.name.clone());
             }
         }
-        // A volume the set repaired that is longer than its table gives, with
-        // no good bytes past that size, takes the table's size: what lies
-        // past was booked for articles that never came, and the rebuilt
-        // volume is the size the table gives.
+        // A volume takes the size its table gives when it holds damage and
+        // reached less, or the set rebuilt it: a volume posted short closes
+        // at the length its articles reached, and the volume the set
+        // rebuilds is the size the table gives. One the set repaired that
+        // is longer than its table gives, with no good bytes past that
+        // size, takes the table's size too: what lies past was booked for
+        // articles that never came.
         let repaired = matches!(
             self.last,
             Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
         );
-        let sizes = if repaired {
-            self.described_sizes()
-        } else {
-            Vec::new()
-        };
-        for (index, size) in sizes {
-            if let Some(member) = bound.get(&index) {
-                namespace.trim_booked(*member, size);
+        let stated = self.states_sizes();
+        for (index, size) in self.described_sizes() {
+            let Some(record) = bound.get(&index).and_then(|member| namespace.get(*member)) else {
+                continue;
+            };
+            let member = record.id;
+            let short = stated
+                && record.length.is_some_and(|length| length < size)
+                && (repaired || !record.coverage.is_clean());
+            if short {
+                let name = record.name.clone();
+                namespace.recognise(member, &name, size);
+            } else if repaired {
+                namespace.trim_booked(member, size);
             }
         }
         let whole: BTreeSet<u32> = bound

@@ -559,6 +559,12 @@ impl NamespaceWriter {
             return Ok(repaired.remove()?);
         }
         self.read_backs += reads;
+        // The set binds what it ruled before its bytes land: a member it
+        // rebuilds takes the length it describes, so the slices that reach
+        // that length close the file there. A repair reads members back, so
+        // it may have identified one by its content; this bind gives it the
+        // name it is.
+        self.bind_recoveries(tree, builder, segments, node, out)?;
         let mut rewritten = std::collections::BTreeSet::new();
         for (member, offset, bytes) in repaired.slices() {
             let bytes = bytes?;
@@ -589,9 +595,6 @@ impl NamespaceWriter {
         for member in rewritten {
             self.reopen(tree, builder, segments, (node, member), out)?;
         }
-        // A repair reads members back, so it may have identified one by its
-        // content; the bind that follows gives it the name it is.
-        self.bind_recoveries(tree, builder, segments, node, out)?;
         self.release_held(tree, builder, segments, out)
     }
 

@@ -553,7 +553,7 @@ impl Recovery for Par2 {
                 let short = record
                     .length
                     .is_some_and(|length| length < description.length)
-                    && !record.coverage.is_clean();
+                    && (repaired || !record.coverage.is_clean());
                 if short {
                     let name = record.name.clone();
                     namespace.recognise(*member, &name, description.length);

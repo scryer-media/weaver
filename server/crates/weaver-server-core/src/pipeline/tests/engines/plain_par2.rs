@@ -31,6 +31,27 @@ fn claims_all(claims: &std::collections::BTreeMap<String, Claim>, expected: Clai
     !claims.is_empty() && claims.values().all(|claim| *claim == expected)
 }
 
+// A file posted short of the length its set describes, its last article
+// ending early and arriving clean. The set finds the last slice wrong and
+// rebuilds it to the described length, and the member is that length: the
+// file is delivered whole, every described byte in it.
+#[tokio::test]
+async fn a_file_posted_short_of_its_description_is_rebuilt_to_the_described_length() {
+    let data = payload(4 * ARTICLE, 63);
+    let described = [("lantern.bin", data.as_slice())];
+    let mut posts = vec![Post::plain("lantern.bin", data[..data.len() - 24].to_vec())];
+    posts.extend(par2_set("lantern", &described, 2));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert!(claims_all(&graph.graph().claims, Claim::Complete));
+    assert_eq!(graph.files.values().next(), Some(&data));
+}
+
 #[tokio::test]
 async fn plain_files_clean() {
     let scenario = Scenario::new(vec![

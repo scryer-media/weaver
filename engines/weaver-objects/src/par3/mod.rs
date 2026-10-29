@@ -674,32 +674,43 @@ impl Recovery for Par3 {
         }
         // A member the set repaired whose good bytes reach past its
         // description is recognised: they arrived shifted along, and the
-        // rebuilt file takes the described path and length. One longer than
-        // its description with no good bytes past it takes the described
-        // length and keeps its name: what lies past was booked for articles
+        // rebuilt file takes the described path and length. One bound
+        // under its own name keeps it, and takes the described length when
+        // it holds damage and reached less, or the set repaired it: a
+        // member posted short closes at the length its articles reached,
+        // and the file the set rebuilds is the length the set describes.
+        // One longer than its description with no good bytes past it takes
+        // the described length too: what lies past was booked for articles
         // that never came.
         let repaired = matches!(
             self.last,
             Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
         );
-        for (path, member) in bound.iter().filter(|_| repaired) {
+        for (path, member) in &bound {
             let Some(size) = files()
                 .find(|file| file.path() == path)
                 .map(|file| file.size())
             else {
                 continue;
             };
-            let shifted = namespace.get(*member).is_some_and(|record| {
-                record
+            let Some(record) = namespace.get(*member) else {
+                continue;
+            };
+            let shifted = repaired
+                && record
                     .coverage
                     .overlapping(ByteRange::new(size, u64::MAX))
-                    .any(|run| run.provenance.is_verified())
-            });
+                    .any(|run| run.provenance.is_verified());
+            let short = record.length.is_some_and(|length| length < size)
+                && (repaired || !record.coverage.is_clean());
             if shifted {
                 if namespace.recognise(*member, path, size).is_some() {
                     renamed.push(*member);
                 }
-            } else {
+            } else if short {
+                let name = record.name.clone();
+                namespace.recognise(*member, &name, size);
+            } else if repaired {
                 namespace.trim_booked(*member, size);
             }
         }
