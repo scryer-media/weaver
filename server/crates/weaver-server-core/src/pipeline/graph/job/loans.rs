@@ -41,6 +41,14 @@ struct Out {
     serial: u64,
     state: Option<SetState>,
     stop: Option<Arc<AtomicBool>>,
+    kind: Work,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Work {
+    Repair,
+    Replay,
+    Verification,
 }
 
 impl Loans {
@@ -59,8 +67,12 @@ impl Loans {
         self.out.is_some()
     }
 
-    pub(crate) fn reading(&self) -> bool {
-        self.out.as_ref().is_some_and(|out| out.stop.is_some())
+    pub(crate) fn repairing(&self) -> bool {
+        self.is_out(Work::Repair)
+    }
+
+    fn is_out(&self, kind: Work) -> bool {
+        self.out.as_ref().is_some_and(|out| out.kind == kind)
     }
 
     pub(crate) fn request_stop(&self) {
@@ -145,6 +157,7 @@ impl Lender for Lending<'_> {
             serial,
             state: loan.state,
             stop: None,
+            kind: Work::Repair,
         });
         let mail = loans.mail.clone();
         // The repair runs inside the pool, on the budget in force as it goes
@@ -190,6 +203,7 @@ impl Lending<'_> {
             serial,
             state: None,
             stop: Some(Arc::clone(&check.stop)),
+            kind: Work::Verification,
         });
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();
@@ -215,6 +229,7 @@ impl Lending<'_> {
             serial,
             state: None,
             stop: Some(Arc::clone(&replay.stop)),
+            kind: Work::Replay,
         });
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();

@@ -289,7 +289,13 @@ impl GraphJob {
 
     // Seam for status: whether a repair of the job is out on a thread.
     pub(crate) fn repair_out(&self) -> bool {
-        self.loans.out()
+        self.loans.repairing()
+    }
+
+    // Completion waits for every worker's acknowledgment and for replays
+    // or checks queued behind admission, not just actual recovery work.
+    pub(crate) fn work_pending(&self) -> bool {
+        self.loans.out() || self.writer.rechecks_waiting() || self.writer.verifications_waiting()
     }
 
     #[cfg(test)]
@@ -317,18 +323,23 @@ impl GraphJob {
     // Seam for completion, status and health: where the job stands, read
     // off the tree. Stable.
     pub(crate) fn phase(&self) -> RootPhase {
-        let extracting = phase::extracting(&self.tree)
-            || self.runs.live()
-            || self.writer.rechecks_waiting()
-            || self.writer.verifications_waiting()
-            || self.loans.reading();
-        RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
+        let extracting = phase::extracting(&self.tree) || self.runs.live();
+        let phase = RootPhase::derive(self.payload_waiting(), self.activity(), extracting);
+        if phase == RootPhase::Done && self.work_pending() {
+            // Replaying input or folding a checksum settles the file; it
+            // does not extract another member. Keep the reported stage,
+            // including a Done restored from an already completed repair.
+            // Completion still waits for the worker's acknowledgment.
+            self.reported.unwrap_or(RootPhase::Downloading)
+        } else {
+            phase
+        }
     }
 
     // What the recovery sets are doing: repairing while a repair run is out
     // over damage a set covers, which a run that only checks is not.
     fn activity(&self) -> Activity {
-        let repairing = self.loans.out() && self.writer.damage_covered(&self.tree);
+        let repairing = self.repair_out() && self.writer.damage_covered(&self.tree);
         phase::activity(self.writer.outcomes(&self.tree), repairing)
     }
 

@@ -395,7 +395,7 @@ fn a_walk_whose_headers_the_directory_contradicts_goes_to_an_engine() {
 }
 
 #[test]
-fn two_entries_of_one_name_go_to_an_engine_before_any_member() {
+fn two_entries_of_one_name_are_rejected_before_any_member() {
     let mut bytes = archive();
     cloak(&mut bytes, "gamma.bin", "alpha.bin");
     // Both headers of the second entry say the first's name.
@@ -406,7 +406,7 @@ fn two_entries_of_one_name_go_to_an_engine_before_any_member() {
     bytes[local..local + 9].copy_from_slice(b"alpha.bin");
     let mut owner = Owner::single(Zip::new(), bytes);
     owner.whole(4096);
-    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
+    assert_eq!(owner.said, vec![Emit::Refuse(Why::InvalidArchive)]);
     assert!(owner.members.is_empty());
 }
 

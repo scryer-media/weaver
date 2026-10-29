@@ -3177,6 +3177,22 @@ impl Tree {
     // open, and each object bound below forgets what it said of it, so the
     // bytes are said again as they first were.
     pub fn uncover(&mut self, node: NodeId, volume: VolumeIndex, range: ByteRange) {
+        self.forget_input(node, volume, range, false);
+    }
+
+    // Input staged through the existing map is being checked again, not
+    // lost. A repair below that map still answers old upstream damage.
+    pub fn recheck(&mut self, node: NodeId, volume: VolumeIndex, range: ByteRange) {
+        self.forget_input(node, volume, range, true);
+    }
+
+    fn forget_input(
+        &mut self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        keep_repairs: bool,
+    ) {
         if let Some(object) = self
             .nodes
             .get_mut(&node)
@@ -3187,7 +3203,22 @@ impl Tree {
         self.walk_down(
             vec![(node, volume, range)],
             |tree, node, member, range, pending| {
-                tree.unsay(node, member, range, pending);
+                if !keep_repairs {
+                    tree.unsay(node, member, range, pending);
+                    return;
+                }
+                let mut forgotten = crate::member::Coverage::new();
+                forgotten.write(range, Provenance::Fresh);
+                if let Some(record) = tree.namespace(node).and_then(|ns| ns.get(member)) {
+                    for run in record.coverage.overlapping(range) {
+                        if run.provenance == Provenance::Repaired {
+                            forgotten.erase(run.range);
+                        }
+                    }
+                }
+                for run in forgotten.runs() {
+                    tree.unsay(node, member, run.range, pending);
+                }
             },
         );
     }
@@ -4168,6 +4199,67 @@ mod tests {
             .coverage
             .write(ByteRange::new(0, 6), Provenance::Repaired);
         assert!(tree.rejected_inputs(NodeId::ROOT, [first]).is_empty());
+    }
+
+    #[test]
+    fn replay_keeps_repairs_but_missing_input_does_not() {
+        let (mut tree, _, child, _) = bound_tree();
+        let record = tree
+            .nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap();
+        record
+            .coverage
+            .write(ByteRange::new(0, 6), Provenance::Fresh);
+        let repaired = ByteRange::new(2, 4);
+        record.coverage.write(repaired, Provenance::Repaired);
+        let input = ByteRange::new(HEADER, HEADER + 6);
+        tree.recheck(child, VolumeIndex(0), input);
+        let coverage = &tree
+            .namespace(child)
+            .unwrap()
+            .get(MemberId(0))
+            .unwrap()
+            .coverage;
+        assert_eq!(coverage.bytes_covered(), repaired.len());
+        assert!(coverage.verified(repaired));
+        let mut effects = Vec::new();
+        tree.replay_piece(
+            child,
+            VolumeIndex(0),
+            Posted {
+                offset: HEADER,
+                bytes: Bytes::from_static(b"abcdef"),
+                provenance: Provenance::Damaged,
+            },
+            &mut Build,
+            &mut effects,
+        );
+        let coverage = &tree
+            .namespace(child)
+            .unwrap()
+            .get(MemberId(0))
+            .unwrap()
+            .coverage;
+        assert!(
+            coverage.verified(repaired),
+            "old damage cannot replace the repair"
+        );
+        assert!(coverage.damaged(ByteRange::new(0, 2)));
+        assert!(coverage.damaged(ByteRange::new(4, 6)));
+        tree.uncover(child, VolumeIndex(0), input);
+        assert_eq!(
+            tree.namespace(child)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .coverage
+                .bytes_covered(),
+            0
+        );
     }
 
     #[test]

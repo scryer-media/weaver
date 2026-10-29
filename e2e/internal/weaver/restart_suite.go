@@ -570,6 +570,9 @@ func ensureRestartFixturesSeeded(slugs []string) error {
 
 func ensureRestartInfrastructure() {
 	log.Println("starting restart-suite infrastructure with fresh NNTP build...")
+	if err := ensureNNTPHealthBinary(); err != nil {
+		log.Fatalf("build NNTP healthcheck for restart suite: %v", err)
+	}
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("build nyuu image for restart suite: %v", err)
 	}

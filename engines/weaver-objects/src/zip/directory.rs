@@ -110,7 +110,7 @@ impl Zip {
             .iter()
             .all(|central| names.insert(central.header.raw.as_slice()))
         {
-            return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+            return self.give_up(Emit::Refuse(Why::InvalidArchive), out);
         }
         match self.walking {
             true => {

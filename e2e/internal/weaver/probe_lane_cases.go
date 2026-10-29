@@ -5,10 +5,13 @@ package weaver
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/scryer-media/weaver/e2e/internal/nntphealth"
 )
 
 func probeLaneRestartCases() []restartCase {
@@ -140,6 +143,11 @@ func runHealthProbeWaitsForOwnedLane(ctx *restartCaseContext) (restartCaseResult
 	// therefore already reserved the second request on this owned lane.
 	// Fixture BODY counters record completed transfers, not requests; the
 	// held second response must still have zero completions at this barrier.
+	// Run the actual healthcheck protocol while that data seat is occupied.
+	// Completion is the barrier; no timer or scheduler ordering is assumed.
+	if err := nntphealth.CheckAddress(net.JoinHostPort(nntpHost(), fmt.Sprint(nntpPort())), 0); err != nil {
+		return restartCaseResult{}, fmt.Errorf("overlapping control-aware healthcheck: %w", err)
+	}
 	bodies, err := adversarialBodyCounts([]string{heldIDs[0]})
 	if err != nil {
 		return restartCaseResult{}, err
@@ -155,8 +163,8 @@ func runHealthProbeWaitsForOwnedLane(ctx *restartCaseContext) (restartCaseResult
 	writeRestartJSON(filepath.Join(ctx.CaseDir, "probe_waiting.json"), map[string]any{
 		"job_id": jobID, "held_message_id": heldIDs[0], "body_completions": bodies, "stat": blocked, "connections": connections,
 	})
-	if bodies[heldIDs[0]] != 0 || statCount(blocked) != 0 || connections.Active != 1 || connections.PeakActive > 1 {
-		return restartCaseResult{}, fmt.Errorf("probe bypassed occupied lane: BODY completions=%v STAT=%d connections=%+v", bodies, statCount(blocked), connections)
+	if err := requireProbeWaiting(bodies[heldIDs[0]], statCount(blocked), connections.Active, connections.PeakActive); err != nil {
+		return restartCaseResult{}, err
 	}
 	if err := liftPrimaryHold(); err != nil {
 		return restartCaseResult{}, err
@@ -190,4 +198,24 @@ func runHealthProbeWaitsForOwnedLane(ctx *restartCaseContext) (restartCaseResult
 	}
 	restored = true
 	return restartCaseResult{Classification: restartPass, Summary: "Armed health probe waited for held BODY, then issued STAT through the released lane; provider peak stayed at one; missing UU prefix failed without usable output"}, nil
+}
+
+func requireProbeWaiting(bodies, stats int, active, peak int64) error {
+	var problems []string
+	if bodies != 0 {
+		problems = append(problems, fmt.Sprintf("held BODY completed %d time(s)", bodies))
+	}
+	if stats != 0 {
+		problems = append(problems, fmt.Sprintf("early STAT requests=%d", stats))
+	}
+	if active != 1 {
+		problems = append(problems, fmt.Sprintf("active data sessions=%d, want 1", active))
+	}
+	if peak > 1 {
+		problems = append(problems, fmt.Sprintf("historical data-session peak=%d, want <=1", peak))
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("probe occupied-lane assertion: %s", strings.Join(problems, "; "))
+	}
+	return nil
 }

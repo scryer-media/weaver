@@ -298,12 +298,21 @@ impl NamespaceWriter {
         }
         // All input was captured before the first unposted callback can
         // invalidate a cipher seed, placement or dependent member.
-        for (volume, offset, range) in &replayed.bytes.runs {
-            tree.uncover(
+        for ((volume, offset, range), provenance) in
+            replayed.bytes.runs.iter().zip(&replayed.provenance)
+        {
+            let (node, volume, range) = (
                 replayed.node,
                 VolumeIndex(volume.0),
                 ByteRange::at(*offset, range.len()),
             );
+            if *provenance == Provenance::Damaged {
+                tree.recheck(node, volume, range);
+            } else {
+                // Verified replacement bytes must face the member's own
+                // checksum again, even where an older repair stood.
+                tree.uncover(node, volume, range);
+            }
         }
         for ((volume, offset, bytes), provenance) in
             replayed.bytes.slices().zip(&replayed.provenance)

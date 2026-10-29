@@ -96,14 +96,10 @@ func AdversarialRecipes() []Recipe {
 		},
 		{
 			Slug: "adv-zip-duplicate-names", Family: "adversarial", ByteReproducible: true,
-			Notes: "Two stored members with the same name and different bytes. Both must be delivered, the second under a suffixed name.",
+			Notes: "Two stored members with the same name and different bytes. Security validation must reject the archive without crediting it as usable delivery.",
 			Build: writeAdversarialZip("duplicates.zip", []rawZipEntry{
 				storedEntry("dup.txt", adversarialPayload("dup-first")),
 				storedEntry("dup.txt", adversarialPayload("dup-second")),
-			}),
-			ExpectedOutputs: expectPayloads(map[string]string{
-				"dup.txt":     "dup-first",
-				"dup (1).txt": "dup-second",
 			}),
 		},
 		{

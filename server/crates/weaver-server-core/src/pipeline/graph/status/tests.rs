@@ -90,7 +90,7 @@ impl RootJob for Prepared {
         None
     }
 
-    fn repair_out(&self) -> bool {
+    fn work_pending(&self) -> bool {
         false
     }
 

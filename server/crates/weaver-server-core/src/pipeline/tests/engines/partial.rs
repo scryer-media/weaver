@@ -1366,6 +1366,50 @@ async fn a_stored_7z_with_a_damaged_member_and_no_par2_refuses_itself_unrepairab
     .await;
 }
 
+#[tokio::test]
+async fn a_security_invalid_zip_is_never_a_whole_posted_file() {
+    let mut archive = super::zip::archive(super::zip::stored());
+    let locations: Vec<usize> = archive
+        .windows(9)
+        .enumerate()
+        .filter_map(|(at, bytes)| (bytes == b"quill.bin").then_some(at))
+        .collect();
+    assert_eq!(locations.len(), 2, "local and central names");
+    for at in locations {
+        archive[at..at + 9].copy_from_slice(b"ember.bin");
+    }
+    for sibling in [false, true] {
+        let mut posted = vec![Post::plain("duplicates.zip", archive.clone())];
+        if sibling {
+            posted.push(Post::plain("survivor.bin", quill()));
+        }
+        let outcome = super::harness::run(&Scenario::new(posted)).await;
+        if sibling {
+            assert_eq!(outcome.status, Some(JobStatus::Partial));
+            assert_eq!(outcome.graph().delivery.whole, ["survivor.bin"]);
+            assert_eq!(outcome.files[&format!("{FOLDER}/survivor.bin")], quill());
+        } else {
+            assert!(matches!(outcome.status, Some(JobStatus::Failed { .. })));
+            assert!(outcome.graph().delivery.whole.is_empty());
+        }
+        assert_eq!(
+            outcome.graph().delivery.withheld,
+            [("duplicates.zip".into(), Why::InvalidArchive)]
+        );
+        assert!(
+            !outcome
+                .files
+                .keys()
+                .any(|name| name.ends_with("ember.bin") || name.ends_with("ember (1).bin"))
+        );
+        for (name, bytes) in outcome.files.iter().chain(outcome.retained_files.iter()) {
+            if name.ends_with("duplicates.zip") {
+                assert_eq!(bytes, &archive);
+            }
+        }
+    }
+}
+
 // A stored zip whose last article, all directory and end record, never
 // arrives. Nothing can bring the directory forward, so once the job is
 // quiet the zip hears the loss and walks its local headers instead; both

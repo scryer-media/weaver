@@ -5533,14 +5533,14 @@
     {
       "path": "testdata/par2-ignorable-deficit/info.nfo",
       "size": 32768,
-      "blake3": "d6241c9cbfba7b027c7b44d0dcf9da495262067791adb650be1ce813893de36b",
+      "blake3": "448c0430d219e32868540831e4ce905bcfe6f633f2477d1b20edd4baa0b9ac67",
       "format": "nfo",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ],
         "inputs": [
@@ -5551,14 +5551,14 @@
     {
       "path": "testdata/par2-ignorable-deficit/release.par2",
       "size": 26400,
-      "blake3": "c576a88e4fa6eadca192559c926bdb5bffaecb44d4f61925d51655ac9260a9e6",
+      "blake3": "8193b500dfacd48431c40deacb140a2677c0882272f155b419ad9dc4c87167ec",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ],
         "inputs": [
@@ -5569,14 +5569,14 @@
     {
       "path": "testdata/par2-ignorable-deficit/release.vol0+3.par2",
       "size": 65184,
-      "blake3": "21a08ce544991ab00feb2dbc43bf1506108a4027d546a9c901145ea7f1bcaec7",
+      "blake3": "f6af9512277a4e7368a9a8f5efc5c0e967b79e107a6a0d4dc9050af0e1df8a87",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ],
         "inputs": [
@@ -5594,7 +5594,7 @@
         "generator": "fixturegen",
         "toolchains": [
           "ffmpeg-7.1-ubuntu2404",
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ],
         "inputs": [

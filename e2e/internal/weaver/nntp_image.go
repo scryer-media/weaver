@@ -38,6 +38,9 @@ var weaverNNTPImageMu sync.Mutex
 func ensureLocalWeaverNNTPImage() error {
 	weaverNNTPImageMu.Lock()
 	defer weaverNNTPImageMu.Unlock()
+	if err := ensureNNTPHealthBinary(); err != nil {
+		return err
+	}
 	if envBool(weaverNNTPPreparedEnv, false) {
 		return nil
 	}

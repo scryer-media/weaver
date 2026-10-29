@@ -23,8 +23,9 @@ services:
     volumes:
       - nntp-certs:/certs
       - nntp-data:/data
+      - ./.bin/nntp-health:/nntp-health:ro
     healthcheck:
-      test: ["CMD", "/e2e-nntp", "health", "--addr", "127.0.0.1:119"]
+      test: ["CMD", "/nntp-health", "--addr", "127.0.0.1:119"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -47,8 +48,9 @@ services:
       - nntp-password
     volumes:
       - nntp2-data:/data
+      - ./.bin/nntp-health:/nntp-health:ro
     healthcheck:
-      test: ["CMD", "/e2e-nntp", "health", "--addr", "127.0.0.1:119"]
+      test: ["CMD", "/nntp-health", "--addr", "127.0.0.1:119"]
       interval: 2s
       timeout: 2s
       retries: 10

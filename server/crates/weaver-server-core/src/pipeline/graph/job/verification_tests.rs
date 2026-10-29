@@ -58,6 +58,18 @@ fn rows(delta: Delta) -> GraphCheckpoint {
 async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_acknowledged() {
     let (mut job, _dir, mut mail, _) = pending();
     let mut slots = RepairSlots::default();
+    assert!(
+        !job.repair_out(),
+        "a queued checksum is not a second repair"
+    );
+    assert!(job.work_pending());
+    assert!(
+        matches!(
+            crate::pipeline::graph::status::drive(&mut job, &mut slots, AskerId(1), 0),
+            Step::Wait
+        ),
+        "a queued check still blocks delivery without an available slot"
+    );
     let mut check = job.writer.take_verification(&job.tree).unwrap();
     let (started, resume) = check.pause_after_read();
     let mut lending = job.loans.lending(Some((&mut slots, 1)));
@@ -65,7 +77,8 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
     lending.verify(check);
     started.await.unwrap();
     assert!(job.awaits_mail());
-    assert_eq!(job.phase(), RootPhase::Extracting);
+    assert!(!job.repair_out(), "an in-flight checksum is not a repair");
+    assert_eq!(job.phase(), RootPhase::Downloading);
     assert!(matches!(
         crate::pipeline::graph::status::drive(&mut job, &mut slots, AskerId(1), 1),
         Step::Wait
@@ -175,7 +188,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
         "pending verification does not refetch recorded bytes"
     );
     assert_eq!(restored.job.writer.pending_verifications(), vec![(0, 0)]);
-    assert_eq!(restored.job.phase(), RootPhase::Extracting);
+    assert_eq!(restored.job.phase(), RootPhase::Downloading);
     let mut slots = RepairSlots::default();
     restored.job.lend(&mut slots, 1).unwrap();
     let said = mail.recv().await.unwrap();
@@ -192,4 +205,34 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
             .coverage
             .damaged(ByteRange::new(0, SIZE as u64))
     );
+}
+
+#[test]
+fn a_queued_checksum_settles_the_reported_stage_without_inventing_extraction() {
+    for reported in [
+        RootPhase::Downloading,
+        RootPhase::Verifying,
+        RootPhase::Repairing,
+        RootPhase::Extracting,
+        RootPhase::Done,
+    ] {
+        let (mut job, _dir, _mail, _) = pending();
+        job.reported = Some(reported);
+        assert_eq!(job.phase(), reported);
+        assert_eq!(job.phase_change(), None);
+        assert!(!job.repair_out());
+        assert!(job.work_pending());
+        assert!(
+            matches!(
+                crate::pipeline::graph::status::drive(
+                    &mut job,
+                    &mut RepairSlots::default(),
+                    AskerId(1),
+                    0
+                ),
+                Step::Wait
+            ),
+            "{reported:?}: the checksum must be acknowledged before delivery"
+        );
+    }
 }

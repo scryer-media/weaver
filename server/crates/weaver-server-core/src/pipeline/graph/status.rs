@@ -59,9 +59,9 @@ pub(crate) trait RootJob {
     fn unpacked(&self) -> bool;
     // The breach of the job's extraction budget, once one stands.
     fn refusal(&self) -> Option<&ExtractionFailure>;
-    // A repair of the job is out on a thread: the set it was lent from has
-    // its ruling still to come, whatever it said as it left.
-    fn repair_out(&self) -> bool;
+    // Recovery, replay or checksum work has not been acknowledged yet,
+    // including a checksum check still waiting for worker admission.
+    fn work_pending(&self) -> bool;
     // A member's file still waits to move to its name.
     fn moves_waiting(&self) -> bool;
 }
@@ -117,8 +117,8 @@ impl RootJob for GraphJob {
         self.writer().refusal()
     }
 
-    fn repair_out(&self) -> bool {
-        GraphJob::repair_out(self)
+    fn work_pending(&self) -> bool {
+        GraphJob::work_pending(self)
     }
 
     fn moves_waiting(&self) -> bool {
@@ -147,9 +147,9 @@ pub(crate) fn drive(
     asker: AskerId,
     limit: usize,
 ) -> Step {
-    // Nothing is ruled while a set's repair is out: what it comes back with
-    // may make whole what the job would otherwise end short of.
-    if job.repair_out() {
+    // No delivery while a worker or queued checksum still has a say about
+    // the file's bytes, even when no recovery set needs to run.
+    if job.work_pending() {
         return Step::Wait;
     }
     let summary = job.recovery_summary();

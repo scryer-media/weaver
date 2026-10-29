@@ -308,6 +308,9 @@ func parseContainerEncryptionKeyState(fingerprintOutput, modeOutput string) (con
 }
 
 func dockerComposeUp(services ...string) error {
+	if err := ensureNNTPHealthBinary(); err != nil {
+		return err
+	}
 	if requiresWeaverService(services) {
 		if err := ensureLocalWeaverImage(); err != nil {
 			return err

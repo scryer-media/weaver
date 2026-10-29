@@ -11,8 +11,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-
-	"github.com/zeebo/blake3"
 )
 
 func feedVerdictRestartCases() []restartCase {
@@ -54,7 +52,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	missingLength, expected, err := feedVerdictOutputOracle(nzb, scenario.ExpectedOutputBLAKE3["survivor.bin"])
+	abandonedIndex, missingLength, expected, err := feedVerdictOutputOracle(nzb, scenario.ExpectedOutputBLAKE3["survivor.bin"])
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -62,14 +60,15 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	// The recipe posts broken.bin before survivor.bin. Withhold the former,
-	// and hold the latter so a committed verdict cannot race terminalization.
+	// Nyuu may finish either file first and write its NZB entry first.
+	// Withhold broken.bin by identity and hold survivor.bin so a committed
+	// verdict cannot race terminalization.
 	var abandonedIDs, survivorIDs []string
 	for _, segment := range segments {
 		switch segment.FileIndex {
-		case 0:
+		case abandonedIndex:
 			abandonedIDs = append(abandonedIDs, segment.MessageID)
-		case 1:
+		case 1 - abandonedIndex:
 			survivorIDs = append(survivorIDs, segment.MessageID)
 		default:
 			return restartCaseResult{}, fmt.Errorf("unexpected feed fixture file %d", segment.FileIndex)
@@ -103,7 +102,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	var committed restartFeedVerdict
 	if err := ctx.pollFor("committed abandoned-file verdict", func() (bool, error) {
 		committed, err = readRestartFeedVerdict(dbPath, jobID)
-		return committed.Version == 1 && committed.Reason != "" && reflect.DeepEqual(committed.AbandonedFiles, []int{0}), err
+		return committed.Version == 1 && committed.Reason != "" && reflect.DeepEqual(committed.AbandonedFiles, []int{abandonedIndex}), err
 	}); err != nil {
 		return restartCaseResult{}, err
 	}
@@ -126,18 +125,26 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	}
 	writeRestartJSON(filepath.Join(ctx.CaseDir, "feed_checkpoint.json"), proof)
 	writeRestartJSON(filepath.Join(ctx.CaseDir, "feed_verdict.json"), committed)
-	if err := requireFeedVerdictPlaceholder(proof, missingLength, expected["broken.bin"]); err != nil {
+	persisted, err := readRestartFeedVerdict(dbPath, jobID)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := requireFeedVerdictAbsence(proof, persisted, abandonedIndex, missingLength); err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := withStateDB(dbPath, func(db *stateConn) error {
 		var verified int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM graph_coverage WHERE job_id = ? AND node_id = 0 AND member_id = 0 AND verified = TRUE`, jobID).Scan(&verified); err != nil {
+		if err := db.QueryRow(`SELECT COUNT(*) FROM graph_coverage WHERE job_id = ? AND node_id = 0 AND member_id = ? AND verified = TRUE`, jobID, abandonedIndex).Scan(&verified); err != nil {
 			return err
 		}
 		if verified != 0 {
 			return fmt.Errorf("abandoned file has %d verified checkpoint runs", verified)
 		}
-		return nil
+		var outputDir string
+		if err := db.QueryRow(`SELECT output_dir FROM active_jobs WHERE job_id = ?`, jobID).Scan(&outputDir); err != nil {
+			return err
+		}
+		return requireAbsentFeedOutput(outputDir)
 	}); err != nil {
 		return restartCaseResult{}, err
 	}
@@ -188,55 +195,71 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	return restartCaseResult{Classification: restartPass, Summary: "Committed feed verdict restored before dispatch; abandoned articles were not fetched after becoming available; healthy survivor delivered whole"}, nil
 }
 
-// No broken-file article is decoded, so its damaged placeholder is bounded
-// by the posted NZB's encoded sizes. Derive its zero bytes from those inputs,
-// never from a checkpoint or output that the assertion is meant to verify.
-func feedVerdictOutputOracle(nzb []byte, survivorHash string) (uint64, map[string]string, error) {
+// No broken-file article is decoded. Its damaged coverage is bounded by the
+// posted NZB's encoded sizes, but no physical file may be fabricated for it.
+func feedVerdictOutputOracle(nzb []byte, survivorHash string) (int, uint64, map[string]string, error) {
 	var post struct {
 		Files []struct {
+			Subject  string `xml:"subject,attr"`
 			Segments []struct {
 				Bytes uint64 `xml:"bytes,attr"`
 			} `xml:"segments>segment"`
 		} `xml:"file"`
 	}
 	if err := xml.Unmarshal(nzb, &post); err != nil {
-		return 0, nil, err
+		return 0, 0, nil, err
 	}
-	if len(post.Files) != 2 || len(post.Files[0].Segments) == 0 || survivorHash == "" {
-		return 0, nil, fmt.Errorf("feed verdict oracle requires two files and a survivor digest")
+	if len(post.Files) != 2 || survivorHash == "" {
+		return 0, 0, nil, fmt.Errorf("feed verdict oracle requires two files and a survivor digest")
+	}
+	abandonedIndex, survivorIndex := -1, -1
+	for index, file := range post.Files {
+		switch {
+		case strings.Contains(file.Subject, `"broken.bin"`) && abandonedIndex == -1:
+			abandonedIndex = index
+		case strings.Contains(file.Subject, `"survivor.bin"`) && survivorIndex == -1:
+			survivorIndex = index
+		default:
+			return 0, 0, nil, fmt.Errorf("unexpected or duplicate feed fixture subject %q", file.Subject)
+		}
+	}
+	if abandonedIndex < 0 || survivorIndex < 0 || len(post.Files[abandonedIndex].Segments) == 0 {
+		return 0, 0, nil, fmt.Errorf("feed verdict oracle requires broken.bin and survivor.bin")
 	}
 	var length uint64
-	for _, segment := range post.Files[0].Segments {
+	for _, segment := range post.Files[abandonedIndex].Segments {
 		// This recipe contains a 64 KiB source; reject an unexpected oversized
-		// fixture before allocating its independently computed zero image.
+		// fixture before accepting its independently computed damaged bounds.
 		if segment.Bytes == 0 || segment.Bytes > 1<<20 || length > 1<<20-segment.Bytes {
-			return 0, nil, fmt.Errorf("unexpected feed fixture encoded size")
+			return 0, 0, nil, fmt.Errorf("unexpected feed fixture encoded size")
 		}
 		length += segment.Bytes
 	}
-	return length, map[string]string{
-		"broken.bin":   fmt.Sprintf("%x", blake3.Sum256(make([]byte, length))),
-		"survivor.bin": survivorHash,
-	}, nil
+	return abandonedIndex, length, map[string]string{"survivor.bin": survivorHash}, nil
 }
 
-func requireFeedVerdictPlaceholder(proof checkpointEvidence, length uint64, hash string) error {
+func requireFeedVerdictAbsence(proof checkpointEvidence, verdict restartFeedVerdict, index int, length uint64) error {
+	if verdict.Version != 1 || verdict.Reason == "" || !reflect.DeepEqual(verdict.AbandonedFiles, []int{index}) {
+		return fmt.Errorf("missing persisted abandoned-file verdict: %+v", verdict)
+	}
 	memberFound := false
 	for _, member := range proof.Members {
-		if member.FileIndex == 0 {
-			memberFound = member.HasFile && member.OutputName == "broken.bin" && member.OnDisk == ""
+		if member.FileIndex == index {
+			if member.HasFile || member.OutputName != "broken.bin" || member.OnDisk != "" {
+				return fmt.Errorf("abandoned file has unexpected backing ownership: %+v", member)
+			}
+			memberFound = true
 		}
 	}
-	backing := proof.Backing["broken.bin"]
-	if !memberFound || backing.Problem != "" || backing.Size != int64(length) || backing.BLAKE3 != hash {
-		return fmt.Errorf("committed feed verdict lacks the expected recorded damaged placeholder: %+v", backing)
+	if _, backed := proof.Backing["broken.bin"]; !memberFound || backed {
+		return fmt.Errorf("abandoned file must have a member and no backing file")
 	}
 	for _, row := range proof.Coverage {
-		if row.FileIndex != 0 {
+		if row.FileIndex != index {
 			continue
 		}
 		if row.Length == nil || *row.Length != length || !row.Coverage.Covers(0, length) {
-			return fmt.Errorf("abandoned file does not cover its encoded placeholder bounds")
+			return fmt.Errorf("abandoned file does not cover its encoded damaged bounds")
 		}
 		for _, run := range row.Coverage.Runs {
 			if run.Provenance != "damaged" || run.End <= run.Start || run.End > length {
@@ -246,4 +269,15 @@ func requireFeedVerdictPlaceholder(proof checkpointEvidence, length uint64, hash
 		return nil
 	}
 	return fmt.Errorf("committed feed verdict has no abandoned-file coverage")
+}
+
+func requireAbsentFeedOutput(outputDir string) error {
+	_, err := os.Lstat(filepath.Join(outputDir, "broken.bin"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("abandoned file has an unexpected fabricated broken.bin")
 }

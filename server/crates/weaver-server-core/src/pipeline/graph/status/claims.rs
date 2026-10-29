@@ -442,6 +442,7 @@ fn withheld_because(why: Why) -> &'static str {
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",
         Why::OrderUnknown => "is a piece of a set nothing puts in order",
+        Why::InvalidArchive => "is an invalid archive rejected by validation",
         _ => "was refused",
     }
 }

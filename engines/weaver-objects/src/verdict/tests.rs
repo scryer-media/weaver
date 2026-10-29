@@ -132,10 +132,10 @@ fn a_7z_failure_that_names_no_damage_is_terminal() {
 }
 
 #[test]
-fn a_zip_directory_the_library_refuses_is_terminal() {
+fn an_invalid_zip_is_not_an_unsupported_posted_file() {
     assert_eq!(
         super::zip(&ZipError::InvalidArchive("Invalid zip header".into())),
-        TERMINAL
+        Emit::Refuse(Why::InvalidArchive)
     );
     assert_eq!(
         super::zip(&ZipError::InvalidArchive(
@@ -144,4 +144,8 @@ fn a_zip_directory_the_library_refuses_is_terminal() {
         DAMAGED
     );
     assert_eq!(super::zip(&ZipError::InvalidPassword), PASSWORD);
+    assert_eq!(
+        super::zip(&ZipError::UnsupportedArchive("unsupported compression")),
+        TERMINAL
+    );
 }

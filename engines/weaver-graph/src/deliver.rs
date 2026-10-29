@@ -166,6 +166,9 @@ pub enum Why {
     // The object would sit deeper than a job's namespaces may nest. What
     // the member holds is the container, delivered as it is.
     TooDeep,
+    // Recognised container rejected by structural or security validation.
+    // Its posted bytes are not a usable substitute for its members.
+    InvalidArchive,
 }
 
 impl Why {
@@ -179,7 +182,8 @@ impl Why {
             | Why::EncryptedHeader
             | Why::Compressed
             | Why::Unmapped
-            | Why::OrderUnknown => true,
+            | Why::OrderUnknown
+            | Why::InvalidArchive => true,
             Why::TailUnreachable
             | Why::UnboundedEntry
             | Why::NotAFile
@@ -208,7 +212,8 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
-            | Why::OrderUnknown => false,
+            | Why::OrderUnknown
+            | Why::InvalidArchive => false,
         }
     }
 }
@@ -299,6 +304,7 @@ mod tests {
             Why::Compressed,
             Why::Unmapped,
             Why::OrderUnknown,
+            Why::InvalidArchive,
         ];
         let delivered = [
             Why::TailUnreachable,

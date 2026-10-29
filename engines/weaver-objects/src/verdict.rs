@@ -4,11 +4,11 @@
 // What an extraction failure means for the job, decided where the failure is
 // still a typed library error.
 //
-// Three answers: no supplied password opens it (`NeedsPassword`); the
+// No supplied password opens it (`NeedsPassword`); the
 // archive's bytes are wrong, a checksum that does not match, a block that
 // does not decode, a read that came back short, so a repair of those bytes
-// can change the answer (`Unrepairable` until one does); and anything else,
-// which no repair or retry is known to change (`Unsupported`).
+// can change the answer (`Unrepairable` until one does); structural ZIP
+// validation rejects it (`InvalidArchive`); or the format is unsupported.
 //
 
 use std::io;
@@ -60,6 +60,7 @@ pub(crate) fn zip(error: &ZipError) -> Emit {
         ZipError::InvalidPassword => PASSWORD,
         ZipError::UnsupportedArchive(why) if *why == ZipError::PASSWORD_REQUIRED => PASSWORD,
         ZipError::InvalidArchive(detail) if zip_8_6_unicode_extra_field_checksum(detail) => DAMAGED,
+        ZipError::InvalidArchive(_) => Emit::Refuse(Why::InvalidArchive),
         _ => TERMINAL,
     }
 }

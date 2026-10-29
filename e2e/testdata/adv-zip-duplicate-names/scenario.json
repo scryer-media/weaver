@@ -1,15 +1,15 @@
 {
   "slug": "adv-zip-duplicate-names",
   "title": "E2E.Adversarial.Zip.Duplicate.Names.2026-TESTGRP",
-  "description": "Two members with the same name and different bytes. Both are delivered, the second under the graph's suffixed name.",
+  "description": "Duplicate ZIP names are rejected by security validation; retained archive bytes are not usable delivery.",
   "category": "2000",
-  "expected_outcome": "success",
+  "expected_outcome": "extraction_failure",
+  "expectedErrorContains": "invalid archive",
   "adversarial": {
     "group": "default",
-    "outcome": "success"
-  },
-  "expectedOutputBLAKE3": {
-    "dup (1).txt": "0a77a37050ec1e769c471059ae5f72d5316a34a49952d21b294911b422515e6e",
-    "dup.txt": "01113fd320b25afbd37c4099ceba7f9e2d8b4f2146a5cf9c7dd94dd0e47c881d"
+    "outcome": "failed",
+    "errorContains": "invalid archive",
+    "extractsNothing": true,
+    "forbiddenOutputs": ["dup.txt", "dup (1).txt"]
   }
 }

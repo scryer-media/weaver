@@ -791,8 +791,33 @@ fn an_entry_whose_local_header_names_another_file_is_refused_unsaid() {
     cloak(&mut archive, "deep/second.bin", "deep/secand.bin");
     let mut expected = plain_said();
     expected.truncate(5);
-    expected.push(Said::Refuse(Why::Unsupported));
+    expected.push(Said::Refuse(Why::InvalidArchive));
     assert_eq!(run(&mut ZipEngine::new(), vec![archive]), expected);
+}
+
+#[test]
+fn duplicate_names_are_rejected_without_announcing_a_member() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    for (name, bytes) in [
+        ("first.txt", b"first".as_slice()),
+        ("other.txt", b"other".as_slice()),
+    ] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    let mut archive = writer.finish().unwrap().into_inner();
+    // Keep both local and central headers consistent while colliding names.
+    for at in (0..archive.len() - 8)
+        .filter(|at| &archive[*at..*at + 9] == b"other.txt")
+        .collect::<Vec<_>>()
+    {
+        archive[at..at + 9].copy_from_slice(b"first.txt");
+    }
+    assert_eq!(
+        run(&mut ZipEngine::new(), vec![archive]),
+        vec![Said::Refuse(Why::InvalidArchive)]
+    );
 }
 
 // Each member's checksum as the run said it, in the order it was said.
