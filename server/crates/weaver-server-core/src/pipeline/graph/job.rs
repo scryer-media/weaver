@@ -500,6 +500,11 @@ impl GraphJob {
         self.root.map.article_lost(volume, ordinal)
     }
 
+    // Every article the root holds lost, with its declared encoded size.
+    pub(crate) fn lost_articles(&self) -> impl Iterator<Item = (VolumeIndex, u32, u64)> + '_ {
+        self.root.map.lost_articles()
+    }
+
     pub(crate) fn ordered_front(&self, volume: VolumeIndex) -> (u32, u64, bool) {
         self.root.map.ordered_front(volume)
     }

@@ -1311,6 +1311,46 @@ async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
     assert_eq!(pipeline.segment_terminal_states.len(), 2);
 }
 
+// What the feed weighs a post on is kept as each article is given up, so
+// reading it walks nothing of the post: with the post's article lists
+// dropped, as a parked job drops them, the figures read the same, and the
+// losses alone are what the reads cost.
+#[tokio::test]
+async fn the_feed_reads_a_posts_losses_without_walking_its_articles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20021);
+    let segment_sizes = [1_000u32, 2_000, 3_000, 4_000];
+    // A sibling ten times the size keeps the post above its critical line.
+    let mut spec = segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes);
+    let sibling = segmented_job_spec("Silver Horizon", "silver-horizon-extra.mkv", &[10_000; 10]);
+    spec.total_bytes += sibling.total_bytes;
+    spec.files.extend(sibling.files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let segment = |segment_number| SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number,
+    };
+    pipeline.book_terminal_segment(segment(0), SegmentTerminalState::Missing);
+    pipeline.book_terminal_segment(segment(2), SegmentTerminalState::Unservable);
+    let read = |pipeline: &Pipeline| {
+        (
+            pipeline.missing_bytes(job_id),
+            pipeline.derived_failed_bytes(job_id),
+            pipeline.graph_article_given_up(segment(2)),
+            pipeline.graph_article_given_up(segment(1)),
+        )
+    };
+    assert_eq!(read(&pipeline), (1_000, 4_000, true, false));
+    for file in &mut pipeline.jobs.get_mut(&job_id).unwrap().spec.files {
+        file.segments.clear();
+    }
+    assert_eq!(read(&pipeline), (1_000, 4_000, true, false));
+}
+
 #[tokio::test]
 async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
     let temp_dir = tempfile::tempdir().unwrap();

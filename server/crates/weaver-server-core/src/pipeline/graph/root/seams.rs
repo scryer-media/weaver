@@ -104,6 +104,21 @@ impl Pipeline {
         };
         let moves = graph.sample();
         apply_moves(state, &moves);
+        // The articles a run before a restart lost are given up as this
+        // run's are, each weighed as the post declares it.
+        let given_up = self.given_up.entry(job_id).or_default();
+        for (volume, ordinal, bytes) in graph.lost_articles() {
+            let counts = state
+                .spec
+                .files
+                .get(volume.0 as usize)
+                .is_some_and(|file| file.role.counts_toward_health());
+            given_up.give_up(
+                segment(job_id, volume, ordinal),
+                None,
+                if counts { bytes } else { 0 },
+            );
+        }
         self.graph_jobs.insert(job_id, graph);
         self.adopt_held_parts(held_parts);
         let result = self.start_graph_runs(job_id);
@@ -187,16 +202,9 @@ impl Pipeline {
     // Whether an article of a graph job will never arrive: every server
     // failed it, in this run or one before a restart.
     pub(in crate::pipeline) fn graph_article_given_up(&self, segment_id: SegmentId) -> bool {
-        self.segment_terminal_states.contains_key(&segment_id)
-            || self
-                .graph_jobs
-                .get(&segment_id.file_id.job_id)
-                .is_some_and(|graph| {
-                    graph.article_lost(
-                        VolumeIndex(segment_id.file_id.file_index),
-                        segment_id.segment_number,
-                    )
-                })
+        self.given_up
+            .get(&segment_id.file_id.job_id)
+            .is_some_and(|given_up| given_up.holds(segment_id))
     }
 
     // Where the root of a graph job stands in laying a file in order, as

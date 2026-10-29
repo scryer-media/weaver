@@ -274,6 +274,7 @@ impl Pipeline {
             transport_failure_streaks: HashMap::new(),
             download_wait_by_job: HashMap::new(),
             segment_terminal_states: HashMap::new(),
+            given_up: HashMap::new(),
             terminal_reconciliations: HashMap::new(),
             files_counted_missing: HashSet::new(),
             server_quota_parked: HashSet::new(),

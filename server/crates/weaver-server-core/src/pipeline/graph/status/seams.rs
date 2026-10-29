@@ -312,15 +312,13 @@ impl Pipeline {
                     par2_damage_ignorable(&member.output_name, &ignore),
                 );
                 // An article the feed stopped asking for was never lost.
-                row.lost_articles = self
-                    .segment_terminal_states
-                    .iter()
-                    .filter(|(segment, state)| {
-                        segment.file_id == file_id
-                            && **state != crate::pipeline::SegmentTerminalState::Abandoned
-                    })
-                    .count();
-                row.lost_bytes = self.file_terminal_failed_bytes(file_id);
+                let losses = self
+                    .given_up
+                    .get(&job_id)
+                    .map(|given_up| given_up.file(file_id.file_index))
+                    .unwrap_or_default();
+                row.lost_articles = losses.lost;
+                row.lost_bytes = losses.bytes;
                 row.declared_bytes = file.segments.iter().map(|s| u64::from(s.bytes)).sum();
                 Some(row)
             })

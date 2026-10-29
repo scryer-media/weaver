@@ -48,6 +48,10 @@ use crate::jobs::model::{FileSpec, JobSpec};
 use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
 
+mod given_up;
+
+pub(in crate::pipeline) use given_up::GivenUp;
+
 // The fewest files a first-article verdict is worth taking. One article per
 // file is a sample, and a sample of a handful of files says very little: a
 // two-file post whose first file is missing is an ordinary damaged post, not
@@ -565,12 +569,11 @@ impl Pipeline {
     // The files the post names as payload that lost at least one article.
     // A lost recovery volume is not damage to the release.
     fn failing_files(&self, job_id: JobId, spec: &JobSpec) -> usize {
-        let failing: BTreeSet<u32> = self
-            .articles_missing(job_id)
-            .map(|segment| segment.file_id.file_index)
-            .collect();
-        failing
-            .into_iter()
+        let Some(given_up) = self.given_up.get(&job_id) else {
+            return 0;
+        };
+        given_up
+            .missing_files()
             .filter(|index| {
                 spec.files.get(*index as usize).is_some_and(|file| {
                     file.role.counts_toward_health() && !declares_recovery(file)
@@ -995,47 +998,10 @@ impl Pipeline {
         }
     }
 
-    // The post's articles that will never arrive, each with the end this
-    // run saw it come to: `None` for one that ended in a run before a
-    // restart, which the root was restored holding as lost.
-    pub(in crate::pipeline) fn articles_given_up(
-        &self,
-        job_id: JobId,
-    ) -> impl Iterator<Item = (SegmentId, Option<SegmentTerminalState>)> + '_ {
-        self.jobs
-            .get(&job_id)
-            .into_iter()
-            .flat_map(move |state| {
-                state
-                    .spec
-                    .files
-                    .iter()
-                    .zip(0u32..)
-                    .flat_map(move |(file, file_index)| {
-                        file.segments.iter().map(move |segment| SegmentId {
-                            file_id: NzbFileId { job_id, file_index },
-                            segment_number: segment.ordinal,
-                        })
-                    })
-            })
-            .filter(|segment| self.graph_article_given_up(*segment))
-            .map(|segment| (segment, self.segment_terminal_states.get(&segment).copied()))
-    }
-
-    // The post's articles every server said are gone, in this run or one
-    // before a restart. An article no server may fetch, or one the feed
-    // stopped asking for, is not one.
-    fn articles_missing(&self, job_id: JobId) -> impl Iterator<Item = SegmentId> + '_ {
-        self.articles_given_up(job_id)
-            .filter(|(_, state)| state.is_none_or(|state| state == SegmentTerminalState::Missing))
-            .map(|(segment, _)| segment)
-    }
-
-    // The bytes of the post the servers said are gone.
-    fn missing_bytes(&self, job_id: JobId) -> u64 {
-        self.articles_missing(job_id)
-            .map(|segment| self.health_counted_segment_bytes(segment))
-            .sum()
+    // The bytes of the post the servers said are gone, in this run or one
+    // before a restart.
+    pub(in crate::pipeline) fn missing_bytes(&self, job_id: JobId) -> u64 {
+        self.given_up.get(&job_id).map_or(0, GivenUp::missing_bytes)
     }
 
     // The feed gives the post up. Below its recovery line nothing can
@@ -1067,12 +1033,10 @@ impl Pipeline {
             .cloned()
             .unwrap_or_else(|| crate::jobs::feed_verdict::FeedVerdict::new(reason));
         let mut lost: BTreeSet<u32> = self
-            .segment_terminal_states
-            .iter()
-            .filter(|(segment, state)| {
-                segment.file_id.job_id == job_id && **state == SegmentTerminalState::Missing
-            })
-            .map(|(segment, _)| segment.file_id.file_index)
+            .given_up
+            .get(&job_id)
+            .into_iter()
+            .flat_map(GivenUp::missing_files)
             .collect();
         lost.extend(verdict.abandoned_files.iter().copied());
         let Some(active) = self

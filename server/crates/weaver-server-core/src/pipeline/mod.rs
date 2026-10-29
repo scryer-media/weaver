@@ -1329,6 +1329,9 @@ pub struct Pipeline {
     // The one terminal state each segment reached, and the only thing the
     // per-job failed-byte ledger is derived from.
     pub(in crate::pipeline) segment_terminal_states: HashMap<SegmentId, SegmentTerminalState>,
+    // Each job's articles that will never arrive, this run's and those its
+    // graph root was restored holding lost: what the feed weighs a post on.
+    pub(in crate::pipeline) given_up: HashMap<JobId, post_health::GivenUp>,
     // What the claim census concluded for a job on its way out, keyed until
     // the terminal record has been written from it.
     pub(in crate::pipeline) terminal_reconciliations: HashMap<JobId, TerminalReconciliation>,
