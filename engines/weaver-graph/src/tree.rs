@@ -1054,6 +1054,14 @@ impl Tree {
     // still hold what they closed whole: the member is a leaf again, and
     // those files are delivered beside it.
     pub fn kept(&self, node: NodeId, member: MemberId) -> impl Iterator<Item = NodeId> + '_ {
+        self.readers(node, member).filter(|id| self.buried(*id))
+    }
+
+    // Every node that reads `member` of `node`'s namespace as one of its
+    // volumes, live or retired: the object that owns it, an engine bound in
+    // a refused object's place, and the refused object itself while it
+    // stands.
+    pub fn readers(&self, node: NodeId, member: MemberId) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes
             .iter()
             .filter(move |(_, found)| {
@@ -1064,7 +1072,6 @@ impl Tree {
                 })
             })
             .map(|(id, _)| *id)
-            .filter(|id| self.buried(*id))
     }
 
     pub fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {

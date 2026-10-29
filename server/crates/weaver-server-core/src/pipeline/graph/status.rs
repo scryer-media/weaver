@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
-use weaver_graph::{Kind, MemberId, Namespace, NodeId, ObjectId};
+use weaver_graph::{Kind, MemberId, Namespace, NodeId, ObjectId, Tree};
 
 use super::job::GraphJob;
 use super::root::phase::RootPhase;
@@ -297,9 +297,10 @@ pub(crate) fn failure(
 // root ruled it cannot rebuild what it covers, every member of the root has
 // said what it is, and no payload member of the root can still come whole.
 // One can while it holds no damage, or while a set of the root that covers
-// it has not ruled impossible. A set below the root that rules impossible
-// settles nothing here: the subtree it covers is short, and what else the
-// job delivers whole is read once the job is done.
+// it has not ruled impossible, or while an object reading it may still
+// produce a file below it (`may_come_whole_below`). A set below the root
+// that rules impossible settles nothing here: the subtree it covers is
+// short, and what else the job delivers whole is read once the job is done.
 pub(crate) fn ruled_short(job: &GraphJob) -> Option<Failure> {
     let summary = RootJob::recovery_summary(job);
     let outcomes = summary.outcomes();
@@ -324,8 +325,36 @@ pub(crate) fn ruled_short(job: &GraphJob) -> Option<Failure> {
                 || writer
                     .covering(tree, &sets, member.id)
                     .any(|set| !failure.objects.contains(&set))
+                || may_come_whole_below(tree, NodeId::ROOT, member.id)
         });
     (!may_come_whole).then_some(failure)
+}
+
+// Whether a member an object reads may yet be delivered whole below it,
+// whatever its own bytes hold: the payload of an archive is what it
+// unpacks, not its volumes. An object still reading has not said what it
+// produces. One that gave its volumes up kept what it closed whole, and so
+// may an object below it; the walk delivers that when the job ends. A
+// recovery object produces no file.
+fn may_come_whole_below(tree: &Tree, node: NodeId, member: MemberId) -> bool {
+    tree.readers(node, member).any(|object| {
+        if tree.recovers(object) {
+            return false;
+        }
+        if tree.is_live(object) {
+            return true;
+        }
+        tree.namespace(object).is_some_and(|namespace| {
+            namespace.members().any(|below| {
+                !tree.buried_member(object, below.id)
+                    && match tree.child_of(object, below.id) {
+                        Some((child, _)) if tree.recovers(child) => false,
+                        Some(_) => may_come_whole_below(tree, object, below.id),
+                        None => below.is_whole(),
+                    }
+            })
+        })
+    })
 }
 
 fn label(kind: Kind) -> String {
