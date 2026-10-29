@@ -264,10 +264,12 @@ fn a_verified_piece_seeds_from_the_files_it_was_posted_to() {
     }
 }
 
-// The pieces of a RAR store archive: the job unpacks its member, keeps the
-// one copy of the bytes, and seeds the archive's pieces back from it.
+// The pieces of a RAR store archive: the job keeps the archive as the
+// torrent lists it, unpacks its member beside it, and seeds the archive's
+// pieces from the archive. The member is the operator's to move or delete:
+// the torrent seeds on without it, and so does its job restored.
 #[tokio::test]
-async fn a_rar_store_archive_in_pieces_delivers_its_member_and_seeds_from_it() {
+async fn a_rar_store_archive_in_pieces_is_kept_unpacked_beside_and_seeds_from_itself() {
     let archive = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
@@ -287,9 +289,12 @@ async fn a_rar_store_archive_in_pieces_delivers_its_member_and_seeds_from_it() {
         std::fs::read(shim.dir.path().join("small.txt")).unwrap(),
         member
     );
-    // The archive's bytes are not kept beside the member: the archive is
-    // read back through it.
-    assert!(!shim.dir.path().join("set.rar").exists());
+    assert_eq!(
+        std::fs::read(shim.dir.path().join("set.rar")).unwrap(),
+        archive
+    );
+
+    std::fs::remove_file(shim.dir.path().join("small.txt")).unwrap();
     for piece in 0..pieces {
         let range = shim.layout.piece_range(piece);
         assert_eq!(
@@ -298,6 +303,61 @@ async fn a_rar_store_archive_in_pieces_delivers_its_member_and_seeds_from_it() {
             "piece {piece}"
         );
     }
+
+    let rows = crate::pipeline::graph::checkpoint::rows(&shim.job.with(|job| job.snapshot()));
+    let snapshot = crate::pipeline::graph::checkpoint::snapshot(&rows).unwrap();
+    let restored = GraphJob::restore_torrent(
+        &snapshot,
+        Arc::clone(&shim.layout),
+        1,
+        storage(shim.dir.path(), &shim.mail),
+        1,
+    )
+    .unwrap();
+    assert!(restored.refetched.is_empty());
+    assert!(restored.job.have().all());
+    for piece in 0..pieces {
+        let range = shim.layout.piece_range(piece);
+        let mut read = Vec::new();
+        assert!(restored.job.posted(VolumeIndex(0), range, &mut read));
+        assert_eq!(
+            read,
+            archive[range.start as usize..range.end as usize],
+            "piece {piece}"
+        );
+    }
+}
+
+// libtorrent `storage_utils::delete_files`: deleting a torrent's files
+// removes them, here with what its job unpacked from them, and then each
+// directory that leaves empty. A file the operator put beside them stays,
+// and so does its directory until it is empty.
+#[tokio::test]
+async fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else() {
+    let archive = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let mut shim = shim(128, vec![file("sub/set.rar", archive.len() as u64)]);
+    for piece in 0..shim.layout.piece_count() {
+        shim.complete(piece, archive);
+    }
+    shim.settle().await;
+    let dir = shim.dir.path().to_path_buf();
+    assert!(dir.join("sub/set.rar").exists());
+    std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+
+    let written = shim.job.with(|job| job.written());
+    crate::torrents::service::delete_written(&dir, &written);
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["notes.txt"]);
+
+    std::fs::remove_file(dir.join("notes.txt")).unwrap();
+    crate::torrents::service::delete_written(&dir, &written);
+    assert!(!dir.exists());
 }
 
 // libtorrent `torrent::on_piece_hashed` has only the pieces that pass: a

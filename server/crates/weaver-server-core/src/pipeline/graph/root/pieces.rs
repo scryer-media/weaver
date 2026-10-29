@@ -492,6 +492,15 @@ impl Root for PieceRoot {
     fn reads_back(&self, tree: &Tree, member: MemberId) -> bool {
         tree.child_of(NodeId::ROOT, member).is_some() || tree.is_windowed(NodeId::ROOT, member)
     }
+
+    // A torrent's files are what it seeds: each stays as its metainfo
+    // names it, whatever unpacking makes of it.
+    fn kept_files(&self) -> Vec<String> {
+        (0..self.layout.volume_count())
+            .filter_map(|volume| self.layout.volume(VolumeIndex(volume as u32)))
+            .map(|file| file.name.clone())
+            .collect()
+    }
 }
 
 // A piece's hash vouches for no block the namespace's recovery objects

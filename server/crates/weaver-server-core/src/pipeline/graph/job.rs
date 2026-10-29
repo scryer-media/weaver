@@ -217,10 +217,11 @@ impl<R: Root> GraphJob<R> {
         root: R,
         members: impl Iterator<Item = (&'a str, Option<u64>)>,
         mut builder: Box<dyn Builder + Send + Sync>,
-        mut writer: NamespaceWriter,
+        writer: NamespaceWriter,
         runs: Runs,
         nesting: u32,
     ) -> Self {
+        let mut writer = writer.keeping(root.kept_files());
         let mut tree = Tree::new();
         tree.nest_at_most(nesting);
         let mut out = Vec::new();
@@ -433,6 +434,12 @@ impl<R: Root> GraphJob<R> {
             .files(NodeId::ROOT)
             .map(|(member, path)| (member, path.to_path_buf()))
             .collect()
+    }
+
+    // Every path the job wrote under its directory: what deleting its files
+    // removes.
+    pub(crate) fn written(&self) -> Vec<PathBuf> {
+        self.writer.written()
     }
 
     // Seam for status: whether the job spends the root member rather than

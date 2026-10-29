@@ -3479,14 +3479,17 @@ impl TorrentService {
             fetch.abort();
             self.inner.counters.fetch(FetchOutcome::Cancelled);
         }
+        let written = torrent
+            .job
+            .as_ref()
+            .map(|job| job.with(|job| job.written()))
+            .unwrap_or_default();
         self.detach(&mut torrent).await;
         if delete_files && let Some(dir) = torrent.record.storage_dir.clone() {
-            match tokio::fs::remove_dir_all(&dir).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::warn!(job_id = job_id.0, error = %error, "could not delete a torrent's files");
-                }
+            let deleted =
+                tokio::task::spawn_blocking(move || delete_written(Path::new(&dir), &written));
+            if let Err(error) = deleted.await {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not delete a torrent's files");
             }
         }
         // The job's outcome: complete, refused by unpacking, or cut short.
@@ -5107,6 +5110,40 @@ enum FromCheckpoint {
 // Where the torrent's job keeps its files.
 fn storage_dir(torrent: &Live) -> PathBuf {
     PathBuf::from(torrent.record.storage_dir.clone().unwrap_or_default())
+}
+
+// libtorrent `storage_utils::delete_files`: the torrent's files go, here
+// with what its job made of them, and then every directory that leaves
+// empty. Whatever else is in its directory stays.
+pub(super) fn delete_written(dir: &Path, written: &[PathBuf]) {
+    for path in written {
+        let removed = match std::fs::symlink_metadata(path) {
+            Ok(found) if found.is_dir() => std::fs::remove_dir_all(path),
+            Ok(_) => std::fs::remove_file(path),
+            Err(error) => Err(error),
+        };
+        match removed {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(file = %path.display(), error = %error, "could not delete a torrent's file");
+            }
+        }
+    }
+    remove_empty(dir);
+}
+
+// The directory, once every directory under it that is empty went first,
+// if it is empty then.
+fn remove_empty(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                remove_empty(&entry.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 // Whether the torrent's job unpacks, as its metainfo fixed it.

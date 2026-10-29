@@ -805,8 +805,11 @@ impl NamespaceWriter {
             .partition(|effect| matches!(effect, Effect::Renamed { .. }));
         self.moved(&moves)?;
         // A recognised member's length is the description's: its file, if
-        // it has one, takes it.
+        // it has one, takes it. A kept member's file keeps its own.
         for member in &renamed {
+            if self.kept(node, *member).is_some() {
+                continue;
+            }
             let length = tree
                 .namespace(node)
                 .and_then(|namespace| namespace.get(*member))

@@ -108,7 +108,8 @@ impl<R: Root> GraphJob<R> {
             storage.accountant,
             storage.free_disk,
         )
-        .capped(storage.caps);
+        .capped(storage.caps)
+        .keeping(root.kept_files());
         writer.restore_members(&tree);
         for ((node, member), state) in &snapshot.files {
             if tree
@@ -332,7 +333,7 @@ impl<R: Root> GraphJob<R> {
     fn deliver_again(&mut self, read: ReadBack) -> Result<(), GraphError> {
         for (range, bytes, provenance) in read.pieces {
             let mut out = Vec::new();
-            self.writer.deliver(
+            self.writer.deliver_again(
                 &mut self.tree,
                 &mut *self.builder,
                 &self.root,

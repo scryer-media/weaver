@@ -8,7 +8,7 @@
 // the provenance it arrived with, by the one write path. The file is no
 // delivery of its own after that, and its bytes no longer count against the
 // job's output, unless the object is a recovery object, whose volumes live
-// in their files.
+// in their files, or the member is one the job keeps.
 
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Effect, MemberId, NodeId, Provenance, Tree};
@@ -111,9 +111,10 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
-        let owned_elsewhere = tree
-            .child_of(node, member)
-            .is_some_and(|(child, _)| !tree.recovers(child));
+        let owned_elsewhere = self.kept(node, member).is_none()
+            && tree
+                .child_of(node, member)
+                .is_some_and(|(child, _)| !tree.recovers(child));
         if owned_elsewhere {
             let files = self.files_mut(node);
             files.refused.remove(&member);
