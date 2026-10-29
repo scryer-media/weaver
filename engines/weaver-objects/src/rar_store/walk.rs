@@ -352,10 +352,9 @@ impl Walk {
         }
         // The end record lies past the last data area: a damaged byte there
         // may be its own.
-        let more = (walk.short_at.is_none() && !damaged_past(kept, reach))
-            .then_some(facts.more_volumes);
-        let moved =
-            self.facts.as_ref() != Some(&facts) || self.ended != ended || self.more != more;
+        let more =
+            (walk.short_at.is_none() && !damaged_past(kept, reach)).then_some(facts.more_volumes);
+        let moved = self.facts.as_ref() != Some(&facts) || self.ended != ended || self.more != more;
         self.blocks = facts
             .members
             .iter()
