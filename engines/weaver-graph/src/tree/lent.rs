@@ -283,7 +283,7 @@ impl Tree {
                     object.volume_closed(volume, &mut emits);
                 }
                 Told::Lost { volume, range } => object.volume_lost(volume, range, &mut emits),
-                Told::Renamed { volume, name } => object.renamed(volume, &name),
+                Told::Renamed { volume, name } => object.renamed(volume, &name, &mut emits),
                 Told::Pulled { seek, pull } => object.pulled(seek, pull, &mut emits),
                 Told::Fed { member, evidence } => {
                     if let Some(recovery) = object.recovery_mut() {

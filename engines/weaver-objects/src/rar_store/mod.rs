@@ -35,9 +35,11 @@ use weaver_graph::{
 use zeroize::Zeroizing;
 
 use crate::crypt::{Cbc, Chain, Padding};
+use crate::engine::SetName;
 use crate::grid::crc32;
 use crate::kept::Kept;
 use crate::keys::Keys;
+use crate::rar_engine::naming;
 use crate::runs::CrcRuns;
 use walk::{Step, Walk};
 
@@ -682,15 +684,30 @@ impl Object for RarStore {
             .claimed(self.gone, self.past())
     }
 
-    // What was read of the volume goes with it, unless it is more than a
-    // volume's headers can need: then the member is refused, never read
-    // again.
+    // A volume contributes to no member yet and can travel with all the
+    // parse it owns. This is also the guard on a transfer the tree asks for.
+    fn carried(&self, volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        if self
+            .entries
+            .iter()
+            .flat_map(|entry| &entry.pieces)
+            .any(|piece| piece.volume == volume)
+        {
+            return None;
+        }
+        let held = self
+            .giving
+            .get(&volume)
+            .or_else(|| self.volumes.get(&volume))?;
+        (held.kept.len() <= claim::CARRIED).then_some(held)
+    }
+
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        self.carried(volume)?;
         self.stale = true;
         self.giving
             .remove(&volume)
             .or_else(|| self.volumes.remove(&volume))
-            .filter(|given| given.kept.len() <= claim::CARRIED)
             .map(|volume| Box::new(volume) as weaver_graph::Carried)
     }
 
@@ -712,8 +729,14 @@ impl Object for RarStore {
         claim::yields(volume, holder, facts.as_ref())
     }
 
-    fn reclaim(&mut self, name: &str, carried: &weaver_graph::Carried) -> Option<VolumeIndex> {
-        self.reclaim_volume(name, carried.downcast_ref::<Volume>()?)?
+    fn reclaim(
+        &self,
+        name: &str,
+        front: &[u8],
+        _length: Option<u64>,
+        carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Option<VolumeIndex> {
+        self.reclaim_volume(name, front, carried.downcast_ref::<Volume>()?)?
             .claimed(self.gone, self.past())
     }
 
@@ -732,9 +755,15 @@ impl Object for RarStore {
         self.stale = true;
     }
 
-    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
-        if let Some(found) = self.volumes.get_mut(&volume) {
-            found.name = Some(name.to_owned());
+    fn renamed(&mut self, volume: VolumeIndex, name: &str, out: &mut Vec<Emit>) {
+        let Some(found) = self.volumes.get_mut(&volume) else {
+            return;
+        };
+        found.name = Some(name.to_owned());
+        let misplaced = naming::parse(name).is_some_and(|named| named.index() != volume.0)
+            && !claim::settled(volume, found);
+        if misplaced && self.carried(volume).is_some() {
+            self.give_back_held(vec![volume], out);
         }
     }
 

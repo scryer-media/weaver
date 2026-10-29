@@ -911,7 +911,7 @@ impl Object for SevenZipStore {
         }
     }
 
-    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
+    fn renamed(&mut self, volume: VolumeIndex, name: &str, _out: &mut Vec<Emit>) {
         self.names.insert(volume, name.to_owned());
     }
 

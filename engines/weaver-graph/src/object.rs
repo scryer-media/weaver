@@ -421,6 +421,14 @@ pub trait Object: Send + Sync {
         false
     }
 
+    // The parse a volume can carry to another owner, without changing this
+    // object. Only a volume whose bytes contribute to no output may travel.
+    // A sibling judges this same parse before the tree changes any binding;
+    // `give_back` then transfers it. No bytes are read to answer.
+    fn carried(&self, _volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+
     // A volume I said I give back: what I parsed of it, to travel with the
     // member, or `None` when I keep nothing of it worth carrying or more
     // than an object may carry, and the member is refused instead.
@@ -433,11 +441,16 @@ pub trait Object: Send + Sync {
     // from here.
     fn taken(&mut self, _volume: VolumeIndex) {}
 
-    // A member a sibling gave back, offered with what that sibling parsed
-    // of it: is it one of my volumes? Answered from what was parsed, never
-    // by reading the member again; `None` from an object that cannot read
-    // what was carried.
-    fn reclaim(&mut self, _name: &str, _carried: &Carried) -> Option<VolumeIndex> {
+    // A sibling's transferable volume, with its retained front and parse:
+    // is it one of mine? The parse outranks the front and name wherever it
+    // says more. This only reads, and never fetches the member again.
+    fn reclaim(
+        &self,
+        _name: &str,
+        _front: &[u8],
+        _length: Option<u64>,
+        _carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Option<VolumeIndex> {
         None
     }
 
@@ -448,7 +461,9 @@ pub trait Object: Send + Sync {
     }
 
     // My volume's member has another name now: a recovery set named it.
-    fn renamed(&mut self, _volume: VolumeIndex, _name: &str) {}
+    // A stronger name can change its placement, through the same emits as
+    // a delivery. The tree applies them before making further claims.
+    fn renamed(&mut self, _volume: VolumeIndex, _name: &str, _out: &mut Vec<Emit>) {}
 
     // My set was refused, whoever said why: I read nothing more, and what I
     // claim after goes where the set went.

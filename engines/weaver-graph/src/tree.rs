@@ -1336,7 +1336,8 @@ impl Tree {
     // it; a member no object owns is asked again who owns it, as a new
     // member is. An owner its bytes founded then takes what the name now
     // places from a sibling founded by names alone, as it does when it is
-    // founded. No other owner loses a member here.
+    // founded. A sibling with parsed state transfers only what it can
+    // carry and this owner accepts.
     fn renamed(
         &mut self,
         node: NodeId,
@@ -1354,17 +1355,10 @@ impl Tree {
         let Some((child, volume)) = self.child_of(node, member) else {
             return self.identify_again(node, member, builder, effects);
         };
-        let told = Told::Renamed {
-            volume,
-            name: name.clone(),
-        };
-        if self.wait(child, Waiting::Told(told)).is_some()
-            && let Some(object) = self
-                .nodes
-                .get_mut(&child)
-                .and_then(|found| found.object.as_mut())
-        {
-            object.renamed(volume, &name);
+        self.reach(child, Told::Renamed { volume, name }, builder, effects);
+        // The object's answer may already have returned and reassigned it.
+        if self.child_of(node, member) != Some((child, volume)) {
+            return;
         }
         if self.founded_by_name(child) && !self.still_claims(node, child, member, volume) {
             return self.release_named(node, child, (volume, member), builder, effects);
@@ -1386,7 +1380,7 @@ impl Tree {
             }
         }
         if !self.founded_by_name(child) {
-            self.take_named(node, child, effects);
+            self.take_claimed(node, child, effects);
         }
     }
 
@@ -1942,7 +1936,7 @@ impl Tree {
         }
         let volumes = |object: &mut dyn Object, given: &Given| {
             let volume = match given.get(&(node, member)) {
-                Some(carried) => object.reclaim(name, carried)?,
+                Some(carried) => object.reclaim(name, prefix, length, carried.as_ref())?,
                 None => object.claim(name, prefix, length).unwrap_or(VolumeIndex(0)),
             };
             Some(BTreeMap::from([(volume, member)]))
@@ -1952,7 +1946,7 @@ impl Tree {
                 self.bound(node, member, kind, child, effects);
                 self.offer_unowned(node, child, effects);
                 if matches!(signed(prefix, length), Sniff::Object(_)) {
-                    self.take_named(node, child, effects);
+                    self.take_claimed(node, child, effects);
                 }
                 self.found_by_name(node, builder, effects);
             }
@@ -2029,19 +2023,18 @@ impl Tree {
         })
     }
 
-    // An object its bytes founded takes, from each sibling founded by name
-    // alone, every volume its own claim places: a name is all that held
-    // them there, and bytes outrank names. The volume goes as one given
-    // back does, its file the member's own and nothing copied, straight to
-    // its new owner, never offered to the sibling again. A sibling left
-    // with no volume goes.
-    fn take_named(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
-        let named: Vec<NodeId> = self
+    // An established object takes the volumes its siblings can transfer
+    // and its own claims accept. Names alone yield to bytes as before;
+    // an owner with parsed state must consent, and the receiver judges that
+    // parse before any edge changes. Routed output never moves with a
+    // volume. The existing give-back/adopt path keeps its bytes in place.
+    fn take_claimed(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
+        let siblings: Vec<NodeId> = self
             .bound_below(node)
             .into_iter()
-            .filter(|sibling| *sibling != child && self.founded_by_name(*sibling))
+            .filter(|sibling| *sibling != child && !self.lent(*sibling))
             .collect();
-        for sibling in named {
+        for sibling in siblings {
             let held: Vec<(VolumeIndex, MemberId)> = self
                 .nodes
                 .get(&sibling)
@@ -2060,12 +2053,25 @@ impl Tree {
                 }) else {
                     continue;
                 };
-                let Some(place) = self
-                    .nodes
-                    .get_mut(&child)
-                    .and_then(|found| found.object.as_mut())
-                    .and_then(|object| object.claim(&name, &front, length))
-                else {
+                let named = self.founded_by_name(sibling);
+                let place = if named {
+                    self.nodes
+                        .get_mut(&child)
+                        .and_then(|found| found.object.as_mut())
+                        .and_then(|object| object.claim(&name, &front, length))
+                } else {
+                    self.nodes
+                        .get(&sibling)
+                        .and_then(|found| found.object.as_ref())
+                        .and_then(|object| object.carried(volume))
+                        .and_then(|carried| {
+                            self.nodes
+                                .get(&child)
+                                .and_then(|found| found.object.as_ref())
+                                .and_then(|object| object.reclaim(&name, &front, length, carried))
+                        })
+                };
+                let Some(place) = place else {
                     continue;
                 };
                 // A place the object holds already: the member is another
@@ -2087,6 +2093,17 @@ impl Tree {
                     holder.is_some_and(|into| front.is_empty() && !self.held_by_name(node, into));
                 if !folds && !outranked {
                     continue;
+                }
+                if !named {
+                    let Some(carried) = self
+                        .nodes
+                        .get_mut(&sibling)
+                        .and_then(|found| found.object.as_mut())
+                        .and_then(|object| object.give_back(volume))
+                    else {
+                        continue;
+                    };
+                    self.given.insert((node, member), carried);
                 }
                 self.release(node, sibling, (volume, member), effects);
                 match holder {
@@ -2182,7 +2199,7 @@ impl Tree {
             // A member given back is claimed by what was parsed of it.
             let carried = self.given.get(&(node, member));
             let Some(volume) = found.object.as_mut().and_then(|object| match carried {
-                Some(carried) => object.reclaim(&name, carried),
+                Some(carried) => object.reclaim(&name, prefix, length, carried.as_ref()),
                 None => object.claim(&name, prefix, length),
             }) else {
                 continue;
@@ -2254,7 +2271,7 @@ impl Tree {
     }
 
     // The holder of a place its object holds provisionally makes way for a
-    // claim that names the place, as take_named moves a volume: the holder
+    // claim that names the place, as take_claimed moves a volume: the holder
     // leaves the object with what was parsed of it, its holds in place, and
     // is parked as a member given back, so the claimant joins the place
     // first and the holder is offered again beside it.
@@ -5068,7 +5085,13 @@ mod tests {
                 .remove(&volume)
                 .map(|name| Box::new(name) as Carried)
         }
-        fn reclaim(&mut self, _: &str, carried: &Carried) -> Option<VolumeIndex> {
+        fn reclaim(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<u64>,
+            carried: &(dyn std::any::Any + Send + Sync),
+        ) -> Option<VolumeIndex> {
             if self.full {
                 return None;
             }
@@ -5298,7 +5321,13 @@ mod tests {
             self.held.retain(|held| *held != volume);
             Some(Box::new(volume))
         }
-        fn reclaim(&mut self, _: &str, carried: &Carried) -> Option<VolumeIndex> {
+        fn reclaim(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<u64>,
+            carried: &(dyn std::any::Any + Send + Sync),
+        ) -> Option<VolumeIndex> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             carried.downcast_ref::<VolumeIndex>().copied()
         }
