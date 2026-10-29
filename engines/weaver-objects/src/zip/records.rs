@@ -129,7 +129,7 @@ pub(crate) fn end64(bytes: &[u8], end: End) -> Option<End> {
 }
 
 // What an entry is, for the reader that streams it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Shape {
     File,
     Directory,
@@ -157,7 +157,7 @@ pub(crate) fn member_name(mut name: String, shape: Shape) -> String {
 }
 
 // An entry as the central directory, or a local header, describes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Header {
     pub(crate) name: String,
     pub(crate) flags: u16,
@@ -165,13 +165,19 @@ pub(crate) struct Header {
     pub(crate) crc: u32,
     pub(crate) compressed: u64,
     pub(crate) length: u64,
-    pub(crate) aes: bool,
     pub(crate) shape: Shape,
+    // The name's own bytes, the last Unicode path and AES fields' bodies,
+    // and the DOS time and date: what the two headers of one entry must
+    // also agree on.
+    pub(crate) raw: Vec<u8>,
+    pub(crate) unicode: Option<Vec<u8>>,
+    pub(crate) aes: Option<Vec<u8>>,
+    pub(crate) modified: u32,
 }
 
 impl Header {
     pub(crate) fn encrypted(&self) -> bool {
-        self.flags & ENCRYPTED != 0 || self.aes || self.method == AES_METHOD
+        self.flags & ENCRYPTED != 0 || self.aes.is_some() || self.method == AES_METHOD
     }
 
     pub(crate) fn stored(&self) -> bool {
@@ -258,19 +264,22 @@ fn central(bytes: &[u8], at: usize) -> Option<(Central, usize)> {
     let disk = wide.take_disk(u32::from(disk), disk == u16::MAX)?;
 
     let mode = (made_by == UNIX).then_some(external >> 16);
-    let name = decode(name, extra);
-    let shape = shape(&name, mode);
+    let decoded = decode(name, extra);
+    let shape = shape(&decoded, mode);
     Some((
         Central {
             header: Header {
-                name,
+                name: decoded,
                 flags,
                 method,
                 crc,
                 compressed,
                 length,
-                aes: field(extra, AES).is_some(),
                 shape,
+                raw: name.to_vec(),
+                unicode: last(extra, UNICODE_PATH),
+                aes: last(extra, AES),
+                modified: u32_at(bytes, at + 12)?,
             },
             disk,
             offset,
@@ -308,22 +317,45 @@ pub(crate) fn local(bytes: &[u8]) -> Option<Header> {
     let mut sizes = Wide::new(extra, extra_at);
     let length = sizes.take(u64::from(length), wide)?;
     let compressed = sizes.take(u64::from(compressed), wide)?;
-    let name = decode(name, extra);
-    let shape = if name.ends_with(['/', '\\']) {
+    let decoded = decode(name, extra);
+    let shape = if decoded.ends_with(['/', '\\']) {
         Shape::Directory
     } else {
         Shape::File
     };
     Some(Header {
-        name,
+        name: decoded,
         flags,
         method: u16_at(bytes, 8)?,
         crc: u32_at(bytes, 14)?,
         compressed,
         length,
-        aes: field(extra, AES).is_some(),
         shape,
+        raw: name.to_vec(),
+        unicode: last(extra, UNICODE_PATH),
+        aes: last(extra, AES),
+        modified: u32_at(bytes, 10)?,
     })
+}
+
+// Whether an entry's local header says what its directory entry says, as
+// the zip library compares them: an entry whose two headers disagree reads
+// as one file to a reader of the directory and as another to one that walks
+// the headers. A local header whose sizes and checksum follow the data may
+// leave them zero.
+pub(crate) fn agree(local: &Header, central: &Header) -> bool {
+    const SAID: u16 = ENCRYPTED | DESCRIPTOR;
+    let pending = local.deferred();
+    let data = |local: u64, central: u64| local == central || (pending && local == 0);
+    local.raw == central.raw
+        && local.unicode == central.unicode
+        && local.method == central.method
+        && local.flags & SAID == central.flags & SAID
+        && local.modified == central.modified
+        && local.aes == central.aes
+        && data(u64::from(local.crc), u64::from(central.crc))
+        && data(local.compressed, central.compressed)
+        && data(local.length, central.length)
 }
 
 // What a header starting at a place in a set is: a local header, the start
@@ -388,6 +420,14 @@ const CP437: [char; 128] = [
     '\u{2248}', //
     '\u{b0}', '\u{2219}', '\u{b7}', '\u{221a}', '\u{207f}', '\u{b2}', '\u{25a0}', '\u{a0}', //
 ];
+
+// The body of the last extra field of an id, as the zip library takes it.
+fn last(extra: &[u8], id: u16) -> Option<Vec<u8>> {
+    fields(extra)
+        .filter(|(kind, _, _)| *kind == id)
+        .last()
+        .map(|(_, _, body)| body.to_vec())
+}
 
 // The body of an extra field by its id, and where it starts.
 fn field(extra: &[u8], id: u16) -> Option<(usize, &[u8])> {

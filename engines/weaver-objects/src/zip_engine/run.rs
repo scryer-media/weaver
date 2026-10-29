@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use ::zip::read::ZipReadOptions;
 use bytes::Bytes;
 use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 
@@ -83,11 +84,15 @@ impl Walk<'_, '_> {
             .archive()
             .map_err(|error| Some(verdict::zip(&error)))?;
         for index in 0..archive.len() {
-            let file = match password {
-                Some(password) => archive.by_index_decrypt(index, password.as_bytes()),
-                None => archive.by_index(index),
-            };
-            let mut file = file.map_err(|error| Some(verdict::zip(&error)))?;
+            // An entry whose local header says another name, size or method
+            // than the directory is two files at once: the one the directory
+            // lists and the one a header walk finds. Neither is the member.
+            let options = ZipReadOptions::new()
+                .password(password.map(str::as_bytes))
+                .enforce_header_consistency(true);
+            let mut file = archive
+                .by_index_with_options(index, options)
+                .map_err(|error| Some(verdict::zip(&error)))?;
             let name = file
                 .name()
                 .map_err(|error| Some(verdict::zip(&error)))?

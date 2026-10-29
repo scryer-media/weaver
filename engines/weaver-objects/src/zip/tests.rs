@@ -14,7 +14,7 @@ use weaver_graph::{
 
 use super::Zip;
 use super::records::{self, LOCAL_LEN};
-use crate::testing::{payload, zip64_end};
+use crate::testing::{cloak, payload, zip64_end};
 use owner::Owner;
 
 fn files() -> Vec<(&'static str, Vec<u8>)> {
@@ -366,6 +366,44 @@ fn an_archive_ended_by_zip64_records_streams_and_one_placing_them_past_its_bytes
 
     let mut bytes = archive();
     zip64_end(&mut bytes, 1, |said| said.record = u64::MAX - 8);
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
+    assert!(owner.members.is_empty());
+}
+
+#[test]
+fn an_entry_whose_local_header_names_another_file_goes_to_an_engine_unstreamed() {
+    let mut bytes = archive();
+    cloak(&mut bytes, "beta.bin", "bet4.bin");
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+    assert!(owner.member("bet4.bin").bytes.is_empty());
+    assert!(!owner.members.values().any(|got| got.name == "beta.bin"));
+}
+
+#[test]
+fn a_walk_whose_headers_the_directory_contradicts_goes_to_an_engine() {
+    let mut bytes = archive();
+    cloak(&mut bytes, "gamma.bin", "gamm4.bin");
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.pull = Pull::Unseekable;
+    owner.frames(0, 4096);
+    owner.close(0);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+}
+
+#[test]
+fn two_entries_of_one_name_go_to_an_engine_before_any_member() {
+    let mut bytes = archive();
+    cloak(&mut bytes, "gamma.bin", "alpha.bin");
+    // Both headers of the second entry say the first's name.
+    let local = bytes
+        .windows(9)
+        .position(|window| window == b"gamma.bin")
+        .unwrap();
+    bytes[local..local + 9].copy_from_slice(b"alpha.bin");
     let mut owner = Owner::single(Zip::new(), bytes);
     owner.whole(4096);
     assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);

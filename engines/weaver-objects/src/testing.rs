@@ -100,6 +100,22 @@ pub(crate) fn zip64_end(last: &mut Vec<u8>, disks: u32, edit: impl FnOnce(&mut Z
     last.extend(0u16.to_le_bytes());
 }
 
+// A whole zip cloaked: the directory entry named `from` renamed `to`, a
+// name of the same length, while its local header keeps the old one.
+pub(crate) fn cloak(archive: &mut [u8], from: &str, to: &str) {
+    use crate::zip::records::{CENTRAL_LEN, directory, find_end};
+    assert_eq!(from.len(), to.len());
+    let end = find_end(archive).unwrap();
+    let start = end.offset as usize;
+    let entries = directory(&archive[start..start + end.size as usize], end.entries).unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry.header.name == from)
+        .unwrap();
+    let name = start + entry.span.start + CENTRAL_LEN;
+    archive[name..name + to.len()].copy_from_slice(to.as_bytes());
+}
+
 // A PAR2 set over `files`, made by par2-rs's creator: the index first, then
 // the recovery volumes.
 pub(crate) fn par2_set(

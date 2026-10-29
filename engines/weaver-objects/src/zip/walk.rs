@@ -3,9 +3,10 @@
 
 // Walking the local headers from the front, when the directory cannot be
 // had first. Each header says its entry's name and sizes, so a stored entry
-// streams as soon as its header is in; the walk stops at the directory. A
-// header whose sizes follow the data cannot say where its entry ends, and
-// a local header carries no file mode, so here a link reads as a file.
+// streams as soon as its header is in; the walk stops at the directory,
+// which every header walked must then agree with. A header whose sizes
+// follow the data cannot say where its entry ends, and a local header
+// carries no file mode, so here a link reads as a file.
 
 use weaver_graph::{ByteRange, Emit, MemberId, Why};
 
@@ -71,6 +72,7 @@ impl Zip {
             let member = MemberId(self.members.len() as u32);
             let length = self.announce(member, &header, out);
             let data = cursor + len;
+            let compressed = header.compressed;
             let Some(map) = &mut self.map else {
                 return;
             };
@@ -82,12 +84,13 @@ impl Zip {
                 crc: header.crc,
                 data: Some(data),
                 streams: length > 0,
+                expected: Some(header),
             });
-            map.frontier = data + header.compressed;
+            map.frontier = data + compressed;
             // What follows the data, a directory entry's included, is the
             // envelope's.
             if length == 0 {
-                self.want(ByteRange::new(data, data + header.compressed), false);
+                self.want(ByteRange::new(data, data + compressed), false);
             }
             self.emit_kept(member, out);
         }

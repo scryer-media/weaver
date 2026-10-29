@@ -10,6 +10,8 @@
 
 use weaver_graph::{ByteRange, Coverage, MemberId};
 
+use super::records::Header;
+
 // What has been said for one member.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Out {
@@ -30,6 +32,10 @@ pub(super) struct Entry {
     // for an entry whose bytes stream into its member.
     pub(super) data: Option<u64>,
     pub(super) streams: bool,
+    // What the record read first says of the entry, until the other says
+    // the same: the directory's, until the local header is read, or the
+    // local header's, until the walk's directory is.
+    pub(super) expected: Option<Header>,
 }
 
 impl Entry {
@@ -62,6 +68,9 @@ pub(super) struct Map {
     pub(super) end: Option<u64>,
     // Where the walk has read to: everything before it is placed.
     pub(super) frontier: u64,
+    // The entries were held against the directory: built from it, or
+    // walked and then found in it.
+    pub(super) checked: bool,
 }
 
 impl Map {

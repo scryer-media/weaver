@@ -13,7 +13,7 @@ use weaver_graph::{
 };
 
 use super::ZipEngine;
-use crate::testing::{payload, zip64_end};
+use crate::testing::{cloak, payload, zip64_end};
 use crate::zip::records;
 
 const NOTES: &[u8] = b"the first member, stored";
@@ -783,6 +783,16 @@ fn the_store_and_the_engine_name_an_entry_alike_whatever_its_bytes_and_flag() {
         assert_eq!(local, store, "{case}: local and central headers");
         assert_eq!(store, "café.txt", "{case}");
     }
+}
+
+#[test]
+fn an_entry_whose_local_header_names_another_file_is_refused_unsaid() {
+    let mut archive = plain();
+    cloak(&mut archive, "deep/second.bin", "deep/secand.bin");
+    let mut expected = plain_said();
+    expected.truncate(5);
+    expected.push(Said::Refuse(Why::Unsupported));
+    assert_eq!(run(&mut ZipEngine::new(), vec![archive]), expected);
 }
 
 // Each member's checksum as the run said it, in the order it was said.

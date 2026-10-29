@@ -88,7 +88,8 @@ pub struct Zip {
 impl Durable for Zip {
     // 4: the grid shelved by chunk of blocks, kept apart from the bytes.
     // 5: a sealed value encodes as nothing, numbered by its owner's walk.
-    const VERSION: u16 = 5;
+    // 6: every entry keeps one record's header until the other agrees.
+    const VERSION: u16 = 6;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)
@@ -290,6 +291,14 @@ impl Zip {
         self.find_recovery(out);
         if self.walking {
             self.walk(out);
+            if !self.gone
+                && self
+                    .map
+                    .as_ref()
+                    .is_some_and(|map| map.end.is_some() && !map.checked)
+            {
+                self.read_directory(out);
+            }
         } else if self.map.is_none() {
             self.read_directory(out);
         }

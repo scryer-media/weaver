@@ -4,9 +4,13 @@
 // Reading the directory: the end record from the container's tail, the
 // zip64 records it points at, then the directory, whose entries are every
 // member, said in directory order. One entry the store cannot stream sends
-// the whole container to an engine before any member is said. Each stored
-// entry's data then waits for its local header, whose own name and extra
-// lengths say where the data starts.
+// the whole container to an engine before any member is said. Each entry
+// then waits for its local header, which must say what the directory says,
+// and whose own name and extra lengths say where a stored entry's data
+// starts. A walk that reaches the directory reads it too, and holds every
+// header it walked against it.
+
+use std::collections::HashSet;
 
 use weaver_graph::{ByteRange, Emit, MemberId, VolumeIndex, Why};
 
@@ -17,13 +21,13 @@ use crate::grid::crc32;
 use crate::zip_engine::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
 
 impl Zip {
-    // Keep and bid for a range the directory read needs; its bytes once they
-    // are all in.
+    // Keep a range the directory read needs, and bid for it unless a walk
+    // reads it in the normal order; its bytes once they are all in.
     fn need(&mut self, range: ByteRange) -> Option<Vec<u8>> {
         if !self.directory.contains(&range) {
             self.directory.push(range);
         }
-        self.want(range, true);
+        self.want(range, !self.walking);
         self.kept.read(range).map(<[u8]>::to_vec)
     }
 
@@ -97,11 +101,67 @@ impl Zip {
             return self.say_damaged(range, out);
         };
         read.push(range);
-        self.basis = read
+        let basis = read
             .into_iter()
-            .filter_map(|range| self.kept.read(range).map(|bytes| (range, crc32(bytes))))
+            .filter_map(|range| self.kept.read(range).map(|bytes| (range, crc32(bytes))));
+        // Two entries of one name are no archive the zip library reads.
+        let mut names = HashSet::with_capacity(centrals.len());
+        if !centrals
+            .iter()
+            .all(|central| names.insert(central.header.raw.as_slice()))
+        {
+            return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+        }
+        match self.walking {
+            true => {
+                self.basis.extend(basis);
+                self.check_walk(&centrals, start, out);
+            }
+            false => {
+                self.basis = basis.collect();
+                self.build(&centrals, start, out);
+            }
+        }
+    }
+
+    // The walk's entries against the directory, as the zip library's stream
+    // reader holds them: as many, each header where the directory puts it
+    // and saying what the directory says, the directory just past the last.
+    fn check_walk(&mut self, centrals: &[Central], start: u64, out: &mut Vec<Emit>) {
+        let headers: Option<Vec<(u64, &Central)>> = centrals
+            .iter()
+            .map(|central| {
+                self.geometry
+                    .global(VolumeIndex(central.disk), central.offset)
+                    .map(|header| (header, central))
+            })
             .collect();
-        self.build(&centrals, start, out);
+        let Some(map) = &mut self.map else {
+            return;
+        };
+        let agrees = headers.is_some_and(|mut headers| {
+            headers.sort_by_key(|(header, _)| *header);
+            map.end == Some(start)
+                && headers.len() == map.entries.len()
+                && map
+                    .entries
+                    .iter()
+                    .zip(&headers)
+                    .all(|(entry, (header, central))| {
+                        entry.header == *header
+                            && entry
+                                .expected
+                                .as_ref()
+                                .is_some_and(|local| records::agree(local, &central.header))
+                    })
+        });
+        if !agrees {
+            return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+        }
+        for entry in &mut map.entries {
+            entry.expected = None;
+        }
+        map.checked = true;
     }
 
     fn build(&mut self, centrals: &[Central], start: u64, out: &mut Vec<Emit>) {
@@ -130,6 +190,7 @@ impl Zip {
         let mut map = Map {
             end: Some(start),
             frontier: start,
+            checked: true,
             ..Map::default()
         };
         // Every member is said now, in directory order, which is the order
@@ -157,6 +218,7 @@ impl Zip {
                 crc: centrals[index].header.crc,
                 data: None,
                 streams: length > 0,
+                expected: Some(centrals[index].header.clone()),
             });
         }
         // Every byte that is no member's is kept, so the posted volumes can
@@ -207,42 +269,67 @@ impl Zip {
         length
     }
 
-    // Each stored entry's local header, once it is in: where its data starts.
+    // Each entry's local header, once it is in whole: it must say what the
+    // directory says, and a stored entry's says where its data starts.
     pub(super) fn read_locals(&mut self, out: &mut Vec<Emit>) {
         let Some(map) = &self.map else {
             return;
         };
-        let waiting: Vec<(usize, u64, u64, u64)> = map
+        // Each with the length of its data, when the data streams.
+        let waiting: Vec<(usize, u64, Option<u64>, u64)> = map
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.streams && entry.data.is_none())
-            .map(|(index, entry)| (index, entry.header, entry.length, map.stretch_end(index)))
+            .filter(|(_, entry)| entry.expected.is_some())
+            .map(|(index, entry)| {
+                let streams = entry.streams.then_some(entry.length);
+                (index, entry.header, streams, map.stretch_end(index))
+            })
             .collect();
-        for (index, header, length, stretch_end) in waiting {
-            let range = ByteRange::new(header, (header + LOCAL_LEN).min(stretch_end));
-            let Some(bytes) = self.kept.read(range) else {
+        for (index, header, streams, stretch_end) in waiting {
+            let fixed = ByteRange::new(header, (header + LOCAL_LEN).min(stretch_end));
+            let Some(bytes) = self.kept.read(fixed) else {
                 continue;
             };
             let Some(len) = records::local_len(bytes) else {
+                self.say_damaged(fixed, out);
+                continue;
+            };
+            let data = header + len;
+            // A header, or data, that runs into the next header is no layout
+            // this store reads.
+            if data + streams.unwrap_or(0) > stretch_end {
+                return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+            }
+            let range = ByteRange::new(header, data);
+            self.kept.want(range);
+            let Some(bytes) = self.kept.read(range) else {
+                continue;
+            };
+            let Some(local) = records::local(bytes) else {
                 self.say_damaged(range, out);
                 continue;
             };
             let crc = crc32(bytes);
-            let data = header + len;
-            // Data that runs into the next header is no layout this store
-            // reads.
-            if data + length > stretch_end {
-                return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
-            }
-            self.basis.push((range, crc));
-            self.kept.want(ByteRange::new(header, data));
-            self.kept.want(ByteRange::new(data + length, stretch_end));
             let Some(map) = &mut self.map else {
                 return;
             };
-            map.entries[index].data = Some(data);
-            if let Some(member) = map.entries[index].member {
+            let entry = &mut map.entries[index];
+            if !entry
+                .expected
+                .take()
+                .is_some_and(|central| records::agree(&local, &central))
+            {
+                return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+            }
+            self.basis.push((range, crc));
+            let Some(length) = streams else {
+                continue;
+            };
+            entry.data = Some(data);
+            let member = entry.member;
+            self.kept.want(ByteRange::new(data + length, stretch_end));
+            if let Some(member) = member {
                 self.emit_kept(member, out);
             }
         }
@@ -253,7 +340,15 @@ impl Zip {
         let Some(map) = &self.map else {
             return false;
         };
-        let waits = |header: u64| ByteRange::at(header, LOCAL_LEN).intersect(range).is_some();
+        // The whole header once its fixed part says how long it is.
+        let waits = |header: u64| {
+            let len = self
+                .kept
+                .read(ByteRange::at(header, LOCAL_LEN))
+                .and_then(records::local_len)
+                .unwrap_or(LOCAL_LEN);
+            ByteRange::at(header, len).intersect(range).is_some()
+        };
         let walked = self.walking && map.end.is_none() && waits(map.frontier);
         walked
             || map
