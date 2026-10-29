@@ -89,6 +89,7 @@ fn missing_checksums_wait_for_open_carriers_but_not_exhausted_ones() {
         .unwrap()
         .slice_checksums
         .clear();
+    job.object.sets.get_mut(&key).unwrap().index_changed();
     assert!(!job.object.awaiting_checksums(&key));
     job.object.volumes[0].closed = false;
     assert!(job.object.awaiting_checksums(&key));

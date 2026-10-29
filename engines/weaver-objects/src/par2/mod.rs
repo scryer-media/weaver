@@ -286,15 +286,12 @@ impl Par2 {
     // Whether a set whose last repair came up short still waits: the blocks
     // it needs are not all in hand, and its volumes may bring more.
     fn awaiting_checksums(&self, key: &[u8; 16]) -> bool {
-        self.sets[key].usable().is_some_and(|index| {
-            index
-                .recovery_file_ids
+        self.sets[key].usable().is_some()
+            && !self.sets[key].checksummed
+            && self
+                .volumes
                 .iter()
-                .any(|file| index.file_checksums(file).is_none())
-        }) && self
-            .volumes
-            .iter()
-            .any(|volume| !volume.closed && volume.serves(key))
+                .any(|volume| !volume.closed && volume.serves(key))
     }
 
     fn waits(&self, key: &[u8; 16], needed: u64) -> bool {
@@ -338,6 +335,7 @@ impl Par2 {
     }
 
     fn take(&mut self, volume: VolumeIndex, found: Vec<Found>) {
+        let mut changed_sets = BTreeSet::new();
         for item in found {
             if self.refused {
                 return;
@@ -369,11 +367,10 @@ impl Par2 {
                         .sets
                         .entry(set)
                         .or_insert_with(|| SetState::new((volume, at)))
-                        .take_metadata(hash, packet, self.output_limit);
+                        .take_metadata(hash, packet);
                     self.volume(volume).sets.insert(set);
                     if changed {
-                        self.evidence.retain(|(key, _), _| *key != set);
-                        self.fold_set(set);
+                        changed_sets.insert(set);
                     }
                 }
                 Found::Recovery {
@@ -391,6 +388,17 @@ impl Par2 {
                     carrier.walked_blocks += 1;
                     carrier.sets.insert(set);
                 }
+            }
+        }
+        if !changed_sets.is_empty() {
+            self.evidence
+                .retain(|(key, _), _| !changed_sets.contains(key));
+            for set in changed_sets {
+                self.sets
+                    .get_mut(&set)
+                    .expect("changed set")
+                    .rebuild(self.output_limit);
+                self.fold_set(set);
             }
         }
     }

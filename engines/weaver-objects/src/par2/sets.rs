@@ -41,6 +41,8 @@ pub(super) struct SetState {
     // The set as far as its metadata has arrived; `None` until its main
     // packet has.
     pub(super) index: Option<Par2FileSet>,
+    described: bool,
+    pub(super) checksummed: bool,
     // Each described file's whole CRC32, folded from its slice checksums
     // when the index is built: the index is fixed until a new packet
     // rebuilds it, so the fold is too.
@@ -69,6 +71,8 @@ impl SetState {
             packets: Sealed::default(),
             hashes: BTreeSet::new(),
             index: None,
+            described: false,
+            checksummed: false,
             whole: BTreeMap::new(),
             alike: BTreeMap::new(),
             recovery: BTreeMap::new(),
@@ -78,27 +82,37 @@ impl SetState {
         }
     }
 
-    // Take a metadata packet; the index is rebuilt when it is new. A set's
-    // metadata is a few packets per file, so rebuilding is cheaper than
-    // keeping two ways of growing it. A set whose geometry is past the
-    // limits has no index.
-    pub(super) fn take_metadata(
-        &mut self,
-        hash: [u8; 16],
-        packet: Packet,
-        output_limit: u64,
-    ) -> bool {
+    // Collect distinct packets; the caller rebuilds once per ingestion batch.
+    pub(super) fn take_metadata(&mut self, hash: [u8; 16], packet: Packet) -> bool {
         if !self.hashes.insert(hash) {
             return false;
         }
         self.packets.change(|packets| packets.0.push(packet));
+        true
+    }
+
+    pub(super) fn rebuild(&mut self, output_limit: u64) {
         self.index = index_of(&self.packets.get().0, output_limit);
         self.whole = whole_of(self.index.as_ref());
         self.alike = alike_of(self.index.as_ref());
-        // New metadata can change verification even when every file was
-        // already described, notably when its slice checksums arrive later.
+        self.index_changed();
         self.last = None;
-        true
+    }
+
+    // Readiness is a property of metadata, never work for a dispatch query.
+    pub(super) fn index_changed(&mut self) {
+        self.described = self.index.as_ref().is_some_and(|index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .all(|id| index.file_description(id).is_some())
+        });
+        self.checksummed = self.index.as_ref().is_some_and(|index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .all(|id| index.file_checksums(id).is_some())
+        });
     }
 
     // A set as a checkpoint recorded it: the index is rebuilt from its
@@ -110,14 +124,16 @@ impl SetState {
         output_limit: u64,
     ) -> Self {
         let index = index_of(&packets.get().0, output_limit);
-        Self {
+        let mut state = Self {
             whole: whole_of(index.as_ref()),
             alike: alike_of(index.as_ref()),
             index,
             packets,
             hashes,
             ..Self::new(first_seen)
-        }
+        };
+        state.index_changed();
+        state
     }
 
     pub(super) fn packets(&self) -> &Sealed<Packets> {
@@ -133,12 +149,7 @@ impl SetState {
     // checksums, when the set carries them, say which slices are good; a
     // file without them is checked whole and rebuilt whole.
     pub(super) fn usable(&self) -> Option<&Par2FileSet> {
-        let index = self.index.as_ref()?;
-        index
-            .recovery_file_ids
-            .iter()
-            .all(|id| index.file_description(id).is_some())
-            .then_some(index)
+        self.described.then_some(self.index.as_ref()).flatten()
     }
 
     // The CRC32 the described file's slices fold to.
