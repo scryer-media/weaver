@@ -219,6 +219,48 @@ pub trait HttpClients: Send + Sync + 'static {
     fn title_case_client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
         Ok(self.builder(target)?.http1_title_case_headers().build()?)
     }
+
+    /// Where a request from these clients to `to` leaves. Clients that do
+    /// not say are a proxy's: the proxy picks how it reaches `to`.
+    fn egress(&self, _to: SocketAddr) -> Egress {
+        Egress::Proxied
+    }
+}
+
+/// Where a request to an address leaves, as libtorrent asks of each listen
+/// socket before it announces from it (`listen_socket_t::can_route`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Egress {
+    /// A proxy dials the address, from wherever it exits.
+    Proxied,
+    /// The host dials it, from this local address.
+    From(IpAddr),
+    /// The host has no route to it.
+    NoRoute,
+}
+
+/// Where the host sends from to reach `to`, from a socket bound to the
+/// interface named `device` and to `from` where given: a UDP socket
+/// connected to `to`, which sends nothing and fails when no route reaches
+/// it.
+pub fn route_to(to: SocketAddr, from: Option<IpAddr>, device: Option<&str>) -> Egress {
+    let route = || -> Option<IpAddr> {
+        let socket =
+            socket2::Socket::new(socket2::Domain::for_address(to), socket2::Type::DGRAM, None)
+                .ok()?;
+        if let Some(device) = device {
+            librqbit_dualstack_sockets::BindDevice::new_from_name(device)
+                .ok()?
+                .bind_sref(&socket, to.is_ipv6())
+                .ok()?;
+        }
+        if let Some(from) = from {
+            socket.bind(&SocketAddr::new(from, 0).into()).ok()?;
+        }
+        socket.connect(&to.into()).ok()?;
+        Some(socket.local_addr().ok()?.as_socket()?.ip())
+    };
+    route().map_or(Egress::NoRoute, Egress::From)
 }
 
 /// The clients a builder makes, each held to its target.
@@ -228,6 +270,10 @@ where
 {
     fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder> {
         Ok(for_target(self(), target))
+    }
+
+    fn egress(&self, to: SocketAddr) -> Egress {
+        route_to(to, None, None)
     }
 }
 
@@ -251,6 +297,26 @@ pub fn for_target(
         .map(|ip| SocketAddr::new(*ip, target.port))
         .collect();
     builder.resolve_to_addrs(target.host, &addrs)
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::{Egress, route_to};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    // Loopback is reached from loopback, by the host's own route or held to
+    // it; a socket held to an IPv4 address has no route to an IPv6 one.
+    #[test]
+    fn a_route_leaves_from_the_address_it_is_held_to() {
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let to = SocketAddr::new(loopback, 9);
+        assert_eq!(route_to(to, None, None), Egress::From(loopback));
+        assert_eq!(route_to(to, Some(loopback), None), Egress::From(loopback));
+        assert_eq!(
+            route_to("[::1]:9".parse().unwrap(), Some(loopback), None),
+            Egress::NoRoute
+        );
+    }
 }
 
 #[cfg(all(test, feature = "e2e-local-trackers"))]

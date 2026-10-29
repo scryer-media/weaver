@@ -3491,12 +3491,19 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             .with_chunk_tracker(|c| c.bytes_left())
             .ok()
             .or(last_run.map(|r| r.left_bytes));
+        // No wanted piece is missing (libtorrent `torrent::is_finished`).
+        let finished = mt
+            .with_chunk_tracker(|c| c.get_hns().needed_bytes == 0)
+            .unwrap_or(false);
+        let private = mt.with_metadata(|m| m.info.info().private).unwrap_or(false);
         crate::tracker::TrackerCommsStats {
+            private,
             uploaded_bytes: totals.uploaded_bytes,
             downloaded_bytes: totals.downloaded_bytes,
             corrupt_bytes: totals.failed_bytes,
             redundant_bytes: totals.redundant_bytes,
             left_bytes,
+            finished,
             torrent_state,
             // `completed` is for becoming a seed, not for finishing a
             // selection (libtorrent `torrent::finished` calls `completed`

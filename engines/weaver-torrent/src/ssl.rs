@@ -460,4 +460,8 @@ impl crate::HttpClients for SslHttpClients {
     ) -> anyhow::Result<reqwest::ClientBuilder> {
         self.ssl.http(self.inner.builder(target)?)
     }
+
+    fn egress(&self, to: std::net::SocketAddr) -> crate::Egress {
+        self.inner.egress(to)
+    }
 }

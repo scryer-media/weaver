@@ -20,7 +20,9 @@ use weaver_torrent::network::{
     DatagramSocket, Resolved, Resolver,
 };
 use weaver_torrent::upnp::PortMapped;
-use weaver_torrent::{HttpClients, HttpTarget, Session, SocketFactory, StreamListener};
+use weaver_torrent::{
+    Egress, HttpClients, HttpTarget, Session, SocketFactory, StreamListener, route_to,
+};
 use weaver_tunnel::bridge::{Bridge, ConnectionOutcome};
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};
@@ -447,26 +449,33 @@ pub fn tracker_client(
         (LegKind::Ladder, bridge) => bridge,
         _ => None,
     };
-    let kind = kind.clone();
-    let base = move || {
-        let builder = reqwest::Client::builder();
-        Ok(match &kind {
-            LegKind::Ladder | LegKind::System => builder,
-            LegKind::SourceAddress(address) => builder.local_address(*address),
-            LegKind::Interface(name) => bound_to(builder, name)?,
-        })
+    let base = {
+        let kind = kind.clone();
+        move || {
+            let builder = reqwest::Client::builder();
+            Ok(match &kind {
+                LegKind::Ladder | LegKind::System => builder,
+                LegKind::SourceAddress(address) => builder.local_address(*address),
+                LegKind::Interface(name) => bound_to(builder, name)?,
+            })
+        }
     };
-    let clients = LegClients { base, bridge };
+    let clients = LegClients {
+        base,
+        bridge,
+        kind: kind.clone(),
+    };
     // A leg whose clients cannot be built does not open.
     let _ = clients.builder(None).map_err(|error| error.to_string())?;
     Ok(Arc::new(clients))
 }
 
 /// A session's HTTP clients: each from `base`, through `bridge` on a leg
-/// that has one.
+/// that has one, leaving as the leg's `kind` does.
 pub(crate) struct LegClients<F> {
     pub(crate) base: F,
     pub(crate) bridge: Option<Arc<Bridge>>,
+    pub(crate) kind: LegKind,
 }
 
 impl<F> HttpClients for LegClients<F>
@@ -507,6 +516,17 @@ where
     )]
     fn title_case_client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
         Ok(self.builder(target)?.http1_title_case_headers().build()?)
+    }
+
+    // A request leaves as the leg's sockets do: through the bridge from
+    // wherever the proxy exits, else from the host, bound as the leg is.
+    fn egress(&self, to: SocketAddr) -> Egress {
+        match (&self.bridge, &self.kind) {
+            (Some(_), _) | (None, LegKind::Ladder) => Egress::Proxied,
+            (None, LegKind::System) => route_to(to, None, None),
+            (None, LegKind::SourceAddress(address)) => route_to(to, Some(*address), None),
+            (None, LegKind::Interface(name)) => route_to(to, None, Some(name)),
+        }
     }
 }
 
@@ -943,6 +963,7 @@ mod tests {
         let clients = LegClients {
             base: || Ok(reqwest::Client::builder().no_proxy()),
             bridge: None,
+            kind: LegKind::System,
         };
         let client = clients
             .client(Some(HttpTarget {

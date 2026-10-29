@@ -32,10 +32,11 @@ use url::Url;
 
 use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
-use crate::core::net::{HttpClients, NamedBy, Resolved, Resolver};
+use crate::core::net::{Egress, HttpClients, NamedBy, Resolved, Resolver, is_public};
 use crate::tracker::Tracker;
 use crate::tracker::tracker_comms_http;
 use crate::tracker::tracker_comms_http::Ask;
+use crate::tracker::tracker_comms_http::Family;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
 use crate::tracker::tracker_comms_udp;
 use crate::tracker::tracker_comms_udp::UdpTrackerClient;
@@ -100,6 +101,11 @@ pub struct TrackerCommsStats {
     /// so 0 only for a seed. None while the torrent's size is unknown (a
     /// magnet still resolving its metadata).
     pub left_bytes: Option<u64>,
+    /// Every wanted piece is had (libtorrent `torrent::is_finished`): a
+    /// seed, or a torrent whose selected files are done.
+    pub finished: bool,
+    /// The metainfo marks the torrent private.
+    pub private: bool,
     pub torrent_state: TrackerCommsStatsState,
     /// The torrent lacked a piece when its current run began, whichever
     /// pieces were wanted then, and is a seed now. Each tracker hears
@@ -533,12 +539,15 @@ impl TrackerList {
     /// The event a regular announce to `entry` carries (libtorrent
     /// `torrent::send_tracker_request`): `started` until it accepts one, then
     /// `completed` once the torrent became a seed during this run, unless a
-    /// tracker has accepted `completed` already.
+    /// tracker has accepted `completed` already, and `paused` while it has
+    /// every piece it wants and is not a seed (`torrent::announce_with_tracker`).
     fn event(&self, entry: &Entry, stats: &TrackerCommsStats) -> Option<TrackerRequestEvent> {
         if !entry.start_sent {
             Some(TrackerRequestEvent::Started)
         } else if stats.completed_during_run && !self.complete_sent && !entry.complete_sent {
             Some(TrackerRequestEvent::Completed)
+        } else if stats.finished && !stats.is_completed() {
+            Some(TrackerRequestEvent::Paused)
         } else {
             None
         }
@@ -589,7 +598,7 @@ impl TrackerList {
                 entry.complete_sent = true;
                 self.complete_sent = true;
             }
-            Some(TrackerRequestEvent::Stopped) | None => {}
+            Some(TrackerRequestEvent::Stopped | TrackerRequestEvent::Paused) | None => {}
         }
     }
 
@@ -1008,6 +1017,7 @@ impl Scraper {
             &url,
             tracker.named_by,
             Ask::Scrape,
+            None,
             &tracker_comms_http::scrape_querystring(&info_hash, self.shape),
             &self.user_agent,
             self.shape,
@@ -2042,6 +2052,14 @@ impl TrackerComms {
         let tracker_url = &tracker.url;
         let trackerid = self.identity.tracker_ids.get(tracker_url);
         let (corrupt, redundant) = self.since_started(tracker_url, event, stats);
+        let routes = self.http_routes(tracker_url).await;
+        // libtorrent lists a private torrent's own public addresses, those
+        // its announces leave from; through a proxy it knows none.
+        let own_addrs: Vec<IpAddr> = routes
+            .iter()
+            .filter_map(|(_, from)| *from)
+            .filter(|ip| stats.private && is_public(*ip))
+            .collect();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
@@ -2058,25 +2076,84 @@ impl TrackerComms {
             key: Some(self.identity.tracker_key),
             trackerid: trackerid.as_deref(),
             encryption: stats.encryption,
+            own_addrs: &own_addrs,
         };
+        let query = request.as_querystring();
 
-        let answer = tracker_comms_http::get(
-            &*self.http_clients,
-            self.udp_client.resolver(),
-            &self.reachable,
-            tracker_url,
-            tracker.named_by,
-            Ask::Announce,
-            &request.as_querystring(),
-            &self.identity.user_agent,
-            tracker_comms_http::Shape::of(&self.identity.peer_id),
-        )
-        .await?;
+        // One announce per route, at once; the peers of every answer are
+        // kept, the rest of the first, as UDP's two families are.
+        let answers = futures::future::join_all(routes.iter().map(|(family, _)| {
+            tracker_comms_http::get(
+                &*self.http_clients,
+                self.udp_client.resolver(),
+                &self.reachable,
+                tracker_url,
+                tracker.named_by,
+                Ask::Announce,
+                *family,
+                &query,
+                &self.identity.user_agent,
+                tracker_comms_http::Shape::of(&self.identity.peer_id),
+            )
+        }))
+        .await;
+        let (mut announced, mut error) = (None::<Announced>, None);
+        for answer in answers {
+            match answer.and_then(|answer| self.read_http_announce(tracker_url, &answer)) {
+                Ok(more) => match &mut announced {
+                    Some(announced) => announced.peers.extend(more.peers),
+                    None => announced = Some(more),
+                },
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        match (announced, error) {
+            (Some(announced), _) => Ok(announced),
+            (None, Some(error)) => Err(error),
+            (None, None) => anyhow::bail!("the tracker was not announced to"),
+        }
+    }
+
+    /// The announces an HTTP tracker at `url` is sent: one per family the
+    /// session routes to the tracker by itself, held to that family, with
+    /// the address it leaves from, as libtorrent announces once from each
+    /// listen socket that can route to the tracker. One held to no family,
+    /// from no known address, when a proxy dials the tracker (libtorrent's
+    /// one proxy socket), the name is resolved where the leg exits, or no
+    /// family routes, so the GET fails in its own words.
+    async fn http_routes(&self, url: &Url) -> Vec<(Option<Family>, Option<IpAddr>)> {
+        let one = vec![(None, None)];
+        let Ok((_, found)) = tracker_comms_http::addresses(url, self.udp_client.resolver()).await
+        else {
+            return one;
+        };
+        let port = url.port_or_known_default().unwrap_or(0);
+        let mut routes = Vec::new();
+        for family in [Family::V4, Family::V6] {
+            let Some(ip) = found.iter().find(|ip| Family::of(**ip) == family) else {
+                continue;
+            };
+            match self.http_clients.egress(SocketAddr::new(*ip, port)) {
+                Egress::Proxied => return one,
+                Egress::NoRoute => {}
+                Egress::From(from) => routes.push((Some(family), Some(from))),
+            }
+        }
+        if routes.is_empty() { one } else { routes }
+    }
+
+    /// An HTTP tracker's answer to an announce, read.
+    fn read_http_announce(
+        &self,
+        tracker_url: &Url,
+        answer: &tracker_comms_http::Answer,
+    ) -> anyhow::Result<Announced> {
         let response = read_answer(&answer.body)?;
         if let Some(id) = &response.tracker_id {
             self.identity.tracker_ids.set(tracker_url, id.as_ref());
         }
-
         Ok(Announced {
             peers: response.iter_peers().collect(),
             interval: response.interval,
@@ -2199,7 +2276,7 @@ mod tests {
 
     use crate::core::{
         hash_id::{Id20, Id32, InfoHashes},
-        net::{DatagramSocket, HttpClients, HttpTarget, NamedBy, Resolver},
+        net::{DatagramSocket, Egress, HttpClients, HttpTarget, NamedBy, Resolver},
     };
     use futures::{FutureExt, StreamExt, future::BoxFuture};
     use parking_lot::Mutex;
@@ -2405,6 +2482,8 @@ mod tests {
             corrupt_bytes: 0,
             redundant_bytes: 0,
             left_bytes: Some(left),
+            finished: left == 0,
+            private: false,
             torrent_state: TrackerCommsStatsState::Live,
             completed_during_run,
             encryption: crate::EncryptionPolicy::Disabled,
@@ -2603,6 +2682,40 @@ mod tests {
         assert_eq!(list.event(&list.entries[1], &seed), None);
         assert_eq!(
             list.start_due(t2 + s(1800), None, &seed),
+            [(http("a"), None)]
+        );
+    }
+
+    #[test]
+    fn a_torrent_with_its_selection_done_but_not_a_seed_announces_paused() {
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"]], t0);
+        let selection_done = TrackerCommsStats {
+            finished: true,
+            ..live(60, 30, false)
+        };
+        // `started` still goes first.
+        assert_eq!(
+            list.start_due(t0, None, &selection_done),
+            [(http("a"), STARTED)]
+        );
+        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        let t1 = t0 + ANSWERED.regular;
+        assert_eq!(
+            list.start_due(t1, None, &selection_done),
+            [(http("a"), Some(TrackerRequestEvent::Paused))]
+        );
+        list.on_success(&http("a"), Some(TrackerRequestEvent::Paused), t1, &ANSWERED);
+        // A seed announces without an event, and one still fetching too.
+        let t2 = t1 + ANSWERED.regular;
+        assert_eq!(
+            list.start_due(t2, None, &live(0, 0, false)),
+            [(http("a"), None)]
+        );
+        list.on_success(&http("a"), None, t2, &ANSWERED);
+        let t3 = t2 + ANSWERED.regular;
+        assert_eq!(
+            list.start_due(t3, None, &live(0, 30, false)),
             [(http("a"), None)]
         );
     }
@@ -4290,17 +4403,24 @@ mod tests {
 
     /// The session's clients on a network where every address is the
     /// tracker at `at`: a client built for any address reaches it there.
-    /// Records the addresses clients were built for.
+    /// Records the addresses clients were built for. An address in `routes`
+    /// is reached as it says; any other through a proxy.
     struct Wired {
         at: SocketAddr,
         built: Mutex<Vec<IpAddr>>,
+        routes: Vec<(IpAddr, Egress)>,
     }
 
     impl Wired {
         fn new(at: &Url) -> Arc<Self> {
+            Self::routing(at, Vec::new())
+        }
+
+        fn routing(at: &Url, routes: Vec<(IpAddr, Egress)>) -> Arc<Self> {
             Arc::new(Self {
                 at: SocketAddr::new(at.host_str().unwrap().parse().unwrap(), at.port().unwrap()),
                 built: Mutex::default(),
+                routes,
             })
         }
     }
@@ -4319,6 +4439,13 @@ mod tests {
                 .no_proxy()
                 .dns_resolver(Arc::new(NoNames));
             Ok(crate::core::net::for_target(builder, target))
+        }
+
+        fn egress(&self, to: SocketAddr) -> Egress {
+            self.routes
+                .iter()
+                .find(|(ip, _)| *ip == to.ip())
+                .map_or(Egress::Proxied, |(_, egress)| *egress)
         }
     }
 
@@ -4377,6 +4504,162 @@ mod tests {
             udp_client,
             stopped.clone(),
         )
+    }
+
+    /// A tracker named by both families, and the session's own address in
+    /// each.
+    fn dual_stack() -> (Names, [IpAddr; 2], [IpAddr; 2]) {
+        let tracker: [IpAddr; 2] = [
+            Ipv4Addr::new(203, 0, 113, 7).into(),
+            "2001:db8::7".parse().unwrap(),
+        ];
+        let own: [IpAddr; 2] = [
+            Ipv4Addr::new(198, 51, 100, 1).into(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let names = Names(vec![
+            ("dual.invalid", tracker[0]),
+            ("dual.invalid", tracker[1]),
+        ]);
+        (names, tracker, own)
+    }
+
+    #[tokio::test]
+    async fn a_tracker_both_families_route_to_is_announced_to_once_in_each() {
+        // libtorrent announces from each listen socket that can route to
+        // the tracker (torrent.cpp `on_filter`): with an IPv4 and an IPv6
+        // route, two announces, each held to its family, and the peers of
+        // both answers kept.
+        let (tracker, at) = http_listener().await;
+        let url = Url::parse(&format!(
+            "http://dual.invalid:{}/announce",
+            at.port().unwrap()
+        ))
+        .unwrap();
+        let (names, addrs, own) = dual_stack();
+        let clients = Wired::routing(
+            &at,
+            vec![
+                (addrs[0], Egress::From(own[0])),
+                (addrs[1], Egress::From(own[1])),
+            ],
+        );
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask {
+            mut peers,
+            status: _status,
+        } = start_through(
+            vec![vec![Tracker::operator(url)]],
+            clients.clone(),
+            names,
+            &token,
+            &stopped,
+        );
+
+        // The peers of neither answer come before both are in.
+        let mut queries = Vec::new();
+        for body in [
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aBe",
+        ] {
+            let (conn, query) = tokio::select! {
+                _ = peers.next() => panic!("a peer came before both announces were answered"),
+                r = read_announce(&tracker) => r,
+            };
+            respond(conn, body).await;
+            queries.push(query);
+        }
+        let [q1, q2] = <[String; 2]>::try_from(queries).unwrap();
+        assert_eq!(query_param(&q1, "event"), Some("started"));
+        assert_eq!(q1, q2);
+        let other_peer: SocketAddr = (Ipv4Addr::LOCALHOST, 0x1a42).into();
+        let mut got = vec![peers.next().await.unwrap(), peers.next().await.unwrap()];
+        got.sort();
+        assert_eq!(got, [the_peer(), other_peer]);
+        let mut built = clients.built.lock().clone();
+        built.sort();
+        assert_eq!(built, addrs);
+        drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_tracker_reached_through_a_proxy_is_announced_to_once() {
+        // Through a proxy libtorrent has one listen socket and announces
+        // once; the proxy picks the family.
+        let (tracker, at) = http_listener().await;
+        let url = Url::parse(&format!(
+            "http://dual.invalid:{}/announce",
+            at.port().unwrap()
+        ))
+        .unwrap();
+        let (names, addrs, _) = dual_stack();
+        let clients = Wired::new(&at);
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask {
+            mut peers,
+            status: _status,
+        } = start_through(
+            vec![vec![Tracker::operator(url)]],
+            clients.clone(),
+            names,
+            &token,
+            &stopped,
+        );
+
+        answer_with_a_peer(
+            &tracker,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(*clients.built.lock(), addrs);
+        drop(peers);
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_family_with_no_route_to_the_tracker_is_not_announced_in() {
+        // libtorrent skips a listen socket that cannot route to the
+        // tracker: with no IPv6 route, one announce, held to IPv4.
+        let (tracker, at) = http_listener().await;
+        let url = Url::parse(&format!(
+            "http://dual.invalid:{}/announce",
+            at.port().unwrap()
+        ))
+        .unwrap();
+        let (names, addrs, own) = dual_stack();
+        let clients = Wired::routing(
+            &at,
+            vec![
+                (addrs[0], Egress::From(own[0])),
+                (addrs[1], Egress::NoRoute),
+            ],
+        );
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask {
+            mut peers,
+            status: _status,
+        } = start_through(
+            vec![vec![Tracker::operator(url)]],
+            clients.clone(),
+            names,
+            &token,
+            &stopped,
+        );
+
+        answer_with_a_peer(
+            &tracker,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(*clients.built.lock(), [addrs[0]]);
+        drop(peers);
+        token.cancel();
     }
 
     // The e2e carveout asks a torrent's tracker at these local addresses.

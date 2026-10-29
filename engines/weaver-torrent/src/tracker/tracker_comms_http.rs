@@ -35,6 +35,9 @@ pub enum TrackerRequestEvent {
     Started,
     Stopped,
     Completed,
+    /// A regular announce of a torrent that has every piece it wants and
+    /// is not a seed (BEP 21; libtorrent `torrent::announce_with_tracker`).
+    Paused,
 }
 
 pub struct TrackerRequest<'a> {
@@ -60,6 +63,11 @@ pub struct TrackerRequest<'a> {
     /// encrypts says `supportcrypto`, and one that only encrypts says
     /// `requirecrypto` too.
     pub encryption: EncryptionPolicy,
+    /// The public addresses this session announces from, which libtorrent
+    /// lists for a private torrent as `ipv4` and `ipv6`
+    /// (`torrent::announce_with_tracker`). Only the libtorrent shape says
+    /// them.
+    pub own_addrs: &'a [IpAddr],
 }
 
 #[derive(Deserialize, Debug)]
@@ -307,6 +315,7 @@ impl TrackerRequestEvent {
             Self::Started => "started",
             Self::Stopped => "stopped",
             Self::Completed => "completed",
+            Self::Paused => "paused",
         }
     }
 }
@@ -351,6 +360,20 @@ impl TrackerRequest<'_> {
         if let Some(trackerid) = self.trackerid {
             s.push_str("&trackerid=");
             libtorrent_escape(trackerid, &mut s);
+        }
+        for family in [Family::V4, Family::V6] {
+            for ip in self
+                .own_addrs
+                .iter()
+                .filter(|ip| Family::of(**ip) == family)
+            {
+                let name = match family {
+                    Family::V4 => "ipv4",
+                    Family::V6 => "ipv6",
+                };
+                write!(s, "&{name}=").unwrap();
+                libtorrent_escape(ip.to_string().as_bytes(), &mut s);
+            }
         }
         s
     }
@@ -405,6 +428,24 @@ pub(crate) enum Ask {
     Scrape,
 }
 
+/// An address family, which a GET may be held to: libtorrent announces once
+/// from each listen socket, and each reaches only the tracker's addresses
+/// of its own family (`http_tracker_connection::on_filter`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    pub(crate) fn of(ip: IpAddr) -> Self {
+        match ip.to_canonical() {
+            IpAddr::V4(_) => Self::V4,
+            IpAddr::V6(_) => Self::V6,
+        }
+    }
+}
+
 /// The arguments an announce carries. A tracker URL whose own query names
 /// one already is refused, the names compared as given, ignoring case.
 const TRACKER_ARGS: [&str; 9] = [
@@ -450,7 +491,7 @@ fn ssrf_refusal(url: &url::Url, ask: Ask, addrs: &[IpAddr]) -> Option<&'static s
 /// `url`'s host as a client is told it, and its addresses: the address it
 /// names, or what `resolver` finds for its name. None when the session's
 /// network resolves the name where it exits.
-async fn addresses(
+pub(crate) async fn addresses(
     url: &url::Url,
     resolver: &dyn Resolver,
 ) -> anyhow::Result<(String, Vec<IpAddr>)> {
@@ -486,16 +527,24 @@ async fn addresses(
 /// exits has no address here: nothing is checked, and the client hands the
 /// name on. A client for the libtorrent shape writes header names as
 /// libtorrent does, each word capitalised.
+#[allow(clippy::too_many_arguments)]
 async fn reach(
     clients: &dyn HttpClients,
     url: &url::Url,
     named_by: NamedBy,
     ask: Ask,
+    family: Option<Family>,
     resolver: &dyn Resolver,
     reachable: &Reachable,
     shape: Shape,
 ) -> anyhow::Result<(reqwest::Client, Vec<IpAddr>)> {
-    let (host, found) = addresses(url, resolver).await?;
+    let (host, mut found) = addresses(url, resolver).await?;
+    if let Some(family) = family
+        && !found.is_empty()
+    {
+        found.retain(|ip| Family::of(*ip) == family);
+        anyhow::ensure!(!found.is_empty(), "the tracker has no {family:?} address");
+    }
     let addrs = only_reachable(found, |ip| *ip, reachable, named_by)?;
     if let Some(why) = ssrf_refusal(url, ask, &addrs) {
         anyhow::bail!("SSRF mitigation: {why}");
@@ -555,6 +604,7 @@ pub(crate) async fn get(
     tracker: &url::Url,
     mut named_by: NamedBy,
     ask: Ask,
+    family: Option<Family>,
     query: &str,
     user_agent: &str,
     shape: Shape,
@@ -570,8 +620,10 @@ pub(crate) async fn get(
     }
     let mut redirects = 0;
     let response = loop {
-        let (client, addrs) =
-            reach(clients, &url, named_by, ask, resolver, reachable, shape).await?;
+        let (client, addrs) = reach(
+            clients, &url, named_by, ask, family, resolver, reachable, shape,
+        )
+        .await?;
         let request = match shape {
             Shape::Weaver => client
                 .get(url.clone())
@@ -772,6 +824,7 @@ mod tests {
                 &url,
                 NamedBy::Operator,
                 Ask::Announce,
+                None,
                 &resolver,
                 &reachable,
                 Shape::Weaver,
@@ -818,6 +871,7 @@ mod tests {
                     &url,
                     NamedBy::Torrent,
                     ask,
+                    None,
                     &at(ip),
                     &reachable,
                     Shape::Weaver,
@@ -842,6 +896,7 @@ mod tests {
             &url,
             NamedBy::Operator,
             Ask::Announce,
+            None,
             &at("127.0.0.1"),
             &reachable,
             Shape::Weaver,
@@ -861,6 +916,7 @@ mod tests {
                 &url,
                 named_by,
                 Ask::Announce,
+                None,
                 &at_exit,
                 &reachable,
                 Shape::Weaver,
@@ -895,6 +951,7 @@ mod tests {
                     &url,
                     NamedBy::Torrent,
                     ask,
+                    None,
                     &at,
                     &reachable,
                     Shape::Weaver,
@@ -956,6 +1013,7 @@ mod tests {
             key: Some(0xAEB9ABBF),
             trackerid: None,
             encryption,
+            own_addrs: &[],
         }
     }
 
@@ -989,6 +1047,51 @@ mod tests {
             ),
             "{}",
             request.as_querystring()
+        );
+    }
+
+    // `paused` goes where libtorrent puts any event, in either shape.
+    #[test]
+    fn a_paused_announce_says_so() {
+        let info_hash = Id20::new(QBITTORRENT_HASH);
+        for peer_id in [*b"-qB5300-CDwwoycKIZ6y", *b"-WV0170-CDwwoycKIZ6y"] {
+            let peer_id = Id20::new(peer_id);
+            let request = TrackerRequest {
+                event: Some(TrackerRequestEvent::Paused),
+                ..qbittorrent_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
+            };
+            let query = request.as_querystring();
+            assert!(query.contains("&event=paused&"), "{query}");
+        }
+    }
+
+    // libtorrent lists a private torrent's own addresses after the tracker
+    // id, IPv4 then IPv6, each escaped (http_tracker_connection.cpp); the
+    // Weaver shape lists none.
+    #[test]
+    fn own_addresses_follow_the_tracker_id_in_libtorrents_shape() {
+        let info_hash = Id20::new(QBITTORRENT_HASH);
+        let own: [IpAddr; 2] = ["2001:db8::1".parse().unwrap(), [198, 51, 100, 1].into()];
+        let peer_id = Id20::new(*b"-qB5300-CDwwoycKIZ6y");
+        let request = TrackerRequest {
+            trackerid: Some(b"t"),
+            own_addrs: &own,
+            ..qbittorrent_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
+        };
+        let query = request.as_querystring();
+        assert!(
+            query.ends_with("&trackerid=t&ipv4=198.51.100.1&ipv6=2001%3adb8%3a%3a1"),
+            "{query}"
+        );
+        let peer_id = Id20::new(*b"-WV0170-CDwwoycKIZ6y");
+        let request = TrackerRequest {
+            own_addrs: &own,
+            ..qbittorrent_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
+        };
+        let query = request.as_querystring();
+        assert!(
+            !query.contains("ipv4") && !query.contains("ipv6"),
+            "{query}"
         );
     }
 
@@ -1066,6 +1169,7 @@ mod tests {
             &tracker,
             NamedBy::Operator,
             Ask::Announce,
+            None,
             query,
             user_agent,
             shape,
@@ -1141,6 +1245,7 @@ mod tests {
             key: None,
             trackerid: None,
             encryption: EncryptionPolicy::Disabled,
+            own_addrs: &[],
         };
         dbg!(request.as_querystring());
     }
@@ -1168,6 +1273,7 @@ mod tests {
                 key: None,
                 trackerid: None,
                 encryption: EncryptionPolicy::Disabled,
+                own_addrs: &[],
             };
             let e: String =
                 id.0.iter()
@@ -1320,6 +1426,7 @@ mod tests {
             key: None,
             trackerid: id,
             encryption: EncryptionPolicy::Disabled,
+            own_addrs: &[],
         };
         assert!(
             request
