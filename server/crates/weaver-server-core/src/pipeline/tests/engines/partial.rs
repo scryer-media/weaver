@@ -12,6 +12,7 @@
 use std::io::Cursor;
 
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod};
+use sha2::Digest;
 use weaver_graph::Why;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, try_run};
@@ -1711,4 +1712,105 @@ async fn a_uuencoded_file_whose_middle_article_is_lost_behind_parts_already_in_i
         "{:?}",
         outcome.files.keys()
     );
+}
+
+// A compressed archive under a recovery set that describes the loss and
+// cannot mend it (an index with no recovery blocks). The set rules the
+// volume Impossible the moment the loss is heard, while the members the
+// loss never touched are whole below it, or still to be produced by the
+// engine: the job is judged by what is delivered when it ends, Partial,
+// never failed early by the ruling on the root volume alone.
+
+fn fixture_bytes(name: &str) -> Vec<u8> {
+    let path = format!(
+        "{}/tests/fixtures/extraction_profiles/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read(path).unwrap()
+}
+
+// `archive` posted as `compressed.rar`, described by a PAR2 index that
+// carries no recovery block, posted first so the set is known when the
+// loss is heard.
+fn starved(archive: &str) -> Vec<Post> {
+    let bytes = fixture_bytes(archive);
+    let index = crate::pipeline::tests::build_test_par2_index_for_files(
+        &[("compressed.rar", bytes.as_slice())],
+        ARTICLE as u64,
+    );
+    vec![
+        Post::plain("silver.horizon.par2", index),
+        Post::plain("compressed.rar", bytes),
+    ]
+}
+
+async fn run_partial_with_whole(scenario: &Scenario, whole: &[&str]) -> Outcome {
+    let outcome = match try_run(scenario).await {
+        Ok(outcome) => outcome,
+        Err(stall) => panic!("graph stalled at {:?}: {}", stall.status, stall.state),
+    };
+    let delivery = &outcome.graph().delivery;
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Partial),
+        "{:?} {delivery:?}",
+        outcome.failure
+    );
+    assert_eq!(
+        outcome.failure_kind,
+        Some(crate::history::HistoryFailureKind::Repair),
+        "{:?}",
+        outcome.failure
+    );
+    for name in whole {
+        assert!(
+            delivery.whole.iter().any(|delivered| delivered == name),
+            "{name} whole; {delivery:?}"
+        );
+        assert!(
+            outcome.files.contains_key(&format!("{FOLDER}/{name}")),
+            "{name} delivered; {:?}",
+            outcome.files.keys()
+        );
+    }
+    outcome
+}
+
+// Three members in one volume of four articles, the last article lost: it
+// holds the third member's bytes; the first two members' bytes lie in the
+// articles that arrive.
+#[tokio::test]
+async fn a_mixed_rar_under_a_starved_par2_delivers_the_members_the_loss_never_touched() {
+    let scenario = Scenario::new(starved("rar4_multifile_lz.rar"))
+        .framed(66)
+        .lost(1, 3);
+    let outcome = run_partial_with_whole(&scenario, &["hello.txt", "second.txt"]).await;
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(
+            &outcome.files[&format!("{FOLDER}/hello.txt")]
+        )),
+        "d9014c4624844aa5bac314773d6b689ad467fa4e1d1a50a1b8a99d5a95f72ff5"
+    );
+}
+
+// A solid stream of three members in one volume of four articles, the last
+// article lost: the engine decodes the first two members whole before the
+// loss stops it.
+#[tokio::test]
+async fn a_solid_rar_under_a_starved_par2_delivers_the_members_before_the_loss() {
+    let scenario = Scenario::new(starved("rar5_solid_small.rar"))
+        .framed(116)
+        .lost(1, 3);
+    run_partial_with_whole(&scenario, &["part0.bin", "part1.bin"]).await;
+}
+
+// The same with the headers encrypted: the engine opens the stream with
+// the job's password and the loss is heard before it has decoded a member.
+#[tokio::test]
+async fn a_header_encrypted_solid_rar_under_a_starved_par2_delivers_the_members_before_the_loss() {
+    let scenario = Scenario::new(starved("rar5_solid_headers_small.rar"))
+        .framed(200)
+        .lost(1, 3)
+        .password("moonlit-harbour");
+    run_partial_with_whole(&scenario, &["part0.bin"]).await;
 }

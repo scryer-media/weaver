@@ -813,7 +813,7 @@ impl NamespaceWriter {
                 // A file whose bytes fail the checksum its object states
                 // for them is damaged, whatever each byte's own check said:
                 // the graph hears it as damage on the whole member.
-                if in_own_file && self.fails_its_checksum(tree, *node, *member) {
+                if in_own_file && self.fails_its_checksum(tree, *node, *member)? {
                     let mut effects = Vec::new();
                     tree.checksum_failed(*node, *member, &mut effects);
                     self.apply_each(tree, builder, segments, effects, out)?;
@@ -1282,30 +1282,38 @@ impl NamespaceWriter {
     }
 
     // Whether the member's file, every byte of it in and none damaged,
-    // fails the CRC32 its object's headers state for it. The leaf folded
-    // the CRC of its writes as they landed, so nothing is read back. A
-    // member with no stated checksum, one already short or damaged, or one
-    // whose writes no longer fold to one run has nothing more for the
-    // check to say.
-    fn fails_its_checksum(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+    // fails the CRC32 its object's headers state for it. Every such member
+    // is checked: the leaf folded the CRC of its writes as they landed and
+    // answers from the fold when it can, and reads the file back when it
+    // cannot. A member with no stated checksum, or one already short or
+    // damaged, has nothing more for the check to say.
+    fn fails_its_checksum(
+        &self,
+        tree: &Tree,
+        node: NodeId,
+        member: MemberId,
+    ) -> Result<bool, WriteError> {
         let Some(record) = tree
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
         else {
-            return false;
+            return Ok(false);
         };
         let (Some(stated), Some(length)) = (record.crc32, record.length) else {
-            return false;
+            return Ok(false);
         };
         let whole = ByteRange::new(0, length);
         if !record.coverage.covered(whole) || record.coverage.damaged(whole) {
-            return false;
+            return Ok(false);
         }
-        self.files
+        let Some(leaf) = self
+            .files
             .get(&node)
             .and_then(|files| files.leaves.get(&member))
-            .and_then(|leaf| leaf.crc32(length))
-            .is_some_and(|written| written != stated)
+        else {
+            return Ok(false);
+        };
+        Ok(leaf.crc32(length)? != stated)
     }
 
     // The member's file reaches `end`, by a write or by taking its length.
@@ -1326,9 +1334,9 @@ impl NamespaceWriter {
         if let Some(leaf) = self
             .files
             .get_mut(&node)
-            .and_then(|files| files.leaves.get_mut(&member))
+            .and_then(|files| files.leaves.remove(&member))
         {
-            leaf.truncate()?;
+            self.discard(leaf)?;
         }
         self.caps.forget(tree, node, member);
         Ok(())
@@ -1496,7 +1504,14 @@ impl Builder for Placing<'_> {
         };
         let access = self.writer.access(tree);
         let start = into.len();
-        let read = read_placed(&access, (parent, member), node, placement, into);
+        // A recovery object's volume stays in its member's own file: its
+        // envelope is that file, at the volume's offsets in the member.
+        let read = match placement {
+            Placement::Envelope { range, .. } if tree.recovers(node) => tree
+                .in_member(node, *range)
+                .is_some_and(|within| access.read_at(parent, member, within, into)),
+            placement => read_placed(&access, (parent, member), node, placement, into),
+        };
         if !read {
             into.truncate(start);
         }

@@ -1189,7 +1189,17 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
     assert!(pipeline.graph_jobs[&job_id].runs().live());
     assert_ne!(run_generation(&pipeline, job_id), first, "read again");
     drain_runs(&mut pipeline, job_id).await;
-    assert_eq!(read(&echoed), body);
+    // The retracted member's file went with its bytes; the one read again
+    // waits under its name for the checkpoint that frees it.
+    let engine = pipeline.graph_jobs[&job_id].tree().engines()[0];
+    let written = pipeline.graph_jobs[&job_id]
+        .writer()
+        .files(engine)
+        .map(|(_, path)| path.to_path_buf())
+        .next()
+        .expect("the member read again has a file");
+    assert_ne!(written, echoed);
+    assert_eq!(read(&written), body);
     assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
     retire_pipeline_database(pipeline).await;
 }

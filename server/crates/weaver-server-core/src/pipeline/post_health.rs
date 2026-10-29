@@ -566,12 +566,8 @@ impl Pipeline {
     // A lost recovery volume is not damage to the release.
     fn failing_files(&self, job_id: JobId, spec: &JobSpec) -> usize {
         let failing: BTreeSet<u32> = self
-            .segment_terminal_states
-            .iter()
-            .filter(|(segment, state)| {
-                segment.file_id.job_id == job_id && **state == SegmentTerminalState::Missing
-            })
-            .map(|(segment, _)| segment.file_id.file_index)
+            .articles_missing(job_id)
+            .map(|segment| segment.file_id.file_index)
             .collect();
         failing
             .into_iter()
@@ -601,7 +597,6 @@ impl Pipeline {
             .files
             .iter()
             .zip(0u32..)
-            .filter(|(file, _)| !file.segments.is_empty())
             .map(|(file, index)| (index, file, self.first_article(job_id, index, file)))
             .collect();
         let payload = heads.iter().filter(|(_, file, _)| !declares_recovery(file));
@@ -1000,15 +995,46 @@ impl Pipeline {
         }
     }
 
-    // The bytes of the post the servers said are gone. An article no
-    // server may fetch, or one the feed stopped asking for, is not one.
-    fn missing_bytes(&self, job_id: JobId) -> u64 {
-        self.segment_terminal_states
-            .iter()
-            .filter(|(segment, state)| {
-                segment.file_id.job_id == job_id && **state == SegmentTerminalState::Missing
+    // The post's articles that will never arrive, each with the end this
+    // run saw it come to: `None` for one that ended in a run before a
+    // restart, which the root was restored holding as lost.
+    pub(in crate::pipeline) fn articles_given_up(
+        &self,
+        job_id: JobId,
+    ) -> impl Iterator<Item = (SegmentId, Option<SegmentTerminalState>)> + '_ {
+        self.jobs
+            .get(&job_id)
+            .into_iter()
+            .flat_map(move |state| {
+                state
+                    .spec
+                    .files
+                    .iter()
+                    .zip(0u32..)
+                    .flat_map(move |(file, file_index)| {
+                        file.segments.iter().map(move |segment| SegmentId {
+                            file_id: NzbFileId { job_id, file_index },
+                            segment_number: segment.ordinal,
+                        })
+                    })
             })
-            .map(|(segment, _)| self.health_counted_segment_bytes(*segment))
+            .filter(|segment| self.graph_article_given_up(*segment))
+            .map(|segment| (segment, self.segment_terminal_states.get(&segment).copied()))
+    }
+
+    // The post's articles every server said are gone, in this run or one
+    // before a restart. An article no server may fetch, or one the feed
+    // stopped asking for, is not one.
+    fn articles_missing(&self, job_id: JobId) -> impl Iterator<Item = SegmentId> + '_ {
+        self.articles_given_up(job_id)
+            .filter(|(_, state)| state.is_none_or(|state| state == SegmentTerminalState::Missing))
+            .map(|(segment, _)| segment)
+    }
+
+    // The bytes of the post the servers said are gone.
+    fn missing_bytes(&self, job_id: JobId) -> u64 {
+        self.articles_missing(job_id)
+            .map(|segment| self.health_counted_segment_bytes(segment))
             .sum()
     }
 

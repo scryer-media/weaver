@@ -430,6 +430,32 @@ fn directories_and_empty_files_are_announced_and_closed() {
     }
 }
 
+// A set posted with its `.rar` and `.r00` names swapped: the real second
+// volume, named as the first, founds the store at 0, where its own front
+// says it is not, since it opens on a member begun before it. Its name
+// settles it nowhere its headers rule out, so when the real first volume
+// states position 0 the holder yields the place, solid or not.
+#[test]
+fn a_volume_named_first_yields_the_place_its_own_front_rules_out() {
+    for solid in [false, true] {
+        let mut options = split(Version::Rar4);
+        options.solid = solid;
+        let volumes = write(&items(), &options);
+        let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+        let mut object = store();
+        object.bound(VolumeIndex(0), "3c9e1f.rar", &front(&volumes[1]), None);
+        assert!(
+            object.provisional(VolumeIndex(0), &front(&volumes[0]), None),
+            "solid={solid}: a holder its front misplaces yields"
+        );
+        assert_eq!(
+            object.claim("3c9e1f.r00", &front(&volumes[0]), None),
+            Some(VolumeIndex(0)),
+            "solid={solid}"
+        );
+    }
+}
+
 #[test]
 fn a_solid_set_asks_for_an_engine_before_any_member() {
     for version in [Version::Rar5, Version::Rar4] {

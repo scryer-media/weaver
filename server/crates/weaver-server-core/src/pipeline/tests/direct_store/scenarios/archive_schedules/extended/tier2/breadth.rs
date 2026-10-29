@@ -553,24 +553,34 @@ pub(super) mod nesting {
                 members.truncate(1);
             }
             let inner = self.innermost(&members);
-            let outer = match self.depth {
+            // The containers inside the outer set, by name: a damaged one is
+            // delivered as it stands beside the members, never withheld.
+            let (outer, containers) = match self.depth {
                 Depth::Two | Depth::SevenZipInside => {
                     let inner_name = if self.depth == Depth::SevenZipInside {
                         "inner.7z"
                     } else {
                         "inner.rar"
                     };
-                    stored(self.outer, inner_name, &inner, self.volumes)
+                    (
+                        stored(self.outer, inner_name, &inner, self.volumes),
+                        vec![inner_name],
+                    )
                 }
                 Depth::Three => {
                     let middle = stored(Container::Rar5, "inner.rar", &inner, 1).remove(0).1;
-                    stored(self.outer, "middle.rar", &middle, self.volumes)
+                    (
+                        stored(self.outer, "middle.rar", &middle, self.volumes),
+                        vec!["middle.rar", "inner.rar"],
+                    )
                 }
-                Depth::RarInside7z => {
-                    stored(Container::SevenZip, "inner.rar", &inner, self.volumes)
-                }
+                Depth::RarInside7z => (
+                    stored(Container::SevenZip, "inner.rar", &inner, self.volumes),
+                    vec!["inner.rar"],
+                ),
             };
             let mut post = data_post(outer, ARTICLE, members);
+            post.allowed = containers.into_iter().map(str::to_string).collect();
             post.password = self.locked.then(|| KEY.to_string());
             let (post, geometry) = with(
                 post,

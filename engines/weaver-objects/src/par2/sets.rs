@@ -117,18 +117,16 @@ impl SetState {
         &self.hashes
     }
 
-    // An index that can verify every file it protects: each has its
-    // description and, unless empty, its slice checksums.
+    // An index that describes every file it protects: each has its
+    // description, which names it, sizes it and hashes it whole. Its slice
+    // checksums, when the set carries them, say which slices are good; a
+    // file without them is checked whole and rebuilt whole.
     pub(super) fn usable(&self) -> Option<&Par2FileSet> {
         let index = self.index.as_ref()?;
         index
             .recovery_file_ids
             .iter()
-            .all(|id| {
-                index.file_description(id).is_some_and(|description| {
-                    description.length == 0 || index.file_checksums(id).is_some()
-                })
-            })
+            .all(|id| index.file_description(id).is_some())
             .then_some(index)
     }
 

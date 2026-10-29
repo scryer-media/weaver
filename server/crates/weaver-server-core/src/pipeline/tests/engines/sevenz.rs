@@ -158,6 +158,70 @@ fn assert_named_by_par2(graph: &Outcome) {
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
+// A stored split set, a hundred articles from its first volume's head on
+// spoiled before posting, and the PAR2 set over the volumes as they were.
+// Every article arrives clean. No volume's front signs anything, so the
+// set's numbered names found a joiner that writes the pieces into one
+// member, its run open for a volume the set may yet rebuild, and the
+// archive is read from that member as far as the spoiled bytes. The set
+// rewrites the volumes under the joiner's run, so the joined member starts
+// over: it has no file of its own until it is decided again, is written
+// anew from its rewritten volumes, and the archive is read again whole.
+#[tokio::test]
+async fn a_split_7z_whose_volumes_the_set_rewrote_under_its_joiner_delivers() {
+    const FRAME: usize = 768;
+    const VOLUMES: usize = 4;
+    const PER_VOLUME: usize = 32;
+    const SPOILED: usize = 100;
+    let member = payload(VOLUMES * PER_VOLUME * FRAME - 7 * FRAME, 71);
+    let archive = build_7z_shaped(
+        &[Entry::file("lantern.mkv", member.clone())],
+        sevenz_turbo::EncoderMethod::COPY,
+        None,
+        false,
+    );
+    let volumes: Vec<Post> = split(&archive, VOLUMES);
+    let files: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = volumes
+        .iter()
+        .map(|post| Post::plain(&post.name, post.bytes.clone()))
+        .collect();
+    let mut left = SPOILED;
+    for post in &mut posts {
+        let end = (left * FRAME).min(post.bytes.len());
+        post.bytes[..end].fill(0);
+        left -= end.div_ceil(FRAME);
+    }
+    assert_eq!(left, 0);
+    posts.extend(par2_volumes_sliced(
+        "lantern",
+        &files,
+        FRAME as u64,
+        SPOILED as u32 + 4,
+        1,
+    ));
+    let graph = run(&Scenario::new(posts).framed(FRAME)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered("lantern.mkv")]
+    );
+    assert!(
+        graph.files[&delivered("lantern.mkv")] == member,
+        "member bytes"
+    );
+    assert_fetched_once(&graph);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired {
+            slices: SPOILED as u64
+        })]
+    );
+}
+
 #[tokio::test]
 async fn a_split_7z_under_hash_names_named_by_par2_last_delivers_its_members() {
     let graph = run(&Scenario::new(hashed_with_par2_last())).await;

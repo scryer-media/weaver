@@ -11,6 +11,7 @@ use sha2::Digest;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run};
 use super::rar::{delivered, posts, with_par2};
+use super::restart::{Down, run_restarting_at};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::protected_sealed_rar4_store_set;
@@ -189,4 +190,26 @@ fn damaged_beside_par2() -> Scenario {
 #[tokio::test]
 async fn pw_rar4_stored_p_damaged_beside_par2_repairs_then_the_right_candidate_delivers() {
     assert_body(&run(&damaged_beside_par2()).await, &body());
+}
+
+// 7. RAR4 stored `-p` in four volumes of one article each, the job
+// submitted with a wrong password and shut down after the second volume:
+// the bytes written before the restart are no longer in the restored leaf's
+// fold, and the member's stated checksum is checked from the file. The job
+// fails as the uninterrupted one does, publishing nothing.
+#[tokio::test]
+async fn pw_rar4_stored_p_wrong_password_restarted_after_the_second_volume_fails() {
+    let volumes = encrypted_rar4_store_set(MEMBER, &body(), 4, SECRET, Some([7; 8]));
+    let scenario = Scenario::new(posts(volumes))
+        .framed(4 * ARTICLE)
+        .password(WRONG);
+    let restarted =
+        run_restarting_at(&scenario, &mut |_| {}, Down::Shutdown, &|nth| nth == 2).await;
+    assert!(restarted.restarts > 0, "the run restarted");
+    assert!(
+        matches!(restarted.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        restarted.status
+    );
+    assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
 }

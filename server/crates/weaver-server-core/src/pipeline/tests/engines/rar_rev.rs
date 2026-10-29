@@ -126,6 +126,22 @@ async fn rar_rev_rebuilds_one_absent_rar5_volume_from_one_recovery_volume() {
     assert_rebuilt(&run(&scenario).await, &body, 1);
 }
 
+// A volume posted short of the size the set's table gives, its last
+// article ending early and arriving clean. The volume takes the table's
+// size, the set rebuilds it to that size, and the member is delivered
+// whole.
+#[tokio::test]
+async fn rar_rev_rebuilds_a_rar5_volume_posted_short_of_its_table_to_its_size() {
+    let body = body();
+    let mut volumes = single_member_store_set(MEMBER, &body, 4);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let revs = rar5_revs("silver.horizon", &bytes, 1);
+    let short = volumes[3].1.len() - 24;
+    volumes[3].1.truncate(short);
+    let scenario = Scenario::new(posted(volumes, &[], revs));
+    assert_rebuilt(&run(&scenario).await, &body, 1);
+}
+
 #[tokio::test]
 async fn rar_rev_rebuilds_two_absent_rar5_volumes_from_two_recovery_volumes() {
     let (body, scenario) = rar5_set(&[1, 3], 2);

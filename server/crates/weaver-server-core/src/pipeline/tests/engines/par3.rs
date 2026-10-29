@@ -85,6 +85,27 @@ fn assert_repaired_once(graph: &Outcome, blocks: u64) {
 // once to rule it clean: unlike a clean PAR2 job, the reads are not zero.
 // Nothing beyond the volumes' heads is fetched for it, and those heads are
 // all that holds a block, so none is reachable.
+// A file posted short of the length its set describes, its last article
+// ending early and arriving clean. The set finds the last block wrong and
+// rebuilds it to the described length, and the member is that length: the
+// file is delivered whole, every described byte in it.
+#[tokio::test]
+async fn a_file_posted_short_of_its_description_is_rebuilt_to_the_described_length() {
+    let data = payload(4 * ARTICLE, 63);
+    let described = [("lantern.bin", data.as_slice())];
+    let mut posts = vec![Post::plain("lantern.bin", data[..data.len() - 24].to_vec())];
+    posts.extend(par3_set("lantern", &described, 2));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert!(claims_all(&graph.graph().claims, Claim::Complete));
+    assert_eq!(graph.files.values().next(), Some(&data));
+}
+
 #[tokio::test]
 async fn plain_files_beside_a_clean_par3_set_complete_and_graph_reads_each_member_back_once() {
     let lantern = payload(3 * ARTICLE, 61);

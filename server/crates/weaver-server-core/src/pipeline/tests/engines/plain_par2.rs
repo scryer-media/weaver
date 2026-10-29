@@ -7,7 +7,8 @@ use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{
     ARTICLE, Claim, Post, Scenario, assert_fetched_once, one_block_article, par2_set, par2_volumes,
-    payload, repair_and_terminal_events, run, run_holding, try_run,
+    payload, recovery_packet, repair_and_terminal_events, run, run_holding, try_run,
+    without_slice_checksums,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
@@ -31,6 +32,27 @@ fn claims_all(claims: &std::collections::BTreeMap<String, Claim>, expected: Clai
     !claims.is_empty() && claims.values().all(|claim| *claim == expected)
 }
 
+// A file posted short of the length its set describes, its last article
+// ending early and arriving clean. The set finds the last slice wrong and
+// rebuilds it to the described length, and the member is that length: the
+// file is delivered whole, every described byte in it.
+#[tokio::test]
+async fn a_file_posted_short_of_its_description_is_rebuilt_to_the_described_length() {
+    let data = payload(4 * ARTICLE, 63);
+    let described = [("lantern.bin", data.as_slice())];
+    let mut posts = vec![Post::plain("lantern.bin", data[..data.len() - 24].to_vec())];
+    posts.extend(par2_set("lantern", &described, 2));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert!(claims_all(&graph.graph().claims, Claim::Complete));
+    assert_eq!(graph.files.values().next(), Some(&data));
+}
+
 #[tokio::test]
 async fn plain_files_clean() {
     let scenario = Scenario::new(vec![
@@ -42,6 +64,80 @@ async fn plain_files_clean() {
     assert!(graph.completed(), "{:?}", graph.failure);
     assert!(claims_all(&graph.claims, Claim::Complete));
     assert!(claims_all(&graph.graph().claims, Claim::Complete));
+}
+
+// A recovery packet posted twice in its volume, one copy bad in a way its
+// header does not show: its length field claims eight bytes more, so the
+// packet it describes runs into the valid copy; or it is cut to its magic,
+// so the header read with it is the valid copy's front. Whichever copy
+// comes first, the walk finds the valid one past the bad one, the damaged
+// slice is repaired with it, and nothing is asked for twice.
+#[tokio::test]
+async fn a_bad_copy_of_a_recovery_packet_never_hides_the_valid_one() {
+    fn longer(valid: &[u8]) -> Vec<u8> {
+        let mut bad = valid.to_vec();
+        bad[8] ^= 0x08;
+        bad
+    }
+    fn cut(valid: &[u8]) -> Vec<u8> {
+        valid[..8].to_vec()
+    }
+    let body = payload(4 * ARTICLE, 61);
+    for (mutate, bad_first) in [
+        (longer as fn(&[u8]) -> Vec<u8>, false),
+        (longer, true),
+        (cut, false),
+        (cut, true),
+    ] {
+        let mut posts = covered(&[("lantern.bin", body.clone())], 1);
+        let valid = recovery_packet(&posts[2]);
+        let bad = mutate(&valid);
+        posts[2].bytes = if bad_first {
+            [bad, valid].concat()
+        } else {
+            [valid, bad].concat()
+        };
+        let context = format!("bad_first={bad_first} bad={} bytes", posts[2].bytes.len());
+        let graph = run(&Scenario::new(posts).damaged(0, 1)).await;
+        assert_fetched_once(&graph);
+        assert!(graph.completed(), "{context}: {:?}", graph.failure);
+        assert!(claims_all(&graph.claims, Claim::Complete), "{context}");
+        assert_eq!(
+            graph.graph().outcomes,
+            vec![Some(RepairOutcome::Repaired { slices: 1 })],
+            "{context}"
+        );
+    }
+}
+
+// A set posted without its slice checksums hashes its file whole and no
+// finer. A clean file checks against that hash and nothing is spent on it;
+// a damaged one cannot say which slice is bad, so the set rebuilds every
+// slice from its recovery, and the file is delivered whole.
+#[tokio::test]
+async fn a_set_without_slice_checksums_checks_and_rebuilds_its_file_whole() {
+    let data = payload(4 * ARTICLE, 62);
+    let posts = || {
+        let mut posts = covered(&[("lantern.bin", data.clone())], 4);
+        for post in &mut posts[1..] {
+            post.bytes = without_slice_checksums(&post.bytes);
+        }
+        posts
+    };
+    let clean = run(&Scenario::new(posts())).await;
+    assert!(clean.completed(), "{:?}", clean.failure);
+    assert_eq!(clean.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert_eq!(clean.files.values().next(), Some(&data));
+
+    let damaged = run(&Scenario::new(posts()).damaged(0, 1)).await;
+    assert_fetched_once(&damaged);
+    assert!(damaged.completed(), "{:?}", damaged.failure);
+    assert!(claims_all(&damaged.claims, Claim::Complete));
+    assert_eq!(
+        damaged.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 4 })]
+    );
+    assert_eq!(damaged.files.values().next(), Some(&data));
 }
 
 #[tokio::test]

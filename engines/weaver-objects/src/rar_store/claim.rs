@@ -304,19 +304,19 @@ pub(super) fn yields(
     !settled(index, holder) && claimant.is_some_and(states_position)
 }
 
+// Whether a volume is settled at `index`: read to its end, or placed there
+// by a stated position or by its name. Nothing settles a volume where its
+// own headers say it is not, a name least of all.
 pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
+    let facts = volume.walk.facts.as_ref().or(volume.front.as_ref());
     volume.walk.ended
-        || volume
-            .walk
-            .facts
-            .as_ref()
-            .or(volume.front.as_ref())
-            .is_some_and(states_position)
-        || volume
-            .name
-            .as_deref()
-            .and_then(naming::parse)
-            .is_some_and(|name| name.index() == index.0)
+        || (!facts.is_some_and(|facts| misplaced(index, facts))
+            && (facts.is_some_and(states_position)
+                || volume
+                    .name
+                    .as_deref()
+                    .and_then(naming::parse)
+                    .is_some_and(|name| name.index() == index.0)))
 }
 
 // The position a volume's headers give it beside the volumes held, by

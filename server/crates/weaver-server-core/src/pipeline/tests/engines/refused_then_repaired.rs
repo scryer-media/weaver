@@ -18,7 +18,7 @@ use weaver_graph::{MemberId, NodeId, Why};
 
 use super::harness::{
     ARTICLE, JOB, Post, Scenario, admit, collect, finished, par2_volumes, par2_volumes_sliced,
-    par3_set, serve,
+    par3_set, run, serve,
 };
 use super::rar::delivered;
 use super::sevenz;
@@ -308,13 +308,19 @@ fn profile(name: &str) -> Vec<u8> {
 // A compressed four-volume RAR5 set with bytes of its second volume zeroed
 // before posting, an index and a volume made over it as it was.
 fn four_volumes_zeroed() -> Vec<Post> {
+    four_volumes_spoiled(1, ZEROED)
+}
+
+// The set with `range` of the volume at `volume` zeroed before posting, an
+// index and a volume of two blocks made over it as it was.
+fn four_volumes_spoiled(volume: usize, range: std::ops::Range<usize>) -> Vec<Post> {
     let originals: Vec<Vec<u8>> = FOUR.iter().map(|name| profile(name)).collect();
     let mut posts: Vec<Post> = FOUR
         .iter()
         .zip(&originals)
         .map(|(name, bytes)| Post::plain(name, bytes.clone()))
         .collect();
-    posts[1].bytes[ZEROED].fill(0);
+    posts[volume].bytes[range].fill(0);
     let files: Vec<(&str, &[u8])> = FOUR
         .iter()
         .copied()
@@ -355,6 +361,11 @@ async fn a_four_volume_rar_said_damaged_before_its_set_repaired_one_volume_is_re
     retire_pipeline_database(pipeline).await;
 
     assert_eq!(status, Some(JobStatus::Complete), "{:?}", files.keys());
+    assert_compressible(&files);
+}
+
+// The four-volume set's one member, delivered alone and whole.
+fn assert_compressible(files: &BTreeMap<String, Vec<u8>>) {
     assert_eq!(
         files.keys().cloned().collect::<Vec<_>>(),
         [delivered("compressible.txt")]
@@ -366,6 +377,35 @@ async fn a_four_volume_rar_said_damaged_before_its_set_repaired_one_volume_is_re
         hex::encode(sha2::Sha256::digest(&files[&delivered("compressible.txt")])),
         expected["sha256"].as_str().unwrap()
     );
+}
+
+// The head of a volume zeroed before posting: its signature and the headers
+// after it. Every article arrives clean, so the store has no volume to
+// place there and gives up on the set for the volume it lacks, before any
+// set is in. The set then rewrites the head. A store that gave up for want
+// of a volume is opened again with every volume it had and the one
+// rewritten, and the member decodes whole: the first volume's head, and a
+// middle volume's.
+#[tokio::test]
+async fn a_store_that_gave_up_for_a_volume_head_is_opened_again_once_the_set_rewrote_it() {
+    for volume in [0, 1] {
+        let scenario = Scenario::new(four_volumes_spoiled(volume, 0..32)).framed(SLICE);
+        let outcome = run(&scenario).await;
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Complete),
+            "volume {volume}: {:?} {:?}",
+            outcome.failure,
+            outcome.files.keys()
+        );
+        assert_eq!(
+            outcome.graph().outcomes,
+            [Some(RepairOutcome::Repaired { slices: 1 })],
+            "volume {volume}"
+        );
+        assert!(outcome.refetched().is_empty(), "{:?}", outcome.refetched());
+        assert_compressible(&outcome.files);
+    }
 }
 
 // A header-enciphered LZMA2 7z split in three, one slice of its second

@@ -724,3 +724,33 @@ fn failed(message: &str) -> super::Failure {
         from_feed: false,
     }
 }
+
+// A delivery left short by a recovery object that ruled the loss beyond it
+// names the repair as the stage, whether or not the object bound a member
+// it could name unrepaired: a set that bound nothing still ruled.
+#[test]
+fn a_short_delivery_names_the_repair_when_a_recovery_object_ruled_though_it_bound_nothing() {
+    use crate::post_processing::model::PipelineFailureStage;
+    let delivery = Delivery {
+        whole: Vec::new(),
+        damaged: vec!["ember.bin".to_string()],
+        unrepaired: Vec::new(),
+        withheld: Vec::new(),
+        files: Vec::new(),
+    };
+    let message = "PAR2 recovery failed for 1 set(s)";
+    assert_eq!(
+        delivery.shortfall_stage(None),
+        PipelineFailureStage::Extract
+    );
+    assert_eq!(
+        delivery.shortfall_stage(Some(&failed(message))),
+        PipelineFailureStage::Extract
+    );
+    let mut ruled = failed(message);
+    ruled.objects = vec![NodeId(1)];
+    assert_eq!(
+        delivery.shortfall_stage(Some(&ruled)),
+        PipelineFailureStage::Repair
+    );
+}

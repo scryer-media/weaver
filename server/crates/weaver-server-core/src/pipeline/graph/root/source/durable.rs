@@ -16,7 +16,13 @@ use crate::pipeline::graph::root::facts::{
 
 impl ArticleMap {
     // Lay the facts over a map made from the post. The post must be the one
-    // they were taken from: the same files, the same articles.
+    // they were taken from: the same files, the same articles. A restore
+    // replays what reached the graph, bytes and losses alike: every arrived
+    // article is read back and delivered again, and every lost one is told
+    // again, whether or not the run that went down had told it. What an
+    // object heard of a loss then is in its facts only if it was in its node
+    // to hear it; one lent out for its repair was waiting on it, and the
+    // facts it is rebuilt from are those it left with.
     pub(crate) fn restore(&mut self, facts: &[VolumeFacts]) -> Result<(), RootFactsError> {
         if facts.len() != self.volumes.len() {
             return Err(RootFactsError::Mismatch("another number of files"));
@@ -36,7 +42,7 @@ impl ArticleMap {
                             .filter(|(start, end)| start <= end)
                             .map(|(start, end)| ByteRange::new(start, end)),
                     ),
-                    ArticleFacts::Lost { damaged } => State::Lost { damaged },
+                    ArticleFacts::Lost { .. } => State::Lost { damaged: false },
                 };
                 volume.set_state(at, state);
             }

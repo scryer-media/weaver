@@ -207,10 +207,8 @@ impl Pipeline {
     // is what settlement re-derives against rather than trusting the running
     // figure it is about to persist forever.
     pub(in crate::pipeline) fn derived_failed_bytes(&self, job_id: JobId) -> u64 {
-        self.segment_terminal_states
-            .keys()
-            .filter(|seg_id| seg_id.file_id.job_id == job_id)
-            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
+        self.articles_given_up(job_id)
+            .map(|(seg_id, _)| self.health_counted_segment_bytes(seg_id))
             .sum()
     }
 

@@ -65,6 +65,9 @@ pub struct Par2 {
     // The namespace asked for a ruling before any set was found: a volume
     // is read for one.
     seeking: bool,
+    // Ranges of its volumes a walk read past as a packet that was none,
+    // which it asks for again when it next speaks.
+    rewalks: Vec<(VolumeIndex, ByteRange)>,
     output_limit: u64,
     // The repair's workspace when the owner grants it none.
     memory_limit: usize,
@@ -89,6 +92,7 @@ impl Par2 {
             refused: false,
             shown: Shown::default(),
             seeking: false,
+            rewalks: Vec::new(),
             output_limit: MAX_JOB_BYTES,
             memory_limit: REPAIR_MEMORY_LIMIT,
         }
@@ -304,6 +308,10 @@ impl Par2 {
             }
             let set = match &item {
                 Found::Metadata { set, .. } | Found::Recovery { set, .. } => Some(*set),
+                Found::Again(range) => {
+                    self.rewalks.push((volume, *range));
+                    continue;
+                }
                 Found::Unused => None,
             };
             let new_set = set.is_some_and(|set| !self.sets.contains_key(&set));
@@ -314,7 +322,7 @@ impl Par2 {
                 return;
             }
             match item {
-                Found::Unused => {}
+                Found::Unused | Found::Again(_) => {}
                 Found::Metadata {
                     set,
                     at,
@@ -346,6 +354,15 @@ impl Par2 {
             }
         }
     }
+
+    // What the walks read past and must read again, asked of the owner.
+    fn ask_again(&mut self, out: &mut Vec<Emit>) {
+        out.extend(
+            self.rewalks
+                .drain(..)
+                .map(|(volume, range)| Emit::Again { volume, range }),
+        );
+    }
 }
 
 impl Object for Par2 {
@@ -361,7 +378,7 @@ impl Object for Par2 {
         &mut self,
         delivery: Delivery<'_>,
         _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
-        _out: &mut Vec<Emit>,
+        out: &mut Vec<Emit>,
     ) {
         let mut found = Vec::new();
         let volume = self.volume(delivery.volume);
@@ -370,15 +387,29 @@ impl Object for Par2 {
             .walker
             .deliver(delivery.offset, delivery.bytes, &mut found);
         self.take(delivery.volume, found);
+        self.ask_again(out);
     }
 
-    fn volume_closed(&mut self, volume: VolumeIndex, _out: &mut Vec<Emit>) {
+    // The walk reads no packet past the volume's end.
+    fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
+        let mut found = Vec::new();
+        self.volume(volume).walker.sized(length, &mut found);
+        self.take(volume, found);
+        self.ask_again(out);
+    }
+
+    fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
         self.volume(volume).closed = true;
+        self.ask_again(out);
     }
 
-    fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
+    // A loss told again, as a restore tells every loss, is one it holds.
+    fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
         let mut found = Vec::new();
         let state = self.volume(volume);
+        if state.lost.iter().any(|lost| lost.covers(range)) {
+            return;
+        }
         state.lost.push(range);
         state.walker.lose(range, &mut found);
         // A recovery packet whose bytes are lost cannot be read back.
@@ -388,6 +419,7 @@ impl Object for Par2 {
                 .retain(|_, at| at.volume != volume || at.range.intersect(range).is_none());
         }
         self.take(volume, found);
+        self.ask_again(out);
     }
 
     fn wants(&self, out: &mut Vec<Seek>) {
@@ -553,7 +585,7 @@ impl Recovery for Par2 {
                 let short = record
                     .length
                     .is_some_and(|length| length < description.length)
-                    && !record.coverage.is_clean();
+                    && (repaired || !record.coverage.is_clean());
                 if short {
                     let name = record.name.clone();
                     namespace.recognise(*member, &name, description.length);

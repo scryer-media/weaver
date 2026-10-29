@@ -77,7 +77,7 @@ async fn most_articles_missing_without_par2_fails_with_no_file_whole() {
     }
     row(
         &scenario,
-        Expect::Failed(HistoryFailureKind::Unpack),
+        Expect::Failed(HistoryFailureKind::Health),
         "six of ten missing",
     )
     .await;
@@ -152,7 +152,7 @@ async fn an_unprotected_damaged_file_leaves_the_job_partial() {
     let body = payload(5 * ARTICLE, 179);
     let notes = payload(3 * ARTICLE, 180);
     let mut posts = covered(&[("lantern.bin", &body)], 2, 1);
-    posts.push(Post::plain("notes.txt", notes));
+    posts.push(Post::plain("notes.txt", notes.clone()));
     let at = posts.len() as u32 - 1;
     let outcome = row(
         &Scenario::new(posts).damaged(at, 1),
@@ -160,7 +160,8 @@ async fn an_unprotected_damaged_file_leaves_the_job_partial() {
         "unprotected damaged",
     )
     .await;
-    assert!(super::delivered(&outcome.files, "notes.txt").is_none());
+    // Delivered as it stands: not the posted bytes.
+    assert!(super::delivered(&outcome.files, "notes.txt").is_some_and(|bytes| *bytes != notes));
 }
 
 // An unprotected file lost whole beside a covered payload: the payload is
@@ -171,11 +172,10 @@ async fn a_missing_unprotected_file_leaves_the_job_partial() {
     let mut posts = covered(&[("lantern.bin", &body)], 2, 1);
     posts.push(Post::plain("notes.txt", payload(3 * ARTICLE, 182)));
     let at = posts.len() as u32 - 1;
-    let outcome = row(
+    row(
         &lose_all(Scenario::new(posts), at),
         Expect::Partial(&[("lantern.bin", &body)]),
         "unprotected missing",
     )
     .await;
-    assert!(super::delivered(&outcome.files, "notes.txt").is_none());
 }

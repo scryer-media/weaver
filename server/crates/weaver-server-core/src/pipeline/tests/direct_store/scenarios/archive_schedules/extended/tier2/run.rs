@@ -341,7 +341,9 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
     let files = post
         .expected
         .iter()
-        .map(|(name, _)| (name.clone(), std::fs::read(output.join(name)).ok()))
+        .map(|(name, _)| name)
+        .chain(post.allowed.iter())
+        .map(|name| (name.clone(), std::fs::read(output.join(name)).ok()))
         .collect();
     let mut published = files_under(&output);
     published.remove(crate::jobs::working_dir::OUTPUT_DIR_MARKER);
@@ -463,9 +465,20 @@ impl Ran {
                 );
             }
             Some(JobStatus::Partial) => {
+                // A file the job may publish counts as usable when it is
+                // whole: the posted bytes when it was posted as a file, else
+                // one unpacked, whose bytes the post does not state.
+                let allowed_whole = post.allowed.iter().any(|name| {
+                    match post.files.iter().find(|posted| posted.name == *name) {
+                        Some(posted) => {
+                            self.files[name].as_deref() == Some(posted.bytes.as_slice())
+                        }
+                        None => self.files[name].is_some(),
+                    }
+                });
                 assert!(
-                    !whole.is_empty(),
-                    "{context}: partial with no expected file whole: {trace:?}"
+                    !whole.is_empty() || allowed_whole,
+                    "{context}: partial with no expected or allowed file whole: {trace:?}"
                 );
                 delivered();
                 assert_ne!(

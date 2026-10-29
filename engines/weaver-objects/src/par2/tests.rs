@@ -1595,3 +1595,56 @@ fn a_streamed_packet_in_an_unposted_range_is_dropped_and_found_again() {
     assert_eq!(recovered(&found), vec![(1, one), (2, two)]);
     assert_eq!(walker.front(), two.end);
 }
+
+// A packet whose bytes fail its hash, or whose header claims past the
+// volume's end, was none. The walk steps one byte past its magic and reads
+// what it took for the packet again from the volume, so a valid copy that
+// lies within those bytes is found, whether the volume's length was known
+// before the bytes came or only at its close.
+#[test]
+fn a_packet_that_was_none_is_read_past_by_one_byte() {
+    use super::walker::{Found, Walker};
+
+    let valid = recovery_packet(1, &payload(54, 4000));
+    // Its length field claims eight bytes more: into the valid copy.
+    let mut longer = valid.clone();
+    longer[8] ^= 0x08;
+    // Cut to its magic: the header read with it is the valid copy's front.
+    let magic = valid[..8].to_vec();
+    for bad in [longer, magic] {
+        for sized_first in [true, false] {
+            let mut volume = bad.clone();
+            volume.extend_from_slice(&valid);
+            let length = volume.len() as u64;
+            let copy = ByteRange::at(bad.len() as u64, valid.len() as u64);
+            let context = format!("bad of {} bytes, sized_first={sized_first}", bad.len());
+            let mut walker = Walker::default();
+            let mut found = Vec::new();
+            if sized_first {
+                walker.sized(length, &mut found);
+            }
+            walker.deliver(0, &volume, &mut found);
+            if !sized_first {
+                walker.sized(length, &mut found);
+            }
+            let again: Vec<ByteRange> = found
+                .iter()
+                .filter_map(|found| match found {
+                    Found::Again(range) => Some(*range),
+                    _ => None,
+                })
+                .collect();
+            for range in again {
+                assert_eq!(range.start, 1, "{context}: one byte past the magic");
+                assert_eq!(walker.front(), 1, "{context}: the walk starts there");
+                walker.deliver(
+                    range.start,
+                    &volume[range.start as usize..range.end as usize],
+                    &mut found,
+                );
+            }
+            assert_eq!(recovered(&found), vec![(1, copy)], "{context}");
+            assert_eq!(walker.front(), length, "{context}");
+        }
+    }
+}
