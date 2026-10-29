@@ -574,7 +574,7 @@ impl Pipeline {
     ) -> Option<(PipelineFailureStage, Option<String>)> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
         Some((
-            delivery.shortfall_stage(),
+            delivery.shortfall_stage(failure.as_ref()),
             failure
                 .map(|failure| failure.message)
                 .or_else(|| delivery.withheld_error()),

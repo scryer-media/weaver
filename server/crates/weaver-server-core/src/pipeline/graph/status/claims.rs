@@ -268,13 +268,16 @@ impl Delivery {
     }
 
     // The stage a short delivery names as the one that left it short: the
-    // repair, when a file is short because a recovery object could not
-    // rebuild it, and otherwise the engine that read it short.
-    pub(crate) fn shortfall_stage(&self) -> PipelineFailureStage {
-        if self.unrepaired.is_empty() {
-            PipelineFailureStage::Extract
-        } else {
+    // repair, when a recovery object ruled it could not rebuild what it
+    // covers, whether or not it bound a member it could name short, or
+    // when a file is short because such an object covers it; otherwise the
+    // engine that read it short.
+    pub(crate) fn shortfall_stage(&self, failure: Option<&Failure>) -> PipelineFailureStage {
+        let ruled = failure.is_some_and(|failure| !failure.objects.is_empty());
+        if ruled || !self.unrepaired.is_empty() {
             PipelineFailureStage::Repair
+        } else {
+            PipelineFailureStage::Extract
         }
     }
 }
