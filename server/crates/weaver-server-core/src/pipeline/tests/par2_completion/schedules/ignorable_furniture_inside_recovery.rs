@@ -162,5 +162,6 @@ async fn another_sets_blocks_never_count_toward_a_short_set() {
         "quill short",
     )
     .await;
-    assert!(super::delivered(&outcome.files, "quill.bin").is_none());
+    // Delivered as it stands, unrepaired: not the posted bytes.
+    assert!(super::delivered(&outcome.files, "quill.bin").is_some_and(|bytes| *bytes != quill));
 }
