@@ -4079,11 +4079,13 @@ mod tests {
             .message
     }
 
+    // An e2e build asks a loopback tracker at any path.
+    #[cfg(not(feature = "e2e-local-trackers"))]
     #[tokio::test]
     async fn a_tracker_url_that_could_forge_a_request_is_never_asked() {
         // A URL whose query names an announce argument is refused, and so is
-        // a loopback tracker the operator named at a path other than
-        // /announce, whatever name it is reached by. Each is refused before
+        // a loopback tracker the operator named at a path with no segment
+        // starting `announce`, whatever name it is reached by. Each is refused before
         // any request; the next tier's tracker is asked.
         let (refused, at) = http_listener().await;
         let port = at.port().unwrap();
@@ -4159,6 +4161,8 @@ mod tests {
         }
     }
 
+    // An e2e build asks a loopback tracker at any path.
+    #[cfg(not(feature = "e2e-local-trackers"))]
     #[tokio::test]
     async fn a_redirect_to_a_loopback_path_no_tracker_answers_is_never_fetched() {
         // libtorrent http_connection::on_read restarts the GET at the
@@ -4439,31 +4443,21 @@ mod tests {
     #[cfg(feature = "e2e-local-trackers")]
     #[tokio::test]
     async fn an_e2e_build_asks_a_tracker_the_torrent_named_at_a_local_address() {
-        // In an e2e build a tracker that came with the torrent is asked at a
-        // private address, as a container network gives one; at a
-        // link-local address it is still refused before any client is
-        // built for it.
+        // In an e2e build a tracker that came with the torrent is asked at
+        // any address, link-local too, at any path.
         let (tracker, at) = http_listener().await;
         let port = at.port().unwrap();
-        let named = |s: &str| Url::parse(&s.replace("PORT", &port.to_string())).unwrap();
-        let refused = named("http://link.invalid:PORT/announce");
-        let asked = named("http://ten.invalid:PORT/announce");
-        let names = Names(vec![
-            ("link.invalid", Ipv4Addr::new(169, 254, 1, 1).into()),
-            ("ten.invalid", Ipv4Addr::new(10, 0, 0, 1).into()),
-        ]);
-        let tiers = vec![
-            vec![Tracker::torrent(refused.clone())],
-            vec![Tracker::torrent(asked)],
-        ];
+        let asked = Url::parse(&format!("http://link.invalid:{port}/0123abcd/announce")).unwrap();
+        let names = Names(vec![("link.invalid", Ipv4Addr::new(169, 254, 1, 1).into())]);
+        let tiers = vec![vec![Tracker::torrent(asked)]];
         let clients = Wired::new(&at);
         let token = CancellationToken::new();
         let stopped = StoppedAnnounces::default();
-        let TrackerTask { mut peers, status } =
-            start_through(tiers, clients.clone(), names, &token, &stopped);
+        let TrackerTask {
+            mut peers,
+            status: _status,
+        } = start_through(tiers, clients.clone(), names, &token, &stopped);
 
-        let e = refusal_of(&status, &mut peers, &refused).await;
-        assert!(e.contains("not public"), "{refused}: {e}");
         let q = answer_with_a_peer(
             &tracker,
             &mut peers,
@@ -4473,7 +4467,7 @@ mod tests {
         assert_eq!(query_param(&q, "event"), Some("started"));
         assert_eq!(
             *clients.built.lock(),
-            [IpAddr::from(Ipv4Addr::new(10, 0, 0, 1))]
+            [IpAddr::from(Ipv4Addr::new(169, 254, 1, 1))]
         );
 
         drop(peers);

@@ -428,18 +428,23 @@ fn has_tracker_query(query: &str) -> bool {
 
 /// Why a GET of `url` for `ask`, whose host resolved to `addrs`, may not be
 /// sent: a tracker at a loopback address is asked only what a tracker
-/// answers, at a path starting `/announce`, or `/scrape` for a scrape. The
-/// client picks the address it connects to, so every address must pass.
-/// Only a tracker the operator named reaches it: one that came with the
-/// torrent is never asked at loopback (see [`NamedBy::may_ask`]).
+/// answers, at a path with a segment starting `announce`, or `scrape` for a
+/// scrape, as `/announce.php`, `/<passkey>/announce` and
+/// `/announce/<passkey>` have. The client picks the address it connects
+/// to, so every address must pass. Only a tracker the operator named
+/// reaches it: one that came with the torrent is never asked at loopback
+/// (see [`NamedBy::may_ask`]). An e2e build asks any path.
 fn ssrf_refusal(url: &url::Url, ask: Ask, addrs: &[IpAddr]) -> Option<&'static str> {
-    let path = match ask {
-        Ask::Announce => "/announce",
-        Ask::Scrape => "/scrape",
+    if cfg!(feature = "e2e-local-trackers") {
+        return None;
+    }
+    let word = match ask {
+        Ask::Announce => "announce",
+        Ask::Scrape => "scrape",
     };
     let loopback = addrs.iter().any(|a| a.to_canonical().is_loopback());
-    (loopback && !url.path().starts_with(path))
-        .then_some("a loopback tracker asked at a path no tracker answers")
+    let tracker_path = url.path().split('/').any(|seg| seg.starts_with(word));
+    (loopback && !tracker_path).then_some("a loopback tracker asked at a path no tracker answers")
 }
 
 /// `url`'s host as a client is told it, and its addresses: the address it
@@ -869,10 +874,8 @@ mod tests {
         }
     }
 
-    // In an e2e build a tracker that came with the torrent is asked at a
-    // loopback, private or unique-local address, at loopback only at a
-    // tracker's path; at a link-local address it is still refused, and no
-    // client is built.
+    // In an e2e build a tracker that came with the torrent is asked at any
+    // address, at any path.
     #[cfg(feature = "e2e-local-trackers")]
     #[tokio::test]
     async fn an_e2e_build_asks_a_tracker_the_torrent_named_at_local_addresses() {
@@ -902,29 +905,25 @@ mod tests {
             }
         };
 
-        for ip in ["127.0.0.1", "10.0.0.1", "192.168.1.1", "fd00::1"] {
-            for (path, ask) in [("/announce", Ask::Announce), ("/scrape", Ask::Scrape)] {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "fd00::1",
+        ] {
+            for (path, ask) in [
+                ("/announce", Ask::Announce),
+                ("/scrape", Ask::Scrape),
+                ("/0123abcd/announce", Ask::Announce),
+                ("/admin", Ask::Announce),
+            ] {
                 let (asked, built) = ask_at(ip, path, ask).await;
                 let (_, addrs) = asked.unwrap_or_else(|e| panic!("{ip} {path}: {e:#}"));
                 assert_eq!(addrs, [ip.parse::<IpAddr>().unwrap()], "{ip} {path}");
                 assert!(built, "{ip} {path}");
             }
         }
-
-        let (asked, built) = ask_at("127.0.0.1", "/admin", Ask::Announce).await;
-        let refused = asked.expect_err("loopback /admin was asked");
-        assert!(format!("{refused:#}").contains("SSRF"), "{refused:#}");
-        assert!(!built);
-
-        let (asked, built) = ask_at("169.254.1.1", "/announce", Ask::Announce).await;
-        let refused = asked.expect_err("169.254.1.1 was asked");
-        assert!(
-            refused
-                .downcast_ref::<crate::tracker::tracker_comms::NotPublic>()
-                .is_some(),
-            "{refused:#}"
-        );
-        assert!(!built);
     }
 
     // The started announce of a qBittorrent 5.3.0 seed, as a tracker
@@ -1412,6 +1411,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "e2e-local-trackers"))]
     #[test]
     fn a_loopback_tracker_is_asked_only_at_a_tracker_path() {
         // Only a tracker the operator named reaches this rule.
@@ -1424,11 +1424,16 @@ mod tests {
                 ("http://h/announce", Ask::Announce),
                 ("http://h/announce.php?x=1", Ask::Announce),
                 ("http://h/scrape.php", Ask::Scrape),
+                // Ocelot's and UNIT3D's passkey paths.
+                ("http://h/0123abcd/announce", Ask::Announce),
+                ("http://h/0123abcd/scrape", Ask::Scrape),
+                ("http://h/announce/0123abcd", Ask::Announce),
             ] {
                 assert_eq!(ssrf_refusal(&url(u), ask, &[a]), None, "{u} {a}");
             }
             for (u, ask) in [
-                ("http://h/x/announce", Ask::Announce),
+                ("http://h/admin", Ask::Announce),
+                ("http://h/x/announce", Ask::Scrape),
                 ("http://h/", Ask::Announce),
                 ("http://h/scrape", Ask::Announce),
                 ("http://h/announce", Ask::Scrape),
