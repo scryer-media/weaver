@@ -24,6 +24,7 @@ use crate::pipeline::download::queue::DownloadWork;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
+use crate::pipeline::post_health::GivenUp;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
 // The priority a window volume is raised to: ahead of every article at the
@@ -106,7 +107,10 @@ impl Pipeline {
         apply_moves(state, &moves);
         // The articles a run before a restart lost are given up as this
         // run's are, each weighed as the post declares it.
-        let given_up = self.given_up.entry(job_id).or_default();
+        let given_up = self
+            .given_up
+            .entry(job_id)
+            .or_insert_with(|| GivenUp::new(&state.spec));
         for (volume, ordinal, bytes) in graph.lost_articles() {
             let counts = state
                 .spec

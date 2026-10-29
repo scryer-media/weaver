@@ -165,17 +165,19 @@ async fn an_unprotected_damaged_file_leaves_the_job_partial() {
 }
 
 // An unprotected file lost whole beside a covered payload: the payload is
-// delivered and the job is partial.
+// delivered and the job is partial. No article of the file arrived, so no
+// file stands in for it.
 #[tokio::test]
 async fn a_missing_unprotected_file_leaves_the_job_partial() {
     let body = payload(5 * ARTICLE, 181);
     let mut posts = covered(&[("lantern.bin", &body)], 2, 1);
     posts.push(Post::plain("notes.txt", payload(3 * ARTICLE, 182)));
     let at = posts.len() as u32 - 1;
-    row(
+    let outcome = row(
         &lose_all(Scenario::new(posts), at),
         Expect::Partial(&[("lantern.bin", &body)]),
         "unprotected missing",
     )
     .await;
+    assert_eq!(super::delivered(&outcome.files, "notes.txt"), None);
 }

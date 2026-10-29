@@ -6,13 +6,16 @@
 // volume it repeats, so the set is one set and its member one file, and
 // an article one copy lost the other brings.
 
+use std::collections::BTreeMap;
+
 use crate::pipeline::tests::direct_store::{
-    single_member_rar4_store_set_numbered, single_member_store_set,
+    protected_store_set, single_member_rar4_store_set_numbered, single_member_store_set,
 };
+use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{ARTICLE, Claim, Outcome, Post, Scenario, par2_set, payload, run};
 use super::restart::{restart_row, run_restarting};
-use super::sevenz::{container, split};
+use super::sevenz::{container, members, split};
 
 const MEMBER: &str = "beacon.bin";
 
@@ -182,6 +185,31 @@ async fn an_article_damaged_in_both_copies_is_repaired() {
     assert_one_member(&run(&scenario).await, &body);
 }
 
+// Each volume carries its own recovery record, and a record is its bytes
+// whichever posting brought them. The first posting lost the article that
+// ends the first volume's record, the copy brought it, and an article both
+// postings served damaged is rebuilt from that record.
+#[tokio::test]
+async fn a_recovery_record_one_posting_lost_the_copy_brings() {
+    let body = body();
+    let posts = twice(protected_store_set(MEMBER, &body, 2, 1));
+    let last = (posts[0].bytes.len().div_ceil(ARTICLE) - 1) as u32;
+    let scenario = Scenario::new(posts)
+        .lost(0, last)
+        .damaged(0, 2)
+        .damaged(2, 2);
+    let graph = run(&scenario).await;
+    assert_one_member(&graph, &body);
+    assert!(
+        graph.graph().rulings.contains(&(
+            "rar_record".to_string(),
+            Some(RepairOutcome::Repaired { slices: 1 })
+        )),
+        "{:?}",
+        graph.graph().rulings
+    );
+}
+
 // A set posted twice, restarted after every article: the restored tree
 // is the one folded, and nothing on disk is fetched again.
 #[tokio::test]
@@ -249,5 +277,212 @@ async fn a_split_sevenz_posted_twice_is_one_set() {
             "lantern beacon/quill.bin".to_string()
         ]
     );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// Every article of posting `file` lost.
+fn lose_posting(posts: Vec<Post>, file: u32) -> Scenario {
+    let articles = posts[file as usize].articles(ARTICLE).count() as u32;
+    (0..articles).fold(Scenario::new(posts), |scenario, ordinal| {
+        scenario.lost(file, ordinal)
+    })
+}
+
+// One posting lost whole and no recovery set: the copy numbered alike
+// brings the volume and the set extracts whole. The lost posting is no file
+// of its own, and the post's health counts the volume once, so the job
+// completes.
+#[tokio::test]
+async fn a_posting_lost_whole_beside_its_copy_completes() {
+    let body = body();
+    let scenario = lose_posting(twice(single_member_store_set(MEMBER, &body, 2)), 0);
+    assert_one_member(&run(&scenario).await, &body);
+}
+
+// The same under names that say nothing: nothing ties the lost posting to a
+// volume, and beside a set that extracts whole the job completes, whatever
+// the feed made of its loss.
+#[tokio::test]
+async fn a_posting_lost_whole_under_a_name_that_says_nothing_completes() {
+    let body = body();
+    let posts = twice(single_member_store_set(MEMBER, &body, 2))
+        .into_iter()
+        .enumerate()
+        .map(|(index, post)| {
+            Post::plain(
+                &format!("{:032x}", 0xd1c7_0000_u128 + index as u128),
+                post.bytes,
+            )
+        })
+        .collect();
+    assert_one_member(&run(&lose_posting(posts, 0)).await, &body);
+}
+
+// Each posting one article, in order, posting `file` lost: it is lost
+// before any copy comes.
+fn lose_one(posts: Vec<Post>, file: u32) -> Scenario {
+    lose_each(posts, &[file])
+}
+
+// The same with every posting in `files` lost.
+fn lose_each(posts: Vec<Post>, files: &[u32]) -> Scenario {
+    let mut scenario = Scenario::new(posts);
+    scenario.article = 1 << 20;
+    files
+        .iter()
+        .fold(scenario, |scenario, &file| scenario.lost(file, 0))
+}
+
+// A compressed set held by its engine, its second volume's first posting
+// lost whole before the copy comes: the engine holds the lost posting by
+// its name alone, and the copy's bytes take the place from it, as they
+// would had the copy come first.
+#[tokio::test]
+async fn a_compressed_posting_lost_whole_yields_its_place_to_its_copy() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|part| {
+            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
+            (format!("silver.horizon.part0{part}.rar"), bytes)
+        })
+        .collect();
+    let graph = run(&lose_one(twice(volumes), 1)).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec!["lantern beacon/compressible.txt".to_string()]
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// A 7z coded by `method`, split in two and posted twice, posting `file`
+// lost before any copy comes: the set completes with both members.
+async fn assert_sevenz_completes_without(method: sevenz_turbo::EncoderMethod, file: u32) {
+    assert_sevenz_posted_twice_completes_without(method, &[file], |post| post).await;
+}
+
+// The same with every posting in `files` lost, each posted under `named`.
+async fn assert_sevenz_posted_twice_completes_without(
+    method: sevenz_turbo::EncoderMethod,
+    files: &[u32],
+    named: impl FnMut(Post) -> Post,
+) {
+    let archive = container(sevenz_turbo::EncoderConfiguration::new(method), None);
+    let pieces = split(&archive, 2);
+    let copies: Vec<Post> = pieces
+        .iter()
+        .map(|post| Post::plain(&post.name.replace(".7z.00", ".7z.000"), post.bytes.clone()))
+        .collect();
+    let posts = pieces.into_iter().chain(copies).map(named).collect();
+    let graph = run(&lose_each(posts, files)).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "lantern beacon/ember.bin".to_string(),
+            "lantern beacon/quill.bin".to_string()
+        ]
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// The same of a coded 7z split in two.
+#[tokio::test]
+async fn a_coded_sevenz_piece_lost_whole_yields_its_place_to_its_copy() {
+    assert_sevenz_completes_without(sevenz_turbo::EncoderMethod::LZMA2, 1).await;
+}
+
+// A 7z's first piece lost before anything else comes: the second piece's
+// name founds a split, and the first piece's copy, which signs a 7z, founds
+// the set and takes the second from it. The lost piece held its place in
+// the split by its name alone, so it is a volume of neither, and the split,
+// left with nothing, goes: the second piece's copy is the set's.
+#[tokio::test]
+async fn a_first_sevenz_piece_lost_before_anything_comes_is_no_volume() {
+    assert_sevenz_completes_without(sevenz_turbo::EncoderMethod::COPY, 0).await;
+}
+
+// Both pieces of a 7z lost before their copies come, under names that say
+// nothing: the lost second piece holds a place by its name alone, and the
+// second copy, whose bytes come, takes the place from it.
+#[tokio::test]
+async fn sevenz_pieces_lost_under_names_that_say_nothing_yield_to_their_copies() {
+    let mut index = 0_u128;
+    assert_sevenz_posted_twice_completes_without(
+        sevenz_turbo::EncoderMethod::COPY,
+        &[0, 1],
+        |post| {
+            index += 1;
+            Post::plain(&format!("{:032x}", 0xd1c7_0000_u128 + index), post.bytes)
+        },
+    )
+    .await;
+}
+
+// A 7z split in two and posted twice under names that say nothing, with a
+// recovery set over all four postings and none of its blocks: the last
+// piece's first posting is lost whole, and its copy brings every byte. The
+// job completes with every member, and every file it publishes is an
+// original's bytes: a member as written, or a posted file as posted.
+#[tokio::test]
+async fn a_piece_lost_beside_its_copy_publishes_only_the_original_bytes() {
+    let archive = container(
+        sevenz_turbo::EncoderConfiguration::new(sevenz_turbo::EncoderMethod::COPY),
+        None,
+    );
+    let pieces: Vec<Vec<u8>> = split(&archive, 2)
+        .into_iter()
+        .map(|post| post.bytes)
+        .collect();
+    let files: Vec<(String, Vec<u8>)> = pieces
+        .iter()
+        .chain(&pieces)
+        .enumerate()
+        .map(|(index, bytes)| {
+            let name = format!("{:032x}", 0xd1c7_0000_u128 + index as u128);
+            (name, bytes.clone())
+        })
+        .collect();
+    let named: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = files
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    posts.extend(par2_set("lantern", &named, 2));
+    let articles: Vec<u32> = posts
+        .iter()
+        .map(|post| post.articles(ARTICLE).count() as u32)
+        .collect();
+    let lost = [1, posts.len() as u32 - 1];
+    let scenario = lost.iter().fold(Scenario::new(posts), |scenario, &file| {
+        (0..articles[file as usize])
+            .fold(scenario, |scenario, ordinal| scenario.lost(file, ordinal))
+    });
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    let originals: BTreeMap<String, Vec<u8>> = members()
+        .into_iter()
+        .map(|(name, bytes)| (name.to_string(), bytes))
+        .chain(files)
+        .map(|(name, bytes)| (format!("lantern beacon/{name}"), bytes))
+        .collect();
+    for (name, _) in members() {
+        assert!(
+            graph.files.contains_key(&format!("lantern beacon/{name}")),
+            "{name} published"
+        );
+    }
+    for (name, bytes) in &graph.files {
+        assert!(
+            originals.get(name) == Some(bytes),
+            "{name} is an original's bytes"
+        );
+    }
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }

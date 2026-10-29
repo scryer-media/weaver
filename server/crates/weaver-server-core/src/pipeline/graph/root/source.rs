@@ -497,15 +497,6 @@ impl ArticleMap {
         })
     }
 
-    // Whether every server failed the article.
-    pub(crate) fn article_lost(&self, volume: VolumeIndex, ordinal: u32) -> bool {
-        self.volumes.get(volume.0 as usize).is_some_and(|found| {
-            found
-                .index(ordinal)
-                .is_some_and(|index| matches!(found.articles[index].state, State::Lost { .. }))
-        })
-    }
-
     // Where a reader laying the volume in order stands: the first article
     // still to come, the decoded offset it is laid at, and whether an
     // article before it was lost. An article in hand whose range this run

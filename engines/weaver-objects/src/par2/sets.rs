@@ -17,6 +17,7 @@ use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Wei
 use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
+use crate::lost::Lost;
 use crate::recovery_volume;
 
 const MAX_PAR2_INPUT_SLICES: u64 = 32_768;
@@ -44,6 +45,10 @@ pub(super) struct SetState {
     // when the index is built: the index is fixed until a new packet
     // rebuilds it, so the fold is too.
     whole: BTreeMap<FileId, u32>,
+    // The slices that share their checksums with another, by those
+    // checksums, folded with `whole`: equal checksums are equal bytes, so
+    // each holds the others' bytes.
+    alike: BTreeMap<SliceKey, Vec<(FileId, u64)>>,
     // Recovery packets by exponent: the first copy found is the one kept.
     pub(super) recovery: BTreeMap<u32, Location>,
     // Which member each described file is bound to: by its front, its
@@ -65,6 +70,7 @@ impl SetState {
             hashes: BTreeSet::new(),
             index: None,
             whole: BTreeMap::new(),
+            alike: BTreeMap::new(),
             recovery: BTreeMap::new(),
             members: BTreeMap::new(),
             unnamed: Vec::new(),
@@ -84,6 +90,7 @@ impl SetState {
         self.packets.change(|packets| packets.0.push(packet));
         self.index = index_of(&self.packets.get().0, output_limit);
         self.whole = whole_of(self.index.as_ref());
+        self.alike = alike_of(self.index.as_ref());
         // A ruling made with no description was on nothing: the set rules
         // again on what it now describes.
         if !described && self.usable().is_some() {
@@ -102,6 +109,7 @@ impl SetState {
         let index = index_of(&packets.get().0, output_limit);
         Self {
             whole: whole_of(index.as_ref()),
+            alike: alike_of(index.as_ref()),
             index,
             packets,
             hashes,
@@ -133,6 +141,16 @@ impl SetState {
     // The CRC32 the described file's slices fold to.
     pub(super) fn whole(&self, file: FileId) -> Option<u32> {
         self.whole.get(&file).copied()
+    }
+
+    // Every slice whose bytes are those of `slice` of `file`, itself among
+    // them; none when no other slice shares its checksums.
+    pub(super) fn alike(&self, file: FileId, slice: u64) -> &[(FileId, u64)] {
+        self.index
+            .as_ref()
+            .and_then(|index| slice_key(index, file, slice))
+            .and_then(|key| self.alike.get(&key))
+            .map_or(&[], Vec::as_slice)
     }
 
     pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
@@ -251,7 +269,7 @@ impl SetState {
 pub(super) struct Volume {
     pub(super) walker: Walker,
     pub(super) arrived: Coverage,
-    pub(super) lost: Vec<ByteRange>,
+    pub(super) lost: Lost,
     pub(super) closed: bool,
     // The recovery blocks the volume's name says it carries.
     pub(super) named_blocks: Option<u64>,
@@ -272,6 +290,13 @@ impl Volume {
     // packets, or nothing of it has been walked to say whose it is.
     pub(super) fn serves(&self, set: &[u8; 16]) -> bool {
         self.sets.is_empty() || self.sets.contains(set)
+    }
+
+    // Whether every byte of the volume was walked: it is closed and nothing
+    // of it was lost. One closed over a loss was never read where the loss
+    // lies, and a volume lost whole was never read at all.
+    pub(super) fn read_through(&self) -> bool {
+        self.closed && self.lost.is_empty()
     }
 
     // Whether the walk has shown the volume carries recovery blocks: one
@@ -297,14 +322,22 @@ impl Volume {
         });
     }
 
-    // Recovery blocks still to come, by the volume's name, less what was
-    // walked and what a lost range could have held. `packet` is the smallest
-    // recovery packet any known set writes, so a loss is never undercounted.
-    pub(super) fn coming(&self, packet: Option<u64>) -> u64 {
+    // The most recovery blocks the volume may still bring: what its name
+    // says it carries, less what was walked. A loss inside it is not counted
+    // against it, so this never falls short of the blocks really there.
+    pub(super) fn left(&self) -> u64 {
         if self.closed {
             return 0;
         }
-        let named = self.named_blocks.unwrap_or(0);
+        self.named_blocks
+            .unwrap_or(0)
+            .saturating_sub(self.walked_blocks)
+    }
+
+    // The fewest recovery blocks the volume will still bring: what is left,
+    // less what a lost range could have held. `packet` is the smallest
+    // recovery packet any known set writes, so a loss is never undercounted.
+    pub(super) fn coming(&self, packet: Option<u64>) -> u64 {
         let lost: u64 = match packet {
             Some(packet) if packet > 0 => self
                 .lost
@@ -312,11 +345,9 @@ impl Volume {
                 .map(|range| range.len().div_ceil(packet) + 1)
                 .sum(),
             _ if self.lost.is_empty() => 0,
-            _ => named,
+            _ => self.left(),
         };
-        named
-            .saturating_sub(self.walked_blocks)
-            .saturating_sub(lost)
+        self.left().saturating_sub(lost)
     }
 }
 
@@ -335,6 +366,33 @@ fn whole_of(index: Option<&Par2FileSet>) -> BTreeMap<FileId, u32> {
         .keys()
         .filter_map(|file| Some((*file, index.expected_file_crc32(*file)?)))
         .collect()
+}
+
+// A slice's checksums, which name its bytes.
+type SliceKey = (u32, [u8; 16]);
+
+fn slice_key(index: &Par2FileSet, file: FileId, slice: u64) -> Option<SliceKey> {
+    let checksum = index
+        .file_checksums(&file)?
+        .get(usize::try_from(slice).ok()?)?;
+    Some((checksum.crc32, checksum.md5))
+}
+
+fn alike_of(index: Option<&Par2FileSet>) -> BTreeMap<SliceKey, Vec<(FileId, u64)>> {
+    let Some(index) = index else {
+        return BTreeMap::new();
+    };
+    let mut alike: BTreeMap<SliceKey, Vec<(FileId, u64)>> = BTreeMap::new();
+    for file in index.files.keys() {
+        for (slice, checksum) in index.file_checksums(file).into_iter().flatten().enumerate() {
+            alike
+                .entry((checksum.crc32, checksum.md5))
+                .or_default()
+                .push((*file, slice as u64));
+        }
+    }
+    alike.retain(|_, slices| slices.len() > 1);
+    alike
 }
 
 // Admit declared geometry before anything is built on it.

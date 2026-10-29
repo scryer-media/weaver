@@ -119,75 +119,206 @@ impl Leaf {
         bytes: &[u8],
         length: Option<u64>,
     ) -> Result<(), LeafError> {
-        let file = self.open(length)?;
+        self.open(length)?;
+        let replaced = self.replaced(offset, bytes.len() as u64)?;
+        let file = self.file.as_ref().expect("opened above");
         write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))?;
-        self.wrote(offset, bytes);
+        self.wrote(offset, bytes, &replaced);
         Ok(())
     }
 
-    // Fold a write into the runs. A run the write overlaps is superseded by
-    // it; its CRC cannot be split from the part the write leaves standing,
-    // so the whole run is forgotten. The write then joins the runs it abuts.
-    fn wrote(&mut self, offset: u64, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let end = offset + bytes.len() as u64;
-        let overlapped: Vec<u64> = self
+    // The bytes a write over `offset..offset + len` replaces, of each run
+    // it overlaps, in order: what the fold needs to keep those runs, and no
+    // more than the write itself puts down.
+    fn replaced(&self, offset: u64, len: u64) -> Result<Vec<(u64, Vec<u8>)>, LeafError> {
+        let end = offset + len;
+        let mut replaced = Vec::new();
+        for (start, run) in self
             .written
             .range(..end)
             .rev()
             .take_while(|(_, run)| run.end > offset)
-            .map(|(start, _)| *start)
-            .collect();
-        for start in overlapped {
-            self.written.remove(&start);
-        }
-        let mut start = offset;
-        let mut run = Written {
-            end,
-            crc32: crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32,
-        };
-        if let Some((&before, prior)) = self.written.range(..offset).next_back()
-            && prior.end == offset
         {
-            run.crc32 = combine(prior.crc32, run.crc32, end - offset);
-            start = before;
-            self.written.remove(&before);
+            let from = (*start).max(offset);
+            let mut old = Vec::new();
+            self.read(from, index(run.end.min(end) - from), &mut old)?;
+            replaced.push((from, old));
         }
-        if let Some(after) = self.written.remove(&end) {
-            run.crc32 = combine(run.crc32, after.crc32, after.end - end);
-            run.end = after.end;
-        }
-        self.written.insert(start, run);
+        replaced.reverse();
+        Ok(replaced)
     }
 
-    // The CRC32 of the member's `length` bytes: from the fold, when one run
-    // of writes covers exactly them, and otherwise read back from the file.
-    // A run broken by a restart, which starts the fold empty, or by a write
-    // over bytes already written, which the fold cannot split, costs one
-    // read of the file; the answer is the same.
+    // Fold a write into the runs. A run the write overlaps keeps its span:
+    // CRC32 is linear, so the bytes it replaced give way to the bytes that
+    // replace them by the CRC of the two, carried past the run's bytes
+    // behind them. What of the write no run held is a run of its own, and
+    // runs that now abut are joined.
+    fn wrote(&mut self, offset: u64, bytes: &[u8], replaced: &[(u64, Vec<u8>)]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let end = offset + bytes.len() as u64;
+        let of = |from: u64, to: u64| &bytes[index(from - offset)..index(to - offset)];
+        let mut at = offset;
+        for (from, old) in replaced {
+            let to = from + old.len() as u64;
+            if at < *from {
+                self.written.insert(
+                    at,
+                    Written {
+                        end: *from,
+                        crc32: crc32(of(at, *from)),
+                    },
+                );
+            }
+            let (_, run) = self
+                .written
+                .range_mut(..=*from)
+                .next_back()
+                .expect("a replaced range lies in a run");
+            let behind = run.end - to;
+            run.crc32 ^= combine(crc32(old), 0, behind) ^ combine(crc32(of(*from, to)), 0, behind);
+            at = to;
+        }
+        if at < end {
+            self.written.insert(
+                at,
+                Written {
+                    end,
+                    crc32: crc32(of(at, end)),
+                },
+            );
+        }
+        self.join(offset, end);
+    }
+
+    // Join the runs about `offset..end` that abut.
+    fn join(&mut self, offset: u64, end: u64) {
+        let first = self
+            .written
+            .range(..offset)
+            .next_back()
+            .filter(|(_, run)| run.end >= offset)
+            .map_or(offset, |(start, _)| *start);
+        let starts: Vec<u64> = self
+            .written
+            .range(first..=end)
+            .map(|(start, _)| *start)
+            .collect();
+        let mut joined: Option<(u64, Written)> = None;
+        for start in starts {
+            let run = self.written.remove(&start).expect("listed above");
+            joined = match joined {
+                Some((from, prior)) if prior.end == start => Some((
+                    from,
+                    Written {
+                        end: run.end,
+                        crc32: combine(prior.crc32, run.crc32, run.end - start),
+                    },
+                )),
+                Some((from, prior)) => {
+                    self.written.insert(from, prior);
+                    Some((start, run))
+                }
+                None => Some((start, run)),
+            };
+        }
+        if let Some((from, run)) = joined {
+            self.written.insert(from, run);
+        }
+    }
+
+    // The file ends at `length`: the runs past it go, and a run it cuts
+    // keeps the CRC of what stays, the bytes it loses undone from it, read
+    // before they go.
+    fn cut(&mut self, length: u64) -> Result<(), LeafError> {
+        let past: Vec<u64> = self
+            .written
+            .range(length..)
+            .map(|(start, _)| *start)
+            .collect();
+        for start in past {
+            self.written.remove(&start);
+        }
+        let Some((&start, &run)) = self.written.range(..length).next_back() else {
+            return Ok(());
+        };
+        if run.end <= length {
+            return Ok(());
+        }
+        let mut lost = Vec::new();
+        self.read(length, index(run.end - length), &mut lost)?;
+        let kept =
+            crc_turbo::CrcCombine::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, run.end - length)
+                .uncombine(u64::from(run.crc32), u64::from(crc32(&lost)))
+                .expect("CRC32 has an x^0 term") as u32;
+        self.written.insert(
+            start,
+            Written {
+                end: length,
+                crc32: kept,
+            },
+        );
+        Ok(())
+    }
+
+    // A restored member's fold, which a restore starts empty. A member
+    // whose bytes passed its stated CRC folds to that CRC; any other folds
+    // what of `ranges` its file holds, read back from it. A range the file
+    // does not hold is left out of the fold.
+    pub(crate) fn fold_passed(&mut self, length: u64, crc32: u32) {
+        self.written.clear();
+        if length > 0 {
+            self.written.insert(0, Written { end: length, crc32 });
+        }
+    }
+
+    pub(crate) fn fold_back(&mut self, ranges: impl IntoIterator<Item = (u64, u64)>) {
+        let mut chunk = Vec::new();
+        for (start, end) in ranges {
+            let mut at = start;
+            while at < end {
+                let take = (end - at).min(READ_BACK);
+                chunk.clear();
+                if self.read(at, index(take), &mut chunk).is_err() {
+                    break;
+                }
+                self.wrote(at, &chunk, &[]);
+                at += take;
+            }
+        }
+    }
+
+    // The CRC32 of the member's `length` bytes as the fold holds them,
+    // when one run covers exactly them.
+    pub(crate) fn folded(&self, length: u64) -> Option<u32> {
+        match self.written.iter().next() {
+            Some((0, run)) if self.written.len() == 1 && run.end == length => Some(run.crc32),
+            _ => None,
+        }
+    }
+
+    // The CRC32 of the member's `length` bytes: from the fold, which a
+    // rewrite, a cut and a restore all keep, and read back from the file
+    // only for bytes that came to it some other way.
     pub(crate) fn crc32(&self, length: u64) -> Result<u32, LeafError> {
-        if let Some((0, run)) = self.written.iter().next()
-            && self.written.len() == 1
-            && run.end == length
-        {
-            return Ok(run.crc32);
+        if let Some(folded) = self.folded(length) {
+            return Ok(folded);
         }
         let mut crc = 0u32;
         let mut at = 0u64;
         let mut chunk = Vec::new();
         while at < length {
-            let take = (length - at).min(READ_BACK) as usize;
+            let take = (length - at).min(READ_BACK);
             chunk.clear();
-            self.read(at, take, &mut chunk)?;
-            let part = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &chunk) as u32;
+            self.read(at, index(take), &mut chunk)?;
+            let part = crc32(&chunk);
             crc = if at == 0 {
                 part
             } else {
-                combine(crc, part, take as u64)
+                combine(crc, part, take)
             };
-            at += take as u64;
+            at += take;
         }
         Ok(crc)
     }
@@ -244,7 +375,9 @@ impl Leaf {
         if self.directory {
             return self.create_directory();
         }
-        let file = self.open(Some(length))?;
+        self.open(Some(length))?;
+        self.cut(length)?;
+        let file = self.file.as_ref().expect("opened above");
         file.set_len(length).map_err(LeafError::io(&self.path))?;
         self.file = None;
         Ok(())
@@ -395,6 +528,14 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Res
     }
 }
 
+fn crc32(bytes: &[u8]) -> u32 {
+    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+}
+
+fn index(len: u64) -> usize {
+    usize::try_from(len).expect("a leaf range fits in memory")
+}
+
 // The CRC32 of `first` followed by `len_second` bytes whose CRC32 is `second`.
 fn combine(first: u32, second: u32, len_second: u64) -> u32 {
     crc_turbo::checksum_combine(
@@ -403,4 +544,49 @@ fn combine(first: u32, second: u32, len_second: u64) -> u32 {
         u64::from(second),
         len_second,
     ) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bytes(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|at| (at as u8).wrapping_mul(31) ^ seed)
+            .collect()
+    }
+
+    fn file_crc(leaf: &Leaf, length: u64) -> u32 {
+        let mut all = Vec::new();
+        leaf.read(0, index(length), &mut all).unwrap();
+        crc32(&all)
+    }
+
+    // A write over bytes already written, a close that cuts the file short
+    // and a restore each leave the fold answering for the file, so the
+    // check at close never reads the member back.
+    #[test]
+    fn the_fold_answers_for_the_file_through_rewrites_cuts_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "lantern.bin");
+        leaf.write(0, &bytes(4096, 1), None).unwrap();
+        leaf.write(6000, &bytes(2192, 2), None).unwrap();
+        // Over the end of one run, the gap and the start of the next.
+        leaf.write(3000, &bytes(4000, 3), None).unwrap();
+        // Inside one run, with other bytes, and with the same bytes.
+        leaf.write(100, &bytes(50, 4), None).unwrap();
+        leaf.write(100, &bytes(50, 4), None).unwrap();
+        assert_eq!(leaf.folded(8192), Some(file_crc(&leaf, 8192)));
+        leaf.close(7000).unwrap();
+        assert_eq!(leaf.folded(7000), Some(file_crc(&leaf, 7000)));
+
+        let mut restored = Leaf::at(dir.path(), "lantern.bin");
+        assert_eq!(restored.folded(7000), None);
+        restored.fold_back([(0, 3000), (3000, 7000)]);
+        assert_eq!(restored.folded(7000), Some(file_crc(&leaf, 7000)));
+        // A range the file does not hold stays out of the fold.
+        let mut short = Leaf::at(dir.path(), "lantern.bin");
+        short.fold_back([(0, 9000)]);
+        assert_eq!(short.folded(7000), None);
+    }
 }

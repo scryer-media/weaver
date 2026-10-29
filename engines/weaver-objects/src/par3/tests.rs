@@ -799,3 +799,33 @@ fn a_hole_in_a_member_leaves_unknown_only_the_block_it_touches() {
     );
     assert!(job.store.members[&first] == one);
 }
+
+// A file refused whole beside another the set describes with the same
+// bytes: every block of it is held, so it costs no recovery block, and the
+// rebuild copies it from the file that holds it.
+#[test]
+fn a_file_refused_whole_is_copied_from_the_file_holding_its_blocks() {
+    let data = payload(71, 9000);
+    let files = par3_set(
+        "set",
+        &[("first.bin", &data), ("again.bin", &data)],
+        BLOCK,
+        1,
+    );
+    let mut job = job(&files);
+    let first = job.member("first.bin", &data);
+    let again = job.namespace.announce("again.bin", Some(data.len() as u64));
+    job.store.members.insert(again, vec![0; data.len()]);
+    Recovery::refused(&mut job.object, again, ByteRange::new(0, data.len() as u64));
+    bind(&mut job);
+    assert!(job.object.covers(again));
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    assert!(job.store.members[&again] == data);
+    assert!(job.store.members[&first] == data);
+}

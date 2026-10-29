@@ -551,6 +551,27 @@ impl Namespace {
         Some(found)
     }
 
+    // A member bound under its own name is a file its recovery set describes
+    // as `size` long; `rebuilt` says the set repaired it. It takes the
+    // described length when it reached less and holds damage or was rebuilt:
+    // a member posted short closes at the length its articles reached, and
+    // the file the set rebuilds is the length the set describes. Rebuilt and
+    // booked longer, it is trimmed as `trim_booked` says. True when its
+    // length changed.
+    pub fn take_described(&mut self, member: MemberId, size: u64, rebuilt: bool) -> bool {
+        let Some(found) = self.members.get(&member) else {
+            return false;
+        };
+        let short = found.length.is_some_and(|length| length < size)
+            && (rebuilt || !found.coverage.is_clean());
+        if short {
+            let name = found.name.clone();
+            self.recognise(member, &name, size);
+            return true;
+        }
+        rebuilt && self.trim_booked(member, size)
+    }
+
     // A recovery object repaired the member and describes it as `size`
     // long, but it is booked longer, with no verified byte past that size:
     // what lies past was booked for articles that never came, and the
@@ -768,6 +789,37 @@ mod tests {
         assert!(!coverage.verified(ByteRange::new(0, 30)));
         assert!(coverage.verified(ByteRange::new(10, 20)));
         assert_eq!(coverage.damaged_ranges().count(), 2);
+    }
+
+    // A member posted short of the length its set describes takes that
+    // length when it holds damage or the set rebuilt it, and keeps its own
+    // when it reached less clean and nothing rebuilt it. One booked longer
+    // is trimmed only once rebuilt.
+    #[test]
+    fn a_described_member_takes_its_length_when_short_and_damaged_or_rebuilt() {
+        let short = |damaged: bool, rebuilt: bool| {
+            let mut namespace = Namespace::new();
+            let member = namespace.announce("ember.bin", Some(20));
+            let provenance = match damaged {
+                true => Provenance::Damaged,
+                false => Provenance::Fresh,
+            };
+            namespace.arrive(member, ByteRange::new(0, 20), provenance);
+            let changed = namespace.take_described(member, 30, rebuilt);
+            (changed, namespace.get(member).unwrap().length)
+        };
+        assert_eq!(short(false, false), (false, Some(20)));
+        assert_eq!(short(true, false), (true, Some(30)));
+        assert_eq!(short(false, true), (true, Some(30)));
+        let booked = |rebuilt: bool| {
+            let mut namespace = Namespace::new();
+            let member = namespace.announce("ember.bin", Some(40));
+            namespace.arrive(member, ByteRange::new(0, 30), Provenance::Repaired);
+            let changed = namespace.take_described(member, 30, rebuilt);
+            (changed, namespace.get(member).unwrap().length)
+        };
+        assert_eq!(booked(false), (false, Some(40)));
+        assert_eq!(booked(true), (true, Some(30)));
     }
 
     // Damage arriving over a member whose middle a repair rebuilt: the

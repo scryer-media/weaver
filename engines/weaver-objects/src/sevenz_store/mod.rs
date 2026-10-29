@@ -39,6 +39,7 @@ use crate::crypt::{Cbc, Chain, Padding};
 use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
 use crate::keys::Keys;
+use crate::lost::minus;
 use crate::quiet::Placed;
 use crate::split;
 use geometry::Geometry;
@@ -182,6 +183,9 @@ pub struct SevenZipStore {
     budget: Budget,
     names: BTreeMap<VolumeIndex, String>,
     lengths: BTreeMap<VolumeIndex, u64>,
+    // The places whose piece's first byte came. A piece whose front never
+    // came holds its place by its name alone.
+    fronted: BTreeSet<VolumeIndex>,
     kept: Kept,
     start: Option<Start>,
     // How long the container is, as the signature header in the front the
@@ -237,7 +241,8 @@ impl Durable for SevenZipStore {
     // 4: a sealed value encodes as nothing, numbered by its owner's walk.
     // 5: the container's length as the first piece's front states it.
     // 6: whether the candidate that opened it had proved itself.
-    const VERSION: u16 = 6;
+    // 7: the places whose piece's front came.
+    const VERSION: u16 = 7;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)
@@ -287,6 +292,7 @@ impl SevenZipStore {
             budget: Budget::default(),
             names: BTreeMap::new(),
             lengths: BTreeMap::new(),
+            fronted: BTreeSet::new(),
             kept,
             start: None,
             measured: None,
@@ -351,7 +357,8 @@ impl SevenZipStore {
     // length nor the first piece's need be known yet, as a uuencoded
     // piece's is not until it ends. One with no number is at each free
     // place its length fits, and a piece as long as the first fits every
-    // free place but the last.
+    // free place but the last. A place a piece whose front never came holds
+    // is free: a name is all that holds it, and the tree weighs the two.
     fn placed(&self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Option<Placed> {
         if matches!(signed(first_bytes, length), Sniff::Object(_)) {
             let again = matches!(
@@ -370,7 +377,9 @@ impl SevenZipStore {
         let first = *self.lengths.get(&VolumeIndex(0))?;
         let total = self.measured?;
         Geometry::new(first, total)?;
-        fits(first, total, length?, |at| !names.contains_key(&at))
+        fits(first, total, length?, |at| {
+            !names.contains_key(&at) || !self.fronted.contains(&at)
+        })
     }
 
     // One past every volume held.
@@ -666,6 +675,9 @@ impl Object for SevenZipStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
+        if delivery.offset == 0 && !delivery.bytes.is_empty() {
+            self.fronted.insert(delivery.volume);
+        }
         let Some(range) = self.container(delivery.volume, delivery.range()) else {
             return;
         };
@@ -674,6 +686,9 @@ impl Object for SevenZipStore {
         }
         let skip = (range.start - self.base(delivery.volume)) - delivery.offset;
         let bytes = &delivery.bytes[skip as usize..(skip + range.len()) as usize];
+        // The bytes of a proof still pending are kept, and reach their members
+        // only when the proof opens its folder, in this call or a later one.
+        let proof = self.proof.map(|proof| proof.range);
         // Absorbing can make the object want more of this very delivery: the
         // signature names the end header, the end header names its packs.
         loop {
@@ -690,7 +705,15 @@ impl Object for SevenZipStore {
                 break;
             }
         }
-        self.route(range, bytes, delivery.provenance, read, out);
+        let pieces: Vec<ByteRange> = match proof {
+            Some(proof) => minus(range, proof).collect(),
+            None => vec![range],
+        };
+        for piece in pieces {
+            let at = (piece.start - range.start) as usize;
+            let slice = &bytes[at..at + piece.len() as usize];
+            self.route(piece, slice, delivery.provenance, read, out);
+        }
         if std::mem::take(&mut self.wrong_key) {
             self.condemn(out);
         }
@@ -850,7 +873,16 @@ impl Object for SevenZipStore {
     // says how long the container is; its length is how long every piece
     // but the last is. Both are what places the pieces bound after it.
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
-        self.names.insert(volume, name.to_owned());
+        if self
+            .names
+            .insert(volume, name.to_owned())
+            .is_some_and(|was| was != name)
+        {
+            self.fronted.remove(&volume);
+        }
+        if !front.is_empty() {
+            self.fronted.insert(volume);
+        }
         if let Some(length) = length {
             self.lengths.entry(volume).or_insert(length);
             self.stale = true;

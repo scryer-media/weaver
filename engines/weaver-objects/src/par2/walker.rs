@@ -21,7 +21,8 @@
 // past the volume's end, was no packet: the walk steps one byte past its
 // magic and resyncs from there, as the next packet may begin anywhere in
 // what was read as its body. Those bytes have left the hold, so the walk
-// asks for them again, and reads them as they come back.
+// asks for them again, and reads them as they come back: from the first
+// magic they held, as no byte before it can begin a packet.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use par2_rs::packet::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
 use par2_rs::{FileHashState, Packet, ScannedPacket, parse_packet};
 use weaver_graph::ByteRange;
+
+use crate::lost::minus;
 
 // The longest body par2-rs buffers for each metadata type. A longer one, and
 // a packet of a type it does not know, is hashed and dropped.
@@ -69,6 +72,43 @@ struct Streamed {
     header: PacketHeader,
     hasher: FileHashState,
     exponent: u32,
+    magic: Magic,
+}
+
+// The first magic in a streamed packet's bytes past its own, as far as they
+// have passed: where the walk starts again if the packet was none.
+#[derive(Default)]
+struct Magic {
+    first: Option<u64>,
+    // The last bytes passed, short of a whole magic, which one may begin in.
+    tail: Vec<u8>,
+}
+
+impl Magic {
+    // The bytes from `at` on pass.
+    fn pass(&mut self, at: u64, bytes: &[u8]) {
+        if self.first.is_some() {
+            return;
+        }
+        let mut joint = std::mem::take(&mut self.tail);
+        let from = at - joint.len() as u64;
+        joint.extend_from_slice(&bytes[..bytes.len().min(MAGIC.len() - 1)]);
+        self.first = find_magic(&joint)
+            .map(|found| from + found)
+            .or_else(|| find_magic(bytes).map(|found| at + found));
+        let keep = if bytes.len() >= MAGIC.len() - 1 {
+            &bytes[bytes.len() + 1 - MAGIC.len()..]
+        } else {
+            &joint[joint.len().saturating_sub(MAGIC.len() - 1)..]
+        };
+        self.tail = keep.to_vec();
+    }
+
+    // Where a walk that read up to `next` starts again: at the first magic,
+    // or where one could still begin.
+    fn again(&self, next: u64) -> u64 {
+        self.first.unwrap_or(next - self.tail.len() as u64)
+    }
 }
 
 #[derive(Default)]
@@ -168,13 +208,13 @@ impl Walker {
         for (_, walk) in &mut self.again {
             walk.sized(length, found);
         }
-        if let Some(at) = self
+        if let Some(from) = self
             .streamed
             .as_ref()
             .filter(|open| open.at + open.header.length > length)
-            .map(|open| open.at)
+            .map(|open| open.magic.again(self.next))
         {
-            self.read_again(at, found);
+            self.read_again(from, found);
         }
         self.walk(found);
     }
@@ -278,11 +318,11 @@ impl Walker {
         self.again.sort_by_key(|(bound, _)| bound.start);
     }
 
-    // The packet streamed from `at` was none. The walk starts again from the
-    // byte past its magic, and what it read of the packet from there, which
-    // has left the hold, comes again from the volume.
-    fn read_again(&mut self, at: u64, found: &mut Vec<Found>) {
-        let range = ByteRange::new(at + 1, self.next);
+    // The packet being streamed was none. The walk starts again from `from`,
+    // the first magic past its own, and what it read of the packet from
+    // there, which has left the hold, comes again from the volume.
+    fn read_again(&mut self, from: u64, found: &mut Vec<Found>) {
+        let range = ByteRange::new(from, self.next);
         self.streamed = None;
         self.unposted(range, found);
         found.push(Found::Again(range));
@@ -403,11 +443,14 @@ impl Walker {
             };
             let mut hasher = FileHashState::new();
             hasher.update(&front[32..HEADER_SIZE]);
+            let mut magic = Magic::default();
+            magic.pass(at + 1, &front[1..HEADER_SIZE]);
             self.streamed = Some(Streamed {
                 at,
                 exponent: u32::from_le_bytes([exponent[0], exponent[1], exponent[2], exponent[3]]),
                 header,
                 hasher,
+                magic,
             });
             self.advance(at + HEADER_SIZE as u64);
             return true;
@@ -440,6 +483,7 @@ impl Walker {
         let end = open.at + open.header.length;
         let take = (end - self.next).min(front.len() as u64) as usize;
         open.hasher.update(&front[..take]);
+        open.magic.pass(self.next, &front[..take]);
         let to = self.next + take as u64;
         self.advance(to);
         if to < end {
@@ -449,7 +493,7 @@ impl Walker {
             return true;
         };
         if open.hasher.finalize() != open.header.packet_hash {
-            self.read_again(open.at, found);
+            self.read_again(open.magic.again(self.next), found);
             return true;
         }
         found.push(match open.header.packet_type {
@@ -482,17 +526,6 @@ impl Walker {
     }
 }
 
-// What of `range` lies outside `cut`.
-pub(super) fn minus(range: ByteRange, cut: ByteRange) -> impl Iterator<Item = ByteRange> {
-    [
-        (range.start, range.end.min(cut.start)),
-        (range.start.max(cut.end), range.end),
-    ]
-    .into_iter()
-    .filter(|(start, end)| start < end)
-    .map(|(start, end)| ByteRange::new(start, end))
-}
-
 fn body_cap(packet_type: PacketType) -> Option<u64> {
     match packet_type {
         PacketType::Main => Some(MAIN_BODY_CAP),
@@ -507,11 +540,15 @@ fn body_cap(packet_type: PacketType) -> Option<u64> {
 // How far to step from a front that is not a trusted header: to the next
 // magic in hand, or to where the next magic could still begin.
 fn resync(front: &[u8]) -> u64 {
-    let found = front[1..]
+    let found = find_magic(&front[1..]).map(|at| at + 1);
+    found.unwrap_or((front.len() + 1 - MAGIC.len()) as u64)
+}
+
+fn find_magic(bytes: &[u8]) -> Option<u64> {
+    bytes
         .windows(MAGIC.len())
         .position(|window| window == MAGIC)
-        .map(|at| at + 1);
-    found.unwrap_or(front.len() + 1 - MAGIC.len()) as u64
+        .map(|at| at as u64)
 }
 
 // What one job's packets may cost across every volume, by par2-rs's three

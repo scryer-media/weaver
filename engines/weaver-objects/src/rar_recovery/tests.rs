@@ -429,3 +429,29 @@ fn a_deferral_is_said_again_after_a_restart() {
     back.wants(&mut again);
     assert_eq!(again, wants(&job.object));
 }
+
+// A data volume posted twice, the posting listed first lost whole: the set
+// binds the posting that arrived, and nothing is missing.
+#[test]
+fn a_volume_posted_twice_binds_the_posting_that_arrived() {
+    let mut job = job();
+    rev(
+        &mut job,
+        "lantern.part1.rev",
+        &rev5(3, 1, 3, &[300, 300, 300]),
+    );
+    let lost = job.namespace.announce("lantern.part2.rar", Some(300));
+    job.namespace.get_mut(lost).expect("announced").closed = true;
+    Recovery::refused(&mut job.object, lost, ByteRange::new(0, 300));
+    data(&mut job, "lantern.part01.rar");
+    let second = data(&mut job, "lantern.part02.rar");
+    data(&mut job, "lantern.part03.rar");
+    bind(&mut job);
+    assert!(job.object.covers(second));
+    assert!(!job.object.covers(lost));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+}

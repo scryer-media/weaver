@@ -275,6 +275,88 @@ fn a_first_volume_joins_only_the_set_it_carries_on_into() {
     );
 }
 
+// A one-volume set beside a numbered set of the same kind: every volume of
+// either states a number, and the sets stay apart. A far volume of the
+// numbered set never joins the one-volume set by its number alone: not
+// where the names are two sets', and not past the volume whose end record
+// says no volume follows. Held past that volume, as the one-volume set's
+// first was claimed beside the other set's second, it goes back at its
+// close.
+#[test]
+fn a_one_volume_set_and_a_numbered_set_keep_apart() {
+    let mut whole = Options::new(Version::Rar5);
+    whole.split = Some(1 << 20);
+    let sample = write(
+        &[Item::File("lantern.sample.bin", payload(6, 3_000))],
+        &whole,
+    )
+    .remove(0);
+    let set = write(&items(), &split(Version::Rar5));
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+
+    let mut named = store();
+    named.bound(VolumeIndex(0), "lantern.sample.rar", &sample, None);
+    assert_eq!(named.claim("alpha.part3.rar", &front(&set[2]), None), None);
+
+    let mut ended = Owner::new(store(), vec![("c0ffee".to_owned(), sample.clone())]);
+    ended.frames(0, 4096);
+    ended.close(0);
+    assert_eq!(ended.object.claim("d00d", &front(&set[2]), None), None);
+
+    let posted = vec![
+        ("c0ffee".to_owned(), sample),
+        ("d00d".to_owned(), set[1].clone()),
+    ];
+    let mut beside = Owner::founded(store(), posted, 1);
+    beside.frames(1, 4096);
+    beside.close(1);
+    beside.frames(0, 4096);
+    beside.close(0);
+    assert!(
+        beside.said.contains(&Emit::GiveBack(VolumeIndex(1))),
+        "{:?}",
+        beside.said
+    );
+    assert_eq!(beside.member("lantern.sample.bin").bytes, payload(6, 3_000));
+}
+
+// Two numbered sets of one kind, posted together. A far volume of one never
+// joins the other by the number its headers state when no held volume
+// beside that number judges it and its name is the other set's; a far
+// volume of the held set still joins by its name.
+#[test]
+fn a_far_volume_joins_only_the_set_its_name_numbers() {
+    let ours = write(&items(), &split(Version::Rar5));
+    let theirs = write(
+        &[Item::File("delta.bin", payload(4, 20_000))],
+        &split(Version::Rar5),
+    );
+    assert_eq!(theirs.len(), 4);
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+
+    let mut first = store();
+    first.bound(VolumeIndex(0), "alpha.part1.rar", &front(&ours[0]), None);
+    assert_eq!(
+        first.claim("delta.part4.rar", &front(&theirs[3]), None),
+        None
+    );
+    assert_eq!(
+        first.claim("alpha.part3.rar", &front(&ours[2]), None),
+        Some(VolumeIndex(2))
+    );
+
+    let mut last = store();
+    last.bound(VolumeIndex(2), "alpha.part3.rar", &front(&ours[2]), None);
+    assert_eq!(
+        last.claim("delta.part1.rar", &front(&theirs[0]), None),
+        None
+    );
+    assert_eq!(
+        last.claim("alpha.part1.rar", &front(&ours[0]), None),
+        Some(VolumeIndex(0))
+    );
+}
+
 // A nameless RAR4 volume posted again goes where no free place takes it:
 // the one held place its neighbours link it to.
 #[test]
@@ -874,6 +956,55 @@ fn a_damaged_file_header_waits_for_repair() {
         assert!(damaged, "{version:?} {:?}", owner.said);
         assert_eq!(owner.members.len(), 1, "only the file before it");
         owner.deliver_as(0, header, Provenance::Repaired, None);
+        owner.close(0);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
+// The flags of the end record the writer closes a volume with: where it
+// says whether a volume follows.
+fn end_flags(version: Version, volume: &[u8]) -> ByteRange {
+    let length = volume.len() as u64;
+    match version {
+        Version::Rar5 => ByteRange::new(length - 2, length),
+        Version::Rar4 => ByteRange::new(length - 4, length - 2),
+    }
+}
+
+// A volume's end record arrives damaged, its flags zeroes, so read as it
+// stands it says no volume follows. The set does not end there: the volumes
+// after it stay held, and the repair that brings the real bytes reads the
+// set whole.
+#[test]
+fn a_damaged_end_record_never_ends_the_set() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let flags = end_flags(version, &volumes[0]);
+        let length = volumes[0].len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        for volume in [1, 2] {
+            owner.frames(volume, 1000);
+            owner.close(volume);
+        }
+        owner.deliver(0, ByteRange::new(0, flags.start));
+        owner.deliver_as(
+            0,
+            flags,
+            Provenance::Damaged,
+            Some(&vec![0; flags.len() as usize]),
+        );
+        owner.deliver(0, ByteRange::new(flags.end, length));
+        owner.close(0);
+        assert!(
+            !owner
+                .said
+                .iter()
+                .any(|emit| matches!(emit, Emit::GiveBack(_))),
+            "{version:?} {:?}",
+            owner.said
+        );
+        owner.deliver_as(0, flags, Provenance::Repaired, None);
         owner.close(0);
         streamed(&owner);
         posted_whole(&owner);

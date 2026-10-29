@@ -613,7 +613,33 @@ pub(in super::super) struct Post {
     pub expected: Vec<(String, Vec<u8>)>,
     // Further files a complete job may publish besides `expected`, such as
     // furniture posted beside the archive.
-    pub allowed: Vec<String>,
+    pub allowed: Vec<Allowed>,
+}
+
+// A file a job may publish besides `expected`.
+#[derive(Clone, Debug)]
+pub(in super::super) struct Allowed {
+    pub name: String,
+    // Its bytes when whole, for a file a user can open: a sample, a picture,
+    // a text. `None` for a container or furniture, which never make a job
+    // Partial however whole they are.
+    pub usable: Option<Vec<u8>>,
+}
+
+impl Allowed {
+    pub(in super::super) fn usable(name: &str, bytes: &[u8]) -> Self {
+        Self {
+            name: name.to_string(),
+            usable: Some(bytes.to_vec()),
+        }
+    }
+
+    pub(in super::super) fn unusable(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            usable: None,
+        }
+    }
 }
 
 impl Post {

@@ -133,11 +133,16 @@ impl Pipeline {
                 slot.insert(terminal_state);
             }
         }
-        self.given_up.entry(job_id).or_default().give_up(
-            seg_id,
-            Some(terminal_state),
-            declared_bytes,
-        );
+        let jobs = &self.jobs;
+        self.given_up
+            .entry(job_id)
+            .or_insert_with(|| {
+                jobs.get(&job_id)
+                    .map_or_else(crate::pipeline::post_health::GivenUp::default, |state| {
+                        crate::pipeline::post_health::GivenUp::new(&state.spec)
+                    })
+            })
+            .give_up(seg_id, Some(terminal_state), declared_bytes);
         self.note_gap_support_fact(seg_id, terminal_state);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);

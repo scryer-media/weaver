@@ -34,7 +34,7 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionFailure;
 
 pub(crate) use claims::Delivered;
-pub(crate) use claims::Delivery;
+pub(crate) use claims::{Delivery, Unarrived};
 pub(in crate::pipeline) use seams::advance;
 pub(crate) use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};

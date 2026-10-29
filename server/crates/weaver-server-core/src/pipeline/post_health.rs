@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use weaver_model::files::FileRole;
+use weaver_model::files::{FileRole, archive_base_name};
 use weaver_nntp::client::ProbeBatchResult;
 use weaver_nntp::pool::ServerId;
 
@@ -386,6 +386,40 @@ pub(crate) fn names_a_piece(name: &str) -> bool {
         )
 }
 
+// The place a posted file's name gives it: the set its stem names and its
+// number in that set, when the name numbers it as an archive volume or a
+// split part. Two files named into one place are one volume posted twice,
+// however each pads its number: `part01` and `part1`, `.7z.001` and
+// `.7z.0001`.
+pub(crate) fn names_a_place(name: &str) -> Option<Place> {
+    let role = FileRole::from_filename(name);
+    let number = match role {
+        FileRole::RarVolume { volume_number } => volume_number,
+        FileRole::SevenZipSplit { number } | FileRole::SplitFile { number } => number,
+        _ => return None,
+    };
+    let stem = archive_base_name(name, &role)?;
+    Some(Place {
+        kind: std::mem::discriminant(&role),
+        stem,
+        number,
+    })
+}
+
+// Whether a file's name says nothing of what the file is: no role and no
+// extension, such as a name that is a hash alone.
+pub(crate) fn names_nothing(name: &str) -> bool {
+    FileRole::from_filename(name) == FileRole::Unknown
+        && std::path::Path::new(name).extension().is_none()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Place {
+    kind: std::mem::Discriminant<FileRole>,
+    stem: String,
+    number: u32,
+}
+
 // The bytes of every file the post names as recovery data, its indexes
 // among them: what the critical line is drawn from.
 pub(crate) fn declared_recovery_bytes(spec: &JobSpec) -> u64 {
@@ -633,7 +667,7 @@ impl Pipeline {
             .get(&job_id)
             .copied()
             .unwrap_or_default();
-        let total = spec.total_bytes;
+        let total = self.post_bytes(job_id, spec);
         let lost = self.missing_bytes(job_id);
         let failed = probe.decided(lost);
         let health = health_milli(total, failed);
@@ -669,7 +703,7 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
-        let total = state.spec.total_bytes;
+        let total = self.post_bytes(job_id, &state.spec);
         if total == 0 || !state.status.in_progress() {
             return;
         }
@@ -946,7 +980,7 @@ impl Pipeline {
             self.post_probes.retire(job_id);
             return;
         };
-        let total = state.spec.total_bytes;
+        let total = self.post_bytes(job_id, &state.spec);
         let recovery = declared_recovery_bytes(&state.spec);
         let tracked = total.saturating_sub(recovery);
         let critical = Self::critical_health_milli(total, recovery);
@@ -1002,6 +1036,13 @@ impl Pipeline {
     // before a restart.
     pub(in crate::pipeline) fn missing_bytes(&self, job_id: JobId) -> u64 {
         self.given_up.get(&job_id).map_or(0, GivenUp::missing_bytes)
+    }
+
+    // The size the post's health is a share of: what it declares, each
+    // volume it posts again counted once.
+    fn post_bytes(&self, job_id: JobId, spec: &JobSpec) -> u64 {
+        spec.total_bytes
+            .saturating_sub(self.given_up.get(&job_id).map_or(0, GivenUp::again_bytes))
     }
 
     // The feed gives the post up. Below its recovery line nothing can

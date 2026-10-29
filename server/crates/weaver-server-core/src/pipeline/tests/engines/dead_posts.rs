@@ -37,6 +37,30 @@ async fn a_post_whose_first_articles_are_lost_fails_before_its_payload_is_fetche
     }
 }
 
+// Twelve files and no recovery, every article of the last lost: the others
+// arrive whole and the job is Partial. Nothing of the last arrived, so no
+// file stands in for it, though the root holds its loss as damage.
+#[tokio::test]
+async fn a_file_whose_every_article_is_lost_has_no_file() {
+    let scenario = (0..4).fold(Scenario::new(files()), |scenario, ordinal| {
+        scenario.lost(11, ordinal)
+    });
+    let graph = run(&scenario).await;
+    assert_eq!(graph.status, Some(JobStatus::Partial));
+    for at in 0..11 {
+        let name = format!("lantern{at:02}.bin");
+        assert_eq!(graph.claims.get(&name), Some(&Claim::Complete), "{name}");
+    }
+    assert!(
+        !graph
+            .files
+            .keys()
+            .any(|path| path.ends_with("lantern11.bin")),
+        "{:?}",
+        graph.files.keys().collect::<Vec<_>>()
+    );
+}
+
 // Ten files of two articles and no recovery, every file's first article
 // refused by every server. The post's health falls below its critical line
 // at the fourth lost first article, long before the sample reaches its

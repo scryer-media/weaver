@@ -9,7 +9,7 @@
 use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::damage::with_recovery;
 use super::fixtures::{Container, MEMBER, PASSWORD as KEY, SEVENZ_MEMBER, payload};
-use super::post::{Encoding, Post, Posted, Role};
+use super::post::{Allowed, Encoding, Post, Posted, Role};
 use super::recovery::{
     self, Code, Geometry, Margin, Par2Volumes, par2_packet, par2_packets, par2_set_id, par2_type,
 };
@@ -580,7 +580,7 @@ pub(super) mod nesting {
                 ),
             };
             let mut post = data_post(outer, ARTICLE, members);
-            post.allowed = containers.into_iter().map(str::to_string).collect();
+            post.allowed = containers.into_iter().map(Allowed::unusable).collect();
             post.password = self.locked.then(|| KEY.to_string());
             let (post, geometry) = with(
                 post,
@@ -1601,7 +1601,7 @@ pub(super) mod sets {
                         bytes,
                     ));
                 }
-                allowed.push(member.to_string());
+                allowed.push(Allowed::usable(member, &sample));
             }
             if self.layout == Layout::LooseMedia {
                 let trailer = payload(107, 20_000);
@@ -1616,22 +1616,25 @@ pub(super) mod sets {
                         format!("{name} {crc:08x}\r\n")
                     })
                     .collect();
-                let furniture: Vec<(String, Vec<u8>)> = vec![
+                // Each with whether a user opens it: the picture and the text
+                // are usable files, the rest only describe the post.
+                let furniture: Vec<(&str, Vec<u8>, bool)> = vec![
                     (
-                        "silver.horizon.nfo".to_string(),
+                        "silver.horizon.nfo",
                         b"Silver Horizon\r\nposted for the harbour\r\n".to_vec(),
+                        false,
                     ),
-                    ("silver.horizon.sfv".to_string(), listing.into_bytes()),
-                    ("silver.horizon.jpg".to_string(), payload(109, 2_000)),
-                    ("silver.horizon.srr".to_string(), payload(113, 1_500)),
-                    (
-                        "readme.txt".to_string(),
-                        b"nothing to see here\r\n".to_vec(),
-                    ),
+                    ("silver.horizon.sfv", listing.into_bytes(), false),
+                    ("silver.horizon.jpg", payload(109, 2_000), true),
+                    ("silver.horizon.srr", payload(113, 1_500), false),
+                    ("readme.txt", b"nothing to see here\r\n".to_vec(), true),
                 ];
-                for (name, bytes) in furniture {
-                    allowed.push(name.clone());
-                    volumes.push((name, bytes));
+                for (name, bytes, usable) in furniture {
+                    allowed.push(match usable {
+                        true => Allowed::usable(name, &bytes),
+                        false => Allowed::unusable(name),
+                    });
+                    volumes.push((name.to_string(), bytes));
                 }
             }
             let mut post = data_post(volumes, ARTICLE, expected);

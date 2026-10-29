@@ -268,7 +268,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
             front: volume.walker.front(),
             walk_lost: volume.walker.lost(),
             arrived: volume.arrived.clone(),
-            lost: volume.lost.clone(),
+            lost: volume.lost.clone().into(),
             closed: volume.closed,
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
@@ -319,7 +319,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
         .map(|volume| Volume {
             walker: Walker::resumed(volume.front, volume.walk_lost),
             arrived: volume.arrived,
-            lost: volume.lost,
+            lost: volume.lost.into(),
             closed: volume.closed,
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,

@@ -342,7 +342,7 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
         .expected
         .iter()
         .map(|(name, _)| name)
-        .chain(post.allowed.iter())
+        .chain(post.allowed.iter().map(|allowed| &allowed.name))
         .map(|name| (name.clone(), std::fs::read(output.join(name)).ok()))
         .collect();
     let mut published = files_under(&output);
@@ -433,7 +433,7 @@ impl Ran {
                 .expected
                 .iter()
                 .map(|(name, _)| name.clone())
-                .chain(post.allowed.iter().cloned())
+                .chain(post.allowed.iter().map(|allowed| allowed.name.clone()))
                 .chain(post.files.iter().map(|posted| posted.name.clone()))
                 .collect();
             let unexpected: Vec<_> = self.published.difference(&allowed).collect();
@@ -465,16 +465,14 @@ impl Ran {
                 );
             }
             Some(JobStatus::Partial) => {
-                // A file the job may publish counts as usable when it is
-                // whole: the posted bytes when it was posted as a file, else
-                // one unpacked, whose bytes the post does not state.
-                let allowed_whole = post.allowed.iter().any(|name| {
-                    match post.files.iter().find(|posted| posted.name == *name) {
-                        Some(posted) => {
-                            self.files[name].as_deref() == Some(posted.bytes.as_slice())
-                        }
-                        None => self.files[name].is_some(),
-                    }
+                // An allowed file counts as usable only when it is one a user
+                // can open and holds its bytes whole; a container or
+                // furniture never does, whatever is on disk.
+                let allowed_whole = post.allowed.iter().any(|allowed| {
+                    allowed
+                        .usable
+                        .as_deref()
+                        .is_some_and(|bytes| self.files[&allowed.name].as_deref() == Some(bytes))
                 });
                 assert!(
                     !whole.is_empty() || allowed_whole,

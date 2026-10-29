@@ -11,6 +11,7 @@ pub mod engine;
 mod grid;
 mod kept;
 pub mod keys;
+mod lost;
 pub mod par2;
 pub mod par3;
 mod quiet;

@@ -24,6 +24,7 @@ use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::graph::status::RepairSlots;
+use crate::pipeline::graph::status::Unarrived;
 
 const CANDIDATES: [&str; 4] = ["lantern-one", "lantern-two", OPENS, "lantern-four"];
 const WRONG: [&str; 4] = ["lantern-one", "lantern-two", "lantern-four", "lantern-five"];
@@ -246,6 +247,7 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
         |_, _| false,
         |_, _| None,
         |_, _| false,
+        |_| Unarrived::Short,
     );
     assert_eq!(
         delivery,

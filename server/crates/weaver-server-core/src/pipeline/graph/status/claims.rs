@@ -136,12 +136,17 @@ pub(crate) fn refused<'c>(
 // A member given back for a reason that withholds it (`Why::withholds`)
 // delivered nothing: its bytes are a container nothing opened, neither
 // whole nor short, and stay as they stand.
+// A posted file none of whose bytes arrived is short only where its name
+// says it is a file the delivery lacks (`Unarrived`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delivery {
     pub(crate) whole: Vec<String>,
     // Damaged or missing with nothing that could rebuild them: delivered as
     // they stand.
     pub(crate) damaged: Vec<String>,
+    // Posted files that never arrived under names that say nothing of what
+    // they were: short unless a set extracted whole beside them.
+    pub(crate) unnamed: Vec<String>,
     // A recovery object that covers them could not rebuild them. Left as
     // they stand, and not a delivery.
     pub(crate) unrepaired: Vec<String>,
@@ -149,6 +154,21 @@ pub(crate) struct Delivery {
     pub(crate) withheld: Vec<(String, Why)>,
     // Every file delivered, whole or as it stands, as the walk met it.
     pub(crate) files: Vec<Delivered>,
+}
+
+// What a posted file that is not whole says of the delivery: short of it,
+// unless none of its bytes arrived and its name says otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unarrived {
+    // A file of the delivery, which is short of it.
+    Short,
+    // A volume or part posted again: another posted file named into the
+    // same place arrived. It is no file of its own.
+    Again,
+    // Nothing: it may have been anything, a copy of a volume a set the
+    // delivery extracted whole holds among them. Beside such a set, the
+    // job completes.
+    Unnamed,
 }
 
 // One file the job hands over, under the name the tree placed it at.
@@ -169,7 +189,8 @@ impl Delivery {
     // job, such as a text file posted beside the payload, and
     // `unrepaired` the members a recovery set whose repair could not
     // rebuild what it found covers, as their namespace says. `refused` says
-    // why a member is a leaf.
+    // why a member is a leaf, and `unarrived` what a posted file that is
+    // not whole was, when none of its bytes arrived.
     pub(crate) fn read(
         tree: &Tree,
         payload: impl Fn(MemberId) -> bool,
@@ -177,10 +198,12 @@ impl Delivery {
         unrepaired: impl Fn(NodeId, MemberId) -> bool,
         refused: impl Fn(NodeId, MemberId) -> Option<Why>,
         piece: impl Fn(NodeId, MemberId) -> bool,
+        unarrived: impl Fn(MemberId) -> Unarrived,
     ) -> Self {
         let mut walk = Walk {
             tree,
             piece: &piece,
+            unarrived: &unarrived,
             furniture: &furniture,
             unrepaired: &unrepaired,
             refused: &refused,
@@ -202,11 +225,19 @@ impl Delivery {
     // in the words of the sets that could not rebuild, and otherwise for
     // what was withheld. A failed rebuild is short whether or not a member
     // carries what it could not rebuild: a file the set describes and
-    // nothing delivered is short too.
+    // nothing delivered is short too. An unnamed file that never arrived
+    // beside a set that extracted whole may have been a copy of one of its
+    // volumes, and the job completes when it can; beside the post's own
+    // files alone it is a file the post lacks. The feed giving the post up
+    // words a failure and rules nothing: a delivery nothing is short of is
+    // complete.
     pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
-        let short =
-            !(self.damaged.is_empty() && self.unrepaired.is_empty() && self.withheld.is_empty());
-        if !short && failure.is_none() {
+        let extracted = self.files.iter().any(|file| file.whole && file.depth > 0);
+        let short = !(self.damaged.is_empty()
+            && self.unrepaired.is_empty()
+            && self.withheld.is_empty()
+            && (self.unnamed.is_empty() || extracted));
+        if !short && failure.is_none_or(|failure| failure.from_feed) {
             return JobStatus::Complete;
         }
         if !self.whole.is_empty() {
@@ -222,6 +253,7 @@ impl Delivery {
                     .damaged
                     .iter()
                     .chain(&self.unrepaired)
+                    .chain(&self.unnamed)
                     .map(String::as_str)
                     .collect();
                 format!(
@@ -290,6 +322,7 @@ struct Walk<'t, F, R> {
     // A member the post names as a piece of something else: an archive
     // volume, a split part or recovery data, never a file the user opens.
     piece: &'t dyn Fn(NodeId, MemberId) -> bool,
+    unarrived: &'t dyn Fn(MemberId) -> Unarrived,
     // Every volume of a set opens the same namespace; it is read once.
     opened: BTreeSet<NodeId>,
     delivery: Delivery,
@@ -335,6 +368,13 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
             self.delivery.withheld.push((name, why));
             return;
         }
+        // A posted file none of whose bytes arrived is what its name says
+        // it was: another posting of a volume is no file at all.
+        let unarrived =
+            (node == NodeId::ROOT && claim != Claim::Complete).then(|| (self.unarrived)(member.id));
+        if unarrived == Some(Unarrived::Again) {
+            return;
+        }
         // A member an object disclaimed is the file it was posted as, and
         // whole when its bytes are, whatever its name says it is. Otherwise
         // a piece left as a leaf is delivered as it stands: whole bytes of a
@@ -344,9 +384,10 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
                 || (!(self.piece)(node, member.id)
                     && self.tree.refused_by(node, member.id).is_none()));
         let delivery = &mut self.delivery;
-        match whole {
-            true => delivery.whole.push(name.clone()),
-            false => delivery.damaged.push(name.clone()),
+        match (whole, unarrived) {
+            (true, _) => delivery.whole.push(name.clone()),
+            (false, Some(Unarrived::Unnamed)) => delivery.unnamed.push(name.clone()),
+            (false, _) => delivery.damaged.push(name.clone()),
         }
         delivery.files.push(Delivered {
             name,

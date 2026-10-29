@@ -31,8 +31,8 @@ use weaver_graph::Posted;
 use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
-    Builder, ByteRange, Effect, Emit, Kind, Marked, MemberId, NodeId, Object, ObjectId, Placement,
-    Provenance, Segment, Tree, VolumeIndex, Why,
+    Builder, ByteRange, Coverage, Effect, Emit, Kind, Marked, MemberId, NodeId, Object, ObjectId,
+    Placement, Provenance, Segment, Tree, VolumeIndex, Why,
 };
 
 use super::checkpoint::why_name;
@@ -929,8 +929,11 @@ impl NamespaceWriter {
     // A member its object gave back is a leaf, and its file is what the
     // object kept of it, its envelope, which was always at the volume's own
     // offsets: the envelope's file is moved to the member's name, never
-    // copied. What the object never placed is still held for the member and
-    // goes into that file as held bytes go into any leaf's. Until an object
+    // copied. An envelope nothing was written to is no file, as a member
+    // none of whose bytes were written has none. What the object never
+    // placed is still held for the member and goes into that file as held
+    // bytes go into any leaf's. The member's coverage is then what that
+    // envelope and its holds hold. Until an object
     // claims it, the tree holds its parse beside it, which is what withholds
     // it; the claim that takes it reads the file in place, as it reads any
     // leaf's.
@@ -945,14 +948,52 @@ impl NamespaceWriter {
             .and_then(|namespace| namespace.get(member))
             .map(|record| record.output_name.clone())
             .ok_or(WriteError::UnknownMember { node, member })?;
-        if let Some(leaf) = self.envelopes.take(from, volume.0) {
-            if let Some(stale) = self.files_mut(node).leaves.insert(member, leaf) {
-                self.discard(stale)?;
+        if let Some(kept) = self.envelopes.take(from, volume.0) {
+            if kept.coverage.bytes_covered() == 0 {
+                self.discard(kept.into_leaf())?;
+            } else {
+                self.uncover_unkept(tree, (node, member), &kept.coverage);
+                if let Some(stale) = self.files_mut(node).leaves.insert(member, kept.into_leaf()) {
+                    self.discard(stale)?;
+                }
+                self.intend(node, member, &output_name);
             }
-            self.intend(node, member, &output_name);
         }
         self.release_to_leaf(tree, node, member)?;
         Ok(())
+    }
+
+    // A byte the member's coverage says arrived that neither the envelope
+    // given back as its file nor its holds have is not in hand, as a
+    // restart's lost range is not, and comes again. Only a restore leaves
+    // one: an envelope comes back as far as its record and its file reach,
+    // the member's coverage as far as what arrived, which counts bytes that
+    // were only held in memory. A range held as damage may never have
+    // arrived at all, and stays.
+    fn uncover_unkept(&self, tree: &mut Tree, (node, member): (NodeId, MemberId), kept: &Coverage) {
+        let Some(record) = tree.namespace(node).and_then(|found| found.get(member)) else {
+            return;
+        };
+        let mut unkept = Coverage::new();
+        for run in record.coverage.runs() {
+            if run.provenance != Provenance::Damaged {
+                unkept.write(run.range, run.provenance);
+            }
+        }
+        for run in kept.runs() {
+            unkept.erase(run.range);
+        }
+        if let Some(files) = self.files.get(&node) {
+            for range in files.holds.held_ranges(held_volume(member)) {
+                unkept.erase(range);
+            }
+        }
+        let unkept: Vec<ByteRange> = unkept.runs().map(|run| run.range).collect();
+        if let Some(namespace) = tree.namespace_mut(node) {
+            for range in unkept {
+                namespace.uncover(member, range);
+            }
+        }
     }
 
     fn write_leaf(
@@ -1258,9 +1299,11 @@ impl NamespaceWriter {
     }
 
     // The member is closed: its file takes the length the tree gave it. A
-    // member none of whose bytes arrived has no file: a name is a file only
-    // once something of it was written, so a file a recovery object
-    // describes is one only when its repair writes it.
+    // member none of whose bytes were written has no file: a name is a file
+    // only once something of it was written, so a file whose every article
+    // was lost is none, though its coverage holds that loss as damage, and
+    // a file a recovery object describes is one only when its repair
+    // writes it.
     fn close_leaf(
         &mut self,
         tree: &Tree,
@@ -1272,7 +1315,11 @@ impl NamespaceWriter {
             .and_then(|namespace| namespace.get(member))
             .ok_or(WriteError::UnknownMember { node, member })?;
         let length = record.length.unwrap_or(0);
-        if length > 0 && record.coverage.bytes_covered() == 0 {
+        let written = self
+            .files
+            .get(&node)
+            .is_some_and(|files| files.leaves.contains_key(&member));
+        if length > 0 && !written {
             return Ok(());
         }
         let output_name = record.output_name.clone();
@@ -1283,10 +1330,10 @@ impl NamespaceWriter {
 
     // Whether the member's file, every byte of it in and none damaged,
     // fails the CRC32 its object's headers state for it. Every such member
-    // is checked: the leaf folded the CRC of its writes as they landed and
-    // answers from the fold when it can, and reads the file back when it
-    // cannot. A member with no stated checksum, or one already short or
-    // damaged, has nothing more for the check to say.
+    // is checked, from the CRC the leaf folded as its writes landed, which
+    // a rewrite, a cut and a restore keep, so nothing is read back here. A
+    // member with no stated checksum, or one already short or damaged, has
+    // nothing more for the check to say.
     fn fails_its_checksum(
         &self,
         tree: &Tree,
@@ -1504,14 +1551,7 @@ impl Builder for Placing<'_> {
         };
         let access = self.writer.access(tree);
         let start = into.len();
-        // A recovery object's volume stays in its member's own file: its
-        // envelope is that file, at the volume's offsets in the member.
-        let read = match placement {
-            Placement::Envelope { range, .. } if tree.recovers(node) => tree
-                .in_member(node, *range)
-                .is_some_and(|within| access.read_at(parent, member, within, into)),
-            placement => read_placed(&access, (parent, member), node, placement, into),
-        };
+        let read = read_placed(&access, (parent, member), node, placement, into);
         if !read {
             into.truncate(start);
         }
@@ -1539,6 +1579,12 @@ pub(crate) trait Source {
         into: &mut Vec<u8>,
     ) -> bool;
     fn envelope(&self, child: NodeId, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool;
+    // Whether the object at `child` is a recovery object, whose volume stays
+    // in its member's own file.
+    fn recovers(&self, child: NodeId) -> bool;
+    // Where a range of the volume of the object at `child` lies in the
+    // member it is bound to; `None` past the window it is bound to.
+    fn in_member(&self, child: NodeId, range: ByteRange) -> Option<ByteRange>;
     // The member's own file, for a range its coverage says was written.
     fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
     // Bytes still held for the member, read where they are kept and left
@@ -1575,6 +1621,11 @@ fn read_placed(
 ) -> bool {
     match placement {
         Placement::Member { member, range } => read_member(source, child, *member, *range, into),
+        // A recovery object's volume stays in its member's own file: its
+        // envelope is that file, at the volume's offsets in the member.
+        Placement::Envelope { range, .. } if source.recovers(child) => source
+            .in_member(child, *range)
+            .is_some_and(|within| read_own(source, node, member, within, into)),
         Placement::Envelope { envelope, range } => source.envelope(child, *envelope, *range, into),
         // What the object could not place was held for the member, and once
         // released it is in the member's own file.
@@ -1675,6 +1726,14 @@ impl Source for Access<'_> {
         self.tree
             .child_of(node, member)
             .filter(|(child, _)| !self.tree.recovers(*child))
+    }
+
+    fn recovers(&self, child: NodeId) -> bool {
+        self.tree.recovers(child)
+    }
+
+    fn in_member(&self, child: NodeId, range: ByteRange) -> Option<ByteRange> {
+        self.tree.in_member(child, range)
     }
 
     fn posted(
