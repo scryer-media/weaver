@@ -679,13 +679,13 @@ async fn a_route_that_could_not_listen_shows_why() {
     sessions.stop_all().await;
 }
 
-// The SSL port chosen while the settings name none is chosen once, outside
-// the privileged ports and the ephemeral range, and kept.
+// The SSL port chosen while the settings name none is chosen once, above
+// the listen ports and below the ephemeral range, and kept.
 #[test]
 fn the_chosen_ssl_port_is_kept() {
     let db = Database::open_in_memory().unwrap();
     let chosen = chosen_ssl_port(&db).unwrap();
-    assert!((10_000..50_000).contains(&chosen));
+    assert!((30_000..50_000).contains(&chosen));
     assert_eq!(chosen_ssl_port(&db).unwrap(), chosen);
 }
 

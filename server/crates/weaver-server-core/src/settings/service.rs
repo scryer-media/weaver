@@ -22,7 +22,21 @@ pub const HARDWARE_PROFILE_SETTING: &str = "hardware_profile";
 // carry a setting the product no longer has.
 pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &["ip_replacement_trial_extra_connections"];
 
+// The torrent listen port. Absent until the first load draws one.
+const BASE_PORT_KEY: &str = "torrent.base_port";
+
 impl Database {
+    // The listen port of a database that names none: drawn at random the
+    // first time, then kept, so peers and forwarded ports find it again.
+    pub(crate) fn chosen_base_port(&self) -> Result<u16, StateError> {
+        use crate::torrents::sessions::{LISTEN_PORTS, random_port};
+        let drawn = random_port(LISTEN_PORTS)?;
+        let stored = self.setting_or_insert(BASE_PORT_KEY, &drawn.to_string())?;
+        stored
+            .parse()
+            .map_err(|_| StateError::Database(format!("{BASE_PORT_KEY} is not a port: {stored}")))
+    }
+
     // Load a full `Config` from the settings and servers tables.
     pub fn load_config(&self) -> Result<Config, StateError> {
         let settings: std::collections::HashMap<String, String> = self
@@ -219,7 +233,10 @@ impl Database {
         };
 
         let seeding = seeding_policy_from_settings(&settings);
-        let torrent = torrent_config_from_settings(&settings);
+        let mut torrent = torrent_config_from_settings(&settings);
+        if !settings.contains_key(BASE_PORT_KEY) {
+            torrent.base_port = self.chosen_base_port()?;
+        }
 
         Ok(Config {
             data_dir,
@@ -284,7 +301,7 @@ impl Database {
 
     pub fn save_torrent_config(&self, torrent: &TorrentConfig) -> Result<(), StateError> {
         self.set_setting("torrent.enabled", &torrent.enabled.to_string())?;
-        self.set_setting("torrent.base_port", &torrent.base_port.to_string())?;
+        self.set_setting(BASE_PORT_KEY, &torrent.base_port.to_string())?;
         match torrent.announce_port {
             Some(port) => self.set_setting("torrent.announce_port", &port.to_string())?,
             None => self.delete_setting("torrent.announce_port")?,
@@ -573,7 +590,7 @@ fn torrent_config_from_settings(
     let defaults = TorrentConfig::default();
     TorrentConfig {
         enabled: parsed_setting(settings, "torrent.enabled").unwrap_or(defaults.enabled),
-        base_port: parsed_setting(settings, "torrent.base_port").unwrap_or(defaults.base_port),
+        base_port: parsed_setting(settings, BASE_PORT_KEY).unwrap_or(defaults.base_port),
         announce_port: parsed_setting(settings, "torrent.announce_port"),
         upnp: parsed_setting(settings, "torrent.upnp").unwrap_or(defaults.upnp),
         encryption: settings

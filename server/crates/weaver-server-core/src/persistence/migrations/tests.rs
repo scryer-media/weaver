@@ -56,6 +56,8 @@ active = true
     assert_eq!(config.data_dir, "/tmp/weaver-data");
     assert_eq!(config.servers.len(), 1);
     assert_eq!(config.servers[0].host, "news.example.com");
+    // The file named no torrent listen port, so one was drawn.
+    assert!(crate::torrents::sessions::LISTEN_PORTS.contains(&config.torrent.base_port));
 
     // Verify TOML was renamed.
     assert!(!toml_path.exists());

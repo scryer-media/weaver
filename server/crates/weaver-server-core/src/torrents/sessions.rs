@@ -1650,9 +1650,23 @@ pub fn port_slot(db: &Database, key: &RouteKey) -> Result<u16, StateError> {
     Ok(slot)
 }
 
+/// Where a listen port is drawn when the settings name none, as qBittorrent
+/// draws its own on the first start (`SessionImpl`, a `Port` of -1): above
+/// the privileged ports and below the ephemeral range. The SSL ports are
+/// drawn from the range above, so no route's slot of one reaches a slot of
+/// the other.
+pub const LISTEN_PORTS: std::ops::Range<u16> = 10_000..30_000;
+const SSL_PORTS: std::ops::Range<u16> = 30_000..50_000;
+
+/// A port from `ports`, at random.
+pub fn random_port(ports: std::ops::Range<u16>) -> Result<u16, StateError> {
+    let mut bytes = [0u8; 2];
+    getrandom::fill(&mut bytes).map_err(|error| StateError::Database(error.to_string()))?;
+    Ok(ports.start + u16::from_le_bytes(bytes) % ports.len() as u16)
+}
+
 /// The SSL port chosen while the settings name none: at random the first
-/// time, above the privileged ports and below the ephemeral range, then
-/// kept, so peers find it again.
+/// time, from [`SSL_PORTS`], then kept, so peers find it again.
 pub fn chosen_ssl_port(db: &Database) -> Result<u16, StateError> {
     if let Some(port) = db
         .get_setting(CHOSEN_SSL_PORT_KEY)?
@@ -1660,9 +1674,7 @@ pub fn chosen_ssl_port(db: &Database) -> Result<u16, StateError> {
     {
         return Ok(port);
     }
-    let mut bytes = [0u8; 2];
-    getrandom::fill(&mut bytes).map_err(|error| StateError::Database(error.to_string()))?;
-    let port = 10_000 + u16::from_le_bytes(bytes) % 40_000;
+    let port = random_port(SSL_PORTS)?;
     db.set_setting(CHOSEN_SSL_PORT_KEY, &port.to_string())?;
     Ok(port)
 }
