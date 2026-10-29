@@ -296,8 +296,8 @@ fn delivered<'a>(files: &'a BTreeMap<String, Vec<u8>>, name: &str) -> Option<&'a
 
 // The run in posting order came to what the damage and the recovery say:
 // every described file whole when the set can mend it, else a job that is
-// not complete, delivers no described file but byte for byte, and fails as
-// a repair when it delivers none. A file listed with no bytes
+// not complete, counts whole only described files delivered byte for byte,
+// and fails as a repair when it counts none. A file listed with no bytes
 // was never a file of the job, and is never delivered.
 fn judge(fixture: &Fixture, whole: &Outcome, sufficient: bool, context: &str) {
     for (name, _) in fixture.files.iter().filter(|(_, bytes)| bytes.is_empty()) {
@@ -329,11 +329,25 @@ fn judge(fixture: &Fixture, whole: &Outcome, sufficient: bool, context: &str) {
         }
         return;
     }
+    // A file the job counts whole is byte for byte the described one; a
+    // file it does not is delivered as it stands, short of its bytes.
+    let counted = &whole.graph().delivery.whole;
     let mut any = false;
     for (_, (name, original)) in fixture.posted() {
-        if let Some(bytes) = delivered(&whole.files, name) {
-            assert!(bytes == original, "{context}: {name} delivered damaged");
+        let Some(bytes) = delivered(&whole.files, name) else {
+            continue;
+        };
+        if counted
+            .iter()
+            .any(|counted| counted.rsplit('/').next() == Some(name))
+        {
+            assert!(
+                bytes == original,
+                "{context}: {name} counted whole, delivered damaged"
+            );
             any = true;
+        } else {
+            assert!(bytes != original, "{context}: {name} whole, not counted");
         }
     }
     match &whole.status {
