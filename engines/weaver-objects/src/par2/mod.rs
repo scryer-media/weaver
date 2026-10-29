@@ -403,9 +403,13 @@ impl Object for Par2 {
         self.ask_again(out);
     }
 
+    // A loss told again, as a restore tells every loss, is one it holds.
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
         let mut found = Vec::new();
         let state = self.volume(volume);
+        if state.lost.iter().any(|lost| lost.covers(range)) {
+            return;
+        }
         state.lost.push(range);
         state.walker.lose(range, &mut found);
         // A recovery packet whose bytes are lost cannot be read back.

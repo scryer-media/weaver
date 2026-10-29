@@ -640,3 +640,41 @@ async fn a_post_dead_on_its_health_is_dead_after_a_restart() {
     assert_eq!(restarted.status, whole.status);
     assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
 }
+
+// A set starved of every recovery volume rules impossible after a restart
+// as before one. Its volumes' losses reach it while it is out of the tree
+// for a repair, and a crash then drops what waited for its return; a
+// restore tells every loss again, so the set hears what the run that went
+// down never had the chance to tell it.
+#[tokio::test]
+async fn a_set_starved_of_its_volumes_is_starved_after_a_restart() {
+    let body = payload(10 * ARTICLE, 176);
+    let mut posts = vec![Post::plain("lantern.bin", body.clone())];
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &body)], 8, 2));
+    // The index arrives; both volumes are lost whole.
+    let volumes: Vec<(u32, u32)> = posts[2..]
+        .iter()
+        .zip(2u32..)
+        .flat_map(|(post, file)| {
+            (0..post.bytes.len().div_ceil(ARTICLE) as u32).map(move |o| (file, o))
+        })
+        .collect();
+    let mut scenario = Scenario::new(posts);
+    for ordinal in 2..8 {
+        scenario = scenario.lost(0, ordinal);
+    }
+    for (file, ordinal) in volumes {
+        scenario = scenario.lost(file, ordinal);
+    }
+    let whole = run(&scenario).await;
+    assert!(
+        matches!(whole.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        whole.status
+    );
+    assert_eq!(whole.failure_kind, Some(HistoryFailureKind::Repair));
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert!(restarted.restarts > 1, "the run restarted");
+    assert_eq!(restarted.status, whole.status);
+    assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
+}

@@ -295,10 +295,14 @@ fn rows(taken: &Snapshot) -> GraphCheckpoint {
     out
 }
 
+// A restore tells every loss again, so no loss comes back as one already
+// told.
 #[test]
 fn a_snapshot_comes_back_from_its_rows() {
     let taken = full();
-    assert_eq!(snapshot(&rows(&taken)), Ok(taken));
+    let mut back = taken.clone();
+    back.root.volumes[0].articles[1] = (1, ArticleFacts::Lost { damaged: false });
+    assert_eq!(snapshot(&rows(&taken)), Ok(back));
 }
 
 #[test]
