@@ -108,7 +108,11 @@ async fn refused_while_open(
 
 // Serve one article as a download lane would: taken off the job's queues as
 // it is fetched, so what is still queued is what the job still owes.
-async fn serve_queued(pipeline: &mut Pipeline, scenario: &Scenario, (file, ordinal): (u32, u32)) {
+pub(super) async fn serve_queued(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    (file, ordinal): (u32, u32),
+) {
     if let Some(state) = pipeline.jobs.get_mut(&JOB) {
         let this = |work: &crate::pipeline::download::queue::DownloadWork| {
             work.segment_id.file_id.file_index == file && work.segment_id.segment_number == ordinal

@@ -9,13 +9,18 @@
 // repair came to returns through the run mail, numbered by the loan, and is
 // applied by the namespace as the set's ruling.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use tokio::sync::mpsc;
 use weaver_graph::NodeId;
 use weaver_graph::slots::{AskerId, Ticket};
 
 use super::super::engine::{Heard, Said};
 use super::super::hardware::Hardware;
-use super::super::namespace::{Lender, Loan, SetState};
+use super::super::namespace::{Lender, Loan, Replay, SetState};
 use super::super::status::RepairSlots;
 
 pub(crate) struct Loans {
@@ -35,6 +40,7 @@ struct Out {
     set: NodeId,
     serial: u64,
     state: Option<SetState>,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl Loans {
@@ -51,6 +57,16 @@ impl Loans {
 
     pub(crate) fn out(&self) -> bool {
         self.out.is_some()
+    }
+
+    pub(crate) fn replaying(&self) -> bool {
+        self.out.as_ref().is_some_and(|out| out.stop.is_some())
+    }
+
+    pub(crate) fn request_stop(&self) {
+        if let Some(stop) = self.out.as_ref().and_then(|out| out.stop.as_ref()) {
+            stop.store(true, Ordering::Relaxed);
+        }
     }
 
     // What the set whose repair is out said of itself as it left.
@@ -128,6 +144,7 @@ impl Lender for Lending<'_> {
             set,
             serial,
             state: loan.state,
+            stop: None,
         });
         let mail = loans.mail.clone();
         // The repair runs inside the pool, on the budget in force as it goes
@@ -159,6 +176,36 @@ impl Lender for Lending<'_> {
                 generation: serial,
                 heard: Heard::Repaired(Box::new(returned)),
             });
+        });
+    }
+}
+
+impl Lending<'_> {
+    // Reconstruction shares admission and the completion acknowledgment
+    // with repair work; it never borrows a live object's delivery queue.
+    pub(crate) fn replay(&mut self, replay: Replay) {
+        let loans = &mut *self.loans;
+        loans.serial += 1;
+        let (scope, node, serial) = (loans.scope, replay.node, loans.serial);
+        loans.out = Some(Out {
+            set: node,
+            serial,
+            state: None,
+            stop: Some(Arc::clone(&replay.stop)),
+        });
+        let mail = loans.mail.clone();
+        let shutdown = loans.hardware.shutdown().clone();
+        tokio::task::spawn_blocking(move || {
+            let replayed = replay.run(&shutdown);
+            if let Err(error) = mail.blocking_send(Said {
+                scope,
+                node,
+                generation: serial,
+                heard: Heard::Replayed(Box::new(replayed)),
+            }) && let Heard::Replayed(replayed) = error.0.heard
+            {
+                let _ = replayed.remove();
+            }
         });
     }
 }

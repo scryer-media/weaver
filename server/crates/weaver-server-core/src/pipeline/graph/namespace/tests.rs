@@ -15,6 +15,7 @@ use super::*;
 use crate::pipeline::graph::lines::Lines;
 
 mod recovery;
+mod replay;
 mod streams;
 mod windows;
 

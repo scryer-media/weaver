@@ -564,6 +564,7 @@ impl NamespaceWriter {
         // that length close the file there. A repair reads members back, so
         // it may have identified one by its content; this bind gives it the
         // name it is.
+        let rejected = tree.rejected_inputs(node, repaired.members());
         self.bind_recoveries(tree, builder, segments, node, out)?;
         let mut rewritten = std::collections::BTreeSet::new();
         for (member, offset, bytes) in repaired.slices() {
@@ -595,6 +596,7 @@ impl NamespaceWriter {
         for member in rewritten {
             self.reopen(tree, builder, segments, (node, member), out)?;
         }
+        self.queue_rechecks(rejected);
         self.release_held(tree, builder, segments, out)
     }
 

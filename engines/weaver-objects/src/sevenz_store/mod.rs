@@ -834,8 +834,25 @@ impl Object for SevenZipStore {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
-        if self.lengths.contains_key(&volume) {
+        if self.gone || self.lengths.get(&volume) == Some(&length) {
             return;
+        }
+        if volume == VolumeIndex(0)
+            && let (Some(before), Some(start)) = (self.geometry, self.start)
+        {
+            let after = Geometry::new(length, start.total());
+            if after != Some(before)
+                && !(before.last() == VolumeIndex(0)
+                    && after.is_some_and(|after| after.last() == VolumeIndex(0)))
+            {
+                // Existing placements use the old piece boundaries. Keep
+                // that inverse map intact until the owner reconstructs the
+                // posted inputs. The graph engine opens their corrected
+                // lengths after that ownership handoff.
+                self.give_up(Emit::NeedsEngine(Why::OrderUnknown), out);
+                return;
+            }
+            self.geometry = after;
         }
         self.lengths.insert(volume, length);
         self.stale = true;

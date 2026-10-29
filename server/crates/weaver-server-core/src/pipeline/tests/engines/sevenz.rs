@@ -971,3 +971,193 @@ async fn a_7z_holding_an_empty_directory_delivers_it() {
         assert_fetched_once(&graph);
     }
 }
+
+// A full member checksum rejects all its bytes even though only one input
+// slice is corrupt. Repairing that slice must replay the rejected member's
+// dependency, while its live store still owns the input.
+#[tokio::test]
+async fn live_stores_replay_checksum_rejected_members_after_repair() {
+    use super::harness::par3_set;
+    use super::refused_then_repaired::serve_queued;
+    use crate::pipeline::tests::pump_pipeline_runtime_queues;
+    use weaver_graph::{MemberId, NodeId};
+
+    for rar in [false, true] {
+        for par3 in [false, true] {
+            let entries = members();
+            let (name, original) = if rar {
+                let (_, bytes) = multi_member_store_set(&entries, 1).remove(0);
+                ("lantern.rar", bytes)
+            } else {
+                ("lantern.7z", stored(None))
+            };
+            let payload = &entries[0].1;
+            let at = original
+                .windows(payload.len())
+                .position(|window| window == payload)
+                .expect("stored member bytes");
+            let mut posted = original.clone();
+            posted[at + ARTICLE + 3] ^= 0x5a;
+            let mut posts = vec![Post::plain(name, posted)];
+            posts.extend(if par3 {
+                par3_set("lantern", &[(name, &original)], 4)
+            } else {
+                par2_set("lantern", &[(name, &original)], 4)
+            });
+            let scenario = Scenario::new(posts);
+            let (_temp, mut pipeline, complete_dir) = admit(&scenario).await;
+            let count = original.len().div_ceil(ARTICLE) as u32;
+            // The prefix and tail precede the middle: a fragmented fold
+            // must still reject the full member before recovery arrives.
+            for ordinal in std::iter::once(0).chain(2..count).chain(std::iter::once(1)) {
+                serve_queued(&mut pipeline, &scenario, (0, ordinal)).await;
+                pump_pipeline_runtime_queues(&mut pipeline).await;
+            }
+            let tree = pipeline.graph_jobs.get(&JOB).expect("active graph").tree();
+            let (store, _) = tree
+                .child_of(NodeId::ROOT, MemberId(0))
+                .expect("live store");
+            assert!(tree.engine(store).is_none(), "the store must remain live");
+            assert!(
+                tree.namespace(store).unwrap().members().any(|member| {
+                    member.crc32.is_some()
+                        && member
+                            .coverage
+                            .runs()
+                            .any(|run| run.provenance == weaver_graph::Provenance::Damaged)
+                }),
+                "the output checksum must fail before repair"
+            );
+            serve_posts(&mut pipeline, &scenario, 1..scenario.posts.len() as u32).await;
+            drive_to_finish(&mut pipeline, &scenario).await;
+            let status = job_status_for_assert(&pipeline, JOB);
+            let mut files = BTreeMap::new();
+            collect(&complete_dir, &complete_dir, &mut files);
+            retire_pipeline_database(pipeline).await;
+            assert_eq!(status, Some(JobStatus::Complete), "rar={rar}, par3={par3}");
+            for (name, expected) in entries {
+                assert_eq!(files.get(&delivered(name)), Some(&expected), "{name}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_corrected_split_lengths_reconstruct_before_changing_geometry() {
+    use weaver_graph::{Kind, MemberId, NodeId};
+
+    let archive = stored(None);
+    let mut posts = split(&archive, 3);
+    let protected: Vec<_> = posts
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let recovery = par2_set("lantern", &protected, 4);
+    // A short posting establishes the wrong first-piece length. Recovery
+    // must restore the tail and replace the geometry derived from it.
+    let short = posts[0].bytes.len() - 17;
+    posts[0].bytes.truncate(short);
+    posts.extend(recovery);
+    let scenario = Scenario::new(posts);
+    let (_temp, mut pipeline, complete_dir) = admit(&scenario).await;
+    serve_posts(&mut pipeline, &scenario, 0..1).await;
+    let tree = pipeline.graph_jobs.get(&JOB).expect("active graph").tree();
+    let (store, _) = tree
+        .child_of(NodeId::ROOT, MemberId(0))
+        .expect("first piece owned");
+    assert_eq!(tree.kind(store), Some(Kind::SevenZipStore));
+    serve_posts(&mut pipeline, &scenario, 3..scenario.posts.len() as u32).await;
+    serve_posts(&mut pipeline, &scenario, 1..3).await;
+    drive_to_finish(&mut pipeline, &scenario).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    for (name, expected) in members() {
+        assert_eq!(files.get(&delivered(name)), Some(&expected), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn checksum_rejection_survives_restart_before_parent_repair() {
+    use super::restart::{Down, run_restarting_at};
+    let original = stored(None);
+    let (name, expected) = members().remove(0);
+    let at = original
+        .windows(expected.len())
+        .position(|window| window == expected)
+        .unwrap();
+    let mut posted = original.clone();
+    posted[at + ARTICLE + 3] ^= 0x5a;
+    let count = posted.len().div_ceil(ARTICLE);
+    let mut posts = vec![Post::plain("lantern.7z", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.7z", &original)], 4));
+    let mut scenario = Scenario::new(posts);
+    scenario.first = std::iter::once(0)
+        .chain(2..count as u32)
+        .chain(std::iter::once(1))
+        .map(|ordinal| (0, ordinal))
+        .collect();
+    let outcome = run_restarting_at(&scenario, &mut |_| {}, Down::Crash, &|arrived| {
+        arrived == count
+    })
+    .await;
+    assert_eq!(outcome.restarts, 1);
+    assert_eq!(outcome.status, Some(JobStatus::Complete));
+    assert!(
+        outcome.from_disk.is_empty(),
+        "recorded input must not be fetched again"
+    );
+    assert_eq!(outcome.files.get(&delivered(name)), Some(&expected));
+}
+
+#[tokio::test]
+async fn parent_repair_does_not_override_a_still_failing_member_checksum() {
+    let (name, expected) = members().remove(0);
+    let mut original = build_7z_shaped(
+        &[Entry::file(name, expected.clone())],
+        EncoderMethod::COPY,
+        None,
+        false,
+    );
+    let at = original
+        .windows(expected.len())
+        .position(|window| window == expected)
+        .unwrap();
+    // The recovery set itself describes bytes that fail the inner CRC.
+    original[at + 7] ^= 0x41;
+    let mut posted = original.clone();
+    posted[at + ARTICLE + 3] ^= 0x5a;
+    let mut posts = vec![Post::plain("lantern.7z", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.7z", &original)], 4));
+    let scenario = Scenario::new(posts);
+    let (_temp, mut pipeline, _) = admit(&scenario).await;
+    serve_posts(&mut pipeline, &scenario, 0..1).await;
+    let tree = pipeline.graph_jobs.get(&JOB).unwrap().tree();
+    let (store, _) = tree
+        .child_of(weaver_graph::NodeId::ROOT, weaver_graph::MemberId(0))
+        .unwrap();
+    assert!(
+        tree.namespace(store)
+            .unwrap()
+            .members()
+            .any(|member| member.crc32.is_some()),
+        "fixture must state a member checksum"
+    );
+    assert!(
+        tree.namespace(store).unwrap().members().any(|member| member
+            .coverage
+            .runs()
+            .any(|run| run.provenance == weaver_graph::Provenance::Damaged)),
+        "fixture must be checksum-rejected"
+    );
+    serve_posts(&mut pipeline, &scenario, 1..scenario.posts.len() as u32).await;
+    drive_to_finish(&mut pipeline, &scenario).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    retire_pipeline_database(pipeline).await;
+    assert!(
+        matches!(status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+}
