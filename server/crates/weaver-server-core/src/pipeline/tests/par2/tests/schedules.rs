@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::engines::harness::{
-    ARTICLE, Outcome, Post, Scenario, par2_volumes_sliced, recovery_blocks, run,
+    ARTICLE, Outcome, Post, Scenario, par2_volumes_sliced, recovery_blocks, recovery_packet, run,
 };
 use crate::pipeline::tests::engines::restart::{
     Down, Restarted, run_restarted_while_repairing, run_restarting_at,
@@ -661,22 +661,6 @@ async fn a_shutdown_at_each_boundary_preserves_the_repair() {
     let (done, _) = run_restarted_while_repairing(&scenario()).await;
     assert_eq!(done.status, whole.status, "shut down while repairing");
     assert_eq!(done.files, whole.files, "shut down while repairing");
-}
-
-// The bytes of the set's one recovery packet, cut from its only volume.
-fn recovery_packet(volume: &Post) -> Vec<u8> {
-    const HEADER: usize = 64;
-    const RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
-    let bytes = &volume.bytes;
-    let mut at = 0;
-    while at + HEADER <= bytes.len() {
-        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
-        if &bytes[at + 48..at + 64] == RECOVERY {
-            return bytes[at..at + length].to_vec();
-        }
-        at += length;
-    }
-    panic!("the volume holds a recovery packet");
 }
 
 // Each bit of a recovery packet flipped, and each truncation of it, posted

@@ -12,7 +12,7 @@ use std::path::Path;
 
 use weaver_graph::recovery::MemberAccess;
 use weaver_graph::{
-    Beside, ByteRange, Delivery, MemberId, Namespace, Object, ObjectId, Provenance, Segment,
+    Beside, ByteRange, Delivery, Emit, MemberId, Namespace, Object, ObjectId, Provenance, Segment,
     Standing, VolumeIndex,
 };
 
@@ -374,19 +374,51 @@ impl<O: Object> Job<O> {
             pieces.reverse();
         }
         let mut out = Vec::new();
+        let length = bytes.len() as u64;
         for (offset, piece) in pieces {
-            self.object.deliver(
-                Delivery {
-                    volume,
-                    offset: offset as u64,
-                    bytes: piece,
-                    provenance: Provenance::Fresh,
-                },
-                &mut |_, _| false,
-                &mut out,
-            );
+            self.object.sized(volume, length, &mut out);
+            self.deliver(volume, offset as u64, piece, &mut out);
+            self.again(volume, bytes, &mut out);
         }
+        self.object.sized(volume, length, &mut out);
         self.object.volume_closed(volume, &mut out);
+        self.again(volume, bytes, &mut out);
         volume
+    }
+
+    fn deliver(&mut self, volume: VolumeIndex, offset: u64, bytes: &[u8], out: &mut Vec<Emit>) {
+        self.object.deliver(
+            Delivery {
+                volume,
+                offset,
+                bytes,
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            out,
+        );
+    }
+
+    // What the object asked for again of its volume comes again from
+    // `bytes`, as the tree reads it back: forgotten first, then delivered.
+    fn again(&mut self, volume: VolumeIndex, bytes: &[u8], out: &mut Vec<Emit>) {
+        while let Some(at) = out
+            .iter()
+            .position(|emit| matches!(emit, Emit::Again { .. }))
+        {
+            let Emit::Again {
+                volume: asked,
+                range,
+            } = out.remove(at)
+            else {
+                unreachable!();
+            };
+            if asked != volume {
+                continue;
+            }
+            self.object.unposted(volume, range);
+            let piece = &bytes[range.start as usize..range.end as usize];
+            self.deliver(volume, range.start, piece, out);
+        }
     }
 }

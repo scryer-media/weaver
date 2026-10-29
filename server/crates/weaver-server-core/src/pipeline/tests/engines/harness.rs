@@ -267,6 +267,22 @@ pub(in crate::pipeline::tests) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> 
     blocks
 }
 
+// The bytes of a volume's one recovery packet, cut from it.
+pub(in crate::pipeline::tests) fn recovery_packet(volume: &Post) -> Vec<u8> {
+    const HEADER: usize = 64;
+    const RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
+    let bytes = &volume.bytes;
+    let mut at = 0;
+    while at + HEADER <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+        if &bytes[at + 48..at + 64] == RECOVERY {
+            return bytes[at..at + length].to_vec();
+        }
+        at += length;
+    }
+    panic!("the volume holds a recovery packet");
+}
+
 // An article of a PAR2 volume whose loss costs exactly one recovery block.
 pub(in crate::pipeline::tests) fn one_block_article(post: &Post) -> u32 {
     let blocks = recovery_blocks(post);

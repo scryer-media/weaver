@@ -1504,7 +1504,14 @@ impl Builder for Placing<'_> {
         };
         let access = self.writer.access(tree);
         let start = into.len();
-        let read = read_placed(&access, (parent, member), node, placement, into);
+        // A recovery object's volume stays in its member's own file: its
+        // envelope is that file, at the volume's offsets in the member.
+        let read = match placement {
+            Placement::Envelope { range, .. } if tree.recovers(node) => tree
+                .in_member(node, *range)
+                .is_some_and(|within| access.read_at(parent, member, within, into)),
+            placement => read_placed(&access, (parent, member), node, placement, into),
+        };
         if !read {
             into.truncate(start);
         }
