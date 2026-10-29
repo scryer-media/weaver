@@ -57,6 +57,9 @@ pub(crate) struct Leaf {
     written: BTreeMap<u64, Written>,
 }
 
+// How much of a file is read back at a time when its CRC is not in the fold.
+const READ_BACK: u64 = 1 << 20;
+
 // A contiguous run of written bytes and their CRC32.
 #[derive(Clone, Copy, Debug)]
 struct Written {
@@ -159,13 +162,34 @@ impl Leaf {
         self.written.insert(start, run);
     }
 
-    // The CRC32 of the member's `length` bytes, when one run of writes
-    // covers exactly them.
-    pub(crate) fn crc32(&self, length: u64) -> Option<u32> {
-        match self.written.iter().next() {
-            Some((0, run)) if self.written.len() == 1 && run.end == length => Some(run.crc32),
-            _ => None,
+    // The CRC32 of the member's `length` bytes: from the fold, when one run
+    // of writes covers exactly them, and otherwise read back from the file.
+    // A run broken by a restart, which starts the fold empty, or by a write
+    // over bytes already written, which the fold cannot split, costs one
+    // read of the file; the answer is the same.
+    pub(crate) fn crc32(&self, length: u64) -> Result<u32, LeafError> {
+        if let Some((0, run)) = self.written.iter().next()
+            && self.written.len() == 1
+            && run.end == length
+        {
+            return Ok(run.crc32);
         }
+        let mut crc = 0u32;
+        let mut at = 0u64;
+        let mut chunk = Vec::new();
+        while at < length {
+            let take = (length - at).min(READ_BACK) as usize;
+            chunk.clear();
+            self.read(at, take, &mut chunk)?;
+            let part = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &chunk) as u32;
+            crc = if at == 0 {
+                part
+            } else {
+                combine(crc, part, take as u64)
+            };
+            at += take as u64;
+        }
+        Ok(crc)
     }
 
     // Create the file in the directory it lies in, which must already be

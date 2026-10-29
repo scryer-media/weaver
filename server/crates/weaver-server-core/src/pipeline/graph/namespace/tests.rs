@@ -1791,3 +1791,35 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
         Some(ExtractionRejectionReason::Deadline)
     );
 }
+
+// The stated checksum is checked whatever shape the writes left the fold
+// in: a write over bytes already written forgets the run it overlapped, so
+// the fold no longer spans the member, and the file is read back instead.
+// Bytes rewritten wrong are damage; bytes rewritten the same stay clean.
+#[test]
+fn a_member_failing_its_stated_checksum_is_damaged_when_a_rewrite_broke_the_fold() {
+    for (again, damaged) in [(&b"midend"[..], false), (&b"mixend"[..], true)] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("video.mkv", Some(9));
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .and_then(|namespace| namespace.get_mut(member))
+            .expect("the announced member")
+            .crc32 = Some(crc32(b"abcmidend"));
+        job.send(member, 0, b"abcmi", Provenance::Fresh);
+        job.send(member, 3, again, Provenance::Fresh);
+        job.close(member);
+        assert!(!job.is_open(NodeId::ROOT, member));
+        let expected = if damaged {
+            vec![(member, ByteRange::new(0, 9))]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            job.root().damaged_ranges().collect::<Vec<_>>(),
+            expected,
+            "rewrote {:?}",
+            String::from_utf8_lossy(again)
+        );
+    }
+}
