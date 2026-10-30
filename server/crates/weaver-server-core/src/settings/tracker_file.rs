@@ -256,6 +256,14 @@ pub fn check_locks(rule: &TrackerRule, changed: &TrackerRule) -> Result<(), Stri
     let Some(bound) = &rule.bound else {
         return Ok(());
     };
+    // The pattern is what the file binds to: a rule whose pattern moved
+    // would no longer be found by the file's next import.
+    if rule.host_pattern != changed.host_pattern {
+        return Err(format!(
+            "host_pattern is locked by {}'s tracker file; unbind the rule to change it.",
+            bound.name
+        ));
+    }
     let differs = |field: &str| match field {
         FIELD_DHT => rule.dht != changed.dht,
         FIELD_PEX => rule.pex != changed.pex,

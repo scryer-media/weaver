@@ -749,6 +749,38 @@ fn a_bound_rule_refuses_a_change_to_a_locked_field() {
     assert_eq!(saved[0].bound, rule.bound);
 }
 
+// A bound rule's pattern is what its file finds it by, so the ordinary save
+// refuses to move it while the binding stands; once unbound, it moves.
+#[test]
+fn a_bound_rule_refuses_a_change_to_its_host_pattern() {
+    let db = Database::open_in_memory().unwrap();
+    let file = tracker_file("revision = \"1\"\n[recommended]\npex = false", None);
+    let rule = db.apply_tracker_file(&file, 10).unwrap();
+    let moved = crate::settings::model::TrackerRule {
+        host_pattern: "*.elsewhere.example".to_owned(),
+        bound: None,
+        ..rule.clone()
+    };
+    let refusal = db
+        .save_tracker_rule(Some(rule.id), moved.clone(), true, true, 11)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        refusal,
+        "host_pattern is locked by Example Tracker's tracker file; unbind the rule to change it."
+    );
+    assert_eq!(db.list_tracker_rules().unwrap(), [rule.clone()]);
+
+    assert!(db.unbind_tracker_rule(rule.id, 12).unwrap());
+    let saved = db
+        .save_tracker_rule(Some(rule.id), moved, true, true, 13)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].host_pattern, "*.elsewhere.example");
+    assert_eq!(saved[0].bound, None);
+}
+
 // A file whose pattern a rule has fills that rule again: its required
 // values replace the rule's, a recommendation the user left takes the new
 // one and one the user changed stays. A file for another pattern makes a
