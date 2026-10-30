@@ -17,6 +17,15 @@
 
 #![warn(clippy::cast_possible_truncation)]
 
+// The e2e carveout lets a torrent make the session announce to local
+// addresses. It builds only with debug assertions on (the dev and e2e
+// profiles), so no release binary can carry it.
+#[cfg(all(feature = "e2e-local-trackers", not(debug_assertions)))]
+compile_error!(
+    "`e2e-local-trackers` is for e2e builds only (--profile e2e or a dev build); \
+     it never builds without debug assertions, so no release binary carries it"
+);
+
 macro_rules! aframe {
     ($e:expr) => {{ $e }};
 }
@@ -111,7 +120,7 @@ pub use url::Url;
 pub use crate::buffers::*;
 pub use crate::clone_to_owned::CloneToOwned;
 pub use crate::core::magnet::*;
-pub use crate::core::net::{HttpClients, HttpTarget, NamedBy, for_target};
+pub use crate::core::net::{Egress, HttpClients, HttpTarget, NamedBy, for_target, route_to};
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;
 pub use crate::identity::{Identity, TrackerIds};

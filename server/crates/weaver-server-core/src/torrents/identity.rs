@@ -4,6 +4,7 @@
 //! How a client names itself to peers and trackers.
 
 use weaver_torrent::core::Id20;
+use weaver_torrent::core::peer_id::url_random;
 use weaver_torrent::{Identity, TrackerIds};
 
 /// A client's Azureus-style peer-id prefix, the User-Agent of its HTTP
@@ -116,12 +117,13 @@ pub struct TorrentIdentity {
 
 impl TorrentIdentity {
     pub fn fresh() -> Self {
-        let mut bytes = [0u8; 16];
-        getrandom::fill(&mut bytes).expect("system randomness");
-        let (peer_id, key) = bytes.split_at(12);
+        let mut peer_id = [0u8; 12];
+        url_random(&mut peer_id);
+        let mut key = [0u8; 4];
+        getrandom::fill(&mut key).expect("system randomness");
         Self {
-            peer_id: peer_id.try_into().expect("twelve bytes"),
-            tracker_key: u32::from_le_bytes(key.try_into().expect("four bytes")),
+            peer_id,
+            tracker_key: u32::from_le_bytes(key),
             tracker_ids: TrackerIds::default(),
         }
     }

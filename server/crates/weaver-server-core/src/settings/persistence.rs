@@ -107,6 +107,25 @@ impl Database {
         })
     }
 
+    // The value stored under `key`, storing `value` first when it holds
+    // none, in one statement, so two first loads keep the same one.
+    pub fn setting_or_insert(&self, key: &str, value: &str) -> Result<String, StateError> {
+        let datastore = self.datastore();
+        let (stored, value) = (key.to_string(), value.to_string());
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "INSERT INTO settings (key, value) VALUES ({}, {})
+                 ON CONFLICT(key) DO NOTHING",
+                &[SqlArg::Text(stored), SqlArg::Text(value)],
+            )
+            .await?;
+            Ok(())
+        })?;
+        self.get_setting(key)?
+            .ok_or_else(|| StateError::Database(format!("setting {key} was not stored")))
+    }
+
     pub fn delete_setting(&self, key: &str) -> Result<(), StateError> {
         let datastore = self.datastore();
         let key = key.to_string();

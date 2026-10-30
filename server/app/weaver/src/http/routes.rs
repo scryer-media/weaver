@@ -175,6 +175,8 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         security.clone(),
         watch_folder.clone(),
         torrents,
+        rss.clone(),
+        super::torrent_facade::Api::LATEST,
     );
     let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
         db.clone(),

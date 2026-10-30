@@ -21,6 +21,12 @@
 //               whatever that object says comes back as effects, applied
 //               here the same way.
 //
+// A root member the job keeps is in its own file whatever it is: every byte
+// it arrives with is written there first, under the name its root gives it,
+// and then goes on as any member's. Its file is never moved, renamed over,
+// taken back or removed, and a read of the member is a read of the file. A
+// torrent's files are kept so: they are what it seeds.
+//
 // The tree records coverage and routes; this file is where bytes touch
 // disk. It takes a node everywhere and never assumes the root.
 
@@ -137,6 +143,9 @@ pub(crate) struct NamespaceWriter {
     renamed: Vec<MemberId>,
     segments: Vec<Segment>,
     placements: Vec<Placement>,
+    // The root members the job keeps, by member id, each under the name its
+    // file has; none for a job that keeps none.
+    kept: Vec<String>,
 }
 
 impl NamespaceWriter {
@@ -159,6 +168,7 @@ impl NamespaceWriter {
             renamed: Vec::new(),
             segments: Vec::new(),
             placements: Vec::new(),
+            kept: Vec::new(),
         }
     }
 
@@ -167,6 +177,33 @@ impl NamespaceWriter {
     pub(crate) fn capped(mut self, caps: Caps) -> Self {
         self.caps = caps;
         self
+    }
+
+    // The root members the job keeps, by member id, under these names.
+    pub(crate) fn keeping(mut self, names: Vec<String>) -> Self {
+        self.kept = names;
+        self
+    }
+
+    // The name a kept member's file has; none for a member not kept.
+    fn kept(&self, node: NodeId, member: MemberId) -> Option<&str> {
+        (node == NodeId::ROOT)
+            .then(|| self.kept.get(member.0 as usize))
+            .flatten()
+            .map(String::as_str)
+    }
+
+    // Every path the job wrote under its directory: each namespace's
+    // members' files, and the directory of what it keeps for itself.
+    pub(crate) fn written(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .files
+            .iter()
+            .flat_map(|(_, files)| files.leaves.values())
+            .map(|leaf| leaf.path().to_path_buf())
+            .collect();
+        paths.push(self.working_dir.join(weaver_graph::names::INTERNAL_DIR));
+        paths
     }
 
     // The breach of the job's extraction budget, once one stands.
@@ -259,8 +296,44 @@ impl NamespaceWriter {
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.keep(tree, &arrival)?;
+        self.deliver_again(tree, builder, segments, arrival, out)
+    }
+
+    // Bytes a restore read back from disk, for a member of a namespace: a
+    // kept member's are read from its file, which they are not written to
+    // again.
+    pub(crate) fn deliver_again(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        arrival: Arrival,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         self.arrive(tree, builder, segments, arrival, out)?;
         self.release_held(tree, builder, segments, out)
+    }
+
+    // A kept member's bytes go to its file before anything owns them, so
+    // what routing them reads back of the file is there.
+    fn keep(&mut self, tree: &Tree, arrival: &Arrival) -> Result<(), WriteError> {
+        let (node, member) = (arrival.node, arrival.member);
+        if self.kept(node, member).is_none() {
+            return Ok(());
+        }
+        let record = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .ok_or(WriteError::UnknownMember { node, member })?;
+        let end = arrival.range().end.max(record.length.unwrap_or(0));
+        self.admit_file(tree, node, member, end)?;
+        self.leaf(node, member, &record.output_name)?.write(
+            arrival.offset,
+            &arrival.bytes,
+            record.length,
+        )?;
+        Ok(())
     }
 
     // Bytes for a member, by the one write path, inside a call that
@@ -480,9 +553,10 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         self.replay(tree, builder, segments, node, copy, ALL, out)?;
         self.replay_file(tree, builder, segments, node, copy, out)?;
+        let kept = self.kept(node, copy).is_some();
         let files = self.files_mut(node);
         files.refused.remove(&copy);
-        if let Some(leaf) = files.leaves.remove(&copy) {
+        if !kept && let Some(leaf) = files.leaves.remove(&copy) {
             leaf.remove()?;
         }
         self.caps.forget(tree, node, copy);
@@ -582,6 +656,9 @@ impl NamespaceWriter {
                 continue;
             };
             self.caps.admit_name(new)?;
+            if self.kept(*node, *member).is_some() {
+                continue;
+            }
             if let Some(leaf) = self
                 .files
                 .get_mut(node)
@@ -853,11 +930,13 @@ impl NamespaceWriter {
                 if tree.is_undecided(*node, *member) {
                     self.settle(tree, builder, segments, *node, *member, out)?;
                 }
-                // A leaf and a recovery volume live in their own files; a
-                // member another object owns has no file to close.
-                let in_own_file = tree
-                    .child_of(*node, *member)
-                    .is_none_or(|(child, _)| tree.recovers(child));
+                // A leaf, a recovery volume and a kept member live in their
+                // own files; a member another object owns has no file to
+                // close.
+                let in_own_file = self.kept(*node, *member).is_some()
+                    || tree
+                        .child_of(*node, *member)
+                        .is_none_or(|(child, _)| tree.recovers(child));
                 if in_own_file {
                     self.close_leaf(tree, *node, *member)?;
                 }
@@ -986,7 +1065,12 @@ impl NamespaceWriter {
             .and_then(|namespace| namespace.get(member))
             .map(|record| record.output_name.clone())
             .ok_or(WriteError::UnknownMember { node, member })?;
+        // A kept member's file has it all: what the object kept goes.
         if let Some(mut leaf) = self.envelopes.take(from, volume.0) {
+            if self.kept(node, member).is_some() {
+                leaf.remove()?;
+                return self.release_to_leaf(tree, node, member);
+            }
             leaf.rename(&self.working_dir, &output_name)?;
             if let Some(stale) = self.files_mut(node).leaves.insert(member, leaf) {
                 stale.remove()?;
@@ -1238,6 +1322,10 @@ impl NamespaceWriter {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), WriteError> {
+        // A kept member's file has every byte it arrived with already.
+        if self.kept(node, member).is_some() {
+            return Ok(());
+        }
         let record = tree
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
@@ -1334,7 +1422,8 @@ impl NamespaceWriter {
                 .keys()
                 .copied()
                 .filter(|member| {
-                    namespace.get(*member).is_none() || tree.buried_member(node, *member)
+                    self.kept(node, *member).is_none()
+                        && (namespace.get(*member).is_none() || tree.buried_member(node, *member))
                 })
                 .collect();
             for member in gone {
@@ -1401,10 +1490,11 @@ impl NamespaceWriter {
         output_name: &str,
     ) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
+        let name = self.kept(node, member).unwrap_or(output_name).to_owned();
         let leaves = &mut self.files_mut(node).leaves;
         match leaves.entry(member) {
             Entry::Occupied(leaf) => Ok(leaf.into_mut()),
-            Entry::Vacant(free) => Ok(free.insert(Leaf::at(&dir, output_name)?)),
+            Entry::Vacant(free) => Ok(free.insert(Leaf::at(&dir, &name)?)),
         }
     }
 
@@ -1635,7 +1725,11 @@ impl Access<'_> {
 }
 
 impl Source for Access<'_> {
+    // A kept member is read from its own file, whatever owns it.
     fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
+        if self.writer.kept(node, member).is_some() {
+            return None;
+        }
         self.tree
             .child_of(node, member)
             .filter(|(child, _)| !self.tree.recovers(*child))

@@ -127,6 +127,12 @@ pub(crate) trait Root: Segments {
     // checkpoint left it and only found in its file; the member's front
     // still goes back into the namespace.
     fn reads_back(&self, tree: &Tree, member: MemberId) -> bool;
+    // The names of the members the job keeps in their own files whatever
+    // owns them, by member id; none when an object that owns a member
+    // takes its bytes from it.
+    fn kept_files(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug)]

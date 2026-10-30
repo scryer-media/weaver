@@ -13,6 +13,8 @@ slow-tests = []
 # tunnel's loopback certificate backs the speed test's HTTPS fixture, and
 # NNTP's direct test route serves servers built with no route of their own.
 test-support = ["weaver-tunnel/test-support", "weaver-nntp/test-support"]
+# e2e builds only; see weaver-torrent's feature of the same name.
+e2e-local-trackers = ["weaver-torrent/e2e-local-trackers"]
 
 [dependencies]
 weaver-tunnel = { path = "../../../engines/weaver-tunnel" }

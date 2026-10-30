@@ -187,6 +187,18 @@ impl Database {
 
         // Assign IDs to any servers missing them.
         config.assign_server_ids();
+        // A file that names no torrent listen port gets one drawn, as a
+        // database that names none does on its first load.
+        let names_port = toml::from_str::<toml::Value>(&contents)
+            .ok()
+            .is_some_and(|file| {
+                file.get("torrent")
+                    .and_then(|t| t.get("base_port"))
+                    .is_some()
+            });
+        if !names_port {
+            config.torrent.base_port = self.chosen_base_port()?;
+        }
 
         self.save_config(&config)?;
 

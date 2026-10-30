@@ -36,6 +36,9 @@ pub const EVENT_NONE: u32 = 0;
 pub const EVENT_COMPLETED: u32 = 1;
 pub const EVENT_STARTED: u32 = 2;
 pub const EVENT_STOPPED: u32 = 3;
+/// Past BEP 15's events: libtorrent writes its `event_t::paused` as is
+/// (`udp_tracker_connection::send_udp_announce`).
+pub const EVENT_PAUSED: u32 = 4;
 
 /// The `event` field of a UDP announce (BEP 15).
 pub(crate) fn udp_event(event: Option<TrackerRequestEvent>) -> u32 {
@@ -44,6 +47,7 @@ pub(crate) fn udp_event(event: Option<TrackerRequestEvent>) -> u32 {
         Some(TrackerRequestEvent::Completed) => EVENT_COMPLETED,
         Some(TrackerRequestEvent::Started) => EVENT_STARTED,
         Some(TrackerRequestEvent::Stopped) => EVENT_STOPPED,
+        Some(TrackerRequestEvent::Paused) => EVENT_PAUSED,
     }
 }
 
@@ -632,6 +636,7 @@ mod tests {
             (Some(E::Completed), 1),
             (Some(E::Started), 2),
             (Some(E::Stopped), 3),
+            (Some(E::Paused), 4),
         ] {
             let request = Request::Announce(
                 1,

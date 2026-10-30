@@ -5,11 +5,9 @@
 // the session writes goes to a file of its own: a piece's chunks are kept in
 // memory while it is in flight, read back from there while the session
 // checks its hash, and once it verified each file's share of it goes to the
-// job's root, which places it where the job's tree says. After that a read
-// of the piece is a read of what the job posted: a file no object reads from
-// its own file, a file an object reads through that object's inverse map,
-// which puts back what the object took off. So a piece seeds from the one
-// copy of its bytes the job keeps.
+// job's root, which writes it to the torrent's file of its name and places
+// it where the job's tree says. After that a read of the piece is a read of
+// those files, as the metainfo lists them, whatever unpacking made of them.
 //
 // A piece's buffer is held against the resident budget every job shares from
 // the moment the session is granted the piece until it verifies, fails its

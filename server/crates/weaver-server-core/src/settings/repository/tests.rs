@@ -11,6 +11,22 @@ fn settings_roundtrip() {
     assert_eq!(db.get_setting("missing").unwrap(), None);
 }
 
+// A database that names no torrent listen port draws one on its first
+// load, from the listen ports, and every later load keeps it.
+#[test]
+fn a_database_naming_no_listen_port_draws_one_and_keeps_it() {
+    let db = Database::open_in_memory().unwrap();
+    let drawn = db.load_config().unwrap().torrent.base_port;
+    assert!(crate::torrents::sessions::LISTEN_PORTS.contains(&drawn));
+    assert_eq!(
+        db.get_setting("torrent.base_port").unwrap(),
+        Some(drawn.to_string())
+    );
+    assert_eq!(db.load_config().unwrap().torrent.base_port, drawn);
+    db.set_setting("torrent.base_port", "6881").unwrap();
+    assert_eq!(db.load_config().unwrap().torrent.base_port, 6881);
+}
+
 #[test]
 fn settings_upsert() {
     let db = Database::open_in_memory().unwrap();
@@ -404,7 +420,15 @@ fn a_database_without_torrent_settings_loads_the_defaults() {
 
     let loaded = db.load_config().unwrap();
     assert_eq!(loaded.seeding, None);
-    assert_eq!(loaded.torrent, crate::settings::TorrentConfig::default());
+    // The defaults, with a listen port drawn in place of the fixed one.
+    assert!(crate::torrents::sessions::LISTEN_PORTS.contains(&loaded.torrent.base_port));
+    assert_eq!(
+        loaded.torrent,
+        crate::settings::TorrentConfig {
+            base_port: loaded.torrent.base_port,
+            ..crate::settings::TorrentConfig::default()
+        }
+    );
     assert_eq!(loaded.categories[0].seeding, None);
     assert!(!loaded.categories[0].torrent_route);
 }
