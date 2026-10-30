@@ -7154,6 +7154,49 @@ async fn seeding_placed(rig: &Rig, metainfo: Vec<u8>, placement: Placement) -> (
     (job_id, view)
 }
 
+// The torrent's view once `holds` holds of it, read as the queue publishes
+// it.
+async fn view_once(
+    service: &TorrentService,
+    changes: &mut watch::Receiver<u64>,
+    job_id: JobId,
+    holds: impl Fn(&TorrentView) -> bool,
+) -> TorrentView {
+    loop {
+        changes.borrow_and_update();
+        let view = service.torrent(job_id).await.unwrap();
+        if holds(&view) {
+            return view;
+        }
+        changes.changed().await.unwrap();
+    }
+}
+
+// The torrent added with `placement`, its view once its job is done and it
+// seeds, and the queue's changes from then on.
+async fn completed_placed(
+    rig: &Rig,
+    metainfo: Vec<u8>,
+    placement: Placement,
+) -> (JobId, TorrentView, watch::Receiver<u64>) {
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            placement,
+            ..request(AddSource::Metainfo(metainfo))
+        })
+        .await
+        .unwrap();
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.state == TorrentState::Seeding && view.completed_at_ms.is_some()
+    })
+    .await;
+    (job_id, view, changes)
+}
+
 // qBittorrent `addAction` with a save path: the files under it are the
 // torrent's, laid out as its metainfo lists them, and the check as it is
 // added finds them. Nothing is fetched.
@@ -7218,6 +7261,67 @@ async fn a_torrent_laid_out_without_its_folder_has_the_files_in_the_save_path() 
         Some(save.to_string_lossy().as_ref())
     );
     assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    rig.service.stop().await;
+}
+
+// qBittorrent `TorrentImpl::setSavePath`, libtorrent `torrent::move_storage`:
+// files that sat straight in their save path move straight into the new
+// one, the torrent's save path and files directory follow them, and it
+// seeds on from there. A file of theirs already at a location fails the
+// move, which says why and leaves everything where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placed_files_move_to_a_new_location_and_the_record_follows() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), &data).unwrap();
+    // Its job is done, so nothing of it is out and each move happens at
+    // once.
+    let (job_id, before, _) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+
+    let taken = rig.dir.path().join("taken");
+    std::fs::create_dir_all(&taken).unwrap();
+    std::fs::write(taken.join("a.bin"), b"theirs").unwrap();
+    assert!(matches!(
+        rig.service
+            .set_location(job_id, taken.to_string_lossy().into_owned())
+            .await,
+        Err(ActionError::State(_))
+    ));
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    assert_eq!(std::fs::read(taken.join("a.bin")).unwrap(), b"theirs");
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    let save_text = save.to_string_lossy().into_owned();
+    assert_eq!(stored.files_dir.as_deref(), Some(save_text.as_str()));
+
+    let moved = rig.dir.path().join("moved/here");
+    let moved_text = moved.to_string_lossy().into_owned();
+    rig.service
+        .set_location(job_id, moved_text.clone())
+        .await
+        .unwrap();
+    assert!(!save.join("a.bin").exists());
+    assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), data);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.files_dir.as_deref(), Some(moved_text.as_str()));
+    assert_eq!(stored.save_path.as_deref(), Some(moved_text.as_str()));
+    assert_eq!(stored.storage_dir, before.storage_dir);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.files_dir.as_deref(), Some(moved_text.as_str()));
+    assert_eq!(view.paths().0, moved_text);
+    assert_eq!((view.state, view.have_bytes), (TorrentState::Seeding, data.len() as u64));
     rig.service.stop().await;
 }
 

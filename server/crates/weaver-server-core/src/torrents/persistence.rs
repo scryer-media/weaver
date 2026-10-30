@@ -563,6 +563,19 @@ impl Database {
         self.set_torrent_column("files_dir", args)
     }
 
+    // The directory the torrent's files go under, as asked or as it moved.
+    pub fn set_torrent_save_path(
+        &self,
+        job_id: JobId,
+        dir: Option<&str>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(dir.map(str::to_owned)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("save_path", args)
+    }
+
     // The torrent's session left seed mode: from here its pieces are what
     // its job has.
     pub fn clear_torrent_seed_mode(&self, job_id: JobId) -> Result<bool, StateError> {

@@ -137,8 +137,8 @@ pub(crate) struct GraphJob<R: Root = ArticleRoot> {
     reported: Option<RootPhase>,
     // The checkpoint waiting for the database, if one is.
     pending: Pending,
-    // Where the job's directory is to move, until it has.
-    moving: Option<PathBuf>,
+    // What of the job is to move, and where, until it has.
+    moving: Option<relocate::Relocation>,
     // The move's outcome, until it is taken.
     relocated: Option<Result<PathBuf, LeafError>>,
 }

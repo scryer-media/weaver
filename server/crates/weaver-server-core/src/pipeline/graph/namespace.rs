@@ -279,6 +279,57 @@ impl NamespaceWriter {
         self.envelopes.relocate(from, to);
     }
 
+    // Where the kept members' files are when that is not under the working
+    // directory.
+    pub(crate) fn kept_dir(&self) -> Option<&Path> {
+        self.kept_dir.as_deref()
+    }
+
+    // The path of every kept root member's file under `dir`, whether or not
+    // it was written; a directory member has none.
+    pub(crate) fn kept_paths(&self, dir: &Path) -> Vec<PathBuf> {
+        self.kept
+            .iter()
+            .filter(|name| !Leaf::is_directory(name))
+            .filter_map(|name| Leaf::at(dir, name).ok())
+            .map(|leaf| leaf.path().to_path_buf())
+            .collect()
+    }
+
+    // Let go of every kept file's handle ahead of the kept files moving.
+    pub(crate) fn release_kept(&mut self) {
+        let kept = self.kept.len();
+        if let Some(files) = self.files.get_mut(&NodeId::ROOT) {
+            for (_, leaf) in files
+                .leaves
+                .iter_mut()
+                .filter(|(member, _)| (member.0 as usize) < kept)
+            {
+                leaf.release();
+            }
+        }
+    }
+
+    // The kept files moved from the directory they were placed in to `to`:
+    // they are kept there from now on, and the paths of those already
+    // written follow. Nothing else of the job moved, even what sits under
+    // the old directory.
+    pub(crate) fn rekeep(&mut self, to: &Path) {
+        let Some(from) = self.kept_dir.replace(to.to_path_buf()) else {
+            return;
+        };
+        let kept = self.kept.len();
+        if let Some(files) = self.files.get_mut(&NodeId::ROOT) {
+            for (_, leaf) in files
+                .leaves
+                .iter_mut()
+                .filter(|(member, _)| (member.0 as usize) < kept)
+            {
+                leaf.relocate(&from, to);
+            }
+        }
+    }
+
     // The file an object at `node` keeps of its volume, at the volume's own
     // offsets, if it kept any of it.
     pub(crate) fn kept_file(&self, node: NodeId, volume: VolumeIndex) -> Option<PathBuf> {

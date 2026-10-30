@@ -18,13 +18,31 @@ use super::super::leaf::LeafError;
 use super::super::root::Root;
 use super::GraphJob;
 
+// What of the job is to move, and where.
+pub(crate) enum Relocation {
+    // Its directory, to the directory claimed for it.
+    Working(PathBuf),
+    // The kept files placed outside its directory, each to its own name
+    // under this directory.
+    Kept(PathBuf),
+}
+
 impl<R: Root> GraphJob<R> {
     // Move the job's directory to `to`, the directory claimed for it, which
     // exists and is empty. Done now when nothing of the job is out on a
     // thread, else at the end of the first step where that holds; the
     // outcome, now or then, comes from [`Self::relocated`].
     pub(crate) fn relocate(&mut self, to: PathBuf) {
-        self.moving = Some(to);
+        self.moving = Some(Relocation::Working(to));
+        self.try_relocate();
+    }
+
+    // Move the kept files placed outside the job's directory to the same
+    // names under `to`, a directory that exists, fenced as
+    // [`Self::relocate`] is (libtorrent `torrent::move_storage` moves a
+    // torrent's files wherever they sit). The job's own directory stays.
+    pub(crate) fn relocate_kept(&mut self, to: PathBuf) {
+        self.moving = Some(Relocation::Kept(to));
         self.try_relocate();
     }
 
@@ -46,15 +64,119 @@ impl<R: Root> GraphJob<R> {
         if self.moving.is_none() || self.awaits_mail() {
             return;
         }
-        let to = self.moving.take().expect("checked above");
-        let from = self.writer.working_dir().to_path_buf();
-        self.writer.release();
-        let outcome = move_directory(&from, &to).map(|()| {
-            self.writer.relocate(&from, &to);
-            to
-        });
+        let outcome = match self.moving.take().expect("checked above") {
+            Relocation::Working(to) => {
+                let from = self.writer.working_dir().to_path_buf();
+                self.writer.release();
+                move_directory(&from, &to).map(|()| {
+                    self.writer.relocate(&from, &to);
+                    to
+                })
+            }
+            Relocation::Kept(to) => match self.writer.kept_dir().map(Path::to_path_buf) {
+                Some(from) => {
+                    self.writer.release_kept();
+                    let moves: Vec<(PathBuf, PathBuf)> = self
+                        .writer
+                        .kept_paths(&from)
+                        .into_iter()
+                        .zip(self.writer.kept_paths(&to))
+                        .collect();
+                    move_files(&from, &moves).map(|()| {
+                        self.writer.rekeep(&to);
+                        to
+                    })
+                }
+                None => Err(LeafError::Io {
+                    path: to,
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "the job keeps no files outside its directory",
+                    ),
+                }),
+            },
+        };
         self.relocated = Some(outcome);
     }
+}
+
+// Move each file from its path to the other, every one or none
+// (libtorrent `storage_utils::move_storage`): a file already at a
+// destination fails the move before anything moved
+// (`move_flags_t::fail_if_exist`), a file not there yet has nothing to move,
+// a file on another device is copied and its source removed only once every
+// file is in, and a move that fails partway puts back what it moved. The
+// directories under `from` the move leaves empty go.
+fn move_files(from: &Path, moves: &[(PathBuf, PathBuf)]) -> Result<(), LeafError> {
+    move_files_using(from, moves, |from, to| std::fs::rename(from, to))
+}
+
+fn move_files_using(
+    from: &Path,
+    moves: &[(PathBuf, PathBuf)],
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<(), LeafError> {
+    for (_, target) in moves {
+        if std::fs::symlink_metadata(target).is_ok() {
+            return Err(LeafError::Io {
+                path: target.clone(),
+                source: io::ErrorKind::AlreadyExists.into(),
+            });
+        }
+    }
+    let mut renamed = Vec::new();
+    let mut copied = Vec::new();
+    let mut failed = None;
+    for (source, target) in moves {
+        if std::fs::symlink_metadata(source).is_err() {
+            continue;
+        }
+        if let Some(parent) = target.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            failed = Some(LeafError::io(parent)(error));
+            break;
+        }
+        match rename(source, target) {
+            Ok(()) => renamed.push((source, target)),
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+                match std::fs::copy(source, target) {
+                    Ok(_) => copied.push((source, target)),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(target);
+                        failed = Some(LeafError::io(source)(error));
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                failed = Some(LeafError::io(source)(error));
+                break;
+            }
+        }
+    }
+    if let Some(error) = failed {
+        for (source, target) in renamed {
+            let _ = std::fs::rename(target, source);
+        }
+        for (_, target) in copied {
+            let _ = std::fs::remove_file(target);
+        }
+        return Err(error);
+    }
+    for (source, _) in copied {
+        let _ = std::fs::remove_file(source);
+    }
+    for (source, _) in moves {
+        let mut dir = source.parent();
+        while let Some(at) = dir.filter(|at| *at != from && at.starts_with(from)) {
+            if std::fs::remove_dir(at).is_err() {
+                break;
+            }
+            dir = at.parent();
+        }
+    }
+    Ok(())
 }
 
 // Move the directory at `from` to `to`, an empty directory that exists:
@@ -172,6 +294,39 @@ mod tests {
         .unwrap();
         assert!(!from.exists());
         assert_eq!(contents(&to), expected);
+    }
+
+    // libtorrent `storage_utils::move_storage`: a file that will not move
+    // puts back every file moved before it, and leaves a copy made across
+    // devices behind no trace, its source untouched.
+    #[test]
+    fn files_that_fail_to_move_partway_are_put_back() {
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("from"), root.path().join("to"));
+        tree(&from);
+        let expected = contents(&from);
+        let names = ["a.bin", "sub/b.bin", "c.bin"];
+        std::fs::write(from.join("c.bin"), b"cc").unwrap();
+        let moves: Vec<(PathBuf, PathBuf)> = names
+            .iter()
+            .map(|name| (from.join(name), to.join(name)))
+            .collect();
+        let error = move_files_using(&from, &moves, |source, target| {
+            if source.ends_with("c.bin") {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else if source.ends_with("b.bin") {
+                Err(io::Error::from(io::ErrorKind::CrossesDevices))
+            } else {
+                std::fs::rename(source, target)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error, LeafError::Io { ref path, .. } if path.ends_with("c.bin")));
+        let mut expected = expected;
+        expected.push((PathBuf::from("c.bin"), b"cc".to_vec()));
+        expected.sort();
+        assert_eq!(contents(&from), expected);
+        assert!(contents(&to).is_empty());
     }
 
     // A rename that fails for another reason leaves the job as it was: the

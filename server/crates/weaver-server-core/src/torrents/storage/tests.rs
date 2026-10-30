@@ -174,6 +174,43 @@ impl Shim {
     }
 }
 
+// A shim whose files are kept in `placed`, a directory of their own beside
+// the job's, and left as they are: no run is ever out.
+fn placed_shim(piece_length: u64, files: Vec<PieceFile>) -> Shim {
+    let layout = Arc::new(PieceLayout::new(piece_length, files).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("work")).unwrap();
+    std::fs::create_dir_all(dir.path().join("placed")).unwrap();
+    let mail = RunMail::default();
+    let job = Arc::new(TorrentJob::new(
+        GraphJob::for_torrent(
+            1,
+            Arc::clone(&layout),
+            Storage {
+                kept_dir: Some(dir.path().join("placed")),
+                unpack: false,
+                ..storage(&dir.path().join("work"), &mail)
+            },
+        ),
+        Arc::default(),
+        Arc::default(),
+        1,
+    ));
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::clone(&job) as Arc<dyn Pieces>,
+        unbounded(),
+    );
+    Shim {
+        job,
+        storage,
+        layout,
+        mail,
+        dir,
+        room: Arc::default(),
+    }
+}
+
 fn three_files() -> (Shim, Vec<u8>) {
     let shim = shim(
         1024,
@@ -529,6 +566,86 @@ async fn an_adoption_under_seed_mode_reads_the_files_outside_its_hold() {
     assert!(super::adopt_under(&shim.layout, &placed, 1, |_| None).is_none());
     assert!(!placed.had(1));
     assert_eq!(placed.takes_held.lock().unwrap().len(), 1);
+}
+
+// libtorrent `torrent::move_storage`: a torrent's files move from where they
+// sit to the new save path, and the torrent goes on from there. Files
+// placed outside the job's directory move part-written, a file not yet
+// begun has nothing to move, a piece in hand is served from the new place,
+// and the pieces still to come are written there. The job's own directory
+// stays.
+#[tokio::test]
+async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
+    let mut shim = placed_shim(
+        1024,
+        vec![file("a.bin", 1000), file("sub/b.bin", 2500), file("c.bin", 700)],
+    );
+    let torrent = noise(4200, 7);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let root = shim.dir.path().to_path_buf();
+    let (placed, moved) = (root.join("placed"), root.join("moved"));
+    assert!(placed.join("sub/b.bin").exists());
+    assert!(!placed.join("c.bin").exists());
+    std::fs::create_dir_all(&moved).unwrap();
+
+    let outcome = shim.job.with(|job| {
+        job.relocate_kept(moved.clone());
+        job.relocated()
+    });
+    assert_eq!(outcome.unwrap().unwrap(), moved);
+    assert!(!placed.join("a.bin").exists());
+    assert!(!placed.join("sub").exists());
+    assert!(placed.is_dir());
+    assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
+    assert!(root.join("work").is_dir());
+    assert_eq!(shim.read(0), torrent[..1024]);
+    assert_eq!(
+        shim.job.with(|job| job.kept_path(VolumeIndex(2))),
+        Some(moved.join("c.bin"))
+    );
+
+    for piece in 2..5 {
+        shim.complete(piece, &torrent);
+    }
+    shim.settle().await;
+    assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
+    assert_eq!(
+        std::fs::read(moved.join("sub/b.bin")).unwrap(),
+        torrent[1000..3500]
+    );
+    assert_eq!(std::fs::read(moved.join("c.bin")).unwrap(), torrent[3500..]);
+    assert_eq!(std::fs::read_dir(&placed).unwrap().count(), 0);
+    assert!(!root.join("work/c.bin").exists());
+}
+
+// libtorrent `move_flags_t::fail_if_exist`: a file of the torrent already at
+// the new place fails the move before anything moved, and the torrent's
+// files stay where they were, still its own.
+#[test]
+fn placed_files_stay_when_one_is_already_where_they_would_go() {
+    let shim = placed_shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+    let torrent = noise(2000, 8);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let root = shim.dir.path().to_path_buf();
+    let (placed, moved) = (root.join("placed"), root.join("moved"));
+    std::fs::create_dir_all(&moved).unwrap();
+    std::fs::write(moved.join("b.bin"), b"theirs").unwrap();
+
+    let outcome = shim.job.with(|job| {
+        job.relocate_kept(moved.clone());
+        job.relocated()
+    });
+    assert!(outcome.unwrap().is_err());
+    assert_eq!(std::fs::read(placed.join("a.bin")).unwrap(), torrent[..1000]);
+    assert!(!moved.join("a.bin").exists());
+    assert_eq!(std::fs::read(moved.join("b.bin")).unwrap(), b"theirs");
+    assert_eq!(
+        shim.job.with(|job| job.kept_path(VolumeIndex(0))),
+        Some(placed.join("a.bin"))
+    );
+    assert_eq!(shim.read(0), torrent[..1024]);
 }
 
 // The job's side of the storage, telling the test when every piece is in.
