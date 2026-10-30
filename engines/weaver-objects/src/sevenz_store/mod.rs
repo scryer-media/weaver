@@ -640,8 +640,10 @@ impl SevenZipStore {
         self.map = Some(Arc::new(map));
     }
 
-    // Repaired bytes changed the header the map was built on: everything
-    // said about the members was built on wrong bytes.
+    // A different header changes the structural basis of the placements.
+    // The old map still owns the input bytes routed through its members;
+    // keep that inverse authority until the engine handoff materialises
+    // the container. Retracting first would destroy the only backing.
     fn rebuild_if_changed(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
         if self.map.is_none()
             || !self
@@ -659,17 +661,7 @@ impl SevenZipStore {
         if same {
             return;
         }
-        for id in 0..self.members.len() {
-            out.push(Emit::Retract(MemberId(id as u32)));
-        }
-        self.map = None;
-        self.basis.clear();
-        self.folders.clear();
-        self.members = Arc::default();
-        self.grid = Grid::default();
-        self.proof = None;
-        self.condemned.clear();
-        self.relock.clear();
+        self.give_up(Emit::NeedsEngine(Why::Unmapped), out);
     }
 }
 
@@ -926,6 +918,23 @@ impl Object for SevenZipStore {
 
     fn renamed(&mut self, volume: VolumeIndex, name: &str, _out: &mut Vec<Emit>) {
         self.names.insert(volume, name.to_owned());
+    }
+
+    fn name_only(&self, volume: VolumeIndex) -> bool {
+        self.names
+            .get(&volume)
+            .is_some_and(|name| split::parse(name).is_some())
+            && !self.fronted.contains(&volume)
+            && !matches!(self.placed("", &[], self.lengths.get(&volume).copied()), Some(Placed::At(at)) if at == volume)
+    }
+
+    fn engine_volume(&self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        self.names.get(&volume)?;
+        Some(Box::new(crate::engine::CarriedVolume {
+            front: (volume.0 == 0).then_some(self.measured).flatten(),
+            length: self.lengths.get(&volume).copied(),
+            name_only: self.name_only(volume),
+        }))
     }
 
     fn refused(&mut self) {

@@ -682,13 +682,31 @@ impl Source for Lent {
         taken.coverage.covered(range) && self.read_file((node, member), path, range, into)
     }
 
+    fn held_ranges(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<ByteRange> {
+        self.note((node, member), true);
+        let Some(taken) = self.members.get(&(node, member)) else {
+            return Vec::new();
+        };
+        let from = taken
+            .held
+            .partition_point(|(held, _)| held.end <= range.start);
+        taken.held[from..]
+            .iter()
+            .take_while(|(held, _)| held.start < range.end)
+            .filter_map(|(held, _)| held.intersect(range))
+            .collect()
+    }
+
     fn held(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
         let Some(taken) = self.members.get(&(node, member)) else {
             return range.is_empty();
         };
-        let pieces: Vec<(ByteRange, Location)> = taken
+        let from = taken
             .held
+            .partition_point(|(held, _)| held.end <= range.start);
+        let pieces: Vec<(ByteRange, Location)> = taken.held[from..]
             .iter()
+            .take_while(|(held, _)| held.start < range.end)
             .filter_map(|(held, location)| {
                 let inside = held.intersect(range)?;
                 let from = inside.start - held.start;

@@ -15,7 +15,9 @@ use super::*;
 use crate::pipeline::graph::lines::Lines;
 
 mod recovery;
+mod recovery_contracts;
 mod replay;
+mod store_proof;
 mod streams;
 mod verification;
 mod windows;
@@ -29,6 +31,7 @@ const HEADER: u64 = SIGNATURE.len() as u64;
 struct Store {
     announced: bool,
     length: u64,
+    checksum_on_repair: Option<u32>,
 }
 
 impl Object for Store {
@@ -55,6 +58,14 @@ impl Object for Store {
                 member: MemberId(0),
                 name: "inner.bin".into(),
                 length: Some(self.length),
+            });
+        }
+        if delivery.provenance == Provenance::Repaired
+            && let Some(crc32) = self.checksum_on_repair.take()
+        {
+            out.push(Emit::Checksum {
+                member: MemberId(0),
+                crc32,
             });
         }
         let skip = HEADER
@@ -90,8 +101,17 @@ impl Object for Store {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
-        Located::Never
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
+        if member != MemberId(0) {
+            return Located::Never;
+        }
+        if let Some(range) = range.intersect(ByteRange::new(0, self.length)) {
+            out.push(Extent {
+                volume: VolumeIndex(0),
+                range: range.shift(HEADER as i64),
+            });
+        }
+        Located::Whole
     }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
@@ -205,6 +225,7 @@ struct Build {
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
     inner: u64,
+    checksum_on_repair: Option<u32>,
     heard: Arc<Mutex<Vec<u64>>>,
 }
 
@@ -214,6 +235,7 @@ impl Builder for Build {
             Kind::RarStore => Some(Box::new(Store {
                 announced: false,
                 length: self.inner,
+                checksum_on_repair: self.checksum_on_repair,
             })),
             Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
             Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
@@ -441,6 +463,7 @@ struct Job {
     fix: Option<Fix>,
     // The length of the member the pretend store holds.
     inner: u64,
+    checksum_on_repair: Option<u32>,
     // What every pretend stream had been delivered each time it heard its
     // volume closed.
     heard: Arc<Mutex<Vec<u64>>>,
@@ -465,6 +488,7 @@ impl Job {
             par: Arc::new(Mutex::new(Seen::default())),
             fix: None,
             inner: 5,
+            checksum_on_repair: None,
             heard: Arc::default(),
             out: Vec::new(),
         }
@@ -538,6 +562,7 @@ impl Job {
             par: Arc::clone(&self.par),
             fix: self.fix,
             inner: self.inner,
+            checksum_on_repair: self.checksum_on_repair,
             heard: Arc::clone(&self.heard),
         }
     }

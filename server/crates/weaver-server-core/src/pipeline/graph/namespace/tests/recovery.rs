@@ -201,6 +201,186 @@ fn a_rebuilt_map_lets_the_sets_proof_reach_the_bytes_it_held() {
     );
 }
 
+fn pending_map_job(budgets: HoldBudgets) -> (Job, MemberId) {
+    let mut job = Job::new(budgets).with_set(Some(Fix {
+        name: "a.7z",
+        read: ByteRange::new(0, map_at().end),
+        fix: (map_at().start, MAP),
+    }));
+    let member = job.member("a.7z", Some(map_at().end));
+    job.send(member, 0, &seven_z(), Provenance::Fresh);
+    job.send(member, body().start, b"hello", Provenance::Damaged);
+    let mut build = job.build();
+    job.writer
+        .arrive(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            Arrival {
+                node: NodeId::ROOT,
+                member,
+                offset: map_at().start,
+                bytes: Bytes::from_static(MAP),
+                provenance: Provenance::Repaired,
+            },
+            &mut job.out,
+        )
+        .unwrap();
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    (job, member)
+}
+
+#[test]
+fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
+    for resident_limit in [0, u64::MAX] {
+        let (mut job, member) = pending_map_job(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        });
+        let mut build = job.build();
+        let mut read = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(
+            NodeId::ROOT,
+            member,
+            ByteRange::new(0, map_at().end),
+            &mut read,
+        ));
+        assert_eq!(read, [seven_z().as_slice(), b"hello", MAP].concat());
+        let mut durable = Vec::new();
+        assert!(
+            !Access {
+                writer: &job.writer,
+                tree: &job.tree,
+                held: false
+            }
+            .read_at(NodeId::ROOT, member, body(), &mut durable,)
+        );
+        assert!(durable.is_empty());
+        // A later placed copy removes just its overlap from pending custody;
+        // reads combine its new byte with the still-held neighbours.
+        job.writer
+            .arrive(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                Arrival {
+                    node: NodeId::ROOT,
+                    member,
+                    offset: body().start + 1,
+                    bytes: Bytes::from_static(b"a"),
+                    provenance: Provenance::Fresh,
+                },
+                &mut job.out,
+            )
+            .unwrap();
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len() - 1);
+        let mut replaced = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(
+            NodeId::ROOT,
+            member,
+            ByteRange::new(0, map_at().end),
+            &mut replaced
+        ));
+        assert_eq!(replaced, [seven_z().as_slice(), b"hallo", MAP].concat());
+        job.writer
+            .release_held(&mut job.tree, &mut build, &Source, &mut job.out)
+            .unwrap();
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+        let mut released = Vec::new();
+        assert!(
+            job.writer
+                .access(&job.tree)
+                .read_at(NodeId::ROOT, member, body(), &mut released)
+        );
+        assert_eq!(released, b"hallo");
+    }
+}
+
+#[test]
+fn a_lent_read_keeps_pending_custody_when_the_live_copy_changes() {
+    let (mut job, member) = pending_map_job(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    });
+    let set = job.set_node();
+    let loan = job
+        .writer
+        .lend(&mut job.tree, NodeId::ROOT, set)
+        .unwrap()
+        .unwrap();
+    job.send(member, body().start + 1, b"a", Provenance::Fresh);
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
+    assert_eq!(
+        job.par.lock().unwrap().read,
+        Some([seven_z().as_slice(), b"hello", MAP].concat())
+    );
+    let mut build = job.build();
+    let result = job.writer.returned(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        &weaver_objects::Objects::default(),
+        returned,
+        &mut job.out,
+    );
+    assert!(matches!(result, Err(WriteError::StaleRecovery { set: stale }) if stale == set));
+    let mut current = Vec::new();
+    assert!(
+        job.writer
+            .access(&job.tree)
+            .read_at(NodeId::ROOT, member, body(), &mut current)
+    );
+    assert_eq!(
+        current, b"hallo",
+        "stale proof must not overwrite the newer placed copy"
+    );
+}
+
+#[test]
+fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
+    let (mut job, member) = pending_map_job(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    });
+    let (child, _) = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.tree
+        .namespace_mut(child)
+        .unwrap()
+        .get_mut(MemberId(0))
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(0, body().len()), Provenance::Fresh);
+    job.writer
+        .write_file(&job.tree, child, MemberId(0), 0, b"stale")
+        .unwrap();
+    job.writer
+        .files
+        .get_mut(&NodeId::ROOT)
+        .unwrap()
+        .scratch
+        .as_mut()
+        .unwrap()
+        .close(0)
+        .unwrap();
+    let mut read = b"prefix".to_vec();
+    assert!(
+        !job.writer
+            .access(&job.tree)
+            .read_at(NodeId::ROOT, member, body(), &mut read)
+    );
+    assert_eq!(read, b"prefix");
+    let mut durable = Vec::new();
+    assert!(
+        Access {
+            writer: &job.writer,
+            tree: &job.tree,
+            held: false
+        }
+        .read_at(NodeId::ROOT, member, body(), &mut durable)
+    );
+    assert_eq!(durable, b"stale");
+}
+
 // An output that refuses the repair's write fails the repair with that
 // refusal, and nothing it rebuilt reaches the member.
 #[test]

@@ -585,7 +585,7 @@ impl NamespaceWriter {
         // name it is.
         let previous = self.acknowledging.replace(set);
         let applied = (|| {
-            let rejected = tree.rejected_inputs(node, repaired.members());
+            let mut rejected = tree.rejected_inputs(node, repaired.members());
             self.bind_recoveries(tree, builder, segments, node, out)?;
             let mut rewritten = std::collections::BTreeSet::new();
             for (member, offset, bytes) in repaired.slices() {
@@ -614,6 +614,10 @@ impl NamespaceWriter {
             ) {
                 rewritten.extend(self.vouched(tree, builder, segments, (node, set), out)?);
             }
+            // Repair or proof delivery can complete a member's checksum
+            // metadata or inverse map. Capture any newly auditable damage
+            // through those changed inputs, alongside the earlier captures.
+            rejected.extend(tree.rejected_inputs(node, rewritten.iter().copied()));
             for member in rewritten {
                 self.reopen(tree, builder, segments, (node, member), out)?;
             }
@@ -658,11 +662,36 @@ impl NamespaceWriter {
                     .collect()
             })
             .unwrap_or_default();
-        let members = marked.iter().map(|(member, _)| *member).collect();
+        let members: Vec<_> = marked.iter().map(|(member, _)| *member).collect();
+        // A derived file can have failed its own complete fold while its
+        // source's fragmented checksum spans could not mark parent damage.
+        // Proof touching an input still warrants replay of that rejection,
+        // even when transport coverage needs no redelivery. Replay checks
+        // the full derived checksum; a proven prefix alone is no verdict
+        // on the rest of the file.
+        let proven_inputs: Vec<_> = tree
+            .namespace(node)
+            .zip(tree.recovery(set))
+            .map(|(namespace, recovery)| {
+                namespace
+                    .members()
+                    .filter_map(|record| {
+                        let length = record.length?;
+                        (recovery.covers(record.id)
+                            && namespace
+                                .proven(record.id, ByteRange::new(0, length), recovery)
+                                .is_some())
+                        .then_some(record.id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rejected = tree.rejected_inputs(node, proven_inputs);
         for (member, range) in marked {
             let proven = (node, member, range, Provenance::Repaired);
             self.redeliver(tree, builder, segments, proven, out)?;
         }
+        self.queue_rechecks(rejected);
         Ok(members)
     }
 

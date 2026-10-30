@@ -29,6 +29,151 @@ fn apply(job: &mut Job, replayed: Replayed) {
 }
 
 #[test]
+fn a_checksum_revealed_by_repair_replays_preexisting_damage_after_the_map_is_complete() {
+    late_checksum_replay(true);
+}
+
+#[test]
+fn a_checksum_revealed_by_clean_proof_replays_preexisting_damage() {
+    late_checksum_replay(false);
+}
+
+fn late_checksum_replay(physical: bool) {
+    for revealed in [false, true] {
+        let posted = [SIGNATURE, b"hello"].concat();
+        let mut job = Job::new(PLENTY).with_set(physical.then_some(Fix {
+            name: "archive.rar",
+            read: ByteRange::new(0, posted.len() as u64),
+            fix: (HEADER + 2, b"l"),
+        }));
+        job.checksum_on_repair = revealed.then(|| crc32(b"hello"));
+        let member = job.member("archive.rar", Some(posted.len() as u64));
+        job.send(member, 0, &posted, Provenance::Fresh);
+        job.close(member);
+        let (node, _) = job.tree.child_of(NodeId::ROOT, member).unwrap();
+        let derived = job
+            .tree
+            .namespace_mut(node)
+            .unwrap()
+            .get_mut(MemberId(0))
+            .unwrap();
+        derived.closed = true;
+        derived
+            .coverage
+            .write(ByteRange::new(0, 5), Provenance::Damaged);
+        assert_eq!(
+            derived.crc32, None,
+            "the missing metadata has not stated a checksum"
+        );
+        assert!(job.tree.rejected_inputs(NodeId::ROOT, [member]).is_empty());
+        if !physical {
+            job.tree
+                .namespace_mut(NodeId::ROOT)
+                .unwrap()
+                .get_mut(member)
+                .unwrap()
+                .coverage
+                .write(ByteRange::new(HEADER + 2, HEADER + 3), Provenance::Damaged);
+        }
+        job.commit();
+        let set = job.writer.sets(&job.tree)[0].1;
+        let mut lent = Inline::default();
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+            .unwrap();
+        let mut build = job.build();
+        assert_eq!(
+            job.run_lent(&mut build, lent),
+            vec![(
+                set,
+                if physical {
+                    RepairOutcome::Repaired { slices: 1 }
+                } else {
+                    RepairOutcome::Clean
+                }
+            )]
+        );
+        assert_eq!(job.writer.rechecks_waiting(), revealed);
+        if revealed {
+            let replay = job.writer.take_replay(&job.tree).unwrap().unwrap();
+            apply(&mut job, replay.run(&Default::default()));
+            assert!(
+                job.tree
+                    .namespace(node)
+                    .unwrap()
+                    .get(MemberId(0))
+                    .unwrap()
+                    .coverage
+                    .verified(ByteRange::new(0, 5))
+            );
+            assert_eq!(job.file("inner.bin"), b"hello");
+        }
+    }
+}
+
+#[test]
+fn clean_proof_preserves_full_replay_only_for_already_rejected_derived_output() {
+    for rejected in [false, true] {
+        let mut job = Job::new(PLENTY).with_set(None);
+        job.inner = 5;
+        let posted = [SIGNATURE, b"hello"].concat();
+        let member = job.member("archive.rar", Some(posted.len() as u64));
+        job.send(member, 0, &posted, Provenance::Fresh);
+        job.close(member);
+        let (node, _) = job.tree.child_of(NodeId::ROOT, member).unwrap();
+        let derived = job
+            .tree
+            .namespace_mut(node)
+            .unwrap()
+            .get_mut(MemberId(0))
+            .unwrap();
+        derived.crc32 = Some(crc32(b"hello"));
+        derived.closed = true;
+        if rejected {
+            derived
+                .coverage
+                .write(ByteRange::new(0, 5), Provenance::Damaged);
+        }
+        // Current bytes are intact. Only a subset of their prior damage
+        // is promoted by this Clean proof, which must not erase the full
+        // dependency of an already rejected derived checksum.
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap()
+            .coverage
+            .write(ByteRange::new(HEADER + 1, HEADER + 2), Provenance::Damaged);
+        job.commit();
+        let set = job.writer.sets(&job.tree)[0].1;
+        let mut lent = Inline::default();
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+            .unwrap();
+        let mut build = job.build();
+        assert_eq!(
+            job.run_lent(&mut build, lent),
+            vec![(set, RepairOutcome::Clean)]
+        );
+        assert_eq!(job.writer.rechecks_waiting(), rejected);
+        if rejected {
+            let replay = job.writer.take_replay(&job.tree).unwrap().unwrap();
+            apply(&mut job, replay.run(&Default::default()));
+            assert!(
+                job.tree
+                    .namespace(node)
+                    .unwrap()
+                    .get(MemberId(0))
+                    .unwrap()
+                    .coverage
+                    .verified(ByteRange::new(0, 5))
+            );
+            assert_eq!(job.file("inner.bin"), b"hello");
+        }
+    }
+}
+
+#[test]
 fn replay_stages_bounded_chunks_before_invalidating_coverage() {
     let (mut job, _, node, expected) = staged_job();
     let before = job.tree.record(node).unwrap();

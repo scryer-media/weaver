@@ -94,7 +94,8 @@ pub struct Holding<'a, T> {
 // evidence travels when a corrected name gives one back for reoffering.
 pub(crate) struct CarriedVolume<T> {
     pub(crate) front: Option<T>,
-    length: Option<u64>,
+    pub(crate) length: Option<u64>,
+    pub(crate) name_only: bool,
 }
 
 // A volume's name as its set numbers it.
@@ -136,6 +137,8 @@ pub struct EngineObject<F: Format> {
     // The set was refused: what it claims after goes where the set went.
     #[serde(skip)]
     gone: bool,
+    #[serde(default)]
+    name_only: BTreeSet<u32>,
 }
 
 impl<F: Format> Durable for EngineObject<F> {
@@ -164,6 +167,7 @@ impl<F: Format> Default for EngineObject<F> {
             bound: BTreeSet::new(),
             password: None,
             gone: false,
+            name_only: BTreeSet::new(),
         }
     }
 }
@@ -218,7 +222,10 @@ impl<F: Format> EngineObject<F> {
                 self.names
                     .values()
                     .next()
-                    .is_some_and(|first| first.same_set(candidate))
+                    // With no naming anchor, a name only refines a place
+                    // the format already establishes; it cannot introduce
+                    // unrelated siblings of a lone unnumbered archive.
+                    .map_or(placed.is_some(), |first| first.same_set(candidate))
             })
             .and_then(|candidate| candidate.slot(&self.names))
             .filter(|index| !front.is_some_and(|front| F::misplaced(front, *index)));
@@ -247,6 +254,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         _out: &mut Vec<Emit>,
     ) {
         let volume = delivery.volume.0;
+        if delivery.offset == 0 && !delivery.bytes.is_empty() {
+            self.name_only.remove(&volume);
+        }
         if delivery.offset == 0
             && self.bound.contains(&volume)
             && let Some(front) = F::front(delivery.bytes)
@@ -304,19 +314,47 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
+        let parsed_front = F::front(front);
+        let name_only = front.is_empty()
+            && F::parse(name).is_some()
+            && {
+                let holdings = self
+                    .bound
+                    .iter()
+                    .map(|index| {
+                        (
+                            *index,
+                            Holding {
+                                front: self.fronts.get(index),
+                                length: self.lengths.get(index).copied(),
+                            },
+                        )
+                    })
+                    .collect();
+                !matches!(F::place(&holdings, parsed_front.as_ref(), length), Some(Placed::At(at)) if at == volume)
+            };
+        if name_only {
+            self.name_only.insert(volume.0);
+        } else {
+            self.name_only.remove(&volume.0);
+        }
         let first = self.names.values().next();
         if let Some(parsed) = F::parse(name)
             && first.is_none_or(|first| first.same_set(&parsed))
         {
             self.names.insert(volume.0, parsed);
         }
-        if let Some(front) = F::front(front) {
+        if let Some(front) = parsed_front {
             self.fronts.insert(volume.0, front);
         }
         if let Some(length) = length {
             self.lengths.insert(volume.0, length);
         }
         self.bound.insert(volume.0);
+    }
+
+    fn name_only(&self, volume: VolumeIndex) -> bool {
+        self.name_only.contains(&volume.0)
     }
 
     fn refused(&mut self) {
@@ -352,6 +390,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             Box::new(CarriedVolume {
                 front: self.fronts.remove(&volume.0),
                 length: self.lengths.remove(&volume.0),
+                name_only: self.name_only.remove(&volume.0),
             }) as weaver_graph::Carried
         })
     }
@@ -378,6 +417,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             return;
         };
         self.bound(volume, name, &[], carried.length);
+        if !carried.name_only {
+            self.name_only.remove(&volume.0);
+        }
         if let Some(front) = carried.front {
             self.fronts.insert(volume.0, front);
         }

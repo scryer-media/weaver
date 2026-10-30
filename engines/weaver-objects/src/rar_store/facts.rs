@@ -54,6 +54,11 @@ struct VolumeFacts {
     headers: Option<RarVolumeFacts>,
     ended: bool,
     locked: Option<RarVolumeHeaderEncryption>,
+    // The binding's parsed front can precede the walk's first header read.
+    #[serde(default)]
+    front: Option<RarVolumeFacts>,
+    #[serde(default)]
+    name_only: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,6 +75,25 @@ pub(super) struct EntryFacts {
     padding: Padding,
     // An open cipher's blocks, never its key.
     chain: Option<Chain>,
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_volume_facts_keep_missing_front_and_authority_unknown() {
+    let bytes = rmp_serde::to_vec(&(
+        VolumeIndex(0),
+        Option::<String>::None,
+        Option::<u64>::None,
+        true,
+        Kept::default(),
+        Option::<RarVolumeFacts>::None,
+        false,
+        Option::<RarVolumeHeaderEncryption>::None,
+    ))
+    .unwrap();
+    let volume: VolumeFacts = rmp_serde::from_slice(&bytes).unwrap();
+    assert!(volume.front.is_none());
+    assert!(!volume.name_only);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -133,6 +157,8 @@ pub(super) fn of(store: &RarStore) -> Facts {
             headers: volume.walk.facts.clone(),
             ended: volume.walk.ended,
             locked: volume.walk.locked,
+            front: volume.front.clone(),
+            name_only: volume.name_only,
         })
         .collect();
     let entries = store
@@ -192,6 +218,8 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         volume.length = found.length;
         volume.closed = found.closed;
         volume.kept = found.kept;
+        volume.front = found.front;
+        volume.name_only = found.name_only;
         volume.walk.blocks = found.headers.as_ref().map_or_else(Vec::new, |headers| {
             headers
                 .members

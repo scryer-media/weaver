@@ -59,6 +59,50 @@ fn a_complete_fold_needs_neither_a_read_nor_a_pending_record() {
 }
 
 #[test]
+fn repair_slices_defer_a_closed_members_checksum_until_the_batch_is_complete() {
+    for correct_final_bytes in [false, true] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("payload.bin", Some(8));
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap()
+            .crc32 = Some(crc32(b"abcdefgh"));
+        job.send(member, 4, b"efgX", Provenance::Fresh);
+        job.writer.acknowledging = Some(NodeId(91));
+        job.send(member, 0, b"abcd", Provenance::Repaired);
+        job.close(member);
+        assert!(job.root().get(member).unwrap().closed);
+        assert!(
+            !job.root()
+                .get(member)
+                .unwrap()
+                .coverage
+                .damaged(ByteRange::new(0, 8)),
+            "a completed gap must not reject bytes that later repair slices will replace"
+        );
+        assert_eq!(job.writer.pending_verifications(), vec![(0, member.0)]);
+        if correct_final_bytes {
+            job.send(member, 7, b"h", Provenance::Repaired);
+        }
+        job.writer.acknowledging = None;
+        let check = job.writer.take_verification(&job.tree).unwrap();
+        apply(&mut job, check.run(&Default::default())).unwrap();
+        assert_eq!(
+            job.root()
+                .get(member)
+                .unwrap()
+                .coverage
+                .damaged(ByteRange::new(0, 8)),
+            !correct_final_bytes,
+            "only the completed repair batch determines the checksum verdict"
+        );
+        assert!(job.writer.pending_verifications().is_empty());
+    }
+}
+
+#[test]
 fn verification_reads_bounded_chunks_and_clears_only_on_acknowledgment() {
     let (mut job, member, bytes) = pending();
     let check = job.writer.take_verification(&job.tree).unwrap();

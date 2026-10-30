@@ -322,8 +322,9 @@ impl Zip {
         self.settle(out);
     }
 
-    // Repaired bytes changed what the map was built on: everything said about
-    // the members was built on wrong bytes.
+    // A changed directory or local header revokes the structural basis,
+    // but the old placements still own the input bytes. Preserve their
+    // inverse map until the engine handoff materialises the container.
     fn rebuild_if_changed(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
         if self.map.is_none()
             || !self
@@ -341,13 +342,7 @@ impl Zip {
         if same {
             return;
         }
-        for id in 0..self.members.len() {
-            out.push(Emit::Retract(MemberId(id as u32)));
-        }
-        self.map = None;
-        self.basis.clear();
-        self.members.clear();
-        self.grid = Grid::default();
+        self.give_up(Emit::NeedsEngine(Why::Unmapped), out);
     }
 
     // Whether the range is one the directory read needs, before the map.

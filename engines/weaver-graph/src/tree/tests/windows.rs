@@ -280,7 +280,12 @@ fn a_range_has_one_window_and_a_retracted_member_takes_its_windows_with_it() {
         &mut Vec::new(),
     );
     assert_eq!(again, None);
-    tree.retract(NodeId::ROOT, first, &mut Vec::new());
+    tree.retract(
+        NodeId::ROOT,
+        first,
+        &mut Taping(Arc::clone(&log)),
+        &mut Vec::new(),
+    );
     assert!(tree.namespace(window).is_none());
     assert!(tree.recovery_nodes(NodeId::ROOT).is_empty());
 }

@@ -59,6 +59,7 @@ pub(crate) struct Volume {
     // What the volume's front stated when it was bound, before any of its
     // bytes reached the walk: what places a sibling beside it meanwhile.
     front: Option<unrar_rs::RarVolumeFacts>,
+    name_only: bool,
 }
 
 impl Volume {
@@ -70,6 +71,7 @@ impl Volume {
             kept: Kept::default(),
             walk: Walk::default(),
             front: None,
+            name_only: false,
         }
     }
 }
@@ -457,6 +459,9 @@ impl Object for RarStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
+        if delivery.offset == 0 && !delivery.bytes.is_empty() {
+            self.volume(delivery.volume).name_only = false;
+        }
         if delivery.bytes.is_empty() {
             return;
         }
@@ -669,7 +674,21 @@ impl Object for RarStore {
         let bound = self.volume(volume);
         bound.name = Some(name.to_owned());
         bound.front = facts;
+        bound.name_only = front.is_empty() && crate::rar_engine::naming::parse(name).is_some();
         self.stale = true;
+    }
+
+    fn name_only(&self, volume: VolumeIndex) -> bool {
+        self.volumes.get(&volume).is_some_and(|held| held.name_only)
+    }
+
+    fn engine_volume(&self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        let held = self.volumes.get(&volume)?;
+        Some(Box::new(crate::engine::CarriedVolume {
+            front: held.walk.facts.as_ref().or(held.front.as_ref()).cloned(),
+            length: held.length,
+            name_only: held.name_only,
+        }))
     }
 
     // A store that gave its set up still claims the rest of it, so the rest
@@ -767,8 +786,17 @@ impl Object for RarStore {
             return;
         };
         found.name = Some(name.to_owned());
-        let misplaced = naming::parse(name).is_some_and(|named| named.index() != volume.0)
-            && !claim::settled(volume, found);
+        // Finishing a RAR4 walk need not reveal an ordinal. A corrected
+        // name then places it more precisely than the links that held it;
+        // only a position the headers actually state outranks that name.
+        let stated = found
+            .walk
+            .facts
+            .as_ref()
+            .or(found.front.as_ref())
+            .is_some_and(claim::states_position);
+        let misplaced =
+            naming::parse(name).is_some_and(|named| named.index() != volume.0) && !stated;
         if misplaced && self.carried(volume).is_some() {
             self.give_back_held(vec![volume], out);
         }

@@ -91,6 +91,7 @@ impl Envelopes {
                     closed: record.closed,
                     settled: record.settled,
                     reached: 0,
+                    length_read: false,
                 },
             );
         });

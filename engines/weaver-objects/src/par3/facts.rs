@@ -42,6 +42,27 @@ pub(super) struct Par3Facts {
 pub(super) struct VolumeFacts {
     arrived: Coverage,
     closed: bool,
+    // Binding identity is not recoverable from replay when the carrier's
+    // leading packet is damaged. Older facts did not keep it.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    name_only: bool,
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_volume_facts_decode_without_inventing_a_binding_name() {
+    let bytes = rmp_serde::to_vec(&(Coverage::default(), true)).unwrap();
+    let volume: VolumeFacts = rmp_serde::from_slice(&bytes).unwrap();
+    assert!(volume.closed);
+    assert!(volume.name.is_none());
+    assert!(!volume.name_only);
+    let bytes =
+        rmp_serde::to_vec(&(Coverage::default(), true, Some("carrier.vol0+1.par3"))).unwrap();
+    let volume: VolumeFacts = rmp_serde::from_slice(&bytes).unwrap();
+    assert!(volume.name.is_some());
+    assert!(!volume.name_only);
 }
 
 impl Durable for Par3Facts {
@@ -76,6 +97,8 @@ pub(super) fn of(par3: &Par3) -> Facts {
             .map(|volume| VolumeFacts {
                 arrived: volume.arrived.clone(),
                 closed: volume.closed,
+                name: volume.name.clone(),
+                name_only: volume.name_only,
             })
             .collect(),
         bound: par3.bound.clone(),
@@ -100,8 +123,12 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
             front: Vec::new(),
             arrived: volume.arrived,
             closed: volume.closed,
-            named_blocks: None,
-            name: None,
+            named_blocks: volume
+                .name
+                .as_deref()
+                .and_then(|name| crate::recovery_volume::named_blocks(name, ".par3")),
+            name: volume.name,
+            name_only: volume.name_only,
         })
         .collect();
     par3.bound = kept.bound;

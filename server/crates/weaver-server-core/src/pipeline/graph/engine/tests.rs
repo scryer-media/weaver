@@ -230,6 +230,74 @@ fn a_volume_that_never_joined_is_lost_once_no_more_can_join() {
 }
 
 #[test]
+fn a_different_verified_copy_invalidates_only_the_run_that_observed_its_old_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, b"original", Provenance::Fresh)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 0, 8).unwrap(), b"original");
+    envelopes
+        .keep(NODE, 0, 0, b"original", Provenance::Fresh)
+        .unwrap();
+    assert!(
+        volumes.current(),
+        "an identical copy changes no observed input"
+    );
+    envelopes
+        .keep(NODE, 0, 8, b"tail", Provenance::Fresh)
+        .unwrap();
+    assert!(volumes.current(), "unread input remains ordinary growth");
+    envelopes
+        .keep(NODE, 0, 7, b"lTAIL", Provenance::Fresh)
+        .unwrap();
+    assert!(
+        volumes.current(),
+        "a partial overlap preserves every consumed byte"
+    );
+    let other = NodeId(NODE.0 + 1);
+    envelopes
+        .keep(other, 0, 0, b"side", Provenance::Fresh)
+        .unwrap();
+    let sibling = reader(&envelopes.shelf(other));
+    assert_eq!(read(&sibling, 0, 4).unwrap(), b"side");
+    envelopes
+        .keep(NODE, 0, 0, b"correct!", Provenance::Fresh)
+        .unwrap();
+    assert!(
+        !volumes.current(),
+        "the run already used a superseded verified copy"
+    );
+    assert_eq!(
+        read(&volumes, 0, 8).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(sibling.current(), "another owner's input was not replaced");
+    let current = reader(&shelf);
+    assert_eq!(read(&current, 0, 12).unwrap(), b"correct!TAIL");
+}
+
+#[test]
+fn a_first_write_below_an_observed_footer_is_not_a_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 8, b"tail", Provenance::Fresh)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 8, 4).unwrap(), b"tail");
+    envelopes
+        .keep(NODE, 0, 0, b"original", Provenance::Fresh)
+        .unwrap();
+    assert!(
+        volumes.current(),
+        "the high-water mark does not make a sparse hole observed input"
+    );
+    assert_eq!(read(&volumes, 0, 12).unwrap(), b"originaltail");
+}
+
+#[test]
 fn a_repair_behind_what_the_run_read_stops_its_reads() {
     let dir = tempfile::tempdir().unwrap();
     let (mut envelopes, shelf) = shelved(dir.path());
@@ -641,6 +709,73 @@ async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
 }
 
 #[tokio::test]
+async fn a_different_verified_copy_retracts_a_finished_runs_output() {
+    replaced_run(true).await;
+}
+
+#[tokio::test]
+async fn a_different_verified_copy_ignores_the_old_runs_queued_end() {
+    replaced_run(false).await;
+}
+
+async fn replaced_run(ended: bool) {
+    let mut echoing = echoing(1);
+    echoing.deliver(0);
+    if ended {
+        while !echoing.hear().await {}
+        assert_eq!(echoing.job.phase(), RootPhase::Done);
+    } else {
+        echoing.until_closed(0).await;
+    }
+    assert_eq!(echoing.echoed(0), body(0));
+    let engine = echoing.engine();
+    let generation = echoing.job.runs().generation(engine).unwrap();
+    for byte in &mut echoing.volumes[0][HEADER..] {
+        *byte ^= 0x5a;
+    }
+    let expected = echoing.volumes[0][HEADER..].to_vec();
+    echoing.deliver(0);
+    assert!(
+        !echoing.closed(0),
+        "derived output based on superseded input is retracted"
+    );
+    assert!(
+        echoing.job.runs().live(),
+        "the existing run path owns the re-extraction"
+    );
+    if !ended {
+        let said = echoing.mail.recv().await.unwrap();
+        assert_eq!((said.node, said.generation), (engine, generation));
+        assert!(matches!(said.heard, Heard::Ended));
+        echoing
+            .job
+            .run_said(said, &mut RepairSlots::default(), 1)
+            .unwrap();
+        assert!(
+            !echoing.closed(0),
+            "an old end cannot close the replacement output"
+        );
+    }
+    while !echoing.hear().await {}
+    let record = echoing
+        .job
+        .tree()
+        .namespace(engine)
+        .unwrap()
+        .get(MemberId(0))
+        .unwrap();
+    assert!(record.closed);
+    let file = echoing.job.writer().file_state(engine, MemberId(0));
+    assert!(file.has_file, "the replacement output has disk backing");
+    let name = file.on_disk.as_deref().unwrap_or(&record.output_name);
+    assert_eq!(
+        std::fs::read(echoing.dir.path().join(name)).unwrap(),
+        expected
+    );
+    assert_eq!(echoing.job.phase(), RootPhase::Done);
+}
+
+#[tokio::test]
 async fn the_engine_bids_for_the_volumes_after_the_one_its_run_reached() {
     let mut echoing = echoing(3);
     assert!(echoing.bid().is_empty(), "nothing is bound yet");
@@ -752,6 +887,40 @@ async fn a_volume_the_run_read_closing_at_another_length_restarts_the_run() {
     assert_ne!(echoing.job.runs().generation(engine), before);
     assert!(!echoing.closed(0), "accepted old output must be retracted");
     assert!(!echoing.dir.path().join("echo-0.bin").exists());
+}
+
+#[test]
+fn giving_back_length_observed_input_stops_its_worker_before_payload_is_read() {
+    for observed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut envelopes, shelf) = shelved(dir.path());
+        close(&shelf, 0, 6, false);
+        let worker = reader(&shelf);
+        if observed {
+            assert_eq!(worker.len(FIRST), Some(6));
+        }
+        assert_eq!(shelf.reached(), None);
+        envelopes.take(NODE, 0).unwrap();
+        assert_eq!(worker.current(), !observed);
+    }
+}
+
+#[test]
+fn a_stale_length_read_cannot_register_a_new_runs_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    close(&shelf, 0, 6, false);
+    let old = reader(&shelf);
+    assert_eq!(old.len(FIRST), Some(6));
+    shelf.restart();
+    let current = reader(&shelf);
+    assert_eq!(
+        old.len(FIRST),
+        None,
+        "stale metadata cannot decide a layout"
+    );
+    envelopes.take(NODE, 0).unwrap();
+    assert!(current.current(), "the new run observed no old length");
 }
 
 #[test]

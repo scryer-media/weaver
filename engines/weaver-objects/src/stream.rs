@@ -258,6 +258,12 @@ impl<D: Decoder> Object for Stream<D> {
     // names: that piece is the format's, wherever its name numbers it. A
     // stream with a name counts from its own set's first piece, so only a
     // piece of that set is claimed.
+    fn name_only(&self, volume: VolumeIndex) -> bool {
+        // Identity joins learn no container membership from opaque bytes:
+        // their numbered placement is solely the decoder's naming rule.
+        D::IDENTITY && self.pieces.contains(&volume.0)
+    }
+
     fn claim(
         &mut self,
         name: &str,

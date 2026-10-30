@@ -277,6 +277,12 @@ pub struct Tree {
     // What an object parsed of a member it gave back, parked beside the
     // member until an object of its namespace reclaims it and adopts it.
     given: Given,
+    // An occupied place whose source front must return before candidates
+    // can be compared. Checkpoints already retain the undecided members;
+    // their front replay reconstructs this transient dependency index.
+    pending_claims: BTreeMap<(NodeId, MemberId), BTreeSet<MemberId>>,
+    #[cfg(test)]
+    retried_claims: usize,
     // Every namespace writes into one directory, so one ledger names them
     // all.
     names: NameLedger,
@@ -309,6 +315,9 @@ impl Tree {
         Self {
             nodes,
             given: BTreeMap::new(),
+            pending_claims: BTreeMap::new(),
+            #[cfg(test)]
+            retried_claims: 0,
             names: NameLedger::new(),
             sets: BTreeSet::new(),
             homed: BTreeMap::new(),
@@ -568,6 +577,7 @@ impl Tree {
             self.close_window(window, builder, effects);
         }
         effects.push(Effect::Closed { node, member });
+        self.retry_claims(node, member, builder, effects);
     }
 
     // The owner handed the object bound at a member of `node`'s namespace
@@ -1674,6 +1684,7 @@ impl Tree {
     fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
         self.given.retain(|(at, _), _| *at != node);
+        self.pending_claims.retain(|(at, _), _| *at != node);
         for record in removed.namespace.members() {
             self.release_name((node, record.id), effects);
         }
@@ -1832,6 +1843,9 @@ impl Tree {
                     self.identify_again(node, member, builder, effects);
                 }
             }
+        }
+        if front {
+            self.retry_claims(node, member, builder, effects);
         }
     }
 
@@ -2000,6 +2014,12 @@ impl Tree {
     fn held_by_name(&self, node: NodeId, member: MemberId) -> bool {
         self.namespace(node)
             .is_some_and(|namespace| namespace.first_bytes(member).is_empty())
+            && self.child_of(node, member).is_some_and(|(child, volume)| {
+                self.nodes
+                    .get(&child)
+                    .and_then(|found| found.object.as_ref())
+                    .is_some_and(|object| object.name_only(volume))
+            })
     }
 
     // An object founded on nothing but names: none of its volumes' fronts
@@ -2011,15 +2031,20 @@ impl Tree {
         let Some(binding) = found.binding.as_ref() else {
             return false;
         };
+        let Some(object) = found.object.as_ref() else {
+            return false;
+        };
         let Some(namespace) = self.namespace(binding.parent) else {
             return false;
         };
-        binding.volumes.values().all(|member| {
-            let length = namespace.get(*member).and_then(|record| record.length);
-            !matches!(
-                signed(namespace.first_bytes(*member), length),
-                Sniff::Object(_)
-            )
+        binding.volumes.iter().all(|(volume, member)| {
+            let front = namespace.first_bytes(*member);
+            if front.is_empty() {
+                object.name_only(*volume)
+            } else {
+                let length = namespace.get(*member).and_then(|record| record.length);
+                !matches!(signed(front, length), Sniff::Object(_))
+            }
         })
     }
 
@@ -2233,9 +2258,33 @@ impl Tree {
                         });
                 if named {
                     self.release(node, *child, (volume, into), effects);
+                    // It has no byte authority yet, so its next front must
+                    // receive a new ownership decision rather than remain
+                    // an orphaned, already-decided leaf.
+                    if let Some(found) = self.nodes.get_mut(&node) {
+                        found.undecided.insert(into);
+                    }
                 } else if yields {
                     self.displace(node, (*child, volume), into, effects);
                 } else {
+                    let waiting = contested
+                        && !prefix.is_empty()
+                        && self.namespace(node).is_some_and(|namespace| {
+                            namespace.first_bytes(into).is_empty()
+                                && namespace.get(into).is_some_and(|holder| !holder.closed)
+                        });
+                    if waiting {
+                        self.pending_claims
+                            .entry((node, into))
+                            .or_default()
+                            .insert(member);
+                        if let Some(found) = self.nodes.get_mut(&node) {
+                            found.undecided.insert(member);
+                        }
+                        // The source still has to return; a second object
+                        // would compete with it before byte identity is known.
+                        return true;
+                    }
                     continue;
                 }
             }
@@ -2268,6 +2317,25 @@ impl Tree {
             return true;
         }
         false
+    }
+
+    fn retry_claims(
+        &mut self,
+        node: NodeId,
+        holder: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(candidates) = self.pending_claims.remove(&(node, holder)) else {
+            return;
+        };
+        for candidate in candidates {
+            #[cfg(test)]
+            {
+                self.retried_claims += 1;
+            }
+            self.identify_again(node, candidate, builder, effects);
+        }
     }
 
     // The holder of a place its object holds provisionally makes way for a
@@ -2719,7 +2787,7 @@ impl Tree {
                     }
                 }
                 Emit::MemberClosed(member) => self.close(node, member, builder, effects),
-                Emit::Retract(member) => self.retract(node, member, effects),
+                Emit::Retract(member) => self.retract(node, member, builder, effects),
                 Emit::RecoveryAt {
                     volume,
                     range,
@@ -2767,7 +2835,14 @@ impl Tree {
     // A member an object produced starts over: whatever node was bound to it
     // is dropped with its subtree, and the member is a fresh, undecided
     // member again.
-    fn retract(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
+    fn retract(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let mut changed = BTreeSet::from([member]);
         if let Some((child, _)) = self
             .nodes
             .get(&node)
@@ -2775,6 +2850,7 @@ impl Tree {
         {
             self.drop_subtree(child, effects);
             let volumes = self.detach(child, effects);
+            changed.extend(volumes.iter().copied());
             if let Some(found) = self.nodes.get_mut(&node) {
                 for volume in &volumes {
                     found.children.remove(volume);
@@ -2803,6 +2879,9 @@ impl Tree {
             found.windows.remove(&member);
         }
         effects.push(Effect::Retracted { node, member });
+        for member in changed {
+            self.retry_claims(node, member, builder, effects);
+        }
     }
 
     // The object at `node` gives its members up: every volume it owned
@@ -2853,10 +2932,31 @@ impl Tree {
             .and_then(Kind::engine_for)
             .filter(|_| engine)
             .and_then(|kind| {
+                let handed: Vec<_> = self
+                    .nodes
+                    .get(&node)
+                    .and_then(|found| found.object.as_ref())
+                    .into_iter()
+                    .flat_map(|object| {
+                        binding.volumes.iter().filter_map(|(volume, member)| {
+                            Some((*member, object.engine_volume(*volume)?))
+                        })
+                    })
+                    .collect();
+                for (member, metadata) in handed {
+                    self.given.insert((parent, member), metadata);
+                }
                 let volumes = binding.volumes.clone();
-                self.attach(parent, kind, |_, _| Some(volumes), builder)
+                let attached = self
+                    .attach(parent, kind, |_, _| Some(volumes), builder)
                     .ok()
-                    .flatten()
+                    .flatten();
+                if attached.is_none() {
+                    for member in binding.volumes.values() {
+                        self.given.remove(&(parent, *member));
+                    }
+                }
+                attached
             });
         for member in binding.volumes.into_values() {
             effects.push(match engine {
@@ -3546,8 +3646,14 @@ mod tests {
     // A pretend store: a seven-byte header on volume 0, then one member
     // whose bytes run across volumes of a fixed length. It claims `.r00`
     // as its second volume.
+    #[derive(serde::Serialize, serde::Deserialize)]
     struct Split {
         announced: bool,
+        name_only: BTreeSet<VolumeIndex>,
+    }
+
+    impl crate::Durable for Split {
+        const VERSION: u16 = 1;
     }
 
     impl Object for Split {
@@ -3557,12 +3663,18 @@ mod tests {
         fn kind(&self) -> Kind {
             Kind::RarStore
         }
+        fn facts(&self) -> crate::Facts {
+            crate::Facts::of(Kind::RarStore, self)
+        }
         fn deliver(
             &mut self,
             delivery: Delivery<'_>,
             _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
             out: &mut Vec<Emit>,
         ) {
+            if delivery.offset == 0 && !delivery.bytes.is_empty() {
+                self.name_only.remove(&delivery.volume);
+            }
             if delivery.bytes == b"REFUSE" {
                 out.push(Emit::Refuse(Why::Compressed));
                 return;
@@ -3639,6 +3751,19 @@ mod tests {
                 _ => None,
             }
         }
+        fn bound(&mut self, volume: VolumeIndex, _: &str, front: &[u8], _: Option<u64>) {
+            if front.is_empty() {
+                self.name_only.insert(volume);
+            } else {
+                self.name_only.remove(&volume);
+            }
+        }
+        fn name_only(&self, volume: VolumeIndex) -> bool {
+            self.name_only.contains(&volume)
+        }
+        fn engine_volume(&self, volume: VolumeIndex) -> Option<crate::Carried> {
+            Some(Box::new((volume, self.name_only(volume))))
+        }
         fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
             if secret == "open" {
                 out.push(Emit::Member {
@@ -3653,7 +3778,7 @@ mod tests {
     }
 
     // A pretend engine: every byte of its volumes is envelope.
-    struct Reader(Vec<(VolumeIndex, String)>);
+    struct Reader(Vec<(VolumeIndex, String)>, BTreeSet<VolumeIndex>);
 
     impl Object for Reader {
         // It keeps no record of what it said of its posted bytes.
@@ -3687,6 +3812,19 @@ mod tests {
         }
         fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
             self.0.push((volume, name.to_owned()));
+            if _front.is_empty() {
+                self.1.insert(volume);
+            }
+        }
+        fn name_only(&self, volume: VolumeIndex) -> bool {
+            self.1.contains(&volume)
+        }
+        fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: crate::Carried) {
+            let (_, name_only) = *carried.downcast::<(VolumeIndex, bool)>().unwrap();
+            self.bound(volume, name, &[], None);
+            if !name_only {
+                self.1.remove(&volume);
+            }
         }
     }
 
@@ -3735,14 +3873,20 @@ mod tests {
         fn taken(&mut self, volume: VolumeIndex) {
             self.0.retain(|held| *held != volume);
         }
+        fn name_only(&self, volume: VolumeIndex) -> bool {
+            self.0.contains(&volume)
+        }
     }
 
     struct Build;
     impl Builder for Build {
         fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
             match kind {
-                Kind::RarStore => Some(Box::new(Split { announced: false })),
-                Kind::RarEngine => Some(Box::new(Reader(Vec::new()))),
+                Kind::RarStore => Some(Box::new(Split {
+                    announced: false,
+                    name_only: BTreeSet::new(),
+                })),
+                Kind::RarEngine => Some(Box::new(Reader(Vec::new(), BTreeSet::new()))),
                 Kind::Split => Some(Box::new(Named(Vec::new()))),
                 _ => None,
             }

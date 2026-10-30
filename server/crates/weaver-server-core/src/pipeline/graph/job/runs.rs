@@ -303,13 +303,21 @@ impl GraphJob {
                     // that reopens, as a restore reopens a volume to
                     // refetch it, has moved nothing yet.
                     let moved = kept.closed.zip(closed).is_some_and(|(was, now)| was != now);
+                    // A layout may have consumed only the closed length.
+                    // Reopening or changing that observed boundary makes
+                    // its decision stale before any payload was reached.
+                    let observed = kept.length_read && kept.closed != closed;
+                    if observed {
+                        kept.length_read = false;
+                    }
                     kept.closed = closed;
                     kept.settled = settled;
-                    if moved
-                        && state
-                            .kept
-                            .range(volume.0..)
-                            .any(|(_, kept)| kept.reached > 0)
+                    if observed
+                        || (moved
+                            && state
+                                .kept
+                                .range(volume.0..)
+                                .any(|(_, kept)| kept.reached > 0))
                     {
                         state.generation += 1;
                     }
@@ -326,5 +334,119 @@ impl GraphJob {
     // or rebuild a member that never came at all.
     fn ended(&self, parent: NodeId) -> bool {
         !self.payload_waiting() && self.writer.ruled(&self.tree, parent)
+    }
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+    use crate::operations::disk::CapacityReader;
+    use crate::pipeline::graph::engine::{RunMail, RunVolumes, Runs, echo::Echoes};
+    use crate::pipeline::graph::namespace::NamespaceWriter;
+    use crate::pipeline::graph::root::tests::{decoded, file};
+    use crate::pipeline::graph::status::RepairSlots;
+    use std::sync::Arc;
+    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+    use weaver_graph::{VolumeIndex, Volumes};
+
+    #[tokio::test]
+    async fn only_a_changed_observed_closed_length_invalidates_the_run() {
+        for (observe, initially_closed, change, invalidated) in [
+            (false, true, true, false),
+            (true, true, false, false),
+            (true, true, true, true),
+            (true, false, true, false),
+        ] {
+            let files = [file("set.part1.rar", &[48]), file("set.part2.rar", &[48])];
+            let directory = tempfile::tempdir().unwrap();
+            let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+                resident_limit: u64::MAX,
+                scratch_total: u64::MAX,
+                scratch_ceiling: u64::MAX,
+                disk_reserve: 0,
+            }));
+            let writer = NamespaceWriter::new(
+                1,
+                directory.path().to_owned(),
+                Arc::clone(&accountant),
+                CapacityReader::unknown(),
+            );
+            let mail = RunMail::default();
+            let runs = Runs::new(1, 0, mail.sender(), accountant);
+            let mut job = GraphJob::new(
+                &files,
+                Box::new(Echoes {
+                    volumes: 2,
+                    ..Default::default()
+                }),
+                writer,
+                runs,
+                u32::MAX,
+            );
+            for volume in 0..2 {
+                let mut bytes = vec![0x80; 48];
+                if volume == 0 {
+                    bytes[..8].copy_from_slice(crate::pipeline::graph::engine::echo::SIGNATURE);
+                }
+                job.intake(
+                    decoded(volume, 0, 0, &bytes, Some(48)),
+                    &mut RepairSlots::default(),
+                    1,
+                )
+                .unwrap();
+            }
+            let node = job.tree.engines()[0];
+            job.feed(node).unwrap();
+            job.runs.request_stop();
+            let shelf = job.writer.shelf(node);
+            if !initially_closed {
+                shelf.update(|state| state.kept.get_mut(&1).unwrap().closed = None);
+            }
+            let reader = RunVolumes::new(Arc::clone(&shelf), shelf.begin());
+            if observe {
+                assert_eq!(reader.len(VolumeIndex(1)), initially_closed.then_some(48));
+            }
+            assert_eq!(shelf.reached(), None, "no payload byte was read");
+            if change {
+                job.tree.namespace_mut(NodeId::ROOT).unwrap().recognise(
+                    MemberId(1),
+                    "set.part2.rar",
+                    47,
+                );
+            }
+            job.feed(node).unwrap();
+            assert_eq!(
+                reader.current(),
+                !invalidated,
+                "observed={observe}, initially_closed={initially_closed}, changed={change}"
+            );
+            if observe && initially_closed && !change {
+                let before = shelf.generation();
+                job.tree
+                    .namespace_mut(NodeId::ROOT)
+                    .unwrap()
+                    .get_mut(MemberId(1))
+                    .unwrap()
+                    .closed = false;
+                job.feed(node).unwrap();
+                assert!(!reader.current(), "the observed boundary became unknown");
+                assert_eq!(shelf.generation(), before + 1);
+                job.feed(node).unwrap();
+                job.tree
+                    .namespace_mut(NodeId::ROOT)
+                    .unwrap()
+                    .get_mut(MemberId(1))
+                    .unwrap()
+                    .closed = true;
+                job.feed(node).unwrap();
+                assert_eq!(
+                    shelf.generation(),
+                    before + 1,
+                    "the consumed observation cannot invalidate repeatedly"
+                );
+                let current = RunVolumes::new(Arc::clone(&shelf), shelf.begin());
+                assert!(current.current());
+            }
+        }
     }
 }

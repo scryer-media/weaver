@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod facts;
+mod recovery_contracts;
 
 #[test]
 fn changed_source_invalidates_both_par3_rulings() {

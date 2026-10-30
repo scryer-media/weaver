@@ -52,7 +52,7 @@ fn a_duplicate_never_advances_the_composition_and_a_repair_replaces() {
         gate(&runs, 3000, crc32(&data), false, None).0,
         SliceVerdict::Damaged
     );
-    // A duplicate of the damaged run, right this time, is still a duplicate.
+    // A newer source copy corrects the earlier transport-valid bytes.
     runs.feed(
         ByteRange::new(1000, 2000),
         crc32(&data[1000..2000]),
@@ -60,8 +60,9 @@ fn a_duplicate_never_advances_the_composition_and_a_repair_replaces() {
     );
     assert_eq!(
         gate(&runs, 3000, crc32(&data), false, None).0,
-        SliceVerdict::Damaged
+        SliceVerdict::Intact
     );
+    assert_eq!(runs.held(), 3000, "replacement does not count bytes twice");
     // A repair over part of it leaves the rest of the run unrecorded.
     let gaps = runs.overwrite(1400, 200, crc32(&data[1400..1600]));
     assert_eq!(gaps, vec![(1000, 1400), (1600, 2000)]);
@@ -74,6 +75,44 @@ fn a_duplicate_never_advances_the_composition_and_a_repair_replaces() {
     assert_eq!(
         gate(&runs, 3000, crc32(&data), false, None).0,
         SliceVerdict::Intact
+    );
+}
+
+#[test]
+fn a_partial_fresh_replacement_leaves_unsplittable_crc_spans_unknown() {
+    let data = bytes();
+    let mut runs = fed(
+        &[(0, 1000), (1000, 2000), (2000, 3000)],
+        &data,
+        Provenance::Fresh,
+    );
+    runs.feed(
+        ByteRange::new(900, 2100),
+        crc32(&data[900..2100]),
+        Provenance::Fresh,
+    );
+    assert_eq!(runs.held(), 1200);
+    assert_eq!(runs.compose(0, 3000), None);
+    runs.feed(
+        ByteRange::new(0, 900),
+        crc32(&data[..900]),
+        Provenance::Fresh,
+    );
+    runs.feed(
+        ByteRange::new(2100, 3000),
+        crc32(&data[2100..]),
+        Provenance::Fresh,
+    );
+    assert_eq!(runs.compose(0, 3000), Some(crc32(&data)));
+    let before = runs.clone();
+    runs.feed(
+        ByteRange::new(900, 2100),
+        crc32(&data[900..2100]),
+        Provenance::Fresh,
+    );
+    assert_eq!(
+        runs, before,
+        "identical evidence changes neither runs nor held bytes"
     );
 }
 
@@ -169,7 +208,7 @@ fn a_damaged_run_keeps_the_gate_unknown_until_clean_bytes_replace_it() {
             gate(&runs, 3000, crc32(&data), false, None).0,
             SliceVerdict::Intact
         );
-        // A clean duplicate over clean bytes is still a duplicate.
+        // A later transport-valid copy can also introduce wrong bytes.
         runs.feed(
             ByteRange::new(1000, 2000),
             crc32(&wrong[1000..2000]),
@@ -177,7 +216,7 @@ fn a_damaged_run_keeps_the_gate_unknown_until_clean_bytes_replace_it() {
         );
         assert_eq!(
             gate(&runs, 3000, crc32(&data), false, None).0,
-            SliceVerdict::Intact
+            SliceVerdict::Damaged
         );
         runs.feed(
             ByteRange::new(1000, 2000),

@@ -23,7 +23,11 @@ mod volumes;
 #[cfg(test)]
 pub(crate) mod echo;
 #[cfg(test)]
+mod read_gate;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use read_gate::{ReadGate, ReadStep};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,6 +37,9 @@ use weaver_graph::holds::{HoldsAccountant, HoldsNamespace, Reserve};
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
 use weaver_graph::{Emit, Extraction, NodeId, Why};
 
+#[cfg(test)]
+pub(super) use self::volumes::RunVolumes;
+#[cfg(not(test))]
 use self::volumes::RunVolumes;
 use super::envelope::Shelf;
 use super::hardware::Hardware;
@@ -222,6 +229,24 @@ pub(crate) struct Runs {
 }
 
 impl Runs {
+    #[cfg(test)]
+    pub(crate) fn gate_read(
+        &self,
+        node: NodeId,
+        volume: weaver_graph::VolumeIndex,
+        range: weaver_graph::ByteRange,
+    ) -> Option<ReadGate> {
+        let run = self.runs.get(&node)?;
+        if !matches!(run.life, Life::Running { .. }) {
+            return None;
+        }
+        Some(
+            run.volumes
+                .as_ref()?
+                .gate_read(self.scope, node, volume, range),
+        )
+    }
+
     pub(crate) fn new(
         scope: u64,
         slots: usize,

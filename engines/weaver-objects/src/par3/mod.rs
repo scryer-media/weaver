@@ -100,6 +100,7 @@ struct Volume {
     named_blocks: Option<u64>,
     // The name it was bound under, which a later volume of the set continues.
     name: Option<String>,
+    name_only: bool,
 }
 
 impl Volume {
@@ -306,7 +307,11 @@ impl Par3 {
                 // brings is not known.
                 _ if !volume.closed && volume.arrived.runs().next().is_none() => None,
                 Some(blocks) => Some(blocks),
-                None if volume.closed && !volume.shows_recovery() => Some(0),
+                // Legacy facts lack binding names. A damaged front cannot
+                // prove that such a carrier has no later recovery packets.
+                None if volume.name.is_some() && volume.closed && !volume.shows_recovery() => {
+                    Some(0)
+                }
                 None => None,
             })
             .sum()
@@ -542,6 +547,9 @@ impl Object for Par3 {
         _out: &mut Vec<Emit>,
     ) {
         let volume = self.volume(delivery.volume);
+        if !delivery.bytes.is_empty() {
+            volume.name_only = false;
+        }
         volume.arrived.write(delivery.range(), delivery.provenance);
         let Ok(offset) = usize::try_from(delivery.offset) else {
             return;
@@ -626,8 +634,9 @@ impl Object for Par3 {
     // may bring more of either, so the object is tried again. Without this
     // the verdict would depend on whether a volume's front decided before
     // or after the damage arrived.
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         let found = self.volume(volume);
+        found.name_only = front.is_empty();
         found.named_blocks = recovery_volume::named_blocks(name, ".par3");
         found.name = Some(name.to_owned());
         if matches!(
@@ -643,6 +652,12 @@ impl Object for Par3 {
 
     fn recovery(&self) -> Option<&dyn Recovery> {
         Some(self)
+    }
+
+    fn name_only(&self, volume: VolumeIndex) -> bool {
+        self.volumes
+            .get(volume.0 as usize)
+            .is_some_and(|held| held.name_only)
     }
 
     fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {

@@ -44,6 +44,7 @@ macro_rules! segment_spec {
     };
 }
 
+mod archive_output_contract;
 mod archive_passwords;
 mod archive_topology;
 mod cancel_batch;

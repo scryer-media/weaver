@@ -234,7 +234,6 @@ impl RarStore {
         // The set's numbering is the one the bound names share; before any
         // is bound, the one this member's own name gives.
         let wanted = naming::parse(name);
-        let unnamed = self.volumes.values().all(|volume| volume.name.is_none());
         let numbered: Vec<_> = self
             .volumes
             .values()
@@ -243,7 +242,7 @@ impl RarStore {
         let ours = wanted
             .as_ref()
             .map(|wanted| numbered.iter().any(|bound| bound.same_set(wanted)));
-        let named = wanted.is_some() && (unnamed || ours == Some(true));
+        let named = wanted.is_some() && (numbered.is_empty() || ours == Some(true));
         // The name gives the volume to another set: it and the bound names
         // number sets, and not the same one.
         let elsewhere = ours == Some(false) && !numbered.is_empty();
@@ -263,6 +262,10 @@ impl RarStore {
         // it, or where nothing gives the volume to another set.
         let (headers, judged) = facts.map_or((None, false), |facts| self.claim_by_headers(facts));
         let headers = headers.filter(|_| judged || !elsewhere);
+        // A new numbering can refine an established header link, but an
+        // unrelated name cannot invent membership beside opaque labels.
+        let named =
+            named.filter(|_| !numbered.is_empty() || self.volumes.is_empty() || headers.is_some());
         // A position held already is answered all the same: the volume
         // posted again is that volume.
         let placed = match (headers, named) {
@@ -317,20 +320,54 @@ impl RarStore {
 }
 
 // Whether the held volumes judged where a volume's headers place it: the
-// position they state is held, and whether the volume is its holder posted
-// again its bytes say, which the tree compares; or one beside it had its
-// headers read. A volume that states no position is placed only by the held
-// volumes its members link it to, which judged it so.
+// position they state carries the same member identity, or a known member
+// continues between this volume and a neighbor. The ordinal alone is shared
+// by every set and cannot override a name belonging to another set. Whether
+// a repeated volume is byte-identical remains the tree's comparison.
 pub(crate) fn judged(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> bool {
-    Nameless { facts }.position().is_none_or(|stated| {
-        held.contains_key(&stated)
-            || [stated.checked_sub(1), stated.checked_add(1)]
-                .into_iter()
-                .flatten()
-                .any(|index| {
-                    held.get(&index)
-                        .is_some_and(|beside| beside.facts.is_some())
-                })
+    let this = Nameless { facts };
+    this.position().is_none_or(|stated| {
+        let same = held
+            .get(&stated)
+            .and_then(|held| held.facts)
+            .is_some_and(|facts| {
+                let other = Nameless { facts };
+                this.kin(&other)
+                    && this
+                        .ordered_members()
+                        .first()
+                        .zip(other.ordered_members().first())
+                        .is_some_and(|(one, two)| {
+                            continues(one, two)
+                                && one.split_before == two.split_before
+                                && one.split_after == two.split_after
+                        })
+            });
+        let before = stated
+            .checked_sub(1)
+            .and_then(|at| held.get(&at))
+            .and_then(|held| held.facts)
+            .is_some_and(|facts| {
+                let previous = Nameless { facts };
+                this.kin(&previous)
+                    && previous
+                        .continuing_member()
+                        .zip(this.continued_member())
+                        .is_some_and(|(tail, head)| continues(tail, head))
+            });
+        let after = stated
+            .checked_add(1)
+            .and_then(|at| held.get(&at))
+            .and_then(|held| held.facts)
+            .is_some_and(|facts| {
+                let next = Nameless { facts };
+                this.kin(&next)
+                    && this
+                        .continuing_member()
+                        .zip(next.continued_member())
+                        .is_some_and(|(tail, head)| continues(tail, head))
+            });
+        same || before || after
     })
 }
 

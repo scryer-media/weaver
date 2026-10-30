@@ -403,6 +403,25 @@ impl Par2 {
         }
     }
 
+    // Once a carrier's end and closure are known, absent bytes cannot
+    // arrive in this posting. Damaged bytes are present and still pass
+    // through the packet's own hash; only uncovered gaps stop the walk.
+    fn closed_holes(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
+        let state = self.volume(volume);
+        let Some(length) = state.walker.length().filter(|_| state.closed) else {
+            return;
+        };
+        let mut holes = Vec::new();
+        crate::recovery_volume::gaps(&state.arrived, |range| {
+            if let Some(range) = range.intersect(ByteRange::new(0, length)) {
+                holes.push(range);
+            }
+        });
+        for range in holes {
+            self.volume_lost(volume, range, out);
+        }
+    }
+
     // What the walks read past and must read again, asked of the owner.
     fn ask_again(&mut self, out: &mut Vec<Emit>) {
         out.extend(
@@ -430,6 +449,9 @@ impl Object for Par2 {
     ) {
         let mut found = Vec::new();
         let volume = self.volume(delivery.volume);
+        if !delivery.bytes.is_empty() {
+            volume.name_only = false;
+        }
         volume.arrived.write(delivery.range(), delivery.provenance);
         volume
             .walker
@@ -441,13 +463,22 @@ impl Object for Par2 {
     // The walk reads no packet past the volume's end.
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         let mut found = Vec::new();
-        self.volume(volume).walker.sized(length, &mut found);
+        let state = self.volume(volume);
+        let changed = state.walker.length() != Some(length);
+        state.walker.sized(length, &mut found);
         self.take(volume, found);
+        if changed {
+            self.closed_holes(volume, out);
+        }
         self.ask_again(out);
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
-        self.volume(volume).closed = true;
+        let state = self.volume(volume);
+        if !state.closed {
+            state.closed = true;
+            self.closed_holes(volume, out);
+        }
         self.ask_again(out);
     }
 
@@ -547,8 +578,9 @@ impl Object for Par2 {
         ours.then_some(VolumeIndex(self.volumes.len() as u32))
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         self.volume(volume).name(name);
+        self.volume(volume).name_only = front.is_empty();
         for state in self.sets.values_mut() {
             state.reopen();
         }
@@ -556,6 +588,12 @@ impl Object for Par2 {
 
     fn recovery(&self) -> Option<&dyn Recovery> {
         Some(self)
+    }
+
+    fn name_only(&self, volume: VolumeIndex) -> bool {
+        self.volumes
+            .get(volume.0 as usize)
+            .is_some_and(|held| held.name_only)
     }
 
     fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {

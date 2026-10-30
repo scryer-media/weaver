@@ -6,8 +6,9 @@
 // distinguish matching fronts; otherwise a content tie stays unbound.
 // With no content match, its name may identify it. A name that answers to two
 // descriptions binds nothing, unless the member's length rules out all but
-// one, and two members that answer to one description both go unbound. A
-// member that answers in two sets is the first set's: the others count it
+// one. Content evidence outranks a name-only claim; equal claims to one
+// description stay unbound and remain available for slice verification. A
+// member whose content answers in two sets is the first set's: the others count it
 // missing in their arithmetic and never write it. A member bound by its
 // content under another name takes the described name. Each posting of a
 // member posted more than once answers for it: the member is every file
@@ -89,8 +90,9 @@ pub(super) fn bind_sets(
     namespace: &Namespace,
     own: ObjectId,
 ) -> (Vec<Bindings>, Vec<(MemberId, Length)>) {
-    let mut claims: Vec<BTreeMap<FileId, Vec<MemberId>>> = vec![BTreeMap::new(); indexes.len()];
-    let mut unnamed = Vec::new();
+    let mut claims: Vec<BTreeMap<FileId, Vec<(MemberId, bool)>>> =
+        vec![BTreeMap::new(); indexes.len()];
+    let mut complete = BTreeMap::new();
     for posting in namespace.records() {
         let member = namespace.resolve(posting.id);
         if namespace
@@ -100,42 +102,63 @@ pub(super) fn bind_sets(
             continue;
         }
         let candidate = Candidate::of(posting, namespace.first_bytes(posting.id));
-        let first = indexes
-            .iter()
-            .enumerate()
-            .find_map(|(at, index)| Some((at, match_member(index, &candidate)?)));
-        match first {
-            Some((at, file)) => {
-                let claimants = claims[at].entry(file).or_default();
-                if !claimants.contains(&member) {
-                    claimants.push(member);
+        if member == posting.id
+            && let Some(length) = candidate.complete
+        {
+            complete.insert(member, length);
+        }
+        let mut first = None;
+        for (at, index) in indexes.iter().enumerate() {
+            if let Some((file, content)) = match_member(index, &candidate) {
+                if content {
+                    first = Some((at, (file, content)));
+                    break;
                 }
+                first.get_or_insert((at, (file, content)));
             }
-            None if member == posting.id => {
-                unnamed.extend(candidate.complete.map(|length| (member, length)))
+        }
+        if let Some((at, (file, content))) = first {
+            let claimants = claims[at].entry(file).or_default();
+            if let Some((_, proven)) = claimants.iter_mut().find(|(id, _)| *id == member) {
+                *proven |= content;
+            } else {
+                claimants.push((member, content));
             }
-            None => {}
         }
     }
-    let bound = claims
+    let bound: Vec<Bindings> = claims
         .into_iter()
         .map(|claims| {
             claims
                 .into_iter()
-                .filter_map(|(file, claimants)| match claimants.as_slice() {
-                    [member] => Some((file, *member)),
-                    _ => None,
+                .filter_map(|(file, mut claimants)| {
+                    // Verified content outranks a posted name. Equal evidence
+                    // still needs a unique member; ordering resolves nothing.
+                    if claimants.iter().any(|(_, content)| *content) {
+                        claimants.retain(|(_, content)| *content);
+                    }
+                    match claimants.as_slice() {
+                        [(member, _)] => Some((file, *member)),
+                        _ => None,
+                    }
                 })
                 .collect()
         })
         .collect();
-    (bound, unnamed)
+    for members in &bound {
+        for member in members.values() {
+            complete.remove(member);
+        }
+    }
+    // A conflicting name did not identify the member. Keep it available
+    // for slice verification and elimination alongside unmatched members.
+    (bound, complete.into_iter().collect())
 }
 
 // The file the member is, by its content first and its name after.
-fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId> {
+fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileId, bool)> {
     match by_content(index, candidate) {
-        ContentMatch::Unique(file) => return Some(file),
+        ContentMatch::Unique(file) => return Some((file, true)),
         ContentMatch::Ambiguous(files) => {
             let mut named = files.into_iter().filter(|file| {
                 index
@@ -143,7 +166,9 @@ fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId
                     .is_some_and(|description| description.filename == candidate.name)
             });
             let file = named.next();
-            return file.filter(|_| named.next().is_none());
+            return file
+                .filter(|_| named.next().is_none())
+                .map(|file| (file, true));
         }
         ContentMatch::Inconclusive => {}
     }
@@ -175,7 +200,7 @@ fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<FileId
         }
     }
     match matches.as_slice() {
-        [(file, _)] => Some(*file),
+        [(file, _)] => Some((*file, false)),
         _ => None,
     }
 }

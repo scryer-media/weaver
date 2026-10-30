@@ -153,6 +153,10 @@ impl Walker {
         }
     }
 
+    pub(super) fn length(&self) -> Option<u64> {
+        self.length
+    }
+
     // The packet boundary the walk has reached, or the earliest a range
     // walked again has: what a resumed walk starts from.
     pub(super) fn front(&self) -> u64 {

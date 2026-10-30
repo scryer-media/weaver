@@ -292,6 +292,7 @@ pub(super) struct Volume {
     pub(super) sets: BTreeSet<[u8; 16]>,
     // The name it was bound under, which a later volume of the set continues.
     pub(super) name: Option<String>,
+    pub(super) name_only: bool,
 }
 
 impl Volume {

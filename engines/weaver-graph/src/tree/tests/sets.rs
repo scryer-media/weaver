@@ -147,7 +147,7 @@ fn store_on(tree: &mut Tree, show: MemberId) -> NodeId {
 }
 
 // A set posted at the root under `name`.
-fn posted(tree: &mut Tree, name: &str) -> NodeId {
+pub(super) fn posted(tree: &mut Tree, name: &str) -> NodeId {
     let member = tree.announce_root(name, None, &mut Vec::new());
     // A PAR2 packet header stating its own length, followed by nothing.
     let mut header = b"PAR2\0PKT".to_vec();
@@ -200,7 +200,7 @@ fn every_namespace_lists_the_sets_a_walk_finds_after_each_change() {
 
     // The store's member starts over: the store and both windows go, and
     // the set is homed where it was posted again.
-    tree.retract(NodeId::ROOT, show, &mut Vec::new());
+    tree.retract(NodeId::ROOT, show, &mut Sets, &mut Vec::new());
     listed_as_walked(&tree);
     assert_eq!(tree.recovery_nodes(NodeId::ROOT), vec![set]);
 

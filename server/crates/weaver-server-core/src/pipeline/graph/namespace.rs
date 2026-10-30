@@ -653,7 +653,9 @@ impl NamespaceWriter {
     ) -> Result<(), WriteError> {
         let mut placements = std::mem::take(&mut self.placements);
         placements.clear();
-        tree.locate(child, volume, arrival.range(), &mut placements);
+        if tree.child_of(arrival.node, arrival.member) == Some((child, volume)) {
+            tree.locate(child, volume, arrival.range(), &mut placements);
+        }
         // An object that gave the volume back in this delivery places none
         // of it. What no piece covers is held for the member, as any bytes
         // whose place is not known, and goes to its own file with the rest.
@@ -1434,6 +1436,13 @@ impl NamespaceWriter {
         else {
             return Ok(false);
         };
+        // Filling a gap can close an output before the repair's later
+        // slices replace other bytes in it. Judge the coherent batch via
+        // the existing sparse obligation, retaining any usable final fold.
+        if self.acknowledging.is_some() {
+            self.verifications.insert((node, member));
+            return Ok(false);
+        }
         match leaf.folded(length) {
             Some(actual) => {
                 self.verifications.remove(&(node, member));
@@ -1673,6 +1682,9 @@ pub(crate) trait Source {
     // Bytes still held for the member, read where they are kept and left
     // held, for a member whose object has not placed them yet.
     fn held(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
+    // Recorded custody within the requested range, in offset order. A map
+    // can become known before these bytes have gone to its placements.
+    fn held_ranges(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<ByteRange>;
 }
 
 pub(crate) fn read_member(
@@ -1690,7 +1702,36 @@ pub(crate) fn read_member(
     let mut read = |placement: &Placement, into: &mut Vec<u8>| {
         read_placed(source, (node, member), child, placement, into)
     };
-    source.posted(child, volume, range, &mut read, into)
+    let mut at = range.start;
+    let held = source.held_ranges(node, member, range);
+    for group in held.chunk_by(|a, b| a.end == b.start) {
+        let held = ByteRange::new(group[0].start, group[group.len() - 1].end);
+        if at < held.start
+            && !source.posted(
+                child,
+                volume,
+                ByteRange::new(at, held.start),
+                &mut read,
+                into,
+            )
+        {
+            return false;
+        }
+        // Held custody is current authority, even if its backing cannot be
+        // read. An older derived copy must not substitute for that failure.
+        if !source.held(node, member, held, into) {
+            return false;
+        }
+        at = held.end;
+    }
+    at == range.end
+        || source.posted(
+            child,
+            volume,
+            ByteRange::new(at, range.end),
+            &mut read,
+            into,
+        )
 }
 
 // What one placement of the object at `child`, bound to `member` of `node`,
@@ -1849,6 +1890,24 @@ impl Source for Access<'_> {
             return range.is_empty();
         };
         written && leaf.read(range.start, index(range.len()), into).is_ok()
+    }
+
+    fn held_ranges(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<ByteRange> {
+        if !self.held {
+            return Vec::new();
+        }
+        self.writer
+            .files
+            .get(&node)
+            .map(|files| {
+                files
+                    .holds
+                    .peek(held_volume(member), range)
+                    .into_iter()
+                    .map(|piece| piece.range)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn held(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {

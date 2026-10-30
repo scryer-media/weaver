@@ -516,3 +516,52 @@ fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
         vec![(0, crc(NOTES)), (1, crc(&second()))]
     );
 }
+
+#[test]
+fn inferred_geometry_preserves_owner_read_failures_without_a_format_refusal() {
+    struct Failed {
+        uncertain: bool,
+        kind: io::ErrorKind,
+    }
+    impl Volumes for Failed {
+        fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+            Ok(after.is_none().then_some(VolumeIndex(0)))
+        }
+        fn len(&self, _: VolumeIndex) -> Option<u64> {
+            Some(100)
+        }
+        fn uncertain_lengths(&self) -> bool {
+            self.uncertain
+        }
+        fn read_at(&self, _: VolumeIndex, _: u64, _: &mut [u8]) -> io::Result<usize> {
+            Err(self.kind.into())
+        }
+    }
+    for kind in [
+        io::ErrorKind::NotFound,
+        io::ErrorKind::Interrupted,
+        io::ErrorKind::Other,
+    ] {
+        for uncertain in [false, true] {
+            let mut object = crate::build(
+                Kind::SevenZipEngine,
+                ObjectId(1),
+                weaver_graph::Budget::default(),
+            )
+            .unwrap();
+            let mut emits = Vec::new();
+            object.engine_mut().unwrap().start().run(
+                Arc::new(Failed { uncertain, kind }),
+                &mut |emit| {
+                    emits.push(emit);
+                    true
+                },
+                weaver_graph::Budget::default(),
+            );
+            assert!(
+                emits.is_empty(),
+                "{kind:?}, uncertain={uncertain}: {emits:?}"
+            );
+        }
+    }
+}

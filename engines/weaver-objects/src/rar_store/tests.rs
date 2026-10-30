@@ -3,6 +3,7 @@
 
 mod facts;
 mod owner;
+mod recovery_contracts;
 mod writer;
 
 use std::io::Cursor;

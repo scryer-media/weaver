@@ -387,6 +387,19 @@ pub trait Object: Send + Sync {
     // reads.
     fn bound(&mut self, _volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {}
 
+    // Positive authority that only the posted name placed this volume, and
+    // no bytes or parsed geometry established its identity. Unknown legacy
+    // state is not name-only merely because a parent's front cache is empty.
+    fn name_only(&self, _volume: VolumeIndex) -> bool {
+        false
+    }
+
+    // A read-only copy of placement metadata for this kind's engine. The
+    // retiring store retains every byte and inverse map until materialized.
+    fn engine_volume(&self, _volume: VolumeIndex) -> Option<Carried> {
+        None
+    }
+
     // I am a window on recovery data another object found, and this is
     // what it handed me to read the range by: at my building, and again
     // each time it hands it anew.

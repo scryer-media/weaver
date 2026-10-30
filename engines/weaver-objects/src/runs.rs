@@ -7,11 +7,10 @@
 // when the header keys it.
 //
 // The runs are kept exactly as they were fed, never merged, so any sub-range
-// that starts and ends on a run boundary can be composed. A run that
-// overlaps one already recorded is a duplicate and is ignored: the same bytes
-// must not advance the composition twice. A repaired run is the opposite: the
-// bytes changed, so it replaces every run it overlaps, and the parts of those
-// runs outside it are covered by nothing until they are fed again. A range the
+// that starts and ends on a run boundary can be composed. An identical run
+// does not advance the composition twice. New verified bytes replace the
+// evidence they overlap, whether repaired or a newer source copy. Parts of
+// those runs outside it are covered by nothing until fed again. A range the
 // runs do not tile exactly has no reference value, which is a refusal, never
 // a pass. The bytes held are counted as runs come and go, so a whole is
 // composed once, when every byte of it is in, and not at every delivery.
@@ -48,23 +47,14 @@ impl Run {
 }
 
 impl CrcRuns {
-    // Record delivered bytes: a repair rewrites what it covers, and so do
-    // clean bytes over damaged ones, whoever brings them; anything else is
-    // a new run or a duplicate.
+    // Verified deliveries are the current word on their bytes, including a
+    // later source copy whose transport checksum passed on different bytes.
     pub(crate) fn feed(&mut self, range: ByteRange, crc: u32, provenance: Provenance) {
-        let mends = provenance.is_verified()
-            && self
-                .runs
-                .iter()
-                .any(|run| !run.verified && run.start < range.end && range.start < run.end());
         match provenance {
-            Provenance::Repaired => {
+            Provenance::Fresh | Provenance::Repaired => {
                 self.overwrite(range.start, range.len(), crc);
             }
-            Provenance::Fresh if mends => {
-                self.overwrite(range.start, range.len(), crc);
-            }
-            Provenance::Fresh | Provenance::Damaged => {
+            Provenance::Damaged => {
                 self.insert(Run {
                     start: range.start,
                     len: range.len(),
@@ -111,31 +101,29 @@ impl CrcRuns {
             return Vec::new();
         }
         let end = start.saturating_add(len);
+        let first = self.runs.partition_point(|run| run.end() <= start);
+        let after = first + self.runs[first..].partition_point(|run| run.start < end);
+        let replacement = Run {
+            start,
+            len,
+            crc,
+            verified: true,
+        };
+        if after == first + 1 && self.runs[first].start == start && self.runs[first].len == len {
+            self.runs[first] = replacement;
+            return Vec::new();
+        }
         let mut gaps = Vec::new();
-        let held = &mut self.held;
-        self.runs.retain(|run| {
-            if run.end() <= start || run.start >= end {
-                return true;
-            }
-            *held -= run.len;
+        for run in &self.runs[first..after] {
+            self.held -= run.len;
             if run.start < start {
                 gaps.push((run.start, start));
             }
             if run.end() > end {
                 gaps.push((end, run.end()));
             }
-            false
-        });
-        let position = self.runs.partition_point(|run| run.start < start);
-        self.runs.insert(
-            position,
-            Run {
-                start,
-                len,
-                crc,
-                verified: true,
-            },
-        );
+        }
+        self.runs.splice(first..after, [replacement]);
         self.held += len;
         gaps
     }

@@ -596,7 +596,7 @@ fn blake2_store_set(
 // RAR4 states the whole-member CRC32 in the *last* part's header and each
 // earlier part's own packed CRC32 in its own — the same two integrity layers,
 // in a completely different container.
-fn single_member_rar4_store_set(
+pub(in crate::pipeline::tests) fn single_member_rar4_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,
@@ -872,7 +872,7 @@ fn peek_queued_segments(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(u32, u32
 // global input-slice ordering PAR2 defines — files in main-packet order,
 // slices in order within each file, each padded to `slice_size` — which is the
 // same ordering `plan_repair` reconstructs from the parsed set.
-fn build_test_par2_with_recovery(
+pub(in crate::pipeline::tests) fn build_test_par2_with_recovery(
     files: &[(&str, &[u8])],
     slice_size: u64,
     recovery_block_count: usize,

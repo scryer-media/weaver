@@ -59,6 +59,8 @@ pub(super) struct VolumeFacts {
     named_blocks: Option<u64>,
     walked_blocks: u64,
     sets: BTreeSet<[u8; 16]>,
+    #[serde(default)]
+    name_only: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,6 +72,24 @@ pub(super) struct SetFacts {
     recovery: BTreeMap<u32, Location>,
     pub(super) members: Vec<([u8; 16], MemberId)>,
     last: Option<SetRepair>,
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_volume_facts_do_not_assert_name_only_authority() {
+    let bytes = rmp_serde::to_vec(&(
+        0u64,
+        Vec::<ByteRange>::new(),
+        Coverage::default(),
+        Vec::<ByteRange>::new(),
+        true,
+        Option::<u64>::None,
+        0u64,
+        BTreeSet::<[u8; 16]>::new(),
+    ))
+    .unwrap();
+    let volume: VolumeFacts = rmp_serde::from_slice(&bytes).unwrap();
+    assert!(!volume.name_only);
 }
 
 // The metadata packets the walk keeps, field for field, so the set's index
@@ -273,6 +293,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
             sets: volume.sets.clone(),
+            name_only: volume.name_only,
         })
         .collect();
     let sets = par2
@@ -325,6 +346,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
             walked_blocks: volume.walked_blocks,
             sets: volume.sets,
             name: None,
+            name_only: volume.name_only,
         })
         .collect();
     for set in kept.sets {
