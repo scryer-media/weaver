@@ -7,14 +7,15 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
-    FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord, TorrentSource,
+    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord, TorrentSource,
     TrackerEntry,
 };
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
      category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
      policy_override, unpack, metadata, upload_limit, download_limit, \
-     sequential, first_last_piece_first";
+     sequential, first_last_piece_first, save_path, content_layout, files_dir, seed_mode, move_to, \
+     queue_position";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -87,6 +88,15 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         download_limit: opt_u64(row, "download_limit")?,
         sequential: row.bool("sequential")?,
         first_last_piece_first: row.bool("first_last_piece_first")?,
+        save_path: row.opt_text("save_path")?,
+        content_layout: row
+            .opt_text("content_layout")?
+            .map(|layout| ContentLayout::parse(&layout).ok_or_else(|| corrupt("layout", &layout)))
+            .transpose()?,
+        files_dir: row.opt_text("files_dir")?,
+        seed_mode: row.bool("seed_mode")?,
+        move_to: row.opt_text("move_to")?,
+        queue_position: row.i64("queue_position")?,
     })
 }
 

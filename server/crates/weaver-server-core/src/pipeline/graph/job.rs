@@ -71,6 +71,9 @@ impl GraphError {
 // where their runs speak, and the extraction budget its writes are held to.
 pub(crate) struct Storage {
     pub(crate) working_dir: PathBuf,
+    // Where the root members the job keeps have their files, when not under
+    // the working directory: files placed before the job began.
+    pub(crate) kept_dir: Option<PathBuf>,
     pub(crate) accountant: Arc<HoldsAccountant>,
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
@@ -503,6 +506,28 @@ impl<R: Root> GraphJob<R> {
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
+        self.take_in(decoded, true, slots, limit)
+    }
+
+    // Bytes the member's file holds already, found there: they arrive as
+    // an intake's do, and a kept member's are not written to it again, as
+    // a restore's read-back is not.
+    pub(crate) fn intake_found(
+        &mut self,
+        decoded: R::Intake,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        self.take_in(decoded, false, slots, limit)
+    }
+
+    fn take_in(
+        &mut self,
+        decoded: R::Intake,
+        write: bool,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         let (arrival, length) = self.root.receive(decoded);
         let member = arrival.member;
         let volume = VolumeIndex(member.0);
@@ -516,13 +541,23 @@ impl<R: Root> GraphJob<R> {
                 &mut out,
             )?;
         }
-        self.writer.deliver(
-            &mut self.tree,
-            &mut *self.builder,
-            &self.root,
-            arrival,
-            &mut out,
-        )?;
+        if write {
+            self.writer.deliver(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                arrival,
+                &mut out,
+            )?;
+        } else {
+            self.writer.deliver_again(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                arrival,
+                &mut out,
+            )?;
+        }
         self.heard(out)?;
         self.after_units([volume], slots, limit)
     }

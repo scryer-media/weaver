@@ -376,12 +376,11 @@ impl Entry {
 /// The trackers one hash of a torrent announces to, tier by tier, and what
 /// announcing to them has done (libtorrent `tracker_list`).
 ///
-/// One tracker at a time is announced to, the first that works in list
-/// order (libtorrent `settings_pack::announce_to_all_tiers` and
-/// `announce_to_all_trackers`, both false by default). A tracker that fails
-/// backs off and moves to the end of its tier, so the next one in the tier
-/// is tried at once; a later tier is reached only once every tracker before
-/// it is failing.
+/// One tracker of each tier is announced to, the first in it that works
+/// (libtorrent `settings_pack::announce_to_all_tiers` on, as qBittorrent
+/// sets it by default, and `announce_to_all_trackers` off). A tracker that
+/// fails backs off and moves to the end of its tier, so the next one in the
+/// tier is tried at once.
 #[derive(Debug)]
 struct TrackerList {
     /// In tier order.
@@ -486,26 +485,29 @@ impl TrackerList {
         found
     }
 
-    /// The walk of libtorrent `torrent::announce_with_tracker` with neither
-    /// `announce_to_all_tiers` nor `announce_to_all_trackers`: over the
-    /// `considered` trackers in list order, every failing one that
-    /// `may_announce`, then the first working one if it may. The trackers
-    /// after it wait.
+    /// The walk of libtorrent `torrent::announce_with_tracker` with
+    /// `announce_to_all_tiers` and not `announce_to_all_trackers`, as
+    /// qBittorrent sets them: over the `considered` trackers in list order,
+    /// in each tier every failing one that `may_announce`, then the first
+    /// working one if it may. The trackers after it in its tier wait; the
+    /// next tier is walked the same way.
     fn walk(
         &self,
         considered: impl Fn(&Entry) -> bool,
         may_announce: impl Fn(&Entry) -> bool,
     ) -> Vec<usize> {
         let mut picked = Vec::new();
+        // The tier whose working tracker the walk has reached.
+        let mut settled = None;
         for (i, entry) in self.entries.iter().enumerate() {
-            if !considered(entry) {
+            if !considered(entry) || settled == Some(entry.tier) {
                 continue;
             }
             if may_announce(entry) {
                 picked.push(i);
             }
             if entry.is_working() {
-                break;
+                settled = Some(entry.tier);
             }
         }
         picked
@@ -564,17 +566,21 @@ impl TrackerList {
 
     /// When the next regular announce may come due, None while every
     /// tracker it could go to waits for an answer (libtorrent
-    /// `torrent::update_tracker_timer`).
+    /// `torrent::update_tracker_timer`). As in the walk, each tier counts up
+    /// to its first working tracker, or the one waiting for an answer.
     fn next_due(&self) -> Option<Instant> {
         let mut next: Option<Instant> = None;
+        let mut settled = None;
         for entry in &self.entries {
-            if entry.updating {
-                break;
+            if settled == Some(entry.tier) {
+                continue;
             }
-            let due = entry.next_announce.max(entry.min_announce);
-            next = Some(next.map_or(due, |next| next.min(due)));
-            if entry.is_working() {
-                break;
+            if !entry.updating {
+                let due = entry.next_announce.max(entry.min_announce);
+                next = Some(next.map_or(due, |next| next.min(due)));
+            }
+            if entry.updating || entry.is_working() {
+                settled = Some(entry.tier);
             }
         }
         next
@@ -1695,8 +1701,8 @@ fn saturating_u32(n: u64) -> u32 {
 
 impl TrackerComms {
     /// Announce to the trackers of a multitracker torrent (BEP 12): one
-    /// tracker at a time, the first in tier order that works, the trackers
-    /// of each tier in random order (see `TrackerList`). A failing tracker
+    /// tracker of each tier at a time, the first in it that works, the
+    /// trackers of each tier in random order (see `TrackerList`). A failing tracker
     /// is tried again after a delay that grows with each failure
     /// (`retry_delay`).
     ///
@@ -2636,17 +2642,21 @@ mod tests {
     }
 
     #[test]
-    fn one_tracker_is_announced_to_at_a_time_tier_by_tier() {
-        // libtorrent torrent::announce_with_tracker with neither
-        // announce_to_all_tiers nor announce_to_all_trackers.
+    fn one_tracker_of_each_tier_is_announced_to_at_a_time() {
+        // libtorrent torrent::announce_with_tracker and
+        // update_tracker_timer with announce_to_all_tiers and not
+        // announce_to_all_trackers, as qBittorrent sets them.
         let s = Duration::from_secs;
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         let stats = live(0, 90, false);
 
-        // Only the first tracker of the first tier is announced to, and
-        // nothing more while it waits for its answer.
-        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        // The first tracker of each tier is announced to, and nothing more
+        // while they wait for their answers.
+        assert_eq!(
+            list.start_due(t0, None, &stats),
+            [(http("a"), STARTED), (http("c"), STARTED)]
+        );
         assert_eq!(list.start_due(t0, None, &stats), []);
         assert_eq!(list.next_due(), None);
 
@@ -2655,10 +2665,11 @@ mod tests {
         assert_eq!(order(&list), [http("b"), http("a"), http("c")]);
         assert_eq!(list.start_due(t0, None, &stats), [(http("b"), STARTED)]);
 
-        // b fails too: only now is the next tier tried.
+        // b fails too: its tier has none left to try until the back-off is
+        // up; c, answering, is not asked again.
         list.on_failure(&http("b"), t0, Duration::ZERO);
         assert_eq!(order(&list), [http("a"), http("b"), http("c")]);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("c"), STARTED)]);
+        assert_eq!(list.start_due(t0, None, &stats), []);
         list.on_success(&http("c"), STARTED, t0, &ANSWERED);
         assert_eq!(list.start_due(t0, None, &stats), []);
 
@@ -2672,11 +2683,17 @@ mod tests {
         );
 
         // a answers and b fails again, backing off longer. a works and comes
-        // first, so neither b nor c is announced to while it keeps working.
+        // first in its tier, so b is not announced to while it keeps
+        // working; c, in its own tier, keeps its own interval.
         list.on_success(&http("a"), STARTED, t1, &ANSWERED);
         list.on_failure(&http("b"), t1, Duration::ZERO);
         assert_eq!(list.entries[1].next_announce, t1 + s(55));
-        assert_eq!(list.start_due(t0 + s(1800), None, &stats), []);
+        assert_eq!(list.next_due(), Some(t0 + s(1800)));
+        assert_eq!(
+            list.start_due(t0 + s(1800), None, &stats),
+            [(http("c"), None)]
+        );
+        list.on_success(&http("c"), None, t0 + s(1800), &ANSWERED);
         assert_eq!(list.next_due(), Some(t1 + s(1800)));
         assert_eq!(
             list.start_due(t1 + s(1800), None, &stats),
@@ -2685,48 +2702,47 @@ mod tests {
     }
 
     #[test]
-    fn the_tracker_in_use_hears_completed_at_once_and_only_once() {
+    fn the_trackers_in_use_hear_completed_at_once_and_only_once() {
         // libtorrent tracker_list::completed, announce_infohash::can_announce
         // and torrent::send_tracker_request.
         let s = Duration::from_secs;
         let t0 = Instant::now();
-        let mut list = list(&[&["a"], &["b"]], t0);
+        let mut list = list(&[&["a", "b"], &["c"]], t0);
         assert_eq!(
             list.start_due(t0, None, &live(0, 90, false)),
-            [(http("a"), STARTED)]
+            [(http("a"), STARTED), (http("c"), STARTED)]
         );
         let delay = ReannounceDelay {
             floor: s(900),
             regular: s(1800),
         };
         list.on_success(&http("a"), STARTED, t0, &delay);
+        list.on_success(&http("c"), STARTED, t0, &delay);
 
-        // The torrent becomes a seed: a is due at once, inside its min
-        // interval, with `completed`.
+        // The torrent becomes a seed: a and c are due at once, inside their
+        // min interval, with `completed`.
         let seed = live(90, 0, true);
         let t1 = t0 + s(10);
         assert_eq!(list.start_due(t1, None, &seed), []);
         list.completed(t1);
-        assert_eq!(list.start_due(t1, None, &seed), [(http("a"), COMPLETED)]);
+        assert_eq!(
+            list.start_due(t1, None, &seed),
+            [(http("a"), COMPLETED), (http("c"), COMPLETED)]
+        );
 
-        // Refused, a backs off, and b, the first tracker after it that
-        // works, is asked at once.
+        // a refuses it and backs off, and b, the next in its tier, is asked
+        // at once; c accepts it.
         list.on_failure(&http("a"), t1, Duration::ZERO);
+        list.on_success(&http("c"), COMPLETED, t1, &delay);
         assert_eq!(list.start_due(t1, None, &seed), [(http("b"), STARTED)]);
         list.on_success(&http("b"), STARTED, t1, &delay);
 
-        // a is retried with `completed` after its back-off; b, which
-        // works, waits for its interval.
-        let t2 = t1 + s(17);
-        assert_eq!(list.start_due(t2, None, &seed), [(http("a"), COMPLETED)]);
-        list.on_success(&http("a"), COMPLETED, t2, &delay);
-
-        // Once a tracker accepted it, no other is sent `completed`, and a,
-        // working again, is the one announced to.
-        assert_eq!(list.event(&list.entries[1], &seed), None);
+        // Once a tracker accepted it, no other is sent `completed`: b,
+        // working, is the one of its tier announced to.
+        assert_eq!(list.event(&list.entries[0], &seed), None);
         assert_eq!(
-            list.start_due(t2 + s(1800), None, &seed),
-            [(http("a"), None)]
+            list.start_due(t1 + s(1800), None, &seed),
+            [(http("b"), None), (http("c"), None)]
         );
     }
 
@@ -2808,15 +2824,17 @@ mod tests {
         assert_eq!(list.stop(), []);
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
         assert_eq!(list.stop(), [http("a")]);
+        list.on_success(&http("c"), STARTED, t0, &ANSWERED);
+        assert_eq!(list.stop(), [http("a"), http("c")]);
 
         // a fails and b takes over: until b accepts `started`, a, failing,
         // is still owed `stopped`.
         list.on_failure(&http("a"), t0, Duration::ZERO);
         assert_eq!(list.start_due(t0, None, &stats), [(http("b"), STARTED)]);
-        assert_eq!(list.stop(), [http("a")]);
-        // Then b, the tracker in use, is.
+        assert_eq!(list.stop(), [http("a"), http("c")]);
+        // Then b, the tracker in use in its tier, is.
         list.on_success(&http("b"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.stop(), [http("b")]);
+        assert_eq!(list.stop(), [http("b"), http("c")]);
     }
 
     #[test]
@@ -3928,19 +3946,15 @@ mod tests {
             };
         }
 
-        // The first tier's tracker alone is asked, and refuses.
+        // Each tier's tracker is asked at once; the first refuses.
         let (err_conn, _) = driving!(read_announce(&err));
-        let announces = status.announces();
-        assert!(announce_of(&announces, &err_url).in_flight);
-        assert_eq!(announce_of(&announces, &ok_url), &never(&ok_url));
-        respond(err_conn, "d14:failure reason4:nopee").await;
-
-        // With the first tier failing, the next tier's is asked.
         let (ok_conn, _) = driving!(read_announce(&ok));
         let announces = status.announces();
+        assert!(announce_of(&announces, &err_url).in_flight);
         let a = announce_of(&announces, &ok_url);
         assert!(a.in_flight);
         assert_eq!(a.last, None);
+        respond(err_conn, "d14:failure reason4:nopee").await;
         respond(
             ok_conn,
             "d8:completei3e10:incompletei5e8:intervali1800e12:min intervali900e5:peers0:e",
@@ -5434,7 +5448,7 @@ mod tests {
         // repeated URL; a kept tracker keeps its state here.
         let s = Duration::from_secs;
         let t0 = Instant::now();
-        let mut list = list(&[&["a"], &["b"]], t0);
+        let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
@@ -5448,22 +5462,26 @@ mod tests {
             list.entries.iter().map(|e| e.tier).collect::<Vec<_>>(),
             [0, 0, 1]
         );
-        // a is not sent `started` again nor brought forward; c, new, is due.
+        // a is not sent `started` again nor brought forward; c and d, new,
+        // are due, each the first of its tier.
         let a = &list.entries[1];
         assert!(a.start_sent);
         assert_eq!(a.next_announce, t0 + ANSWERED.regular);
         assert_eq!(
             list.start_due(t0 + s(10), None, &stats),
-            [(http("c"), STARTED)]
+            [(http("c"), STARTED), (http("d"), STARTED)]
         );
     }
 
     #[test]
     fn replaced_trackers_gone_that_accepted_started_are_returned() {
         let t0 = Instant::now();
-        let mut list = list(&[&["a"], &["b"], &["c"]], t0);
+        let mut list = list(&[&["a", "b"], &["c"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, None, &stats),
+            [(http("a"), STARTED), (http("c"), STARTED)]
+        );
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
 
         // a heard `started` and is owed `stopped`; b never heard from us.
@@ -5477,7 +5495,7 @@ mod tests {
         // libtorrent trigger_announce and torrent::announce_tracker_now.
         let s = Duration::from_secs;
         let t0 = Instant::now();
-        let mut list = list(&[&["a"], &["b"]], t0);
+        let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
         let delay = ReannounceDelay {
@@ -5670,5 +5688,99 @@ mod tests {
         stopped.wait_idle().await;
         drop((b, c));
         token.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_tier_added_while_the_torrent_runs_is_announced_to_at_once_and_on_schedule() {
+        // libtorrent torrent::add_tracker announces at once while the
+        // torrent announces, and with announce_to_all_tiers, as qBittorrent
+        // sets it, torrent::announce_with_tracker and update_tracker_timer
+        // take one tracker of every tier, not only the first that works.
+        let (a, a_url) = http_listener().await;
+        let (b, b_url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![a_url.clone()]], &stopped).await;
+        let TrackerTask { mut peers, status } = task;
+        macro_rules! driving {
+            ($f:expr) => {
+                tokio::select! {
+                    _ = peers.next() => panic!("the tracker sent peers"),
+                    r = $f => r,
+                }
+            };
+        }
+        let answered = "d8:intervali1800e12:min intervali900e5:peers0:e";
+
+        let (conn, q) = driving!(read_announce(&a));
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        respond(conn, answered).await;
+        let table = table_once(&status, &mut peers, |t| t[0].last.is_some()).await;
+        // What a's row says of its announces; its next one is read off the
+        // clock each time the table is.
+        let heard = |row: &TrackerAnnounce| (row.in_flight, row.last.clone(), row.fails);
+        let a_row = heard(&table[0]);
+
+        // b, a tier of its own added after a heard `started`, is announced
+        // to at once though a works; a is not asked again.
+        status.replace(op(vec![vec![a_url.clone()], vec![b_url.clone()]]));
+        let (conn, q) = driving!(read_announce(&b));
+        assert_eq!(query_param(&q, "event"), Some("started"));
+        let table = status.announces();
+        assert_eq!(heard(&table[0]), a_row);
+        assert!(table[1].in_flight);
+        respond(conn, answered).await;
+
+        // Answered, b is due again after its interval, as a is after its own.
+        let table = table_once(&status, &mut peers, |t| {
+            t[1].last.is_some() && !t[1].in_flight
+        })
+        .await;
+        assert_eq!(heard(&table[0]), a_row);
+        let b_last = table[1].last.clone().unwrap();
+        assert!(b_last.result.is_ok());
+        assert_eq!(
+            table[1].next_announce,
+            Some(b_last.at + Duration::from_secs(1800))
+        );
+
+        // Both heard `started`, so both hear `stopped`.
+        drop(peers);
+        let (stopped_a, stopped_b) = tokio::join!(next_announce(&a), next_announce(&b));
+        assert_eq!(query_param(&stopped_a, "event"), Some("stopped"));
+        assert_eq!(query_param(&stopped_b, "event"), Some("stopped"));
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    #[test]
+    fn a_tier_added_while_announcing_comes_due_at_once_and_after_its_interval() {
+        // libtorrent torrent::add_tracker, then update_tracker_timer with
+        // announce_to_all_tiers: the new tier keeps its own schedule beside
+        // the first's.
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"]], t0);
+        let stats = live(0, 90, false);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        assert_eq!(list.next_due(), Some(t0 + s(1800)));
+
+        let t1 = t0 + s(60);
+        list.replace(&[vec![http("a")], vec![http("b")]], t1);
+        assert_eq!(list.next_due(), Some(t1));
+        assert_eq!(list.start_due(t1, None, &stats), [(http("b"), STARTED)]);
+        list.on_success(&http("b"), STARTED, t1, &ANSWERED);
+
+        assert_eq!(list.next_due(), Some(t0 + s(1800)));
+        assert_eq!(
+            list.start_due(t0 + s(1800), None, &stats),
+            [(http("a"), None)]
+        );
+        list.on_success(&http("a"), None, t0 + s(1800), &ANSWERED);
+        assert_eq!(list.next_due(), Some(t1 + s(1800)));
+        assert_eq!(
+            list.start_due(t1 + s(1800), None, &stats),
+            [(http("b"), None)]
+        );
     }
 }

@@ -23,6 +23,7 @@ impl GraphJob<PieceRoot> {
     pub(crate) fn for_torrent(scope: u64, layout: Arc<PieceLayout>, storage: Storage) -> Self {
         let Storage {
             working_dir,
+            kept_dir,
             accountant,
             free_disk,
             slots,
@@ -33,7 +34,9 @@ impl GraphJob<PieceRoot> {
             unpack,
         } = storage;
         let runs = Runs::new(scope, slots, mail, Arc::clone(&accountant));
-        let writer = NamespaceWriter::new(scope, working_dir, accountant, free_disk).capped(caps);
+        let writer = NamespaceWriter::new(scope, working_dir, accountant, free_disk)
+            .capped(caps)
+            .keeping_in(kept_dir);
         Self::torrent(layout, super::builder(unpack), writer, runs, nesting).offering(passwords)
     }
 
@@ -85,6 +88,24 @@ impl GraphJob<PieceRoot> {
         for share in shares {
             if self.root.waiting(share.volume, share.piece) {
                 self.intake(share, slots, limit)?;
+            }
+        }
+        Ok(())
+    }
+
+    // A piece a check found where the files were placed, as its files'
+    // shares: in hand as a verified piece is, and nothing is written, since
+    // the files hold it already (libtorrent `torrent::on_piece_hashed` has
+    // the piece and writes nothing).
+    pub(crate) fn adopted(
+        &mut self,
+        shares: Vec<Verified>,
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        for share in shares {
+            if self.root.waiting(share.volume, share.piece) {
+                self.intake_found(share, slots, limit)?;
             }
         }
         Ok(())
@@ -151,6 +172,16 @@ impl GraphJob<PieceRoot> {
     // start from.
     pub(crate) fn have(&self) -> BitVec<u8, Msb0> {
         self.root.have()
+    }
+
+    // Whether the piece is in hand and no check waits to find it.
+    pub(crate) fn has_piece(&self, piece: u32) -> bool {
+        self.root.had(piece)
+    }
+
+    // Where the volume's file is kept, written or not.
+    pub(crate) fn kept_path(&self, volume: VolumeIndex) -> Option<std::path::PathBuf> {
+        self.writer.kept_path(MemberId(volume.0))
     }
 
     // Each file's bytes in hand, by torrent index.

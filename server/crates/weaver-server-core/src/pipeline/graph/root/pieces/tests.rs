@@ -376,6 +376,7 @@ fn accountant() -> Arc<HoldsAccountant> {
 pub(crate) fn storage(dir: &std::path::Path) -> Storage {
     Storage {
         working_dir: dir.to_path_buf(),
+        kept_dir: None,
         accountant: accountant(),
         free_disk: CapacityReader::unknown(),
         slots: 1,

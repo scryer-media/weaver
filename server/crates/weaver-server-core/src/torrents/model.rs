@@ -41,6 +41,47 @@ impl TorrentSource {
     }
 }
 
+/// How a torrent's files are laid out under the directory they go to
+/// (qBittorrent `TorrentContentLayout`): as the metainfo lists them, under a
+/// folder of their own however it lists them, or with the metainfo's folder
+/// stripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentLayout {
+    Original,
+    Subfolder,
+    NoSubfolder,
+}
+
+impl ContentLayout {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Original => "Original",
+            Self::Subfolder => "Subfolder",
+            Self::NoSubfolder => "NoSubfolder",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "Original" => Some(Self::Original),
+            "Subfolder" => Some(Self::Subfolder),
+            "NoSubfolder" => Some(Self::NoSubfolder),
+            _ => None,
+        }
+    }
+
+    // Whether the files of a torrent that is `single_file` go under a folder
+    // of their own (qBittorrent `SessionImpl::addTorrent_impl` adds or strips
+    // the metainfo's root folder).
+    pub const fn foldered(self, single_file: bool) -> bool {
+        match self {
+            Self::Original => !single_file,
+            Self::Subfolder => true,
+            Self::NoSubfolder => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentState {
@@ -155,6 +196,22 @@ pub struct TorrentRecord {
     pub sequential: bool,
     // Whether each file's first and last pieces are fetched first.
     pub first_last_piece_first: bool,
+    // The directory it was asked to put its files under, None for its
+    // category's, and how they are laid out there, None for a folder of
+    // its own.
+    pub save_path: Option<String>,
+    pub content_layout: Option<ContentLayout>,
+    // The directory its files sit in when they were placed outside a folder
+    // of its own; None when they sit in its storage directory.
+    pub files_dir: Option<String>,
+    // Added in seed mode and not out of it yet: its session takes every
+    // piece as had and checks each as a peer first asks for it.
+    pub seed_mode: bool,
+    // The directory it moves under once complete; None when it stays.
+    pub move_to: Option<String>,
+    // Where it stands in the download queue, the lowest first (libtorrent
+    // `torrent::queue_position`). A seed keeps the place it had.
+    pub queue_position: i64,
 }
 
 impl TorrentRecord {

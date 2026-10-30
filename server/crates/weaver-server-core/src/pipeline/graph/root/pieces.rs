@@ -177,6 +177,15 @@ impl PieceRoot {
         have
     }
 
+    // Whether the piece is in hand, as [`Self::have`] counts it.
+    pub(crate) fn had(&self, piece: u32) -> bool {
+        self.layout.spans(piece).into_iter().all(|span| {
+            span.volume.is_none_or(|volume| {
+                matches!(self.unit(volume, piece), Some(Unit::Arrived(_)))
+            })
+        })
+    }
+
     // Each file's share of the piece that is in hand, with its range in
     // the file's coordinates.
     pub(crate) fn in_hand(&self, piece: u32) -> Vec<(VolumeIndex, ByteRange)> {

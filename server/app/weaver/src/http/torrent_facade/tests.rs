@@ -434,6 +434,8 @@ fn view(state: TorrentState) -> TorrentView {
         added_at_ms: 1_700_000_000_000,
         completed_at_ms: None,
         storage_dir: Some("/complete/tv/a".into()),
+        files_dir: None,
+        queue_position: None,
         seeding_left: None,
         seeding_override: None,
         seeding_inherited: None,
@@ -709,6 +711,69 @@ fn a_magnet_name_shapes_no_path_before_weaver_places_it() {
     assert_eq!(info["content_path"], "");
     assert_eq!(info["save_path"], "");
     assert_eq!(info["name"], "../../x");
+}
+
+// qBittorrent `addAction` and `SessionImpl::addTorrent`: a save path is
+// read only with automatic management off, `seedMode` and the older
+// `skip_checking` both skip the check, and `root_folder` stands in for a
+// missing `contentLayout`.
+#[test]
+fn an_add_reads_where_the_files_are_and_how_they_are_laid_out() {
+    let params = |fields: &[(&str, &str)]| Params {
+        fields: fields
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+        files: Vec::new(),
+    };
+
+    assert_eq!(placement(&params(&[])), Placement::default());
+    let placed = placement(&params(&[
+        ("savepath", "/data/seed"),
+        ("autoTMM", "false"),
+        ("skip_checking", "true"),
+        ("root_folder", "false"),
+    ]));
+    assert_eq!(
+        placed,
+        Placement {
+            save_path: Some("/data/seed".into()),
+            layout: Some(ContentLayout::NoSubfolder),
+            seed_mode: true,
+            ..Placement::default()
+        }
+    );
+    let placed = placement(&params(&[
+        ("savepath", "/data/seed"),
+        ("seedMode", "true"),
+        ("contentLayout", "Subfolder"),
+        ("root_folder", "false"),
+        ("downloadPath", "/data/incomplete"),
+        ("useDownloadPath", "true"),
+    ]));
+    assert_eq!(
+        placed,
+        Placement {
+            save_path: Some("/data/seed".into()),
+            layout: Some(ContentLayout::Subfolder),
+            download_path: Some("/data/incomplete".into()),
+            seed_mode: true,
+        }
+    );
+    // Managed, the category decides where the files go.
+    let managed = placement(&params(&[("savepath", "/data/seed"), ("autoTMM", "true")]));
+    assert_eq!(managed.save_path, None);
+    // A download path switched off, or a layout this client does not name,
+    // falls back as qBittorrent does.
+    let placed = placement(&params(&[
+        ("downloadPath", "/data/incomplete"),
+        ("useDownloadPath", "false"),
+        ("contentLayout", "Sideways"),
+    ]));
+    assert_eq!(
+        (placed.download_path, placed.layout),
+        (None, Some(ContentLayout::Original))
+    );
 }
 
 #[test]
@@ -1345,6 +1410,57 @@ async fn stop_start_and_force_change_the_state() {
     )
     .await;
     assert_eq!(rig.torrents().await[0]["force_start"], true);
+}
+
+// The priority actions move torrents in the download queue, as qBittorrent's
+// do with queueing on, and never force one; each torrent reports its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_priority_actions_move_a_torrent_in_the_queue() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    rig.add_file(&metainfo("two.mkv", 3000, false), &[]).await;
+    let hash_of = |rows: &[Value], name: &str| {
+        rows.iter()
+            .find(|row| row["name"] == name)
+            .unwrap()["hash"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let rows = rig.torrents().await;
+    let (one, two) = (hash_of(&rows, "one.mkv"), hash_of(&rows, "two.mkv"));
+    let places = || async {
+        let rows = rig.torrents().await;
+        let place = |name: &str| {
+            let row = rows.iter().find(|row| row["name"] == name).unwrap();
+            assert_eq!(row["force_start"], false, "{name}");
+            row["priority"].as_i64().unwrap()
+        };
+        (place("one.mkv"), place("two.mkv"))
+    };
+    assert_eq!(places().await, (1, 2));
+
+    let act = |action: &'static str, hash: String| {
+        let rig = &rig;
+        async move {
+            rig.post(&format!("/api/v2/torrents/{action}"), &format!("hashes={hash}"))
+                .await
+                .status
+        }
+    };
+    assert_eq!(act("topPrio", two.clone()).await, StatusCode::OK);
+    assert_eq!(places().await, (2, 1));
+    assert_eq!(act("bottomPrio", two.clone()).await, StatusCode::OK);
+    assert_eq!(places().await, (1, 2));
+    assert_eq!(act("increasePrio", two.clone()).await, StatusCode::OK);
+    assert_eq!(places().await, (2, 1));
+    assert_eq!(act("decreasePrio", two).await, StatusCode::OK);
+    assert_eq!(places().await, (1, 2));
+    assert_eq!(act("increasePrio", one).await, StatusCode::OK);
+    assert_eq!(places().await, (1, 2));
+
+    let preferences = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(preferences["queueing_enabled"], true);
 }
 
 // qBittorrent's `torrents/recheck` reaches the service's recheck for each
@@ -2139,11 +2255,6 @@ async fn a_closed_torrent_limit_is_never_read_as_no_limit() {
 #[tokio::test]
 async fn the_stub_endpoints_answer_and_a_url_must_be_a_magnet() {
     let rig = rig().await;
-    let top = rig.post("/api/v2/torrents/topPrio", "hashes=all").await;
-    assert_eq!(
-        (top.status, top.body.as_str()),
-        (StatusCode::CONFLICT, "Torrent queueing must be enabled")
-    );
     for action in ["addTags", "removeTags"] {
         let reply = rig
             .post(&format!("/api/v2/torrents/{action}"), "hashes=all&tags=x")

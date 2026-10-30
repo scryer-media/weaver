@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -74,7 +74,7 @@ use crate::torrents::sessions::{
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
-    FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert,
+    ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert,
     TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
 };
 
@@ -443,6 +443,27 @@ pub struct AddRequest {
     // Its own rate limits in bytes a second, none being no limit.
     pub upload_limit: Option<u64>,
     pub download_limit: Option<u64>,
+    // Where its files go.
+    pub placement: Placement,
+}
+
+/// Where a torrent's files go, as a client adding it asks (qBittorrent
+/// `AddTorrentParams`). The default is weaver's own: a folder of the
+/// torrent's under its category's directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// The directory its files go under; None for its category's.
+    pub save_path: Option<String>,
+    /// How they are laid out there; None for a folder of its own, or with
+    /// a save path, as the metainfo lists them.
+    pub layout: Option<ContentLayout>,
+    /// The directory it downloads under, moving under the save path once
+    /// complete; None to download where it stays.
+    pub download_path: Option<String>,
+    /// Its files are complete where they go already: it seeds them at once
+    /// unchecked, and checks each piece as a peer first asks for it
+    /// (libtorrent `torrent_flags::seed_mode`).
+    pub seed_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -545,6 +566,12 @@ pub struct TorrentView {
     pub added_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
+    /// Where its files sit when they were placed outside its storage
+    /// directory, with no folder of their own.
+    pub files_dir: Option<String>,
+    /// Its place among the torrents still downloading, from 1; None while
+    /// it seeds.
+    pub queue_position: Option<u32>,
     pub seeding_left: Option<String>,
     /// The torrent's own seeding policy, when it sets one, and what it
     /// would have without it.
@@ -651,7 +678,7 @@ impl TorrentView {
     /// output itself, its file when it is one file named as the torrent is,
     /// else its folder. Both are empty until weaver has placed the torrent.
     pub fn paths(&self) -> (String, String) {
-        let Some(dir) = &self.storage_dir else {
+        let Some(dir) = self.files_dir.as_ref().or(self.storage_dir.as_ref()) else {
             return (String::new(), String::new());
         };
         let dir = PathBuf::from(dir);
@@ -661,11 +688,17 @@ impl TorrentView {
         };
         let content = match single {
             Some(name) => dir.join(name),
-            None => dir,
+            None => dir.clone(),
         };
-        let save = content
-            .parent()
-            .map_or_else(|| content.clone(), Path::to_path_buf);
+        // Files with no folder of their own sit in the directory they went
+        // to, which is their save path (qBittorrent `TorrentImpl::contentPath`
+        // is the save path for files with no root folder).
+        let save = match &self.files_dir {
+            Some(_) => dir,
+            None => content
+                .parent()
+                .map_or_else(|| content.clone(), Path::to_path_buf),
+        };
         (
             save.to_string_lossy().into_owned(),
             content.to_string_lossy().into_owned(),
@@ -972,6 +1005,10 @@ struct Live {
     // takes the next change.
     run_error: Option<String>,
     queued: bool,
+    // Its place among the torrents still downloading, from 1, as the queue
+    // was last applied; None while it seeds (qBittorrent
+    // `TorrentImpl::queuePosition`).
+    queue_rank: Option<u32>,
     // Who holds it stopped, while a hold does.
     paused_by: Option<HoldOrigin>,
     // The operator's level for each file, as stored.
@@ -1076,6 +1113,7 @@ impl Live {
             engine: Engine::Absent,
             run_error: None,
             queued: false,
+            queue_rank: None,
             paused_by: None,
             levels: Vec::new(),
             speeds: (0, 0),
@@ -1622,6 +1660,9 @@ struct Inner {
     // publish from an action never waits on a session that is opening.
     sessions_read: Mutex<Vec<SessionSeries>>,
     counters: Counters,
+    // The place in the download queue the next torrent added takes: past
+    // every one kept (libtorrent puts a new torrent last in the queue).
+    next_queue_position: AtomicI64,
 }
 
 #[derive(Clone)]
@@ -1659,6 +1700,7 @@ impl TorrentService {
                 published: watch::channel(Arc::default()).0,
                 sessions_read: Mutex::default(),
                 counters: Counters::default(),
+                next_queue_position: AtomicI64::new(0),
             }),
         }
     }
@@ -2293,12 +2335,23 @@ impl TorrentService {
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
-            self.queue_resume(torrent, now, true)
+            (self.queue_resume(torrent, now, true), torrent.record.move_to.take())
         };
+        let (landing, move_to) = landing;
         let _ = self.landed(landing).await;
+        // One that downloaded under its download path moves under its save
+        // path now (qBittorrent `TorrentImpl::handleTorrentFinished`).
+        if let Some(to) = move_to {
+            if let Err(error) = self.inner.db.clear_torrent_move_to(job_id) {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's move");
+            }
+            if let Err(error) = self.set_location(job_id, to).await {
+                tracing::warn!(job_id = job_id.0, error = %error, "a complete torrent did not move under its save path");
+            }
+        }
     }
 
-    fn storage(&self, dir: PathBuf, layout: &PieceLayout, unpack: bool) -> Storage {
+    fn storage(&self, dir: Dirs, layout: &PieceLayout, unpack: bool) -> Storage {
         let policy = self
             .inner
             .db
@@ -2311,7 +2364,8 @@ impl TorrentService {
             .collect();
         let env = &self.inner.env;
         Storage {
-            working_dir: dir,
+            working_dir: dir.work,
+            kept_dir: dir.files,
             accountant: Arc::clone(&env.accountant),
             free_disk: env.free_disk.clone(),
             slots: env.slots,
@@ -2328,7 +2382,7 @@ impl TorrentService {
     fn restored(
         &self,
         job_id: JobId,
-        dir: PathBuf,
+        dir: Dirs,
         layout: &Arc<PieceLayout>,
         unpack: bool,
     ) -> FromCheckpoint {
@@ -2397,7 +2451,7 @@ impl TorrentService {
     fn graph_job(
         &self,
         job_id: JobId,
-        dir: PathBuf,
+        dir: Dirs,
         layout: &Arc<PieceLayout>,
         unpack: bool,
         checkpoint: FromCheckpoint,
@@ -2477,7 +2531,7 @@ impl TorrentService {
         self.describe(torrent, parsed);
         let (job_id, dir, unpack) = (
             torrent.record.job_id,
-            storage_dir(torrent),
+            dirs(torrent),
             unpacks(torrent),
         );
         let checkpoint = self.restored(job_id, dir.clone(), &parsed.layout, unpack);
@@ -2556,7 +2610,7 @@ impl TorrentService {
                 .filter(|torrent| torrent.job.is_none())
                 .and_then(|torrent| {
                     Some((
-                        storage_dir(torrent),
+                        dirs(torrent),
                         Arc::clone(torrent.layout.as_ref()?),
                         unpacks(torrent),
                     ))
@@ -2635,10 +2689,7 @@ impl TorrentService {
                 self.admit(&parsed.manifest)?;
                 self.duplicate(parsed.hashes)?;
                 let job_id = self.reserve()?;
-                let dir = self
-                    .claim_dir(&settings, category.as_ref(), &parsed.manifest, job_id)
-                    .await?;
-                let record = self.record(
+                let mut record = self.record(
                     job_id,
                     &request,
                     category.as_ref(),
@@ -2646,8 +2697,13 @@ impl TorrentService {
                     parsed.manifest.name.clone(),
                     TorrentSource::Metainfo,
                     Some(bytes),
-                    Some(dir.clone()),
                 );
+                let (dir, files_dir) = self
+                    .place(&settings, category.as_ref(), &record, &parsed.manifest, job_id)
+                    .await?;
+                record.storage_dir = Some(dir.clone());
+                record.files_dir = files_dir;
+                record.seed_mode = request.placement.seed_mode;
                 let mut torrent = match self.insert(record, &parsed.trackers) {
                     Ok(torrent) => torrent,
                     Err(error) => {
@@ -2701,6 +2757,9 @@ impl TorrentService {
                     .name
                     .clone()
                     .unwrap_or_else(|| hashes.best().as_string());
+                // A magnet has no files to seed until its metainfo is in
+                // hand (libtorrent `torrent_flags::seed_mode` needs the
+                // metainfo at add): it downloads.
                 let record = self.record(
                     job_id,
                     &request,
@@ -2708,7 +2767,6 @@ impl TorrentService {
                     hashes,
                     name,
                     TorrentSource::Magnet,
-                    None,
                     None,
                 );
                 let mut torrent = self.insert(record, &trackers)?;
@@ -2777,6 +2835,71 @@ impl TorrentService {
         })
     }
 
+    // Where a torrent's job writes, and where its files go when that is not
+    // there, as `record` asks. Without a save path or a layout that strips
+    // the folder, its files go in a folder of its own claimed under its
+    // category's directory, as weaver lays every torrent out. With a save
+    // path they go under it as qBittorrent lays them out
+    // (`SessionImpl::addTorrent_impl`), the metainfo's layout unless asked
+    // otherwise, into whatever is there already. Files with no folder of
+    // their own sit straight in the directory they go to, and the job
+    // writes in a folder of its own claimed as weaver claims one.
+    async fn place(
+        &self,
+        settings: &TorrentSettings,
+        category: Option<&CategoryConfig>,
+        record: &TorrentRecord,
+        manifest: &Manifest,
+        job_id: JobId,
+    ) -> Result<(String, Option<String>), AddError> {
+        let layout = record.content_layout;
+        let category_parent = || {
+            completion_parent(
+                &settings.complete_dir,
+                &settings.categories,
+                category.map(|category| category.name.as_str()),
+            )
+            .map_err(AddError::Invalid)
+        };
+        // A relative save path is under the category's directory, as
+        // qBittorrent takes one under the default save path.
+        let parent = match record.save_path.as_deref() {
+            Some(parent) if Path::new(parent).is_absolute() => Some(PathBuf::from(parent)),
+            Some(parent) => Some(category_parent()?.join(parent)),
+            None => None,
+        };
+        let foldered = layout
+            .unwrap_or(ContentLayout::Original)
+            .foldered(manifest.single_file);
+        let made = |dir: &Path| {
+            std::fs::create_dir_all(dir).map_err(|error| {
+                AddError::State(format!("could not make the torrent's directory: {error}"))
+            })
+        };
+        match parent {
+            Some(parent) if foldered => {
+                let dir = parent.join(admission::output_name(manifest));
+                made(&dir)?;
+                Ok((dir.to_string_lossy().into_owned(), None))
+            }
+            Some(parent) => {
+                made(&parent)?;
+                let dir = self.claim_dir(settings, category, manifest, job_id).await?;
+                Ok((dir, Some(parent.to_string_lossy().into_owned())))
+            }
+            None if layout.is_none_or(|layout| layout.foldered(manifest.single_file)) => Ok((
+                self.claim_dir(settings, category, manifest, job_id).await?,
+                None,
+            )),
+            None => {
+                let parent = category_parent()?;
+                made(&parent)?;
+                let dir = self.claim_dir(settings, category, manifest, job_id).await?;
+                Ok((dir, Some(parent.to_string_lossy().into_owned())))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
@@ -2787,8 +2910,16 @@ impl TorrentService {
         name: String,
         source: TorrentSource,
         metainfo: Option<Bytes>,
-        storage_dir: Option<String>,
     ) -> TorrentRecord {
+        // qBittorrent `TorrentImpl`: a torrent with a download path in use
+        // downloads there and moves under its save path once complete.
+        let placement = &request.placement;
+        let (save_path, move_to) = match &placement.download_path {
+            Some(download) if !placement.seed_mode => {
+                (Some(download.clone()), placement.save_path.clone())
+            }
+            _ => (placement.save_path.clone(), None),
+        };
         TorrentRecord {
             job_id,
             infohash_v1: hashes.v1.map(|hash| hash.0),
@@ -2805,7 +2936,7 @@ impl TorrentService {
             },
             forced: request.forced,
             completed_at_ms: None,
-            storage_dir,
+            storage_dir: None,
             policy_override: request.policy_override.clone(),
             unpack: request.unpack,
             metadata: request.metadata.clone(),
@@ -2813,6 +2944,12 @@ impl TorrentService {
             download_limit: request.download_limit,
             sequential: false,
             first_last_piece_first: false,
+            save_path,
+            content_layout: placement.layout,
+            files_dir: None,
+            seed_mode: false,
+            move_to,
+            queue_position: self.inner.next_queue_position.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -2992,25 +3129,26 @@ impl TorrentService {
         let parsed = parse(&bytes)?;
         self.admit(&parsed.manifest)?;
         let settings = self.settings();
-        let Some((category_id, known)) = self
+        let Some(record) = self
             .inner
             .live
             .lock()
             .await
             .get(&job_id)
-            .map(|torrent| (torrent.record.category_id, hashes_of(&torrent.record)))
+            .map(|torrent| torrent.record.clone())
         else {
             return Ok(());
         };
+        let known = hashes_of(&record);
         // A hash only the metainfo names may be another torrent's: a hybrid
         // added once by each of its hashes.
         self.duplicate(InfoHashes {
             v1: parsed.hashes.v1.filter(|_| known.v1.is_none()),
             v2: parsed.hashes.v2.filter(|_| known.v2.is_none()),
         })?;
-        let category = settings.category(category_id).cloned();
-        let dir = self
-            .claim_dir(&settings, category.as_ref(), &parsed.manifest, job_id)
+        let category = settings.category(record.category_id).cloned();
+        let (dir, files_dir) = self
+            .place(&settings, category.as_ref(), &record, &parsed.manifest, job_id)
             .await?;
         let mut live = self.inner.live.lock().await;
         let Some(torrent) = live.get_mut(&job_id) else {
@@ -3022,6 +3160,7 @@ impl TorrentService {
         torrent.record.infohash_v2 = parsed.hashes.v2.map(|hash| hash.0);
         torrent.record.name = parsed.manifest.name.clone();
         torrent.record.storage_dir = Some(dir.clone());
+        torrent.record.files_dir = files_dir.clone();
         torrent.record.metainfo = Some(bytes.clone());
         // The trackers the magnet listed stay, edits included, each as
         // whoever named it; the metainfo's own join after them as the
@@ -3045,6 +3184,7 @@ impl TorrentService {
                 &dir,
                 &trackers,
             )
+            .and_then(|_| self.inner.db.set_torrent_files_dir(job_id, files_dir.as_deref()))
             .map_err(|error| AddError::State(state_error(error)))?;
         self.give_metainfo(torrent, &parsed);
         drop(live);
@@ -3171,7 +3311,10 @@ impl TorrentService {
                         .reason_for(queued(&settings, &rules, torrent, now).target())
                         .is_some(),
                 ratelimits,
-                job.with(|job| initial_have(job)),
+                (
+                    job.with(|job| initial_have(job, placed(&torrent.record))),
+                    torrent.record.seed_mode,
+                ),
                 identity_of(rule, &torrent.identity),
                 torrent.seen,
                 PeerTerms::of(rule),
@@ -3230,8 +3373,12 @@ impl TorrentService {
             }
             _ => (identity, None),
         };
-        let factory =
-            PieceStorageFactory::new(layout, intake as Arc<dyn Pieces>, self.resident(job_id));
+        let pieces = intake as Arc<dyn Pieces>;
+        let factory = PieceStorageFactory::new(
+            Arc::clone(&layout),
+            Arc::clone(&pieces),
+            self.resident(job_id),
+        );
         let mut options = AddTorrentOptions {
             paused,
             overwrite: true,
@@ -3251,7 +3398,9 @@ impl TorrentService {
         };
         terms.apply(&mut options);
         options.ssl_identity = ssl_identity(ssl.as_ref());
+        let (have, seed_mode) = have;
         apply_initial_have(&mut options, have);
+        options.seed_mode = seed_mode;
         let added = session
             .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
             .await;
@@ -3310,6 +3459,9 @@ impl TorrentService {
                             },
                         ),
                     });
+                if seed_mode {
+                    adopt_placed(&handle, layout, &pieces);
+                }
                 torrent.attached = Some(Attached {
                     session,
                     handle,
@@ -3813,6 +3965,11 @@ impl TorrentService {
                         "the torrent is already moving".to_owned(),
                     ));
                 }
+                if torrent.record.files_dir.is_some() {
+                    return Err(ActionError::Invalid(
+                        "the torrent's files stay in the directory they were placed in".to_owned(),
+                    ));
+                }
                 match (torrent.job.clone(), torrent.record.storage_dir.clone()) {
                     (Some(job), Some(dir)) => Ok((job, PathBuf::from(dir))),
                     _ => Err(ActionError::Invalid(
@@ -4027,9 +4184,9 @@ impl TorrentService {
         Ok(())
     }
 
-    /// A queue action on a torrent. The top priority, or a move to the top,
-    /// forces it past the download queue; any other priority, or a move to
-    /// the bottom, leaves it to the queue.
+    /// A queue action on a torrent. A move changes its place in the
+    /// download queue; the top priority forces it past the queue, and any
+    /// other leaves it to the queue.
     pub async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), ActionError> {
         match action {
             QueueAction::Pause => self.pause(job_id).await,
@@ -4039,12 +4196,80 @@ impl TorrentService {
                 self.remove(job_id, delete_files, false).await
             }
             QueueAction::Update(update) => self.update(job_id, update).await,
-            QueueAction::Move(QueueMoveTarget::Top) => self.set_forced(job_id, true).await,
-            QueueAction::Move(QueueMoveTarget::Bottom) => self.set_forced(job_id, false).await,
-            QueueAction::Move(QueueMoveTarget::Offset(_)) => Err(ActionError::Invalid(
-                "a torrent moves to the top or the bottom of the queue".into(),
-            )),
+            QueueAction::Move(target) => self.reorder(&[job_id], target).await,
         }
+    }
+
+    /// Moves `job_ids` in the download queue as qBittorrent's queue actions
+    /// do (`SessionImpl::increaseTorrentsQueuePos` and the others): of the
+    /// torrents named, those still downloading, taken in queue order, each
+    /// move one place up for a negative offset, starting with the first, or
+    /// one down for a positive one, starting with the last; to the top
+    /// starting with the last, so they keep their order there; to the bottom
+    /// starting with the first. A seed has no place to move (libtorrent
+    /// `torrent::finished` takes it out of the queue). Nothing moves a
+    /// torrent past the queue: forcing does that.
+    pub async fn reorder(
+        &self,
+        job_ids: &[JobId],
+        target: QueueMoveTarget,
+    ) -> Result<(), ActionError> {
+        {
+            let mut live = self.inner.live.lock().await;
+            if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {
+                return Err(ActionError::NotFound(missing));
+            }
+            let mut order: Vec<&Live> = live.values().filter(|torrent| !torrent.seeding()).collect();
+            order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
+            let mut order: Vec<JobId> = order.iter().map(|torrent| torrent.record.job_id).collect();
+            let named: Vec<JobId> = order
+                .iter()
+                .copied()
+                .filter(|job_id| job_ids.contains(job_id))
+                .collect();
+            let first_first = match target {
+                QueueMoveTarget::Top => false,
+                QueueMoveTarget::Bottom => true,
+                QueueMoveTarget::Offset(offset) => offset < 0,
+            };
+            let moving: Box<dyn Iterator<Item = &JobId>> = if first_first {
+                Box::new(named.iter())
+            } else {
+                Box::new(named.iter().rev())
+            };
+            for &job_id in moving {
+                // Named and still downloading, so in the order.
+                let _ = crate::jobs::handle::splice_job_order(&mut order, job_id, target);
+            }
+            // The torrents still downloading take the places they held among
+            // themselves, in their new order; a seed keeps its own.
+            let mut places: Vec<i64> = order
+                .iter()
+                .map(|job_id| live[job_id].record.queue_position)
+                .collect();
+            places.sort_unstable();
+            let moved: Vec<(JobId, i64)> = order
+                .iter()
+                .zip(places)
+                .filter(|(job_id, place)| live[*job_id].record.queue_position != *place)
+                .map(|(job_id, place)| (*job_id, place))
+                .collect();
+            if moved.is_empty() {
+                return Ok(());
+            }
+            self.inner
+                .db
+                .set_torrent_queue_positions(&moved)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            for (job_id, place) in moved {
+                if let Some(torrent) = live.get_mut(&job_id) {
+                    torrent.record.queue_position = place;
+                }
+            }
+        }
+        self.apply_queue().await;
+        self.publish().await;
+        Ok(())
     }
 
     async fn update(&self, job_id: JobId, update: JobUpdate) -> Result<(), ActionError> {
@@ -4080,6 +4305,11 @@ impl TorrentService {
         self.load_rules()?;
         let records = self.inner.db.list_torrents().map_err(state_error)?;
         let now = self.inner.clock.now_ms();
+        if let Some(last) = records.iter().map(|record| record.queue_position).max() {
+            self.inner
+                .next_queue_position
+                .fetch_max(last + 1, Ordering::Relaxed);
+        }
         for record in records {
             let job_id = record.job_id;
             let counters = self
@@ -4133,12 +4363,18 @@ impl TorrentService {
         let holds = self.holds();
         let mut live = self.inner.live.lock().await;
         let mut order: Vec<&Live> = live.values().collect();
-        order.sort_by_key(|torrent| (torrent.record.added_at_ms, torrent.record.job_id));
+        order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
         let queue: Vec<Queued> = order
             .iter()
             .map(|torrent| queued(&settings, &rules, torrent, now))
             .collect();
         let active = status::active(&queue, settings.torrent.max_active_downloads, &holds);
+        let ranks: BTreeMap<JobId, u32> = queue
+            .iter()
+            .filter(|torrent| !torrent.seeding)
+            .zip(1..)
+            .map(|(torrent, rank)| (torrent.job_id, rank))
+            .collect();
         let targets: BTreeMap<JobId, _> = queue
             .iter()
             .map(|torrent| (torrent.job_id, torrent.target()))
@@ -4146,6 +4382,7 @@ impl TorrentService {
         for torrent in live.values_mut() {
             let job_id = torrent.record.job_id;
             let active = active.contains(&job_id);
+            torrent.queue_rank = ranks.get(&job_id).copied();
             torrent.settle(now);
             torrent.paused_by = torrent
                 .resumed()
@@ -4284,6 +4521,17 @@ impl TorrentService {
         {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
+                // Seed mode ended in the session: from here what the job has
+                // is what the torrent has, after a restart too.
+                if torrent.record.seed_mode
+                    && let Some(attached) = &torrent.attached
+                    && !attached.handle.seed_mode()
+                {
+                    torrent.record.seed_mode = false;
+                    if let Err(error) = self.inner.db.clear_torrent_seed_mode(torrent.record.job_id) {
+                        tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not record that a torrent left seed mode");
+                    }
+                }
                 let reading = torrent.reading(now);
                 torrent.engine = reading.engine.clone();
                 torrent.speeds = reading.speeds;
@@ -4687,6 +4935,8 @@ impl TorrentService {
             added_at_ms: record.added_at_ms,
             completed_at_ms: record.completed_at_ms,
             storage_dir: record.storage_dir.clone(),
+            files_dir: record.files_dir.clone(),
+            queue_position: torrent.queue_rank,
             seeding_left: status::goal_left(policy.as_ref(), counters, total, now),
             seeding_override: record.policy_override,
             seeding_inherited: settings.inherited(record, rule),
@@ -4979,6 +5229,43 @@ fn apply_initial_have(
     options.checkpoint = have.map(Checkpoint::pieces);
 }
 
+// Whether the torrent's files went where its client asked, where they may
+// be already.
+fn placed(record: &TorrentRecord) -> bool {
+    record.save_path.is_some() || record.files_dir.is_some()
+}
+
+// A seed-mode torrent's files go to its job from where they were placed,
+// piece by piece on a blocking thread, while its session seeds them: the job
+// comes to hold what the session took as had, and completes. The session
+// leaving seed mode stops it before any check of every piece begins, and so
+// does the torrent leaving its session. A piece is read from the files
+// outside seed mode's hold, so a peer's request never waits on that read.
+fn adopt_placed(handle: &Arc<ManagedTorrent>, layout: Arc<PieceLayout>, pieces: &Arc<dyn Pieces>) {
+    let handle = Arc::downgrade(handle);
+    let pieces = Arc::downgrade(pieces);
+    tokio::task::spawn_blocking(move || {
+        for piece in 0..layout.piece_count() {
+            let (Some(handle), Some(pieces)) = (handle.upgrade(), pieces.upgrade()) else {
+                return;
+            };
+            if !handle.seed_mode() {
+                return;
+            }
+            match crate::torrents::storage::adopt_under(&layout, &*pieces, piece, |take| {
+                handle.while_seeding(take)
+            }) {
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    tracing::warn!(piece, error = %format!("{error:#}"), "a seed-mode torrent's placed files could not be read");
+                    return;
+                }
+                None => return,
+            }
+        }
+    });
+}
+
 // Why a session refusal leaves a torrent without one.
 fn held_by(error: SessionError) -> Held {
     match error {
@@ -5107,9 +5394,20 @@ enum FromCheckpoint {
     Failed(String),
 }
 
+// Where a torrent's job writes, and where its files are when they were
+// placed outside that directory.
+#[derive(Clone)]
+struct Dirs {
+    work: PathBuf,
+    files: Option<PathBuf>,
+}
+
 // Where the torrent's job keeps its files.
-fn storage_dir(torrent: &Live) -> PathBuf {
-    PathBuf::from(torrent.record.storage_dir.clone().unwrap_or_default())
+fn dirs(torrent: &Live) -> Dirs {
+    Dirs {
+        work: PathBuf::from(torrent.record.storage_dir.clone().unwrap_or_default()),
+        files: torrent.record.files_dir.clone().map(PathBuf::from),
+    }
 }
 
 // libtorrent `storage_utils::delete_files`: the torrent's files go, here
