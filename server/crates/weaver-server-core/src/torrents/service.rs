@@ -19,7 +19,7 @@ use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::core::{Id20, Id32, InfoHashes};
 use weaver_torrent::limits::LimitsConfig;
 use weaver_torrent::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, Checkpoint, Identity, Magnet,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, BF, Checkpoint, Identity, Magnet,
     ManagedTorrent, PeerConnectionOptions, ResumePeers, Session, SslIdentity, TorrentTotals,
     TorrentVersion, TrackerAnnounce, torrent_from_bytes, tracker::Tracker,
 };
@@ -1049,6 +1049,9 @@ struct Live {
     // Where a move goes, while it waits or is under way; the job does the
     // moving.
     moving: Option<Moving>,
+    // How many pieces had passed their check in seed mode when they were
+    // last kept.
+    seed_verified: usize,
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
@@ -1148,6 +1151,7 @@ impl Live {
             speeds: (0, 0),
             peers: (0, 0, 0),
             moving: None,
+            seed_verified: 0,
             file_have: Vec::new(),
             kept_pieces: 0,
             failed: None,
@@ -3442,6 +3446,18 @@ impl TorrentService {
         let (have, seed_mode) = have;
         apply_initial_have(&mut options, have);
         options.seed_mode = seed_mode;
+        // The pieces that passed their check in seed mode before are passed
+        // again (libtorrent restores `verified_pieces` on a seed-mode add).
+        // Lost, they are checked again as a peer asks for them.
+        if seed_mode {
+            options.seed_verified = match self.inner.db.torrent_seed_verified(job_id) {
+                Ok(verified) => verified.map(|bytes| BF::from_boxed_slice(bytes.into_boxed_slice())),
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read the pieces a torrent checked in seed mode");
+                    None
+                }
+            };
+        }
         let added = session
             .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
             .await;
@@ -4657,8 +4673,29 @@ impl TorrentService {
                     && !attached.handle.seed_mode()
                 {
                     torrent.record.seed_mode = false;
+                    torrent.seed_verified = 0;
                     if let Err(error) = self.inner.db.clear_torrent_seed_mode(torrent.record.job_id) {
                         tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not record that a torrent left seed mode");
+                    }
+                }
+                // Still in it: the pieces that passed since they were last
+                // kept are kept, so a restart serves them without a second
+                // check (libtorrent saves `verified_pieces` in resume data).
+                if torrent.record.seed_mode
+                    && let Some(attached) = &torrent.attached
+                    && let Some(verified) = attached.handle.seed_verified()
+                    && verified.count_ones() > torrent.seed_verified
+                {
+                    let count = verified.count_ones();
+                    match self
+                        .inner
+                        .db
+                        .set_torrent_seed_verified(torrent.record.job_id, verified.as_raw_slice())
+                    {
+                        Ok(_) => torrent.seed_verified = count,
+                        Err(error) => {
+                            tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not keep the pieces a torrent checked in seed mode");
+                        }
                     }
                 }
                 let reading = torrent.reading(now);

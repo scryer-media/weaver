@@ -577,10 +577,43 @@ impl Database {
     }
 
     // The torrent's session left seed mode: from here its pieces are what
-    // its job has.
+    // its job has, and none needs the check it passed in seed mode kept.
     pub fn clear_torrent_seed_mode(&self, job_id: JobId) -> Result<bool, StateError> {
         let args = vec![SqlArg::Bool(false), SqlArg::I64(stored(job_id.0)?)];
-        self.set_torrent_column("seed_mode", args)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET seed_mode = {}, seed_verified = NULL WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The pieces that passed their check in seed mode, a bitfield as the
+    // wire's: the first piece the high bit of the first byte (libtorrent's
+    // `verified_pieces` in resume data).
+    pub fn set_torrent_seed_verified(&self, job_id: JobId, pieces: &[u8]) -> Result<bool, StateError> {
+        let args = vec![SqlArg::OptBytes(Some(pieces.to_vec())), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("seed_verified", args)
+    }
+
+    // The pieces [`Self::set_torrent_seed_verified`] last kept; None when it
+    // kept none.
+    pub fn torrent_seed_verified(&self, job_id: JobId) -> Result<Option<Vec<u8>>, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT seed_verified FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            Ok(row.map(|row| row.opt_bytes("seed_verified")).transpose()?.flatten())
+        })
     }
 
     // The torrent moved where it was to move once complete, or will not.

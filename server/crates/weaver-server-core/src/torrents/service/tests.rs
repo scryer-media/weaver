@@ -7445,6 +7445,49 @@ async fn a_torrent_added_with_relative_paths_keeps_them_absolute() {
     rig.service.stop().await;
 }
 
+// libtorrent's `verified_pieces` in resume data: a torrent still in seed mode
+// after a restart takes back the pieces that passed their check before, and
+// serves them without a second one; leaving seed mode forgets them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_mode_torrent_keeps_its_checked_pieces_through_a_restart() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("seeded");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+    let (job_id, _) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            seed_mode: true,
+            ..Placement::default()
+        },
+    )
+    .await;
+    assert_eq!(rig.db.torrent_seed_verified(job_id).unwrap(), None);
+    // Pieces 0 and 2 of 4 passed, as the running tick keeps them.
+    let passed = [0b1010_0000u8];
+    rig.db.set_torrent_seed_verified(job_id, &passed).unwrap();
+    rig.service.stop().await;
+
+    let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&restarted).await;
+    let handle = handle_of(&restarted, job_id).await;
+    assert!(handle.seed_mode());
+    let verified = handle.seed_verified().unwrap();
+    assert_eq!(verified.iter_ones().collect::<Vec<_>>(), [0, 2]);
+    restarted.tick().await;
+    assert_eq!(rig.db.torrent_seed_verified(job_id).unwrap(), Some(passed.to_vec()));
+
+    rig.db.clear_torrent_seed_mode(job_id).unwrap();
+    assert_eq!(rig.db.torrent_seed_verified(job_id).unwrap(), None);
+    assert!(!rig.db.get_torrent(job_id).unwrap().unwrap().seed_mode);
+    restarted.stop().await;
+}
+
 // libtorrent `torrent_flags::seed_mode`, as qBittorrent `seedMode` sets it: a
 // torrent whose files are complete where it is added seeds them at once,
 // and its trackers hear it downloaded nothing, as they first hear of it and

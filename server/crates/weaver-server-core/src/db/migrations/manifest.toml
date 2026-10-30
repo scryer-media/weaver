@@ -1264,3 +1264,20 @@ kind = "sql"
 file = "migrations/0095_torrent_queue_position/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 96
+description = "a torrent in seed mode keeps the pieces that passed their check"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0096_torrent_seed_verified/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0096_torrent_seed_verified/postgres.sql"
+engine = "postgres"
+scope = "all"
