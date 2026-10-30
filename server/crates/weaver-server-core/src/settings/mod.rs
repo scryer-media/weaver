@@ -10,6 +10,7 @@ pub mod record;
 pub mod repository;
 mod schedules;
 pub mod service;
+pub mod tracker_file;
 
 pub use model::{
     BlocklistSource, BufferPoolOverrides, Client, Config, DeliveryNamingOverrides,
