@@ -9,8 +9,11 @@
 // under.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::deliver::Provenance;
+use crate::evidence::Algorithm;
+use crate::marks::Marked;
 use crate::object::ObjectId;
 use crate::recovery::Recovery;
 use crate::volume::ByteRange;
@@ -38,9 +41,20 @@ pub struct Member {
     pub closed: bool,
     // The CRC32 its object's headers state for its bytes, when they do.
     pub crc32: Option<u32>,
+    // Its front came: clean bytes from offset zero were once in hand, so
+    // more than its name placed it, whether or not the front is kept now.
+    // Only a retraction, which starts the member over, takes it back.
+    pub fronted: bool,
 }
 
 impl Member {
+    // The kind of digest its stated check is of: what a level that judges
+    // the member folds as its bytes pass. A member that states no check
+    // needs none, and nothing is folded for it.
+    pub fn check(&self) -> Option<Algorithm> {
+        self.crc32.map(|_| Algorithm::Crc32)
+    }
+
     pub fn is_leaf(&self) -> bool {
         self.bound_to.is_none()
     }
@@ -124,19 +138,27 @@ impl Coverage {
     // it would mend.
     pub fn damaged(&self, range: ByteRange) -> bool {
         self.overlapping(range)
-            .any(|run| run.provenance == Provenance::Damaged)
+            .any(|run| run.provenance.is_damaged())
     }
 
     pub fn damaged_ranges(&self) -> impl Iterator<Item = ByteRange> + '_ {
         self.runs
             .values()
-            .filter(|run| run.provenance == Provenance::Damaged)
+            .filter(|run| run.provenance.is_damaged())
             .map(|run| run.range)
     }
 
+    // The runs `range` reaches, found from the one at or before its start,
+    // so a member's every arrival reads only the runs it lands on.
     pub fn overlapping(&self, range: ByteRange) -> impl Iterator<Item = &Run> {
+        let from = self
+            .runs
+            .range(..=range.start)
+            .next_back()
+            .map_or(range.start, |(start, _)| *start);
         self.runs
-            .values()
+            .range(from..range.end.max(from))
+            .map(|(_, run)| run)
             .filter(move |run| run.range.intersect(range).is_some())
     }
 
@@ -202,10 +224,13 @@ impl Coverage {
     }
 }
 
-// The members of one object, and the names they are written under.
+// The members of one object, and the names they are written under. Every
+// way to change a member's record marks it, as does every change to what
+// the tree keeps of it beside the record, so a snapshot reads again only the
+// members marked since it read last.
 #[derive(Debug, Default)]
 pub struct Namespace {
-    members: BTreeMap<MemberId, Member>,
+    members: Marked<MemberId, Member>,
     next: u32,
     // The front of each member, up to FIRST_BYTES: what a recovery object
     // recognises an obfuscated member by. Kept apart from the members so a
@@ -230,7 +255,15 @@ pub struct Namespace {
 struct Front {
     bytes: Vec<u8>,
     arrived: Coverage,
+    // Which write left the front as it is: drawn from one sequence every
+    // namespace shares, so no two writes anywhere carry the same stamp. A
+    // recovery object that moves between namespaces, or outlives one, never
+    // mistakes another front for one it read.
+    stamp: u64,
 }
+
+// The stamps fronts are written under. Zero is no front.
+static FRONT_WRITES: AtomicU64 = AtomicU64::new(1);
 
 // How much of a member's front the namespace keeps. PAR2 identifies a file
 // by the MD5 of its first 16 KiB, and nothing needs more.
@@ -241,8 +274,13 @@ impl Namespace {
         Self::default()
     }
 
+    // The member's posted length may not be its own: a reader of the member
+    // learns it as it learns any change to it.
     pub fn mark_length_uncertain(&mut self, member: MemberId) {
-        self.uncertain_lengths.insert(self.resolve(member));
+        let member = self.resolve(member);
+        if self.uncertain_lengths.insert(member) {
+            self.members.mark(member);
+        }
     }
 
     pub fn length_uncertain(&self, member: MemberId) -> bool {
@@ -265,6 +303,7 @@ impl Namespace {
                 coverage: Coverage::new(),
                 closed: false,
                 crc32: None,
+                fronted: false,
             },
         );
         id
@@ -284,6 +323,23 @@ impl Namespace {
 
     pub fn get_mut(&mut self, member: MemberId) -> Option<&mut Member> {
         self.members.get_mut(&member)
+    }
+
+    // The member's rows changed by what the tree keeps of it beside its
+    // record: its owner, whether it waits on one, what it was given up as.
+    pub fn mark(&mut self, member: MemberId) {
+        self.members.mark(member);
+    }
+
+    // The generation of the members' marks: a change to one marks it under
+    // a later one.
+    pub fn generation(&self) -> u64 {
+        self.members.marks().at()
+    }
+
+    // The members marked since generation `at`, one gone since among them.
+    pub fn changed_since(&self, at: u64) -> impl Iterator<Item = MemberId> + '_ {
+        self.members.marks().since(at)
     }
 
     // The members, each once: a further posting of one is not listed.
@@ -373,21 +429,26 @@ impl Namespace {
     }
 
     // `copy` is another posting of `into`: from now on its bytes are
-    // `into`'s, and it keeps only its own record of what arrived under its
-    // name. A member that closed before stays closed: what the copy brings
-    // after mends it, as a repair would.
-    pub fn fold(&mut self, copy: MemberId, into: MemberId) -> bool {
+    // `into`'s, and its own record holds what `into` took of it, which is
+    // nothing yet. What it recorded while it was a member of its own comes
+    // back, each run with how it arrived: those bytes go down again as
+    // `into`'s, and where `into` holds them clean already they were never
+    // the copy's to give. A member that closed before stays closed: what
+    // the copy brings after mends it, as a repair would.
+    pub fn fold(&mut self, copy: MemberId, into: MemberId) -> Option<Coverage> {
         if !self.folds(copy, into) {
-            return false;
+            return None;
         }
         if self.members.get(&into).is_some_and(|record| record.closed) {
             self.ended.insert(into);
         }
-        if self.uncertain_lengths.remove(&copy) {
-            self.uncertain_lengths.insert(into);
+        if self.uncertain_lengths.remove(&copy) && self.uncertain_lengths.insert(into) {
+            self.members.mark(into);
         }
         self.copies.insert(copy, into);
-        true
+        self.members
+            .get_mut(&copy)
+            .map(|record| std::mem::take(&mut record.coverage))
     }
 
     // A fold a checkpoint recorded. Whether the member's own posting had
@@ -400,6 +461,7 @@ impl Namespace {
             && !self.copies.contains_key(&into);
         if folds {
             self.copies.insert(copy, into);
+            self.members.mark(copy);
         }
         folds
     }
@@ -447,51 +509,75 @@ impl Namespace {
 
     // Bytes of `posting` arrived over `range` with `provenance`. The
     // posting records them, and the member it is takes them except where
-    // they are damaged and another posting brought those bytes clean, or
-    // its own record already answers them: a clean byte replaces a damaged
-    // one or a hole, whichever posting brings it, a damaged byte never
-    // replaces a clean one another posting brought, and damage never takes
-    // back a repair. Returns the member and the parts of `range` it took,
-    // in order.
+    // another posting brought those bytes first, or its own record already
+    // answers them: the first copy, clean or refuted, stands against every
+    // other posting's copy but a repair, a repair stands against everything
+    // but a repair, and anything replaces other damage or a hole. What it takes
+    // lands as it came, except under a checksum's verdict, which stands
+    // over the bytes it judged until a repair. Returns the member and the
+    // parts of `range` it took, in order, each with what it landed as.
     pub fn arrive(
         &mut self,
         posting: MemberId,
         range: ByteRange,
         provenance: Provenance,
-    ) -> (MemberId, Vec<ByteRange>) {
+    ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
         let (member, taken) = self.taking(posting, range, provenance);
-        if posting != member
-            && let Some(copy) = self.members.get_mut(&posting)
-        {
-            copy.coverage.write(range, provenance);
-        }
-        if let Some(record) = self.members.get_mut(&member) {
-            for part in &taken {
-                record.coverage.write(*part, provenance);
+        // A further posting records what the member took of it: bytes the
+        // first copy answered were never its, and say nothing of it.
+        let postings: &[MemberId] = if posting == member {
+            &[member]
+        } else {
+            &[posting, member]
+        };
+        for id in postings {
+            if let Some(record) = self.members.get_mut(id) {
+                for &(part, landed) in &taken {
+                    record.coverage.write(part, landed);
+                }
             }
         }
         (member, taken)
     }
 
-    // The same acceptance decision used by arrive, before evidence is fed.
+    // The same acceptance decision used by arrive, before evidence is fed:
+    // the parts of `range` the member takes, each with what it lands as.
     pub fn taking(
         &self,
         posting: MemberId,
         range: ByteRange,
         provenance: Provenance,
-    ) -> (MemberId, Vec<ByteRange>) {
+    ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
         let member = self.resolve(posting);
-        let taken = if provenance.is_verified() {
-            vec![range]
-        } else {
-            gaps(range, &self.standing(posting, member, range, provenance))
+        let held = self.members.get(&member).map(|record| &record.coverage);
+        let mut taken: Vec<(ByteRange, Provenance)> = Vec::new();
+        let mut take = |piece: ByteRange, landed: Provenance| match taken.last_mut() {
+            Some((last, was)) if last.end == piece.start && *was == landed => last.end = piece.end,
+            _ => taken.push((piece, landed)),
         };
+        for part in gaps(range, &self.standing(posting, member, range, provenance)) {
+            let mut at = part.start;
+            for run in held.into_iter().flat_map(|held| held.overlapping(part)) {
+                let Some(piece) = run.range.intersect(part) else {
+                    continue;
+                };
+                if piece.start > at {
+                    take(ByteRange::new(at, piece.start), provenance);
+                }
+                take(piece, run.provenance.landing(provenance));
+                at = piece.end;
+            }
+            if at < part.end {
+                take(ByteRange::new(at, part.end), provenance);
+            }
+        }
         (member, taken)
     }
 
     // What of `range` stands against bytes of `posting` arriving with
-    // `provenance`, which is not verified: what another posting brought
-    // clean, and what the member's own record answers.
+    // `provenance`: what another posting brought first, against any copy
+    // but a repair, since the first copy stands, and what the member's own
+    // record answers.
     fn standing(
         &self,
         posting: MemberId,
@@ -499,7 +585,12 @@ impl Namespace {
         range: ByteRange,
         provenance: Provenance,
     ) -> Coverage {
-        let mut standing = self.clean_elsewhere(posting, member, range);
+        let mut standing = match provenance {
+            Provenance::Repaired => Coverage::new(),
+            Provenance::Fresh | Provenance::Damaged | Provenance::Refuted => {
+                self.first_elsewhere(posting, member, range)
+            }
+        };
         if let Some(record) = self.members.get(&member) {
             for run in record.coverage.overlapping(range) {
                 if run.provenance.answers(provenance)
@@ -513,10 +604,11 @@ impl Namespace {
     }
 
     // What of `range` a posting of the member other than `posting` brought
-    // clean. A further posting's own record says it of itself; the
-    // member's own posting is whatever the member holds clean that
-    // `posting` did not bring.
-    fn clean_elsewhere(&self, posting: MemberId, member: MemberId, range: ByteRange) -> Coverage {
+    // first. A further posting's own record says what it brought clean; the
+    // member's own posting is whatever the member holds that `posting` did
+    // not bring, but damage: a copy a checksum refuted is still the first
+    // copy, and only a repair displaces it.
+    fn first_elsewhere(&self, posting: MemberId, member: MemberId, range: ByteRange) -> Coverage {
         let mut clean = Coverage::new();
         for copy in self.copies_of(member).filter(|copy| copy.id != posting) {
             clean_within(&copy.coverage, range, &mut clean);
@@ -526,7 +618,13 @@ impl Namespace {
                 (self.members.get(&member), self.members.get(&posting))
         {
             let mut held = Coverage::new();
-            clean_within(&record.coverage, range, &mut held);
+            for run in record.coverage.overlapping(range) {
+                if run.provenance != Provenance::Damaged
+                    && let Some(piece) = run.range.intersect(range)
+                {
+                    held.write(piece, Provenance::Fresh);
+                }
+            }
             let mut brought = Coverage::new();
             clean_within(&own.coverage, range, &mut brought);
             for run in brought.runs() {
@@ -626,6 +724,7 @@ impl Namespace {
             found.length = None;
             found.closed = false;
             found.crc32 = None;
+            found.fronted = false;
         }
         self.ended.remove(&member);
         self.first_bytes.remove(&member);
@@ -674,23 +773,47 @@ impl Namespace {
         front
             .arrived
             .write(ByteRange::new(start as u64, end as u64), provenance);
+        front.stamp = FRONT_WRITES.fetch_add(1, Ordering::Relaxed);
+        if !self.first_bytes(member).is_empty()
+            && let Some(record) = self.members.get_mut(&member)
+        {
+            record.fronted = true;
+        }
     }
 
     // The member's front: what arrived contiguous from offset zero, at most
     // FIRST_BYTES, because a front with a hole in it identifies nothing,
     // and damage says nothing of what the member is.
     pub fn first_bytes(&self, member: MemberId) -> &[u8] {
+        self.stamped_front(member).1
+    }
+
+    // The member's front with the stamp of the write that left it so: the
+    // same stamp is the same front, and zero is none. Fronts are not kept
+    // across a restart, so a restored front comes again under a new stamp.
+    pub fn stamped_front(&self, member: MemberId) -> (u64, &[u8]) {
         let Some(front) = self.first_bytes.get(&member) else {
-            return &[];
+            return (0, &[]);
         };
         let mut reached = 0;
         for run in front.arrived.runs() {
-            if run.range.start != reached || run.provenance == Provenance::Damaged {
+            if run.range.start != reached || run.provenance.is_damaged() {
                 break;
             }
             reached = run.range.end;
         }
-        &front.bytes[..usize::try_from(reached).unwrap_or(0).min(front.bytes.len())]
+        let kept = usize::try_from(reached).unwrap_or(0).min(front.bytes.len());
+        (front.stamp, &front.bytes[..kept])
+    }
+
+    // The member's front came once and is not in hand: a restart kept the
+    // record of it, not its bytes. `Some(false)` while it comes again,
+    // `Some(true)` once its first byte is lost, `None` when its front is in
+    // hand or never came.
+    pub fn front_away(&self, member: MemberId) -> Option<bool> {
+        let record = self.members.get(&member)?;
+        (record.fronted && self.first_bytes(member).is_empty())
+            .then(|| record.coverage.damaged(ByteRange::new(0, 1)))
     }
 
     // The bytes the namespace keeps in memory for the record `member`: the
@@ -785,6 +908,13 @@ mod tests {
             .collect()
     }
 
+    fn landed(pieces: &[(u64, u64, Provenance)]) -> Vec<(ByteRange, Provenance)> {
+        pieces
+            .iter()
+            .map(|&(start, end, provenance)| (ByteRange::new(start, end), provenance))
+            .collect()
+    }
+
     #[test]
     fn adjacent_runs_of_one_provenance_merge() {
         let mut coverage = Coverage::new();
@@ -855,7 +985,10 @@ mod tests {
         namespace.arrive(member, ByteRange::new(0, 30), Provenance::Damaged);
         namespace.arrive(member, ByteRange::new(10, 20), Provenance::Repaired);
         let (_, taken) = namespace.arrive(member, ByteRange::new(0, 30), Provenance::Damaged);
-        assert_eq!(taken, vec![ByteRange::new(0, 10), ByteRange::new(20, 30)]);
+        assert_eq!(
+            taken,
+            landed(&[(0, 10, Provenance::Damaged), (20, 30, Provenance::Damaged)])
+        );
         assert_eq!(
             runs(&namespace.get(member).unwrap().coverage),
             vec![
@@ -865,7 +998,200 @@ mod tests {
             ]
         );
         let (_, taken) = namespace.arrive(member, ByteRange::new(5, 25), Provenance::Fresh);
-        assert_eq!(taken, vec![ByteRange::new(5, 25)]);
+        assert_eq!(
+            taken,
+            landed(&[(5, 10, Provenance::Fresh), (20, 25, Provenance::Fresh)])
+        );
+    }
+
+    #[test]
+    fn a_repair_replaces_damaged_and_verified_bytes_alike() {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(30));
+        namespace.arrive(member, ByteRange::new(0, 10), Provenance::Fresh);
+        namespace.arrive(member, ByteRange::new(10, 20), Provenance::Damaged);
+        let (_, taken) = namespace.arrive(member, ByteRange::new(5, 15), Provenance::Repaired);
+        assert_eq!(taken, landed(&[(5, 15, Provenance::Repaired)]));
+        let (_, taken) = namespace.arrive(member, ByteRange::new(0, 30), Provenance::Repaired);
+        assert_eq!(taken, landed(&[(0, 30, Provenance::Repaired)]));
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![(0, 30, Provenance::Repaired)]
+        );
+    }
+
+    // A member and a further posting of it, folded: whichever posting brings
+    // clean bytes first, they stand against the other, and each posting's
+    // own bytes coming again are taken again.
+    fn posted_twice() -> (Namespace, MemberId, MemberId) {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(40));
+        let copy = namespace.announce("ember.copy", Some(40));
+        for posting in [member, copy] {
+            namespace.keep_first_bytes(posting, 0, &[7; 40], Provenance::Fresh);
+            namespace.arrive(posting, ByteRange::new(30, 40), Provenance::Fresh);
+        }
+        let before = namespace.fold(copy, member).expect("the fronts agree");
+        assert_eq!(runs(&before), vec![(30, 40, Provenance::Fresh)]);
+        assert!(
+            namespace
+                .get(copy)
+                .unwrap()
+                .coverage
+                .runs()
+                .next()
+                .is_none()
+        );
+        (namespace, member, copy)
+    }
+
+    // A posting folded after bytes of it came while it was a member of its
+    // own: they go down again as the member's, and where the member holds
+    // them clean already the first copy stands, since the member never took
+    // them from the copy.
+    #[test]
+    fn a_folded_postings_earlier_bytes_meet_the_first_copy() {
+        let (mut namespace, member, copy) = posted_twice();
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(30, 40), Provenance::Fresh);
+        assert!(taken.is_empty(), "{taken:?}");
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(0, 10), Provenance::Fresh);
+        assert_eq!(taken, landed(&[(0, 10, Provenance::Fresh)]));
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![(0, 10, Provenance::Fresh), (30, 40, Provenance::Fresh)]
+        );
+    }
+
+    #[test]
+    fn the_first_clean_copy_stands_until_a_repair_or_damage_displaces_it() {
+        let (mut namespace, member, copy) = posted_twice();
+        namespace.arrive(member, ByteRange::new(0, 20), Provenance::Fresh);
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(10, 30), Provenance::Fresh);
+        assert_eq!(taken, landed(&[(20, 30, Provenance::Fresh)]));
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(0, 10), Provenance::Fresh);
+        assert!(taken.is_empty(), "{taken:?}");
+        let (_, taken) = namespace.arrive(member, ByteRange::new(20, 30), Provenance::Fresh);
+        assert!(taken.is_empty(), "the copy brought them first: {taken:?}");
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(20, 30), Provenance::Fresh);
+        assert_eq!(
+            taken,
+            landed(&[(20, 30, Provenance::Fresh)]),
+            "its own bytes again"
+        );
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(0, 10), Provenance::Damaged);
+        assert!(taken.is_empty(), "{taken:?}");
+    }
+
+    // A first copy that was wrong, then a recovery set's repair of it: the
+    // repair takes the range, and a further posting's clean copy after it
+    // takes nothing.
+    #[test]
+    fn a_recovery_proof_displaces_the_first_copy() {
+        let (mut namespace, member, copy) = posted_twice();
+        namespace.arrive(member, ByteRange::new(0, 30), Provenance::Fresh);
+        let (_, taken) = namespace.arrive(member, ByteRange::new(5, 15), Provenance::Repaired);
+        assert_eq!(taken, landed(&[(5, 15, Provenance::Repaired)]));
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(0, 30), Provenance::Fresh);
+        assert!(taken.is_empty(), "{taken:?}");
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![
+                (0, 5, Provenance::Fresh),
+                (5, 15, Provenance::Repaired),
+                (15, 40, Provenance::Fresh),
+            ]
+        );
+    }
+
+    // A first copy a checksum refuted is still the first copy: a further
+    // posting's clean copy of those bytes is not written over it, and only
+    // a repair displaces it.
+    #[test]
+    fn a_further_copy_does_not_displace_a_refuted_first_copy() {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(100));
+        let copy = namespace.announce("ember.copy", Some(100));
+        for posting in [member, copy] {
+            namespace.keep_first_bytes(posting, 0, &[7; 10], Provenance::Fresh);
+            namespace.arrive(posting, ByteRange::new(0, 10), Provenance::Fresh);
+        }
+        assert!(namespace.fold(copy, member).is_some());
+        namespace.arrive(member, ByteRange::new(10, 100), Provenance::Fresh);
+        namespace.arrive(member, ByteRange::new(10, 90), Provenance::Refuted);
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(10, 90), Provenance::Fresh);
+        assert!(
+            taken.is_empty(),
+            "the further copy was written over the refuted first copy: {taken:?}"
+        );
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![
+                (0, 10, Provenance::Fresh),
+                (10, 90, Provenance::Refuted),
+                (90, 100, Provenance::Fresh),
+            ]
+        );
+        let (_, taken) = namespace.arrive(member, ByteRange::new(10, 90), Provenance::Repaired);
+        assert_eq!(taken, landed(&[(10, 90, Provenance::Repaired)]));
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![
+                (0, 10, Provenance::Fresh),
+                (10, 90, Provenance::Repaired),
+                (90, 100, Provenance::Fresh),
+            ]
+        );
+    }
+
+    // Bytes a checksum refuted: the same posting's bytes arriving again
+    // land under the verdict, as do bytes it judged that come after it, and
+    // only a repair displaces it.
+    #[test]
+    fn a_fresh_copy_of_its_own_posting_does_not_lift_a_checksum_verdict() {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(100));
+        namespace.arrive(member, ByteRange::new(0, 60), Provenance::Fresh);
+        namespace.arrive(member, ByteRange::new(10, 90), Provenance::Refuted);
+        let (_, taken) = namespace.arrive(member, ByteRange::new(60, 100), Provenance::Fresh);
+        assert_eq!(
+            taken,
+            landed(&[(60, 90, Provenance::Refuted), (90, 100, Provenance::Fresh)]),
+            "bytes the verdict was said of before they came"
+        );
+        let (_, taken) = namespace.arrive(member, ByteRange::new(0, 100), Provenance::Fresh);
+        assert_eq!(
+            taken,
+            landed(&[
+                (0, 10, Provenance::Fresh),
+                (10, 90, Provenance::Refuted),
+                (90, 100, Provenance::Fresh),
+            ])
+        );
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![
+                (0, 10, Provenance::Fresh),
+                (10, 90, Provenance::Refuted),
+                (90, 100, Provenance::Fresh),
+            ]
+        );
+        assert!(
+            namespace
+                .get(member)
+                .unwrap()
+                .coverage
+                .damaged(ByteRange::new(10, 90))
+        );
+        let (_, taken) = namespace.arrive(member, ByteRange::new(10, 90), Provenance::Repaired);
+        assert_eq!(taken, landed(&[(10, 90, Provenance::Repaired)]));
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![
+                (0, 10, Provenance::Fresh),
+                (10, 90, Provenance::Repaired),
+                (90, 100, Provenance::Fresh),
+            ]
+        );
     }
 
     #[test]

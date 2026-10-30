@@ -2,7 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{Delivery, Facts, Kind, MemberId, Object, Provenance, Recovery, VolumeIndex};
+use weaver_graph::{
+    Delivery, Facts, Kind, MemberId, Object, Provenance, Recovery, RestoreError, VolumeIndex,
+};
 
 use super::super::Par3;
 use super::super::facts::{Par3Facts, par3};
@@ -65,7 +67,9 @@ fn deliver(object: &mut Par3, volumes: &[(VolumeIndex, Vec<u8>)], act: Act) {
         Delivery {
             volume: *volume,
             offset,
-            bytes: &bytes[offset as usize..(offset + len) as usize],
+            bytes: &weaver_graph::Evidenced::from(
+                bytes[offset as usize..(offset + len) as usize].to_vec(),
+            ),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
@@ -209,5 +213,26 @@ fn par3_facts_identifying_a_member_it_could_not_are_refused() {
             weaver_graph::Budget::default()
         ),
         Err(weaver_graph::RestoreError::Impossible { .. })
+    ));
+}
+
+// Facts the version before each volume kept its bound name are refused, not
+// read with the name missing.
+#[test]
+fn facts_of_the_previous_version_are_refused() {
+    let body = payload(141, 2048);
+    let files = par3_set("previous", &[("payload.bin", &body)], BLOCK, 1);
+    let mut object = Par3::new(OWN);
+    object.bound(VolumeIndex(0), &files[0].0, &[], None);
+    let mut facts = object.facts();
+    assert_eq!(facts.version, 4);
+    assert!(par3(&facts).is_ok());
+    facts.version = 3;
+    assert!(matches!(
+        par3(&facts),
+        Err(RestoreError::Version {
+            kind: Kind::Par3,
+            version: 3
+        })
     ));
 }

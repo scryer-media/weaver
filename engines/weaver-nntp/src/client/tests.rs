@@ -1755,6 +1755,38 @@ async fn quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
     assert!(selection.quota_blocked.is_none());
 }
 
+// The pipeline asks this on every article it takes, so it reads what each
+// quota published and never takes a quota's lock; the answer is the one the
+// quotas' snapshots give.
+#[tokio::test]
+async fn all_fill_quota_blocked_reads_published_state_without_locking() {
+    let client = quota_selection_client(&[false, false, true], &[(0, None), (1, None)]);
+    let controls: Vec<_> = (0..2)
+        .map(|idx| client.pool.server_transfer_control(ServerId(idx)).unwrap())
+        .collect();
+    let locks_before: Vec<u64> = controls
+        .iter()
+        .map(|control| control.snapshot_lock_count())
+        .collect();
+
+    assert!(client.all_normal_fill_servers_quota_blocked());
+
+    let locks_after: Vec<u64> = controls
+        .iter()
+        .map(|control| control.snapshot_lock_count())
+        .collect();
+    assert_eq!(locks_after, locks_before, "no quota lock per article");
+    assert!(
+        controls
+            .iter()
+            .all(|control| control.snapshot().quota_blocked)
+    );
+
+    // One fill with room left: not every fill is blocked.
+    let client = quota_selection_client(&[false, false], &[(0, None)]);
+    assert!(!client.all_normal_fill_servers_quota_blocked());
+}
+
 #[tokio::test]
 async fn backfill_server_absent_from_ordinary_order() {
     let client = tiered_client(&[false, false, true]);

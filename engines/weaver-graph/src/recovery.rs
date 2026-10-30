@@ -165,7 +165,9 @@ pub trait Recovery {
     }
 
     // Evidence as bytes pass: the namespace calls this for every covered
-    // member on every delivery and every repair.
+    // member on every delivery and every repair. It is where a ruling is
+    // taken back for its input: bytes said again keep it when they are what
+    // it read. Forgetting input says nothing to a set.
     fn feed(&mut self, member: MemberId, segments: &[Segment]);
 
     // Evidence published while acknowledging this object's own repair.
@@ -173,9 +175,6 @@ pub trait Recovery {
     fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
         self.feed(member, segments);
     }
-
-    // A recorded source span could not be restored or has been replaced.
-    fn uncovered(&mut self, _member: MemberId, _range: ByteRange) {}
 
     // The block sizes at whose boundaries `feed`'s checksums have to be cut
     // for this object to vouch for a block without reading it back. A

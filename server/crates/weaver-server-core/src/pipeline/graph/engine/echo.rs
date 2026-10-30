@@ -29,6 +29,9 @@ pub(crate) struct Echoes {
     // The window each engine declares it holds resident while it runs.
     pub(crate) window: u64,
     pub(crate) gate: Option<Arc<RunGate>>,
+    // Whether each run also reads every volume's closed length once it has
+    // echoed its body, as a layout that sizes itself from a volume does.
+    pub(crate) lengths: bool,
 }
 
 // Hold a real worker across actor-side cancellation without relying on its
@@ -73,6 +76,7 @@ impl Builder for Echoes {
             bids: Arc::clone(&self.bids),
             window: self.window,
             gate: self.gate.clone(),
+            lengths: self.lengths,
         }))
     }
 
@@ -93,6 +97,7 @@ struct Echo {
     bids: Arc<Mutex<Vec<Seek>>>,
     window: u64,
     gate: Option<Arc<RunGate>>,
+    lengths: bool,
 }
 
 impl Object for Echo {
@@ -125,10 +130,13 @@ impl Object for Echo {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
-        let (_, part) = name.rsplit_once(".part")?;
-        let part: u32 = part.strip_suffix(".rar")?.parse().ok()?;
-        (part >= 2).then(|| VolumeIndex(part - 1))
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+        name.rsplit_once(".part")
+            .and_then(|(_, part)| part.strip_suffix(".rar")?.parse::<u32>().ok())
+            .filter(|part| *part >= 2)
+            .map(|part| VolumeIndex(part - 1))
+            .into_iter()
+            .collect()
     }
     fn reads_in_order(&self) -> bool {
         true
@@ -146,6 +154,7 @@ impl Engine for Echo {
         Box::new(EchoRun {
             volumes: self.volumes,
             gate: self.gate.clone(),
+            lengths: self.lengths,
         })
     }
     fn bid(&self, reached: VolumeIndex, out: &mut Vec<Seek>) {
@@ -167,6 +176,7 @@ impl Engine for Echo {
 struct EchoRun {
     volumes: u32,
     gate: Option<Arc<RunGate>>,
+    lengths: bool,
 }
 
 impl Extraction for EchoRun {
@@ -202,7 +212,7 @@ impl Extraction for EchoRun {
                 let bytes = Emit::Bytes {
                     member,
                     offset: offset - HEADER as u64,
-                    bytes: Bytes::copy_from_slice(&chunk[..read]),
+                    bytes: Bytes::copy_from_slice(&chunk[..read]).into(),
                     provenance: Provenance::Fresh,
                 };
                 if read > 0 && !sink(bytes) {
@@ -212,6 +222,9 @@ impl Extraction for EchoRun {
                 if read < CHUNK {
                     break;
                 }
+            }
+            if self.lengths {
+                volumes.len(volume);
             }
             if !sink(Emit::MemberClosed(member)) {
                 return;

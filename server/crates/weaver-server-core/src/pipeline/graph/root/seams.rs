@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
 use tracing::warn;
 use weaver_graph::{ByteRange, Segment, VolumeIndex};
 
@@ -147,37 +146,32 @@ impl Pipeline {
         &mut self,
         segment_id: SegmentId,
         offset: u64,
-        data: &DecodedChunk,
+        data: DecodedChunk,
         intact: bool,
         positioned: bool,
         length: u64,
-        segments: &[weaver_yenc::Segment],
+        declared_end: Option<u64>,
+        segments: Vec<weaver_yenc::Segment>,
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
         let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return false;
         };
-        let decoded = Decoded {
-            volume: VolumeIndex(segment_id.file_id.file_index),
-            ordinal: segment_id.segment_number,
+        let decoded = decoded(
+            segment_id,
             offset,
-            bytes: copy(data),
+            data,
             intact,
             positioned,
-            length: (positioned && length > 0).then_some(length),
-            segments: segments
-                .iter()
-                .map(|segment| Segment {
-                    range: ByteRange::at(segment.file_offset, segment.len),
-                    crc32: segment.crc32,
-                    verified: intact,
-                })
-                .collect(),
-        };
+            length,
+            declared_end,
+            segments,
+        );
         let committed = decoded.bytes.len() as u64;
         let result = graph.intake(decoded, &mut self.graph_status.repairs, limit);
-        if result.is_ok() {
+        // A copy the root dropped committed nothing.
+        if let Ok(true) = result {
             self.metrics
                 .bytes_committed
                 .fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
@@ -185,7 +179,7 @@ impl Pipeline {
                 .segments_committed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.after_graph_result(job_id, result);
+        self.after_graph_result(job_id, result.map(drop));
         true
     }
 
@@ -629,8 +623,36 @@ fn segment(job_id: JobId, volume: VolumeIndex, ordinal: u32) -> SegmentId {
     }
 }
 
-fn copy(data: &DecodedChunk) -> Bytes {
-    let mut bytes = BytesMut::with_capacity(data.len_bytes());
-    data.for_each_slice(|slice| bytes.extend_from_slice(slice));
-    bytes.freeze()
+// A decoded article as the root takes it, by value: the decoder's buffer
+// becomes the delivery's bytes, and its checksums are refiled in the list
+// they came in, so neither is copied.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decoded(
+    segment_id: SegmentId,
+    offset: u64,
+    data: DecodedChunk,
+    intact: bool,
+    positioned: bool,
+    length: u64,
+    declared_end: Option<u64>,
+    segments: Vec<weaver_yenc::Segment>,
+) -> Decoded {
+    Decoded {
+        volume: VolumeIndex(segment_id.file_id.file_index),
+        ordinal: segment_id.segment_number,
+        offset,
+        bytes: data.into_bytes(),
+        intact,
+        positioned,
+        length: (positioned && length > 0).then_some(length),
+        declared_end: declared_end.filter(|_| positioned),
+        segments: segments
+            .into_iter()
+            .map(|segment| Segment {
+                range: ByteRange::at(segment.file_offset, segment.len),
+                crc32: segment.crc32,
+                verified: intact,
+            })
+            .collect(),
+    }
 }

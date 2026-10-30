@@ -46,6 +46,7 @@ enum ProvenanceMirror {
     Fresh,
     Damaged,
     Repaired,
+    Refuted,
 }
 through!(Provenance, ProvenanceMirror);
 

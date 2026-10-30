@@ -23,8 +23,8 @@ mod tests;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, Located, MemberId, Object,
-    Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Why,
+    ByteRange, Coverage, Delivery, Durable, Emit, Evidenced, Extent, Facts, Kind, Located,
+    MemberId, Object, Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Why,
 };
 
 use crate::grid::crc32;
@@ -280,7 +280,7 @@ impl Tar {
     fn route(
         &mut self,
         range: ByteRange,
-        bytes: &[u8],
+        bytes: &Evidenced,
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
@@ -302,7 +302,7 @@ impl Tar {
             out.push(Emit::Bytes {
                 member,
                 offset,
-                bytes: Bytes::copy_from_slice(&bytes[at..at + part.len() as usize]),
+                bytes: bytes.slice(at..at + part.len() as usize),
                 provenance,
             });
             let said = &mut self.members[member.0 as usize];

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::{
     Builder, ByteRange, Delivery, Emit, Extent, Kind, Located, MemberId, NodeId, Object, ObjectId,
-    Placement, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use weaver_model::files::FileRole;
 
@@ -190,6 +190,8 @@ pub(in crate::pipeline::graph) fn decoded(
         intact: true,
         positioned: true,
         length,
+        // A whole part ends where it declares.
+        declared_end: Some(offset + bytes.len() as u64),
         segments: Vec::new(),
     }
 }
@@ -814,6 +816,132 @@ async fn a_lost_article_marks_its_range_damaged() {
     );
 }
 
+// An article that decoded short of where the bytes after it begin, or of
+// the file's declared end for the last, lost the bytes between: they are
+// damage told as a lost article's are, in whichever order the edges came.
+#[test]
+fn a_short_article_loses_its_missing_tail() {
+    let intake = |job: &mut GraphJob, article: Decoded| {
+        job.intake(article, &mut RepairSlots::default(), 1).unwrap();
+    };
+    // Bytes that end `short` of the part `[offset, end)` the header declares.
+    let cut = |ordinal: u32, offset: u64, end: u64, short: u64, length: u64| {
+        let mut article = decoded(
+            0,
+            ordinal,
+            offset,
+            &vec![7; (end - offset - short) as usize],
+            Some(length),
+        );
+        article.intact = false;
+        article.declared_end = Some(end);
+        article
+    };
+    // The last article, short of the declared end.
+    let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100])], Vec::new());
+    intake(&mut job, decoded(0, 0, 0, &[7; 100], Some(200)));
+    intake(&mut job, cut(1, 100, 200, 40, 200));
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    // The same, the end declared by the first to arrive.
+    let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100])], Vec::new());
+    intake(&mut job, cut(1, 100, 200, 40, 200));
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    intake(&mut job, decoded(0, 0, 0, &[7; 100], Some(200)));
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    // A middle article, before and after the one beyond it.
+    for next_first in [false, true] {
+        let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100, 100])], Vec::new());
+        let short = cut(0, 0, 100, 40, 300);
+        let next = decoded(0, 1, 100, &[7; 100], Some(300));
+        if next_first {
+            intake(&mut job, next);
+            intake(&mut job, short);
+        } else {
+            intake(&mut job, short);
+            intake(&mut job, next);
+        }
+        intake(&mut job, decoded(0, 2, 200, &[7; 100], Some(300)));
+        assert_eq!(
+            damaged_ranges(&job, 0),
+            vec![ByteRange::new(0, 100)],
+            "next_first={next_first}"
+        );
+    }
+}
+
+// A damaged article that decoded 97 bytes past the part end its header
+// declares: those bytes are not its own. The article after it begins where
+// the header said, its bytes stand fresh, and the damage stays inside the
+// damaged article's part, in either order of arrival.
+#[test]
+fn an_overlong_damaged_article_does_not_move_the_next_article() {
+    for next_first in [false, true] {
+        let overlong = {
+            let mut article = decoded(0, 0, 0, &[7; 1097], Some(2000));
+            article.intact = false;
+            article.declared_end = Some(1000);
+            article
+        };
+        let next = decoded(0, 1, 1000, &[9; 1000], Some(2000));
+        let articles = match next_first {
+            true => [next.clone(), overlong.clone()],
+            false => [overlong.clone(), next.clone()],
+        };
+        let mut root = ArticleRoot::new(&[file("carrier.bin", &[1000, 1000])]);
+        let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[1000, 1000])], Vec::new());
+        for article in articles {
+            root.receive(article.clone());
+            job.intake(article, &mut RepairSlots::default(), 1).unwrap();
+        }
+        assert!(
+            root.map.known_in(0, 0).contains(&(1, 1000)),
+            "next_first={next_first}: {:?}",
+            root.map.known_in(0, 0)
+        );
+        assert_eq!(
+            root.map.arrived_ranges(VolumeIndex(0)),
+            vec![
+                (0, ByteRange::new(0, 1000)),
+                (1, ByteRange::new(1000, 2000))
+            ],
+            "next_first={next_first}"
+        );
+        let namespace = job.tree().namespace(NodeId::ROOT).unwrap();
+        let member = namespace.get(MemberId(0)).unwrap();
+        let fresh: Vec<_> = member
+            .coverage
+            .overlapping(ByteRange::new(1000, 2000))
+            .map(|run| (run.range, run.provenance))
+            .collect();
+        assert_eq!(
+            fresh,
+            vec![(ByteRange::new(1000, 2000), Provenance::Fresh)],
+            "next_first={next_first}"
+        );
+        assert_eq!(
+            damaged_ranges(&job, 0),
+            vec![ByteRange::new(0, 1000)],
+            "next_first={next_first}"
+        );
+    }
+}
+
+// A damaged article that decoded 100 bytes short still says, by its
+// header, where the next article begins.
+#[test]
+fn a_short_damaged_article_still_declares_where_the_next_one_starts() {
+    let mut article = decoded(0, 0, 0, &[7; 900], Some(2000));
+    article.intact = false;
+    article.declared_end = Some(1000);
+    let mut root = ArticleRoot::new(&[file("carrier.bin", &[1000, 1000])]);
+    root.receive(article);
+    assert!(
+        root.map.known_in(0, 0).contains(&(1, 1000)),
+        "{:?}",
+        root.map.known_in(0, 0)
+    );
+}
+
 #[tokio::test]
 async fn a_damaged_yenc_article_is_delivered_as_damaged() {
     let (mut job, dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
@@ -870,6 +998,214 @@ async fn a_damaged_yenc_article_is_delivered_as_damaged() {
         damaged_ranges(&pipeline.graph_jobs[&job_id], 0),
         vec![ByteRange::new(0, 64)]
     );
+}
+
+// The decoder's article in the lane's shape: one buffer, and its checksums
+// at a block boundary inside it.
+fn lane_article() -> (DecodedChunk, *const u8, Vec<weaver_yenc::Segment>) {
+    let body: Box<[u8]> = (0..700u32).map(|i| (i % 251) as u8).collect();
+    let buffer = body.as_ptr();
+    let checksums = vec![
+        weaver_yenc::Segment {
+            file_offset: 0,
+            len: 400,
+            crc32: 0x0a,
+        },
+        weaver_yenc::Segment {
+            file_offset: 400,
+            len: 300,
+            crc32: 0x0b,
+        },
+    ];
+    (DecodedChunk::from(vec![body]), buffer, checksums)
+}
+
+fn checksum(start: u64, end: u64, crc32: u32, verified: bool) -> weaver_graph::Segment {
+    weaver_graph::Segment {
+        range: ByteRange::new(start, end),
+        crc32,
+        verified,
+    }
+}
+
+// The root delivers the decoder's own buffer: no article is copied on its
+// way in, and the checksums are refiled in the list they came in.
+#[test]
+fn a_decoded_article_reaches_the_root_in_the_decoder_s_buffer() {
+    let (data, buffer, checksums) = lane_article();
+    let list = checksums.as_ptr() as usize;
+    let article = super::seams::decoded(
+        segment_id(JobId(1), 0, 0),
+        0,
+        data,
+        true,
+        true,
+        700,
+        Some(700),
+        checksums,
+    );
+    assert_eq!(article.bytes.as_ptr(), buffer, "the buffer was copied");
+    assert_eq!(
+        article.segments.as_ptr() as usize,
+        list,
+        "the checksums were collected into a new list"
+    );
+
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[700])]);
+    let arrival = root.receive(article).expect("the first copy stands");
+    assert_eq!(arrival.bytes.as_ptr(), buffer);
+    assert_eq!(arrival.bytes.len(), 700);
+    assert_eq!(arrival.provenance, Provenance::Fresh);
+    assert_eq!(
+        kept_checksums(&root, ByteRange::new(0, 700)),
+        vec![checksum(0, 400, 0x0a, true), checksum(400, 700, 0x0b, true)]
+    );
+}
+
+// Bytes past the declared end are cut off as a shorter view of the same
+// buffer, with the checksum that reaches them.
+#[test]
+fn a_declared_end_cuts_the_decoder_s_buffer_without_a_copy() {
+    let (data, buffer, checksums) = lane_article();
+    let article = super::seams::decoded(
+        segment_id(JobId(1), 0, 0),
+        0,
+        data,
+        true,
+        true,
+        700,
+        Some(500),
+        checksums,
+    );
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[700])]);
+    let arrival = root.receive(article).expect("the first copy stands");
+    assert_eq!(arrival.bytes.as_ptr(), buffer, "the cut copied the buffer");
+    assert_eq!(arrival.bytes.len(), 500);
+    assert_eq!(arrival.provenance, Provenance::Damaged);
+    assert_eq!(
+        kept_checksums(&root, ByteRange::new(0, 700)),
+        vec![checksum(0, 400, 0x0a, false)]
+    );
+}
+
+// The checksums the root keeps for a volume's range.
+fn kept_checksums(root: &ArticleRoot, range: ByteRange) -> Vec<weaver_graph::Segment> {
+    use crate::pipeline::graph::namespace::Segments;
+
+    let mut out = Vec::new();
+    root.checksums
+        .segments_for(NodeId::ROOT, VolumeIndex(0), range, &mut out);
+    out
+}
+
+// Two copies of the middle article, both passing their own checksums, with
+// different bytes: the first stands, and the second brings nothing.
+#[tokio::test]
+async fn a_second_valid_copy_of_an_accepted_article_is_not_delivered() {
+    let middle = ByteRange::new(90, 180);
+    let (first, second) = (vec![1u8; 90], vec![2u8; 90]);
+    let copy = |bytes: &[u8], crc32: u32| {
+        with_segments(decoded(0, 1, 90, bytes, Some(270)), &[(90, 180, crc32)])
+    };
+
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    assert!(root.receive(copy(&first, 1)).is_some());
+    assert!(root.receive(copy(&second, 2)).is_none(), "no arrival for B");
+    let kept = kept_checksums(&root, middle);
+    assert_eq!(kept.len(), 1);
+    assert_eq!((kept[0].range, kept[0].crc32), (middle, 1));
+
+    let (mut job, dir, _) = job_with(&[file("plain.bin", &[100, 100, 100])], Vec::new());
+    for article in [
+        decoded(0, 0, 0, &[7; 90], Some(270)),
+        copy(&first, 1),
+        copy(&second, 2),
+        decoded(0, 2, 180, &[9; 90], Some(270)),
+    ] {
+        job.intake(article, &mut RepairSlots::default(), 1).unwrap();
+    }
+    let written = std::fs::read(dir.path().join("plain.bin")).unwrap();
+    assert_eq!(&written[90..180], first.as_slice());
+    assert!(damaged_ranges(&job, 0).is_empty());
+}
+
+// A restart keeps the first intact copy standing: the root's facts say the
+// article arrived and its checksums passed, so a second copy brings
+// nothing, as before the restart. A copy that failed its checksums still
+// stands only until an intact one.
+#[test]
+fn a_duplicate_after_restart_is_dropped_as_before_it() {
+    use super::facts::{Encoded, Parts, decode};
+    let files = [file("plain.bin", &[100, 100, 100])];
+    let copy = |ordinal: u32, byte: u8, crc32: u32, intact: bool| {
+        let offset = u64::from(ordinal) * 90;
+        let mut article = decoded(0, ordinal, offset, &[byte; 90], Some(270));
+        article.intact = intact;
+        article.segments = vec![weaver_graph::Segment {
+            range: ByteRange::at(offset, 90),
+            crc32,
+            verified: intact,
+        }];
+        article
+    };
+    let restarted = |root: &ArticleRoot| {
+        let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
+        let Parts::All(parts) = encoding.parts else {
+            panic!("a fresh encoding is whole");
+        };
+        let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
+        ArticleRoot::restore(&files, &facts).unwrap()
+    };
+
+    let mut root = ArticleRoot::new(&files);
+    assert!(root.receive(copy(1, 1, 1, true)).is_some());
+    assert!(root.receive(copy(2, 3, 3, false)).is_some());
+    let mut root = restarted(&root);
+    assert!(
+        root.receive(copy(1, 2, 2, true)).is_none(),
+        "no arrival for B"
+    );
+    let kept = kept_checksums(&root, ByteRange::new(90, 180));
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].crc32, 1, "the checksums stay A's");
+    let arrival = root
+        .receive(copy(2, 4, 4, true))
+        .expect("an intact copy replaces a damaged one");
+    assert_eq!(arrival.bytes.as_ref(), &[4u8; 90][..]);
+}
+
+// An article fetched again after a seek sent it back: the copy that comes
+// is admitted, with its own checksums.
+#[test]
+fn a_resought_article_replaces_the_rejected_copy() {
+    let middle = ByteRange::new(90, 180);
+    let copy = |byte: u8, crc32: u32| {
+        with_segments(
+            decoded(0, 1, 90, &[byte; 90], Some(270)),
+            &[(90, 180, crc32)],
+        )
+    };
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    assert!(root.receive(copy(1, 1)).is_some());
+    assert!(root.receive(copy(2, 2)).is_none());
+    root.map.unarrive(VolumeIndex(0), 1);
+    let arrival = root.receive(copy(2, 2)).expect("the copy fetched again");
+    assert_eq!(arrival.bytes.as_ref(), &[2u8; 90][..]);
+    let kept = kept_checksums(&root, middle);
+    assert_eq!(kept.len(), 1);
+    assert_eq!((kept[0].range, kept[0].crc32), (middle, 2));
+    // A copy that failed its own checksum stands only until an intact one.
+    let mut damaged = copy(3, 3);
+    damaged.ordinal = 2;
+    damaged.offset = 180;
+    damaged.segments.clear();
+    damaged.intact = false;
+    assert!(root.receive(damaged).is_some());
+    let mut intact = copy(4, 4);
+    intact.ordinal = 2;
+    intact.offset = 180;
+    intact.segments.clear();
+    assert!(root.receive(intact).is_some());
 }
 
 #[test]
@@ -1061,7 +1397,7 @@ fn with_segments(mut article: Decoded, segments: &[(u64, u64, u32)]) -> Decoded 
 }
 
 // Reading only the chunks the root marked gives the encoding of the whole
-// root after every kind of change: arrivals out of order, one again at
+// root after every kind of change: arrivals out of order, one fetched again at
 // another start, two at one start and one of them taken back, checksums
 // that replace others, losses, damage, raises, a length, and a volume
 // placed only in order.
@@ -1093,7 +1429,8 @@ fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
                 &[(1000, 1060, 4)],
             ));
         }),
-        Box::new(|root| {
+        Box::new(move |root| {
+            root.map.unarrive(a, 20);
             root.receive(with_segments(
                 decoded(0, 20, 1100, &[4; 60], None),
                 &[(1100, 1160, 5)],
@@ -1164,6 +1501,114 @@ fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
     let small = changed(40);
     assert!(!small.is_empty() && small.len() <= 3, "{small:?}");
     assert_eq!(changed(400), small);
+}
+
+// Fifty zip volumes of twenty articles each, every article of the first
+// forty-nine in hand and the first of the last.
+fn forty_nine_in_hand() -> (GraphJob, tempfile::TempDir) {
+    let files: Vec<RootFile> = (0..50)
+        .map(|volume| file(&format!("part{volume:02}.zip"), &[100; 20]))
+        .collect();
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    for volume in 0..49 {
+        for ordinal in 0..20 {
+            job.intake(
+                part_article(volume, ordinal),
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+        }
+    }
+    job.intake(part_article(49, 0), &mut RepairSlots::default(), 1)
+        .unwrap();
+    job.seek_round(|_| true).unwrap();
+    (job, dir)
+}
+
+fn part_article(volume: u32, ordinal: u32) -> Decoded {
+    let bytes = match ordinal {
+        0 => zip_front(90),
+        _ => vec![0; 90],
+    };
+    decoded(
+        volume,
+        ordinal,
+        u64::from(ordinal) * 90,
+        &bytes,
+        Some(20 * 90),
+    )
+}
+
+// An arrival asks the root what is still to come, what lost range can be
+// told and which sets to lead, and each is answered from the volumes still
+// open: the forty-nine in hand are never looked at, nor any article.
+#[test]
+fn an_arrival_reads_only_the_volumes_still_open() {
+    let (mut job, _dir) = forty_nine_in_hand();
+    job.article_visits();
+
+    job.intake(part_article(49, 1), &mut RepairSlots::default(), 1)
+        .unwrap();
+    job.seek_round(|_| true).unwrap();
+
+    // The last volume, once each: whether it still waits once the article
+    // is in, whether the payload is still to come for the step's quiet and
+    // for its lend, and which set it leads. No damage is untold.
+    assert_eq!(job.article_visits(), (4, 0));
+}
+
+// A lost article is told from its own volume: the walk for damage visits
+// that volume and reads that article, and once told visits nothing. A
+// restored root files its open articles from the states it is restored
+// with, before anything asks: it tells the loss again, as a restored root
+// tells every loss, and knows which volumes are in hand.
+#[test]
+fn a_lost_article_is_told_from_its_own_volume_alone() {
+    use super::facts::{Encoded, Parts, decode};
+    let files: Vec<RootFile> = (0..50)
+        .map(|volume| file(&format!("part{volume:02}.bin"), &[100; 20]))
+        .collect();
+    let mut root = ArticleRoot::new(&files);
+    for volume in 0..49 {
+        for ordinal in 0..20 {
+            root.receive(part_article(volume, ordinal));
+        }
+    }
+    root.receive(part_article(49, 4));
+    root.receive(part_article(49, 6));
+    root.map.visits();
+
+    root.map.lost(VolumeIndex(49), 5);
+    assert_eq!(
+        root.damage(),
+        vec![(VolumeIndex(49), ByteRange::new(450, 540))]
+    );
+    assert_eq!(root.map.visits(), (1, 1));
+
+    assert_eq!(root.damage(), Vec::new());
+    assert_eq!(root.map.visits(), (0, 0));
+
+    let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
+    let Parts::All(parts) = encoding.parts else {
+        panic!("a fresh encoding is whole");
+    };
+    let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
+    let mut restored = ArticleRoot::restore(&files, &facts).unwrap();
+    assert_eq!(
+        restored.map.coming().collect::<Vec<_>>(),
+        vec![VolumeIndex(49)]
+    );
+    assert!(restored.map.volume_whole(VolumeIndex(48)));
+    assert!(!restored.map.volume_waiting(VolumeIndex(48)));
+    assert!(!restored.map.volume_whole(VolumeIndex(49)));
+    assert!(restored.map.volume_waiting(VolumeIndex(49)));
+    restored.map.visits();
+    assert_eq!(
+        restored.damage(),
+        vec![(VolumeIndex(49), ByteRange::new(450, 540))]
+    );
+    assert_eq!(restored.map.visits(), (1, 1));
 }
 
 // Every job becomes a graph job when its articles are built, and not before.
@@ -1333,21 +1778,27 @@ fn pending_verification_changes_only_the_small_root_record() {
     assert_eq!(done.bytes, first.bytes);
 }
 
+// Facts the version before the root row kept its outstanding checks are
+// refused, not read with none outstanding.
 #[test]
-fn previous_root_facts_without_pending_verification_still_decode() {
-    use super::facts::{Encoded, Parts, decode};
+fn facts_of_the_previous_version_are_refused() {
+    use super::facts::{Encoded, Parts, RootFactsError, decode};
     let root = ArticleRoot::new(&[file("payload.bin", &[70])]);
     let mut encoded = Encoded::default();
-    let encoding = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    let encoding = root.encode(&mut encoded, 9, 0, None, vec![(3, 7)]);
     let Parts::All(parts) = encoding.parts else {
         panic!("first encoding is whole");
     };
-    let mut legacy = encoding.bytes;
+    assert!(decode(encoding.version, &encoding.bytes, &parts).is_ok());
     // Version four was the same MessagePack tuple without the trailing list.
-    assert_eq!(legacy[0], 0x96);
-    assert_eq!(legacy.pop(), Some(0x90));
-    legacy[0] = 0x95;
-    let restored = decode(4, &legacy, &parts).unwrap();
-    assert!(restored.pending_verifications.is_empty());
-    assert_eq!(restored.posted, vec!["payload.bin"]);
+    let mut previous = root
+        .encode(&mut Encoded::default(), 9, 0, None, Vec::new())
+        .bytes;
+    assert_eq!(previous[0], 0x96);
+    assert_eq!(previous.pop(), Some(0x90));
+    previous[0] = 0x95;
+    assert_eq!(
+        decode(4, &previous, &parts),
+        Err(RootFactsError::Version(4))
+    );
 }

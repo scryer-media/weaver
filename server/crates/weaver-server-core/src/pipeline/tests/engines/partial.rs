@@ -1218,23 +1218,23 @@ async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its
 async fn a_7z_whose_last_part_never_arrives_withholds_its_parts_unmapped() {
     let volumes = sevenz_without_its_last_part();
     let scenario = Scenario::new(beside(posts(&volumes)));
+    // The numbered pieces join into one file, and the 7z store beneath it
+    // withholds that file; a piece is never a file of its own.
+    let joined: Vec<u8> = volumes
+        .iter()
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
     run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
             kind: Some("Unpack"),
-            files: with_quill(raw(&volumes)),
+            files: with_quill(vec![file("lantern.7z", Some(joined))]),
             whole: &["quill.bin"],
             damaged: &[],
             unrepaired: &[],
-            withheld: &[
-                ("lantern.7z.001", Why::Unmapped),
-                ("lantern.7z.002", Why::Unmapped),
-            ],
-            refused: &[
-                "kind=sevenz_store member=lantern.7z.001 why=unmapped",
-                "kind=sevenz_store member=lantern.7z.002 why=unmapped",
-            ],
+            withheld: &[("lantern.7z", Why::Unmapped)],
+            refused: &["kind=sevenz_store member=lantern.7z why=unmapped"],
             delivered: &[QUILL],
         },
     )

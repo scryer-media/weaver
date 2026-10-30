@@ -433,11 +433,14 @@ async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_
         let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
         let handle = handle(&pipeline);
         let id = JobId(9207 + index);
-        let spec = minimal_job_state(id, "pause before delivery", PathBuf::new()).spec;
-        let working_dir = insert_active_job(&mut pipeline, id, spec).await;
-        tokio::fs::write(working_dir.join("payload.bin"), b"payload")
-            .await
-            .unwrap();
+        insert_delivered_job(
+            &mut pipeline,
+            id,
+            "pause before delivery",
+            "payload.bin",
+            b"payload",
+        )
+        .await;
         let state = pipeline.jobs.get_mut(&id).unwrap();
         state.status = JobStatus::Extracting;
         state.download_state = crate::DownloadState::Complete;
@@ -481,13 +484,31 @@ async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_
         assert!(pipeline.pending_completion_checks.contains(&id));
         let mut events = handle.subscribe_events();
         pipeline.check_job_completion(id).await;
+        // The released move is in flight, so the wait below has a move to hear.
+        assert!(
+            pipeline.inflight_moves.contains(&id),
+            "{:?}",
+            pipeline.jobs.get(&id).map(|state| &state.status)
+        );
         let done = pipeline.move_done_rx.recv().await.unwrap();
         assert_eq!(done.job_id, id);
         assert!(done.result.is_ok());
         pipeline.handle_move_to_complete_done(done).await;
-        while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCompleted { job_id } if job_id == id)
-        {
-        }
+        let terminal = loop {
+            match events.recv().await.unwrap() {
+                event @ (PipelineEvent::JobCompleted { job_id }
+                | PipelineEvent::JobFailed { job_id, .. })
+                    if job_id == id =>
+                {
+                    break event;
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            matches!(terminal, PipelineEvent::JobCompleted { .. }),
+            "{terminal:?}"
+        );
         assert_eq!(
             pipeline.db.get_job_history(id.0).unwrap().unwrap().status,
             "complete"

@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use sevenz_turbo::AesProperties;
-use weaver_graph::{ByteRange, Emit, Why};
+use weaver_graph::{ByteRange, Emit, Evidenced, Why};
 use zeroize::Zeroizing;
 
 use super::header::{self, Start};
@@ -341,6 +341,7 @@ impl SevenZipStore {
         // folder opened only now has come out, so there is nothing to read.
         if let Some(proof) = self.proof.take() {
             for (range, bytes, provenance) in self.kept.take(proof.range) {
+                let bytes = Evidenced::from(bytes);
                 self.route(range, &bytes, provenance, &mut |_, _| false, out);
             }
         }

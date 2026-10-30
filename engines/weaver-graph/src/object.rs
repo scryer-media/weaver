@@ -387,27 +387,36 @@ pub trait Object: Send + Sync {
     // reads.
     fn bound(&mut self, _volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {}
 
+    // A read-only copy of placement metadata for this kind's engine. The
+    // retiring store retains every byte and inverse map until materialized.
+    fn engine_volume(&self, _volume: VolumeIndex) -> Option<Carried> {
+        None
+    }
+
     // I am a window on recovery data another object found, and this is
-    // what it handed me to read the range by: at my building, and again
-    // each time it hands it anew.
+    // what it handed me to read the range by: at my building, again each
+    // time it hands it anew, and again when I take my node back after a
+    // loan, whether I am the one lent or one rebuilt from its facts.
     fn handed(&mut self, _handed: &Handed) {}
 
     // A new member appeared beside the one I am bound to. Is it one of my
     // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
     // store a piece with no signature of its own by its length. Only an
     // object can say, because only it knows how its volumes chain. Answer
-    // with the volume index the member becomes, its position in the set and
-    // never the order it arrived in, or `None` to let the sniffer decide. A
-    // freshly built object is asked first about the member it was built
-    // for, and `None` makes that member its first volume. The answer only
-    // reads: the volume exists once `bound` says so.
+    // with every volume index the member could become, held or not, its
+    // position in the set and never the order it arrived in, or none to let
+    // the sniffer decide: whether the member is the one holding a place is
+    // the tree's to judge, by fronts, as which of several free places it
+    // takes is. A freshly built object is asked first about the member it
+    // was built for, and none makes that member its first volume. The
+    // answer only reads: the volume exists once `bound` says so.
     fn claim(
         &mut self,
         _name: &str,
         _first_bytes: &[u8],
         _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
-        None
+    ) -> Vec<VolumeIndex> {
+        Vec::new()
     }
 
     // Bytes outrank names, headers outrank links: whether I hold `volume`
@@ -432,6 +441,11 @@ pub trait Object: Send + Sync {
         None
     }
 
+    // Every volume `carried` answers for, as I stand now. I keep them as my
+    // volumes come, go, and come to contribute to an output, so a sibling's
+    // take reads only these, never a volume that routes output.
+    fn carriable(&self, _out: &mut Vec<VolumeIndex>) {}
+
     // A volume I said I give back: what I parsed of it, to travel with the
     // member, or `None` when I keep nothing of it worth carrying or more
     // than an object may carry, and the member is refused instead.
@@ -446,15 +460,16 @@ pub trait Object: Send + Sync {
 
     // A sibling's transferable volume, with its retained front and parse:
     // is it one of mine? The parse outranks the front and name wherever it
-    // says more. This only reads, and never fetches the member again.
+    // says more. It answers as `claim` does. This only reads, and never
+    // fetches the member again.
     fn reclaim(
         &self,
         _name: &str,
         _front: &[u8],
         _length: Option<u64>,
         _carried: &(dyn std::any::Any + Send + Sync),
-    ) -> Option<VolumeIndex> {
-        None
+    ) -> Vec<VolumeIndex> {
+        Vec::new()
     }
 
     // A member I reclaimed is now this volume of mine, and what was parsed

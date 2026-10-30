@@ -240,6 +240,7 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
     let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     // The data first: its segments arrive before anything covers it.
     decode_all(&mut pipeline, job_id, &posts, 0).await;
+    assert!(pipeline.graph_jobs[&job_id].checksums_held(MemberId(0)));
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     // The volume's first article, which is what the sample fetches; the
     // rest stays parked.
@@ -253,6 +254,8 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
     assert_eq!(summaries[0].outcome, Some(RepairOutcome::Clean));
     assert_eq!(job.writer().read_backs(), 0, "the fed segments were enough");
     assert!(job.namespace().is_clean());
+    // The ruling proved the file whole, and its checksums were sealed.
+    assert!(!job.checksums_held(MemberId(0)));
     retire_pipeline_database(pipeline).await;
 }
 

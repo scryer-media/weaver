@@ -115,11 +115,7 @@ exit {exit_code}
 
     let job_id = JobId(10071);
     let job_name = "Late Completion With Live Script";
-    let spec = minimal_job_state(job_id, job_name, PathBuf::new()).spec;
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-    tokio::fs::write(working_dir.join("payload.mkv"), b"payload")
-        .await
-        .unwrap();
+    insert_delivered_job(&mut pipeline, job_id, job_name, "payload.mkv", b"payload").await;
     let destination = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
     pipeline.start_move_to_complete(job_id).await.unwrap();
     settle_inflight_moves(&mut pipeline).await;
@@ -361,16 +357,28 @@ async fn queue_scripts_hold_a_job_without_post_processing_instances() {
             PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone());
 
         let job_id = JobId(10081);
-        let spec = minimal_job_state(job_id, "Queue Scripts Only", PathBuf::new()).spec;
-        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-        tokio::fs::write(working_dir.join("payload.mkv"), b"payload")
+        insert_delivered_job(
+            &mut pipeline,
+            job_id,
+            "Queue Scripts Only",
+            "payload.mkv",
+            b"payload",
+        )
+        .await;
+        // The delivered file raised the job's own queue event; hear it out
+        // first, so whether the terminal pass waits turns on the scripts alone.
+        crate::post_processing::events::wait_for_job_events(&pipeline.db, job_id.0)
             .await
             .unwrap();
         pipeline.start_move_to_complete(job_id).await.unwrap();
         settle_inflight_moves(&mut pipeline).await;
 
         if !with_queue_script {
-            assert!(!pipeline.jobs.contains_key(&job_id));
+            assert!(
+                !pipeline.jobs.contains_key(&job_id),
+                "{:?}",
+                pipeline.jobs.get(&job_id).map(|state| &state.status)
+            );
             let finished = pipeline
                 .finished_jobs()
                 .await
@@ -551,49 +559,9 @@ async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivere
     let job_id = JobId(10072);
     let job_name = "Amber Orchard Restart Window";
     let payload = b"delivered payload".to_vec();
-    let spec = standalone_job_spec(job_name, &[("payload.bin".into(), payload.len() as u32)]);
-    let nzb = format!(
-        r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="fixture" date="0" subject="&quot;payload.bin&quot;"><groups><group>alt.binaries.test</group></groups><segments><segment bytes="{}" number="1">segment-0@example.com</segment></segments></file></nzb>"#,
-        payload.len()
-    );
-    let working_dir = insert_active_job_with_persisted_nzb(
-        &mut pipeline,
-        job_id,
-        spec,
-        crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap(),
-    )
-    .await;
     // The job's one article arrives and the job moves its output.
-    let work = pipeline
-        .jobs
-        .get_mut(&job_id)
-        .unwrap()
-        .articles
-        .active_mut()
-        .unwrap()
-        .download_queue
-        .pop()
-        .unwrap();
-    let raw = encode_article_part("payload.bin", &payload, 1, 1, 1, payload.len() as u64);
-    pipeline.active_downloads += 1;
-    pipeline
-        .handle_download_done(DownloadResult {
-            lane_id: 0,
-            job_id,
-            runtime_generation: 0,
-            segment_id: work.segment_id,
-            data: Ok(DownloadPayload::Raw(raw)),
-            attempts: Vec::new(),
-            lane_observation: None,
-            source_server_idx: None,
-            origin: DownloadResultOrigin::NormalPrimary,
-            retry_count: 0,
-            exclude_servers: Vec::new(),
-            release_connection_slot: true,
-        })
-        .await;
-    drain_decode_results(&mut pipeline, 1).await;
-    hear_graph_mail(&mut pipeline, job_id).await;
+    let working_dir =
+        insert_delivered_job(&mut pipeline, job_id, job_name, "payload.bin", &payload).await;
     pipeline.check_job_completion(job_id).await;
     // The download's queue-script barrier runs no script and lets it on.
     let TerminalPostProcessingEvent::QueueDone(id, result) = pipeline

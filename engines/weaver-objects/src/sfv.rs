@@ -334,16 +334,7 @@ impl Recovery for Sfv {
     }
 
     fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
-        for segment in segments {
-            self.grid.offer(member, WHOLE, segment);
-        }
-    }
-
-    fn uncovered(&mut self, member: MemberId, _range: ByteRange) {
-        self.grid.forget(member);
-        if self.covers(member) {
-            self.outcome = None;
-        }
+        self.grid.offer_all(member, WHOLE, segments);
     }
 
     // One verdict for the whole member: an SFV has no slices.

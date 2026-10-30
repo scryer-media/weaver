@@ -421,28 +421,40 @@ fn claim_names_the_volumes_of_its_own_set_only() {
     let mut engine = named(&["Set.part1.rar"]);
     assert_eq!(
         engine.claim("set.PART2.rar", b"", None),
-        Some(VolumeIndex(1))
+        vec![VolumeIndex(1)]
     );
     assert_eq!(
         engine.claim("set.part10.rar", b"", None),
-        Some(VolumeIndex(9))
+        vec![VolumeIndex(9)]
     );
     assert_eq!(
         engine.claim("set.part01.rar", b"", None),
-        Some(VolumeIndex(0)),
+        vec![VolumeIndex(0)],
         "a volume posted again is that volume"
     );
-    assert_eq!(engine.claim("other.part2.rar", b"", None), None);
-    assert_eq!(engine.claim("set.r00", b"", None), None);
-    assert_eq!(engine.claim("set.par2", b"", None), None);
+    assert_eq!(
+        engine.claim("other.part2.rar", b"", None),
+        Vec::<VolumeIndex>::new()
+    );
+    assert_eq!(
+        engine.claim("set.r00", b"", None),
+        Vec::<VolumeIndex>::new()
+    );
+    assert_eq!(
+        engine.claim("set.par2", b"", None),
+        Vec::<VolumeIndex>::new()
+    );
 
     let mut old = named(&["set.rar"]);
-    assert_eq!(old.claim("set.r00", b"", None), Some(VolumeIndex(1)));
-    assert_eq!(old.claim("SET.R41", b"", None), Some(VolumeIndex(42)));
+    assert_eq!(old.claim("set.r00", b"", None), vec![VolumeIndex(1)]);
+    assert_eq!(old.claim("SET.R41", b"", None), vec![VolumeIndex(42)]);
     // `.sNN` follows `.r99`.
-    assert_eq!(old.claim("set.s00", b"", None), Some(VolumeIndex(101)));
-    assert_eq!(old.claim("set.part2.rar", b"", None), None);
-    assert_eq!(old.claim("set.rar", b"", None), Some(VolumeIndex(0)));
+    assert_eq!(old.claim("set.s00", b"", None), vec![VolumeIndex(101)]);
+    assert_eq!(
+        old.claim("set.part2.rar", b"", None),
+        Vec::<VolumeIndex>::new()
+    );
+    assert_eq!(old.claim("set.rar", b"", None), vec![VolumeIndex(0)]);
 }
 
 #[test]
@@ -478,7 +490,7 @@ fn number_alone_does_not_join_different_named_rar_sets() {
             &candidate,
             Some(candidate.len() as u64)
         ),
-        None,
+        Vec::<VolumeIndex>::new(),
         "the streaming store uses the same membership boundary"
     );
     let mut engine = RarEngine::new();
@@ -490,7 +502,7 @@ fn number_alone_does_not_join_different_named_rar_sets() {
     );
     assert_eq!(
         engine.claim("first.part01.rar", &candidate, Some(candidate.len() as u64)),
-        Some(VolumeIndex(0)),
+        vec![VolumeIndex(0)],
         "a matching set name places an earlier volume"
     );
     assert_eq!(
@@ -499,7 +511,7 @@ fn number_alone_does_not_join_different_named_rar_sets() {
             &candidate,
             Some(candidate.len() as u64)
         ),
-        None,
+        Vec::<VolumeIndex>::new(),
         "an unjudged number cannot join another named set"
     );
 }
@@ -511,7 +523,7 @@ fn linked_headers_can_join_different_posted_rar_names() {
     engine.bound(VolumeIndex(1), "first.part02.rar", &volumes[1], None);
     assert_eq!(
         engine.claim("second.part01.rar", &volumes[0], None),
-        Some(VolumeIndex(0)),
+        vec![VolumeIndex(0)],
         "the held continuation judges membership across posted labels"
     );
 }
@@ -526,21 +538,21 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     engine.bound(VolumeIndex(0), "a1b2.101", &volumes[0], None);
     assert_eq!(
         engine.claim("a1b2.102", &volumes[1], None),
-        Some(VolumeIndex(1))
+        vec![VolumeIndex(1)]
     );
     assert_eq!(
         engine.claim("a1b2.103", &volumes[0], None),
-        Some(VolumeIndex(0)),
+        vec![VolumeIndex(0)],
         "a volume posted again is that volume"
     );
     assert_eq!(
         engine.claim("a1b2.103", &one_volume(), None),
-        None,
+        Vec::<VolumeIndex>::new(),
         "no volume of a set"
     );
     assert_eq!(
         engine.claim("a1b2.103", b"", None),
-        None,
+        Vec::<VolumeIndex>::new(),
         "a front that says nothing"
     );
     let stranger = [
@@ -550,7 +562,7 @@ fn claim_places_a_nameless_volume_by_its_headers() {
     .concat();
     assert_eq!(
         engine.claim("a1b2.103", &stranger, None),
-        None,
+        Vec::<VolumeIndex>::new(),
         "it continues no member of ours"
     );
 
@@ -574,7 +586,7 @@ fn a_stated_volume_is_placed_beside_a_bound_volume_whose_front_is_unread() {
         rar5::end(false),
     ]
     .concat();
-    assert_eq!(engine.claim("a1b2.103", &third, None), Some(VolumeIndex(2)));
+    assert_eq!(engine.claim("a1b2.103", &third, None), vec![VolumeIndex(2)]);
 }
 
 #[test]

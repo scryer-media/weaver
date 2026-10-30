@@ -66,7 +66,7 @@ impl Pipeline {
     pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId, raw_bytes: u64) {
         self.active_decode_bytes.insert(segment_id, raw_bytes);
         let job_id = segment_id.file_id.job_id;
-        *self.active_decodes_by_job.entry(job_id).or_default() += 1;
+        self.active_decodes_by_job.started(job_id);
         *self
             .active_decodes_by_file
             .entry(segment_id.file_id)
@@ -77,12 +77,7 @@ impl Pipeline {
     fn note_decode_finished(&mut self, segment_id: SegmentId) {
         self.active_decode_bytes.remove(&segment_id);
         let job_id = segment_id.file_id.job_id;
-        if let Some(active) = self.active_decodes_by_job.get_mut(&job_id) {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                self.active_decodes_by_job.remove(&job_id);
-            }
-        }
+        self.active_decodes_by_job.finished(job_id);
         if let Some(active) = self.active_decodes_by_file.get_mut(&segment_id.file_id) {
             *active = active.saturating_sub(1);
             if *active == 0 {
@@ -839,11 +834,12 @@ impl Pipeline {
             self.graph_article_decoded(
                 segment_id,
                 file_offset,
-                &data,
+                data,
                 !retain_damage,
                 !encoding.is_uu(),
                 yenc_layout.file_size,
-                &segments,
+                declared_part_end(expected_layout, yenc_layout),
+                segments,
             );
             if retain_damage && !encoding.is_uu() {
                 // The damaged copy stands. Its extent, and the range its header

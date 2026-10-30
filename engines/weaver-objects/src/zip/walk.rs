@@ -10,6 +10,7 @@
 
 use weaver_graph::{ByteRange, Emit, MemberId, Why};
 
+use super::directory::Said;
 use super::map::{Entry, Map};
 use super::records::{self, LOCAL_LEN, Next};
 use super::{Zip, refusal};
@@ -70,6 +71,7 @@ impl Zip {
             }
             self.basis.push((range, crc32(&bytes)));
             let member = MemberId(self.members.len() as u32);
+            let said = Said::of(&header);
             let length = self.announce(member, &header, out);
             let data = cursor + len;
             let compressed = header.compressed;
@@ -80,6 +82,8 @@ impl Zip {
             map.entries.push(Entry {
                 header: cursor,
                 member: Some(member),
+                name: said.name,
+                checksum: said.checksum,
                 length,
                 crc: header.crc,
                 data: Some(data),

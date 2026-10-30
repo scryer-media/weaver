@@ -2065,21 +2065,17 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
 async fn emits_download_pipeline_drained_once_before_later_completion_events() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(20011);
-    insert_active_job(
+    insert_delivered_job(
         &mut pipeline,
         job_id,
-        JobSpec {
-            name: "Drain Pending Buffers".to_string(),
-            password: None,
-            files: vec![],
-            total_bytes: 0,
-            category: None,
-            metadata: vec![],
-        },
+        "Drain Pending Buffers",
+        "payload.bin",
+        b"payload",
     )
     .await;
+    // Only what follows the end of the download pass is under test.
+    let mut events = pipeline.event_tx.subscribe();
 
     pipeline.active_download_passes.insert(job_id);
     pipeline.pending_decode.push_back(PendingDecodeWork {

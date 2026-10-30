@@ -603,12 +603,7 @@ impl Object for Par3 {
     // By the magic its bytes open with, or, before any bytes, by a name
     // that continues the set's: the stem of a volume already held, then a
     // `.vol` name ending in `.par3`.
-    fn claim(
-        &mut self,
-        name: &str,
-        first_bytes: &[u8],
-        _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
+    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
         let ours = if first_bytes.is_empty() {
             self.volumes
                 .iter()
@@ -619,6 +614,8 @@ impl Object for Par3 {
         };
         (ours && self.volumes.len() < MAX_CARRIERS)
             .then_some(VolumeIndex(self.volumes.len() as u32))
+            .into_iter()
+            .collect()
     }
 
     // An impossible verdict counted the blocks of the volumes bound then,
@@ -798,19 +795,7 @@ impl Recovery for Par3 {
     }
 
     fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
-        for segment in segments {
-            self.input.offer(member, crate::grid::WHOLE, segment);
-        }
-    }
-
-    fn uncovered(&mut self, member: MemberId, _range: ByteRange) {
-        self.input.forget(member);
-        if self.covers(member) {
-            self.last = None;
-            self.settled
-                .retain(|_, settled| !settled.members.contains(&Some(member)));
-            self.ruled.clear();
-        }
+        self.input.offer_all(member, crate::grid::WHOLE, segments);
     }
 
     // Kept for every member of the namespace, bound or not: a bind later

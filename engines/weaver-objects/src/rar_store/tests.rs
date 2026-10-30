@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod contested;
 mod facts;
 mod owner;
+mod recovery_contracts;
+mod settle;
 mod writer;
 
 use std::io::Cursor;
@@ -252,7 +255,7 @@ fn a_nameless_volume_without_its_predecessor_is_placed_where_it_states() {
     // Volume 2 of the set states its number; volume 1, which nobody holds
     // yet, does not decide where it goes.
     let front = &volumes[2][..4096.min(volumes[2].len())];
-    assert_eq!(object.claim("d00d", front, None), Some(VolumeIndex(2)));
+    assert_eq!(object.claim("d00d", front, None), vec![VolumeIndex(2)]);
 }
 
 // A store holding only a set's second volume takes the first volume that
@@ -268,10 +271,13 @@ fn a_first_volume_joins_only_the_set_it_carries_on_into() {
     let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
     let mut object = store();
     object.bound(VolumeIndex(1), "c0ffee", &front(&ours[1]), None);
-    assert_eq!(object.claim("d00d", &front(&theirs[0]), None), None);
+    assert_eq!(
+        object.claim("d00d", &front(&theirs[0]), None),
+        Vec::<VolumeIndex>::new()
+    );
     assert_eq!(
         object.claim("beef", &front(&ours[0]), None),
-        Some(VolumeIndex(0))
+        vec![VolumeIndex(0)]
     );
 }
 
@@ -296,12 +302,18 @@ fn a_one_volume_set_and_a_numbered_set_keep_apart() {
 
     let mut named = store();
     named.bound(VolumeIndex(0), "lantern.sample.rar", &sample, None);
-    assert_eq!(named.claim("alpha.part3.rar", &front(&set[2]), None), None);
+    assert_eq!(
+        named.claim("alpha.part3.rar", &front(&set[2]), None),
+        Vec::<VolumeIndex>::new()
+    );
 
     let mut ended = Owner::new(store(), vec![("c0ffee".to_owned(), sample.clone())]);
     ended.frames(0, 4096);
     ended.close(0);
-    assert_eq!(ended.object.claim("d00d", &front(&set[2]), None), None);
+    assert_eq!(
+        ended.object.claim("d00d", &front(&set[2]), None),
+        Vec::<VolumeIndex>::new()
+    );
 
     let posted = vec![
         ("c0ffee".to_owned(), sample),
@@ -338,22 +350,22 @@ fn a_far_volume_joins_only_the_set_its_name_numbers() {
     first.bound(VolumeIndex(0), "alpha.part1.rar", &front(&ours[0]), None);
     assert_eq!(
         first.claim("delta.part4.rar", &front(&theirs[3]), None),
-        None
+        Vec::<VolumeIndex>::new()
     );
     assert_eq!(
         first.claim("alpha.part3.rar", &front(&ours[2]), None),
-        Some(VolumeIndex(2))
+        vec![VolumeIndex(2)]
     );
 
     let mut last = store();
     last.bound(VolumeIndex(2), "alpha.part3.rar", &front(&ours[2]), None);
     assert_eq!(
         last.claim("delta.part1.rar", &front(&theirs[0]), None),
-        None
+        Vec::<VolumeIndex>::new()
     );
     assert_eq!(
         last.claim("alpha.part1.rar", &front(&ours[0]), None),
-        Some(VolumeIndex(0))
+        vec![VolumeIndex(0)]
     );
 }
 
@@ -374,7 +386,7 @@ fn a_nameless_volume_posted_again_is_the_held_volume_its_neighbours_link_it_to()
     }
     assert_eq!(
         object.claim("d00d", &volumes[1], None),
-        Some(VolumeIndex(1))
+        vec![VolumeIndex(1)]
     );
 }
 
@@ -532,7 +544,7 @@ fn a_volume_named_first_yields_the_place_its_own_front_rules_out() {
         );
         assert_eq!(
             object.claim("3c9e1f.r00", &front(&volumes[0]), None),
-            Some(VolumeIndex(0)),
+            vec![VolumeIndex(0)],
             "solid={solid}"
         );
     }
@@ -560,7 +572,7 @@ fn a_volume_held_by_its_name_goes_back_when_a_rename_places_it_elsewhere() {
             None,
             carried.as_ref()
         ),
-        Some(VolumeIndex(1))
+        vec![VolumeIndex(1)]
     );
 }
 
@@ -572,6 +584,9 @@ fn a_volume_contributing_output_cannot_transfer_its_parse() {
     no_trouble(&owner);
     assert!(!owner.members.is_empty());
     assert!(owner.object.carried(VolumeIndex(0)).is_none());
+    let mut carriable = Vec::new();
+    owner.object.carriable(&mut carriable);
+    assert_eq!(carriable, Vec::new(), "every volume routes output");
     assert!(owner.object.give_back(VolumeIndex(0)).is_none());
     posted_whole(&owner);
 }
@@ -928,6 +943,32 @@ fn encrypted_headers_without_the_password_are_refused_at_quiet() {
     }
 }
 
+// A volume whose walk stopped at its enciphered headers has stated nothing
+// yet: the engine it is handed to holds no front for it, so a store it is
+// given back to places it by its name, not by a verdict nothing read.
+#[test]
+fn an_unread_encrypted_volume_hands_its_engine_no_front() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split_encrypted(version, true));
+        let front = volumes[0][..volumes[0].len().min(4096)].to_vec();
+        let mut owner = Owner::named(store(), volumes);
+        owner.frames(0, 4096);
+        assert!(owner.said.contains(&Emit::NeedsPassword), "{version:?}");
+        let carried = owner
+            .object
+            .engine_volume(VolumeIndex(0))
+            .expect("the store holds the volume")
+            .downcast::<crate::engine::CarriedVolume<unrar_rs::RarVolumeFacts>>()
+            .expect("a store hands its engine a carried volume");
+        assert!(carried.front.is_none(), "{version:?} {:?}", carried.front);
+        assert_eq!(
+            store().reclaim("other.part02.rar", &front, None, &*carried),
+            vec![VolumeIndex(1)],
+            "{version:?}"
+        );
+    }
+}
+
 #[test]
 fn encrypted_files_without_the_password_are_refused_at_quiet() {
     let volumes = write(&items(), &encrypted(Version::Rar5, false));
@@ -1085,26 +1126,6 @@ fn a_repair_behind_an_announced_member_retracts_and_rewalks() {
         owner.close(0);
         streamed(&owner);
         posted_whole(&owner);
-    }
-}
-
-#[test]
-fn a_damaged_member_byte_is_reported_at_its_volume_range() {
-    for version in [Version::Rar5, Version::Rar4] {
-        let volumes = write(&items(), &Options::new(version));
-        let real = volumes[0].clone();
-        let at = find(&real, &files()[1].1[..64]) + 1000;
-        let mut bad = real.clone();
-        bad[at] ^= 0xff;
-        let mut owner = Owner::named(store(), volumes);
-        let length = real.len() as u64;
-        owner.deliver_as(0, ByteRange::new(0, length), Provenance::Fresh, Some(&bad));
-        owner.close(0);
-        let damaged = owner.said.iter().any(|emit| {
-            matches!(emit, Emit::Damaged { volume: VolumeIndex(0), range } if range.contains(at as u64))
-        });
-        assert!(damaged, "{version:?} {:?}", owner.said);
-        assert!(owner.member("beta.bin").closed);
     }
 }
 
@@ -1466,4 +1487,181 @@ fn unrar_reads_what_the_writer_writes() {
             assert_eq!(unrar(&volumes, password), expected, "{options:?}");
         }
     }
+}
+
+// The verdicts the runs give a file whole and each of its parts that
+// carries its own checksum.
+fn gates(owner: &Owner, id: usize) -> Vec<weaver_graph::SliceVerdict> {
+    let entry = &owner.object.entries[id];
+    let key = entry.hash_key.as_deref();
+    let length = entry.plain_len().unwrap();
+    let whole = crate::runs::gate(
+        &entry.plain_runs,
+        length,
+        entry.crc.unwrap(),
+        entry.uses_mac,
+        key,
+    );
+    let mut verdicts = vec![whole.0];
+    for (index, piece) in entry.pieces.iter().enumerate() {
+        let Some(crc) = piece.crc else {
+            continue;
+        };
+        let runs = entry.parts.get(&index).cloned().unwrap_or_default();
+        verdicts.push(crate::runs::gate(&runs, piece.data.len(), crc, piece.uses_mac, key).0);
+    }
+    verdicts
+}
+
+// A split set with a recovery record, in articles of 1000 bytes, every
+// volume in and closed.
+fn in_articles(version: Version) -> Owner {
+    let mut options = split(version);
+    options.recovery = true;
+    let mut owner = Owner::named(store(), write(&items(), &options));
+    for volume in 0..owner.volumes.len() {
+        owner.frames(volume, 1000);
+    }
+    for volume in 0..owner.volumes.len() {
+        owner.close(volume);
+    }
+    owner
+}
+
+fn intact(owner: &Owner, id: usize) -> bool {
+    gates(owner, id)
+        .iter()
+        .all(|verdict| *verdict == weaver_graph::SliceVerdict::Intact)
+}
+
+// The first copy of an article stands: the same bytes posted again across
+// other boundaries are a duplicate of what the runs hold, the file's and its
+// part's checksums still compose, and nothing is asked for again.
+#[test]
+fn an_identical_repost_with_other_boundaries_keeps_the_record_gate_intact() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut owner = in_articles(version);
+        let alpha = find(&owner.volumes[0].1, &files()[0].1[..64]) as u64;
+        assert!(alpha < 900, "{version:?} the repost lies in alpha");
+        assert!(intact(&owner, 0), "{version:?}");
+        owner.deliver(0, ByteRange::new(900, 2100));
+        assert!(intact(&owner, 0), "{version:?} {:?}", gates(&owner, 0));
+        assert!(
+            !owner
+                .seeks
+                .iter()
+                .any(|seek| seek.volume == VolumeIndex(0) && seek.range.start < 900),
+            "{version:?} {:?}",
+            owner.seeks
+        );
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
+// A repair across other boundaries than the articles it mends rewrites the
+// runs it overlaps; what it cut from them and did not cover is read back
+// from the file's own bytes, so the checksums compose again with nothing
+// fetched twice.
+#[test]
+fn a_repair_with_other_boundaries_refeeds_only_what_it_cut() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut options = split(version);
+        options.recovery = true;
+        let volumes = write(&items(), &options);
+        let mut bad = volumes[0][1000..2000].to_vec();
+        bad[17] ^= 0xff;
+        let mut owner = Owner::named(store(), volumes);
+        for start in (0..owner.volumes[0].1.len() as u64).step_by(1000) {
+            let end = (start + 1000).min(owner.volumes[0].1.len() as u64);
+            match start {
+                1000 => owner.deliver_as(
+                    0,
+                    ByteRange::new(start, end),
+                    Provenance::Damaged,
+                    Some(&bad),
+                ),
+                _ => owner.deliver(0, ByteRange::new(start, end)),
+            }
+        }
+        for volume in 1..owner.volumes.len() {
+            owner.frames(volume, 1000);
+        }
+        for volume in 0..owner.volumes.len() {
+            owner.close(volume);
+        }
+        assert!(!intact(&owner, 0), "{version:?} the damage holds the gate");
+        owner.deliver_as(0, ByteRange::new(900, 2100), Provenance::Repaired, None);
+        assert!(intact(&owner, 0), "{version:?} {:?}", gates(&owner, 0));
+        assert!(owner.seeks.is_empty(), "{version:?} {:?}", owner.seeks);
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
+// A stored file split across volumes, its data handed with the CRC32 of
+// each article as a decoder hands it: every part's checksum and the file's
+// fold from what came with the bytes, and none of its data is hashed. The
+// same data handed bare is hashed once, and the verdicts are the same.
+#[test]
+fn a_stored_split_file_handed_its_evidence_is_judged_without_hashing_its_data() {
+    use weaver_graph::evidence::counting;
+
+    let volumes = write(&items(), &split(Version::Rar5));
+    let mut plan = Owner::named(store(), volumes.clone());
+    plan.whole(usize::MAX >> 1);
+    let mut data: Vec<(usize, ByteRange)> = plan
+        .object
+        .entries
+        .iter()
+        .flat_map(|entry| entry.pieces.iter())
+        .map(|piece| (piece.volume.0 as usize, piece.data))
+        .collect();
+    data.sort_by_key(|(volume, range)| (*volume, range.start));
+    assert!(
+        plan.object.entries[0].pieces.len() > 1,
+        "alpha spans volumes"
+    );
+    let total: u64 = data.iter().map(|(_, range)| range.len()).sum();
+    let run = |articles: Option<u64>| {
+        let mut owner = Owner::named(store(), volumes.clone());
+        owner.articles = articles;
+        // The headers first, so the data lands where they place it.
+        for volume in 0..owner.volumes.len() {
+            let mut at = 0;
+            for (_, range) in data.iter().filter(|(found, _)| *found == volume) {
+                owner.deliver(volume, ByteRange::new(at, range.start));
+                at = range.end;
+            }
+            let length = owner.volumes[volume].1.len() as u64;
+            owner.deliver(volume, ByteRange::new(at, length));
+        }
+        let before = counting::hashed();
+        for (volume, range) in &data {
+            owner.deliver(*volume, *range);
+        }
+        let hashed = counting::hashed() - before;
+        for volume in 0..owner.volumes.len() {
+            owner.close(volume);
+        }
+        no_trouble(&owner);
+        streamed(&owner);
+        let verdicts: Vec<_> = (0..owner.object.entries.len())
+            .map(|id| gates(&owner, id))
+            .collect();
+        (hashed, verdicts)
+    };
+    let (handed, with) = run(Some(1000));
+    let (bare, without) = run(None);
+    assert_eq!(handed, 0, "no data byte hashed under evidence");
+    assert_eq!(bare, total, "bare data hashed once");
+    assert_eq!(with, without);
+    assert!(
+        with.iter()
+            .flatten()
+            .all(|verdict| *verdict == weaver_graph::SliceVerdict::Intact),
+        "{with:?}"
+    );
 }

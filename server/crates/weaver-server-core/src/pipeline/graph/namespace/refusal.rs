@@ -23,7 +23,7 @@
 use bytes::Bytes;
 use weaver_graph::{Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, Tree};
 
-use super::{Arrival, NamespaceWriter, READ_BACK, Segments, WriteError};
+use super::{Arrival, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
 
 impl NamespaceWriter {
     pub(super) fn materialise(
@@ -46,7 +46,7 @@ impl NamespaceWriter {
             // What the object held came from the file, which still has it.
             self.take_held(node, member, super::ALL)?;
             if tree.child_of(node, member).is_some() {
-                self.replay_file(tree, builder, segments, node, member, out)?;
+                self.replay_file(tree, builder, segments, node, member, None, out)?;
             }
             self.release_subtree(tree, retired)?;
             return self.close_if_leaf(tree, node, member);
@@ -60,7 +60,7 @@ impl NamespaceWriter {
             .map(|files| files.holds.held_ranges(super::held_volume(member)))
             .unwrap_or_default();
         if tree.child_of(node, member).is_some() {
-            self.replay(tree, builder, segments, node, member, super::ALL, out)?;
+            self.replay(tree, builder, segments, node, member, super::ALL, None, out)?;
         } else {
             self.release_to_leaf(tree, node, member)?;
         }
@@ -86,14 +86,15 @@ impl NamespaceWriter {
                         offset: piece.start,
                         provenance: bytes.as_ref().map_or(Provenance::Damaged, |_| provenance),
                         bytes: bytes
-                            .unwrap_or_else(|| Bytes::from(vec![0; super::index(piece.len())])),
+                            .unwrap_or_else(|| Bytes::from(vec![0; super::index(piece.len())]))
+                            .into(),
                     };
                     // Reproduced bytes were evidence when they first came;
                     // damage is new, and the recovery objects hear it.
                     if arrival.provenance == provenance {
                         self.route(tree, builder, segments, arrival, out)?;
                     } else {
-                        self.arrive(tree, builder, segments, arrival, out)?;
+                        self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
                     }
                 }
             }

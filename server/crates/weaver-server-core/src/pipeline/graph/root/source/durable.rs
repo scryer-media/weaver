@@ -22,7 +22,9 @@ impl ArticleMap {
     // again, whether or not the run that went down had told it. What an
     // object heard of a loss then is in its facts only if it was in its node
     // to hear it; one lent out for its repair was waiting on it, and the
-    // facts it is rebuilt from are those it left with.
+    // facts it is rebuilt from are those it left with. Each state is laid
+    // down the one way a state changes, so the open articles are filed again
+    // from the states alone.
     pub(crate) fn restore(&mut self, facts: &[VolumeFacts]) -> Result<(), RootFactsError> {
         if facts.len() != self.volumes.len() {
             return Err(RootFactsError::Mismatch("another number of files"));
@@ -44,7 +46,7 @@ impl ArticleMap {
                     ),
                     ArticleFacts::Lost { .. } => State::Lost { damaged: false },
                 };
-                volume.set_state(at, state);
+                volume.set_state(&mut self.open, at, state);
             }
             let last = volume.articles.len() as u64;
             let known: BTreeMap<usize, u64> = facts
@@ -66,6 +68,10 @@ impl ArticleMap {
                 volume.know(boundary, offset);
             }
             volume.ordered_only = facts.ordered_only;
+            // A tail found short is told again, as a lost article is.
+            for at in 0..volume.articles.len() {
+                volume.cut_after(&mut self.open, at);
+            }
             // Raised again through the moves, so the queue built from the
             // post is reclassed as the one that went down was.
             for (ordinal, raised) in &facts.raised {
@@ -84,6 +90,18 @@ impl ArticleMap {
             }
         }
         Ok(())
+    }
+
+    // An article an earlier run brought is intact when `whole` says the
+    // bytes delivered over its range were.
+    pub(crate) fn vouch(&mut self, mut whole: impl FnMut(VolumeIndex, ByteRange) -> bool) {
+        for (index, found) in self.volumes.iter_mut().enumerate() {
+            for article in &mut found.articles {
+                if let State::Arrived(Some(range)) = article.state {
+                    article.intact = whole(VolumeIndex(index as u32), range);
+                }
+            }
+        }
     }
 
     // Each article of the volume that arrived with a known range, in
@@ -112,7 +130,7 @@ impl ArticleMap {
         if let Some(index) = found.index(ordinal)
             && matches!(found.articles[index].state, State::Arrived(_))
         {
-            found.set_state(index, State::Waiting);
+            found.set_state(&mut self.open, index, State::Waiting);
         }
     }
 

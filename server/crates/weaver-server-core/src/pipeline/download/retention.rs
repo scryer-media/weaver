@@ -163,12 +163,18 @@ impl Pipeline {
         second: &[usize],
     ) -> Vec<usize> {
         let mut merged = first.to_vec();
-        for idx in second {
+        Self::extend_exclude_servers(&mut merged, second);
+        merged
+    }
+
+    // [`Self::union_exclude_servers`] into a list the caller already owns,
+    // so a result that owns its work's ledger reuses that ledger's buffer.
+    pub(in crate::pipeline) fn extend_exclude_servers(merged: &mut Vec<usize>, more: &[usize]) {
+        for idx in more {
             if !merged.contains(idx) {
                 merged.push(*idx);
             }
         }
-        merged
     }
 
     // Union of a work item's failure exclusions and the job's retention

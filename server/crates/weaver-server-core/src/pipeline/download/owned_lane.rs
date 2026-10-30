@@ -1220,8 +1220,10 @@ struct LaneLeaseContext {
 }
 
 impl LaneLeaseContext {
+    // Takes the lease's exclusions and plan rather than copying them: once
+    // its context is cut, a lease is only the works it hands the lane.
     fn from_lease(
-        lease: &DownloadBatchLease,
+        lease: &mut DownloadBatchLease,
         server_idx: usize,
         supports_pipelining: bool,
     ) -> Self {
@@ -1231,7 +1233,7 @@ impl LaneLeaseContext {
             job_id: lease.job_id,
             runtime_generation: lease.runtime_generation,
             completion_critical: lease.completion_critical,
-            retention_excludes: lease.effective_exclude_servers.clone(),
+            retention_excludes: std::mem::take(&mut lease.effective_exclude_servers),
             pressure_clear: lease.pressure_clear,
             mode: Pipeline::actual_download_lane_mode(
                 lease.lane_mode,
@@ -1239,7 +1241,7 @@ impl LaneLeaseContext {
                 server_idx,
                 supports_pipelining,
             ),
-            checkpoint_plan: lease.checkpoint_plan.clone(),
+            checkpoint_plan: std::mem::take(&mut lease.checkpoint_plan),
         }
     }
 
@@ -1461,7 +1463,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         parked_tx,
         initial_lease,
     } = run;
-    let lease = initial_lease;
+    let mut lease = initial_lease;
 
     if !lease_is_current(&state, &nntp, &lease) {
         let _ = event_tx.blocking_send(OwnedDownloadLaneEvent::LeaseObsolete { lease });
@@ -1550,7 +1552,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
     // decrement a gauge it was never counted in.
     let mut booked_mode = lease.lane_mode;
     let mut context = Arc::new(LaneLeaseContext::from_lease(
-        &lease,
+        &mut lease,
         server_idx,
         supports_pipelining,
     ));
@@ -1599,7 +1601,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 Ok(response) => {
                     pending_refill = None;
                     match response.lease {
-                        Some(next_lease) if !next_lease.works.is_empty() => {
+                        Some(mut next_lease) if !next_lease.works.is_empty() => {
                             booked_mode = Pipeline::actual_download_lane_mode(
                                 next_lease.lane_mode,
                                 &next_lease.server_modes,
@@ -1607,7 +1609,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                                 supports_pipelining,
                             );
                             context = Arc::new(LaneLeaseContext::from_lease(
-                                &next_lease,
+                                &mut next_lease,
                                 server_idx,
                                 supports_pipelining,
                             ));
@@ -1784,7 +1786,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             }
             let response = answer.expect("refill answer present after the drain-point retry");
             match response.lease {
-                Some(next_lease) if !next_lease.works.is_empty() => {
+                Some(mut next_lease) if !next_lease.works.is_empty() => {
                     booked_mode = Pipeline::actual_download_lane_mode(
                         next_lease.lane_mode,
                         &next_lease.server_modes,
@@ -1792,7 +1794,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                         supports_pipelining,
                     );
                     context = Arc::new(LaneLeaseContext::from_lease(
-                        &next_lease,
+                        &mut next_lease,
                         server_idx,
                         supports_pipelining,
                     ));
@@ -1980,10 +1982,10 @@ fn drain_pending_refill(
 ) -> Option<LaneLeaseContext> {
     let response_rx = pending_refill?;
     if let Ok(response) = response_rx.blocking_recv()
-        && let Some(lease) = response.lease
+        && let Some(mut lease) = response.lease
         && !lease.works.is_empty()
     {
-        let context = LaneLeaseContext::from_lease(&lease, server_idx, supports_pipelining);
+        let context = LaneLeaseContext::from_lease(&mut lease, server_idx, supports_pipelining);
         let _ = send_owned_batch(
             event_tx,
             lease.lane_id,
@@ -2084,8 +2086,13 @@ fn send_owned_batch(
 // The rotation hint (`avoid_server`) deliberately stays out: it only shapes
 // selection, and counting it here would let a transient timeout help declare
 // an article missing.
-fn result_exclude_servers(work: &DownloadWork, retention_excludes: &[usize]) -> Vec<usize> {
-    Pipeline::union_exclude_servers(&work.exclude_servers, retention_excludes)
+//
+// The result owns the work, so the union grows the work's own ledger in
+// place: an article whose lease excludes nothing new allocates nothing here.
+fn result_exclude_servers(work: &mut DownloadWork, retention_excludes: &[usize]) -> Vec<usize> {
+    let mut excludes = std::mem::take(&mut work.exclude_servers);
+    Pipeline::extend_exclude_servers(&mut excludes, retention_excludes);
+    excludes
 }
 
 // Credit one fetched article's wire bytes to its job and, beside it, to the
@@ -2125,7 +2132,7 @@ pub(in crate::pipeline) fn credit_transfer(
 }
 
 fn result_from_trace(
-    work: DownloadWork,
+    mut work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
     job_id: JobId,
@@ -2135,7 +2142,7 @@ fn result_from_trace(
 ) -> DownloadResult {
     let segment_id = work.segment_id;
     let retry_count = work.retry_count;
-    let exclude_servers = result_exclude_servers(&work, retention_excludes);
+    let exclude_servers = result_exclude_servers(&mut work, retention_excludes);
     // The work's own flags, never the lease's: a lane may be refilled with the
     // other class's work, and the origin books the article that was actually
     // fetched.
@@ -2171,7 +2178,7 @@ fn result_from_trace(
 
 #[allow(clippy::too_many_arguments)]
 fn unresolved_result(
-    work: DownloadWork,
+    mut work: DownloadWork,
     runtime_generation: u64,
     lane_id: u64,
     job_id: JobId,
@@ -2186,7 +2193,7 @@ fn unresolved_result(
 ) -> DownloadResult {
     let is_recovery = work.is_recovery;
     let completion_critical = work.completion_critical;
-    let exclude_servers = result_exclude_servers(&work, retention_excludes);
+    let exclude_servers = result_exclude_servers(&mut work, retention_excludes);
     DownloadResult {
         lane_id,
         job_id,
@@ -2336,12 +2343,12 @@ mod tests {
     #[test]
     fn a_result_is_attributed_to_the_lease_its_work_came_from() {
         let old = Arc::new(LaneLeaseContext::from_lease(
-            &test_lease(JobId(7), 3, vec![1], vec![tail_work(1, 0)]),
+            &mut test_lease(JobId(7), 3, vec![1], vec![tail_work(1, 0)]),
             0,
             true,
         ));
         let new = Arc::new(LaneLeaseContext::from_lease(
-            &test_lease(JobId(7), 4, vec![2, 5], vec![tail_work(2, 0)]),
+            &mut test_lease(JobId(7), 4, vec![2, 5], vec![tail_work(2, 0)]),
             0,
             true,
         ));
@@ -2401,7 +2408,7 @@ mod tests {
     #[test]
     fn a_result_reports_the_article_s_own_failure_ledger() {
         let context = Arc::new(LaneLeaseContext::from_lease(
-            &test_lease(JobId(7), 3, Vec::new(), vec![tail_work(1, 0)]),
+            &mut test_lease(JobId(7), 3, Vec::new(), vec![tail_work(1, 0)]),
             1,
             true,
         ));
@@ -2443,6 +2450,74 @@ mod tests {
             "the server this article already failed on must survive the trip \
              back, or the completion path cannot tell that both servers are out"
         );
+    }
+
+    // The result owns its work, so the union of the article's ledger and the
+    // lease's retention exclusions is grown in the ledger's own buffer: the
+    // same servers in the same order, and no new list per article.
+    #[test]
+    fn a_result_grows_the_article_s_own_ledger_in_place() {
+        let unresolved = |work: DownloadWork, retention: &[usize]| {
+            unresolved_result(
+                work,
+                3,
+                0,
+                JobId(7),
+                1,
+                DownloadLaneMode::Sequential,
+                false,
+                None,
+                true,
+                1,
+                retention,
+                "test",
+            )
+        };
+
+        let mut work = tail_work(1, 1);
+        work.exclude_servers = Vec::with_capacity(4);
+        work.exclude_servers.extend([3, 0]);
+        let ledger = work.exclude_servers.as_ptr();
+        let result = unresolved(work, &[0, 2, 3, 5]);
+        assert_eq!(result.exclude_servers, vec![3, 0, 2, 5]);
+        assert_eq!(
+            result.exclude_servers.as_ptr(),
+            ledger,
+            "the union reuses the article's ledger rather than copying it"
+        );
+
+        let mut work = tail_work(2, 1);
+        work.exclude_servers = vec![4];
+        let ledger = work.exclude_servers.as_ptr();
+        let result = unresolved(work, &[]);
+        assert_eq!(result.exclude_servers, vec![4]);
+        assert_eq!(result.exclude_servers.as_ptr(), ledger);
+
+        let result = unresolved(tail_work(3, 0), &[1]);
+        assert_eq!(result.exclude_servers, vec![1]);
+    }
+
+    // The context takes the lease's retention exclusions and checkpoint plan
+    // instead of copying them; nothing reads either off the lease afterwards.
+    #[test]
+    fn a_lease_context_takes_the_lease_s_exclusions_without_copying() {
+        let mut lease = test_lease(JobId(7), 3, vec![2, 5], vec![tail_work(1, 0)]);
+        lease.checkpoint_plan =
+            weaver_yenc::CheckpointPlan::Single(std::num::NonZeroU64::new(4096).unwrap());
+        let retention = lease.effective_exclude_servers.as_ptr();
+        let context = LaneLeaseContext::from_lease(&mut lease, 0, true);
+        assert_eq!(context.retention_excludes, vec![2, 5]);
+        assert_eq!(
+            context.retention_excludes.as_ptr(),
+            retention,
+            "the context holds the lease's own list, not a copy"
+        );
+        assert_eq!(
+            context.checkpoint_plan,
+            weaver_yenc::CheckpointPlan::Single(std::num::NonZeroU64::new(4096).unwrap())
+        );
+        assert_eq!(lease.dial_exclude_servers, vec![2, 5]);
+        assert_eq!(lease.works.len(), 1);
     }
 
     // Per-article delivery is the point: decode starts on a lease's first

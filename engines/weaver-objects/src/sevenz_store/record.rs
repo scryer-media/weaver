@@ -11,14 +11,15 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use weaver_graph::{ByteRange, Emit, MemberId, Placement, Provenance, Segment, SliceVerdict};
+use weaver_graph::{
+    Algorithm, ByteRange, Emit, Evidenced, MemberId, Placement, Provenance, Segment, SliceVerdict,
+};
 
 use super::map::Map;
 use super::place::read_folder;
 use super::{Lock, Out, SevenZipStore};
 use crate::crypt::{Placed, worse};
-use crate::grid::{self, WHOLE, crc32};
+use crate::grid::{self, WHOLE};
 
 // What of an AES folder's plaintext its members have placed: the members'
 // coverage at their offsets in the folder. Bytes no member holds were
@@ -53,7 +54,7 @@ impl SevenZipStore {
     pub(super) fn route(
         &mut self,
         range: ByteRange,
-        bytes: &[u8],
+        bytes: &Evidenced,
         provenance: Provenance,
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
@@ -67,7 +68,7 @@ impl SevenZipStore {
                 continue;
             };
             let slice =
-                &bytes[(part.start - range.start) as usize..(part.end - range.start) as usize];
+                bytes.slice((part.start - range.start) as usize..(part.end - range.start) as usize);
             let local = part.shift(-(folder.pack.start as i64));
             match &mut self.folders[index] {
                 Lock::Plain => {}
@@ -82,16 +83,18 @@ impl SevenZipStore {
                     let mut plain = |wanted: ByteRange, buffer: &mut Vec<u8>| {
                         read_folder(&map, index, wanted, read, buffer)
                     };
-                    let arrival = (local.start, slice, provenance);
+                    let arrival = (local.start, &slice[..], provenance);
                     cbc.deliver(&placed, padding, arrival, &mut plain, &mut plains);
+                    // Deciphered bytes carry no evidence: nothing hashed them.
                     for plain in std::mem::take(&mut plains) {
                         let span = ByteRange::at(plain.offset, plain.bytes.len() as u64);
-                        self.emit_plain(&map, index, span, &plain.bytes, plain.provenance, out);
+                        let bytes = Evidenced::from(plain.bytes);
+                        self.emit_plain(&map, index, span, &bytes, plain.provenance, out);
                     }
                     continue;
                 }
             }
-            self.emit_plain(&map, index, local, slice, provenance, out);
+            self.emit_plain(&map, index, local, &slice, provenance, out);
         }
         self.map = Some(map);
     }
@@ -102,7 +105,7 @@ impl SevenZipStore {
         map: &Map,
         folder: usize,
         range: ByteRange,
-        bytes: &[u8],
+        bytes: &Evidenced,
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
@@ -111,7 +114,7 @@ impl SevenZipStore {
                 continue;
             };
             let slice =
-                &bytes[(part.start - range.start) as usize..(part.end - range.start) as usize];
+                bytes.slice((part.start - range.start) as usize..(part.end - range.start) as usize);
             let offset = part.start - entry.offset;
             self.record(map, member, offset, slice, provenance, out);
         }
@@ -122,7 +125,7 @@ impl SevenZipStore {
         map: &Map,
         member: MemberId,
         offset: u64,
-        bytes: &[u8],
+        mut bytes: Evidenced,
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
@@ -130,21 +133,24 @@ impl SevenZipStore {
             return;
         };
         let range = ByteRange::at(offset, bytes.len() as u64);
+        // A member that states no CRC has nothing to fold its bytes against.
+        // One that does hashes here once what no level above proved, and
+        // hands the digest down with the bytes.
+        if entry.crc.is_some() {
+            bytes.fill(Algorithm::Crc32);
+            let segment = Segment {
+                range,
+                crc32: bytes.digest(Algorithm::Crc32).value as u32,
+                verified: provenance.is_verified(),
+            };
+            self.grid.offer(member, WHOLE, &segment);
+        }
         out.push(Emit::Bytes {
             member,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes,
             provenance,
         });
-        self.grid.offer(
-            member,
-            WHOLE,
-            &Segment {
-                range,
-                crc32: crc32(bytes),
-                verified: provenance.is_verified(),
-            },
-        );
         let whole = ByteRange::new(0, entry.length);
         let folded = self.grid.fold(member, WHOLE, 0, whole);
         let verdict = entry

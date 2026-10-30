@@ -14,7 +14,19 @@ use weaver_graph::{VolumeIndex, Volumes};
 use crate::engine::Joined;
 use crate::grid::{crc32, crc32_combine};
 
-pub(super) fn resolve(volumes: Arc<dyn Volumes>) -> io::Result<Arc<dyn Volumes>> {
+#[derive(Debug)]
+pub(super) enum Failure {
+    Source(io::Error),
+    Layout,
+}
+
+impl From<io::Error> for Failure {
+    fn from(error: io::Error) -> Self {
+        Self::Source(error)
+    }
+}
+
+pub(super) fn resolve(volumes: Arc<dyn Volumes>) -> Result<Arc<dyn Volumes>, Failure> {
     if !volumes.uncertain_lengths() {
         return Ok(volumes);
     }
@@ -26,20 +38,20 @@ pub(super) fn resolve(volumes: Arc<dyn Volumes>) -> io::Result<Arc<dyn Volumes>>
     };
     let start = 32u64
         .checked_add(u64::from_le_bytes(head[12..20].try_into().unwrap()))
-        .ok_or_else(invalid)?;
+        .ok_or(Failure::Layout)?;
     let size = u64::from_le_bytes(head[20..28].try_into().unwrap());
     let expected = u32::from_le_bytes(head[28..32].try_into().unwrap());
     let mut physical = Vec::new();
     let mut after = None;
     while let Some(volume) = volumes.next(after)? {
         if volume.0 as usize != physical.len() || physical.len() >= 100_000 {
-            return Err(invalid());
+            return Err(Failure::Layout);
         }
         physical.push(input.closed_len(volume)?);
         after = Some(volume);
     }
     let Some(&first) = physical.first() else {
-        return Err(invalid());
+        return Err(Failure::Layout);
     };
     let mut selected = None;
     let mut buffer = [0; 64 * 1024];
@@ -94,12 +106,12 @@ pub(super) fn resolve(volumes: Arc<dyn Volumes>) -> io::Result<Arc<dyn Volumes>>
         }
         if crc == expected {
             if selected.is_some() {
-                return Err(invalid());
+                return Err(Failure::Layout);
             }
             selected = Some(candidate);
         }
     }
-    selected.ok_or_else(invalid)
+    selected.ok_or(Failure::Layout)
 }
 
 fn invalid() -> io::Error {

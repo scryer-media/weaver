@@ -1226,3 +1226,28 @@ async fn a_locked_stored_7z_one_deep_opened_by_a_candidate_delivers_its_proof_me
     }
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
+
+// A stored RAR holding the PAR2 set over `ember.bin` ahead of the member:
+// the member's bytes reach the set as they land, with the checksums the
+// articles brought, cut where the set's slices fall. The set finds every
+// slice proven and reads nothing back.
+#[tokio::test]
+async fn a_set_inside_a_stored_rar_proves_the_member_beside_it_as_it_lands() {
+    let ember = payload(5 * ARTICLE + 11, 93);
+    let mut entries: Vec<(String, Vec<u8>)> =
+        par2_set("inner", &[("ember.bin", ember.as_slice())], 2)
+            .into_iter()
+            .map(|post| (post.name, post.bytes))
+            .collect();
+    entries.push(("ember.bin".to_string(), ember.clone()));
+    let named: Vec<(&str, Vec<u8>)> = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    let scenario = Scenario::new(vec![Post::plain("lantern.rar", rar(&named))]);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(graph.files.get(&delivered("ember.bin")) == Some(&ember));
+    assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert_eq!(graph.reads, 0, "a slice was read back");
+}

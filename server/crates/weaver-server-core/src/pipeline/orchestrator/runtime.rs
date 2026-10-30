@@ -267,7 +267,7 @@ impl Pipeline {
             active_download_connections_by_job: HashMap::new(),
             active_completion_critical_connections_by_job: HashMap::new(),
             active_downloads_by_file: HashMap::new(),
-            active_decodes_by_job: HashMap::new(),
+            active_decodes_by_job: Default::default(),
             active_decodes_by_file: HashMap::new(),
             active_decode_bytes: HashMap::new(),
             job_last_download_activity: HashMap::new(),
@@ -1485,7 +1485,7 @@ impl Pipeline {
         {
             warn!(
                 active_downloads = self.active_downloads,
-                active_decodes = self.active_decodes_by_job.values().sum::<usize>(),
+                active_decodes = self.active_decodes_by_job.total(),
                 pending_decode = self.pending_decode.len(),
                 "shutdown drain ended with in-flight pipeline work"
             );
@@ -1575,7 +1575,7 @@ impl Pipeline {
                 Err(_) => {
                     warn!(
                         active_downloads = self.active_downloads,
-                        active_decodes = self.active_decodes_by_job.values().sum::<usize>(),
+                        active_decodes = self.active_decodes_by_job.total(),
                         pending_decode = self.pending_decode.len(),
                         decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed),
                         idle_timeout_secs = Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT.as_secs(),

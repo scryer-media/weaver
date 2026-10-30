@@ -78,7 +78,7 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
     started.await.unwrap();
     assert!(job.awaits_mail());
     assert!(!job.repair_out(), "an in-flight checksum is not a repair");
-    assert_eq!(job.phase(), RootPhase::Downloading);
+    assert_eq!(job.phase(), RootPhase::Verifying);
     assert!(matches!(
         crate::pipeline::graph::status::drive(&mut job, &mut slots, AskerId(1), 1),
         Step::Wait
@@ -188,7 +188,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
         "pending verification does not refetch recorded bytes"
     );
     assert_eq!(restored.job.writer.pending_verifications(), vec![(0, 0)]);
-    assert_eq!(restored.job.phase(), RootPhase::Downloading);
+    assert_eq!(restored.job.phase(), RootPhase::Verifying);
     let mut slots = RepairSlots::default();
     restored.job.lend(&mut slots, 1).unwrap();
     let said = mail.recv().await.unwrap();
@@ -207,19 +207,60 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
     );
 }
 
+// The member closed damaged with its checksum owed, the payload is in and
+// no set will rule again: nothing can clean it, so the obligation is no
+// work to wait on, the census reads it damaged, and the walk drops it.
 #[test]
-fn a_queued_checksum_settles_the_reported_stage_without_inventing_extraction() {
+fn an_ineligible_obligation_in_an_ended_namespace_is_not_pending_work() {
+    let files = vec![file("payload.bin", &[SIZE as u32])];
+    let (mut job, _dir, _) = job_with(&files, Vec::new());
+    let bytes = vec![0x71; SIZE];
+    let mut damaged = decoded(0, 0, 0, &bytes, Some(SIZE as u64));
+    damaged.intact = false;
+    let mut slots = RepairSlots::default();
+    job.intake(damaged, &mut slots, 1).unwrap();
+    let member = job
+        .tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(MemberId(0))
+        .unwrap();
+    member.crc32 = Some(crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &bytes) as u32);
+    assert!(member.closed);
+    assert!(member.coverage.damaged(ByteRange::new(0, SIZE as u64)));
+    job.writer.restore_verifications(&[(0, 0)]);
+    let mail = RunMail::default();
+    job.loans = Loans::new(1, mail.sender(), job.runs.hardware());
+    assert!(job.writer.ruled(&job.tree, NodeId::ROOT));
+
+    assert!(!job.work_pending());
+    assert_ne!(job.phase(), RootPhase::Verifying);
+    assert_eq!(
+        crate::pipeline::graph::status::drive(&mut job, &mut slots, AskerId(1), 1),
+        Step::Deliver
+    );
+    job.lend(&mut slots, 1).unwrap();
+    assert!(!job.awaits_mail(), "nothing is lent to check it");
+    assert!(job.writer.pending_verifications().is_empty());
+}
+
+#[test]
+fn a_queued_checksum_is_verifying_whatever_was_reported_before() {
     for reported in [
-        RootPhase::Downloading,
-        RootPhase::Verifying,
-        RootPhase::Repairing,
-        RootPhase::Extracting,
-        RootPhase::Done,
+        None,
+        Some(RootPhase::Downloading),
+        Some(RootPhase::Verifying),
+        Some(RootPhase::Repairing),
+        Some(RootPhase::Extracting),
+        Some(RootPhase::Done),
     ] {
         let (mut job, _dir, _mail, _) = pending();
-        job.reported = Some(reported);
-        assert_eq!(job.phase(), reported);
-        assert_eq!(job.phase_change(), None);
+        job.reported = reported;
+        assert_eq!(job.phase(), RootPhase::Verifying, "{reported:?}");
+        assert_eq!(
+            job.phase_change(),
+            (reported != Some(RootPhase::Verifying)).then_some(RootPhase::Verifying)
+        );
         assert!(!job.repair_out());
         assert!(job.work_pending());
         assert!(

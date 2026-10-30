@@ -32,8 +32,10 @@ const MAX_DERIVED_BLOCKS_PER_JOB: usize = 65_536;
 // The block size of the grid whose one block is the whole member.
 pub(crate) const WHOLE: u64 = u64::MAX;
 
+// Hashed through the graph's own algorithm, so every CRC32 a store computes
+// is one a test can count.
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
-    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
+    weaver_graph::Algorithm::Crc32.hash(bytes).value as u32
 }
 
 // The CRC32 of `first` followed by `len_second` bytes whose CRC32 is `second`.
@@ -199,13 +201,32 @@ impl Grid {
 
     // Record a segment on the member's grid of `block_size`.
     pub(crate) fn offer(&mut self, member: MemberId, block_size: u64, segment: &Segment) {
-        if block_size == 0 || segment.range.is_empty() {
+        self.offer_all(member, block_size, std::slice::from_ref(segment));
+    }
+
+    // Record the segments of one delivery. Whatever any of them overlaps is
+    // superseded before one is recorded, so a piece never joins a run the
+    // next piece of the same delivery replaces.
+    pub(crate) fn offer_all(&mut self, member: MemberId, block_size: u64, segments: &[Segment]) {
+        if block_size == 0 {
+            return;
+        }
+        for segment in segments {
+            self.supersede(member, block_size, segment);
+        }
+        for segment in segments {
+            self.record(member, block_size, segment);
+        }
+    }
+
+    // Whatever the segment overlaps is superseded by it.
+    fn supersede(&mut self, member: MemberId, block_size: u64, segment: &Segment) {
+        if segment.range.is_empty() {
             return;
         }
         let first = segment.range.start / block_size;
         let last = (segment.range.end - 1) / block_size;
         let file = self.files.entry((member, block_size)).or_default();
-        // Whatever the segment overlaps is superseded by it.
         for index in first..=last {
             let bounds = block_bounds(index, block_size);
             let overlaps = file.block(index).is_some_and(|block| {
@@ -225,9 +246,17 @@ impl Grid {
                 self.load.add(after);
             }
         }
-        if first != last {
+    }
+
+    fn record(&mut self, member: MemberId, block_size: u64, segment: &Segment) {
+        if segment.range.is_empty() {
             return;
         }
+        let first = segment.range.start / block_size;
+        if first != (segment.range.end - 1) / block_size {
+            return;
+        }
+        let file = self.files.entry((member, block_size)).or_default();
         let bounds = block_bounds(first, block_size);
         let (before, after) = file.change(first, |block| {
             let before = Load::of(block, bounds);

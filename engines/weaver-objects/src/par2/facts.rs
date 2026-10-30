@@ -277,11 +277,11 @@ pub(super) fn of(par2: &Par2) -> Facts {
         .collect();
     let sets = par2
         .ordered()
-        .into_iter()
+        .iter()
         .map(|key| {
-            let state = &par2.sets[&key];
+            let state = &par2.sets[key];
             SetFacts {
-                key,
+                key: *key,
                 first_seen: state.first_seen,
                 packets: state.packets().clone(),
                 hashes: state.hashes().clone(),
@@ -339,7 +339,7 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
             &[],
         );
         state.last = set.last;
-        par2.sets.insert(set.key, state);
+        par2.file_set(set.key, state);
     }
     par2.grid = kept.grid;
     par2.lengths = kept.lengths;
@@ -348,8 +348,8 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
     par2.shown.refusals = kept.refusals;
     par2.output_limit = kept.output_limit;
     par2.memory_limit = kept.memory_limit;
-    for key in par2.ordered() {
-        par2.fold_set(key);
+    for at in 0..par2.order.len() {
+        par2.fold_set(par2.order[at]);
     }
     Ok(par2)
 }

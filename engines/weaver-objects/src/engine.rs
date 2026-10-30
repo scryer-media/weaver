@@ -94,7 +94,7 @@ pub struct Holding<'a, T> {
 // evidence travels when a corrected name gives one back for reoffering.
 pub(crate) struct CarriedVolume<T> {
     pub(crate) front: Option<T>,
-    length: Option<u64>,
+    pub(crate) length: Option<u64>,
 }
 
 // A volume's name as its set numbers it.
@@ -218,7 +218,10 @@ impl<F: Format> EngineObject<F> {
                 self.names
                     .values()
                     .next()
-                    .is_some_and(|first| first.same_set(candidate))
+                    // With no naming anchor, a name only refines a place
+                    // the format already establishes; it cannot introduce
+                    // unrelated siblings of a lone unnumbered archive.
+                    .map_or(placed.is_some(), |first| first.same_set(candidate))
             })
             .and_then(|candidate| candidate.slot(&self.names))
             .filter(|index| !front.is_some_and(|front| F::misplaced(front, *index)));
@@ -267,9 +270,11 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         let why = crate::quiet::damaged(standing)
             .or_else(|| standing.asking().then_some(Why::EncryptedHeader))
             .or_else(|| {
-                crate::quiet::unordered(standing, |beside| {
-                    self.placed(beside.name, beside.front, beside.length)
-                })
+                crate::quiet::unordered(
+                    standing,
+                    |beside| self.placed(beside.name, beside.front, beside.length),
+                    |place| self.bound.contains(&place.0),
+                )
             })
             .or_else(|| crate::quiet::unplaced(standing));
         out.extend(why.map(Emit::Refuse));
@@ -362,15 +367,19 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         front: &[u8],
         length: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
-    ) -> Option<VolumeIndex> {
-        let carried = carried.downcast_ref::<CarriedVolume<F::Front>>()?;
+    ) -> Vec<VolumeIndex> {
+        let Some(carried) = carried.downcast_ref::<CarriedVolume<F::Front>>() else {
+            return Vec::new();
+        };
         let parsed = F::front(front);
         self.placed_front(
             name,
             carried.front.as_ref().or(parsed.as_ref()),
             carried.length.or(length),
-        )?
-        .claimed(self.gone, Placed::past(self.bound.last().copied()))
+        )
+        .map_or_else(Vec::new, |placed| {
+            placed.claimed(self.gone, Placed::past(self.bound.last().copied()))
+        })
     }
 
     fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
@@ -383,18 +392,12 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         }
     }
 
-    // The place the volume's facts give it. One that fits more than one
-    // place is not claimed while the set stands: a name a recovery set
-    // gives it later may order it.
-    fn claim(
-        &mut self,
-        name: &str,
-        first_bytes: &[u8],
-        length: Option<u64>,
-    ) -> Option<VolumeIndex> {
+    // The places the volume's facts give it, held or not: which it takes,
+    // if any, is the tree's to judge.
+    fn claim(&mut self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Vec<VolumeIndex> {
         let past = Placed::past(self.bound.last().copied());
-        self.placed(name, first_bytes, length)?
-            .claimed(self.gone, past)
+        self.placed(name, first_bytes, length)
+            .map_or_else(Vec::new, |placed| placed.claimed(self.gone, past))
     }
 
     fn reads_in_order(&self) -> bool {

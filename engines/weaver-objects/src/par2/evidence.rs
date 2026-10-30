@@ -12,9 +12,18 @@ use weaver_graph::{ByteRange, MemberId, SliceVerdict};
 
 use crate::grid::{self, Grid, WHOLE};
 
+// How many times a member's slice verdicts were read through, for the tests
+// that count it.
+#[cfg(test)]
+thread_local! {
+    pub(super) static VETOED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug)]
 pub(super) struct Evidence {
-    pub(super) slices: Vec<SliceVerdict>,
+    // Written only by `refold`, which counts the damaged ones as it goes.
+    slices: Vec<SliceVerdict>,
+    damaged: u64,
     pub(super) whole: SliceVerdict,
     // The member's length is exactly the described one.
     pub(super) exact: bool,
@@ -32,6 +41,7 @@ impl Evidence {
         let Some(description) = index.file_description(&file) else {
             return Self {
                 slices: Vec::new(),
+                damaged: 0,
                 whole: SliceVerdict::Unknown,
                 exact: false,
             };
@@ -40,6 +50,7 @@ impl Evidence {
         let count = index.slice_count_for_file(described) as usize;
         let mut evidence = Self {
             slices: vec![SliceVerdict::Unknown; count],
+            damaged: 0,
             whole: SliceVerdict::Unknown,
             exact: length == Some(described),
         };
@@ -79,7 +90,7 @@ impl Evidence {
             for slice in first..(last + 1).min(self.slices.len()) {
                 let start = slice as u64 * block;
                 let end = (start + block).min(described);
-                self.slices[slice] = match checksums.get(slice) {
+                let verdict = match checksums.get(slice) {
                     None => SliceVerdict::Unknown,
                     // A short final slice is compared on its zero padding,
                     // which says something only when the member ends where
@@ -92,6 +103,9 @@ impl Evidence {
                         expected.crc32,
                     ),
                 };
+                let was = std::mem::replace(&mut self.slices[slice], verdict);
+                self.damaged += u64::from(verdict == SliceVerdict::Damaged);
+                self.damaged -= u64::from(was == SliceVerdict::Damaged);
             }
         }
         self.whole = match expected_whole {
@@ -110,6 +124,13 @@ impl Evidence {
         self.whole == SliceVerdict::Damaged || self.slices.contains(&SliceVerdict::Damaged)
     }
 
+    // How many slices the slice checksums say are damaged. The whole
+    // member's veto takes no slice to damaged, so this is the vetoed count
+    // too.
+    pub(super) fn damaged(&self) -> u64 {
+        self.damaged
+    }
+
     // Proven intact without a read: every slice intact with independent
     // coverage, at exactly the described length, and no arm says damaged.
     pub(super) fn is_proven(&self) -> bool {
@@ -124,6 +145,8 @@ impl Evidence {
     // Per-slice verdicts with the veto applied: a whole-member mismatch
     // leaves no slice proven.
     pub(super) fn vetoed(&self) -> impl Iterator<Item = SliceVerdict> + '_ {
+        #[cfg(test)]
+        VETOED_READS.with(|reads| reads.set(reads.get() + 1));
         let veto = self.whole == SliceVerdict::Damaged;
         self.slices.iter().map(move |slice| match slice {
             SliceVerdict::Intact if veto => SliceVerdict::Unknown,

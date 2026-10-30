@@ -55,7 +55,7 @@ fn deliver(object: &mut Par2, twin_volumes: &[(VolumeIndex, Vec<u8>)], act: Act)
         Delivery {
             volume: *volume,
             offset,
-            bytes: piece,
+            bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,

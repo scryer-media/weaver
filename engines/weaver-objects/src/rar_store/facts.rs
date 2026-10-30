@@ -54,6 +54,9 @@ struct VolumeFacts {
     headers: Option<RarVolumeFacts>,
     ended: bool,
     locked: Option<RarVolumeHeaderEncryption>,
+    // What the front stated when it was bound, which can precede the walk's
+    // first header read.
+    front: Option<RarVolumeFacts>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,7 +102,8 @@ impl From<MemberKeying> for KeyTuple {
 }
 
 impl Durable for StoreFacts {
-    const VERSION: u16 = 1;
+    // 2: the front each volume stated when it was bound.
+    const VERSION: u16 = 2;
 
     fn impossible(&self) -> Option<&'static str> {
         let indices: BTreeSet<_> = self.volumes.iter().map(|volume| volume.index).collect();
@@ -133,6 +137,7 @@ pub(super) fn of(store: &RarStore) -> Facts {
             headers: volume.walk.facts.clone(),
             ended: volume.walk.ended,
             locked: volume.walk.locked,
+            front: volume.front.clone(),
         })
         .collect();
     let entries = store
@@ -188,10 +193,13 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
     let mut store = RarStore::new();
     for found in kept.volumes {
         let mut volume = Volume::new();
-        volume.name = found.name;
+        if let Some(name) = &found.name {
+            volume.name_as(name);
+        }
         volume.length = found.length;
         volume.closed = found.closed;
         volume.kept = found.kept;
+        volume.front = found.front;
         volume.walk.blocks = found.headers.as_ref().map_or_else(Vec::new, |headers| {
             headers
                 .members
@@ -205,16 +213,19 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         volume.walk.ended = found.ended;
         volume.walk.locked = found.locked;
         store.volumes.insert(found.index, volume);
+        // The walk reads the kept headers again at the look below.
+        store.file(found.index);
+        store.touch(found.index);
     }
     let keyings: Vec<_> = kept.entries.iter().map(|entry| entry.keying).collect();
     store.entries = kept.entries.into_iter().map(entry).collect();
+    store.remap();
     store.damage_said = kept.damage_said.into_iter().collect();
     store.recovery_said = kept.recovery_said;
     store.gaps_said = kept.gaps_said;
     store.gone = kept.gone;
     // The walk reads the kept headers again; what it says now was said
     // before the checkpoint, so it goes nowhere.
-    store.stale = !store.gone;
     store.settle(None, &mut Vec::new());
     // Nor is a question it asked while no password was on hand yet: the
     // server offers the winning one again, and one never asked is asked

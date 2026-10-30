@@ -29,6 +29,8 @@ pub(in super::super) struct GraphOutcome {
     // The names the post carries its files under, and the names its
     // recovery set describes the volumes by.
     pub(in super::super) own: BTreeSet<String>,
+    // A joined posting whose output was compared with every source byte.
+    pub(in super::super) joined: Option<String>,
     // Articles the job asked for while it held them on disk by its own
     // account.
     pub(in super::super) rerequested: BTreeSet<(u32, u32)>,
@@ -64,6 +66,7 @@ pub(in super::super) struct Leaves {
 pub(in super::super) struct Files {
     pub(in super::super) posted: usize,
     pub(in super::super) whole: usize,
+    pub(in super::super) joined: Option<String>,
 }
 
 // What a post is under one schedule: the members its archive holds, and
@@ -185,7 +188,8 @@ fn loses(interruption: Interruption) -> bool {
 }
 
 // The one rule set, as the ways a run disagrees with it. The members
-// delivered whole are exactly the deliverable ones. The job is complete
+// delivered whole include the reference reader's deliverable ones, and
+// every published member is checked against its fixture bytes. The job is complete
 // when every member is whole and the post mended all the schedule
 // damaged, failed when nothing is whole, and partial otherwise. A post the
 // job has no reason to read as an archive is files as posted, held to the
@@ -215,6 +219,12 @@ pub(in super::super) fn graph_disagreements(
         .map(|(name, _)| name.clone())
         .collect();
     let status = if let Some(files) = files {
+        if files.joined.is_some() && files.joined != outcome.joined {
+            said.push(format!(
+                "joined posting {:?} was not delivered byte-exact",
+                files.joined
+            ));
+        }
         if files.whole == 0 {
             matches!(outcome.status, Some(JobStatus::Failed { .. }))
         } else if files.whole == files.posted {
@@ -241,24 +251,19 @@ pub(in super::super) fn graph_disagreements(
             ))
         ));
     }
-    if whole != *deliverable {
-        said.push(format!(
-            "delivered whole {whole:?}, deliverable {deliverable:?}"
-        ));
-    }
-    if deliverable.is_empty() {
-        let present: Vec<_> = outcome
-            .files
-            .iter()
-            .filter(|(_, bytes)| bytes.is_some())
-            .map(|(name, _)| name)
-            .collect();
-        if !present.is_empty() {
-            said.push(format!(
-                "nothing is deliverable, yet {present:?} is published"
-            ));
-        }
-    }
+    let present = outcome
+        .files
+        .iter()
+        .filter(|(_, bytes)| bytes.is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    said.extend(
+        crate::pipeline::tests::archive_output_contract::disagreements(
+            deliverable,
+            &whole,
+            &present,
+        ),
+    );
     if !whole.is_empty() && !outcome.leftovers.is_empty() {
         said.push(format!(
             "left outside the output directory: {:?}",
@@ -283,13 +288,25 @@ pub(in super::super) fn graph_disagreements(
     }
     if interruption.fails()
         && options.recovery != RecoveryFormat::Absent
-        && deliverable.is_empty()
+        && whole.is_empty()
         && outcome.failure_kind != Some(HistoryFailureKind::Repair)
     {
         said.push(format!(
             "the starved set fails the job as {:?}, not as a repair; recovery seen {:?}",
             outcome.failure_kind, outcome.recovery
         ));
+    }
+    if !said.is_empty() {
+        for (name, expected) in post.members {
+            if let Some(Some(actual)) = outcome.files.get(name)
+                && let Some(difference) =
+                    crate::pipeline::tests::archive_output_contract::output_difference(
+                        name, expected, actual,
+                    )
+            {
+                said.push(difference);
+            }
+        }
     }
     said
 }
@@ -669,6 +686,19 @@ async fn drive_graph_schedule(
         .collect();
     let mut published = files_under(&output);
     published.remove(crate::jobs::working_dir::OUTPUT_DIR_MARKER);
+    // A numbered posting may be delivered under its joined name. The
+    // alias belongs to this post only if every output byte is the posted
+    // sequence; a name alone never makes an unexpected file acceptable.
+    let mut joined = None;
+    if let Some((name, bytes)) = crate::pipeline::tests::archive_output_contract::joined_posting(
+        posted
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    ) && std::fs::read(output.join(&name)).ok().as_deref() == Some(bytes.as_slice())
+    {
+        own.insert(name.clone());
+        joined = Some(name);
+    }
     let mut leftovers: BTreeSet<String> = files_under(&pipeline.intermediate_dir)
         .into_iter()
         .map(|path| format!("intermediate/{path}"))
@@ -693,6 +723,7 @@ async fn drive_graph_schedule(
         published,
         leftovers,
         own,
+        joined,
         rerequested: run.rerequested,
         durable: run.delivered,
         trace: run.trace,

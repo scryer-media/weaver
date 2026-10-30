@@ -62,9 +62,13 @@ fn a_duplicate_never_advances_the_composition_and_a_repair_replaces() {
         gate(&runs, 3000, crc32(&data), false, None).0,
         SliceVerdict::Damaged
     );
+    assert_eq!(runs.held(), 3000, "a duplicate does not count bytes twice");
     // A repair over part of it leaves the rest of the run unrecorded.
-    let gaps = runs.overwrite(1400, 200, crc32(&data[1400..1600]));
-    assert_eq!(gaps, vec![(1000, 1400), (1600, 2000)]);
+    let gaps = runs.overwrite(ByteRange::new(1400, 1600), crc32(&data[1400..1600]));
+    assert_eq!(
+        gaps,
+        vec![ByteRange::new(1000, 1400), ByteRange::new(1600, 2000)]
+    );
     assert_eq!(runs.compose(0, 3000), None);
     runs.feed(
         ByteRange::new(1000, 2000),

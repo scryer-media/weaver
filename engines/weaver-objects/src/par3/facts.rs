@@ -42,12 +42,16 @@ pub(super) struct Par3Facts {
 pub(super) struct VolumeFacts {
     arrived: Coverage,
     closed: bool,
+    // The name it was bound under: replay does not bind it again when the
+    // carrier's leading packet is damaged.
+    name: Option<String>,
 }
 
 impl Durable for Par3Facts {
     // 2: a repair that came up short kept with the volumes closed then.
     // 3: the ranges of members the parent refused.
-    const VERSION: u16 = 3;
+    // 4: the name each volume was bound under.
+    const VERSION: u16 = 4;
 
     fn impossible(&self) -> Option<&'static str> {
         if self.volumes.len() > MAX_CARRIERS {
@@ -76,6 +80,7 @@ pub(super) fn of(par3: &Par3) -> Facts {
             .map(|volume| VolumeFacts {
                 arrived: volume.arrived.clone(),
                 closed: volume.closed,
+                name: volume.name.clone(),
             })
             .collect(),
         bound: par3.bound.clone(),
@@ -100,8 +105,11 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
             front: Vec::new(),
             arrived: volume.arrived,
             closed: volume.closed,
-            named_blocks: None,
-            name: None,
+            named_blocks: volume
+                .name
+                .as_deref()
+                .and_then(|name| crate::recovery_volume::named_blocks(name, ".par3")),
+            name: volume.name,
         })
         .collect();
     par3.bound = kept.bound;

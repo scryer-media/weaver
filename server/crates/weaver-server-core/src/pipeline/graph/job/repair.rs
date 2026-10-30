@@ -11,6 +11,8 @@
 // that the job is quiet, and an object that cannot finish refuses itself for
 // its own reason. The server tells; it chooses no reason.
 
+use std::collections::BTreeSet;
+
 use weaver_graph::slots::Ticket;
 use weaver_graph::{MemberId, NodeId, VolumeIndex};
 
@@ -44,41 +46,22 @@ impl GraphJob {
         self.loans.give_back()
     }
 
-    // Walk the namespaces in node order, which puts every parent before its
-    // children, and ask each to rule its sets. A namespace the walk's own
-    // repairs bring into being is walked too.
+    // Walk the namespaces that have sets in node order, which puts every
+    // parent before its children, and ask each to rule them: a namespace
+    // with none has nothing to rule or announce. A set the walk's own
+    // repairs bring into being is walked too. A replay or a checksum check
+    // waiting goes out once no repair took the job's one loan: what either
+    // changes, applied, takes back the rulings it touches (an uncovered
+    // input), and the set rules again through the same walk.
     fn walk(&mut self, mut slots: Option<(&mut RepairSlots, usize)>) -> Result<(), GraphError> {
-        if self.writer.rechecks_waiting() {
-            let mut lending = self
-                .loans
-                .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
-            if !lending.admit() {
-                return Ok(());
-            }
-            if let Some(replay) = self
-                .writer
-                .take_replay(&self.tree)
-                .map_err(WriteError::from)?
-            {
-                lending.replay(replay);
-                return Ok(());
-            }
-        }
-        if self.writer.verifications_waiting() {
-            let mut lending = self
-                .loans
-                .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
-            if !lending.admit() {
-                return Ok(());
-            }
-            if let Some(check) = self.writer.take_verification(&self.tree) {
-                lending.verify(check);
-                return Ok(());
-            }
-        }
         let mut walked = None;
-        while let Some(node) = self.tree.next_live(walked) {
+        while let Some(node) = self.tree.next_recovery_home(walked) {
             walked = Some(node);
+            if !self.tree.is_live(node) {
+                continue;
+            }
+            #[cfg(test)]
+            tests::RULED.with_borrow_mut(|ruled| ruled.push(node));
             let runs = &self.runs;
             let mut lending = self
                 .loans
@@ -95,23 +78,91 @@ impl GraphJob {
             self.heard(out)?;
         }
         self.seal_proven();
+        // An ended namespace's obligations nothing can check end here.
+        self.writer
+            .drop_unmet_verifications(&self.tree, self.payload_waiting());
+        if !self.writer.rechecks_waiting() && !self.writer.verifications_waiting() {
+            return Ok(());
+        }
+        let mut lending = self
+            .loans
+            .lending(slots.as_mut().map(|(slots, limit)| (&mut **slots, *limit)));
+        if !lending.admit() {
+            return Ok(());
+        }
+        if let Some(replay) = self
+            .writer
+            .take_replay(&self.tree)
+            .map_err(WriteError::from)?
+        {
+            lending.replay(replay);
+        } else if let Some(check) = self.writer.take_verification(&self.tree) {
+            lending.verify(check);
+        }
         Ok(())
     }
 
     // Every root member the walk's rulings proved whole has its decoder
-    // checksums dropped: no set reads them again.
+    // checksums dropped: no set reads them again. A member is proved by its
+    // own record being whole and by every root set over it standing clean
+    // or repaired, so a pass asks only what could have become proved since
+    // the last: the members the root's namespace marked, and the members a
+    // set covers when it came to stand clean or a volume of its own came
+    // while it stood. A set that left the root may have been the one thing
+    // keeping any member unproved, so every member is asked. A job's first
+    // pass asks every member.
     fn seal_proven(&mut self) {
-        let proven: Vec<MemberId> = self
-            .tree
-            .namespace(NodeId::ROOT)
-            .map(|namespace| {
-                namespace
-                    .members()
-                    .map(|member| member.id)
-                    .filter(|member| self.writer.proven_whole(&self.tree, NodeId::ROOT, *member))
-                    .collect()
+        let Some(namespace) = self.tree.namespace(NodeId::ROOT) else {
+            return;
+        };
+        let tree = &self.tree;
+        let writer = &self.writer;
+        let sets = tree.recovery_nodes(NodeId::ROOT);
+        let standing: BTreeSet<NodeId> = sets
+            .iter()
+            .copied()
+            .filter(|set| writer.stands_proved(tree, *set))
+            .collect();
+        let mut asked: BTreeSet<MemberId> = BTreeSet::new();
+        let every = || namespace.members().map(|member| member.id);
+        let covered = |set: NodeId| every().filter(move |member| writer.covers(tree, set, *member));
+        match &self.sealed_at {
+            None => asked.extend(every()),
+            Some(sealed) if sealed.sets.iter().any(|set| !sets.contains(set)) => {
+                asked.extend(every());
+            }
+            Some(sealed) => {
+                let mut grew: BTreeSet<NodeId> =
+                    standing.difference(&sealed.standing).copied().collect();
+                for member in namespace.changed_since(sealed.members) {
+                    asked.insert(member);
+                    if let Some((child, _)) = tree.child_of(NodeId::ROOT, member)
+                        && standing.contains(&child)
+                    {
+                        grew.insert(child);
+                    }
+                }
+                for set in grew {
+                    asked.extend(covered(set));
+                }
+            }
+        }
+        let proven: Vec<MemberId> = asked
+            .into_iter()
+            .filter(|member| {
+                namespace.get(*member).is_some() && namespace.copy_of(*member).is_none()
             })
-            .unwrap_or_default();
+            .filter(|member| {
+                #[cfg(test)]
+                tests::SEAL_ASKED.with_borrow_mut(|asked| asked.push(*member));
+                writer.proven_whole(tree, (NodeId::ROOT, &sets), *member)
+            })
+            .collect();
+        self.sealed_at = Some(Sealed {
+            members: namespace.generation(),
+            sets,
+            standing,
+        });
         for member in proven {
             self.root.seal(VolumeIndex(member.0));
         }
@@ -160,7 +211,7 @@ impl GraphJob {
             && !self.runs.live()
             && !self.loans.out()
             && !self.writer.rechecks_waiting()
-            && !self.writer.verifications_waiting()
+            && !self.verifications_due()
             && self.writer.all_ruled(&self.tree)
     }
 
@@ -183,3 +234,15 @@ impl GraphJob {
         self.heard(out)
     }
 }
+
+// Where the last seal pass left the root: its namespace's generation, its
+// sets, and those of them that stood clean or repaired.
+pub(super) struct Sealed {
+    members: u64,
+    sets: Vec<NodeId>,
+    standing: BTreeSet<NodeId>,
+}
+
+#[cfg(test)]
+#[path = "repair_tests.rs"]
+pub(super) mod tests;

@@ -115,7 +115,7 @@ impl Job {
             Emit::Bytes {
                 member: MemberId(member),
                 offset,
-                bytes: Bytes::copy_from_slice(bytes),
+                bytes: Bytes::copy_from_slice(bytes).into(),
                 provenance: Provenance::Fresh,
             },
         );
@@ -178,13 +178,13 @@ fn a_stream_bound_and_closed_in_one_pass_hears_its_volume_closed_once_after_its_
             Emit::Bytes {
                 member: MemberId(0),
                 offset: 0,
-                bytes: Bytes::from_static(&XZ[..6]),
+                bytes: Bytes::from_static(&XZ[..6]).into(),
                 provenance: Provenance::Fresh,
             },
             Emit::Bytes {
                 member: MemberId(0),
                 offset: 6,
-                bytes: Bytes::from_static(&XZ[6..]),
+                bytes: Bytes::from_static(&XZ[6..]).into(),
                 provenance: Provenance::Fresh,
             },
             Emit::MemberClosed(MemberId(0)),

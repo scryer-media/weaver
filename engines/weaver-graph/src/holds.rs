@@ -15,6 +15,7 @@
 // refuses the member to a leaf (`Why::HoldsBreached`) and keeps downloading.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -509,11 +510,19 @@ impl HoldLedger {
     // The held parts of `range`, in offset order, left held: a repair reads
     // bytes before any object has given them a home.
     pub fn peek(&self, volume: VolumeIndex, range: ByteRange) -> Vec<Taken> {
+        if range.is_empty() {
+            return Vec::new();
+        }
         self.volumes
             .get(&volume)
             .map(|holds| {
+                let start = holds
+                    .range(..=range.start)
+                    .next_back()
+                    .filter(|(_, hold)| hold.range.end > range.start)
+                    .map_or(range.start, |(&start, _)| start);
                 holds
-                    .range(..range.end)
+                    .range(start..range.end)
                     .filter_map(|(_, hold)| {
                         let inside = hold.range.intersect(range)?;
                         Some(Taken {
@@ -547,6 +556,16 @@ impl HoldLedger {
             .get(&volume)
             .map(|holds| holds.values().map(|hold| hold.range).collect())
             .unwrap_or_default()
+    }
+
+    // The first volume after `after` that holds anything, in volume order,
+    // or the first of them when `after` is none.
+    pub fn next_held_volume(&self, after: Option<VolumeIndex>) -> Option<VolumeIndex> {
+        let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.volumes
+            .range((from, Bound::Unbounded))
+            .find(|(_, holds)| !holds.is_empty())
+            .map(|(volume, _)| *volume)
     }
 
     pub fn total_held(&self) -> u64 {
@@ -806,6 +825,67 @@ mod tests {
                 namespaces: 0
             }
         );
+    }
+
+    #[test]
+    fn peek_clips_an_overlapping_predecessor_and_preserves_gaps_and_accounting() {
+        for resident in [0, 100] {
+            let accountant = Arc::new(HoldsAccountant::new(budgets(resident)));
+            let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+            for (offset, fill) in [(10, 1), (30, 2), (50, 3)] {
+                ledger.hold(VolumeIndex(0), offset, bytes(fill, 10), PLENTY);
+            }
+            let usage = accountant.usage();
+            let taken = ledger.peek(VolumeIndex(0), ByteRange::new(18, 35));
+            let location = |fill, offset, len| {
+                if resident == 0 {
+                    Location::Scratch { offset, len }
+                } else {
+                    Location::Ram(bytes(fill, len as usize))
+                }
+            };
+            assert_eq!(
+                taken,
+                vec![
+                    Taken {
+                        range: ByteRange::new(18, 20),
+                        location: location(1, 8, 2)
+                    },
+                    Taken {
+                        range: ByteRange::new(30, 35),
+                        location: location(2, 10, 5)
+                    },
+                ]
+            );
+            assert_eq!(
+                ledger.peek(VolumeIndex(0), ByteRange::new(45, 55)),
+                vec![Taken {
+                    range: ByteRange::new(50, 55),
+                    location: location(3, 20, 5)
+                },]
+            );
+            for range in [
+                ByteRange::new(20, 30),
+                ByteRange::new(35, 35),
+                ByteRange::new(60, 70),
+            ] {
+                assert!(ledger.peek(VolumeIndex(0), range).is_empty());
+            }
+            assert!(
+                ledger
+                    .peek(VolumeIndex(1), ByteRange::new(0, 100))
+                    .is_empty()
+            );
+            assert_eq!(accountant.usage(), usage);
+            assert_eq!(
+                ledger.held_ranges(VolumeIndex(0)),
+                vec![
+                    ByteRange::new(10, 20),
+                    ByteRange::new(30, 40),
+                    ByteRange::new(50, 60)
+                ]
+            );
+        }
     }
 
     #[test]

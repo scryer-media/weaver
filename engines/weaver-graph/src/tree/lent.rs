@@ -8,10 +8,9 @@
 // queues behind it. Taken back, the object hears what waited as if it had
 // been there, and the queued members are asked again who owns them.
 
-use bytes::Bytes;
-
 use super::{Builder, Effect, NodeId, Tree};
 use crate::deliver::{Delivery, Provenance};
+use crate::evidence::Evidenced;
 use crate::facts::Facts;
 use crate::member::MemberId;
 use crate::object::{Kind, Object};
@@ -34,7 +33,7 @@ pub(super) struct Lent {
 pub(super) struct Arrived {
     pub(super) volume: VolumeIndex,
     pub(super) offset: u64,
-    pub(super) bytes: Bytes,
+    pub(super) bytes: Evidenced,
     pub(super) provenance: Provenance,
 }
 
@@ -85,10 +84,6 @@ pub(super) enum Told {
         member: MemberId,
         range: ByteRange,
     },
-    Uncovered {
-        member: MemberId,
-        range: ByteRange,
-    },
 }
 
 impl Lent {
@@ -101,11 +96,9 @@ impl Tree {
     // Lend the recovery object at `node` out of the tree. `None` when the
     // node holds no recovery object.
     pub fn lend(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        let recovery = self.recovery(node)?;
+        self.recovery(node)?;
         let covers = self
-            .home(node)
-            .and_then(|home| self.namespace(home))
-            .map(|namespace| {
+            .consult_recovery(node, |recovery, namespace| {
                 namespace
                     .members()
                     .map(|member| member.id)
@@ -149,14 +142,15 @@ impl Tree {
         Some(&self.nodes.get(&node)?.lent.as_ref()?.facts)
     }
 
-    // A lent object comes back. It hears everything that waited for it, in
-    // the order it came, and every member that queued behind it is asked
-    // again who owns it. A node retracted meanwhile has nowhere to take it,
-    // so the object is dropped with it.
+    // A lent object comes back, the one lent or one rebuilt from its facts.
+    // It is handed what its node's owner handed last, then hears everything
+    // that waited for it, in the order it came, and every member that queued
+    // behind it is asked again who owns it. A node retracted meanwhile has
+    // nowhere to take it, so the object is dropped with it.
     pub fn take_back(
         &mut self,
         node: NodeId,
-        object: Box<dyn Object>,
+        mut object: Box<dyn Object>,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
@@ -167,6 +161,9 @@ impl Tree {
             .lent
             .take()
             .map_or_else(Default::default, |lent| (lent.waiting, lent.queued));
+        if let Some(binding) = &found.binding {
+            object.handed(&binding.handed);
+        }
         found.object = Some(object);
         for waiting in waiting {
             self.hear(node, waiting, builder, effects);
@@ -212,15 +209,6 @@ impl Tree {
                     recovery.feed(member, evidence);
                 }
             });
-        }
-    }
-
-    pub(super) fn uncover_input(&mut self, set: NodeId, member: MemberId, range: ByteRange) {
-        if self
-            .wait(set, Waiting::Told(Told::Uncovered { member, range }))
-            .is_some()
-        {
-            self.with_recovery(set, |recovery, _| recovery.uncovered(member, range));
         }
     }
 
@@ -330,11 +318,6 @@ impl Tree {
                 Told::Refused { member, range } => {
                     if let Some(recovery) = object.recovery_mut() {
                         recovery.refused(member, range);
-                    }
-                }
-                Told::Uncovered { member, range } => {
-                    if let Some(recovery) = object.recovery_mut() {
-                        recovery.uncovered(member, range);
                     }
                 }
             }

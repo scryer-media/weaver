@@ -55,10 +55,10 @@ fn rev(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeInd
 // A recovery volume every byte of which has arrived, not yet closed.
 fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<VolumeIndex> {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front, None) {
-        Some(volume) => volume,
-        None if job.store.volumes.is_empty() => VolumeIndex(0),
-        None => return None,
+    let volume = match job.object.claim(name, front, None)[..] {
+        [volume] => volume,
+        [] if job.store.volumes.is_empty() => VolumeIndex(0),
+        _ => return None,
     };
     let member = job.namespace.announce(name, Some(bytes.len() as u64));
     job.arrive(member, 0, bytes, Provenance::Fresh);
@@ -72,7 +72,7 @@ fn arriving(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> Option<Volu
             Delivery {
                 volume,
                 offset: (at * 16) as u64,
-                bytes: piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -127,7 +127,7 @@ fn a_rar5_header_reads_from_one_delivery_past_a_front_bound_short() {
         Delivery {
             volume,
             offset: 0,
-            bytes: &bytes,
+            bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
@@ -165,7 +165,7 @@ fn recovery_volumes_of_one_set_are_claimed_and_another_sets_are_not() {
     assert_eq!(
         job.object
             .claim("lantern.part2.rar", b"Rar!\x1a\x07\x01\x00", None),
-        None
+        Vec::<VolumeIndex>::new()
     );
 }
 
@@ -318,7 +318,7 @@ fn acknowledged_rev_growth_retains_repaired_proof_but_later_loss_revokes_it() {
 }
 
 #[test]
-fn missing_replayed_source_revokes_restored_rev_proof() {
+fn damaged_replayed_source_revokes_restored_rev_proof() {
     let mut job = job();
     rev(&mut job, "lantern.part1.rev", &rev5(2, 1, 2, &[300, 300]));
     let first = data(&mut job, "lantern.part01.rar");
@@ -330,7 +330,12 @@ fn missing_replayed_source_revokes_restored_rev_proof() {
         RepairOutcome::Clean
     );
     let mut restored: RarRecovery = job.object.facts().read(Kind::RarRecovery).unwrap();
-    restored.uncovered(first, ByteRange::new(32, 64));
+    job.namespace
+        .get_mut(first)
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(32, 64), Provenance::Damaged);
+    restored.bind(&mut job.namespace, &mut Vec::new());
     assert_eq!(restored.missing(), 1);
     assert_eq!(restored.outcome(), None);
 }
@@ -444,9 +449,9 @@ fn a_set_survives_a_restart() {
 // A recovery volume whose front was handed over, the rest still to come.
 fn sampled(job: &mut Job<RarRecovery>, name: &str, bytes: &[u8]) -> VolumeIndex {
     let front = &bytes[..bytes.len().min(64)];
-    let volume = match job.object.claim(name, front, None) {
-        Some(volume) => volume,
-        None => VolumeIndex(0),
+    let volume = match job.object.claim(name, front, None)[..] {
+        [volume] => volume,
+        _ => VolumeIndex(0),
     };
     job.object.bound(volume, name, front, None);
     job.object

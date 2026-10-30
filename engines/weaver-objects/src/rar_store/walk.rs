@@ -15,7 +15,7 @@ use unrar_rs::{
     ArchiveFormat, KdfCache, RarArchive, RarError, RarVolumeFacts, RarVolumeFactsWalk,
     RarVolumeHeaderEncryption,
 };
-use weaver_graph::{ByteRange, Emit, Provenance, Why};
+use weaver_graph::{ByteRange, Emit, Why};
 
 use super::image::SparseImage;
 use crate::kept::Kept;
@@ -47,7 +47,7 @@ pub(super) enum Step {
     Refuse(Emit),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct Walk {
     pub(super) facts: Option<RarVolumeFacts>,
     // What the end record says of a volume after this one, once the walk
@@ -56,20 +56,6 @@ pub(super) struct Walk {
     pub(super) ended: bool,
     pub(super) blocks: Vec<Block>,
     pub(super) locked: Option<RarVolumeHeaderEncryption>,
-    dirty: bool,
-}
-
-impl Default for Walk {
-    fn default() -> Self {
-        Self {
-            facts: None,
-            more: None,
-            ended: false,
-            blocks: Vec::new(),
-            locked: None,
-            dirty: true,
-        }
-    }
 }
 
 fn signature_len(facts: &RarVolumeFacts) -> u64 {
@@ -97,7 +83,7 @@ fn data_end(facts: &RarVolumeFacts) -> u64 {
 fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
     let mut at = from;
     for (range, _, provenance) in kept.runs() {
-        if (!closed && provenance == Provenance::Damaged) || range.end <= at {
+        if (!closed && provenance.is_damaged()) || range.end <= at {
             continue;
         }
         if range.start > at {
@@ -112,14 +98,14 @@ fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
 fn damaged_past(kept: &Kept, from: u64) -> bool {
     kept.runs()
         .into_iter()
-        .any(|(range, _, provenance)| provenance == Provenance::Damaged && range.end > from)
+        .any(|(range, _, provenance)| provenance.is_damaged() && range.end > from)
 }
 
 // The damaged run a byte sits in.
 fn damaged_at(kept: &Kept, at: u64) -> Option<ByteRange> {
     kept.runs()
         .into_iter()
-        .find(|(range, _, provenance)| *provenance == Provenance::Damaged && range.contains(at))
+        .find(|(range, _, provenance)| provenance.is_damaged() && range.contains(at))
         .map(|(range, _, _)| range)
 }
 
@@ -207,11 +193,6 @@ fn quick_open_cross_check(
 }
 
 impl Walk {
-    // Something the walk reads changed: walk again.
-    pub(super) fn touch(&mut self) {
-        self.dirty = true;
-    }
-
     // How far the headers place bytes: nothing before any are read, every
     // byte once the volume has ended.
     pub(super) fn reach(&self) -> Option<u64> {
@@ -262,6 +243,8 @@ impl Walk {
         self.successor() == Some(false)
     }
 
+    // Walk again over what is kept: the store steps only a volume something
+    // the walk reads changed for.
     pub(super) fn step(
         &mut self,
         kept: &mut Kept,
@@ -270,9 +253,6 @@ impl Walk {
         kdf: &Arc<KdfCache>,
         closed: bool,
     ) -> Step {
-        if !std::mem::take(&mut self.dirty) {
-            return self.waiting(kept, closed, false);
-        }
         let signature = ByteRange::new(0, length.map_or(SIGNATURE, |length| length.min(SIGNATURE)));
         kept.want(signature);
         if hole(kept, 0, closed) < signature.end {

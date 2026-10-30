@@ -388,23 +388,20 @@ impl Object for RarRecovery {
     // names: a front that signs another kind is that kind's, whatever its
     // name; one that signs nothing, as a RAR3 volume's does, is claimed by
     // its name.
-    fn claim(
-        &mut self,
-        name: &str,
-        first_bytes: &[u8],
-        length: Option<u64>,
-    ) -> Option<VolumeIndex> {
+    fn claim(&mut self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Vec<VolumeIndex> {
         if matches!(
             weaver_graph::signed(first_bytes, length),
             weaver_graph::Sniff::Object(kind) if kind != Kind::RarRecovery
         ) {
-            return None;
+            return Vec::new();
         }
         let rev = first_bytes.starts_with(REV5_SIGN) || naming::recovery_stem(name).is_some();
         (rev && !self.revs.is_empty()
             && self.stem.is_some()
             && naming::recovery_stem(name) == self.stem)
             .then_some(VolumeIndex(self.revs.len() as u32))
+            .into_iter()
+            .collect()
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
@@ -547,15 +544,6 @@ impl Recovery for RarRecovery {
                 Some(Ruling::Short { .. } | Ruling::Reached(RepairOutcome::Impossible { .. }))
             )
         {
-            self.last = None;
-        }
-    }
-
-    fn uncovered(&mut self, member: MemberId, range: ByteRange) {
-        if !range.is_empty()
-            && let Some((&index, _)) = self.bound.iter().find(|(_, bound)| **bound == member)
-        {
-            self.whole.remove(&index);
             self.last = None;
         }
     }

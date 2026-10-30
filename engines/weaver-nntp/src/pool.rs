@@ -1691,6 +1691,15 @@ impl NntpPool {
         self.transfer_controls.get(server.0).cloned().flatten()
     }
 
+    // Whether `server`'s quota turns work away. No lock and no `Arc` clone:
+    // the presentation asks it of every fill server on every article.
+    pub fn server_quota_blocked(&self, server: ServerId) -> bool {
+        self.transfer_controls
+            .get(server.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|control| control.quota_blocked())
+    }
+
     pub fn try_acquire_blocking_permit(
         &self,
         server: ServerId,

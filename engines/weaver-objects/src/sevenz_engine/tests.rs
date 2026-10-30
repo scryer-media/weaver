@@ -404,26 +404,68 @@ fn a_sink_that_says_stop_hears_nothing_more() {
 #[test]
 fn claim_names_the_volumes_of_its_own_set_only() {
     let mut engine = named(&["Set.7z.001"]);
-    assert_eq!(engine.claim("set.7Z.002", b"", None), Some(VolumeIndex(1)));
+    assert_eq!(engine.claim("set.7Z.002", b"", None), vec![VolumeIndex(1)]);
     assert_eq!(
         engine.claim("set.7z.1000", b"", None),
-        Some(VolumeIndex(999))
+        vec![VolumeIndex(999)]
     );
     assert_eq!(
         engine.claim("set.7z.0001", b"", None),
-        Some(VolumeIndex(0)),
+        vec![VolumeIndex(0)],
         "a piece posted again is that piece"
     );
-    assert_eq!(engine.claim("set.7z.000", b"", None), None);
-    assert_eq!(engine.claim("other.7z.002", b"", None), None);
-    assert_eq!(engine.claim("set.7z", b"", None), None);
-    assert_eq!(engine.claim("set.part2.rar", b"", None), None);
+    assert_eq!(
+        engine.claim("set.7z.000", b"", None),
+        Vec::<VolumeIndex>::new()
+    );
+    assert_eq!(
+        engine.claim("other.7z.002", b"", None),
+        Vec::<VolumeIndex>::new()
+    );
+    assert_eq!(engine.claim("set.7z", b"", None), Vec::<VolumeIndex>::new());
+    assert_eq!(
+        engine.claim("set.part2.rar", b"", None),
+        Vec::<VolumeIndex>::new()
+    );
 
     let mut lone = named(&["set.7z"]);
     assert_eq!(
         lone.claim("set.7z.002", b"", None),
-        None,
+        Vec::<VolumeIndex>::new(),
         "a lone 7z has no siblings"
+    );
+}
+
+// Whether an unsigned piece is the one holding its place is the tree's to
+// judge, by their fronts: the engine offers it the place all the same.
+#[test]
+fn an_unsigned_copy_of_a_held_continuation_volume_is_offered_the_held_place() {
+    let bytes = store();
+    let pieces: Vec<&[u8]> = bytes.chunks(bytes.len().div_ceil(3)).collect();
+    assert_eq!(pieces.len(), 3);
+    assert!(pieces[2].len() < pieces[1].len());
+    let mut engine = SevenZipEngine::new();
+    let names = [
+        "e93a07c1d25b4f68a0c3e1f7b9d24c85",
+        "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64",
+    ];
+    for volume in [0, 1] {
+        let piece = pieces[volume];
+        engine.bound(
+            VolumeIndex(volume as u32),
+            names[volume],
+            &piece[..32],
+            Some(piece.len() as u64),
+        );
+    }
+    let piece = pieces[1];
+    assert_eq!(
+        engine.claim(
+            "5d0f9a3c7e1b4826a9c4f0e2b7d13a68",
+            &piece[..32],
+            Some(piece.len() as u64)
+        ),
+        vec![VolumeIndex(1)]
     );
 }
 
@@ -515,4 +557,53 @@ fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
         checksums(&emits),
         vec![(0, crc(NOTES)), (1, crc(&second()))]
     );
+}
+
+#[test]
+fn inferred_geometry_preserves_owner_read_failures_without_a_format_refusal() {
+    struct Failed {
+        uncertain: bool,
+        kind: io::ErrorKind,
+    }
+    impl Volumes for Failed {
+        fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+            Ok(after.is_none().then_some(VolumeIndex(0)))
+        }
+        fn len(&self, _: VolumeIndex) -> Option<u64> {
+            Some(100)
+        }
+        fn uncertain_lengths(&self) -> bool {
+            self.uncertain
+        }
+        fn read_at(&self, _: VolumeIndex, _: u64, _: &mut [u8]) -> io::Result<usize> {
+            Err(self.kind.into())
+        }
+    }
+    for kind in [
+        io::ErrorKind::NotFound,
+        io::ErrorKind::Interrupted,
+        io::ErrorKind::Other,
+    ] {
+        for uncertain in [false, true] {
+            let mut object = crate::build(
+                Kind::SevenZipEngine,
+                ObjectId(1),
+                weaver_graph::Budget::default(),
+            )
+            .unwrap();
+            let mut emits = Vec::new();
+            object.engine_mut().unwrap().start().run(
+                Arc::new(Failed { uncertain, kind }),
+                &mut |emit| {
+                    emits.push(emit);
+                    true
+                },
+                weaver_graph::Budget::default(),
+            );
+            assert!(
+                emits.is_empty(),
+                "{kind:?}, uncertain={uncertain}: {emits:?}"
+            );
+        }
+    }
 }

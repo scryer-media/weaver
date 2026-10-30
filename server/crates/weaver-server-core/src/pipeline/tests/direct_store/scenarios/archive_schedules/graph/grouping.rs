@@ -146,24 +146,59 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
         // as one, and holds the pieces posted as files. A recovery set under
         // the posted names says nothing of what the pieces are, and what it
         // recreates is already in what the post leaves.
+        let withheld = interruption.withheld().map(|(volume, _)| volume as usize);
         let archive = !cell.container.is_sevenz()
-            || cell.naming.names_place()
+            || crate::pipeline::tests::archive_output_contract::names_show_archive(
+                fixture
+                    .volumes
+                    .iter()
+                    .enumerate()
+                    .filter(|(copy, _)| Some(*copy) != withheld)
+                    .map(|(_, (name, _))| name.as_str()),
+            )
             || cell.binding.names_real()
             || left.first().is_some_and(|piece| {
                 piece
                     .as_ref()
                     .is_some_and(|bytes| bytes.starts_with(SEVENZ))
             });
-        let files = (!archive).then(|| {
-            let posted: Vec<&Vec<u8>> = left.iter().flatten().collect();
-            Files {
-                posted: posted.len(),
-                whole: posted
-                    .iter()
-                    .filter(|piece| fixture.volumes.iter().any(|(_, bytes)| bytes == **piece))
-                    .count(),
-            }
-        });
+        let (_, posted) = cell.naming.layout();
+        let visible = fixture
+            .volumes
+            .iter()
+            .enumerate()
+            .filter(|(copy, _)| Some(*copy) != withheld)
+            .map(|(copy, (name, bytes))| {
+                (left[posted[copy]].as_ref() == Some(bytes))
+                    .then_some((name.as_str(), bytes.as_slice()))
+            })
+            .collect::<Option<Vec<_>>>();
+        let joined = (!cell.binding.names_real())
+            .then_some(visible)
+            .flatten()
+            .and_then(crate::pipeline::tests::archive_output_contract::joined_posting)
+            .filter(|(name, bytes)| {
+                crate::pipeline::tests::archive_output_contract::signatureless_join(name, bytes)
+            });
+        let files = if let Some((name, _)) = joined {
+            Some(Files {
+                posted: 1,
+                whole: 1,
+                joined: Some(name),
+            })
+        } else {
+            (!archive).then(|| {
+                let posted: Vec<&Vec<u8>> = left.iter().flatten().collect();
+                Files {
+                    posted: posted.len(),
+                    joined: None,
+                    whole: posted
+                        .iter()
+                        .filter(|piece| fixture.volumes.iter().any(|(_, bytes)| bytes == **piece))
+                        .count(),
+                }
+            })
+        };
         Leaves {
             deliverable,
             mended,

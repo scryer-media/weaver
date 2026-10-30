@@ -152,7 +152,7 @@ impl Object for Store {
                 out.push(Emit::Bytes {
                     member,
                     offset: start - header,
-                    bytes: Bytes::copy_from_slice(body),
+                    bytes: Bytes::copy_from_slice(body).into(),
                     provenance: delivery.provenance,
                 });
             }
@@ -232,7 +232,7 @@ impl Object for Store {
         out.push(Emit::Bytes {
             member,
             offset: 0,
-            bytes: Bytes::copy_from_slice(&self.body),
+            bytes: Bytes::copy_from_slice(&self.body).into(),
             provenance: weaver_graph::Provenance::Fresh,
         });
         out.push(Emit::MemberClosed(member));
@@ -242,10 +242,13 @@ impl Object for Store {
         None
     }
 
-    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
-        let (_, part) = name.rsplit_once(".part")?;
-        let part: u32 = part.strip_suffix(".rar")?.parse().ok()?;
-        (part >= 2).then(|| VolumeIndex(part - 1))
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+        name.rsplit_once(".part")
+            .and_then(|(_, part)| part.strip_suffix(".rar")?.parse::<u32>().ok())
+            .filter(|part| *part >= 2)
+            .map(|part| VolumeIndex(part - 1))
+            .into_iter()
+            .collect()
     }
 }
 
@@ -355,7 +358,7 @@ impl Extraction for LockedRun {
             let bytes = Emit::Bytes {
                 member,
                 offset: offset - HEADER as u64,
-                bytes: Bytes::copy_from_slice(&chunk[..read]),
+                bytes: Bytes::copy_from_slice(&chunk[..read]).into(),
                 provenance: weaver_graph::Provenance::Fresh,
             };
             if !sink(bytes) {

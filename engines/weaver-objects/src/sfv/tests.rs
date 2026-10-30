@@ -136,7 +136,7 @@ fn acknowledged_sfv_proof_retains_its_ruling() {
 }
 
 #[test]
-fn missing_source_invalidates_restored_sfv_proof() {
+fn damaged_source_invalidates_restored_sfv_proof() {
     let original = payload(15, 5000);
     let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
     let member = job.member("one.bin", &original);
@@ -150,7 +150,7 @@ fn missing_source_invalidates_restored_sfv_proof() {
     );
     let mut restored: Sfv = job.object.facts().read(Kind::Sfv).unwrap();
     assert_eq!(restored.outcome(), Some(RepairOutcome::Clean));
-    restored.uncovered(member, ByteRange::new(0, original.len() as u64));
+    restored.feed(member, &segments(0, &original, 700, 700, false));
     assert_eq!(restored.outcome(), None);
     job.store
         .holes

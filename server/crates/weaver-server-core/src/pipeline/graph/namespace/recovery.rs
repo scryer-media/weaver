@@ -11,15 +11,18 @@
 // one write path. A set parses, verifies and rewrites bytes; when, and over
 // what, is decided here, by the same rules at every depth.
 
+use std::collections::BTreeSet;
+
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
 use weaver_graph::{
-    Builder, ByteRange, Effect, Handed, Kind, MemberId, NodeId, Provenance, RecoveryKind, Restore,
-    Segment, Tree, VolumeIndex,
+    Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, NodeId, Provenance,
+    RecoveryKind, Restore, Segment, Tree, VolumeIndex,
 };
 
 use super::{
-    Arrival, Loan, NamespaceWriter, READ_BACK, Returned, Segments, WriteError, crc32, index,
+    Acknowledging, Arrival, Loan, NamespaceWriter, READ_BACK, Returned, Segments, Write,
+    WriteError, in_own_file, index,
 };
 
 // Who a due set's repair is lent to, to run off the loop. One goes out at a
@@ -28,6 +31,13 @@ pub(crate) trait Lender {
     // Whether a repair may go out now.
     fn admit(&mut self) -> bool;
     fn lend(&mut self, loan: Loan);
+}
+
+// How many member names a bind kept to log what it newly covered, for the
+// tests that count them.
+#[cfg(test)]
+thread_local! {
+    pub(super) static NAMES_KEPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // What one set says of the members it covers.
@@ -99,6 +109,15 @@ impl NamespaceWriter {
         })
     }
 
+    // Nothing more will come for the namespace's members, not even a
+    // repair: the payload is in, and the namespace's sets have ruled. One
+    // that has not may cover a member yet, since it binds what it covers as
+    // its own volumes arrive, and those can come after the member closed,
+    // or rebuild a member that never came at all.
+    pub(crate) fn ended(&self, tree: &Tree, node: NodeId, payload_waiting: bool) -> bool {
+        !payload_waiting && self.ruled(tree, node)
+    }
+
     // Some member of a namespace holds damage a set of that namespace
     // covers: a repair of it has something to rebuild.
     pub(crate) fn damage_covered(&self, tree: &Tree) -> bool {
@@ -109,7 +128,7 @@ impl NamespaceWriter {
                     member
                         .coverage
                         .runs()
-                        .any(|run| run.provenance == Provenance::Damaged)
+                        .any(|run| run.provenance.is_damaged())
                         && self.covering(tree, &sets, member.id).next().is_some()
                 })
             })
@@ -118,28 +137,39 @@ impl NamespaceWriter {
 
     // The member is closed whole and the sets proved it: one covers it, and
     // every one that does ruled it clean or repaired it and is not out on
-    // loan. No set reads the source's checksums of its bytes again.
-    pub(crate) fn proven_whole(&self, tree: &Tree, node: NodeId, member: MemberId) -> bool {
+    // loan. No set reads the source's checksums of its bytes again. `sets`
+    // are the namespace's sets as the tree lists them, asked once by the
+    // caller for every member it asks about.
+    pub(crate) fn proven_whole(
+        &self,
+        tree: &Tree,
+        (node, sets): (NodeId, &[NodeId]),
+        member: MemberId,
+    ) -> bool {
         let whole = tree
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
             .is_some_and(|record| record.is_whole());
-        let sets = tree.recovery_nodes(node);
-        let mut covering = self.covering(tree, &sets, member).peekable();
-        whole
-            && covering.peek().is_some()
-            && covering.all(|set| {
-                !tree.lent(set)
-                    && tree
-                        .recovery(set)
-                        .and_then(|recovery| recovery.outcome())
-                        .is_some_and(|outcome| {
-                            matches!(
-                                outcome,
-                                RepairOutcome::Clean | RepairOutcome::Repaired { .. }
-                            )
-                        })
-            })
+        if !whole {
+            return false;
+        }
+        let mut covering = self.covering(tree, sets, member).peekable();
+        covering.peek().is_some() && covering.all(|set| self.stands_proved(tree, set))
+    }
+
+    // The set is home and last ruled clean or repaired: it proves what it
+    // covers.
+    pub(crate) fn stands_proved(&self, tree: &Tree, set: NodeId) -> bool {
+        !tree.lent(set)
+            && tree
+                .recovery(set)
+                .and_then(|recovery| recovery.outcome())
+                .is_some_and(|outcome| {
+                    matches!(
+                        outcome,
+                        RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+                    )
+                })
     }
 
     // Every set of every namespace has ruled on something other than
@@ -350,29 +380,55 @@ impl NamespaceWriter {
     // engine reads it. One that has yet to learn what it describes rules
     // once every other member is in too: nothing else will ask for the
     // volumes that would say, and its ruling waits on them.
+    //
+    // A set over members a narrower set covers too rules after it: while
+    // a set over a strict subset of its covered members has yet to rule or
+    // is out repairing, the wider one waits, so it rules on what the
+    // narrower one left. A record inside one volume repairs that volume
+    // before the PAR2 set over every volume reads it.
     fn due(&self, tree: &Tree, node: NodeId, reading: bool) -> Vec<NodeId> {
         let Some(namespace) = tree.namespace(node) else {
             return Vec::new();
         };
         let known = members_known(tree, node, reading);
-        let mut due = tree.recovery_nodes(node);
-        due.retain(|&set| {
-            let Some(recovery) = tree.recovery(set) else {
-                return false;
-            };
-            let covers = namespace.members().any(|member| recovery.covers(member.id));
-            recovery.outcome().is_none()
-                && known
-                && (covers
+        let sets = tree.recovery_nodes(node);
+        // What each set that has yet to rule, or is out, covers: asked once,
+        // and only once a set is otherwise due, for its own ruling and for
+        // every wider set beside it.
+        let mut pending: Option<Vec<(NodeId, BTreeSet<MemberId>)>> = None;
+        sets.iter()
+            .copied()
+            .filter(|&set| {
+                let Some(recovery) = tree
+                    .recovery(set)
+                    .filter(|recovery| recovery.outcome().is_none())
+                else {
+                    return false;
+                };
+                if !known
+                    || !namespace.members().all(|member| {
+                        !recovery.covers(member.id)
+                            || member.closed
+                            || self.open_only_for_refused(tree, node, reading, member)
+                    })
+                {
+                    return false;
+                }
+                let pending = pending.get_or_insert_with(|| pending_covers(tree, namespace, &sets));
+                let Some((_, covers)) = pending.iter().find(|(pending, _)| *pending == set) else {
+                    return false;
+                };
+                (!covers.is_empty()
                     || closed_volumes(tree, set) > 0
                     || (recovery.undescribed() && self.members_in(tree, node)))
-                && namespace.members().all(|member| {
-                    !recovery.covers(member.id)
-                        || member.closed
-                        || self.open_only_for_refused(tree, node, reading, member)
-                })
-        });
-        due
+                    && !pending.iter().any(|(other, narrower)| {
+                        *other != set
+                            && !narrower.is_empty()
+                            && narrower.len() < covers.len()
+                            && narrower.is_subset(covers)
+                    })
+            })
+            .collect()
     }
 
     // Below the root, the object that reads a member closes it only once
@@ -494,6 +550,8 @@ impl NamespaceWriter {
     // proved is offered again once applied, so whatever refused it on the
     // bytes it held before reads it as it is now. Stale work that cannot be
     // reconstructed fails explicitly and publishes none of its staged bytes.
+    // The slices a repair applied rebuilt, when it rebuilt any: that return
+    // is the one moment the repair is complete, said once.
     pub(crate) fn returned(
         &mut self,
         tree: &mut Tree,
@@ -502,7 +560,7 @@ impl NamespaceWriter {
         restore: &dyn Restore,
         mut returned: Returned,
         out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Option<u64>, WriteError> {
         // A repair whose output refused a write failed with it, and nothing
         // it came to is applied. The refusal is the error, whatever removing
         // the output then says.
@@ -512,7 +570,8 @@ impl NamespaceWriter {
         }
         // A set retracted while it was out has nowhere to rule.
         if !tree.lent(returned.set) {
-            return Ok(returned.repaired.remove()?);
+            returned.repaired.remove()?;
+            return Ok(None);
         }
         // A repair the shutdown stopped is not repaired: what it read was
         // cut short. It is rebuilt as it left, as one the loop moved under
@@ -552,16 +611,18 @@ impl NamespaceWriter {
                 .map(|(parent, volumes)| volumes.values().map(|member| (parent, *member)).collect())
                 .unwrap_or_default();
             for (parent, member) in volumes {
-                self.replay_file(tree, builder, segments, parent, member, out)?;
+                self.replay_file(tree, builder, segments, parent, member, None, out)?;
             }
-            return Ok(repaired.remove()?);
+            repaired.remove()?;
+            return Ok(None);
         }
         tree.take_back(set, object, &mut self.placing(builder), &mut effects);
         self.apply_all(tree, builder, segments, effects, out)?;
         // A stopped repair whose object keeps no facts is taken back as it
         // came, and nothing it came to is applied.
         if stopped {
-            return Ok(repaired.remove()?);
+            repaired.remove()?;
+            return Ok(None);
         }
         for diagnostic in diagnostics {
             tracing::warn!(
@@ -583,9 +644,12 @@ impl NamespaceWriter {
         // that length close the file there. A repair reads members back, so
         // it may have identified one by its content; this bind gives it the
         // name it is.
-        let previous = self.acknowledging.replace(set);
+        self.acknowledging = Some(Acknowledging {
+            set,
+            closed: BTreeSet::new(),
+        });
         let applied = (|| {
-            let rejected = tree.rejected_inputs(node, repaired.members());
+            let mut rejected = tree.rejected_inputs(node, repaired.members());
             self.bind_recoveries(tree, builder, segments, node, out)?;
             let mut rewritten = std::collections::BTreeSet::new();
             for (member, offset, bytes) in repaired.slices() {
@@ -595,14 +659,15 @@ impl NamespaceWriter {
                     node,
                     member,
                     offset,
-                    bytes,
+                    // A repair's output: nothing proved it on the way.
+                    bytes: bytes.into(),
                     provenance: Provenance::Repaired,
                 };
-                self.arrive(tree, builder, segments, arrival, out)?;
+                self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
             }
             repaired.remove()?;
             for (member, range) in found {
-                let marked = (node, member, range, Provenance::Damaged);
+                let marked = (node, member, range, Provenance::Refuted);
                 self.redeliver(tree, builder, segments, marked, out)?;
             }
             // A rebuilt volume can let its object place bytes held behind it;
@@ -614,14 +679,55 @@ impl NamespaceWriter {
             ) {
                 rewritten.extend(self.vouched(tree, builder, segments, (node, set), out)?);
             }
-            for member in rewritten {
+            // Repair or proof delivery can complete a member's checksum
+            // metadata or inverse map. Capture any newly auditable damage
+            // through those changed inputs, alongside the earlier captures.
+            rejected.extend(tree.rejected_inputs(node, rewritten.iter().copied()));
+            for &member in &rewritten {
                 self.reopen(tree, builder, segments, (node, member), out)?;
+            }
+            // A member the set rebuilt or proved whole has its length and
+            // every byte proven: that proof closes it, through the close
+            // its producer's would take, and the batch judges it with every
+            // member it closed.
+            for member in rewritten {
+                if proven_open(tree, node, member) {
+                    self.shut(tree, builder, segments, node, member, out)?;
+                }
             }
             self.queue_rechecks(rejected);
             self.release_held(tree, builder, segments, out)
         })();
-        self.acknowledging = previous;
-        applied
+        let batch = self.acknowledging.take().expect("the batch opened above");
+        applied?;
+        self.acknowledged(tree, builder, segments, batch, out)?;
+        Ok(match outcome {
+            Some(RepairOutcome::Repaired { slices }) => Some(slices),
+            _ => None,
+        })
+    }
+
+    // The batch is down: each member it closed that is still closed in its
+    // own file gets its verdict once, on the bytes it ends with. One the
+    // batch reopened or handed to an object is judged when it closes again.
+    pub(super) fn acknowledged(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        batch: Acknowledging,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        for (node, member) in batch.closed {
+            let closed = tree
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .is_some_and(|record| record.closed);
+            if closed && in_own_file(tree, node, member) {
+                self.judge(tree, builder, segments, (node, member), out)?;
+            }
+        }
+        Ok(())
     }
 
     // A set that found what it covers whole, or made it so, has proven
@@ -658,7 +764,7 @@ impl NamespaceWriter {
                     .collect()
             })
             .unwrap_or_default();
-        let members = marked.iter().map(|(member, _)| *member).collect();
+        let members: Vec<_> = marked.iter().map(|(member, _)| *member).collect();
         for (member, range) in marked {
             let proven = (node, member, range, Provenance::Repaired);
             self.redeliver(tree, builder, segments, proven, out)?;
@@ -679,6 +785,11 @@ impl NamespaceWriter {
         (node, member): (NodeId, MemberId),
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // Held by a live object, the member's bytes went on below it: a
+        // refusal there is answered at its own depth.
+        for below in tree.refused_through(node, member) {
+            self.reopen(tree, builder, segments, below, out)?;
+        }
         let mut effects = Vec::new();
         let reopened = tree.reopen(node, member, &mut self.placing(builder), &mut effects);
         if reopened.is_empty() {
@@ -686,15 +797,17 @@ impl NamespaceWriter {
         }
         let files = self.files_mut(node);
         for volume in &reopened {
-            files.refused.remove(volume);
+            files.unrefuse(*volume);
         }
         self.prune(tree)?;
-        self.apply_each(tree, builder, segments, effects, out)
+        self.apply_each(tree, builder, segments, effects, Write::Again, out)
     }
 
     // Deliver a range of a member again, read back from wherever it went,
     // under what a set proved of it: the one write path then marks it here
-    // and in every namespace below.
+    // and in every namespace below. A set read those bytes to rule on them,
+    // and reads take held custody first, so bytes that do not read back now
+    // are gone: an error, never a proof dropped.
     fn redeliver(
         &mut self,
         tree: &mut Tree,
@@ -709,16 +822,21 @@ impl NamespaceWriter {
             at = chunk.end;
             let mut bytes = Vec::new();
             if !self.access(tree).read_at(node, member, chunk, &mut bytes) {
-                continue;
+                return Err(WriteError::ProofUnreadable {
+                    node,
+                    member,
+                    range: chunk,
+                });
             }
             let arrival = Arrival {
                 node,
                 member,
                 offset: chunk.start,
-                bytes: Bytes::from(bytes),
+                // Read back: no evidence comes with it.
+                bytes: Bytes::from(bytes).into(),
                 provenance,
             };
-            self.arrive(tree, builder, segments, arrival, out)?;
+            self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
         }
         Ok(())
     }
@@ -727,15 +845,18 @@ impl NamespaceWriter {
     // every set that covers the member. Fresh bytes carry the source's
     // checksums as they came. Any other bytes are not the source's, and nor
     // are bytes the source has no checksums for, as in a namespace below the
-    // root: they carry checksums of what is in hand, and are evidence unless
-    // they are damage.
+    // root: they carry checksums of what is in hand, cut where the covering
+    // sets fold their blocks, each from the evidence the bytes came with, and
+    // are evidence unless they are damage. `posting` is the volume the
+    // source keeps its checksums of the bytes under.
     pub(super) fn feed(
         &mut self,
         tree: &mut Tree,
         segments: &dyn Segments,
         arrival: &Arrival,
-        member: MemberId,
+        posting: MemberId,
     ) {
+        let member = arrival.member;
         let sets = tree.recovery_nodes(arrival.node);
         let covering: Vec<NodeId> = self.covering(tree, &sets, member).collect();
         if covering.is_empty() {
@@ -745,21 +866,42 @@ impl NamespaceWriter {
         self.segments.clear();
         segments.segments_for(
             arrival.node,
-            VolumeIndex(arrival.member.0),
+            VolumeIndex(posting.0),
             range,
             &mut self.segments,
         );
-        let sourced = !self.segments.is_empty();
-        if !sourced {
-            // One checksum of the whole range, filled in below.
-            self.segments.push(Segment {
-                range,
-                crc32: 0,
-                verified: false,
-            });
-        }
-        if arrival.provenance != Provenance::Fresh
-            || !sourced
+        let crc32 = |piece: ByteRange| {
+            let (start, end) = (
+                index(piece.start - range.start),
+                index(piece.end - range.start),
+            );
+            arrival
+                .bytes
+                .slice(start..end)
+                .digest(Algorithm::Crc32)
+                .value as u32
+        };
+        if self.segments.is_empty() {
+            let verified = arrival.provenance != Provenance::Damaged;
+            let mut sizes = Vec::new();
+            for set in &covering {
+                if let Some(recovery) = tree.recovery(*set) {
+                    recovery.block_sizes(&mut sizes);
+                }
+            }
+            let cuts = block_cuts(range, &sizes);
+            let mut rest = arrival.bytes.clone();
+            let mut at = range.start;
+            for cut in cuts.into_iter().chain([range.end]) {
+                let (piece, after) = rest.split_at(index(cut - at));
+                self.segments.push(Segment {
+                    range: ByteRange::new(at, cut),
+                    crc32: piece.digest(Algorithm::Crc32).value as u32,
+                    verified,
+                });
+                (rest, at) = (after, cut);
+            }
+        } else if arrival.provenance != Provenance::Fresh
             || self
                 .segments
                 .iter()
@@ -769,23 +911,25 @@ impl NamespaceWriter {
                 let Some(piece) = segment.range.intersect(range) else {
                     return false;
                 };
-                let start = index(piece.start - range.start);
-                let end = index(piece.end - range.start);
-                let verified = if arrival.provenance == Provenance::Fresh && sourced {
+                let verified = if arrival.provenance == Provenance::Fresh {
                     segment.verified
                 } else {
-                    arrival.provenance != Provenance::Damaged
+                    !arrival.provenance.is_damaged()
                 };
                 *segment = Segment {
                     range: piece,
-                    crc32: crc32(&arrival.bytes[start..end]),
+                    crc32: crc32(piece),
                     verified,
                 };
                 true
             });
         }
         for set in covering {
-            if self.acknowledging == Some(set) {
+            if self
+                .acknowledging
+                .as_ref()
+                .is_some_and(|batch| batch.set == set)
+            {
                 tree.feed_proven(set, member, &self.segments);
             } else {
                 tree.feed(set, member, &self.segments);
@@ -818,7 +962,7 @@ impl NamespaceWriter {
         for run in record.coverage.runs() {
             let verified = match run.provenance {
                 Provenance::Fresh => true,
-                Provenance::Damaged => false,
+                Provenance::Damaged | Provenance::Refuted => false,
                 Provenance::Repaired => continue,
             };
             found.clear();
@@ -870,34 +1014,39 @@ impl NamespaceWriter {
         for set in sets {
             let newly = tree
                 .with_recovery(set, |recovery, namespace| {
-                    let before: Vec<(bool, String)> = members
+                    // A member covered before the bind is not newly
+                    // covered by it, so only the others' names before the
+                    // bind are kept.
+                    let uncovered: Vec<(MemberId, String)> = members
                         .iter()
+                        .filter(|member| !recovery.covers(**member))
                         .map(|member| {
+                            #[cfg(test)]
+                            NAMES_KEPT.with(|kept| kept.set(kept.get() + 1));
                             let name = namespace
                                 .get(*member)
                                 .map(|record| record.name.clone())
                                 .unwrap_or_default();
-                            (recovery.covers(*member), name)
+                            (*member, name)
                         })
                         .collect();
                     let earlier = renamed.len();
                     recovery.bind(namespace, &mut renamed);
                     let by_content = &renamed[earlier..];
-                    members
-                        .iter()
-                        .zip(before)
-                        .filter(|(member, (was, _))| !was && recovery.covers(**member))
-                        .map(|(member, (_, name))| {
+                    uncovered
+                        .into_iter()
+                        .filter(|(member, _)| recovery.covers(*member))
+                        .map(|(member, name)| {
                             let described = namespace
-                                .get(*member)
+                                .get(member)
                                 .map(|record| record.name.clone())
                                 .unwrap_or_default();
-                            let by = if by_content.contains(member) {
+                            let by = if by_content.contains(&member) {
                                 "content"
                             } else {
                                 "name"
                             };
-                            (*member, name, described, by)
+                            (member, name, described, by)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -971,7 +1120,7 @@ impl NamespaceWriter {
             }
         }
         self.renamed = renamed;
-        self.apply_each(tree, builder, segments, claims, out)
+        self.apply_each(tree, builder, segments, claims, Write::Again, out)
     }
 
     // An object found its own recovery data at a range of its volume. The
@@ -1024,12 +1173,39 @@ impl NamespaceWriter {
             &mut self.placing(builder),
             &mut effects,
         );
-        self.apply_each(tree, builder, segments, effects, out)?;
+        self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         if window.is_some() {
             self.bind_recoveries(tree, builder, segments, parent, out)?;
         }
         Ok(())
     }
+}
+
+// What each of `sets` that has yet to rule, or is out, covers of the
+// namespace's members.
+fn pending_covers(
+    tree: &Tree,
+    namespace: &weaver_graph::Namespace,
+    sets: &[NodeId],
+) -> Vec<(NodeId, BTreeSet<MemberId>)> {
+    sets.iter()
+        .filter_map(|&set| {
+            let covers: BTreeSet<MemberId> = match tree.recovery(set) {
+                Some(recovery) if recovery.outcome().is_none() => namespace
+                    .members()
+                    .map(|member| member.id)
+                    .filter(|member| recovery.covers(*member))
+                    .collect(),
+                None if tree.lent(set) => namespace
+                    .members()
+                    .map(|member| member.id)
+                    .filter(|member| tree.lent_covers(set, *member))
+                    .collect(),
+                _ => return None,
+            };
+            Some((set, covers))
+        })
+        .collect()
 }
 
 // How many of the set's own volumes are closed.
@@ -1058,6 +1234,20 @@ fn closed_in(tree: &Tree, node: NodeId, member: MemberId) -> bool {
     tree.namespace(node)
         .and_then(|namespace| namespace.get(member))
         .is_some_and(|record| record.closed)
+}
+
+// Still open, though every byte of its stated length is in and none is
+// damaged: whole by what a set proved, not yet by its close.
+fn proven_open(tree: &Tree, node: NodeId, member: MemberId) -> bool {
+    tree.namespace(node)
+        .and_then(|namespace| namespace.get(member))
+        .is_some_and(|record| {
+            !record.closed
+                && record.is_complete()
+                && record
+                    .length
+                    .is_some_and(|length| !record.coverage.damaged(ByteRange::new(0, length)))
+        })
 }
 
 // Whether the recovery object covers some member of the namespace.
@@ -1097,4 +1287,21 @@ fn follow_founded(tree: &mut Tree, node: NodeId) -> Vec<NodeId> {
         }
     }
     moved
+}
+
+// Where, inside `range`, a block of any of `sizes` begins: the cuts a
+// piece of evidence has to be split at for a set that folds blocks of that
+// size to take it whole.
+fn block_cuts(range: ByteRange, sizes: &[u64]) -> Vec<u64> {
+    let mut cuts: Vec<u64> = Vec::new();
+    for size in sizes.iter().copied().filter(|size| *size > 0) {
+        let mut cut = (range.start / size + 1).checked_mul(size);
+        while let Some(at) = cut.filter(|at| *at < range.end) {
+            cuts.push(at);
+            cut = at.checked_add(size);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
 }

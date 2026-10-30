@@ -15,10 +15,17 @@ use super::*;
 use crate::pipeline::graph::lines::Lines;
 
 mod recovery;
+mod recovery_contracts;
 mod replay;
+mod store_proof;
 mod streams;
 mod verification;
 mod windows;
+
+thread_local! {
+    // How many members a pass over the holds asked what is held of them.
+    pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
 const HEADER: u64 = SIGNATURE.len() as u64;
@@ -29,6 +36,7 @@ const HEADER: u64 = SIGNATURE.len() as u64;
 struct Store {
     announced: bool,
     length: u64,
+    checksum_on_repair: Option<u32>,
 }
 
 impl Object for Store {
@@ -57,6 +65,14 @@ impl Object for Store {
                 length: Some(self.length),
             });
         }
+        if delivery.provenance == Provenance::Repaired
+            && let Some(crc32) = self.checksum_on_repair.take()
+        {
+            out.push(Emit::Checksum {
+                member: MemberId(0),
+                crc32,
+            });
+        }
         let skip = HEADER
             .saturating_sub(delivery.offset)
             .min(delivery.bytes.len() as u64);
@@ -64,7 +80,7 @@ impl Object for Store {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: delivery.offset + skip - HEADER,
-                bytes: Bytes::copy_from_slice(&delivery.bytes[skip as usize..]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[skip as usize..]).into(),
                 provenance: delivery.provenance,
             });
         }
@@ -90,8 +106,17 @@ impl Object for Store {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
-        Located::Never
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
+        if member != MemberId(0) {
+            return Located::Never;
+        }
+        if let Some(range) = range.intersect(ByteRange::new(0, self.length)) {
+            out.push(Extent {
+                volume: VolumeIndex(0),
+                range: range.shift(HEADER as i64),
+            });
+        }
+        Located::Whole
     }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
@@ -154,7 +179,8 @@ impl Object for Late {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: part.start - body().start,
-                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize])
+                    .into(),
                 provenance: delivery.provenance,
             });
         }
@@ -205,6 +231,7 @@ struct Build {
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
     inner: u64,
+    checksum_on_repair: Option<u32>,
     heard: Arc<Mutex<Vec<u64>>>,
 }
 
@@ -214,6 +241,7 @@ impl Builder for Build {
             Kind::RarStore => Some(Box::new(Store {
                 announced: false,
                 length: self.inner,
+                checksum_on_repair: self.checksum_on_repair,
             })),
             Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
             Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
@@ -441,6 +469,7 @@ struct Job {
     fix: Option<Fix>,
     // The length of the member the pretend store holds.
     inner: u64,
+    checksum_on_repair: Option<u32>,
     // What every pretend stream had been delivered each time it heard its
     // volume closed.
     heard: Arc<Mutex<Vec<u64>>>,
@@ -465,6 +494,7 @@ impl Job {
             par: Arc::new(Mutex::new(Seen::default())),
             fix: None,
             inner: 5,
+            checksum_on_repair: None,
             heard: Arc::default(),
             out: Vec::new(),
         }
@@ -510,7 +540,7 @@ impl Job {
             node,
             member,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance,
         };
         let mut build = self.build();
@@ -538,6 +568,7 @@ impl Job {
             par: Arc::clone(&self.par),
             fix: self.fix,
             inner: self.inner,
+            checksum_on_repair: self.checksum_on_repair,
             heard: Arc::clone(&self.heard),
         }
     }
@@ -633,6 +664,31 @@ fn bytes_before_the_member_is_decided_are_held_then_replayed_to_its_leaf() {
     assert!(!job.tree.is_undecided(NodeId::ROOT, member));
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
     assert_eq!(job.accountant.usage().resident, 0);
+    assert_eq!(job.file("notes.bin"), b"Raws, world");
+}
+
+// Every article routes through the writer, so the effects of each one land
+// in the room the writer keeps: empty between deliveries, its buffer reused
+// by the next, and the bytes still reach the file in order.
+#[test]
+fn routed_deliveries_reuse_the_writer_s_effect_room() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 0, b"Raws", Provenance::Fresh);
+    assert!(!job.tree.is_undecided(NodeId::ROOT, member));
+    job.send(member, 4, b", wor", Provenance::Fresh);
+    assert!(job.writer.effects.is_empty());
+    let room = (job.writer.effects.as_ptr(), job.writer.effects.capacity());
+    assert!(room.1 > 0, "a routed delivery left its buffer in the room");
+
+    job.send(member, 9, b"ld", Provenance::Fresh);
+    assert!(job.writer.effects.is_empty());
+    assert_eq!(
+        (job.writer.effects.as_ptr(), job.writer.effects.capacity()),
+        room,
+        "the next delivery reuses the room rather than a list of its own"
+    );
+    job.close(member);
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
@@ -869,6 +925,7 @@ fn replaying_a_leaf_whose_file_is_gone_ends_in_the_leaf_error() {
         &Source,
         NodeId::ROOT,
         member,
+        None,
         &mut job.out,
     );
     assert!(
@@ -909,6 +966,7 @@ fn replaying_a_leaf_whose_lost_tail_was_never_written_replays_what_it_holds() {
         &Source,
         NodeId::ROOT,
         member,
+        None,
         &mut job.out,
     );
     assert!(replayed.is_ok(), "{replayed:?}");
@@ -971,6 +1029,37 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     let mut whole = front;
     whole.extend_from_slice(MAP);
     assert_eq!(posted, whole);
+}
+
+// A pass over the holds asks only the volumes that hold bytes: of six
+// hundred members and two stores waiting on their maps, a delivery to a
+// plain member asks the two stores, and each map then releases its own.
+#[test]
+fn a_pass_over_the_holds_asks_only_the_volumes_that_hold_bytes() {
+    let mut job = Job::new(PLENTY);
+    let plain: Vec<MemberId> = (0..600)
+        .map(|index| job.member(&format!("f{index}.bin"), Some(4)))
+        .collect();
+    let stores = [
+        job.member("a.7z", Some(map_at().end)),
+        job.member("b.7z", Some(map_at().end)),
+    ];
+    let mut front = seven_z().to_vec();
+    front.extend_from_slice(b"hello");
+    for store in stores {
+        job.send(store, 0, &front, Provenance::Fresh);
+    }
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 2 * body().len());
+    RELEASE_ASKED.set(0);
+
+    job.send(plain[0], 0, b"data", Provenance::Fresh);
+
+    assert_eq!(RELEASE_ASKED.get(), stores.len());
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 2 * body().len());
+    job.send(stores[0], map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.send(stores[1], map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
 }
 
 // The ledger confines every name to the working dir: a name that would
@@ -1429,7 +1518,13 @@ fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
             (0, &source[..])
         };
         job.writer
-            .write_file(&job.tree, NodeId::ROOT, member, offset, bytes)
+            .write_file(
+                &job.tree,
+                NodeId::ROOT,
+                member,
+                offset,
+                &bytes.to_vec().into(),
+            )
             .unwrap();
         let original = job.writer.files[&NodeId::ROOT].leaves[&member]
             .path()
@@ -1450,7 +1545,8 @@ fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
                 .restore_file(&job.tree, NodeId::ROOT, member, &state)
                 .unwrap();
             assert_eq!(
-                job.writer.files[&NodeId::ROOT].leaves[&member].folded(12),
+                job.writer.files[&NodeId::ROOT].leaves[&member]
+                    .folded(12, weaver_graph::Algorithm::Crc32),
                 None
             );
         }
@@ -1493,7 +1589,7 @@ fn give_back_does_not_retain_a_truncated_leaf_tail() {
             NodeId::ROOT,
             member,
             0,
-            &[SIGNATURE, b"hello"].concat(),
+            &[SIGNATURE, b"hello"].concat().into(),
         )
         .unwrap();
     let leaf = job
@@ -1547,7 +1643,7 @@ fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_recor
             NodeId::ROOT,
             member,
             0,
-            &[SIGNATURE, b"hello"].concat(),
+            &[SIGNATURE, b"hello"].concat().into(),
         )
         .unwrap();
     let leaf = job
@@ -1620,6 +1716,7 @@ fn a_member_given_back_after_a_restore_holds_only_what_its_envelope_kept() {
         &Source,
         NodeId::ROOT,
         member,
+        None,
         &mut job.out,
     );
     assert!(replayed.is_ok(), "{replayed:?}");
@@ -1674,7 +1771,7 @@ fn a_refusal_keeps_the_member_it_closed_and_replaces_the_open_one_with_the_volum
         Emit::Bytes {
             member: MemberId(1),
             offset: 0,
-            bytes: Bytes::from_static(b"ab"),
+            bytes: Bytes::from_static(b"ab").into(),
             provenance: Provenance::Fresh,
         },
     ] {
@@ -1870,7 +1967,7 @@ fn bytes_the_source_has_no_checksums_for_are_checked_as_they_are_in_hand() {
             node: NodeId::ROOT,
             member,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance,
         };
         let mut build = job.build();
@@ -2024,7 +2121,7 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
         node: NodeId::ROOT,
         member: store,
         offset: front.len() as u64,
-        bytes: Bytes::from_static(b"world"),
+        bytes: Bytes::from_static(b"world").into(),
         provenance: Provenance::Fresh,
     };
     let mut build = job.build();
@@ -2151,7 +2248,7 @@ fn clipping_source_evidence_does_not_upgrade_verification() {
         node: NodeId::ROOT,
         member,
         offset: 2,
-        bytes: Bytes::from_static(b"data"),
+        bytes: Bytes::from_static(b"data").into(),
         provenance: Provenance::Fresh,
     };
     job.writer
@@ -2266,6 +2363,120 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         assert!(
             job.writer.moved_since(&job.tree, &returned),
             "borrowed RAM and scratch sources keep their own identities"
+        );
+    }
+}
+
+#[test]
+fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
+    for resident_limit in [u64::MAX, 0] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        })
+        .with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 8),
+            fix: (2, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(16));
+        let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
+            assert!(
+                !job.writer
+                    .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes))
+                    .unwrap()
+            );
+            job.tree
+                .namespace_mut(NodeId::ROOT)
+                .unwrap()
+                .get_mut(member)
+                .unwrap()
+                .coverage
+                .write(
+                    ByteRange::new(offset, offset + bytes.len() as u64),
+                    Provenance::Fresh,
+                );
+        };
+        arrive(&mut job, 0, b"original");
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        assert_eq!(
+            job.par.lock().unwrap().read.as_deref(),
+            Some(b"original".as_slice())
+        );
+        arrive(&mut job, 8, b"and more");
+        assert!(
+            !job.writer.moved_since(&job.tree, &returned),
+            "bytes past what the repair read leave its ruling standing"
+        );
+        arrive(&mut job, 2, b"new");
+        assert!(
+            job.writer.moved_since(&job.tree, &returned),
+            "a hold replaced inside what the repair read takes its ruling back"
+        );
+    }
+}
+
+// The file a repair read is written again past what it read while the
+// repair is out: its ruling stands. A byte it read written again, or said
+// again with another provenance, takes the ruling back.
+#[test]
+fn a_returned_ruling_stands_while_its_file_changes_past_what_it_read() {
+    for rewritten in [true, false] {
+        let mut job = Job::new(PLENTY).with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 8),
+            fix: (2, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(16));
+        job.send(member, 0, b"original and mor", Provenance::Fresh);
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        let write = |job: &mut Job, offset: u64, bytes: &[u8]| {
+            job.writer
+                .files_mut(NodeId::ROOT)
+                .leaves
+                .get_mut(&member)
+                .unwrap()
+                .write(offset, bytes, None)
+                .unwrap();
+        };
+        write(&mut job, 8, b"AND MORE");
+        assert_eq!(job.file("payload.bin"), b"originalAND MORE");
+        assert!(
+            !job.writer.moved_since(&job.tree, &returned),
+            "bytes past what the repair read leave its ruling standing"
+        );
+        if rewritten {
+            write(&mut job, 4, b"new");
+        } else {
+            job.tree
+                .namespace_mut(NodeId::ROOT)
+                .unwrap()
+                .get_mut(member)
+                .unwrap()
+                .coverage
+                .write(ByteRange::new(4, 7), Provenance::Repaired);
+        }
+        assert!(
+            job.writer.moved_since(&job.tree, &returned),
+            "rewritten={rewritten}: a byte the repair read changed takes its ruling back"
         );
     }
 }

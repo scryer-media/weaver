@@ -61,6 +61,7 @@ pub struct Plain {
 
 pub fn worse(left: Provenance, right: Provenance) -> Provenance {
     match (left, right) {
+        (Provenance::Refuted, _) | (_, Provenance::Refuted) => Provenance::Refuted,
         (Provenance::Damaged, _) | (_, Provenance::Damaged) => Provenance::Damaged,
         (Provenance::Repaired, _) | (_, Provenance::Repaired) => Provenance::Repaired,
         _ => Provenance::Fresh,
@@ -125,7 +126,7 @@ impl Block {
             let bit = 1u16 << (at + index);
             self.cipher[at + index] = *byte;
             self.have |= bit;
-            if provenance == Provenance::Damaged {
+            if provenance.is_damaged() {
                 self.damaged |= bit;
             } else {
                 self.damaged &= !bit;
@@ -597,7 +598,7 @@ impl Chain {
         for (index, block) in blocks.iter().enumerate() {
             let provenance = worse(block.provenance(), seed.provenance());
             let at = start + index as u64 * BLOCK;
-            if provenance == Provenance::Damaged {
+            if provenance.is_damaged() {
                 self.checkpoints.insert(at + BLOCK, *block);
                 if at > 0 {
                     self.checkpoints.insert(at, seed);
@@ -641,9 +642,7 @@ impl Chain {
             .and_then(|block| seen.came_out(block_at(block)));
         match (before, seen.came_out(block_at(at))) {
             (Some(before), Some(after)) => {
-                at.is_multiple_of(STRIDE)
-                    || before == Provenance::Damaged
-                    || after == Provenance::Damaged
+                at.is_multiple_of(STRIDE) || before.is_damaged() || after.is_damaged()
             }
             _ => true,
         }

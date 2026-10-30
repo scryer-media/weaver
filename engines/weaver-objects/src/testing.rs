@@ -371,10 +371,10 @@ impl<O: Object> Job<O> {
     pub(crate) fn name(&mut self, name: &str, bytes: &[u8]) -> VolumeIndex {
         let (front, length) = (&bytes[..bytes.len().min(64)], Some(bytes.len() as u64));
         let claimed = self.object.claim(name, front, length);
-        let volume = match claimed {
-            Some(volume) => volume,
-            None if self.store.volumes.is_empty() => VolumeIndex(0),
-            None => panic!("claimed"),
+        let volume = match claimed[..] {
+            [volume] => volume,
+            [] if self.store.volumes.is_empty() => VolumeIndex(0),
+            _ => panic!("claimed"),
         };
         self.object.bound(volume, name, front, length);
         self.store.volumes.insert(volume, bytes.to_vec());
@@ -420,7 +420,7 @@ impl<O: Object> Job<O> {
             Delivery {
                 volume,
                 offset,
-                bytes,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,

@@ -11,7 +11,7 @@ use weaver_graph::{MemberId, NodeId};
 use super::claims::{self, Claim, ClaimedMember};
 use super::{
     Delivery, Failure, RecoverySummary, RootJob, Step, Unarrived, drive, failure, metrics,
-    repaired_slices, shown_status,
+    shown_status,
 };
 use crate::events::model::PipelineEvent;
 use crate::jobs::ids::{JobId, NzbFileId};
@@ -676,17 +676,7 @@ impl Pipeline {
             self.post_probes.retire(job_id);
             log_set_rulings(job_id, graph);
             let summary = RootJob::recovery_summary(&*graph);
-            let outcomes = summary.outcomes();
-            metrics::repaired(&summary, &outcomes);
-            if let Some(slices_repaired) = repaired_slices(&summary, &outcomes, &*graph) {
-                self.metrics
-                    .job_lifecycle
-                    .note_repair(StageOutcomeKind::Complete, u64::from(slices_repaired));
-                let _ = self.event_tx.send(PipelineEvent::RepairComplete {
-                    job_id,
-                    slices_repaired,
-                });
-            }
+            metrics::repaired(&summary, &summary.outcomes());
         }
         for event in stage {
             self.emit_job_event(event);
@@ -757,6 +747,17 @@ impl Pipeline {
                         None,
                     );
                     self.emit_job_event(event);
+                }
+                // A repair is complete when it comes back applied, and is
+                // said then, once: no phase the job enters says it again.
+                Note::Repaired(slices) => {
+                    self.metrics
+                        .job_lifecycle
+                        .note_repair(StageOutcomeKind::Complete, slices);
+                    let _ = self.event_tx.send(PipelineEvent::RepairComplete {
+                        job_id,
+                        slices_repaired: u32::try_from(slices).unwrap_or(u32::MAX),
+                    });
                 }
             }
         }

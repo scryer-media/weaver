@@ -154,7 +154,7 @@ fn a_window_takes_what_passed_and_what_passes_at_its_own_offsets() {
         first,
         Posted {
             offset: 12,
-            bytes: Bytes::from(vec![7u8; 25]),
+            bytes: Bytes::from(vec![7u8; 25]).into(),
             provenance: Provenance::Damaged,
         },
         &mut Taping(Arc::clone(&log)),
@@ -251,14 +251,14 @@ fn damage_on_the_member_is_lost_to_the_window_where_they_overlap() {
     heard(&log);
     let mut effects = Vec::new();
     let mut taping = Taping(Arc::clone(&log));
-    tree.damaged_under_windows(
+    tree.damage_reached(
         NodeId::ROOT,
         first,
         ByteRange::new(25, 40),
         &mut taping,
         &mut effects,
     );
-    tree.damaged_under_windows(
+    tree.damage_reached(
         NodeId::ROOT,
         first,
         ByteRange::new(0, 10),

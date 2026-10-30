@@ -70,6 +70,48 @@ fn a_set_lives_in_the_namespace_of_the_members_it_describes() {
     assert_eq!(job.writer.set_name(&job.tree, set), Some("set.par2"));
 }
 
+// Six hundred members the set covers, and one obfuscated member it does not
+// yet: the front that names it binds the set again, which keeps the names
+// of the members not yet covered alone, that one and the set's own volume,
+// and covers it by its content as before.
+#[test]
+fn a_bind_keeps_only_the_names_of_members_not_yet_covered() {
+    use crate::pipeline::graph::namespace::recovery::NAMES_KEPT;
+    let mut job = Job::new(PLENTY).with_set(None);
+    let covered: Vec<MemberId> = (0..600)
+        .map(|index| job.member(&format!("part{index}.bin"), Some(4)))
+        .collect();
+    let late = job.member("3f9a.bin", Some(4));
+    let sets = job.tree.recovery_nodes(NodeId::ROOT);
+    let set = job.set_node();
+    assert_eq!(job.writer.covering(&job.tree, &sets, late).count(), 0);
+    NAMES_KEPT.with(|kept| kept.set(0));
+    job.send(late, 0, b"data", Provenance::Fresh);
+    assert_eq!(
+        NAMES_KEPT.with(std::cell::Cell::get),
+        2,
+        "the late member's name and the set's own volume's"
+    );
+    let own = job.root().find_by_name("set.par2").expect("own volume").id;
+    assert_eq!(
+        job.writer
+            .covering(&job.tree, &sets, late)
+            .collect::<Vec<_>>(),
+        vec![set],
+        "the late member is covered"
+    );
+    assert_eq!(job.root().get(late).unwrap().name, "show.mkv");
+    assert_eq!(job.writer.covering(&job.tree, &sets, own).count(), 0);
+    for member in covered {
+        assert_eq!(
+            job.writer
+                .covering(&job.tree, &sets, member)
+                .collect::<Vec<_>>(),
+            vec![set]
+        );
+    }
+}
+
 #[test]
 fn a_sets_own_volume_carries_recovery_and_a_member_it_covers_does_not() {
     let mut job = Job::new(PLENTY).with_set(None);
@@ -199,6 +241,200 @@ fn a_rebuilt_map_lets_the_sets_proof_reach_the_bytes_it_held() {
         Vec::new(),
         "the set proved the body it held"
     );
+}
+
+fn pending_map_job(budgets: HoldBudgets) -> (Job, MemberId) {
+    let mut job = Job::new(budgets).with_set(Some(Fix {
+        name: "a.7z",
+        read: ByteRange::new(0, map_at().end),
+        fix: (map_at().start, MAP),
+    }));
+    let member = job.member("a.7z", Some(map_at().end));
+    job.send(member, 0, &seven_z(), Provenance::Fresh);
+    job.send(member, body().start, b"hello", Provenance::Damaged);
+    let mut build = job.build();
+    job.writer
+        .arrive(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            crate::pipeline::graph::namespace::Write::New {
+                entered: NodeId::ROOT,
+                posting: member,
+            },
+            Arrival {
+                node: NodeId::ROOT,
+                member,
+                offset: map_at().start,
+                bytes: Bytes::from_static(MAP).into(),
+                provenance: Provenance::Repaired,
+            },
+            &mut job.out,
+        )
+        .unwrap();
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    (job, member)
+}
+
+#[test]
+fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
+    for resident_limit in [0, u64::MAX] {
+        let (mut job, member) = pending_map_job(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        });
+        let mut build = job.build();
+        let mut read = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(
+            NodeId::ROOT,
+            member,
+            ByteRange::new(0, map_at().end),
+            &mut read,
+        ));
+        assert_eq!(read, [seven_z().as_slice(), b"hello", MAP].concat());
+        let mut durable = Vec::new();
+        assert!(
+            !Access {
+                writer: &job.writer,
+                tree: &job.tree,
+                held: false
+            }
+            .read_at(NodeId::ROOT, member, body(), &mut durable,)
+        );
+        assert!(durable.is_empty());
+        // A later placed copy removes just its overlap from pending custody;
+        // reads combine its new byte with the still-held neighbours.
+        job.writer
+            .arrive(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                crate::pipeline::graph::namespace::Write::New {
+                    entered: NodeId::ROOT,
+                    posting: member,
+                },
+                Arrival {
+                    node: NodeId::ROOT,
+                    member,
+                    offset: body().start + 1,
+                    bytes: Bytes::from_static(b"a").into(),
+                    provenance: Provenance::Fresh,
+                },
+                &mut job.out,
+            )
+            .unwrap();
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len() - 1);
+        let mut replaced = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(
+            NodeId::ROOT,
+            member,
+            ByteRange::new(0, map_at().end),
+            &mut replaced
+        ));
+        assert_eq!(replaced, [seven_z().as_slice(), b"hallo", MAP].concat());
+        job.writer
+            .release_held(&mut job.tree, &mut build, &Source, &mut job.out)
+            .unwrap();
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+        let mut released = Vec::new();
+        assert!(
+            job.writer
+                .access(&job.tree)
+                .read_at(NodeId::ROOT, member, body(), &mut released)
+        );
+        assert_eq!(released, b"hallo");
+    }
+}
+
+#[test]
+fn a_lent_read_keeps_pending_custody_when_the_live_copy_changes() {
+    let (mut job, member) = pending_map_job(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    });
+    let set = job.set_node();
+    let loan = job
+        .writer
+        .lend(&mut job.tree, NodeId::ROOT, set)
+        .unwrap()
+        .unwrap();
+    job.send(member, body().start + 1, b"a", Provenance::Fresh);
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
+    assert_eq!(
+        job.par.lock().unwrap().read,
+        Some([seven_z().as_slice(), b"hello", MAP].concat())
+    );
+    let mut build = job.build();
+    let result = job.writer.returned(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        &weaver_objects::Objects::default(),
+        returned,
+        &mut job.out,
+    );
+    assert!(matches!(result, Err(WriteError::StaleRecovery { set: stale }) if stale == set));
+    let mut current = Vec::new();
+    assert!(
+        job.writer
+            .access(&job.tree)
+            .read_at(NodeId::ROOT, member, body(), &mut current)
+    );
+    assert_eq!(
+        current, b"hallo",
+        "stale proof must not overwrite the newer placed copy"
+    );
+}
+
+#[test]
+fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
+    let (mut job, member) = pending_map_job(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    });
+    let (child, _) = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.tree
+        .namespace_mut(child)
+        .unwrap()
+        .get_mut(MemberId(0))
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(0, body().len()), Provenance::Fresh);
+    job.writer
+        .write_file(
+            &job.tree,
+            child,
+            MemberId(0),
+            0,
+            &weaver_graph::Evidenced::from(&b"stale"[..]),
+        )
+        .unwrap();
+    job.writer
+        .files
+        .get_mut(&NodeId::ROOT)
+        .unwrap()
+        .scratch
+        .as_mut()
+        .unwrap()
+        .close(0)
+        .unwrap();
+    let mut read = b"prefix".to_vec();
+    assert!(
+        !job.writer
+            .access(&job.tree)
+            .read_at(NodeId::ROOT, member, body(), &mut read)
+    );
+    assert_eq!(read, b"prefix");
+    let mut durable = Vec::new();
+    assert!(
+        Access {
+            writer: &job.writer,
+            tree: &job.tree,
+            held: false
+        }
+        .read_at(NodeId::ROOT, member, body(), &mut durable)
+    );
+    assert_eq!(durable, b"stale");
 }
 
 // An output that refuses the repair's write fails the repair with that

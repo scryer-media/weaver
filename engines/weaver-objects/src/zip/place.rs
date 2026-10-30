@@ -10,7 +10,7 @@
 
 use weaver_graph::{ByteRange, Extent, Located, MemberId, Placement, VolumeIndex};
 
-use super::map::Piece;
+use super::map::{Map, Piece};
 use super::{ENVELOPE, Zip};
 
 fn push(out: &mut Vec<Placement>, placement: Placement) {
@@ -103,16 +103,31 @@ impl Zip {
         range: ByteRange,
         out: &mut Vec<Extent>,
     ) -> Located {
-        let Some(map) = &self.map else {
-            return Located::NotYet;
-        };
+        match &self.map {
+            Some(map) => self.extent_in(map, member, range, out),
+            None => Located::NotYet,
+        }
+    }
+
+    // On a map in hand, the one the store stands on or the one a directory
+    // read again gives.
+    pub(super) fn extent_in(
+        &self,
+        map: &Map,
+        member: MemberId,
+        range: ByteRange,
+        out: &mut Vec<Extent>,
+    ) -> Located {
         let Some(entry) = map.entry(member).filter(|entry| entry.streams) else {
             return Located::Never;
         };
         let Some(span) = entry.span() else {
             return Located::NotYet;
         };
-        let Some(part) = range.shift(span.start as i64).intersect(span) else {
+        let Some(part) = range
+            .intersect(ByteRange::new(0, span.len()))
+            .map(|part| part.shift(span.start as i64))
+        else {
             return Located::Never;
         };
         let mut pieces = Vec::new();

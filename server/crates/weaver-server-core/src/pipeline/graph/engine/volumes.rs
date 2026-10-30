@@ -200,7 +200,14 @@ impl Volumes for RunVolumes {
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
-        self.shelf.lock().kept.get(&volume.0)?.closed
+        let mut state = self.shelf.lock();
+        if state.generation != self.generation || self.stopped() {
+            return None;
+        }
+        let kept = state.kept.get_mut(&volume.0)?;
+        let length = kept.closed?;
+        kept.length_read = Some(length);
+        Some(length)
     }
 
     fn settled(&self, volume: VolumeIndex) -> bool {

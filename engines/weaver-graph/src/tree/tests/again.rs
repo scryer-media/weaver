@@ -145,7 +145,7 @@ fn deliver(
         member,
         Posted {
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance,
         },
         builder,

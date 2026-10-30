@@ -38,7 +38,6 @@ pub(crate) struct RootFacts {
     #[serde(default)]
     pub(crate) reported: Option<RootPhase>,
     // Namespace members whose whole-file verification has not been acknowledged.
-    #[serde(default)]
     pub(crate) pending_verifications: Vec<(u32, u32)>,
 }
 
@@ -101,6 +100,9 @@ impl ArticleRoot {
         }
         root.map.restore(&facts.volumes)?;
         root.checksums.restore(&facts.volumes);
+        let checksums = &root.checksums;
+        root.map
+            .vouch(|volume, range| checksums.verified(volume, range));
         Ok(root)
     }
 
@@ -130,7 +132,6 @@ pub(crate) struct Encoded {
     volumes: Vec<EncodedVolume>,
     read_backs: u64,
     reported: Option<RootPhase>,
-    #[serde(default)]
     pending_verifications: Vec<(u32, u32)>,
     // The generation of each of its sealed values when its parts were last
     // taken, by number in the walk.
@@ -393,7 +394,7 @@ pub(crate) fn decode(
     bytes: &[u8],
     parts: &[Part],
 ) -> Result<RootFacts, RootFactsError> {
-    if version != 4 && version != RootFacts::VERSION {
+    if version != RootFacts::VERSION {
         return Err(RootFactsError::Version(version));
     }
     decode_parts::<Encoded>(bytes, parts)

@@ -464,8 +464,8 @@ async fn a_member_par3_cannot_repair_beside_a_whole_one_ends_partial() {
 }
 
 // `ember.bin` under a PAR2 set and `beacon.bin` under a PAR3 set, one
-// damaged article each: both sets repair, and the graph announces the
-// job's repair once, with the slices of both, before the job completes.
+// damaged article each: both sets repair, and the graph announces each
+// set's repair once, as it comes back, before the job completes.
 #[tokio::test]
 async fn a_par2_and_a_par3_set_repairing_different_members_are_announced_once() {
     let ember = payload(3 * ARTICLE, 72);
@@ -495,15 +495,15 @@ async fn a_par2_and_a_par3_set_repairing_different_members_are_announced_once() 
     );
     assert_eq!(
         repair_and_terminal_events(&graph),
-        vec!["RepairComplete 2".to_string(), "JobCompleted".to_string()]
+        ["RepairComplete 1", "RepairComplete 1", "JobCompleted"]
     );
 }
 
 // `lantern.bin` under a PAR2 set of one recovery block and a PAR3 set of
-// four, two articles damaged: the PAR2 set cannot rebuild them and the PAR3
-// set does. The member is whole, so the PAR2 shortfall fails nothing, and
-// the graph announces the repair once, with the slices the PAR3 set
-// rebuilt, before the job completes.
+// four, two articles damaged: the PAR2 set rules short, the PAR3 set
+// rebuilds the member, and the PAR2 set then finds it whole, whichever set
+// read it first. The graph announces the repair once, with the slices the
+// PAR3 set rebuilt, before the job completes.
 #[tokio::test]
 async fn a_par3_set_repairing_what_a_par2_set_is_short_for_is_announced_once() {
     let lantern = payload(4 * ARTICLE, 74);
@@ -517,10 +517,7 @@ async fn a_par3_set_repairing_what_a_par2_set_is_short_for_is_announced_once() {
     assert_eq!(
         graph.graph().outcomes,
         vec![
-            Some(RepairOutcome::Impossible {
-                damaged: 2,
-                reachable: 1
-            }),
+            Some(RepairOutcome::Clean),
             Some(RepairOutcome::Repaired { slices: 2 })
         ]
     );

@@ -78,6 +78,8 @@ pub struct MemberRecord {
     // The CRC32 its object's headers state for it.
     #[serde(default)]
     pub crc32: Option<u32>,
+    // Its front came once, whether or not a restart can read it back.
+    pub fronted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

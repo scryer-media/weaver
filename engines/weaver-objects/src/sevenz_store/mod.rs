@@ -67,21 +67,18 @@ pub(crate) fn measured(first_bytes: &[u8]) -> Option<u64> {
     }
 }
 
-// Where a piece with no number goes by its length alone, among the free
-// places of a set whose first piece is `first` bytes long and measures a
-// container of `total`: every piece but the last is as long as the first,
-// so a piece that long fits every free place but the last.
-pub(crate) fn fits(
-    first: u64,
-    total: u64,
-    length: u64,
-    free: impl Fn(VolumeIndex) -> bool,
-) -> Option<Placed> {
+// Where a piece with no number goes by its length alone, among the places
+// of a set whose first piece is `first` bytes long and measures a container
+// of `total`: every piece but the last is as long as the first, so a piece
+// that long fits every place but the last. A place held already is offered
+// all the same: whether the piece is the one holding it is the tree's to
+// judge, by their fronts.
+pub(crate) fn fits(first: u64, total: u64, length: u64) -> Option<Placed> {
     let geometry = Geometry::new(first, total)?;
     Placed::of(
         (1..=geometry.last().0)
             .map(VolumeIndex)
-            .filter(|at| free(*at) && geometry.holds(*at) == length),
+            .filter(|at| geometry.holds(*at) == length),
     )
 }
 
@@ -105,6 +102,14 @@ enum Lock {
 }
 
 impl Lock {
+    // A folder no key has opened yet.
+    fn fresh(folder: &map::Folder) -> Self {
+        match folder.aes {
+            Some(_) => Lock::Locked,
+            None => Lock::Plain,
+        }
+    }
+
     fn is_locked(&self) -> bool {
         matches!(self, Lock::Locked | Lock::Sealed(..))
     }
@@ -183,9 +188,6 @@ pub struct SevenZipStore {
     budget: Budget,
     names: BTreeMap<VolumeIndex, String>,
     lengths: BTreeMap<VolumeIndex, u64>,
-    // The places whose piece's first byte came. A piece whose front never
-    // came holds its place by its name alone.
-    fronted: BTreeSet<VolumeIndex>,
     kept: Kept,
     start: Option<Start>,
     // How long the container is, as the signature header in the front the
@@ -199,7 +201,12 @@ pub struct SevenZipStore {
     header_ranges: Vec<ByteRange>,
     // Shared, with what its members said, by the postings handed out.
     map: Option<Arc<Map>>,
-    // The header bytes the map was built on, by range and checksum.
+    // The map a changed header gives, while the bytes it moves are asked
+    // for again under the one that placed them; it takes over at the next
+    // input.
+    next: Option<Arc<Map>>,
+    // The header bytes the map was built on, by range and checksum; none
+    // once any of them changed, until a header is read again.
     basis: Vec<(ByteRange, u32)>,
     folders: Vec<Lock>,
     members: Arc<Vec<Out>>,
@@ -244,7 +251,9 @@ impl Durable for SevenZipStore {
     // 5: the container's length as the first piece's front states it.
     // 6: whether the candidate that opened it had proved itself.
     // 7: the places whose piece's front came.
-    const VERSION: u16 = 7;
+    // 8: the map a changed header gives, until it takes over.
+    // 9: the places of 7 dropped again; the tree judges a held place by fronts.
+    const VERSION: u16 = 9;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)
@@ -270,7 +279,11 @@ impl Durable for SevenZipStore {
                         && self.proof.is_none_or(|proof| proof.fits(map))
                 }
             };
-        (!mapped || !self.kept.sound()).then_some("a map no 7z header gives")
+        let next = self
+            .next
+            .as_ref()
+            .is_none_or(|next| self.map.is_some() && next.is_sound());
+        (!mapped || !next || !self.kept.sound()).then_some("a map no 7z header gives")
     }
 }
 
@@ -294,7 +307,6 @@ impl SevenZipStore {
             budget: Budget::default(),
             names: BTreeMap::new(),
             lengths: BTreeMap::new(),
-            fronted: BTreeSet::new(),
             kept,
             start: None,
             measured: None,
@@ -302,6 +314,7 @@ impl SevenZipStore {
             encrypted: false,
             header_ranges: Vec::new(),
             map: None,
+            next: None,
             basis: Vec::new(),
             folders: Vec::new(),
             members: Arc::default(),
@@ -358,10 +371,9 @@ impl SevenZipStore {
     // piece posted again. A piece numbered from the first piece's name is
     // at that number: its name is all that places it, so neither its own
     // length nor the first piece's need be known yet, as a uuencoded
-    // piece's is not until it ends. One with no number is at each free
-    // place its length fits, and a piece as long as the first fits every
-    // free place but the last. A place a piece whose front never came holds
-    // is free: a name is all that holds it, and the tree weighs the two.
+    // piece's is not until it ends. One with no number is at each place its
+    // length fits, held or not, and a piece as long as the first fits every
+    // place but the last: the tree weighs it against what holds the place.
     fn placed(&self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Option<Placed> {
         if matches!(signed(first_bytes, length), Sniff::Object(_)) {
             let again = matches!(
@@ -380,9 +392,7 @@ impl SevenZipStore {
         let first = *self.lengths.get(&VolumeIndex(0))?;
         let total = self.measured?;
         Geometry::new(first, total)?;
-        fits(first, total, length?, |at| {
-            !names.contains_key(&at) || !self.fronted.contains(&at)
-        })
+        fits(first, total, length?)
     }
 
     // One past every volume held.
@@ -459,7 +469,7 @@ impl SevenZipStore {
         }
         self.check_lengths(out);
         self.check_recovery(start, out);
-        if self.map.is_none() {
+        if self.map.is_none() || self.basis.is_empty() {
             self.read_header(start, out);
         }
         for folder in std::mem::take(&mut self.relock) {
@@ -601,76 +611,214 @@ impl SevenZipStore {
             .iter()
             .filter_map(|range| self.kept.read(*range).map(|bytes| (*range, crc32(bytes))))
             .collect();
-        self.folders = map
-            .folders
-            .iter()
-            .map(|folder| match folder.aes {
-                Some(_) => Lock::Locked,
-                None => Lock::Plain,
-            })
-            .collect();
-        let mut members: Vec<Out> = map.entries.iter().map(|_| Out::default()).collect();
-        // Every member is announced now, in id order, which is the order the
-        // namespace numbers them in.
-        for (id, entry) in map.entries.iter().enumerate() {
-            let member = MemberId(id as u32);
-            out.push(Emit::Member {
-                member,
-                name: entry.name.clone(),
-                length: Some(entry.length),
-            });
-            // A 7z checks its members' plain bytes, keyed or not.
-            if let Some(crc32) = entry.crc {
-                out.push(Emit::Checksum { member, crc32 });
-            }
-            if entry.length == 0 {
-                members[id].closed = true;
-                out.push(Emit::MemberClosed(member));
-            }
+        match self.map.clone() {
+            None => self.adopt(map, out),
+            Some(old) => self.remap(&old, map, out),
         }
+    }
+
+    // The first map: every member is announced now, in id order, which is
+    // the order the namespace numbers them in.
+    fn adopt(&mut self, map: Map, out: &mut Vec<Emit>) {
+        self.folders = map.folders.iter().map(Lock::fresh).collect();
+        let mut members: Vec<Out> = map.entries.iter().map(|_| Out::default()).collect();
+        for (id, member) in members.iter_mut().enumerate() {
+            announce(&map, id, member, out);
+        }
+        self.members = Arc::new(members);
+        self.map = Some(Arc::new(map));
+        self.choose_proof();
+    }
+
+    // A password is proved against a file before it opens the folders.
+    fn choose_proof(&mut self) {
+        self.proof = None;
+        let Some(map) = &self.map else {
+            return;
+        };
         if self.opened.is_none() && self.folders.iter().any(Lock::is_locked) {
-            self.proof = open::Proof::choose(&map);
+            self.proof = open::Proof::choose(map);
             if let Some(proof) = &self.proof {
                 let range = proof.range;
                 self.kept.want(range);
                 self.bid(range, Weight(1));
             }
         }
-        self.members = Arc::new(members);
-        self.map = Some(Arc::new(map));
     }
 
-    // Repaired bytes changed the header the map was built on: everything
-    // said about the members was built on wrong bytes.
-    fn rebuild_if_changed(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.map.is_none()
-            || !self
+    // A changed header over a map in hand. The members it places as the
+    // old map did keep what they said; every other one moves. The bytes the
+    // old map placed in a moving member, and those the new map places in
+    // one, are asked for again: they read back through the old map, which
+    // stands until the next input, and arrive under the new one.
+    fn remap(&mut self, old: &Map, new: Map, out: &mut Vec<Emit>) {
+        let mut extents = Vec::new();
+        for id in moved(old, &new) {
+            let member = MemberId(id as u32);
+            self.extent_in(old, member, ByteRange::new(0, u64::MAX), &mut extents);
+            self.extent_in(&new, member, ByteRange::new(0, u64::MAX), &mut extents);
+        }
+        self.next = Some(Arc::new(new));
+        if extents.is_empty() {
+            return self.install(out);
+        }
+        extents.sort_by_key(|extent| (extent.volume, extent.range.start));
+        let mut ranges: Vec<(VolumeIndex, ByteRange)> = Vec::new();
+        for Extent { volume, range } in extents {
+            match ranges.last_mut() {
+                Some((last, merged)) if *last == volume && merged.end >= range.start => {
+                    merged.end = merged.end.max(range.end);
+                }
+                _ => ranges.push((volume, range)),
+            }
+        }
+        out.extend(
+            ranges
+                .into_iter()
+                .map(|(volume, range)| Emit::Again { volume, range }),
+        );
+    }
+
+    // The map a changed header gave takes over: each moving member starts
+    // over under it, every other member and every folder it keeps stand as
+    // they were, and the old map is dropped.
+    fn install(&mut self, out: &mut Vec<Emit>) {
+        let Some(new) = self.next.take() else {
+            return;
+        };
+        let Some(old) = self.map.take() else {
+            return;
+        };
+        let moved = moved(&old, &new);
+        for &id in moved.iter().filter(|id| **id < old.entries.len()) {
+            out.push(Emit::Retract(MemberId(id as u32)));
+            self.grid.forget(MemberId(id as u32));
+        }
+        // A folder the new map keeps keeps its cipher; the others start
+        // locked or plain.
+        let was: Vec<Option<usize>> = new
+            .folders
+            .iter()
+            .map(|folder| {
+                old.folders
+                    .binary_search_by_key(&folder.pack.start, |old| old.pack.start)
+                    .ok()
+                    .filter(|at| same_folder(&old.folders[*at], folder))
+            })
+            .collect();
+        let mut locks = std::mem::take(&mut self.folders);
+        self.folders = new
+            .folders
+            .iter()
+            .zip(&was)
+            .map(|(folder, was)| match was {
+                Some(at) => std::mem::replace(&mut locks[*at], Lock::Locked),
+                None => Lock::fresh(folder),
+            })
+            .collect();
+        let carried = |set: &BTreeSet<usize>| -> BTreeSet<usize> {
+            was.iter()
+                .enumerate()
+                .filter_map(|(at, was)| was.filter(|was| set.contains(was)).map(|_| at))
+                .collect()
+        };
+        self.condemned = carried(&self.condemned);
+        self.relock = carried(&self.relock);
+        let mut members: Vec<Out> = (0..new.entries.len())
+            .map(|id| match moved.binary_search(&id) {
+                Ok(_) => Out::default(),
+                Err(_) => self.members[id].clone(),
+            })
+            .collect();
+        for &id in moved.iter().filter(|id| **id < new.entries.len()) {
+            announce(&new, id, &mut members[id], out);
+        }
+        self.members = Arc::new(members);
+        self.map = Some(new);
+        if self.proof.is_some() || self.opened.is_none() {
+            self.choose_proof();
+        }
+        self.stale = true;
+    }
+
+    // Header bytes the map stands on changed. The map stands until a
+    // header is read again; a changed signature header names another end
+    // header, so it is read again too.
+    fn rebuild_if_changed(&mut self, range: ByteRange) {
+        if self.map.is_none() {
+            return;
+        }
+        let footing = match self.basis.is_empty() {
+            true => SIGNATURE.intersect(range).is_some(),
+            false => self
                 .basis
                 .iter()
-                .any(|(basis, _)| basis.intersect(range).is_some())
-        {
-            return;
+                .any(|(basis, _)| basis.intersect(range).is_some()),
+        };
+        let same = !self.basis.is_empty()
+            && self.basis.iter().all(|(basis, crc)| {
+                self.kept
+                    .read(*basis)
+                    .is_some_and(|bytes| crc32(bytes) == *crc)
+            });
+        if footing && !same {
+            self.basis.clear();
+            self.start = None;
         }
-        let same = self.basis.iter().all(|(basis, crc)| {
-            self.kept
-                .read(*basis)
-                .is_some_and(|bytes| crc32(bytes) == *crc)
-        });
-        if same {
-            return;
-        }
-        for id in 0..self.members.len() {
-            out.push(Emit::Retract(MemberId(id as u32)));
-        }
-        self.map = None;
-        self.basis.clear();
-        self.folders.clear();
-        self.members = Arc::default();
-        self.grid = Grid::default();
-        self.proof = None;
-        self.condemned.clear();
-        self.relock.clear();
     }
+}
+
+// Announce a member of a map, as its namespace numbers it.
+fn announce(map: &Map, id: usize, said: &mut Out, out: &mut Vec<Emit>) {
+    let entry = &map.entries[id];
+    let member = MemberId(id as u32);
+    out.push(Emit::Member {
+        member,
+        name: entry.name.clone(),
+        length: Some(entry.length),
+    });
+    // A 7z checks its members' plain bytes, keyed or not.
+    if let Some(crc32) = entry.crc {
+        out.push(Emit::Checksum { member, crc32 });
+    }
+    if entry.length == 0 {
+        said.closed = true;
+        out.push(Emit::MemberClosed(member));
+    }
+}
+
+// The members two maps place differently, by id, ascending: another name,
+// length or checksum, or other bytes of the container.
+fn moved(old: &Map, new: &Map) -> Vec<usize> {
+    (0..old.entries.len().max(new.entries.len()))
+        .filter(|&id| match (old.entries.get(id), new.entries.get(id)) {
+            (Some(was), Some(is)) => {
+                was.name != is.name
+                    || was.length != is.length
+                    || was.crc != is.crc
+                    || was.offset != is.offset
+                    || match (was.folder, is.folder) {
+                        (None, None) => false,
+                        (Some(a), Some(b)) => !same_folder(&old.folders[a], &new.folders[b]),
+                        _ => true,
+                    }
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+// One folder in both maps: the same pack, plaintext and cipher.
+fn same_folder(a: &map::Folder, b: &map::Folder) -> bool {
+    a.pack == b.pack
+        && a.plain_len == b.plain_len
+        && match (&a.aes, &b.aes) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.cycles_power() == b.cycles_power() && a.salt() == b.salt() && a.iv() == b.iv()
+            }
+            _ => false,
+        }
 }
 
 impl Object for SevenZipStore {
@@ -688,9 +836,7 @@ impl Object for SevenZipStore {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
-        if delivery.offset == 0 && !delivery.bytes.is_empty() {
-            self.fronted.insert(delivery.volume);
-        }
+        self.install(out);
         let Some(range) = self.container(delivery.volume, delivery.range()) else {
             return;
         };
@@ -698,7 +844,9 @@ impl Object for SevenZipStore {
             return;
         }
         let skip = (range.start - self.base(delivery.volume)) - delivery.offset;
-        let bytes = &delivery.bytes[skip as usize..(skip + range.len()) as usize];
+        let bytes = delivery
+            .bytes
+            .slice(skip as usize..(skip + range.len()) as usize);
         // The bytes of a proof still pending are kept, and reach their members
         // only when the proof opens its folder, in this call or a later one.
         let proof = self.proof.map(|proof| proof.range);
@@ -706,9 +854,9 @@ impl Object for SevenZipStore {
         // signature names the end header, the end header names its packs.
         loop {
             let generation = self.kept.generation();
-            if self.kept.absorb(range, bytes, delivery.provenance) {
+            if self.kept.absorb(range, &bytes, delivery.provenance) {
                 self.stale = true;
-                self.rebuild_if_changed(range, out);
+                self.rebuild_if_changed(range);
             }
             self.settle(out);
             if self.gone {
@@ -724,8 +872,8 @@ impl Object for SevenZipStore {
         };
         for piece in pieces {
             let at = (piece.start - range.start) as usize;
-            let slice = &bytes[at..at + piece.len() as usize];
-            self.route(piece, slice, delivery.provenance, read, out);
+            let slice = bytes.slice(at..at + piece.len() as usize);
+            self.route(piece, &slice, delivery.provenance, read, out);
         }
         if std::mem::take(&mut self.wrong_key) {
             self.condemn(out);
@@ -733,6 +881,7 @@ impl Object for SevenZipStore {
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
+        self.install(out);
         self.stale = true;
         self.settle(out);
     }
@@ -741,12 +890,15 @@ impl Object for SevenZipStore {
     // opened nothing, a piece beside the set that nothing orders, or a
     // member named and never placed leaves the container unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        self.install(out);
         let why = crate::quiet::damaged(standing)
             .or_else(|| self.shut())
             .or_else(|| {
-                crate::quiet::unordered(standing, |beside| {
-                    self.placed(beside.name, beside.front, beside.length)
-                })
+                crate::quiet::unordered(
+                    standing,
+                    |beside| self.placed(beside.name, beside.front, beside.length),
+                    |place| self.names.contains_key(&place),
+                )
             })
             .or_else(|| crate::quiet::unplaced(standing));
         if let Some(why) = why {
@@ -755,6 +907,7 @@ impl Object for SevenZipStore {
     }
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
+        self.install(out);
         let Some(range) = self.container(volume, range) else {
             return;
         };
@@ -802,6 +955,7 @@ impl Object for SevenZipStore {
     }
 
     fn pulled(&mut self, seek: Seek, pull: Pull, out: &mut Vec<Emit>) {
+        self.install(out);
         if pull != Pull::Unseekable || self.map.is_some() {
             return;
         }
@@ -847,6 +1001,7 @@ impl Object for SevenZipStore {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
+        self.install(out);
         if self.gone || self.lengths.get(&volume) == Some(&length) {
             return;
         }
@@ -875,6 +1030,7 @@ impl Object for SevenZipStore {
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
         // The offer answers the question the store asked: a candidate that
         // opens nothing leaves it free to ask for the next one.
+        self.install(out);
         self.asked = false;
         if !self
             .candidates
@@ -903,16 +1059,7 @@ impl Object for SevenZipStore {
     // says how long the container is; its length is how long every piece
     // but the last is. Both are what places the pieces bound after it.
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], length: Option<u64>) {
-        if self
-            .names
-            .insert(volume, name.to_owned())
-            .is_some_and(|was| was != name)
-        {
-            self.fronted.remove(&volume);
-        }
-        if !front.is_empty() {
-            self.fronted.insert(volume);
-        }
+        self.names.insert(volume, name.to_owned());
         if let Some(length) = length {
             self.lengths.entry(volume).or_insert(length);
             self.stale = true;
@@ -928,31 +1075,36 @@ impl Object for SevenZipStore {
         self.names.insert(volume, name.to_owned());
     }
 
+    fn engine_volume(&self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        self.names.get(&volume)?;
+        Some(Box::new(crate::engine::CarriedVolume {
+            front: (volume.0 == 0).then_some(self.measured).flatten(),
+            length: self.lengths.get(&volume).copied(),
+        }))
+    }
+
     fn refused(&mut self) {
         self.gone = true;
     }
 
     // Every piece but the last is as long as the first, and the last holds
     // the rest of the container the first piece's signature header
-    // measures, so a piece's length says which free places it can take.
+    // measures, so a piece's length says which places it can take.
     // Where it could take several, as a piece as long as the first can,
     // only the number its name carries, counted from the first piece's own,
     // can say which: a numbered piece takes that place whatever its length,
     // and whether or not it is held, since a piece posted again is that
     // piece; the store checks its length as it checks every volume's. A
-    // piece with no number takes the one free place its length fits
-    // exactly, and a piece no fact places is not claimed. One that fits
-    // more than one free place is the set's and nothing orders it: a name a
-    // recovery set gives it later may, so it is not claimed while the set
-    // stands, and the set refuses on quiet for it.
-    fn claim(
-        &mut self,
-        name: &str,
-        first_bytes: &[u8],
-        length: Option<u64>,
-    ) -> Option<VolumeIndex> {
-        self.placed(name, first_bytes, length)?
-            .claimed(self.gone, self.past())
+    // piece with no number is answered every place its length fits, held
+    // or not: the tree weighs it against each piece holding one by their
+    // fronts, and takes the one free place left, if one is. A piece no fact
+    // places is not claimed. One that more than one free place fits is the
+    // set's and nothing orders it: a name a recovery set gives it later
+    // may, so the tree leaves it unclaimed while the set stands, and the set
+    // refuses on quiet for it.
+    fn claim(&mut self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Vec<VolumeIndex> {
+        self.placed(name, first_bytes, length)
+            .map_or_else(Vec::new, |placed| placed.claimed(self.gone, self.past()))
     }
     fn facts(&self) -> Facts {
         Facts::of(Kind::SevenZipStore, self)

@@ -24,7 +24,7 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
     assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
     let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[], None);
     assert_eq!(claim(&mut live), claim(&mut again));
-    assert_eq!(claim(&mut live), Some(VolumeIndex(1)));
+    assert_eq!(claim(&mut live), vec![VolumeIndex(1)]);
     let bids = |object: &mut Box<dyn Object>| {
         let mut out: Vec<Seek> = Vec::new();
         object.wants(&mut out);

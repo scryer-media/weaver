@@ -133,3 +133,24 @@ fn rar_facts_of_another_version_are_refused() {
         Err(RestoreError::Version { .. })
     ));
 }
+
+// Facts the version before each volume kept the front it was bound with
+// are refused, not read with the front missing.
+#[test]
+fn facts_of_the_previous_version_are_refused() {
+    use weaver_graph::{Object, VolumeIndex};
+    let volumes = named(write(&items(), &split(Version::Rar5)));
+    let mut object = store();
+    object.bound(VolumeIndex(0), &volumes[0].0, &volumes[0].1, None);
+    let mut facts = object.facts();
+    assert_eq!(facts.version, 2);
+    assert!(crate::restore(&facts, weaver_graph::Budget::default()).is_ok());
+    facts.version = 1;
+    assert!(matches!(
+        crate::restore(&facts, weaver_graph::Budget::default()),
+        Err(RestoreError::Version {
+            kind: Kind::RarStore,
+            version: 1
+        })
+    ));
+}

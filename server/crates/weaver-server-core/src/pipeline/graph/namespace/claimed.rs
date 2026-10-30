@@ -11,11 +11,12 @@
 // whose volumes live in their files.
 
 use bytes::Bytes;
-use weaver_graph::{ByteRange, Effect, MemberId, NodeId, Provenance, Tree};
+use weaver_graph::{ByteRange, Coverage, Effect, MemberId, NodeId, Tree};
 
 use super::{Arrival, NamespaceWriter, READ_BACK, Segments, WriteError};
 
 impl NamespaceWriter {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn replay_file(
         &mut self,
         tree: &mut Tree,
@@ -23,6 +24,7 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         node: NodeId,
         member: MemberId,
+        said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         // A member with no file has nothing in one: what it received is in
@@ -36,7 +38,9 @@ impl NamespaceWriter {
         // lies past the end is not read. The file goes to the owner the
         // member has now: a run that has that owner give the member up hands
         // it on, and the hand-off carries the whole file to whatever holds
-        // the member next, so this replay is done.
+        // the member next, so this replay is done. A folded posting's runs
+        // are `said`, its record from before it folded, which no route
+        // moves.
         if !self
             .files
             .get(&node)
@@ -47,12 +51,14 @@ impl NamespaceWriter {
         let owner = tree.child_of(node, member);
         let mut at = 0;
         while tree.child_of(node, member) == owner
-            && let Some(run) = tree
-                .namespace(node)
-                .and_then(|namespace| namespace.get(member))
-                .and_then(|record| {
-                    record
-                        .coverage
+            && let Some(run) = said
+                .or_else(|| {
+                    tree.namespace(node)
+                        .and_then(|namespace| namespace.get(member))
+                        .map(|record| &record.coverage)
+                })
+                .and_then(|coverage| {
+                    coverage
                         .overlapping(ByteRange::new(at, u64::MAX))
                         .next()
                         .copied()
@@ -63,9 +69,10 @@ impl NamespaceWriter {
                 .get(&node)
                 .and_then(|files| files.leaves.get(&member))
                 .ok_or(WriteError::UnknownMember { node, member })?;
-            let end = match run.provenance {
-                Provenance::Damaged => run.range.end.min(leaf.len()?),
-                _ => run.range.end,
+            let end = if run.provenance.is_damaged() {
+                run.range.end.min(leaf.len()?)
+            } else {
+                run.range.end
             };
             let start = run.range.start.max(at);
             if start >= end {
@@ -80,7 +87,7 @@ impl NamespaceWriter {
                 node,
                 member,
                 offset: chunk.start,
-                bytes: Bytes::from(bytes),
+                bytes: Bytes::from(bytes).into(),
                 provenance: run.provenance,
             };
             self.route(tree, builder, segments, arrival, out)?;
@@ -101,7 +108,7 @@ impl NamespaceWriter {
             .is_some_and(|(child, _)| !tree.recovers(child));
         if owned_elsewhere {
             let files = self.files_mut(node);
-            files.refused.remove(&member);
+            files.unrefuse(member);
             if let Some(leaf) = files.leaves.remove(&member) {
                 self.discard(leaf)?;
             }

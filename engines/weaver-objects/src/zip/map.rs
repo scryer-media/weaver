@@ -26,6 +26,10 @@ pub(super) struct Entry {
     pub(super) header: u64,
     // `None` for an entry that is no member: a link or a device.
     pub(super) member: Option<MemberId>,
+    // The name its member is said under, and the checksum it is said to
+    // have.
+    pub(super) name: String,
+    pub(super) checksum: Option<u32>,
     pub(super) length: u64,
     pub(super) crc: u32,
     // Where the data starts in the container, once the local header says,
