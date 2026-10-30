@@ -373,15 +373,21 @@ impl Peer {
         }
     }
 
-    // The state of a peer we want and are not connected to. A banned peer is
-    // no connect candidate (libtorrent `peer_list::is_connect_candidate`); a
-    // holepunched one is, whatever its failures.
+    // The state of a peer we are not connected to. A banned peer is no
+    // connect candidate (libtorrent `peer_list::is_connect_candidate`); a
+    // holepunched one is, whatever its failures. Nor is one known to only
+    // upload while the list says we are finished, however it came to be
+    // idle: named again, let go, or brought into a new run.
     fn idle_state(&self, peers: &PeerStates) -> PeerState {
         if self.outgoing_address == Some(self.addr)
             && (self.failcount < MAX_FAILCOUNT || self.holepunch)
             && !peers.is_banned(self.addr.ip())
         {
-            PeerState::Queued
+            if self.holepunch || self.needed(peers.is_finished()) {
+                PeerState::Queued
+            } else {
+                PeerState::NotNeeded
+            }
         } else {
             PeerState::Dead
         }

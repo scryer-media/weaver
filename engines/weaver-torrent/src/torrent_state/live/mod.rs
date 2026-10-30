@@ -966,10 +966,12 @@ impl TorrentStateLive {
 
     async fn task_peer_adder(self: Arc<Self>) -> crate::Result<()> {
         let state = self;
-        // Whether we were finished when the connect candidates were last
-        // looked over; None before they ever were.
-        let mut candidates_finished = None;
         loop {
+            // Whether we are finished decides who is a connect candidate:
+            // the list looks again before it is waited on, so a known seed
+            // wakes nothing once we seed too (libtorrent
+            // `peer_list::connect_one_peer`, `recalculate_connect_candidates`).
+            state.peers.set_finished(state.is_finished_and_no_active_streams());
             if !state.wants_peers() {
                 // Nothing to fetch and nothing to give: connect to no one until
                 // the peers are wanted again.
@@ -990,17 +992,9 @@ impl TorrentStateLive {
             // torrent in turn.
             let permit = state.peer_semaphore.clone().acquire_owned().await?;
             let slot = slots.open().await?;
-            // Whether we are finished decides who is a connect candidate:
-            // when it changed, every peer is looked at again (libtorrent
-            // `peer_list::connect_one_peer`, `recalculate_connect_candidates`).
-            let finished = state.is_finished_and_no_active_streams();
-            if candidates_finished != Some(finished) {
-                for mut peer in state.peers.states.iter_mut() {
-                    peer.value_mut().finished(finished, &state.peers);
-                }
-                candidates_finished = Some(finished);
-            }
-            // The slots may have taken a while; connect to whoever is due now.
+            // The slots may have taken a while: we may have finished since,
+            // so the list looks again, and we connect to whoever is due now.
+            state.peers.set_finished(state.is_finished_and_no_active_streams());
             let Some((addr, rx, tx)) = state.peers.connect_next(tokio::time::Instant::now()) else {
                 continue;
             };

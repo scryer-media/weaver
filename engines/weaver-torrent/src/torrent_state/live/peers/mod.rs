@@ -115,6 +115,11 @@ pub(crate) struct PeerStates {
     // setting, read at each judgment as libtorrent reads it into each
     // `torrent::get_peer_list_state`, so a change holds at once.
     allow_multiple_connections_per_ip: Arc<AtomicBool>,
+    // Whether we were finished when the list last looked: a peer known to
+    // only upload is then no connect candidate, however it comes to be
+    // idle (libtorrent `peer_list::m_finished`, which
+    // `is_connect_candidate` reads).
+    finished: AtomicBool,
     // What the peers sent of the pieces that failed. A record names a peer
     // on the list: it leaves with the peer (libtorrent `torrent::peers_erased`
     // tells `smart_ban_plugin::on_erase_peers`), goes with the list
@@ -331,6 +336,7 @@ impl PeerStates {
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
             allow_multiple_connections_per_ip: Default::default(),
+            finished: AtomicBool::new(false),
             smart_ban: Mutex::new(list.smart_ban),
         };
         for mut peer in list.peers {
@@ -346,6 +352,25 @@ impl PeerStates {
     pub fn allowing_multiple_connections_per_ip(mut self, allow: Arc<AtomicBool>) -> Self {
         self.allow_multiple_connections_per_ip = allow;
         self
+    }
+
+    /// Whether we are `finished` now. When it changed, every peer is looked
+    /// at again: one known to only upload is a connect candidate only while
+    /// we are not (libtorrent `peer_list::recalculate_connect_candidates`,
+    /// which `find_connect_candidates` runs when `is_finished` changed).
+    pub fn set_finished(&self, finished: bool) {
+        if self.finished.swap(finished, Ordering::Relaxed) == finished {
+            return;
+        }
+        for mut peer in self.states.iter_mut() {
+            peer.value_mut().finished(finished, self);
+        }
+        self.candidates_changed.notify_one();
+    }
+
+    /// Whether we were finished when the list last looked.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
     }
 
     /// Whether the peers a connection at their address held back may be
@@ -2154,6 +2179,56 @@ mod tests {
             PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
         assert_eq!(next.with_peer(seed, |p| p.needed(true)), Some(false));
         assert_eq!(next.with_peer(seed, |p| p.needed(false)), Some(true));
+    }
+
+    // libtorrent `peer_list::is_connect_candidate`, `(p.seed ||
+    // p.upload_only) && m_finished`: a complete torrent whose list holds only
+    // seeds opens no connection, however a seed comes to be idle: brought
+    // into a new run, named again, or let go and wanted again. Once we want
+    // pieces again, the seeds are candidates again.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_torrent_with_only_seeds_on_its_list_opens_no_connection() {
+        let peers = make_peer_states();
+        let (one, two) = (peer_addr(1), peer_addr(2));
+        let t0 = Instant::now();
+        for seed in [one, two] {
+            peers.add_peer(seed, PeerSourceFlag::Tracker);
+            peers
+                .with_peer_mut(seed, "test", |peer| {
+                    peer.connect_if_due(t0, &peers).unwrap();
+                    assert!(
+                        peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp)
+                            .is_some()
+                    );
+                })
+                .unwrap();
+            peers.update_bitfield(seed, full_bitfield()).unwrap();
+        }
+        peers.close_all(t0);
+
+        let next =
+            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        next.set_finished(true);
+        let now = Instant::now();
+        let quiet = |next: &PeerStates| {
+            assert_eq!(state_of(next, one), Some("not needed"));
+            assert_eq!(state_of(next, two), Some("not needed"));
+            assert_eq!(next.next_candidate(now), NextCandidate::None);
+            assert!(next.connect_next(now).is_none());
+            assert_eq!(next.stats().connecting, 0);
+        };
+        quiet(&next);
+
+        next.add_peer(one, PeerSourceFlag::Tracker);
+        next.add_peer(two, PeerSourceFlag::Pex);
+        quiet(&next);
+        next.requeue_not_needed();
+        quiet(&next);
+
+        next.set_finished(false);
+        assert_eq!(state_of(&next, one), Some("queued"));
+        assert_eq!(state_of(&next, two), Some("queued"));
+        assert!(next.connect_next(now).is_some());
     }
 
     fn at_port(addr: SocketAddr, port: u16) -> SocketAddr {
