@@ -2342,12 +2342,13 @@ impl TorrentService {
         let (landing, move_to) = landing;
         let _ = self.landed(landing).await;
         // One that downloaded under its download path moves under its save
-        // path now (qBittorrent `TorrentImpl::handleTorrentFinished`).
+        // path now, over any file of the same name there (qBittorrent
+        // `TorrentImpl::handleTorrentFinished` and `adjustStorageLocation`).
         if let Some(to) = move_to {
             if let Err(error) = self.inner.db.clear_torrent_move_to(job_id) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's move");
             }
-            if let Err(error) = self.set_location(job_id, to).await {
+            if let Err(error) = self.move_storage(job_id, to, true).await {
                 tracing::warn!(job_id = job_id.0, error = %error, "a complete torrent did not move under its save path");
             }
         }
@@ -3958,6 +3959,20 @@ impl TorrentService {
     /// fails the move. A move that fails leaves the torrent where it was,
     /// and says why when it failed at once.
     pub async fn set_location(&self, job_id: JobId, parent: String) -> Result<(), ActionError> {
+        self.move_storage(job_id, parent, false).await
+    }
+
+    // The move of `set_location`. Placed files already at the new place
+    // fail it, as qBittorrent's move of a user's asks for
+    // (`MoveStorageMode::KeepExistingFiles`), unless `replace`, when they
+    // give way, as its move of a finished torrent under its save path does
+    // (`TorrentImpl::adjustStorageLocation`, `MoveStorageMode::Overwrite`).
+    async fn move_storage(
+        &self,
+        job_id: JobId,
+        parent: String,
+        replace: bool,
+    ) -> Result<(), ActionError> {
         let parent = PathBuf::from(parent.trim());
         if !parent.is_absolute() {
             return Err(ActionError::Invalid(
@@ -3984,7 +3999,9 @@ impl TorrentService {
             })
             .await?;
         if let Some(placed) = placed {
-            return self.move_placed(job_id, job, &placed, parent).await;
+            return self
+                .move_placed(job_id, job, &placed, parent, replace)
+                .await;
         }
         if from.parent() == Some(parent.as_path()) {
             return Ok(());
@@ -4038,6 +4055,7 @@ impl TorrentService {
         job: Arc<TorrentJob>,
         from: &Path,
         to: PathBuf,
+        replace: bool,
     ) -> Result<(), ActionError> {
         if from == to {
             return Ok(());
@@ -4057,7 +4075,7 @@ impl TorrentService {
                 torrent.settle(self.inner.clock.now_ms());
                 torrent.moving = Some(Moving::Files);
                 Ok(job.with(|job| {
-                    job.relocate_kept(to.clone());
+                    job.relocate_kept(to.clone(), replace);
                     job.relocated()
                 }))
             })

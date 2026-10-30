@@ -23,8 +23,8 @@ pub(crate) enum Relocation {
     // Its directory, to the directory claimed for it.
     Working(PathBuf),
     // The kept files placed outside its directory, each to its own name
-    // under this directory.
-    Kept(PathBuf),
+    // under `to`; `replace` takes the place of a file already there.
+    Kept { to: PathBuf, replace: bool },
 }
 
 impl<R: Root> GraphJob<R> {
@@ -40,9 +40,11 @@ impl<R: Root> GraphJob<R> {
     // Move the kept files placed outside the job's directory to the same
     // names under `to`, a directory that exists, fenced as
     // [`Self::relocate`] is (libtorrent `torrent::move_storage` moves a
-    // torrent's files wherever they sit). The job's own directory stays.
-    pub(crate) fn relocate_kept(&mut self, to: PathBuf) {
-        self.moving = Some(Relocation::Kept(to));
+    // torrent's files wherever they sit). The job's own directory stays. A
+    // file already at a destination fails the move, unless `replace`, when
+    // the moved file takes its place (`move_flags_t::always_replace_files`).
+    pub(crate) fn relocate_kept(&mut self, to: PathBuf, replace: bool) {
+        self.moving = Some(Relocation::Kept { to, replace });
         self.try_relocate();
     }
 
@@ -73,7 +75,7 @@ impl<R: Root> GraphJob<R> {
                     to
                 })
             }
-            Relocation::Kept(to) => match self.writer.kept_dir().map(Path::to_path_buf) {
+            Relocation::Kept { to, replace } => match self.writer.kept_dir().map(Path::to_path_buf) {
                 Some(from) => {
                     self.writer.release_kept();
                     let moves: Vec<(PathBuf, PathBuf)> = self
@@ -82,7 +84,7 @@ impl<R: Root> GraphJob<R> {
                         .into_iter()
                         .zip(self.writer.kept_paths(&to))
                         .collect();
-                    move_files(&from, &moves).map(|()| {
+                    move_files(&from, &moves, replace).map(|()| {
                         self.writer.rekeep(&to);
                         to
                     })
@@ -103,20 +105,23 @@ impl<R: Root> GraphJob<R> {
 // Move each file from its path to the other, every one or none
 // (libtorrent `storage_utils::move_storage`): a file already at a
 // destination fails the move before anything moved
-// (`move_flags_t::fail_if_exist`), a file not there yet has nothing to move,
-// a file on another device is copied and its source removed only once every
-// file is in, and a move that fails partway puts back what it moved. The
+// (`move_flags_t::fail_if_exist`), unless `replace`, when the moved file
+// takes its place (`always_replace_files`); a file not there yet has nothing
+// to move, a file on another device is copied and its source removed only
+// once every file is in, and a move that fails partway puts back what it
+// moved. A file it replaced stays replaced, as libtorrent's does. The
 // directories under `from` the move leaves empty go.
-fn move_files(from: &Path, moves: &[(PathBuf, PathBuf)]) -> Result<(), LeafError> {
-    move_files_using(from, moves, |from, to| std::fs::rename(from, to))
+fn move_files(from: &Path, moves: &[(PathBuf, PathBuf)], replace: bool) -> Result<(), LeafError> {
+    move_files_using(from, moves, replace, |from, to| std::fs::rename(from, to))
 }
 
 fn move_files_using(
     from: &Path,
     moves: &[(PathBuf, PathBuf)],
+    replace: bool,
     rename: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), LeafError> {
-    for (_, target) in moves {
+    for (_, target) in moves.iter().filter(|_| !replace) {
         if std::fs::symlink_metadata(target).is_ok() {
             return Err(LeafError::Io {
                 path: target.clone(),
@@ -311,7 +316,7 @@ mod tests {
             .iter()
             .map(|name| (from.join(name), to.join(name)))
             .collect();
-        let error = move_files_using(&from, &moves, |source, target| {
+        let error = move_files_using(&from, &moves, false, |source, target| {
             if source.ends_with("c.bin") {
                 Err(io::Error::from(io::ErrorKind::PermissionDenied))
             } else if source.ends_with("b.bin") {
@@ -327,6 +332,30 @@ mod tests {
         expected.sort();
         assert_eq!(contents(&from), expected);
         assert!(contents(&to).is_empty());
+    }
+
+    // `always_replace_files`, the mode qBittorrent's move of a finished
+    // torrent asks for (`MoveStorageMode::Overwrite`): a file already at a
+    // destination gives way to the moved one instead of failing the move.
+    #[test]
+    fn files_moved_with_replace_take_the_place_of_those_there() {
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("from"), root.path().join("to"));
+        tree(&from);
+        let expected = contents(&from);
+        std::fs::create_dir_all(to.join("sub")).unwrap();
+        std::fs::write(to.join("sub/b.bin"), b"old").unwrap();
+        let moves: Vec<(PathBuf, PathBuf)> = expected
+            .iter()
+            .map(|(name, _)| (from.join(name), to.join(name)))
+            .collect();
+        let refused = move_files(&from, &moves, false).unwrap_err();
+        assert!(matches!(refused, LeafError::Io { ref path, .. } if path.ends_with("sub/b.bin")));
+        assert_eq!(contents(&from), expected);
+
+        move_files(&from, &moves, true).unwrap();
+        assert_eq!(contents(&to), expected);
+        assert!(contents(&from).is_empty());
     }
 
     // A rename that fails for another reason leaves the job as it was: the

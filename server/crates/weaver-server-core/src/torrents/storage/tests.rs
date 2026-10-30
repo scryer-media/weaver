@@ -590,7 +590,7 @@ async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
     std::fs::create_dir_all(&moved).unwrap();
 
     let outcome = shim.job.with(|job| {
-        job.relocate_kept(moved.clone());
+        job.relocate_kept(moved.clone(), false);
         job.relocated()
     });
     assert_eq!(outcome.unwrap().unwrap(), moved);
@@ -634,7 +634,7 @@ fn placed_files_stay_when_one_is_already_where_they_would_go() {
     std::fs::write(moved.join("b.bin"), b"theirs").unwrap();
 
     let outcome = shim.job.with(|job| {
-        job.relocate_kept(moved.clone());
+        job.relocate_kept(moved.clone(), false);
         job.relocated()
     });
     assert!(outcome.unwrap().is_err());

@@ -7325,6 +7325,50 @@ async fn placed_files_move_to_a_new_location_and_the_record_follows() {
     rig.service.stop().await;
 }
 
+// qBittorrent `TorrentImpl::handleTorrentFinished`: a torrent laid out with
+// no folder of its own that downloaded under its download path moves under
+// its save path once complete, over a file of the same name already there
+// (`adjustStorageLocation`, `MoveStorageMode::Overwrite`), and its save path
+// and files directory follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let download = rig.dir.path().join("incoming");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("a.bin"), &data).unwrap();
+    let save = rig.dir.path().join("done");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), b"older").unwrap();
+    let save_text = save.to_string_lossy().into_owned();
+
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save_text.clone()),
+            download_path: Some(download.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.files_dir.as_deref() == Some(save_text.as_str())
+    })
+    .await;
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    assert!(!download.join("a.bin").exists());
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.files_dir.as_deref(), Some(save_text.as_str()));
+    assert_eq!(stored.save_path.as_deref(), Some(save_text.as_str()));
+    assert_eq!(stored.move_to, None);
+    assert_eq!((view.state, view.have_bytes), (TorrentState::Seeding, data.len() as u64));
+    rig.service.stop().await;
+}
+
 // libtorrent `torrent_flags::seed_mode`, as qBittorrent `seedMode` sets it: a
 // torrent whose files are complete where it is added seeds them at once,
 // and its trackers hear it downloaded nothing, as they first hear of it and
