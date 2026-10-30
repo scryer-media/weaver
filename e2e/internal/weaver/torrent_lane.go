@@ -317,8 +317,8 @@ func (lane *torrentLane) gql(query string, variables map[string]any, out any) er
 
 const torrentFields = `id name infohash state detail category private forced progress totalBytes haveBytes
 uploadedBytes downloadedBytes ratio downloadBps uploadBps peers seeds leechers completedAtMs storageDir
-seedingLeft seedingSource route seedingPolicy { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action maxUploadBps }
-seedingOverride { ratioGoal action }
+seedingLeft route seedingPolicy { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action uploadCap levels { ratioGoal } }
+seedingOverride { ratioGoal { state value } action { state value } }
 files { index path length selected progress }
 trackers { tier url status message seeders leechers lastAnnounceMs }`
 
@@ -345,15 +345,18 @@ type torrentView struct {
 	CompletedAtMs   *int64  `json:"completedAtMs"`
 	StorageDir      *string `json:"storageDir"`
 	SeedingLeft     *string `json:"seedingLeft"`
-	SeedingSource   string  `json:"seedingSource"`
 	Route           *string `json:"route"`
 	SeedingPolicy   struct {
 		RatioGoal *float64 `json:"ratioGoal"`
 		Action    string   `json:"action"`
+		// The level each term comes from.
+		Levels struct {
+			RatioGoal string `json:"ratioGoal"`
+		} `json:"levels"`
 	} `json:"seedingPolicy"`
 	SeedingOverride *struct {
-		RatioGoal *float64 `json:"ratioGoal"`
-		Action    string   `json:"action"`
+		RatioGoal leaf[float64] `json:"ratioGoal"`
+		Action    leaf[string]  `json:"action"`
 	} `json:"seedingOverride"`
 	Files []struct {
 		Index    int     `json:"index"`
@@ -443,6 +446,21 @@ func (lane *torrentLane) mutateBool(name string, args string, variables map[stri
 		return err
 	}
 	return nil
+}
+
+// leaf is one setting at one level: INHERIT, OFF, or SET with its value.
+type leaf[T any] struct {
+	State string `json:"state"`
+	Value *T     `json:"value"`
+}
+
+// ratioGoalTerms are seeding terms that set a ratio goal and stop the
+// torrent once it is met, every other term inherited.
+func ratioGoalTerms(ratio float64) map[string]any {
+	return map[string]any{
+		"ratioGoal": map[string]any{"state": "SET", "value": ratio},
+		"action":    map[string]any{"state": "SET", "value": "STOP"},
+	}
 }
 
 // argDecl declares the variables a simple mutation uses.

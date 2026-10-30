@@ -36,13 +36,12 @@ use weaver_server_core::rss::RssService;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
-    SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentLimit,
-    TorrentPeerProtocol, resolve_seeding_policy,
+    Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption,
+    TorrentLimit, TorrentPeerProtocol,
 };
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::{
-    ActionError, AddError, AddRequest, Placement, SeedingSource, TorrentService, TorrentSettings,
-    TorrentView,
+    ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
 use weaver_server_core::torrents::{
     ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
@@ -1107,38 +1106,47 @@ fn eta(view: &TorrentView) -> u64 {
     view.eta_seconds.unwrap_or(ETA_UNKNOWN)
 }
 
-// The torrent's share limits (`-2` where it inherits the global policy the
-// preferences report) and the limits in force; `-1` is no goal. Mode and
-// action read `Default` while the torrent inherits them.
+// The torrent's own share limits, each `-2` where it inherits, `-1` where
+// it has no goal of its own, else its goal; and the limits in force, `-1`
+// for no goal. Mode and action read `Default` while the torrent inherits
+// them.
 fn share_limits(view: &TorrentView) -> [(&'static str, Value); 8] {
     let policy = &view.seeding_policy;
+    let own = view.seeding_override.unwrap_or_default();
     let minutes = |value: Option<u32>| json!(value.map_or(-1, i64::from));
-    let (ratio, seeding, inactive) = (
-        policy
-            .ratio_goal
-            .map_or(json!(-1), |ratio| json!(f64::from(ratio))),
-        minutes(policy.seed_time_goal_minutes),
-        minutes(policy.inactive_goal_minutes),
-    );
-    let inherits = matches!(view.seeding_source, SeedingSource::Global);
-    let own = |value: &Value| if inherits { json!(-2) } else { value.clone() };
-    let (mode, action) = if inherits {
-        ("Default", "Default")
-    } else {
-        (
-            limits_mode_name(policy.mode),
-            limit_action_name(policy.action),
-        )
+    let ratio = |value: Option<f32>| value.map_or(json!(-1), |ratio| json!(f64::from(ratio)));
+    let leaf = |leaf: Leaf<Value>| match leaf {
+        Leaf::Inherit => json!(-2),
+        Leaf::Off => json!(-1),
+        Leaf::Set(value) => value,
     };
     [
-        ("ratio_limit", own(&ratio)),
-        ("seeding_time_limit", own(&seeding)),
-        ("inactive_seeding_time_limit", own(&inactive)),
-        ("share_limits_mode", json!(mode)),
-        ("share_limit_action", json!(action)),
-        ("max_ratio", ratio),
-        ("max_seeding_time", seeding),
-        ("max_inactive_seeding_time", inactive),
+        (
+            "ratio_limit",
+            leaf(own.ratio_goal.map(|value| ratio(Some(value)))),
+        ),
+        (
+            "seeding_time_limit",
+            leaf(own.seed_time_goal_minutes.map(|value| minutes(Some(value)))),
+        ),
+        (
+            "inactive_seeding_time_limit",
+            leaf(own.inactive_goal_minutes.map(|value| minutes(Some(value)))),
+        ),
+        (
+            "share_limits_mode",
+            json!(own.mode.set().map_or("Default", limits_mode_name)),
+        ),
+        (
+            "share_limit_action",
+            json!(own.action.set().map_or("Default", limit_action_name)),
+        ),
+        ("max_ratio", ratio(policy.ratio_goal)),
+        ("max_seeding_time", minutes(policy.seed_time_goal_minutes)),
+        (
+            "max_inactive_seeding_time",
+            minutes(policy.inactive_goal_minutes),
+        ),
     ]
 }
 
@@ -2123,17 +2131,9 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_owned);
-    let policy_override = {
-        let config = ctx.inner.config.read().await;
-        match share_policy(
-            &params,
-            inherited(&config, category.as_deref()),
-            None,
-            false,
-        ) {
-            Ok(policy) => policy,
-            Err(response) => return response,
-        }
+    let policy_override = match share_policy(&params, None, false) {
+        Ok(policy) => policy,
+        Err(response) => return response,
     };
     let (upload_limit, download_limit) =
         match (add_limit(&params, "upLimit"), add_limit(&params, "dlLimit")) {
@@ -2277,43 +2277,17 @@ fn placement(params: &Params) -> Placement {
     }
 }
 
-// The seeding policy a torrent added to `category` inherits before its
-// trackers are known; the tracker rule it matches is applied as it is added.
-fn inherited(config: &Config, category: Option<&str>) -> Option<SeedingPolicy> {
-    let category = category.and_then(|name| {
-        config
-            .categories
-            .iter()
-            .find(|category| category.name.eq_ignore_ascii_case(name))
-    });
-    resolve_seeding_policy(
-        None,
-        None,
-        category.and_then(|category| category.seeding.as_ref()),
-        config.seeding.as_ref(),
-    )
-}
-
-// One share limit: absent leaves it as it is, `-2` inherits, `-1` is no
-// goal, and a value from 0 up is the goal. A torrent's override cannot
-// lift a goal it inherits, so `-1` over one is refused.
-fn share_limit(
-    params: &Params,
-    name: &str,
-    current: Option<f64>,
-    inherited: Option<f64>,
-) -> Result<Option<f64>, Response> {
+// One share limit over the level's current one: absent leaves it as it
+// is, `-2` inherits, `-1` is no goal at this level whatever the levels
+// above set, and a value from 0 up is the goal.
+fn share_limit(params: &Params, name: &str, current: Leaf<f64>) -> Result<Leaf<f64>, Response> {
     let Some(value) = params.get(name) else {
         return Ok(current);
     };
     match value.trim().parse::<f64>() {
-        Ok(value) if value >= 0.0 => Ok(Some(value)),
-        Ok(value) if value == -2.0 => Ok(None),
-        Ok(value) if value == -1.0 && inherited.is_none() => Ok(None),
-        Ok(value) if value == -1.0 => Err(text(
-            StatusCode::CONFLICT,
-            format!("{name}: a torrent cannot drop the goal it inherits"),
-        )),
+        Ok(value) if value >= 0.0 => Ok(Leaf::Set(value)),
+        Ok(value) if value == -2.0 => Ok(Leaf::Inherit),
+        Ok(value) if value == -1.0 => Ok(Leaf::Off),
         _ => Err(text(
             StatusCode::BAD_REQUEST,
             format!("{name} is not a limit"),
@@ -2363,56 +2337,52 @@ fn limit_action_of(name: &str) -> Option<Option<SeedingAction>> {
     }
 }
 
-// A seeding override from the client's share limits, over the current
-// override: a torrent's, or a category's over the global policy.
+// A level's seeding terms from the client's share limits, over its current
+// ones: a torrent's, or a category's. Terms that set nothing are none.
 fn share_policy(
     params: &Params,
-    inherited: Option<SeedingPolicy>,
     current: Option<SeedingPolicy>,
     strict: bool,
 ) -> Result<Option<SeedingPolicy>, Response> {
     if params.get("shareLimitAction").map(str::trim) == Some("EnableSuperSeeding") {
         return Err(unavailable("Super seeding"));
     }
-    let mode = share_named(params, "shareLimitsMode", limits_mode_of, strict)?;
-    let action = share_named(params, "shareLimitAction", limit_action_of, strict)?;
-    let field = |pick: fn(&SeedingPolicy) -> Option<f64>| {
-        (
-            current.as_ref().and_then(pick),
-            inherited.as_ref().and_then(pick),
-        )
-    };
-    let (now, from) = field(|policy| policy.ratio_goal.map(f64::from));
-    let ratio = share_limit(params, "ratioLimit", now, from)?;
-    let (now, from) = field(|policy| policy.seed_time_goal_minutes.map(f64::from));
-    let seeding = share_limit(params, "seedingTimeLimit", now, from)?;
-    let (now, from) = field(|policy| policy.inactive_goal_minutes.map(f64::from));
-    let inactive = share_limit(params, "inactiveSeedingTimeLimit", now, from)?;
-    let max_upload_bps = current.as_ref().and_then(|policy| policy.max_upload_bps);
-    // The most specific policy's mode and action rule (`resolve_seeding_policy`).
-    let base = current.or(inherited).unwrap_or_default();
-    let from = inherited.unwrap_or_default();
-    let mode = mode.map_or(base.mode, |mode| mode.unwrap_or(from.mode));
-    let action = action.map_or(base.action, |action| action.unwrap_or(from.action));
-    if ratio.is_none()
-        && seeding.is_none()
-        && inactive.is_none()
-        && max_upload_bps.is_none()
-        && mode == from.mode
-        && action == from.action
-    {
-        return Ok(None);
+    let current = current.unwrap_or_default();
+    fn named<T>(named: Option<Option<T>>, current: Leaf<T>) -> Leaf<T> {
+        match named {
+            None => current,
+            Some(None) => Leaf::Inherit,
+            Some(Some(value)) => Leaf::Set(value),
+        }
     }
-    let minutes =
-        |value: Option<f64>| value.map(|value| value.round().min(f64::from(u32::MAX)) as u32);
-    Ok(Some(SeedingPolicy {
+    let mode = named(
+        share_named(params, "shareLimitsMode", limits_mode_of, strict)?,
+        current.mode,
+    );
+    let action = named(
+        share_named(params, "shareLimitAction", limit_action_of, strict)?,
+        current.action,
+    );
+    let minutes = |value: f64| value.round().min(f64::from(u32::MAX)) as u32;
+    let ratio = share_limit(params, "ratioLimit", current.ratio_goal.map(f64::from))?;
+    let seeding = share_limit(
+        params,
+        "seedingTimeLimit",
+        current.seed_time_goal_minutes.map(f64::from),
+    )?;
+    let inactive = share_limit(
+        params,
+        "inactiveSeedingTimeLimit",
+        current.inactive_goal_minutes.map(f64::from),
+    )?;
+    Ok(SeedingPolicy::kept(Some(SeedingPolicy {
         ratio_goal: ratio.map(|ratio| ratio as f32),
-        seed_time_goal_minutes: minutes(seeding),
-        inactive_goal_minutes: minutes(inactive),
+        seed_time_goal_minutes: seeding.map(minutes),
+        inactive_goal_minutes: inactive.map(minutes),
         mode,
         action,
-        max_upload_bps,
-    }))
+        seed_time_counting: current.seed_time_counting,
+    })))
 }
 
 async fn set_share_limits(ctx: &TorrentFacadeContext, params: &Params) -> Response {
@@ -2420,11 +2390,10 @@ async fn set_share_limits(ctx: &TorrentFacadeContext, params: &Params) -> Respon
         return ok();
     };
     for view in ctx.targets(params).await {
-        let policy =
-            match share_policy(params, view.seeding_inherited, view.seeding_override, false) {
-                Ok(policy) => policy,
-                Err(response) => return response,
-            };
+        let policy = match share_policy(params, view.seeding_override, false) {
+            Ok(policy) => policy,
+            Err(response) => return response,
+        };
         match torrents.set_policy_override(view.job_id, policy).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
             Err(error @ ActionError::Invalid(_)) => {
@@ -2667,13 +2636,13 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "banned_IPs": torrent.banned_ips.join("\n"),
         "block_peers_on_privileged_ports": torrent.block_privileged_ports,
         "stop_tracker_timeout": torrent.stop_tracker_timeout_secs,
-        "max_ratio_enabled": seeding.is_some_and(|policy| policy.ratio_goal.is_some()),
-        "max_ratio": seeding.and_then(|policy| policy.ratio_goal).map_or(-1.0, f64::from),
-        "max_seeding_time_enabled": seeding.is_some_and(|policy| policy.seed_time_goal_minutes.is_some()),
-        "max_seeding_time": minutes(seeding.and_then(|policy| policy.seed_time_goal_minutes)),
-        "max_inactive_seeding_time_enabled": seeding.is_some_and(|policy| policy.inactive_goal_minutes.is_some()),
-        "max_inactive_seeding_time": minutes(seeding.and_then(|policy| policy.inactive_goal_minutes)),
-        "max_ratio_act": match seeding.map_or(SeedingAction::Stop, |policy| policy.action) {
+        "max_ratio_enabled": seeding.is_some_and(|policy| policy.ratio_goal.set().is_some()),
+        "max_ratio": seeding.and_then(|policy| policy.ratio_goal.set()).map_or(-1.0, f64::from),
+        "max_seeding_time_enabled": seeding.is_some_and(|policy| policy.seed_time_goal_minutes.set().is_some()),
+        "max_seeding_time": minutes(seeding.and_then(|policy| policy.seed_time_goal_minutes.set())),
+        "max_inactive_seeding_time_enabled": seeding.is_some_and(|policy| policy.inactive_goal_minutes.set().is_some()),
+        "max_inactive_seeding_time": minutes(seeding.and_then(|policy| policy.inactive_goal_minutes.set())),
+        "max_ratio_act": match seeding.and_then(|policy| policy.action.set()).unwrap_or_default() {
             SeedingAction::Stop => 0,
             SeedingAction::Remove => 1,
             SeedingAction::RemoveWithData => 3,
@@ -2870,26 +2839,32 @@ impl TorrentFacadeContext {
 
 // Each category with its folder and share limits (qBittorrent
 // `categoriesAction`, `CategoryOptions::toJSON`): `-2` where a limit is
-// inherited, and `Default` for a mode and action the category does not set.
+// inherited, `-1` where the category sets no goal, and `Default` for a mode
+// and action the category does not set.
 pub(super) fn categories(config: &Config) -> Value {
     let map: Map<String, Value> = config
         .categories
         .iter()
         .map(|category| {
-            let seeding = category.seeding.as_ref();
-            let limit = |value: Option<f64>| value.map_or(json!(-2), |value| json!(value));
-            let minutes = |value: Option<u32>| json!(value.map_or(-2, i64::from));
+            let seeding = category.seeding.unwrap_or_default();
+            let leaf = |leaf: Leaf<Value>| match leaf {
+                Leaf::Inherit => json!(-2),
+                Leaf::Off => json!(-1),
+                Leaf::Set(value) => value,
+            };
+            let ratio = leaf(seeding.ratio_goal.map(|ratio| json!(f64::from(ratio))));
+            let minutes = |value: Leaf<u32>| leaf(value.map(|value| json!(i64::from(value))));
             (
                 category.name.clone(),
                 json!({
                     "name": category.name,
                     "savePath": category_dir(config, Some(&category.name)).to_string_lossy(),
                     "download_path": Value::Null,
-                    "ratio_limit": limit(seeding.and_then(|policy| policy.ratio_goal.map(f64::from))),
-                    "seeding_time_limit": minutes(seeding.and_then(|policy| policy.seed_time_goal_minutes)),
-                    "inactive_seeding_time_limit": minutes(seeding.and_then(|policy| policy.inactive_goal_minutes)),
-                    "share_limit_action": seeding.map_or("Default", |policy| limit_action_name(policy.action)),
-                    "share_limits_mode": seeding.map_or("Default", |policy| limits_mode_name(policy.mode)),
+                    "ratio_limit": ratio,
+                    "seeding_time_limit": minutes(seeding.seed_time_goal_minutes),
+                    "inactive_seeding_time_limit": minutes(seeding.inactive_goal_minutes),
+                    "share_limit_action": seeding.action.set().map_or("Default", limit_action_name),
+                    "share_limits_mode": seeding.mode.set().map_or("Default", limits_mode_name),
                 }),
             )
         })
@@ -2939,12 +2914,7 @@ fn category_options(
                 .into_owned(),
         ),
     };
-    let seeding = share_policy(
-        params,
-        config.seeding,
-        current.and_then(|category| category.seeding),
-        true,
-    )?;
+    let seeding = share_policy(params, current.and_then(|category| category.seeding), true)?;
     Ok((dest_dir, seeding))
 }
 
@@ -2981,6 +2951,7 @@ async fn create_category(
     let candidate = name.clone();
     let created = tokio::task::spawn_blocking(move || {
         let category = CategoryConfig {
+            upload_cap: Default::default(),
             id: db.next_category_id()?,
             name: candidate,
             dest_dir,

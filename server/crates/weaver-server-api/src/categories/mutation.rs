@@ -43,7 +43,7 @@ impl CategoriesMutation {
         }
         let dest_dir = input.dest_dir.clone().filter(|value| !value.is_empty());
         validate_category_name(&name, dest_dir.as_deref())?;
-        let (seeding, torrent_route, unpack) = input.torrent_fields(None)?;
+        let fields = input.torrent_fields(None)?;
 
         with_timed_config_read(config, "categories.mutation.add_category.validate", |cfg| {
             if cfg
@@ -73,9 +73,10 @@ impl CategoriesMutation {
             name: name.clone(),
             dest_dir,
             aliases: input.aliases,
-            seeding,
-            torrent_route,
-            unpack,
+            seeding: fields.seeding,
+            torrent_route: fields.torrent_route,
+            unpack: fields.unpack,
+            upload_cap: fields.upload_cap,
         };
 
         let added = {
@@ -155,15 +156,16 @@ impl CategoriesMutation {
                     )));
                 }
 
-                let (seeding, torrent_route, unpack) = input.torrent_fields(Some(current))?;
+                let fields = input.torrent_fields(Some(current))?;
                 Ok(weaver_server_core::categories::CategoryConfig {
                     id,
                     name: name.clone(),
                     dest_dir: dest_dir.clone(),
                     aliases: input.aliases.clone(),
-                    seeding,
-                    torrent_route,
-                    unpack,
+                    seeding: fields.seeding,
+                    torrent_route: fields.torrent_route,
+                    unpack: fields.unpack,
+                    upload_cap: fields.upload_cap,
                 })
             },
         )
@@ -276,6 +278,7 @@ mod tests {
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
             seeding: None,
+            upload_cap: None,
             torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,
@@ -318,6 +321,7 @@ mod tests {
                         cfg.categories
                             .push(weaver_server_core::categories::CategoryConfig {
                                 seeding: None,
+                                upload_cap: Default::default(),
                                 torrent_route: false,
                                 unpack: None,
                                 id: 1,

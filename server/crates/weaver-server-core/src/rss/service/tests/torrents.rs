@@ -91,8 +91,10 @@ async fn rig(items: &str, sizes: Option<(u64, u64)>, torrents_on: bool) -> Rig {
         db.clone(),
         sessions,
         TorrentSettings {
+            upload_cap: None,
             complete_dir: dir.path().join("complete"),
             categories: vec![CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: true,
                 unpack: None,

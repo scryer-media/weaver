@@ -852,7 +852,7 @@ async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
     let h = TestHarness::new().await;
     let defaults = h
         .execute(
-            "{ settings { seeding { ratioGoal } torrent { enabled basePort announcePort upnp encryption maxActiveDownloads maxPeersTotal sessionDir } } }",
+            "{ settings { seeding { ratioGoal { value } } uploadCap torrent { enabled basePort announcePort upnp encryption maxActiveDownloads maxPeersTotal sessionDir } } }",
         )
         .await;
     assert_no_errors(&defaults);
@@ -865,10 +865,20 @@ async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
     let saved = h
         .execute(
             r#"mutation { updateSettings(input: {
-                seeding: { ratioGoal: 2.0, seedTimeGoalMinutes: 90, mode: ALL, action: REMOVE_WITH_DATA }
+                seeding: {
+                    ratioGoal: { state: SET, value: 2.0 }
+                    seedTimeGoalMinutes: { state: SET, value: 90 }
+                    mode: { state: SET, value: ALL }
+                    action: { state: SET, value: REMOVE_WITH_DATA }
+                }
+                uploadCap: 65536
                 torrent: { enabled: true, basePort: 51413, announcePort: 40000, encryption: REQUIRE, sessionDir: "/data/session" }
             }) {
-                seeding { ratioGoal seedTimeGoalMinutes inactiveGoalMinutes mode action maxUploadBps }
+                seeding {
+                    ratioGoal { value } seedTimeGoalMinutes { value }
+                    inactiveGoalMinutes { state value } mode { value } action { value }
+                }
+                uploadCap
                 torrent { enabled basePort announcePort upnp encryption sessionDir }
             } }"#,
         )
@@ -876,11 +886,14 @@ async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
     assert_no_errors(&saved);
     let data = response_data(&saved);
     let seeding = &data["updateSettings"]["seeding"];
-    assert_eq!(seeding["ratioGoal"], 2.0);
-    assert_eq!(seeding["seedTimeGoalMinutes"], 90);
-    assert!(seeding["inactiveGoalMinutes"].is_null());
-    assert_eq!(seeding["mode"], "ALL");
-    assert_eq!(seeding["action"], "REMOVE_WITH_DATA");
+    assert_eq!(seeding["ratioGoal"]["value"], 2.0);
+    assert_eq!(seeding["seedTimeGoalMinutes"]["value"], 90);
+    // At the global level a goal left out is off: nothing is above it.
+    assert_eq!(seeding["inactiveGoalMinutes"]["state"], "OFF");
+    assert!(seeding["inactiveGoalMinutes"]["value"].is_null());
+    assert_eq!(seeding["mode"]["value"], "ALL");
+    assert_eq!(seeding["action"]["value"], "REMOVE_WITH_DATA");
+    assert_eq!(data["updateSettings"]["uploadCap"], 65536);
     let torrent = &data["updateSettings"]["torrent"];
     assert_eq!(torrent["enabled"], true);
     assert_eq!(torrent["basePort"], 51413);
@@ -891,14 +904,16 @@ async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
 
     let stored = h.db.load_config().unwrap();
     assert_eq!(stored.seeding, h.config.read().await.seeding);
+    assert_eq!(stored.upload_cap, Some(65_536));
+    assert_eq!(stored.upload_cap, h.config.read().await.upload_cap);
     assert_eq!(stored.torrent, h.config.read().await.torrent);
     assert_eq!(stored.torrent.base_port, 51413);
 
     // Leaving a field out keeps it; null clears it.
     let cleared = h
         .execute(
-            r#"mutation { updateSettings(input: { seeding: null, torrent: { announcePort: null } }) {
-                seeding { ratioGoal } torrent { enabled announcePort }
+            r#"mutation { updateSettings(input: { seeding: null, uploadCap: null, torrent: { announcePort: null } }) {
+                seeding { ratioGoal { value } } uploadCap torrent { enabled announcePort }
             } }"#,
         )
         .await;
@@ -909,10 +924,11 @@ async fn seeding_and_torrent_settings_default_then_persist_and_clear() {
     assert!(data["updateSettings"]["torrent"]["announcePort"].is_null());
     let stored = h.db.load_config().unwrap();
     assert_eq!(stored.seeding, None);
+    assert_eq!(stored.upload_cap, None);
     assert_eq!(stored.torrent.announce_port, None);
 
     let refused = h
-        .execute(r#"mutation { updateSettings(input: { seeding: { ratioGoal: -1.0 } }) { seeding { ratioGoal } } }"#)
+        .execute(r#"mutation { updateSettings(input: { seeding: { ratioGoal: { state: SET, value: -1.0 } } }) { seeding { ratioGoal { value } } } }"#)
         .await;
     assert!(!refused.errors.is_empty());
     assert_eq!(h.db.load_config().unwrap().seeding, None);

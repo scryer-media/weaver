@@ -39,7 +39,8 @@ fn resume_update(
     if let Some(counters) = counters {
         sets.push(
             "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
-             last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}",
+             last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}, \
+             consecutive_seeding_s = {}",
         );
         args.extend([
             SqlArg::I64(stored(counters.uploaded_bytes)?),
@@ -48,6 +49,7 @@ fn resume_update(
             SqlArg::OptI64(counters.last_seen_complete_ms),
             SqlArg::I64(stored(counters.finished_duration_s)?),
             SqlArg::OptI64(counters.last_activity_ms),
+            SqlArg::I64(stored(counters.consecutive_seeding_s)?),
         ]);
     }
     if let Some(peers) = peers {
@@ -122,8 +124,7 @@ fn listed<T: serde::de::DeserializeOwned>(
 }
 
 fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
-    let policy_override = torrent
-        .policy_override
+    let policy_override = SeedingPolicy::kept(torrent.policy_override)
         .map(|policy| serde_json::to_string(&policy))
         .transpose()
         .map_err(|error| StateError::Database(error.to_string()))?;
@@ -146,6 +147,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptText(torrent.storage_dir.clone()),
         SqlArg::OptText(policy_override),
         SqlArg::OptBool(torrent.unpack),
+        SqlArg::OptBool(torrent.unpack_in_force),
         SqlArg::OptText(metadata),
         SqlArg::OptI64(torrent.upload_limit.map(stored).transpose()?),
         SqlArg::OptI64(torrent.download_limit.map(stored).transpose()?),
@@ -352,13 +354,14 @@ impl Database {
         self.set_torrent_column("forced", args)
     }
 
-    // The torrent's own seeding policy. Returns whether the torrent exists.
+    // The torrent's own seeding policy; one whose every leaf inherits is
+    // kept as none. Returns whether the torrent exists.
     pub fn set_torrent_policy_override(
         &self,
         job_id: JobId,
         policy_override: Option<SeedingPolicy>,
     ) -> Result<bool, StateError> {
-        let policy_override = policy_override
+        let policy_override = SeedingPolicy::kept(policy_override)
             .map(|policy| serde_json::to_string(&policy))
             .transpose()
             .map_err(|error| StateError::Database(error.to_string()))?;
@@ -408,13 +411,17 @@ impl Database {
 
     // Whether the torrent's archives are extracted, fixed when its job is
     // built. Returns whether the torrent exists.
-    pub fn set_torrent_unpack(&self, job_id: JobId, unpack: bool) -> Result<bool, StateError> {
+    pub fn set_torrent_unpack_in_force(
+        &self,
+        job_id: JobId,
+        unpack: bool,
+    ) -> Result<bool, StateError> {
         let args = vec![SqlArg::Bool(unpack), SqlArg::I64(stored(job_id.0)?)];
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
                 datastore.read_exec(),
-                "UPDATE torrents SET unpack = {} WHERE job_id = {}",
+                "UPDATE torrents SET unpack_in_force = {} WHERE job_id = {}",
                 &args,
             )
             .await?;

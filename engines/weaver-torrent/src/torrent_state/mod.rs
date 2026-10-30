@@ -163,6 +163,12 @@ pub(crate) struct ManagedTorrentOptions {
     pub sequential: AtomicBool,
     /// [`AddTorrentOptions::trackers_only`](crate::AddTorrentOptions::trackers_only).
     pub trackers_only: bool,
+    /// [`AddTorrentOptions::disable_dht`](crate::AddTorrentOptions::disable_dht).
+    pub disable_dht: bool,
+    /// [`AddTorrentOptions::disable_lsd`](crate::AddTorrentOptions::disable_lsd).
+    pub disable_lsd: bool,
+    /// [`AddTorrentOptions::disable_pex`](crate::AddTorrentOptions::disable_pex).
+    pub disable_pex: bool,
     /// [`AddTorrentOptions::seed_mode`](crate::AddTorrentOptions::seed_mode),
     /// while it lasts. Every run checks through this one record, so a piece
     /// checked once is not checked again after a pause.
@@ -471,6 +477,31 @@ impl ManagedTorrent {
             self.with_metadata(|m| m.info.info().private)
                 .unwrap_or(false),
             self.shared.options.trackers_only,
+        )
+    }
+
+    /// Where the torrent looks for peers beside its trackers: none when it
+    /// takes them from its trackers alone, else the DHT and the local
+    /// network unless it was added without either.
+    pub fn discovery(&self) -> crate::session::Discovery {
+        crate::session::Discovery::of(
+            self.takes_peers_from_trackers_only(),
+            self.shared.options.disable_dht,
+            self.shared.options.disable_lsd,
+        )
+    }
+
+    /// Whether the torrent speaks peer exchange: its session runs it, it
+    /// was not added without it, and it takes peers from more than its
+    /// trackers.
+    pub fn speaks_pex(&self) -> bool {
+        crate::session::speaks_pex(
+            self.shared
+                .session
+                .upgrade()
+                .is_some_and(|session| !session.disable_pex),
+            self.takes_peers_from_trackers_only(),
+            self.shared.options.disable_pex,
         )
     }
 

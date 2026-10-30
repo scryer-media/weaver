@@ -28,7 +28,19 @@ export function transferFields(t: Translate, torrent: TorrentData): TorrentField
   const speed = (rate: number, average: number) =>
     t("next.torrent.averageValue", { rate: formatRate(rate), average: formatRate(average) });
   return [
-    { label: t("next.torrent.timeActive"), value: formatDuration(torrent.activeSeconds) },
+    {
+      label: t("next.torrent.timeActive"),
+      // qBittorrent reads "4m39s (seeded for 3m10s)"; the current unbroken
+      // run follows the seeding it is part of.
+      value:
+        torrent.seedingSeconds > 0
+          ? t("next.torrent.timeActiveSeeded", {
+              active: formatDuration(torrent.activeSeconds),
+              seeded: formatDuration(torrent.seedingSeconds),
+              run: formatDuration(torrent.consecutiveSeedingSeconds),
+            })
+          : formatDuration(torrent.activeSeconds),
+    },
     { label: t("next.torrent.eta"), value: seconds(torrent.etaSeconds) },
     {
       label: t("next.torrent.connections"),

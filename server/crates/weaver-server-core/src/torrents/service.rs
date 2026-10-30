@@ -34,8 +34,8 @@ use crate::jobs::handle::{
     SchedulerHandle, TorrentRate,
 };
 use crate::jobs::model::{
-    FieldUpdate, JobStatus, JobUpdate, PRIORITY_ATTRIBUTE_KEY, Protocol,
-    job_status_from_persisted_str,
+    ArchivePasswordCandidate, ArchivePasswordSource, FieldUpdate, JobStatus, JobUpdate,
+    PRIORITY_ATTRIBUTE_KEY, Protocol, job_status_from_persisted_str,
 };
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
 use crate::jobs::report::JobReport;
@@ -56,8 +56,8 @@ use crate::proxies::{
 };
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{
-    Client, Config, SeedingAction, SeedingPolicy, TorrentConfig, TorrentEncryption,
-    TrackerUploadLimit, resolve_seeding_policy,
+    Client, Config, Leaf, Level, Levels, SeedTimeCounting, Seeding, SeedingAction, SeedingGoalMode,
+    SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
@@ -118,15 +118,123 @@ pub struct TorrentSettings {
     pub complete_dir: PathBuf,
     pub categories: Vec<CategoryConfig>,
     pub seeding: Option<SeedingPolicy>,
+    pub upload_cap: Option<u64>,
     pub torrent: TorrentConfig,
 }
+
+/// Where each level keeps one setting a torrent takes over its levels; a
+/// level that does not carry it is `None`, and inherits. This is the one
+/// place that says which level may set which setting:
+///
+/// | setting                  | torrent | rule | category | global          |
+/// |--------------------------|---------|------|----------|-----------------|
+/// | seeding goals, mode, act | yes     | yes  | yes      | yes             |
+/// | upload cap               | no (1)  | yes  | yes      | yes             |
+/// | unpack                   | yes     | yes  | yes      | yes             |
+/// | DHT, PEX, LSD            | no      | yes  | no       | the session's   |
+/// | encryption               | no      | yes  | no       | the session's   |
+/// | route scope              | no      | yes  | yes      | the default     |
+///
+/// (1) A torrent's own upload limit is not a level of the cap: the tighter
+/// of the two holds ([`ratelimits_of`]).
+///
+/// A tracker rule alone names a client, an SSL identity, whether its
+/// torrents start forced, and whether the schedule may pause them; those
+/// are read from the rule and have no chain.
+pub struct Field<T> {
+    torrent: Option<fn(&TorrentRecord) -> Leaf<T>>,
+    rule: Option<fn(&TrackerRule) -> Leaf<T>>,
+    category: Option<fn(&CategoryConfig) -> Leaf<T>>,
+    global: fn(&TorrentSettings) -> Leaf<T>,
+}
+
+// A seeding leaf, where every level keeps a policy.
+macro_rules! seeding_field {
+    ($leaf:ident) => {
+        Field {
+            torrent: Some(|record| record.policy_override.unwrap_or_default().$leaf),
+            rule: Some(|rule| rule.seeding.unwrap_or_default().$leaf),
+            category: Some(|category| category.seeding.unwrap_or_default().$leaf),
+            global: |settings| settings.seeding.unwrap_or_default().at_global().$leaf,
+        }
+    };
+}
+
+pub const RATIO_GOAL: Field<f32> = seeding_field!(ratio_goal);
+pub const SEED_TIME_GOAL: Field<u32> = seeding_field!(seed_time_goal_minutes);
+pub const INACTIVE_GOAL: Field<u32> = seeding_field!(inactive_goal_minutes);
+pub const SEEDING_MODE: Field<SeedingGoalMode> = seeding_field!(mode);
+pub const SEEDING_ACTION: Field<SeedingAction> = seeding_field!(action);
+pub const SEED_TIME_COUNTING: Field<SeedTimeCounting> = seeding_field!(seed_time_counting);
+
+pub const UPLOAD_CAP: Field<u64> = Field {
+    torrent: None,
+    rule: Some(|rule| rule.upload_cap),
+    category: Some(|category| category.upload_cap),
+    global: |settings| Leaf::limit(settings.upload_cap),
+};
+
+pub const UNPACK: Field<bool> = Field {
+    torrent: Some(|record| Leaf::of(record.unpack)),
+    rule: Some(|rule| Leaf::of(rule.unpack)),
+    category: Some(|category| Leaf::of(category.unpack)),
+    global: |settings| Leaf::Set(settings.torrent.unpack),
+};
+
+// The session runs the DHT, local discovery and peer exchange for every
+// torrent it is not turned off for, under its own encryption.
+pub const DHT: Field<bool> = Field {
+    torrent: None,
+    rule: Some(|rule| Leaf::of(rule.dht)),
+    category: None,
+    global: |_| Leaf::Inherit,
+};
+pub const PEX: Field<bool> = Field {
+    torrent: None,
+    rule: Some(|rule| Leaf::of(rule.pex)),
+    category: None,
+    global: |_| Leaf::Inherit,
+};
+pub const LSD: Field<bool> = Field {
+    torrent: None,
+    rule: Some(|rule| Leaf::of(rule.lsd)),
+    category: None,
+    global: |_| Leaf::Inherit,
+};
+pub const ENCRYPTION: Field<TorrentEncryption> = Field {
+    torrent: None,
+    rule: Some(|rule| Leaf::of(rule.encryption)),
+    category: None,
+    global: |_| Leaf::Inherit,
+};
+
+// A rule or category routes its torrents itself once it says so.
+pub const SCOPE: Field<TorrentScope> = Field {
+    torrent: None,
+    rule: Some(|rule| {
+        if rule.torrent_route {
+            Leaf::Set(TorrentScope::TrackerRule(rule.id))
+        } else {
+            Leaf::Inherit
+        }
+    }),
+    category: Some(|category| {
+        if category.torrent_route {
+            Leaf::Set(TorrentScope::Category(category.id))
+        } else {
+            Leaf::Inherit
+        }
+    }),
+    global: |_| Leaf::Set(TorrentScope::Default),
+};
 
 impl TorrentSettings {
     pub fn of(config: &Config) -> Self {
         Self {
             complete_dir: PathBuf::from(config.complete_dir()),
             categories: config.categories.clone(),
-            seeding: config.seeding.clone(),
+            seeding: config.seeding,
+            upload_cap: config.upload_cap,
             torrent: config.torrent.clone(),
         }
     }
@@ -135,94 +243,161 @@ impl TorrentSettings {
         id.and_then(|id| self.categories.iter().find(|category| category.id == id))
     }
 
+    /// `field` at each level for a torrent: `torrent`, when there is one
+    /// yet, in category `category` under tracker rule `rule`.
+    pub fn levels<T>(
+        &self,
+        field: &Field<T>,
+        torrent: Option<&TorrentRecord>,
+        category: Option<u32>,
+        rule: Option<&TrackerRule>,
+    ) -> Levels<T> {
+        fn at<L, T>(of: Option<fn(&L) -> Leaf<T>>, level: Option<&L>) -> Leaf<T> {
+            of.zip(level).map_or(Leaf::Inherit, |(of, level)| of(level))
+        }
+        Levels {
+            torrent: at(field.torrent, torrent),
+            rule: at(field.rule, rule),
+            category: at(field.category, self.category(category)),
+            global: (field.global)(self),
+        }
+    }
+
+    /// `field` at each level for `record` under `rule`.
+    pub fn of_torrent<T>(
+        &self,
+        field: &Field<T>,
+        record: &TorrentRecord,
+        rule: Option<&TrackerRule>,
+    ) -> Levels<T> {
+        self.levels(field, Some(record), record.category_id, rule)
+    }
+
     // The scope whose route a torrent takes: its tracker rule's when the
     // rule routes its torrents itself, else its category's when that does,
     // else the default.
     fn scope(&self, id: Option<u32>, rule: Option<&TrackerRule>) -> TorrentScope {
-        match (rule, self.category(id)) {
-            (Some(rule), _) if rule.torrent_route => TorrentScope::TrackerRule(rule.id),
-            (_, Some(category)) if category.torrent_route => TorrentScope::Category(category.id),
-            _ => TorrentScope::Default,
-        }
+        self.levels(&SCOPE, None, id, rule)
+            .resolve()
+            .unwrap_or(TorrentScope::Default)
     }
 
-    fn policy(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> Option<SeedingPolicy> {
-        resolve_seeding_policy(
-            record.policy_override.as_ref(),
-            rule.and_then(|rule| rule.seeding.as_ref()),
-            self.category_seeding(record),
-            self.seeding.as_ref(),
-        )
-    }
-
-    // The policy the torrent would have without its own override.
-    fn inherited(
+    /// The seeding terms `record` is held to under `rule`, each resolved
+    /// over its levels, and the level each comes from.
+    pub fn seeding(
         &self,
         record: &TorrentRecord,
         rule: Option<&TrackerRule>,
-    ) -> Option<SeedingPolicy> {
-        resolve_seeding_policy(
-            None,
-            rule.and_then(|rule| rule.seeding.as_ref()),
-            self.category_seeding(record),
-            self.seeding.as_ref(),
+    ) -> (Seeding, SeedingLevels) {
+        let ratio = self.of_torrent(&RATIO_GOAL, record, rule);
+        let seed_time = self.of_torrent(&SEED_TIME_GOAL, record, rule);
+        let inactive = self.of_torrent(&INACTIVE_GOAL, record, rule);
+        let mode = self.of_torrent(&SEEDING_MODE, record, rule);
+        let action = self.of_torrent(&SEEDING_ACTION, record, rule);
+        let counting = self.of_torrent(&SEED_TIME_COUNTING, record, rule);
+        let cap = self.of_torrent(&UPLOAD_CAP, record, rule);
+        (
+            Seeding {
+                ratio_goal: ratio.resolve(),
+                seed_time_goal_minutes: seed_time.resolve(),
+                inactive_goal_minutes: inactive.resolve(),
+                mode: mode.resolve().unwrap_or_default(),
+                action: action.resolve().unwrap_or_default(),
+                seed_time_counting: counting.resolve().unwrap_or_default(),
+            },
+            SeedingLevels {
+                ratio_goal: ratio.level(),
+                seed_time_goal_minutes: seed_time.level(),
+                inactive_goal_minutes: inactive.level(),
+                mode: mode.level(),
+                action: action.level(),
+                seed_time_counting: counting.level(),
+                upload_cap: cap.level(),
+            },
         )
     }
 
-    // Whether the torrent's archives are extracted: its own value, else its
-    // tracker rule's, else its category's, else the global default.
+    /// The seeding terms `record` is held to under `rule`.
+    pub fn policy(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> Seeding {
+        self.seeding(record, rule).0
+    }
+
+    /// The upload cap `record` takes from its levels under `rule`.
+    pub fn upload_cap(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> Option<u64> {
+        self.of_torrent(&UPLOAD_CAP, record, rule).resolve()
+    }
+
+    // Whether the torrent's archives would be extracted were its job built
+    // now: its own value, else its tracker rule's, else its category's,
+    // else the global one.
     fn unpack(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> bool {
-        record
-            .unpack
-            .or_else(|| rule.and_then(|rule| rule.unpack))
-            .or_else(|| {
-                self.category(record.category_id)
-                    .and_then(|category| category.unpack)
-            })
-            .unwrap_or(self.torrent.unpack)
+        self.of_torrent(&UNPACK, record, rule)
+            .resolve()
+            .unwrap_or(false)
     }
+}
 
-    fn category_seeding(&self, record: &TorrentRecord) -> Option<&SeedingPolicy> {
-        self.category(record.category_id)
-            .and_then(|category| category.seeding.as_ref())
-    }
+/// The level each of a torrent's seeding terms comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedingLevels {
+    pub ratio_goal: Level,
+    pub seed_time_goal_minutes: Level,
+    pub inactive_goal_minutes: Level,
+    pub mode: Level,
+    pub action: Level,
+    pub seed_time_counting: Level,
+    pub upload_cap: Level,
+}
 
-    // The most specific level that sets a policy.
-    fn seeding_source(&self, record: &TorrentRecord, rule: Option<&TrackerRule>) -> SeedingSource {
-        let rule = rule.filter(|rule| rule.seeding.is_some());
-        if record.policy_override.is_some() {
-            SeedingSource::Torrent
-        } else if let Some(rule) = rule {
-            SeedingSource::TrackerRule(rule.host_pattern.clone())
-        } else if self.category_seeding(record).is_some() {
-            SeedingSource::Category
-        } else {
-            SeedingSource::Global
+impl Default for SeedingLevels {
+    fn default() -> Self {
+        Self {
+            ratio_goal: Level::Global,
+            seed_time_goal_minutes: Level::Global,
+            inactive_goal_minutes: Level::Global,
+            mode: Level::Global,
+            action: Level::Global,
+            seed_time_counting: Level::Global,
+            upload_cap: Level::Global,
         }
     }
 }
 
 // What a torrent's session holds its peers to under its tracker rule:
-// whether it takes them from its trackers alone, and the encryption its
-// connections are made under over the session's. A change of either takes
+// whether it takes them from its trackers alone, whether it looks for them
+// on the DHT, on the local network and by peer exchange, and the encryption
+// its connections are made under over the session's. A change of any takes
 // the torrent through its session again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
     trackers_only: bool,
+    disable_dht: bool,
+    disable_pex: bool,
+    disable_lsd: bool,
     encryption: Option<TorrentEncryption>,
 }
 
 impl PeerTerms {
-    fn of(rule: Option<&TrackerRule>) -> Self {
-        rule.map_or_else(Self::default, |rule| Self {
-            trackers_only: rule.trackers_only(),
-            encryption: rule.encryption,
-        })
+    // A switch no level sets is the session's, which runs each for every
+    // torrent it is not turned off for.
+    fn of(settings: &TorrentSettings, rule: Option<&TrackerRule>) -> Self {
+        let off =
+            |field: &Field<bool>| settings.levels(field, None, None, rule).resolve() == Some(false);
+        Self {
+            trackers_only: rule.is_some_and(TrackerRule::trackers_only),
+            disable_dht: off(&DHT),
+            disable_pex: off(&PEX),
+            disable_lsd: off(&LSD),
+            encryption: settings.levels(&ENCRYPTION, None, None, rule).resolve(),
+        }
     }
 
     // `options` under these terms.
     fn apply(self, options: &mut AddTorrentOptions) {
         options.trackers_only = self.trackers_only;
+        options.disable_dht = self.disable_dht;
+        options.disable_pex = self.disable_pex;
+        options.disable_lsd = self.disable_lsd;
         options.peer_opts = self.encryption.map(|encryption| PeerConnectionOptions {
             encryption: Some(encryption_policy(encryption)),
             ..Default::default()
@@ -249,6 +424,42 @@ fn ssl_identity(ssl: Option<&TrackerCertificate>) -> Option<SslIdentity> {
     })
 }
 
+// The one place a torrent's archive passwords are chosen: the passwords of
+// the rule it is under, then the global list, a value already in the list
+// skipped so its first copy keeps its place. Only this reads a rule's
+// passwords, and it hands them to the graph of a torrent under that rule
+// alone: an NZB job's harvest reads no rule, a torrent under another rule or
+// none gets only the global list, and nothing writes a rule's passwords to
+// the global list.
+fn torrent_archive_passwords(
+    rule: Option<&TrackerRule>,
+    global: &[ArchivePasswordCandidate],
+) -> Vec<ArchivePasswordCandidate> {
+    let tracker = rule
+        .into_iter()
+        .flat_map(|rule| rule.archive_passwords.as_slice())
+        .map(|value| ArchivePasswordCandidate::new(ArchivePasswordSource::Tracker, value.clone()));
+    let mut candidates: Vec<ArchivePasswordCandidate> = Vec::new();
+    for candidate in tracker.chain(global.iter().cloned()) {
+        if candidates
+            .iter()
+            .all(|kept| kept.value() != candidate.value())
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+// A torrent's checkpoint names the candidate each node was offered last by
+// its place in the list, and the list may have changed since: each node is
+// offered the first candidate again, so it retries the list from the top.
+fn retry_passwords_from_top(snapshot: &mut checkpoint::Snapshot) {
+    for index in snapshot.passwords.values_mut() {
+        *index = 0;
+    }
+}
+
 // The tracker rule of id `id`, while it stands.
 fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
     let id = id?;
@@ -269,41 +480,15 @@ fn identity_of(rule: Option<&TrackerRule>, own: &TorrentIdentity) -> Identity {
     client_of(rule).identity_of(own)
 }
 
-// The limits `record`'s session holds it to: its own, and on upload a cap
-// where that is tighter: its own policy's, else its tracker rule's upload
-// limit, else the cap its seeding policy resolves to. A rule's `Unlimited`
-// leaves its category's and the global policy's caps out. Each is a channel
-// the torrent's peers draw from beside the session's, as each peer class
-// over a libtorrent peer is (`bandwidth_manager::request_bandwidth`).
-fn ratelimits_of(
-    record: &TorrentRecord,
-    policy: Option<SeedingPolicy>,
-    rule: Option<&TrackerRule>,
-) -> LimitsConfig {
-    let cap = record
-        .policy_override
-        .and_then(|policy| policy.max_upload_bps)
-        .map(Some)
-        .or_else(|| {
-            rule.and_then(|rule| rule.upload_limit)
-                .map(TrackerUploadLimit::bps)
-        })
-        .unwrap_or_else(|| policy.and_then(|policy| policy.max_upload_bps));
+// The limits `record`'s session holds it to: its own, and on upload the cap
+// its levels resolve to where that is tighter. Each is a channel the
+// torrent's peers draw from beside the session's, as each peer class over a
+// libtorrent peer is (`bandwidth_manager::request_bandwidth`).
+fn ratelimits_of(record: &TorrentRecord, cap: Option<u64>) -> LimitsConfig {
     LimitsConfig {
         upload_bps: limit_kind(record.upload_limit).tighter(limit_kind(cap)),
         download_bps: limit_kind(record.download_limit),
     }
-}
-
-/// Where a torrent's seeding policy comes from: the most specific level that
-/// sets one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SeedingSource {
-    Torrent,
-    /// The tracker rule its trackers matched, by its host pattern.
-    TrackerRule(String),
-    Category,
-    Global,
 }
 
 /// The torrents the schedule's pause leaves seeding under one tracker rule.
@@ -531,12 +716,6 @@ fn state_error(error: StateError) -> String {
     error.to_string()
 }
 
-/// A torrent's own seeding terms; terms that set nothing are no terms, and
-/// the torrent inherits its tracker rule's, category's and the global ones.
-fn own_policy(policy: Option<SeedingPolicy>) -> Option<SeedingPolicy> {
-    policy.filter(|policy| *policy != SeedingPolicy::default())
-}
-
 /// A torrent as consumers read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TorrentView {
@@ -596,6 +775,10 @@ pub struct TorrentView {
     pub reannounce_seconds: Option<u64>,
     /// Seconds spent running in a session.
     pub active_seconds: u64,
+    /// Seconds spent complete and seeding, in all.
+    pub seeding_seconds: u64,
+    /// Seconds of the current unbroken seeding run.
+    pub consecutive_seeding_seconds: u64,
     /// The bytes moved over the time active.
     pub download_avg_bps: u64,
     pub upload_avg_bps: u64,
@@ -620,15 +803,20 @@ pub struct TorrentView {
     /// it seeds.
     pub queue_position: Option<u32>,
     pub seeding_left: Option<String>,
-    /// The torrent's own seeding policy, when it sets one, and what it
-    /// would have without it.
+    /// The torrent's own seeding policy, when it sets a leaf.
     pub seeding_override: Option<SeedingPolicy>,
-    pub seeding_inherited: Option<SeedingPolicy>,
-    /// The seeding policy in force, and the level it comes from.
-    pub seeding_policy: SeedingPolicy,
-    pub seeding_source: SeedingSource,
-    /// Whether its archives are extracted.
+    /// The seeding terms in force, and the level each comes from.
+    pub seeding_policy: Seeding,
+    pub seeding_levels: SeedingLevels,
+    /// The host pattern of the tracker rule its trackers match.
+    pub tracker_rule: Option<String>,
+    /// The upload cap its levels resolve to, held beside its own limit.
+    pub upload_cap: Option<u64>,
+    /// Whether its archives are extracted: as its job was built, or as the
+    /// levels say until then.
     pub unpack: bool,
+    /// Whether it was asked to extract its archives; `None` inherits.
+    pub unpack_override: Option<bool>,
     pub route: Option<String>,
     pub files: Vec<TorrentFile>,
     /// Whether its pieces are fetched in order.
@@ -1091,7 +1279,7 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
     let runs_through_schedule = rule.is_some_and(|rule| rule.never_pause)
         && (!seeding
             || status::goal_left(
-                settings.policy(&torrent.record, rule).as_ref(),
+                &settings.policy(&torrent.record, rule),
                 &torrent.counters,
                 torrent.total,
                 now,
@@ -1128,20 +1316,23 @@ impl Live {
     }
 
     // A torrent whose ledger and peers the database holds as given, as of
-    // `now`.
+    // `now`. Its seeding run starts again from zero: the time Weaver was
+    // down is no seeding.
     fn new(
         record: TorrentRecord,
-        counters: TorrentCounters,
+        mut counters: TorrentCounters,
         resume: ResumePeers,
         now: i64,
     ) -> Self {
+        let written = counters;
+        counters.consecutive_seeding_s = 0;
         Self {
             record,
             identity: TorrentIdentity::fresh(),
             rule_id: None,
             private: false,
             ledger: Ledger {
-                written: Some((counters, resume.clone())),
+                written: Some((written, resume.clone())),
                 peers_at_ms: now,
                 lost: Arc::default(),
             },
@@ -1461,6 +1652,7 @@ struct Unviewed {
     hash_failed_bytes: u64,
     redundant_bytes: u64,
     seeding_seconds: u64,
+    consecutive_seeding_seconds: u64,
     peers_connecting: u32,
     leg: Option<(String, usize)>,
     fetch: Option<weaver_torrent::FetchPhase>,
@@ -1485,6 +1677,7 @@ impl Unviewed {
             redundant_bytes: self.redundant_bytes,
             active_seconds: view.active_seconds,
             seeding_seconds: self.seeding_seconds,
+            consecutive_seeding_seconds: self.consecutive_seeding_seconds,
             download_bps: view.download_bps,
             upload_bps: view.upload_bps,
             ratio: view.ratio,
@@ -1514,6 +1707,7 @@ struct Timed {
     at_ms: i64,
     active_ms: u64,
     finished_ms: u64,
+    consecutive_ms: u64,
 }
 
 impl Timed {
@@ -1522,12 +1716,15 @@ impl Timed {
             at_ms: now,
             active_ms: 0,
             finished_ms: 0,
+            consecutive_ms: 0,
         }
     }
 
     // Run on to `now`: the time since runs into the active duration while
-    // `active`, and into the finished one while `seeding`. A clock stepped
-    // back credits nothing for that reading, and the next runs from `now`.
+    // `active`, and into the finished one and the current seeding run while
+    // `seeding`; a reading that is not `seeding` ends the run, and it starts
+    // again from zero. A clock stepped back credits nothing for that
+    // reading, and the next runs from `now`.
     fn advanced(
         self,
         now: i64,
@@ -1548,6 +1745,16 @@ impl Timed {
             at_ms: now,
             active_ms: run(self.active_ms, active, &mut counters.active_duration_s),
             finished_ms: run(self.finished_ms, seeding, &mut counters.finished_duration_s),
+            consecutive_ms: if seeding {
+                run(
+                    self.consecutive_ms,
+                    true,
+                    &mut counters.consecutive_seeding_s,
+                )
+            } else {
+                counters.consecutive_seeding_s = 0;
+                0
+            },
         }
     }
 }
@@ -2416,7 +2623,31 @@ impl TorrentService {
         }
     }
 
-    fn storage(&self, dir: Dirs, layout: &PieceLayout, unpack: bool) -> Storage {
+    // The archive passwords a graph built for `torrent` now takes. One
+    // already extracting keeps the list it started with.
+    fn archive_passwords(&self, torrent: &Live) -> Vec<String> {
+        let job_id = torrent.record.job_id;
+        let global = self
+            .inner
+            .db
+            .global_archive_password_candidates()
+            .unwrap_or_else(|error| {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not load global archive passwords");
+                Vec::new()
+            });
+        torrent_archive_passwords(torrent.rule(&self.rules()), &global)
+            .into_iter()
+            .map(|candidate| candidate.value().to_owned())
+            .collect()
+    }
+
+    fn storage(
+        &self,
+        dir: Dirs,
+        layout: &PieceLayout,
+        unpack: bool,
+        passwords: Vec<String>,
+    ) -> Storage {
         let policy = self
             .inner
             .db
@@ -2435,7 +2666,7 @@ impl TorrentService {
             free_disk: env.free_disk.clone(),
             slots: env.slots,
             mail: env.mail.clone(),
-            passwords: Vec::new(),
+            passwords,
             caps: Caps::new(Arc::clone(&env.limits), policy, declared),
             nesting: limits::NESTING,
             unpack,
@@ -2450,6 +2681,7 @@ impl TorrentService {
         dir: Dirs,
         layout: &Arc<PieceLayout>,
         unpack: bool,
+        passwords: Vec<String>,
     ) -> FromCheckpoint {
         let loaded = self.inner.db.load_graph_checkpoint(job_id);
         self.inner
@@ -2462,12 +2694,13 @@ impl TorrentService {
         };
         let restored = checkpoint::snapshot(&rows)
             .map_err(|error| error.to_string())
-            .and_then(|snapshot| {
+            .and_then(|mut snapshot| {
+                retry_passwords_from_top(&mut snapshot);
                 GraphJob::restore_torrent(
                     &snapshot,
                     Arc::clone(layout),
                     job_id.0,
-                    self.storage(dir, layout, unpack),
+                    self.storage(dir, layout, unpack, passwords),
                     self.inner.env.slots,
                 )
                 .map_err(|error| error.to_string())
@@ -2519,6 +2752,7 @@ impl TorrentService {
         dir: Dirs,
         layout: &Arc<PieceLayout>,
         unpack: bool,
+        passwords: Vec<String>,
         checkpoint: FromCheckpoint,
     ) -> GraphJob<PieceRoot> {
         match checkpoint {
@@ -2548,7 +2782,7 @@ impl TorrentService {
         GraphJob::for_torrent(
             job_id.0,
             Arc::clone(layout),
-            self.storage(dir, layout, unpack),
+            self.storage(dir, layout, unpack, passwords),
         )
     }
 
@@ -2595,8 +2829,15 @@ impl TorrentService {
     fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) {
         self.describe(torrent, parsed);
         let (job_id, dir, unpack) = (torrent.record.job_id, dirs(torrent), unpacks(torrent));
-        let checkpoint = self.restored(job_id, dir.clone(), &parsed.layout, unpack);
-        let job = self.graph_job(job_id, dir, &parsed.layout, unpack, checkpoint);
+        let passwords = self.archive_passwords(torrent);
+        let checkpoint = self.restored(
+            job_id,
+            dir.clone(),
+            &parsed.layout,
+            unpack,
+            passwords.clone(),
+        );
+        let job = self.graph_job(job_id, dir, &parsed.layout, unpack, passwords, checkpoint);
         self.give_job(torrent, job);
     }
 
@@ -2612,14 +2853,14 @@ impl TorrentService {
     // unpacks is fixed here and kept, so a restart builds the same tree.
     fn describe(&self, torrent: &mut Live, parsed: &Parsed) {
         let job_id = torrent.record.job_id;
-        if torrent.record.unpack.is_none() {
+        if torrent.record.unpack_in_force.is_none() {
             let unpack = self
                 .settings()
                 .unpack(&torrent.record, torrent.rule(&self.rules()));
-            if let Err(error) = self.inner.db.set_torrent_unpack(job_id, unpack) {
+            if let Err(error) = self.inner.db.set_torrent_unpack_in_force(job_id, unpack) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record whether a torrent unpacks");
             }
-            torrent.record.unpack = Some(unpack);
+            torrent.record.unpack_in_force = Some(unpack);
         }
         torrent.names = parsed.manifest.paths.clone();
         torrent.total = parsed.total;
@@ -2674,17 +2915,19 @@ impl TorrentService {
                         dirs(torrent),
                         Arc::clone(torrent.layout.as_ref()?),
                         unpacks(torrent),
+                        self.archive_passwords(torrent),
                     ))
                 })
         };
-        let Some((dir, layout, unpack)) = waiting else {
+        let Some((dir, layout, unpack, passwords)) = waiting else {
             return;
         };
         let restoring = {
             let (service, dir, layout) = (self.clone(), dir.clone(), Arc::clone(&layout));
+            let passwords = passwords.clone();
             tokio::task::spawn_blocking(move || {
                 let checkpoint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    service.restored(job_id, dir, &layout, unpack)
+                    service.restored(job_id, dir, &layout, unpack, passwords)
                 }))
                 .unwrap_or_else(|_| FromCheckpoint::Failed("the restore panicked".to_string()));
                 (guard, checkpoint)
@@ -2694,7 +2937,7 @@ impl TorrentService {
         let Ok((_restoring, checkpoint)) = restoring.await else {
             return;
         };
-        let job = self.graph_job(job_id, dir, &layout, unpack, checkpoint);
+        let job = self.graph_job(job_id, dir, &layout, unpack, passwords, checkpoint);
         if let Some(torrent) = self
             .inner
             .live
@@ -2856,7 +3099,7 @@ impl TorrentService {
                 );
                 let mut torrent = self.insert(record, &trackers)?;
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
-                let terms = PeerTerms::of(torrent.rule(&rules));
+                let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
                 self.inner.live.lock().await.insert(job_id, torrent);
                 self.spawn_resolve(job_id, plan, uri, None, identity, terms)
@@ -3017,8 +3260,9 @@ impl TorrentService {
             forced: request.forced,
             completed_at_ms: None,
             storage_dir: None,
-            policy_override: own_policy(request.policy_override),
+            policy_override: SeedingPolicy::kept(request.policy_override),
             unpack: request.unpack,
+            unpack_in_force: None,
             metadata: request.metadata.clone(),
             upload_limit: request.upload_limit,
             download_limit: request.download_limit,
@@ -3337,7 +3581,7 @@ impl TorrentService {
             uri,
             Some(tiers),
             identity_of(rule, &own),
-            PeerTerms::of(rule),
+            PeerTerms::of(&self.settings(), rule),
         )
         .await;
     }
@@ -3386,11 +3630,8 @@ impl TorrentService {
                 return;
             };
             let rule = torrent.rule(&rules);
-            let ratelimits = ratelimits_of(
-                &torrent.record,
-                settings.policy(&torrent.record, rule),
-                rule,
-            );
+            let ratelimits =
+                ratelimits_of(&torrent.record, settings.upload_cap(&torrent.record, rule));
             (
                 settings.scope(torrent.record.category_id, rule),
                 bytes,
@@ -3410,7 +3651,7 @@ impl TorrentService {
                 ),
                 identity_of(rule, &torrent.identity),
                 torrent.seen,
-                PeerTerms::of(rule),
+                PeerTerms::of(&settings, rule),
                 certificate_of(rule),
                 (
                     fetch_levels(torrent, job),
@@ -3726,9 +3967,7 @@ impl TorrentService {
         let torrent = live.get(&job_id).ok_or(ActionError::NotFound(job_id))?;
         if torrent.private && !confirm_unmet_goal {
             let policy = settings.policy(&torrent.record, torrent.rule(&self.rules()));
-            if let Some(left) =
-                status::goal_left(policy.as_ref(), &torrent.counters, torrent.total, now)
-            {
+            if let Some(left) = status::goal_left(&policy, &torrent.counters, torrent.total, now) {
                 return Err(ActionError::UnmetGoal(left));
             }
         }
@@ -4359,7 +4598,10 @@ impl TorrentService {
         job_id: JobId,
         policy: Option<SeedingPolicy>,
     ) -> Result<(), ActionError> {
-        let policy = own_policy(policy);
+        if let Some(policy) = &policy {
+            policy.validate().map_err(ActionError::Invalid)?;
+        }
+        let policy = SeedingPolicy::kept(policy);
         self.with_torrent(job_id, |torrent| {
             self.inner
                 .db
@@ -4699,7 +4941,7 @@ impl TorrentService {
                     }
                     continue;
                 }
-                let terms = PeerTerms::of(rule);
+                let terms = PeerTerms::of(&settings, rule);
                 match plan {
                     Ok(plan) => {
                         if let Some(reason) = &plan.down {
@@ -4816,11 +5058,8 @@ impl TorrentService {
                 if !torrent.seeding() || !torrent.resumed() || torrent.record.forced {
                     continue;
                 }
-                let Some(policy) = settings.policy(&torrent.record, torrent.rule(&rules)) else {
-                    continue;
-                };
-                if status::goal_left(Some(&policy), &torrent.counters, torrent.total, now).is_some()
-                {
+                let policy = settings.policy(&torrent.record, torrent.rule(&rules));
+                if status::goal_left(&policy, &torrent.counters, torrent.total, now).is_some() {
                     continue;
                 }
                 match policy.action {
@@ -4896,11 +5135,7 @@ impl TorrentService {
                 continue;
             };
             let rule = torrent.rule(&rules);
-            let limits = ratelimits_of(
-                &torrent.record,
-                settings.policy(&torrent.record, rule),
-                rule,
-            );
+            let limits = ratelimits_of(&torrent.record, settings.upload_cap(&torrent.record, rule));
             if attached.handle.ratelimits() != limits {
                 attached.handle.set_ratelimits(limits);
             }
@@ -5128,7 +5363,7 @@ impl TorrentService {
         );
         let rules = self.rules();
         let rule = torrent.rule(&rules);
-        let policy = settings.policy(record, rule);
+        let (policy, seeding_levels) = settings.seeding(record, rule);
         let swarm = status::swarm(&torrent.announces(), now);
         // The time the torrent has run to this reading, the part of a
         // second included, and its averages over that same time.
@@ -5182,6 +5417,8 @@ impl TorrentService {
             swarm_leechers: swarm.leechers,
             reannounce_seconds: swarm.reannounce_seconds,
             active_seconds,
+            seeding_seconds: counters.finished_duration_s,
+            consecutive_seeding_seconds: counters.consecutive_seeding_s,
             download_avg_bps: status::average_bps(counters.downloaded_bytes, active_seconds),
             upload_avg_bps: status::average_bps(counters.uploaded_bytes, active_seconds),
             wasted_bytes: wasted(&reading.seen),
@@ -5195,12 +5432,16 @@ impl TorrentService {
             storage_dir: record.storage_dir.clone(),
             files_dir: record.files_dir.clone(),
             queue_position: torrent.queue_rank,
-            seeding_left: status::goal_left(policy.as_ref(), counters, total, now),
+            seeding_left: status::goal_left(&policy, counters, total, now),
             seeding_override: record.policy_override,
-            seeding_inherited: settings.inherited(record, rule),
-            seeding_policy: policy.unwrap_or_default(),
-            seeding_source: settings.seeding_source(record, rule),
-            unpack: settings.unpack(record, rule),
+            seeding_policy: policy,
+            seeding_levels,
+            tracker_rule: rule.map(|rule| rule.host_pattern.clone()),
+            upload_cap: settings.upload_cap(record, rule),
+            unpack: record
+                .unpack_in_force
+                .unwrap_or_else(|| settings.unpack(record, rule)),
+            unpack_override: record.unpack,
             scope: settings.scope(record.category_id, rule),
             route: torrent.route.as_ref().map(|key| key.as_str().to_owned()),
             files: Vec::new(),
@@ -5363,6 +5604,7 @@ impl TorrentService {
             hash_failed_bytes: reading.seen.failed_bytes,
             redundant_bytes: reading.seen.redundant_bytes,
             seeding_seconds: reading.counters.finished_duration_s,
+            consecutive_seeding_seconds: reading.counters.consecutive_seeding_s,
             peers_connecting: reading.peers.2,
             leg: torrent
                 .attached
@@ -5370,7 +5612,7 @@ impl TorrentService {
                 .and_then(|attached| attached.leg.as_ref())
                 .map(|leg| leg.tenancy.leg().clone()),
             fetch: torrent.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
-            seeding: SeedingSeries::of(policy.as_ref(), &reading.counters, torrent.total, now),
+            seeding: SeedingSeries::of(&policy, &reading.counters, torrent.total, now),
         }
     }
 
@@ -5713,7 +5955,7 @@ fn remove_empty(dir: &Path) {
 
 // Whether the torrent's job unpacks, as its metainfo fixed it.
 fn unpacks(torrent: &Live) -> bool {
-    torrent.record.unpack.unwrap_or_default()
+    torrent.record.unpack_in_force.unwrap_or_default()
 }
 
 // The bytes in hand of the files that go to disk: the progress over the

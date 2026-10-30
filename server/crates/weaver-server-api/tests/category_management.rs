@@ -396,8 +396,8 @@ async fn a_category_keeps_its_seeding_policy_and_torrent_route_until_told_otherw
     let added = h
         .execute(
             r#"mutation {
-                addCategory(input: { name: "linux", seeding: { ratioGoal: 3.0, action: REMOVE }, torrentRoute: true }) {
-                    id seeding { ratioGoal mode action } torrentRoute
+                addCategory(input: { name: "linux", seeding: { ratioGoal: { state: SET, value: 3.0 }, action: { state: SET, value: REMOVE } }, torrentRoute: true, uploadCap: { state: OFF } }) {
+                    id seeding { ratioGoal { value } mode { state } action { value } } torrentRoute uploadCap { state value }
                 }
             }"#,
         )
@@ -405,28 +405,30 @@ async fn a_category_keeps_its_seeding_policy_and_torrent_route_until_told_otherw
     assert_no_errors(&added);
     let data = response_data(&added);
     let id = data["addCategory"]["id"].as_u64().unwrap();
-    assert_eq!(data["addCategory"]["seeding"]["ratioGoal"], 3.0);
-    assert_eq!(data["addCategory"]["seeding"]["mode"], "ANY");
-    assert_eq!(data["addCategory"]["seeding"]["action"], "REMOVE");
+    assert_eq!(data["addCategory"]["seeding"]["ratioGoal"]["value"], 3.0);
+    assert_eq!(data["addCategory"]["seeding"]["mode"]["state"], "INHERIT");
+    assert_eq!(data["addCategory"]["seeding"]["action"]["value"], "REMOVE");
+    assert_eq!(data["addCategory"]["uploadCap"]["state"], "OFF");
     assert_eq!(data["addCategory"]["torrentRoute"], true);
 
     // An update that names neither field keeps both.
     let renamed = h
         .execute(&format!(
             r#"mutation {{ updateCategory(id: {id}, input: {{ name: "distros" }}) {{
-                seeding {{ ratioGoal }} torrentRoute
+                seeding {{ ratioGoal {{ value }} }} torrentRoute uploadCap {{ state }}
             }} }}"#
         ))
         .await;
     assert_no_errors(&renamed);
     let data = response_data(&renamed);
-    assert_eq!(data["updateCategory"]["seeding"]["ratioGoal"], 3.0);
+    assert_eq!(data["updateCategory"]["seeding"]["ratioGoal"]["value"], 3.0);
     assert_eq!(data["updateCategory"]["torrentRoute"], true);
+    assert_eq!(data["updateCategory"]["uploadCap"]["state"], "OFF");
 
     let cleared = h
         .execute(&format!(
             r#"mutation {{ updateCategory(id: {id}, input: {{ name: "distros", seeding: null, torrentRoute: false }}) {{
-                seeding {{ ratioGoal }} torrentRoute
+                seeding {{ ratioGoal {{ value }} }} torrentRoute
             }} }}"#
         ))
         .await;

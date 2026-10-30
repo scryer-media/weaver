@@ -1141,6 +1141,7 @@ mod tests {
     fn preserves_existing_servers() {
         let db = Database::open_in_memory().unwrap();
         let existing = Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: "/db".to_string(),
@@ -1150,6 +1151,7 @@ mod tests {
             buffer_pool: None,
             servers: vec![existing_server()],
             categories: vec![CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,

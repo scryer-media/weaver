@@ -80,6 +80,10 @@ pub enum ArchivePasswordSource {
     FilenameConvention,
     Settings,
     PasswordFile,
+    // A password the tracker rule a torrent is under holds. Only the torrent
+    // service makes one, and only for that rule's torrents; no label reads
+    // back as one, so no job row can carry it.
+    Tracker,
 }
 
 impl ArchivePasswordSource {
@@ -92,6 +96,7 @@ impl ArchivePasswordSource {
             Self::FilenameConvention => "filename_convention",
             Self::Settings => "settings",
             Self::PasswordFile => "password_file",
+            Self::Tracker => "tracker",
         }
     }
 

@@ -46,6 +46,7 @@ impl Harness {
         let complete_dir = temp_dir.path().join("complete");
         let db = Database::open(&db_path).unwrap();
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: data_dir.display().to_string(),

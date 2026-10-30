@@ -538,6 +538,8 @@ metric_families! {
         ["job_id", "category", "route"], "Time the torrent has run, downloading or seeding, over its life.");
     TORRENT_SEEDING_SECONDS = ("weaver_torrent_seeding_seconds_total", Counter,
         ["job_id", "category", "route"], "Time the torrent has run complete, seeding, over its life.");
+    TORRENT_CONSECUTIVE_SEEDING_SECONDS = ("weaver_torrent_consecutive_seeding_seconds", Gauge,
+        ["job_id", "category", "route"], "Time the torrent has seeded since it last stopped seeding.");
     TORRENT_DOWNLOAD_RATE = ("weaver_torrent_download_bytes_per_second", Gauge,
         ["job_id", "category", "route"], "Payload bytes per second the torrent receives.");
     TORRENT_UPLOAD_RATE = ("weaver_torrent_upload_bytes_per_second", Gauge,

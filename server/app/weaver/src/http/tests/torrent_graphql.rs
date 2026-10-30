@@ -18,7 +18,9 @@ use weaver_server_core::runtime::system_profile::{
     SystemProfile,
 };
 use weaver_server_core::security::RuntimeSecurityConfig;
-use weaver_server_core::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig};
+use weaver_server_core::settings::{
+    Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig,
+};
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
@@ -241,6 +243,7 @@ async fn started(
             db.clone(),
         ),
         TorrentSettings {
+            upload_cap: None,
             complete_dir: dir.join("complete"),
             categories: Vec::new(),
             seeding,
@@ -292,21 +295,24 @@ async fn empty_seeding_terms_inherit_the_global_policy() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory().unwrap();
     let global = SeedingPolicy {
-        ratio_goal: Some(1.0),
-        mode: SeedingGoalMode::All,
-        action: SeedingAction::Remove,
+        ratio_goal: Leaf::Set(1.0),
+        mode: Leaf::Set(SeedingGoalMode::All),
+        action: Leaf::Set(SeedingAction::Remove),
         ..SeedingPolicy::default()
-    };
+    }
+    .at_global();
     let torrents = started(dir.path(), &db, Some(global)).await;
     let app = endpoint(dir.path(), db, torrents.clone()).await;
-    let seeding = "seedingSource seedingOverride { ratioGoal } \
-                   seedingPolicy { ratioGoal mode action }";
+    let seeding = "seedingOverride { ratioGoal { state value } } \
+                   seedingPolicy { ratioGoal mode action levels { ratioGoal } }";
     let inherits = |torrent: &serde_json::Value| {
-        assert_eq!(torrent["seedingSource"], "GLOBAL", "{torrent}");
         assert_eq!(torrent["seedingOverride"], serde_json::Value::Null);
         assert_eq!(
             torrent["seedingPolicy"],
-            serde_json::json!({ "ratioGoal": 1.0, "mode": "ALL", "action": "REMOVE" })
+            serde_json::json!({
+                "ratioGoal": 1.0, "mode": "ALL", "action": "REMOVE",
+                "levels": { "ratioGoal": "GLOBAL" },
+            })
         );
     };
 
@@ -339,14 +345,21 @@ async fn empty_seeding_terms_inherit_the_global_policy() {
             assert_eq!(set.get("errors"), None, "{set}");
         }
     };
-    set("{ ratioGoal: 3 }").await;
+    set("{ ratioGoal: { state: SET, value: 3 } }").await;
     let own = read(app.clone()).await;
-    assert_eq!(own["seedingSource"], "TORRENT", "{own}");
-    assert_eq!(own["seedingOverride"]["ratioGoal"], 3.0);
+    assert_eq!(
+        own["seedingPolicy"]["levels"]["ratioGoal"], "TORRENT",
+        "{own}"
+    );
+    assert_eq!(own["seedingOverride"]["ratioGoal"]["value"], 3.0);
+
+    // Terms that only inherit are none.
+    set("{ ratioGoal: { state: INHERIT } }").await;
+    inherits(&read(app.clone()).await);
 
     set("{}").await;
     inherits(&read(app.clone()).await);
-    set("{ ratioGoal: 3 }").await;
+    set("{ ratioGoal: { state: SET, value: 3 } }").await;
     set("null").await;
     inherits(&read(app.clone()).await);
     torrents.stop().await;

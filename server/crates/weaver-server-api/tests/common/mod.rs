@@ -114,6 +114,7 @@ impl TestHarness {
         );
 
         let config = Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: tempdir.path().to_string_lossy().to_string(),

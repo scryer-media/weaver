@@ -182,6 +182,7 @@ fn test_scheduler_handle() -> SchedulerHandle {
 
 fn test_config() -> SharedConfig {
     Arc::new(RwLock::new(Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: "/tmp/weaver".to_string(),
@@ -1483,6 +1484,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         redundant_bytes: 16,
         active_seconds: 900,
         seeding_seconds: 600,
+        consecutive_seeding_seconds: 300,
         download_bps: 0,
         upload_bps: 2048,
         ratio: 2.5,
@@ -1538,6 +1540,7 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         redundant_bytes: 0,
         active_seconds: 12,
         seeding_seconds: 0,
+        consecutive_seeding_seconds: 0,
         download_bps: 0,
         upload_bps: 0,
         ratio: 0.0,

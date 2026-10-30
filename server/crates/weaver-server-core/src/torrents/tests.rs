@@ -3,7 +3,7 @@
 
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
-use crate::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy};
+use crate::settings::{Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy};
 use crate::torrents::{
     FilePriority, Infohash, NamedBy, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord,
     TorrentSource, TrackerEntry,
@@ -11,6 +11,7 @@ use crate::torrents::{
 
 fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRecord {
     TorrentRecord {
+        unpack_in_force: None,
         job_id: JobId(job_id),
         infohash_v1: v1,
         infohash_v2: v2,
@@ -64,13 +65,15 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
     record.category_id = Some(4);
     record.storage_dir = Some("/data/torrents/7".to_string());
     record.policy_override = Some(SeedingPolicy {
-        ratio_goal: Some(1.5),
-        seed_time_goal_minutes: None,
-        inactive_goal_minutes: Some(30),
-        mode: SeedingGoalMode::All,
-        action: SeedingAction::RemoveWithData,
-        max_upload_bps: Some(1_000_000),
+        seed_time_counting: Default::default(),
+        ratio_goal: Leaf::Set(1.5),
+        seed_time_goal_minutes: Leaf::Off,
+        inactive_goal_minutes: Leaf::Set(30),
+        mode: Leaf::Set(SeedingGoalMode::All),
+        action: Leaf::Inherit,
     });
+    record.unpack = Some(false);
+    record.unpack_in_force = Some(true);
     record.upload_limit = Some(0);
     record.download_limit = Some(5_000_000_000);
 
@@ -156,6 +159,7 @@ fn intent_and_counters_update_in_place() {
     assert_eq!(stored.completed_at_ms, Some(9_000));
 
     let counters = TorrentCounters {
+        consecutive_seeding_s: 0,
         uploaded_bytes: 7_000_000_000,
         downloaded_bytes: 3_500_000_000,
         active_duration_s: 900,
@@ -354,12 +358,9 @@ fn each_option_writes_its_own_column() {
     db.insert_torrent(&torrent(1, Some([1; 20]), None), &[])
         .unwrap();
     let policy = SeedingPolicy {
-        ratio_goal: Some(2.0),
-        seed_time_goal_minutes: None,
-        inactive_goal_minutes: None,
-        mode: SeedingGoalMode::Any,
-        action: SeedingAction::Stop,
-        max_upload_bps: None,
+        ratio_goal: Leaf::Set(2.0),
+        action: Leaf::Set(SeedingAction::Stop),
+        ..SeedingPolicy::default()
     };
     assert!(db.set_torrent_category(JobId(1), Some(4)).unwrap());
     assert!(db.set_torrent_forced(JobId(1), true).unwrap());
@@ -377,6 +378,15 @@ fn each_option_writes_its_own_column() {
     assert_eq!(
         (stored.category_id, stored.forced, stored.policy_override),
         (Some(4), false, Some(policy))
+    );
+    // A policy whose every leaf inherits is kept as none.
+    assert!(
+        db.set_torrent_policy_override(JobId(1), Some(SeedingPolicy::default()))
+            .unwrap()
+    );
+    assert_eq!(
+        db.get_torrent(JobId(1)).unwrap().unwrap().policy_override,
+        None
     );
     assert!(!db.set_torrent_forced(JobId(2), true).unwrap());
 }

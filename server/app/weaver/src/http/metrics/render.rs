@@ -2401,6 +2401,13 @@ pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics) {
     );
     each(
         out,
+        &f::TORRENT_CONSECUTIVE_SEEDING_SECONDS,
+        &torrents,
+        |t| one(t.consecutive_seeding_seconds),
+        int,
+    );
+    each(
+        out,
         &f::TORRENT_DOWNLOAD_RATE,
         &torrents,
         |t| one(t.download_bps),

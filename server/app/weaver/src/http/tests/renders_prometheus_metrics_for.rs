@@ -1064,6 +1064,7 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_active_seconds_total{{{SEEDING}}} 900"),
         format!("weaver_torrent_active_seconds_total{{{MAGNET}}} 12"),
         format!("weaver_torrent_seeding_seconds_total{{{SEEDING}}} 600"),
+        format!("weaver_torrent_consecutive_seeding_seconds{{{SEEDING}}} 300"),
         format!("weaver_torrent_download_bytes_per_second{{{SEEDING}}} 0"),
         format!("weaver_torrent_upload_bytes_per_second{{{SEEDING}}} 2048"),
         format!("weaver_torrent_ratio{{{SEEDING}}} 2.5"),

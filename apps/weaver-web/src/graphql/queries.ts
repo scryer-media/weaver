@@ -253,12 +253,30 @@ const SERVER_DETAILS_FIELDS = `
 
 export const SEEDING_POLICY_FIELDS = `
   fragment SeedingPolicyFields on SeedingPolicySettings {
-    ratioGoal
-    seedTimeGoalMinutes
-    inactiveGoalMinutes
-    mode
-    action
-    maxUploadBps
+    ratioGoal {
+      state
+      value
+    }
+    seedTimeGoalMinutes {
+      state
+      value
+    }
+    inactiveGoalMinutes {
+      state
+      value
+    }
+    mode {
+      state
+      value
+    }
+    action {
+      state
+      value
+    }
+    seedTimeCounting {
+      state
+      value
+    }
   }
 `;
 
@@ -273,6 +291,10 @@ const CATEGORY_FIELDS = `
     }
     torrentRoute
     unpack
+    uploadCap {
+      state
+      value
+    }
   }
   ${SEEDING_POLICY_FIELDS}
 `;
@@ -1407,6 +1429,7 @@ const TORRENT_SETTINGS_FIELDS = `
     seeding {
       ...SeedingPolicyFields
     }
+    uploadCap
     torrent {
       enabled
       basePort
@@ -1464,15 +1487,25 @@ const TRACKER_RULE_FIELDS = `
     unpack
     client
     torrentRoute
-    discovery
+    dht
+    pex
+    lsd
     encryption
-    uploadLimit {
-      bps
+    uploadCap {
+      state
+      value
     }
     forced
     hasSsl
     sslSubject
     sslNotAfter
+    archivePasswordCount
+    bound {
+      name
+      revision
+      importedAt
+      locked
+    }
   }
   ${SEEDING_POLICY_FIELDS}
 `;
@@ -1548,6 +1581,47 @@ export const DELETE_TRACKER_RULE_MUTATION = gql`
   ${TRACKER_RULE_FIELDS}
 `;
 
+/** What importing a tracker file would do; nothing is kept. */
+export const PREVIEW_TRACKER_FILE_MUTATION = gql`
+  mutation PreviewTrackerFile($file: String!, $password: String) {
+    previewTrackerFile(file: $file, password: $password) {
+      name
+      revision
+      hostPattern
+      ruleId
+      changes {
+        field
+        locked
+        old
+        new
+      }
+      hasSsl
+      sslSubject
+      sslNotAfter
+      archivePasswordCount
+      fingerprint
+    }
+  }
+`;
+
+export const APPLY_TRACKER_FILE_MUTATION = gql`
+  mutation ApplyTrackerFile($file: String!, $password: String, $fingerprint: String!) {
+    applyTrackerFile(file: $file, password: $password, fingerprint: $fingerprint) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+export const UNBIND_TRACKER_RULE_MUTATION = gql`
+  mutation UnbindTrackerRule($id: Int!) {
+    unbindTrackerRule(id: $id) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
 /** The torrents the schedule's pause leaves seeding, by tracker rule. */
 export const SCHEDULE_SEEDING_QUERY = gql`
   query ScheduleSeeding {
@@ -1606,6 +1680,8 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       swarmLeechers
       reannounceSeconds
       activeSeconds
+      seedingSeconds
+      consecutiveSeedingSeconds
       downloadAvgBps
       uploadAvgBps
       wastedBytes
@@ -1624,11 +1700,26 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         ...SeedingPolicyFields
       }
       seedingPolicy {
-        ...SeedingPolicyFields
+        ratioGoal
+        seedTimeGoalMinutes
+        inactiveGoalMinutes
+        mode
+        action
+        seedTimeCounting
+        uploadCap
+        levels {
+          ratioGoal
+          seedTimeGoalMinutes
+          inactiveGoalMinutes
+          mode
+          action
+          seedTimeCounting
+          uploadCap
+        }
       }
-      seedingSource
-      seedingRule
+      trackerRule
       unpack
+      unpackOverride
       route
       files {
         index

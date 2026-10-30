@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
-use crate::settings::SeedingPolicy;
+use crate::settings::Seeding;
 use crate::settings::model::tracker_host;
 use crate::torrents::service::TorrentPieces;
 use crate::torrents::{TorrentCounters, TorrentState, TorrentTracker, TrackerStatus, status};
@@ -231,6 +231,8 @@ pub struct TorrentSeries {
     pub redundant_bytes: u64,
     pub active_seconds: u64,
     pub seeding_seconds: u64,
+    /// The seconds of its current unbroken seeding run.
+    pub consecutive_seeding_seconds: u64,
     pub download_bps: u64,
     pub upload_bps: u64,
     pub ratio: f64,
@@ -275,19 +277,8 @@ pub struct SeedingSeries {
 impl SeedingSeries {
     /// The goals of `policy` against `counters` at `now_ms`; met as
     /// [`status::goal_left`] says.
-    pub fn of(
-        policy: Option<&SeedingPolicy>,
-        counters: &TorrentCounters,
-        total_bytes: u64,
-        now_ms: i64,
-    ) -> Self {
+    pub fn of(policy: &Seeding, counters: &TorrentCounters, total_bytes: u64, now_ms: i64) -> Self {
         let met = status::goal_left(policy, counters, total_bytes, now_ms).is_none();
-        let Some(policy) = policy else {
-            return Self {
-                goals: Vec::new(),
-                met,
-            };
-        };
         let mut goals = Vec::new();
         if let Some(goal) = policy.ratio_goal {
             let goal = f64::from(goal);
@@ -296,7 +287,7 @@ impl SeedingSeries {
         }
         if let Some(minutes) = policy.seed_time_goal_minutes {
             let goal = u64::from(minutes) * 60;
-            let left = goal.saturating_sub(counters.finished_duration_s);
+            let left = goal.saturating_sub(policy.seeded_seconds(counters));
             goals.push((SeedingGoal::SeedTime, goal as f64, left as f64));
         }
         if let Some(minutes) = policy.inactive_goal_minutes {

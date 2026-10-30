@@ -269,6 +269,7 @@ mod tests {
         .unwrap();
 
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: "/tmp/weaver-runtime-reload-test".to_string(),
@@ -308,6 +309,7 @@ mod tests {
     #[tokio::test]
     async fn missing_policy_registry_preserves_prior_generation() {
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: "/tmp/weaver-runtime-reload-missing-policy-test".to_string(),

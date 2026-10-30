@@ -143,7 +143,7 @@ func torrentScenarios() []torrentScenario {
 			Name: "category-route-and-policy",
 			Asserts: []string{
 				"a category with its own torrent route (an HTTP CONNECT ladder) and seeding policy",
-				"its torrent lands under complete/<category>, reports seedingSource CATEGORY and the category's ratio goal",
+				"its torrent lands under complete/<category>, reports its ratio goal from the CATEGORY level and the category's value",
 				"its route differs from the default route, and the tracker hears it from the proxy's address, not Weaver's",
 			},
 			Run: scenarioCategory,
@@ -470,7 +470,7 @@ func (lane *torrentLane) leechFromWeaver(fixture *torrentFixture, view *torrentV
 
 func scenarioRatioGoal(lane *torrentLane, evidence map[string]any) error {
 	fixture := lane.fixture("ratio")
-	view, err := lane.submit(fixture, submitOptions{Seeding: map[string]any{"ratioGoal": 1.0, "action": "STOP"}})
+	view, err := lane.submit(fixture, submitOptions{Seeding: ratioGoalTerms(1.0)})
 	if err != nil {
 		return err
 	}
@@ -479,8 +479,8 @@ func scenarioRatioGoal(lane *torrentLane, evidence map[string]any) error {
 	if err != nil {
 		return err
 	}
-	if view.SeedingSource != "TORRENT" || view.SeedingPolicy.RatioGoal == nil || *view.SeedingPolicy.RatioGoal != 1.0 {
-		return fmt.Errorf("policy %+v from %s, want the torrent's own ratio goal 1.0", view.SeedingPolicy, view.SeedingSource)
+	if view.SeedingPolicy.Levels.RatioGoal != "TORRENT" || view.SeedingPolicy.RatioGoal == nil || *view.SeedingPolicy.RatioGoal != 1.0 {
+		return fmt.Errorf("policy %+v, want the torrent's own ratio goal 1.0", view.SeedingPolicy)
 	}
 	evidence["seeding"] = view
 	mark, err := lane.trackerMark()
@@ -636,7 +636,7 @@ func scenarioRemove(lane *torrentLane, evidence map[string]any) error {
 		return fmt.Errorf("%s is still on disk after remove with data", dir)
 	}
 	// A private torrent with an unmet goal.
-	view, err = lane.downloadOnly("private-goal", submitOptions{Seeding: map[string]any{"ratioGoal": 50.0, "action": "STOP"}})
+	view, err = lane.downloadOnly("private-goal", submitOptions{Seeding: ratioGoalTerms(50.0)})
 	if err != nil {
 		return err
 	}
@@ -820,7 +820,7 @@ func scenarioCategory(lane *torrentLane, evidence map[string]any) error {
 	var added struct{ AddCategory struct{ ID int } }
 	err := lane.gql(`mutation($input: CategoryInput!) { addCategory(input: $input) { id } }`, map[string]any{"input": map[string]any{
 		"name": torrentLaneCategory, "torrentRoute": true,
-		"seeding": map[string]any{"ratioGoal": 3.5, "action": "STOP"},
+		"seeding": ratioGoalTerms(3.5),
 	}}, &added)
 	if err != nil {
 		return fmt.Errorf("add category: %w", err)
@@ -843,8 +843,8 @@ func scenarioCategory(lane *torrentLane, evidence map[string]any) error {
 	if deref(view.Category) != torrentLaneCategory {
 		problems = append(problems, fmt.Sprintf("category %q", deref(view.Category)))
 	}
-	if view.SeedingSource != "CATEGORY" || view.SeedingPolicy.RatioGoal == nil || *view.SeedingPolicy.RatioGoal != 3.5 {
-		problems = append(problems, fmt.Sprintf("policy %+v from %s, want the category's 3.5", view.SeedingPolicy, view.SeedingSource))
+	if view.SeedingPolicy.Levels.RatioGoal != "CATEGORY" || view.SeedingPolicy.RatioGoal == nil || *view.SeedingPolicy.RatioGoal != 3.5 {
+		problems = append(problems, fmt.Sprintf("policy %+v, want the category's 3.5", view.SeedingPolicy))
 	}
 	if !strings.HasPrefix(deref(view.StorageDir), "/data/complete/"+torrentLaneCategory+"/") {
 		problems = append(problems, fmt.Sprintf("storageDir %q outside the category's directory", deref(view.StorageDir)))
@@ -864,7 +864,7 @@ func scenarioCategory(lane *torrentLane, evidence map[string]any) error {
 		return fmt.Errorf("clear the torrent's category: %w", err)
 	}
 	moved, err := lane.waitTorrent(view.ID, "uncategorised torrent on the default route and policy", func(view *torrentView) bool {
-		return view != nil && view.Category == nil && view.SeedingSource == "GLOBAL" &&
+		return view != nil && view.Category == nil && view.SeedingPolicy.Levels.RatioGoal == "GLOBAL" &&
 			view.Route != nil && *view.Route == lane.defaultRoute
 	})
 	evidence["uncategorised"] = moved
