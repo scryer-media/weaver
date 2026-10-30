@@ -28,6 +28,7 @@ use weaver_graph::{
 
 use self::loans::Loans;
 use self::passwords::Passwords;
+pub(crate) use self::relocate::Existing;
 use super::Engine;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
@@ -141,6 +142,9 @@ pub(crate) struct GraphJob<R: Root = ArticleRoot> {
     moving: Option<relocate::Relocation>,
     // The move's outcome, until it is taken.
     relocated: Option<Result<PathBuf, LeafError>>,
+    // Whether the last move of kept files left a file already there in
+    // place, until it is told.
+    kept_existing: bool,
 }
 
 // A root member as the post lists it.
@@ -264,6 +268,7 @@ impl<R: Root> GraphJob<R> {
             pending: Pending::default(),
             moving: None,
             relocated: None,
+            kept_existing: false,
         }
     }
 

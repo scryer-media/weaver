@@ -7353,8 +7353,7 @@ async fn a_torrent_laid_out_without_its_folder_has_the_files_in_the_save_path() 
 // qBittorrent `TorrentImpl::setSavePath`, libtorrent `torrent::move_storage`:
 // files that sat straight in their save path move straight into the new
 // one, the torrent's save path and files directory follow them, and it
-// seeds on from there. A file of theirs already at a location fails the
-// move, which says why and leaves everything where it was.
+// seeds on from there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placed_files_move_to_a_new_location_and_the_record_follows() {
     let (metainfo, data) = placed_torrent();
@@ -7377,21 +7376,6 @@ async fn placed_files_move_to_a_new_location_and_the_record_follows() {
     )
     .await;
 
-    let taken = rig.dir.path().join("taken");
-    std::fs::create_dir_all(&taken).unwrap();
-    std::fs::write(taken.join("a.bin"), b"theirs").unwrap();
-    assert!(matches!(
-        rig.service
-            .set_location(job_id, taken.to_string_lossy().into_owned())
-            .await,
-        Err(ActionError::State(_))
-    ));
-    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
-    assert_eq!(std::fs::read(taken.join("a.bin")).unwrap(), b"theirs");
-    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
-    let save_text = save.to_string_lossy().into_owned();
-    assert_eq!(stored.files_dir.as_deref(), Some(save_text.as_str()));
-
     let moved = rig.dir.path().join("moved/here");
     let moved_text = moved.to_string_lossy().into_owned();
     rig.service
@@ -7408,6 +7392,55 @@ async fn placed_files_move_to_a_new_location_and_the_record_follows() {
     assert_eq!(view.files_dir.as_deref(), Some(moved_text.as_str()));
     assert_eq!(view.paths().0, moved_text);
     assert_eq!((view.state, view.have_bytes), (TorrentState::Seeding, data.len() as u64));
+    rig.service.stop().await;
+}
+
+// qBittorrent `TorrentImpl::moveStorage`, a user's move under
+// `MoveStorageMode::KeepExistingFiles` (libtorrent `dont_replace`): a file
+// already at the new location stays, the torrent's own copy stays where it
+// was, the record follows the move, and the torrent is checked again from
+// its new place (libtorrent `torrent::on_storage_moved`), which finds the
+// file there is not its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_onto_a_file_already_there_keeps_it_and_checks_again() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), &data).unwrap();
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+
+    let taken = rig.dir.path().join("taken");
+    let taken_text = taken.to_string_lossy().into_owned();
+    std::fs::create_dir_all(&taken).unwrap();
+    std::fs::write(taken.join("a.bin"), b"theirs").unwrap();
+    rig.service
+        .set_location(job_id, taken_text.clone())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(taken.join("a.bin")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.files_dir.as_deref(), Some(taken_text.as_str()));
+    assert_eq!(stored.save_path.as_deref(), Some(taken_text.as_str()));
+
+    // It had every piece; the check from the new place finds none.
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.have_bytes == 0 && view.state != TorrentState::CheckingFiles
+    })
+    .await;
+    assert_eq!(view.files_dir.as_deref(), Some(taken_text.as_str()));
     rig.service.stop().await;
 }
 
@@ -7456,8 +7489,9 @@ async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
 }
 
 // qBittorrent `SessionImpl::initLoadTorrentParams`: a relative save path is
-// under the default save path, a relative download path under the save path
-// when there is no default download path, and an absolute one stands.
+// under the default save path, and a missing one is the default save path
+// itself; a relative download path is under the save path when there is no
+// default download path, and an absolute one stands.
 #[test]
 fn relative_paths_resolve_under_the_default_save_path() {
     let default = Path::new("/complete/tv");
@@ -7481,8 +7515,13 @@ fn relative_paths_resolve_under_the_default_save_path() {
     );
     assert_eq!(
         placed(None, Some("incoming")),
-        (None, some("/complete/tv/incoming"))
+        (some("/complete/tv"), some("/complete/tv/incoming"))
     );
+    assert_eq!(
+        placed(None, Some("/scratch")),
+        (some("/complete/tv"), some("/scratch"))
+    );
+    assert_eq!(placed(None, None), (None, None));
     assert_eq!(
         placed(Some("/data/shows"), Some("incoming")),
         (some("/data/shows"), some("/data/shows/incoming"))
@@ -7527,6 +7566,44 @@ async fn a_torrent_added_with_relative_paths_keeps_them_absolute() {
     assert!(!download.join("a.bin").exists());
     let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
     assert_eq!(stored.save_path.as_deref(), Some(save_text.as_str()));
+    assert_eq!(view.have_bytes, data.len() as u64);
+    rig.service.stop().await;
+}
+
+// qBittorrent `SessionImpl::initLoadTorrentParams`: a torrent added with a
+// download path and no save path takes the default save path, here its
+// category's directory, and moves there once complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_download_path_without_a_save_path_moves_to_the_default_save_path() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let complete = rig.dir.path().join("complete");
+    let complete_text = complete.to_string_lossy().into_owned();
+    let download = rig.dir.path().join("incoming");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("a.bin"), &data).unwrap();
+
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            download_path: Some(download.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.files_dir.as_deref() == Some(complete_text.as_str())
+    })
+    .await;
+    assert_eq!(std::fs::read(complete.join("a.bin")).unwrap(), data);
+    assert!(!download.join("a.bin").exists());
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.save_path.as_deref(), Some(complete_text.as_str()));
+    assert_eq!(stored.move_to, None);
     assert_eq!(view.have_bytes, data.len() as u64);
     rig.service.stop().await;
 }

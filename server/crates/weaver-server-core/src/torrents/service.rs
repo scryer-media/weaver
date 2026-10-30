@@ -45,7 +45,7 @@ use crate::pipeline::claim_complete_destination_path;
 use crate::pipeline::graph::checkpoint;
 use crate::pipeline::graph::engine::{Hears, Outside, RunMail, Said};
 use crate::pipeline::graph::job::restore::Restored;
-use crate::pipeline::graph::job::{GraphJob, Storage};
+use crate::pipeline::graph::job::{Existing, GraphJob, Storage};
 use crate::pipeline::graph::leaf::LeafError;
 use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
 use crate::pipeline::graph::root::phase::RootPhase;
@@ -469,8 +469,10 @@ pub struct Placement {
 // `placement` with its paths absolute, as qBittorrent
 // `SessionImpl::initLoadTorrentParams` makes them as a torrent is added: a
 // relative save path is under the default save path, here `default_save`,
-// the torrent's category directory. A relative download path is under the
-// default download path, which weaver has none of, so under the save path.
+// the torrent's category directory, and a download path with no save path
+// moves to the default save path once complete. A relative download path is
+// under the default download path, which weaver has none of, so under the
+// save path.
 fn absolute_placement(placement: &Placement, default_save: &Path) -> Placement {
     let under = |base: &Path, path: &str| {
         if Path::new(path).is_absolute() {
@@ -479,10 +481,11 @@ fn absolute_placement(placement: &Placement, default_save: &Path) -> Placement {
             base.join(path).to_string_lossy().into_owned()
         }
     };
-    let save_path = placement
-        .save_path
-        .as_deref()
-        .map(|path| under(default_save, path));
+    let save_path = match (&placement.save_path, &placement.download_path) {
+        (Some(path), _) => Some(under(default_save, path)),
+        (None, Some(_)) => Some(default_save.to_string_lossy().into_owned()),
+        (None, None) => None,
+    };
     let download_base = save_path.as_deref().map_or(default_save, Path::new);
     let download_path = placement
         .download_path
@@ -2403,7 +2406,7 @@ impl TorrentService {
             if let Err(error) = self.inner.db.clear_torrent_move_to(job_id) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's move");
             }
-            if let Err(error) = self.move_storage(job_id, to, true).await {
+            if let Err(error) = self.move_storage(job_id, to, Existing::Replace).await {
                 tracing::warn!(job_id = job_id.0, error = %error, "a complete torrent did not move under its save path");
             }
         }
@@ -2745,7 +2748,11 @@ impl TorrentService {
             path.as_deref()
                 .is_some_and(|path| !Path::new(path).is_absolute())
         };
-        if relative(&request.placement.save_path) || relative(&request.placement.download_path) {
+        let placement = &request.placement;
+        if relative(&placement.save_path)
+            || relative(&placement.download_path)
+            || (placement.download_path.is_some() && placement.save_path.is_none())
+        {
             let parent = completion_parent(
                 &settings.complete_dir,
                 &settings.categories,
@@ -4032,22 +4039,27 @@ impl TorrentService {
     /// nothing there is replaced or kept. Files placed outside the
     /// torrent's directory move straight into `parent` instead, where they
     /// sat with no folder of their own; a file of theirs already there
-    /// fails the move. A move that fails leaves the torrent where it was,
-    /// and says why when it failed at once.
+    /// stays, and the torrent is checked again from there. A move that
+    /// fails leaves the torrent where it was, and says why when it failed
+    /// at once.
     pub async fn set_location(&self, job_id: JobId, parent: String) -> Result<(), ActionError> {
-        self.move_storage(job_id, parent, false).await
+        self.move_storage(job_id, parent, Existing::Keep).await
     }
 
-    // The move of `set_location`. Placed files already at the new place
-    // fail it, as qBittorrent's move of a user's asks for
-    // (`MoveStorageMode::KeepExistingFiles`), unless `replace`, when they
-    // give way, as its move of a finished torrent under its save path does
-    // (`TorrentImpl::adjustStorageLocation`, `MoveStorageMode::Overwrite`).
+    // The move of `set_location`. A placed file already at the new place
+    // stays, its would-be replacement stays where it was, and the torrent
+    // is checked again from the new place, as qBittorrent's move of a
+    // user's asks for (`TorrentImpl::moveStorage`, `MoveStorageMode::
+    // KeepExistingFiles`, which is libtorrent's `move_flags_t::dont_replace`;
+    // libtorrent `torrent::on_storage_moved` rechecks on `need_full_check`).
+    // `Existing::Replace` gives way instead, as its move of a finished
+    // torrent under its save path does (`TorrentImpl::adjustStorageLocation`,
+    // `MoveStorageMode::Overwrite`).
     async fn move_storage(
         &self,
         job_id: JobId,
         parent: String,
-        replace: bool,
+        existing: Existing,
     ) -> Result<(), ActionError> {
         let parent = PathBuf::from(parent.trim());
         if !parent.is_absolute() {
@@ -4076,7 +4088,7 @@ impl TorrentService {
             .await?;
         if let Some(placed) = placed {
             return self
-                .move_placed(job_id, job, &placed, parent, replace)
+                .move_placed(job_id, job, &placed, parent, existing)
                 .await;
         }
         if from.parent() == Some(parent.as_path()) {
@@ -4131,7 +4143,7 @@ impl TorrentService {
         job: Arc<TorrentJob>,
         from: &Path,
         to: PathBuf,
-        replace: bool,
+        existing: Existing,
     ) -> Result<(), ActionError> {
         if from == to {
             return Ok(());
@@ -4151,7 +4163,7 @@ impl TorrentService {
                 torrent.settle(self.inner.clock.now_ms());
                 torrent.moving = Some(Moving::Files);
                 Ok(job.with(|job| {
-                    job.relocate_kept(to.clone(), replace);
+                    job.relocate_kept(to.clone(), existing);
                     job.relocated()
                 }))
             })
@@ -4196,14 +4208,13 @@ impl TorrentService {
         job_id: JobId,
         outcome: Result<PathBuf, LeafError>,
     ) -> Result<(), ActionError> {
-        let moving = self
+        let (moving, job) = self
             .with_torrent(job_id, |torrent| {
                 torrent.settle(self.inner.clock.now_ms());
-                Ok(torrent.moving.take())
+                Ok((torrent.moving.take(), torrent.job.clone()))
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or((None, None));
         match outcome {
             Ok(to) => {
                 let to = to.to_string_lossy().into_owned();
@@ -4232,6 +4243,12 @@ impl TorrentService {
                 {
                     tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's new directory");
                 }
+                if files
+                    && let Some(job) = &job
+                    && job.with(GraphJob::kept_existing)
+                {
+                    self.check_kept(job_id, job).await;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -4243,6 +4260,30 @@ impl TorrentService {
                     "the torrent's move failed, and it stays where it was: {error}"
                 )))
             }
+        }
+    }
+
+    // A move kept a file already at the torrent's new place, so its files
+    // there are not all its own: every piece is checked again (libtorrent
+    // `torrent::on_storage_moved` rechecks on `need_full_check`). A torrent
+    // in no session forgets its pieces instead, and the session it next
+    // joins checks them, as it checks any torrent whose job vouches for
+    // nothing.
+    async fn check_kept(&self, job_id: JobId, job: &Arc<TorrentJob>) {
+        let attached = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|torrent| torrent.attached.is_some());
+        let checked = if attached {
+            self.recheck(job_id).await.map_err(anyhow::Error::from)
+        } else {
+            Pieces::checking(&**job).map(|_| ())
+        };
+        if let Err(error) = checked {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not check a torrent again after its move kept files there");
         }
     }
 

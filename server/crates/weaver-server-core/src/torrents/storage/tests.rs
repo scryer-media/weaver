@@ -18,7 +18,7 @@ use weaver_torrent::{
 use super::{PieceStorage, PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::engine::RunMail;
-use crate::pipeline::graph::job::{GraphJob, Storage};
+use crate::pipeline::graph::job::{Existing, GraphJob, Storage};
 use crate::pipeline::graph::limits::Caps;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::root::pieces::{PieceFile, PieceLayout, Verified};
@@ -590,7 +590,7 @@ async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
     std::fs::create_dir_all(&moved).unwrap();
 
     let outcome = shim.job.with(|job| {
-        job.relocate_kept(moved.clone(), false);
+        job.relocate_kept(moved.clone(), Existing::Keep);
         job.relocated()
     });
     assert_eq!(outcome.unwrap().unwrap(), moved);
@@ -619,11 +619,12 @@ async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
     assert!(!root.join("work/c.bin").exists());
 }
 
-// libtorrent `move_flags_t::fail_if_exist`: a file of the torrent already at
-// the new place fails the move before anything moved, and the torrent's
-// files stay where they were, still its own.
+// libtorrent `move_flags_t::dont_replace`: a file already at the new place
+// stays, the torrent's own copy of it stays where it was, the other files
+// move, and the job reads every file from the new place; the move tells,
+// once, that it kept one.
 #[test]
-fn placed_files_stay_when_one_is_already_where_they_would_go() {
+fn a_file_already_where_placed_files_go_is_kept() {
     let shim = placed_shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
     let torrent = noise(2000, 8);
     shim.complete(0, &torrent);
@@ -634,18 +635,20 @@ fn placed_files_stay_when_one_is_already_where_they_would_go() {
     std::fs::write(moved.join("b.bin"), b"theirs").unwrap();
 
     let outcome = shim.job.with(|job| {
-        job.relocate_kept(moved.clone(), false);
+        job.relocate_kept(moved.clone(), Existing::Keep);
         job.relocated()
     });
-    assert!(outcome.unwrap().is_err());
-    assert_eq!(std::fs::read(placed.join("a.bin")).unwrap(), torrent[..1000]);
-    assert!(!moved.join("a.bin").exists());
+    assert_eq!(outcome.unwrap().unwrap(), moved);
+    assert!(shim.job.with(GraphJob::kept_existing));
+    assert!(!shim.job.with(GraphJob::kept_existing));
+    assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
+    assert!(!placed.join("a.bin").exists());
     assert_eq!(std::fs::read(moved.join("b.bin")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(placed.join("b.bin")).unwrap(), torrent[1000..]);
     assert_eq!(
-        shim.job.with(|job| job.kept_path(VolumeIndex(0))),
-        Some(placed.join("a.bin"))
+        [0, 1].map(|volume| shim.job.with(|job| job.kept_path(VolumeIndex(volume)))),
+        [Some(moved.join("a.bin")), Some(moved.join("b.bin"))]
     );
-    assert_eq!(shim.read(0), torrent[..1024]);
 }
 
 // The job's side of the storage, telling the test when every piece is in.
