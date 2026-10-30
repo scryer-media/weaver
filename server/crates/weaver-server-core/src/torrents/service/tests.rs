@@ -7369,6 +7369,82 @@ async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
     rig.service.stop().await;
 }
 
+// qBittorrent `SessionImpl::initLoadTorrentParams`: a relative save path is
+// under the default save path, a relative download path under the save path
+// when there is no default download path, and an absolute one stands.
+#[test]
+fn relative_paths_resolve_under_the_default_save_path() {
+    let default = Path::new("/complete/tv");
+    let placed = |save: Option<&str>, download: Option<&str>| {
+        let placement = absolute_placement(
+            &Placement {
+                save_path: save.map(str::to_owned),
+                download_path: download.map(str::to_owned),
+                layout: Some(ContentLayout::NoSubfolder),
+                seed_mode: false,
+            },
+            default,
+        );
+        assert_eq!(placement.layout, Some(ContentLayout::NoSubfolder));
+        (placement.save_path, placement.download_path)
+    };
+    let some = |path: &str| Some(path.to_owned());
+    assert_eq!(
+        placed(Some("shows"), Some("incoming")),
+        (some("/complete/tv/shows"), some("/complete/tv/shows/incoming"))
+    );
+    assert_eq!(
+        placed(None, Some("incoming")),
+        (None, some("/complete/tv/incoming"))
+    );
+    assert_eq!(
+        placed(Some("/data/shows"), Some("incoming")),
+        (some("/data/shows"), some("/data/shows/incoming"))
+    );
+    assert_eq!(
+        placed(Some("shows"), Some("/scratch")),
+        (some("/complete/tv/shows"), some("/scratch"))
+    );
+}
+
+// A torrent added with relative paths keeps them absolute, so the move
+// under its save path once complete finds where to go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_added_with_relative_paths_keeps_them_absolute() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let complete = rig.dir.path().join("complete");
+    let save = complete.join("shows");
+    let download = save.join("incoming");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("a.bin"), &data).unwrap();
+    let save_text = save.to_string_lossy().into_owned();
+
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some("shows".to_owned()),
+            download_path: Some("incoming".to_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.files_dir.as_deref() == Some(save_text.as_str())
+    })
+    .await;
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    assert!(!download.join("a.bin").exists());
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.save_path.as_deref(), Some(save_text.as_str()));
+    assert_eq!(view.have_bytes, data.len() as u64);
+    rig.service.stop().await;
+}
+
 // libtorrent `torrent_flags::seed_mode`, as qBittorrent `seedMode` sets it: a
 // torrent whose files are complete where it is added seeds them at once,
 // and its trackers hear it downloaded nothing, as they first hear of it and

@@ -1463,6 +1463,28 @@ async fn the_priority_actions_move_a_torrent_in_the_queue() {
     assert_eq!(preferences["queueing_enabled"], true);
 }
 
+// A relative `savepath` is under the default save path, as qBittorrent
+// `SessionImpl::initLoadTorrentParams` takes one, and reads back absolute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_save_path_is_under_the_default_save_path() {
+    let rig = rig().await;
+    rig.add_file(
+        &metainfo("one.mkv", 3000, false),
+        &[("savepath", "shows"), ("contentLayout", "NoSubfolder")],
+    )
+    .await;
+    let complete = PathBuf::from(rig.config.read().await.complete_dir());
+    let torrent = &rig.torrents().await[0];
+    assert_eq!(
+        Path::new(torrent["save_path"].as_str().unwrap()),
+        complete.join("shows")
+    );
+    assert_eq!(
+        Path::new(torrent["content_path"].as_str().unwrap()),
+        complete.join("shows/one.mkv")
+    );
+}
+
 // qBittorrent's `torrents/recheck` reaches the service's recheck for each
 // torrent it names: an unknown hash is skipped, and a torrent the offline
 // rig holds in no session has nothing to check it, which conflicts.

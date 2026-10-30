@@ -466,6 +466,35 @@ pub struct Placement {
     pub seed_mode: bool,
 }
 
+// `placement` with its paths absolute, as qBittorrent
+// `SessionImpl::initLoadTorrentParams` makes them as a torrent is added: a
+// relative save path is under the default save path, here `default_save`,
+// the torrent's category directory. A relative download path is under the
+// default download path, which weaver has none of, so under the save path.
+fn absolute_placement(placement: &Placement, default_save: &Path) -> Placement {
+    let under = |base: &Path, path: &str| {
+        if Path::new(path).is_absolute() {
+            path.to_owned()
+        } else {
+            base.join(path).to_string_lossy().into_owned()
+        }
+    };
+    let save_path = placement
+        .save_path
+        .as_deref()
+        .map(|path| under(default_save, path));
+    let download_base = save_path.as_deref().map_or(default_save, Path::new);
+    let download_path = placement
+        .download_path
+        .as_deref()
+        .map(|path| under(download_base, path));
+    Placement {
+        save_path,
+        download_path,
+        ..placement.clone()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum AddError {
     #[error("{0}")]
@@ -2685,6 +2714,20 @@ impl TorrentService {
             ),
             None => None,
         };
+        let mut request = request;
+        let relative = |path: &Option<String>| {
+            path.as_deref()
+                .is_some_and(|path| !Path::new(path).is_absolute())
+        };
+        if relative(&request.placement.save_path) || relative(&request.placement.download_path) {
+            let parent = completion_parent(
+                &settings.complete_dir,
+                &settings.categories,
+                category.as_ref().map(|category| category.name.as_str()),
+            )
+            .map_err(AddError::Invalid)?;
+            request.placement = absolute_placement(&request.placement, &parent);
+        }
         match request.source.clone() {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);
@@ -2864,13 +2907,8 @@ impl TorrentService {
             )
             .map_err(AddError::Invalid)
         };
-        // A relative save path is under the category's directory, as
-        // qBittorrent takes one under the default save path.
-        let parent = match record.save_path.as_deref() {
-            Some(parent) if Path::new(parent).is_absolute() => Some(PathBuf::from(parent)),
-            Some(parent) => Some(category_parent()?.join(parent)),
-            None => None,
-        };
+        // Absolute: `add` resolved a relative one.
+        let parent = record.save_path.as_deref().map(PathBuf::from);
         let foldered = layout
             .unwrap_or(ContentLayout::Original)
             .foldered(manifest.single_file);
