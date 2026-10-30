@@ -180,9 +180,8 @@ impl PieceRoot {
     // Whether the piece is in hand, as [`Self::have`] counts it.
     pub(crate) fn had(&self, piece: u32) -> bool {
         self.layout.spans(piece).into_iter().all(|span| {
-            span.volume.is_none_or(|volume| {
-                matches!(self.unit(volume, piece), Some(Unit::Arrived(_)))
-            })
+            span.volume
+                .is_none_or(|volume| matches!(self.unit(volume, piece), Some(Unit::Arrived(_))))
         })
     }
 

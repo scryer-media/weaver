@@ -702,7 +702,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             trace!(?chunk, "upload taken off the queue before it was sent");
                             continue;
                         }
-                        if !self.handler.serves(&chunk).await.map_err(Error::ReadChunk)? {
+                        if !self
+                            .handler
+                            .serves(&chunk)
+                            .await
+                            .map_err(Error::ReadChunk)?
+                        {
                             trace!(?chunk, "upload not served");
                             continue;
                         }
@@ -1295,7 +1300,11 @@ mod tests {
         let lengths = crate::core::lengths::Lengths::new(2 * BLOCK as u64, BLOCK).unwrap();
         let block = |piece| {
             lengths
-                .chunk_info_from_received_data(lengths.validate_piece_index(piece).unwrap(), 0, BLOCK)
+                .chunk_info_from_received_data(
+                    lengths.validate_piece_index(piece).unwrap(),
+                    0,
+                    BLOCK,
+                )
                 .unwrap()
         };
         let (tx, rx) = mpsc::unbounded_channel();

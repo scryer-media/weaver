@@ -140,6 +140,7 @@ impl<R: Root> GraphJob<R> {
             pending: Pending::default(),
             moving: None,
             relocated: None,
+            kept_existing: false,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;

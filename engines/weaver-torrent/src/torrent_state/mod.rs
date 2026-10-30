@@ -64,6 +64,7 @@ use crate::spawn_utils::BlockingSpawner;
 use crate::storage::BoxStorageFactory;
 use crate::stream_connect::StreamConnector;
 use crate::torrent_state::stats::LiveStats;
+use crate::type_aliases::BF;
 use crate::type_aliases::FileInfos;
 use crate::type_aliases::PeerSource;
 use crate::type_aliases::PeerStream;
@@ -1150,6 +1151,14 @@ impl ManagedTorrent {
     /// [`crate::AddTorrentOptions::seed_mode`]).
     pub fn seed_mode(&self) -> bool {
         self.shared.options.seed.on()
+    }
+
+    /// The pieces that passed their check while the torrent is in seed mode,
+    /// to add it with again (see [`crate::AddTorrentOptions::seed_verified`];
+    /// libtorrent `torrent::verified`, saved as `verified_pieces`). None once
+    /// seed mode ended.
+    pub fn seed_verified(&self) -> Option<BF> {
+        self.shared.options.seed.verified()
     }
 
     /// `f` while the torrent stays in seed mode, which it stays in until `f`

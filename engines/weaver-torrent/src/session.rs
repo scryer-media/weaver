@@ -87,7 +87,9 @@ use crate::{
         live::peers::PeerList,
         seed_mode::SeedMode,
     },
-    type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream},
+    type_aliases::{
+        BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream,
+    },
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -603,6 +605,12 @@ pub struct AddTorrentOptions {
     /// piece (libtorrent `torrent_flags::seed_mode`). Off by default.
     #[serde(default)]
     pub seed_mode: bool,
+    /// Under [`Self::seed_mode`], the pieces that passed their check before,
+    /// as [`ManagedTorrent::seed_verified`] gave them: a peer's request for
+    /// one is served without a second check (libtorrent's `verified_pieces`
+    /// in resume data). Not read without seed mode.
+    #[serde(skip)]
+    pub seed_verified: Option<BF>,
     /// Our identity under an SSL torrent's CA, presented to its peers and
     /// its HTTPS trackers (see [`Session::set_ssl_identity`]). An SSL
     /// torrent added without one connects to no peer and announces nowhere
@@ -660,6 +668,7 @@ impl Default for AddTorrentOptions {
             super_seeding: false,
             trackers_only: false,
             seed_mode: false,
+            seed_verified: None,
             ssl_identity: None,
             metadata_fetch: None,
             tracker_handover: None,
@@ -2801,7 +2810,10 @@ impl Session {
                     sequential: opts.sequential.into(),
                     trackers_only: opts.trackers_only,
                     seed: if opts.seed_mode {
-                        SeedMode::over(metadata.info.lengths().total_pieces())
+                        SeedMode::over(
+                            metadata.info.lengths().total_pieces(),
+                            opts.seed_verified.as_ref(),
+                        )
                     } else {
                         SeedMode::default()
                     },
