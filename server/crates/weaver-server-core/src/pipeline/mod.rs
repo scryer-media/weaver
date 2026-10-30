@@ -1439,6 +1439,7 @@ pub struct Pipeline {
     pub(super) global_paused: bool,
     pub(super) applied_speed_test_pause: bool,
     pub(super) applied_random_read_iops: Option<f64>,
+    pub(super) applied_sequential_write_mbps: Option<f64>,
     // Whether the active global pause came from a bandwidth schedule rather
     // than an operator action. Only meaningful while `global_paused` is true;
     // it selects the Scheduled vs ManualPause download-block presentation.

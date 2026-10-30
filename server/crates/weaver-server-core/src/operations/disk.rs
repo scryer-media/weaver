@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::operations::instrumentation::DiskSpaceSnapshot;
+use crate::runtime::StartupDiskGate;
 
 // Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
@@ -652,18 +653,37 @@ impl fmt::Debug for StorageCapacity {
 }
 
 impl StorageCapacity {
-    // Start sampling the real filesystems behind the three roots.
-    pub fn start(data: PathBuf, intermediate: PathBuf, complete: PathBuf) -> Self {
-        Self::with_probe(
+    // Start sampling the real filesystems behind the three roots once
+    // `startup_disk_work` opens. Until then every reading is unknown, which
+    // readers already allow for before a root's first probe.
+    pub fn start(
+        data: PathBuf,
+        intermediate: PathBuf,
+        complete: PathBuf,
+        startup_disk_work: StartupDiskGate,
+    ) -> Self {
+        Self::with_probe_after(
             [data, intermediate, complete],
             STORAGE_CAPACITY_REFRESH_INTERVAL,
             Arc::new(probe_disk_space),
+            startup_disk_work,
         )
     }
 
-    // Like [`Self::start`] with a caller-supplied probe and interval. `roots`
-    // is in [`StorageRoot::ALL`] order.
+    // Like [`Self::start`] with a caller-supplied probe and interval, and
+    // nothing to wait for. `roots` is in [`StorageRoot::ALL`] order.
     pub fn with_probe(roots: [PathBuf; 3], interval: Duration, probe: SharedProbeFn) -> Self {
+        Self::with_probe_after(roots, interval, probe, StartupDiskGate::opened())
+    }
+
+    // Like [`Self::with_probe`], with each root's first probe held until
+    // `startup_disk_work` opens.
+    pub fn with_probe_after(
+        roots: [PathBuf; 3],
+        interval: Duration,
+        probe: SharedProbeFn,
+        startup_disk_work: StartupDiskGate,
+    ) -> Self {
         let slots = StorageRoot::ALL.map(|root| {
             Arc::new(RootSlot {
                 root,
@@ -678,11 +698,19 @@ impl StorageCapacity {
             })
         });
         for slot in &slots {
+            // The sampler waits on its own slot's condition variable, so
+            // the gate opening has to wake it there.
+            let woken = Arc::clone(slot);
+            startup_disk_work.on_open(move || {
+                drop(woken.lock());
+                woken.wake.notify_all();
+            });
             let thread_slot = Arc::clone(slot);
             let thread_probe = Arc::clone(&probe);
+            let thread_gate = startup_disk_work.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("weaver-capacity-{}", slot.root.label()))
-                .spawn(move || run_root_sampler(&thread_slot, interval, thread_probe));
+                .spawn(move || run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate));
             if let Err(error) = spawned {
                 warn!(
                     root = slot.root.label(),
@@ -771,7 +799,26 @@ impl Drop for StorageCapacity {
     }
 }
 
-fn run_root_sampler(slot: &RootSlot, interval: Duration, probe: SharedProbeFn) {
+fn run_root_sampler(
+    slot: &RootSlot,
+    interval: Duration,
+    probe: SharedProbeFn,
+    startup_disk_work: &StartupDiskGate,
+) {
+    // Hold the first probe until the startup disk work is done. Stopping the
+    // storage meanwhile ends the wait as well.
+    {
+        let state = slot.lock();
+        let state = slot
+            .wake
+            .wait_while(state, |state| {
+                !state.stopped && !startup_disk_work.is_open()
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.stopped {
+            return;
+        }
+    }
     let mut sampler: Option<CapacitySampler> = None;
     loop {
         let path = {
@@ -1116,6 +1163,40 @@ mod tests {
             PathBuf::from("/intermediate"),
             PathBuf::from("/unmounted"),
         ]
+    }
+
+    // No root is probed before the startup disk work is done: every probe
+    // records whether the gate was open when it ran.
+    #[test]
+    fn samplers_hold_their_first_probe_until_startup_disk_work_is_done() {
+        let gate = StartupDiskGate::closed();
+        let opened_at_probe = Arc::new(Mutex::new(Vec::new()));
+        let probe: SharedProbeFn = {
+            let gate = gate.clone();
+            let opened_at_probe = Arc::clone(&opened_at_probe);
+            Arc::new(move |_: &Path| {
+                opened_at_probe.lock().unwrap().push(gate.is_open());
+                Ok(DiskSpace {
+                    total_bytes: 1000,
+                    available_bytes: 500,
+                })
+            })
+        };
+        let storage = StorageCapacity::with_probe_after(roots(), NEVER, probe, gate.clone());
+        for root in StorageRoot::ALL {
+            assert!(
+                matches!(storage.current(root), Capacity::Unknown),
+                "nothing is known before the gate opens"
+            );
+        }
+
+        gate.open();
+        for root in StorageRoot::ALL {
+            storage.wait_for_probes(root, 1);
+        }
+        let opened_at_probe = opened_at_probe.lock().unwrap();
+        assert_eq!(opened_at_probe.len(), 3, "one probe per root");
+        assert!(opened_at_probe.iter().all(|open| *open));
     }
 
     #[test]

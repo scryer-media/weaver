@@ -61,6 +61,7 @@ impl Pipeline {
         shared_state: SharedPipelineState,
         db: crate::Database,
         config: crate::settings::SharedConfig,
+        startup_disk_work: crate::runtime::StartupDiskGate,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
         initial_history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
@@ -157,6 +158,7 @@ impl Pipeline {
             data_dir.clone(),
             intermediate_dir.clone(),
             complete_dir.clone(),
+            startup_disk_work,
         ));
         let extraction_limits = Arc::new(ExtractionLimits::from_env_with_profile_ceiling(
             &complete_dir,
@@ -338,6 +340,7 @@ impl Pipeline {
             global_paused: initial_global_paused,
             applied_speed_test_pause: false,
             applied_random_read_iops: None,
+            applied_sequential_write_mbps: None,
             scheduled_pause: false,
             rate_limit_reservations: HashMap::new(),
             configured_rate_limit: 0,

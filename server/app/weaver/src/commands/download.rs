@@ -146,6 +146,7 @@ pub(crate) async fn run(
         shared_state,
         db.clone(),
         standalone_config,
+        weaver_server_core::runtime::StartupDiskGate::opened(),
     )
     .await?;
 

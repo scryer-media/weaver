@@ -347,6 +347,16 @@ impl Pipeline {
             self.applied_random_read_iops = Some(iops);
             self.tuner.set_random_read_iops(iops);
         }
+        let write_mbps = self
+            .shared_state
+            .queue
+            .read(|inner| inner.globals.sequential_write_mbps);
+        if let Some(write_mbps) =
+            write_mbps.filter(|mbps| self.applied_sequential_write_mbps != Some(*mbps))
+        {
+            self.applied_sequential_write_mbps = Some(write_mbps);
+            self.tuner.set_sequential_write_mbps(write_mbps);
+        }
         let globals = self.shared_state.queue.read(|inner| inner.globals.clone());
         if globals.paused != self.global_paused || globals.scheduled_pause != self.scheduled_pause {
             self.download_dispatch_stall = None;

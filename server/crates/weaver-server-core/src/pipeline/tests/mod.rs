@@ -220,6 +220,7 @@ impl TestHarness {
             shared_state,
             db.clone(),
             config.clone(),
+            crate::runtime::StartupDiskGate::opened(),
         )
         .await
         .unwrap();
@@ -689,6 +690,7 @@ async fn new_direct_pipeline_on_machine(
         shared_state,
         db,
         config,
+        crate::runtime::StartupDiskGate::opened(),
     )
     .await
     .unwrap();

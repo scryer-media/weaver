@@ -26,12 +26,86 @@ pub(crate) struct OwnedDownloadLanePool {
 // for queued work *and* publish itself idle in the same breath, or a run is
 // pushed into the gap between the two and waits for a wake-up that has
 // already happened. It is taken at lease boundaries only — never per article.
+//
+// Worker threads are started on demand, up to `cap`, and leave after a long
+// idle spell. A slot keeps its index for the life of the pool, empty or not:
+// a socket-recall hook captured by an idle worker addresses its slot by
+// index, and a worker leaving must not shift the ones beside it.
 struct OwnedLanePoolShared {
-    workers: Vec<OwnedLaneWorkerSlot>,
+    workers: Vec<Option<OwnedLaneWorkerSlot>>,
     // Runs and probes that arrived while every worker was busy. Whichever
     // worker finishes first drains this before it publishes itself idle, so
     // a lease never sits behind one busy worker's private channel.
     queued_runs: VecDeque<QueuedOwnedLaneWork>,
+    // The most worker threads that may be alive at once: the configured
+    // connection count.
+    cap: usize,
+    // Tells a worker apart from an earlier one that sat in the same slot.
+    next_worker_id: u64,
+    intervals: OwnedLaneIntervals,
+    #[cfg(test)]
+    observer: Option<std_mpsc::Sender<OwnedLaneObservation>>,
+}
+
+// How often an idle worker wakes, and how long it stays idle before its
+// thread leaves. Fixed in production; tests shorten them.
+#[derive(Clone, Copy)]
+struct OwnedLaneIntervals {
+    liveness: Duration,
+    idle_release: Duration,
+}
+
+impl Default for OwnedLaneIntervals {
+    fn default() -> Self {
+        Self {
+            liveness: CACHED_LANE_LIVENESS_INTERVAL,
+            idle_release: LANE_IDLE_RELEASE,
+        }
+    }
+}
+
+// How long a worker thread may sit idle before it leaves. A machine with
+// many configured connections and little to download should not keep a
+// thread per connection parked forever; the next lease starts a new one.
+const LANE_IDLE_RELEASE: Duration = Duration::from_secs(5 * 60);
+
+// Which worker a thread is: its slot, and which occupant of that slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnedLaneSeat {
+    index: usize,
+    id: u64,
+}
+
+// What the pool's workers did, for tests that wait on the pool rather than
+// on the clock.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnedLaneObservation {
+    Spawned(usize),
+    Idle(usize),
+    Vacated(usize),
+}
+
+// How a new worker thread begins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnedLaneWorkerStart {
+    // Claimed by the submit that started it: its first command is the work
+    // it was started for, and it must not publish itself idle before that.
+    Claimed,
+    // Free from the start: it drains the queue and then publishes itself.
+    Idle,
+}
+
+// One step of an idle worker's release.
+enum OwnedLaneRelease {
+    // A command was routed here meanwhile; take it instead of leaving.
+    Stay,
+    // Queued work found on the way out.
+    Work(QueuedOwnedLaneWork),
+    // Withdrawn from claims; its connection can be let go before it leaves.
+    Withdrawn,
+    // The slot is vacated (or no longer this worker's) and the thread ends.
+    Left,
 }
 
 // Work routed to a worker: a lease to run, or a health probe batch to ask.
@@ -62,6 +136,7 @@ pub(crate) struct StoppedOwnedLaneWork {
 }
 
 struct OwnedLaneWorkerSlot {
+    id: u64,
     sender: std_mpsc::Sender<OwnedLanePoolCommand>,
     // `Some` while the worker sits between runs and no run has been routed to
     // it yet. Taking it is the claim: two concurrent submits cannot choose
@@ -204,9 +279,7 @@ impl OwnedLanePoolShared {
 
     fn claim_worker_where(&mut self, serves: impl Fn(&IdleOwnedLane) -> bool) -> Option<usize> {
         let matching = self.workers.iter().position(|worker| {
-            worker
-                .idle
-                .as_ref()
+            idle_marker(worker)
                 .and_then(|idle| idle.lane.as_ref())
                 .is_some_and(&serves)
         });
@@ -214,11 +287,37 @@ impl OwnedLanePoolShared {
             .or_else(|| {
                 self.workers
                     .iter()
-                    .position(|worker| worker.idle.as_ref().is_some_and(|idle| idle.lane.is_none()))
+                    .position(|worker| idle_marker(worker).is_some_and(|idle| idle.lane.is_none()))
             })
-            .or_else(|| self.workers.iter().position(|worker| worker.idle.is_some()))?;
-        self.workers[index].idle = None;
+            .or_else(|| {
+                self.workers
+                    .iter()
+                    .position(|worker| idle_marker(worker).is_some())
+            })?;
+        if let Some(worker) = self.workers[index].as_mut() {
+            worker.idle = None;
+        }
         Some(index)
+    }
+
+    // The slot `seat` occupies, while it is still that worker's. A slot a
+    // resize emptied, or one a later worker has since taken, is not.
+    fn seat(&self, seat: OwnedLaneSeat) -> Option<&OwnedLaneWorkerSlot> {
+        self.workers
+            .get(seat.index)
+            .and_then(Option::as_ref)
+            .filter(|worker| worker.id == seat.id)
+    }
+
+    fn seat_mut(&mut self, seat: OwnedLaneSeat) -> Option<&mut OwnedLaneWorkerSlot> {
+        self.workers
+            .get_mut(seat.index)
+            .and_then(Option::as_mut)
+            .filter(|worker| worker.id == seat.id)
+    }
+
+    fn live_workers(&self) -> usize {
+        self.workers.iter().flatten().count()
     }
 
     // Take a run this worker should start now, or publish it idle.
@@ -229,32 +328,75 @@ impl OwnedLanePoolShared {
     // is already asleep.
     fn take_queued_run_or_publish_idle(
         &mut self,
-        index: usize,
+        seat: OwnedLaneSeat,
         lane: Option<IdleOwnedLane>,
     ) -> Option<QueuedOwnedLaneWork> {
         if let Some(run) = self.queued_runs.pop_front() {
             return Some(run);
         }
-        if let Some(worker) = self.workers.get_mut(index) {
+        if let Some(worker) = self.seat_mut(seat) {
             worker.idle = Some(IdleOwnedLaneWorker { lane });
+            #[cfg(test)]
+            self.observe(OwnedLaneObservation::Idle(seat.index));
         }
         None
     }
 
     // Update what an already-idle worker is holding. A worker that has been
     // claimed since is left alone: its next run is already on the way.
-    fn note_idle_lane(&mut self, index: usize, lane: Option<IdleOwnedLane>) {
-        if let Some(worker) = self.workers.get_mut(index)
+    fn note_idle_lane(&mut self, seat: OwnedLaneSeat, lane: Option<IdleOwnedLane>) {
+        if let Some(worker) = self.seat_mut(seat)
             && let Some(idle) = worker.idle.as_mut()
         {
             idle.lane = lane;
         }
     }
 
-    fn mark_busy(&mut self, index: usize) {
-        if let Some(worker) = self.workers.get_mut(index) {
-            worker.idle = None;
+    // Empty the slot `seat` occupies, if it still does. Trailing empty slots
+    // are dropped; the indices of the others never move.
+    fn vacate(&mut self, seat: OwnedLaneSeat) {
+        if self.seat(seat).is_none() {
+            return;
         }
+        self.workers[seat.index] = None;
+        self.trim_vacant_tail();
+        #[cfg(test)]
+        self.observe(OwnedLaneObservation::Vacated(seat.index));
+    }
+
+    fn trim_vacant_tail(&mut self) {
+        while self.workers.last().is_some_and(Option::is_none) {
+            self.workers.pop();
+        }
+    }
+
+    // First step of an idle worker leaving: withdraw it from claims, unless
+    // a command was routed to it meanwhile or there is queued work to take.
+    fn begin_release(&mut self, seat: OwnedLaneSeat) -> OwnedLaneRelease {
+        let Some(worker) = self.seat_mut(seat) else {
+            return OwnedLaneRelease::Left;
+        };
+        if worker.idle.is_none() {
+            return OwnedLaneRelease::Stay;
+        }
+        worker.idle = None;
+        match self.queued_runs.pop_front() {
+            Some(work) => OwnedLaneRelease::Work(work),
+            None => OwnedLaneRelease::Withdrawn,
+        }
+    }
+
+    // Last step of an idle worker leaving. A run queued while it let its
+    // connection go is taken instead: with this worker counted against the
+    // cap, a submit may have queued it for exactly this worker.
+    fn finish_release(&mut self, seat: OwnedLaneSeat) -> OwnedLaneRelease {
+        if self.seat(seat).is_some()
+            && let Some(work) = self.queued_runs.pop_front()
+        {
+            return OwnedLaneRelease::Work(work);
+        }
+        self.vacate(seat);
+        OwnedLaneRelease::Left
     }
 
     // Idle workers with no connection, in pool order: the ones a warm can
@@ -265,19 +407,40 @@ impl OwnedLanePoolShared {
     ) -> Vec<std_mpsc::Sender<OwnedLanePoolCommand>> {
         self.workers
             .iter()
+            .flatten()
             .filter(|worker| worker.idle.as_ref().is_some_and(|idle| idle.lane.is_none()))
             .take(limit)
             .map(|worker| worker.sender.clone())
             .collect()
     }
+
+    #[cfg(test)]
+    fn observe(&self, observation: OwnedLaneObservation) {
+        if let Some(observer) = self.observer.as_ref() {
+            let _ = observer.send(observation);
+        }
+    }
+}
+
+fn idle_marker(worker: &Option<OwnedLaneWorkerSlot>) -> Option<&IdleOwnedLaneWorker> {
+    worker.as_ref().and_then(|worker| worker.idle.as_ref())
 }
 
 impl OwnedDownloadLanePool {
     pub(crate) fn new(worker_count: usize) -> Self {
+        Self::with_intervals(worker_count, OwnedLaneIntervals::default())
+    }
+
+    fn with_intervals(worker_count: usize, intervals: OwnedLaneIntervals) -> Self {
         let mut pool = Self {
             shared: Arc::new(std::sync::Mutex::new(OwnedLanePoolShared {
                 workers: Vec::new(),
                 queued_runs: VecDeque::new(),
+                cap: 0,
+                next_worker_id: 0,
+                intervals,
+                #[cfg(test)]
+                observer: None,
             })),
             #[cfg(test)]
             reset_calls: AtomicUsize::new(0),
@@ -286,17 +449,59 @@ impl OwnedDownloadLanePool {
         pool
     }
 
+    // A pool whose workers wake and leave on the test's schedule.
+    #[cfg(test)]
+    pub(crate) fn with_test_intervals(
+        worker_count: usize,
+        liveness: Duration,
+        idle_release: Duration,
+    ) -> Self {
+        Self::with_intervals(
+            worker_count,
+            OwnedLaneIntervals {
+                liveness,
+                idle_release,
+            },
+        )
+    }
+
+    // Report every spawn, idle publication and vacated slot from here on.
+    #[cfg(test)]
+    pub(crate) fn observe(&self) -> std_mpsc::Receiver<OwnedLaneObservation> {
+        let (tx, rx) = std_mpsc::channel();
+        lock_pool(&self.shared).observer = Some(tx);
+        rx
+    }
+
+    // Set how many workers may run at once. Nothing is started here: a
+    // worker is started when work finds no idle one, so a machine with many
+    // configured connections pays for the threads it uses, not the ones it
+    // could. Surplus live workers are asked to leave, highest slot first.
     pub(crate) fn resize(&mut self, worker_count: usize) {
-        let worker_count = worker_count.max(1);
+        let cap = worker_count.max(1);
         let mut shared = lock_pool(&self.shared);
-        while shared.workers.len() < worker_count {
-            let index = shared.workers.len();
-            let sender = spawn_owned_lane_worker(index, Arc::clone(&self.shared));
-            shared
-                .workers
-                .push(OwnedLaneWorkerSlot { sender, idle: None });
+        shared.cap = cap;
+        let mut live = shared.live_workers();
+        let mut index = shared.workers.len();
+        while live > cap && index > 0 {
+            index -= 1;
+            // Dropping the sender is the request: the worker finishes what
+            // it is running and leaves when it next reads its channel.
+            if shared.workers[index].take().is_some() {
+                live -= 1;
+            }
         }
-        shared.workers.truncate(worker_count);
+        shared.trim_vacant_tail();
+        // Work queued while the old cap held every worker busy starts on the
+        // room the new cap gives instead of waiting for one to finish.
+        let starts = shared.queued_runs.len().min(cap.saturating_sub(live));
+        for _ in 0..starts {
+            if spawn_owned_lane_worker(&self.shared, &mut shared, OwnedLaneWorkerStart::Idle)
+                .is_none()
+            {
+                break;
+            }
+        }
     }
 
     // The servers of the connections idle workers are keeping, one entry
@@ -306,6 +511,7 @@ impl OwnedDownloadLanePool {
         shared
             .workers
             .iter()
+            .flatten()
             .filter_map(|worker| {
                 let idle = worker.idle.as_ref()?;
                 Some(idle.lane.as_ref().map(|lane| lane.server.0))
@@ -313,8 +519,15 @@ impl OwnedDownloadLanePool {
             .collect()
     }
 
+    // How many workers may run at once: the configured connection count.
     pub(crate) fn worker_count(&self) -> usize {
-        lock_pool(&self.shared).workers.len()
+        lock_pool(&self.shared).cap
+    }
+
+    // How many worker threads are alive now.
+    #[cfg(test)]
+    pub(crate) fn live_worker_count(&self) -> usize {
+        lock_pool(&self.shared).live_workers()
     }
 
     #[cfg(test)]
@@ -328,7 +541,7 @@ impl OwnedDownloadLanePool {
         #[cfg(test)]
         self.reset_calls.fetch_add(1, Ordering::Relaxed);
         let mut shared = lock_pool(&self.shared);
-        for worker in &shared.workers {
+        for worker in shared.workers.iter().flatten() {
             let _ = worker.sender.send(OwnedLanePoolCommand::Reset);
         }
         let mut stopped = StoppedOwnedLaneWork {
@@ -366,27 +579,15 @@ impl OwnedDownloadLanePool {
             initial_lease,
         });
         let mut shared = lock_pool(&self.shared);
-        if shared.workers.is_empty() {
+        if shared.cap == 0 {
             return Err(run.initial_lease);
         }
-        let Some(index) = shared.claim_worker_for(&run) else {
-            // Every worker is mid-lease. Queue for whichever finishes first
-            // rather than picking one: a run pushed into a busy worker's
-            // private channel waits out that worker's whole lease even while
-            // another goes idle beside it.
-            shared.queued_runs.push_back(QueuedOwnedLaneWork::Run(run));
-            return Ok(());
-        };
-        shared.workers[index]
-            .sender
-            .send(OwnedLanePoolCommand::Run(run))
-            .map_err(|error| match error.0 {
-                OwnedLanePoolCommand::Run(run) => run.initial_lease,
-                OwnedLanePoolCommand::Reset
-                | OwnedLanePoolCommand::RecallSocket(_)
-                | OwnedLanePoolCommand::Probe(_)
-                | OwnedLanePoolCommand::Warm(_) => {
-                    unreachable!("only a Run command is sent from submit")
+        let claimed = shared.claim_worker_for(&run);
+        route_owned_lane_work(&self.shared, &mut shared, claimed, QueuedOwnedLaneWork::Run(run))
+            .map_err(|work| match work {
+                QueuedOwnedLaneWork::Run(run) => run.initial_lease,
+                QueuedOwnedLaneWork::Probe(_) => {
+                    unreachable!("only a run is routed from submit")
                 }
             })
     }
@@ -412,30 +613,25 @@ impl OwnedDownloadLanePool {
             mail,
         });
         let mut shared = lock_pool(&self.shared);
-        if shared.workers.is_empty() {
+        if shared.cap == 0 {
             return Err(probe.batch);
         }
-        let Some(index) = shared.claim_worker_for_probe(&probe) else {
-            shared
-                .queued_runs
-                .push_back(QueuedOwnedLaneWork::Probe(probe));
-            return Ok(());
-        };
-        shared.workers[index]
-            .sender
-            .send(OwnedLanePoolCommand::Probe(probe))
-            .map_err(|error| match error.0 {
-                OwnedLanePoolCommand::Probe(probe) => probe.batch,
-                OwnedLanePoolCommand::Run(_)
-                | OwnedLanePoolCommand::Reset
-                | OwnedLanePoolCommand::RecallSocket(_)
-                | OwnedLanePoolCommand::Warm(_) => {
-                    unreachable!("only a Probe command is sent from probe")
-                }
-            })
+        let claimed = shared.claim_worker_for_probe(&probe);
+        route_owned_lane_work(
+            &self.shared,
+            &mut shared,
+            claimed,
+            QueuedOwnedLaneWork::Probe(probe),
+        )
+        .map_err(|work| match work {
+            QueuedOwnedLaneWork::Probe(probe) => probe.batch,
+            QueuedOwnedLaneWork::Run(_) => unreachable!("only a probe is routed from probe"),
+        })
     }
 
-    // Ask up to `limit` connectionless idle workers to dial `seat` now.
+    // Ask up to `limit` connectionless idle workers to dial `seat` now,
+    // starting workers for the asks no idle one can take while the cap
+    // allows.
     //
     // Returns how many were asked. Each dials on its own worker thread, so
     // the handshakes overlap each other and nothing already leased waits on
@@ -451,7 +647,21 @@ impl OwnedDownloadLanePool {
         if limit == 0 {
             return 0;
         }
-        let senders = lock_pool(&self.shared).idle_workers_without_a_lane(limit);
+        let senders = {
+            let mut shared = lock_pool(&self.shared);
+            let mut senders = shared.idle_workers_without_a_lane(limit);
+            while senders.len() < limit && shared.live_workers() < shared.cap {
+                let Some(index) =
+                    spawn_owned_lane_worker(&self.shared, &mut shared, OwnedLaneWorkerStart::Idle)
+                else {
+                    break;
+                };
+                if let Some(worker) = shared.workers[index].as_ref() {
+                    senders.push(worker.sender.clone());
+                }
+            }
+            senders
+        };
         let mut asked = 0;
         for sender in senders {
             let warm = Box::new(OwnedLaneWarm {
@@ -468,36 +678,141 @@ impl OwnedDownloadLanePool {
     }
 }
 
+// Hand `work` to the worker `claimed` for it; when none was idle, start one
+// if the cap allows, else queue it for whichever worker finishes first.
+//
+// Queueing rather than picking a busy worker matters: a run pushed into a
+// busy worker's private channel waits out that worker's whole lease even
+// while another goes idle beside it. The work comes back only when the
+// worker it was sent to is gone.
+fn route_owned_lane_work(
+    owner: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
+    shared: &mut OwnedLanePoolShared,
+    claimed: Option<usize>,
+    work: QueuedOwnedLaneWork,
+) -> Result<(), QueuedOwnedLaneWork> {
+    let index = match claimed {
+        Some(index) => index,
+        None if shared.live_workers() < shared.cap => {
+            match spawn_owned_lane_worker(owner, shared, OwnedLaneWorkerStart::Claimed) {
+                Some(index) => index,
+                None => {
+                    shared.queued_runs.push_back(work);
+                    return Ok(());
+                }
+            }
+        }
+        None => {
+            shared.queued_runs.push_back(work);
+            return Ok(());
+        }
+    };
+    let command = match work {
+        QueuedOwnedLaneWork::Run(run) => OwnedLanePoolCommand::Run(run),
+        QueuedOwnedLaneWork::Probe(probe) => OwnedLanePoolCommand::Probe(probe),
+    };
+    let Some(worker) = shared.workers[index].as_ref() else {
+        unreachable!("a claimed or just-started worker holds its slot");
+    };
+    let seat = OwnedLaneSeat {
+        index,
+        id: worker.id,
+    };
+    worker.sender.send(command).map_err(|error| {
+        // The receiver is gone, so the worker is too: free its slot.
+        shared.vacate(seat);
+        match error.0 {
+            OwnedLanePoolCommand::Run(run) => QueuedOwnedLaneWork::Run(run),
+            OwnedLanePoolCommand::Probe(probe) => QueuedOwnedLaneWork::Probe(probe),
+            OwnedLanePoolCommand::Reset
+            | OwnedLanePoolCommand::RecallSocket(_)
+            | OwnedLanePoolCommand::Warm(_) => {
+                unreachable!("only routed work is sent here")
+            }
+        }
+    })
+}
+
+// Start a worker thread in the lowest empty slot. Called under the pool lock,
+// so two callers cannot take the same slot. A thread that cannot be started
+// is logged and reported as `None`; the caller queues its work instead.
 fn spawn_owned_lane_worker(
-    index: usize,
-    shared: Arc<std::sync::Mutex<OwnedLanePoolShared>>,
-) -> std_mpsc::Sender<OwnedLanePoolCommand> {
+    owner: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
+    shared: &mut OwnedLanePoolShared,
+    start: OwnedLaneWorkerStart,
+) -> Option<usize> {
+    let index = shared
+        .workers
+        .iter()
+        .position(Option::is_none)
+        .unwrap_or(shared.workers.len());
+    let id = shared.next_worker_id;
+    let seat = OwnedLaneSeat { index, id };
+    let intervals = shared.intervals;
     let (tx, rx) = std_mpsc::channel();
-    std::thread::Builder::new()
+    let thread_owner = Arc::clone(owner);
+    let spawned = std::thread::Builder::new()
         .name(format!("weaver-nntp-lane-{index}"))
         .spawn(move || {
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
-            run_owned_lane_worker(index, rx, &shared);
-        })
-        .expect("failed to spawn owned blocking NNTP lane");
-    tx
+            run_owned_lane_worker(seat, rx, &thread_owner, start, intervals);
+        });
+    if let Err(error) = spawned {
+        warn!(
+            index,
+            error = %error,
+            "could not start an NNTP lane thread; its work waits for a busy lane"
+        );
+        return None;
+    }
+    shared.next_worker_id += 1;
+    let slot = Some(OwnedLaneWorkerSlot {
+        id,
+        sender: tx,
+        idle: None,
+    });
+    if index == shared.workers.len() {
+        shared.workers.push(slot);
+    } else {
+        shared.workers[index] = slot;
+    }
+    #[cfg(test)]
+    shared.observe(OwnedLaneObservation::Spawned(index));
+    Some(index)
 }
 
 fn run_owned_lane_worker(
-    index: usize,
+    seat: OwnedLaneSeat,
     rx: std_mpsc::Receiver<OwnedLanePoolCommand>,
     shared: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
+    start: OwnedLaneWorkerStart,
+    intervals: OwnedLaneIntervals,
 ) {
     let mut cached_lane: Option<CachedOwnedLane> = None;
     // The answer to the probe this worker just asked, sent once the worker
     // has published what it holds, so whoever hears the answer finds the
     // connection that gave it already offered to the next batch.
     let mut owed: Option<OwedProbeAnswer> = None;
+    if start == OwnedLaneWorkerStart::Claimed {
+        // Started for one piece of work, which its submit sends right behind
+        // the spawn. Publishing idle first would offer this worker to a
+        // second submit with the first one's work already on its way.
+        loop {
+            let Ok(command) = rx.recv() else {
+                lock_pool(shared).vacate(seat);
+                return;
+            };
+            if let Some(work) = answer_idle_command(seat, shared, &mut cached_lane, command) {
+                owed = run_owned_lane_work(&mut cached_lane, work);
+                break;
+            }
+        }
+    }
     'work: loop {
         // Drain the pool's queue before going to sleep, and publish this
         // worker as idle only when there is nothing left to take.
         let queued = lock_pool(shared).take_queued_run_or_publish_idle(
-            index,
+            seat,
             cached_lane.as_ref().map(IdleOwnedLane::from_cached),
         );
         if let Some(answer) = owed.take() {
@@ -511,18 +826,19 @@ fn run_owned_lane_worker(
         // Idle from here until a run is routed to this worker. The other
         // commands are answered in place and leave the worker idle, so the
         // idle marker is only re-published after a run.
+        let mut idle_since = Instant::now();
         loop {
             if let Some(cached) = cached_lane.as_ref() {
                 let owner = Arc::downgrade(shared);
                 cached.lane.mark_idle(Arc::new(move |id| {
-                    if let Some(owner) = owner.upgrade() {
-                        let _ = lock_pool(&owner).workers[index]
-                            .sender
-                            .send(OwnedLanePoolCommand::RecallSocket(id));
+                    if let Some(owner) = owner.upgrade()
+                        && let Some(worker) = lock_pool(&owner).seat(seat)
+                    {
+                        let _ = worker.sender.send(OwnedLanePoolCommand::RecallSocket(id));
                     }
                 }));
             }
-            let command = match rx.recv_timeout(CACHED_LANE_LIVENESS_INTERVAL) {
+            let command = match rx.recv_timeout(intervals.liveness) {
                 Ok(command) => command,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {
                     // A server that times out an idle connection leaves the
@@ -530,20 +846,60 @@ fn run_owned_lane_worker(
                     // keep the pool permit for it until a lease was routed
                     // here. Give the permit back as soon as that is noticed.
                     if discard_closed_cached_lane(&mut cached_lane) {
-                        lock_pool(shared).note_idle_lane(index, None);
+                        lock_pool(shared).note_idle_lane(seat, None);
+                    }
+                    if idle_since.elapsed() >= intervals.idle_release {
+                        match release_idle_worker(seat, shared, &mut cached_lane) {
+                            OwnedLaneRelease::Stay => {}
+                            OwnedLaneRelease::Work(work) => {
+                                owed = run_owned_lane_work(&mut cached_lane, work);
+                                continue 'work;
+                            }
+                            OwnedLaneRelease::Withdrawn | OwnedLaneRelease::Left => return,
+                        }
                     }
                     continue;
                 }
                 Err(std_mpsc::RecvTimeoutError::Disconnected) => break 'work,
             };
-            if let Some(work) = answer_idle_command(index, shared, &mut cached_lane, command) {
+            // A warmed connection is about to be wanted: its idle spell
+            // starts now, not when the worker last finished a run.
+            let warmed = matches!(command, OwnedLanePoolCommand::Warm(_));
+            if let Some(work) = answer_idle_command(seat, shared, &mut cached_lane, command) {
                 owed = run_owned_lane_work(&mut cached_lane, work);
                 continue 'work;
             }
+            if warmed {
+                idle_since = Instant::now();
+            }
         }
     }
-    lock_pool(shared).mark_busy(index);
+    lock_pool(shared).vacate(seat);
     park_cached_lane(&mut cached_lane);
+}
+
+// Let an idle worker's thread go. Its connection is closed before its slot
+// is given up, so the permit is back in the pool by the time anything can
+// start a worker in its place. Queued work found on the way is taken instead.
+fn release_idle_worker(
+    seat: OwnedLaneSeat,
+    shared: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
+    cached_lane: &mut Option<CachedOwnedLane>,
+) -> OwnedLaneRelease {
+    match lock_pool(shared).begin_release(seat) {
+        OwnedLaneRelease::Withdrawn => {}
+        OwnedLaneRelease::Left => {
+            park_cached_lane(cached_lane);
+            return OwnedLaneRelease::Left;
+        }
+        step @ (OwnedLaneRelease::Stay | OwnedLaneRelease::Work(_)) => return step,
+    }
+    park_cached_lane(cached_lane);
+    let step = lock_pool(shared).finish_release(seat);
+    if matches!(step, OwnedLaneRelease::Left) {
+        debug!(slot = seat.index, "idle NNTP lane thread released");
+    }
+    step
 }
 
 // Start the work routed to this worker. A probe's answer is handed back, to
@@ -614,7 +970,7 @@ impl OwedProbeAnswer {
 // the caller to start; everything else is settled here and leaves the
 // worker idle.
 fn answer_idle_command(
-    index: usize,
+    seat: OwnedLaneSeat,
     shared: &Arc<std::sync::Mutex<OwnedLanePoolShared>>,
     cached_lane: &mut Option<CachedOwnedLane>,
     command: OwnedLanePoolCommand,
@@ -625,7 +981,7 @@ fn answer_idle_command(
                 .as_ref()
                 .is_some_and(|cached| cached.lane.socket_id() == id)
             {
-                lock_pool(shared).note_idle_lane(index, None);
+                lock_pool(shared).note_idle_lane(seat, None);
                 // Local closure acknowledges this exact recall. No waiting
                 // for QUIT, and no refund before socket drop.
                 cached_lane.take();
@@ -636,13 +992,13 @@ fn answer_idle_command(
         OwnedLanePoolCommand::Run(run) => return Some(QueuedOwnedLaneWork::Run(run)),
         OwnedLanePoolCommand::Probe(probe) => return Some(QueuedOwnedLaneWork::Probe(probe)),
         OwnedLanePoolCommand::Reset => {
-            lock_pool(shared).note_idle_lane(index, None);
+            lock_pool(shared).note_idle_lane(seat, None);
             park_cached_lane(cached_lane);
         }
         OwnedLanePoolCommand::Warm(warm) => {
             warm_cached_lane(cached_lane, *warm);
             lock_pool(shared)
-                .note_idle_lane(index, cached_lane.as_ref().map(IdleOwnedLane::from_cached));
+                .note_idle_lane(seat, cached_lane.as_ref().map(IdleOwnedLane::from_cached));
         }
     }
     None
@@ -2601,16 +2957,37 @@ mod routing_tests {
     }
 
     fn shared_with(idle: Vec<Option<IdleOwnedLaneWorker>>) -> OwnedLanePoolShared {
-        OwnedLanePoolShared {
-            workers: idle
-                .into_iter()
-                .map(|idle| OwnedLaneWorkerSlot {
+        let workers: Vec<_> = idle
+            .into_iter()
+            .enumerate()
+            .map(|(index, idle)| {
+                Some(OwnedLaneWorkerSlot {
+                    id: index as u64,
                     sender: std_mpsc::channel().0,
                     idle,
                 })
-                .collect(),
+            })
+            .collect();
+        OwnedLanePoolShared {
+            cap: workers.len(),
+            next_worker_id: workers.len() as u64,
+            workers,
             queued_runs: VecDeque::new(),
+            intervals: OwnedLaneIntervals::default(),
+            observer: None,
         }
+    }
+
+    // The worker the test fixtures put in slot `index`.
+    fn seat(index: usize) -> OwnedLaneSeat {
+        OwnedLaneSeat {
+            index,
+            id: index as u64,
+        }
+    }
+
+    fn slot(shared: &OwnedLanePoolShared, index: usize) -> &OwnedLaneWorkerSlot {
+        shared.workers[index].as_ref().expect("an occupied slot")
     }
 
     fn idle_with(lane: Option<IdleOwnedLane>) -> Option<IdleOwnedLaneWorker> {
@@ -2752,15 +3129,15 @@ mod routing_tests {
         // idle; worker 0 finishes into an empty queue and publishes itself.
         assert!(
             shared
-                .take_queued_run_or_publish_idle(1, None)
+                .take_queued_run_or_publish_idle(seat(1), None)
                 .is_some_and(|work| matches!(
                     work,
                     QueuedOwnedLaneWork::Run(run) if run.initial_lease.job_id == JobId(7)
                 ))
         );
-        assert!(shared.workers[1].idle.is_none(), "worker 1 is running it");
-        assert!(shared.take_queued_run_or_publish_idle(0, None).is_none());
-        assert!(shared.workers[0].idle.is_some());
+        assert!(slot(&shared, 1).idle.is_none(), "worker 1 is running it");
+        assert!(shared.take_queued_run_or_publish_idle(seat(0), None).is_none());
+        assert!(slot(&shared, 0).idle.is_some());
     }
 
     #[test]
@@ -2768,7 +3145,7 @@ mod routing_tests {
         let nntp = test_client();
         let (sender, commands) = std_mpsc::channel();
         let mut shared = shared_with(vec![None]);
-        shared.workers[0].sender = sender;
+        shared.workers[0].as_mut().unwrap().sender = sender;
         for segment_number in 0..3 {
             let mut run = test_run(&nntp, Vec::new());
             run.initial_lease.works[0].segment_id.segment_number = segment_number;
@@ -2794,7 +3171,7 @@ mod routing_tests {
         );
         assert!(
             lock_pool(&pool.shared)
-                .take_queued_run_or_publish_idle(0, None)
+                .take_queued_run_or_publish_idle(seat(0), None)
                 .is_none(),
             "finishing a lease must reach the pending reset without another old run"
         );
@@ -2884,7 +3261,7 @@ mod routing_tests {
         let mut cached = None;
 
         let started = answer_idle_command(
-            0,
+            seat(0),
             &shared,
             &mut cached,
             OwnedLanePoolCommand::Warm(Box::new(warm_for(&nntp, 0))),
@@ -2896,7 +3273,7 @@ mod routing_tests {
             "the worker now holds the warmed connection"
         );
         assert!(
-            lock_pool(&shared).workers[0]
+            slot(&lock_pool(&shared), 0)
                 .idle
                 .as_ref()
                 .and_then(|idle| idle.lane.as_ref())
@@ -3080,12 +3457,199 @@ mod routing_tests {
         let run = test_run(&nntp, Vec::new());
 
         assert_eq!(shared.claim_worker_for(&run), Some(0));
-        shared.note_idle_lane(0, Some(idle_lane(&nntp, 0)));
+        shared.note_idle_lane(seat(0), Some(idle_lane(&nntp, 0)));
 
         assert!(
-            shared.workers[0].idle.is_none(),
+            slot(&shared, 0).idle.is_none(),
             "its next lease is already on the way"
         );
+    }
+
+    // Submit a run whose lease is stale: its worker reports it obsolete on
+    // `events` and is done. While `events` is full the report waits for
+    // room, so the test decides how long the worker stays busy.
+    fn submit_obsolete_run(
+        pool: &OwnedDownloadLanePool,
+        nntp: &Arc<weaver_nntp::NntpClient>,
+        events: &mpsc::Sender<OwnedDownloadLaneEvent>,
+    ) {
+        let (refill_tx, _refill_rx) = mpsc::channel(1);
+        let (parked_tx, _parked_rx) = mpsc::channel(1);
+        pool.submit(
+            Arc::clone(nntp),
+            crate::jobs::handle::SharedPipelineState::new(
+                crate::operations::metrics::PipelineMetrics::new(),
+                Vec::new(),
+            ),
+            events.clone(),
+            refill_tx,
+            parked_tx,
+            test_lease(JobId(7), 1, Vec::new(), vec![tail_work(1, 0)]),
+        )
+        .unwrap_or_else(|_| panic!("a pool with room takes the run"));
+    }
+
+    fn obsolete_report() -> OwnedDownloadLaneEvent {
+        OwnedDownloadLaneEvent::LeaseObsolete {
+            lease: test_lease(JobId(9), 1, Vec::new(), vec![tail_work(1, 0)]),
+        }
+    }
+
+    // Wait for `count` idle publications, whichever workers they come from.
+    fn await_idle(observed: &std_mpsc::Receiver<OwnedLaneObservation>, count: usize) {
+        let mut seen = 0;
+        while seen < count {
+            if let OwnedLaneObservation::Idle(_) = observed.recv().unwrap() {
+                seen += 1;
+            }
+        }
+    }
+
+    // A pool sized for many connections starts no thread until work comes,
+    // and then only as many as the work needs at once.
+    #[test]
+    fn lane_threads_start_on_demand_up_to_the_cap() {
+        let nntp = test_client();
+        let pool = OwnedDownloadLanePool::new(48);
+        let observed = pool.observe();
+        assert_eq!(pool.worker_count(), 48, "the cap is the configured count");
+        assert_eq!(pool.live_worker_count(), 0, "no thread before any work");
+
+        let (events, mut reports) = mpsc::channel(1);
+        events.try_send(obsolete_report()).unwrap();
+        submit_obsolete_run(&pool, &nntp, &events);
+        assert_eq!(observed.recv().unwrap(), OwnedLaneObservation::Spawned(0));
+        assert_eq!(pool.live_worker_count(), 1, "one run, one thread");
+
+        // The first worker cannot finish while `events` is full.
+        submit_obsolete_run(&pool, &nntp, &events);
+        assert_eq!(
+            observed.recv().unwrap(),
+            OwnedLaneObservation::Spawned(1),
+            "a run that finds every live worker busy starts another"
+        );
+        assert_eq!(pool.live_worker_count(), 2);
+
+        for _ in 0..3 {
+            reports.blocking_recv().unwrap();
+        }
+        await_idle(&observed, 2);
+        submit_obsolete_run(&pool, &nntp, &events);
+        assert_eq!(
+            pool.live_worker_count(),
+            2,
+            "an idle worker takes the next run without a new thread"
+        );
+        reports.blocking_recv().unwrap();
+    }
+
+    // A worker idle past the release interval gives up its slot, and the
+    // next run starts a thread in that same slot.
+    #[test]
+    fn an_idle_worker_leaves_and_its_slot_is_reused() {
+        let nntp = test_client();
+        let pool = OwnedDownloadLanePool::with_test_intervals(
+            4,
+            Duration::from_millis(1),
+            Duration::ZERO,
+        );
+        let observed = pool.observe();
+        let (events, mut reports) = mpsc::channel(4);
+
+        submit_obsolete_run(&pool, &nntp, &events);
+        assert_eq!(observed.recv().unwrap(), OwnedLaneObservation::Spawned(0));
+        reports.blocking_recv().unwrap();
+        assert_eq!(observed.recv().unwrap(), OwnedLaneObservation::Idle(0));
+        assert_eq!(observed.recv().unwrap(), OwnedLaneObservation::Vacated(0));
+        assert_eq!(pool.live_worker_count(), 0, "the thread is gone");
+
+        submit_obsolete_run(&pool, &nntp, &events);
+        assert_eq!(
+            observed.recv().unwrap(),
+            OwnedLaneObservation::Spawned(0),
+            "the vacated slot is the one reused"
+        );
+        reports.blocking_recv().unwrap();
+    }
+
+    // A leaving worker counts against the cap until its slot is empty, so a
+    // run queued while it let its connection go may have been queued for
+    // it. It takes that run instead of leaving; with nothing queued it goes.
+    #[test]
+    fn a_leaving_worker_takes_work_queued_on_its_way_out() {
+        let nntp = test_client();
+        let mut shared = shared_with(vec![idle_with(None)]);
+
+        assert!(matches!(
+            shared.begin_release(seat(0)),
+            OwnedLaneRelease::Withdrawn
+        ));
+        let run = test_run(&nntp, Vec::new());
+        assert!(
+            shared.claim_worker_for(&run).is_none(),
+            "a withdrawn worker is offered nothing"
+        );
+        shared.queued_runs.push_back(QueuedOwnedLaneWork::Run(run));
+        assert!(matches!(
+            shared.finish_release(seat(0)),
+            OwnedLaneRelease::Work(QueuedOwnedLaneWork::Run(_))
+        ));
+        assert!(shared.workers[0].is_some(), "it keeps its slot to run it");
+
+        assert!(shared.take_queued_run_or_publish_idle(seat(0), None).is_none());
+        assert!(matches!(
+            shared.begin_release(seat(0)),
+            OwnedLaneRelease::Withdrawn
+        ));
+        assert!(matches!(
+            shared.finish_release(seat(0)),
+            OwnedLaneRelease::Left
+        ));
+        assert!(shared.workers.is_empty(), "the slot is vacated");
+    }
+
+    // Queued work found as a worker starts to leave is taken at once.
+    #[test]
+    fn a_worker_about_to_leave_takes_queued_work_first() {
+        let nntp = test_client();
+        let mut shared = shared_with(vec![idle_with(None)]);
+        shared
+            .queued_runs
+            .push_back(QueuedOwnedLaneWork::Run(test_run(&nntp, Vec::new())));
+
+        assert!(matches!(
+            shared.begin_release(seat(0)),
+            OwnedLaneRelease::Work(QueuedOwnedLaneWork::Run(_))
+        ));
+        assert!(slot(&shared, 0).idle.is_none(), "it is busy with the run");
+    }
+
+    // A worker claimed for a run does not leave: the run is already in its
+    // channel.
+    #[test]
+    fn a_claimed_worker_stays_for_its_run() {
+        let nntp = test_client();
+        let mut shared = shared_with(vec![idle_with(None)]);
+
+        assert_eq!(shared.claim_worker_for(&test_run(&nntp, Vec::new())), Some(0));
+        assert!(matches!(
+            shared.begin_release(seat(0)),
+            OwnedLaneRelease::Stay
+        ));
+        assert!(shared.workers[0].is_some());
+    }
+
+    // A worker a resize sent away must not publish itself into a slot a
+    // later worker has taken.
+    #[test]
+    fn a_departed_worker_never_publishes_into_its_successor_s_slot() {
+        let mut shared = shared_with(vec![None]);
+        shared.workers[0].as_mut().unwrap().id = 5;
+
+        assert!(shared.take_queued_run_or_publish_idle(seat(0), None).is_none());
+        assert!(slot(&shared, 0).idle.is_none(), "the successor stays busy");
+        shared.vacate(seat(0));
+        assert!(shared.workers[0].is_some(), "nor can it vacate the slot");
     }
 }
 

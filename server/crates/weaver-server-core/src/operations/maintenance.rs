@@ -10,15 +10,21 @@ use std::time::{Duration, SystemTime};
 use crate::Database;
 use crate::persistence::maintenance::DbMaintenanceOptions;
 use crate::persistence::sql_runtime::SqlEngine;
+use crate::runtime::StartupDiskGate;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const STALE_STAGING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+// The first pass waits for `startup_disk_work` to open: a database
+// checkpoint and a staging sweep at the same moment as the startup disk probe
+// would skew the probe and stall the disk while the service comes up.
 pub fn spawn_maintenance_worker(
     db: Database,
     complete_dir: PathBuf,
+    startup_disk_work: StartupDiskGate,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        startup_disk_work.wait().await;
         run_maintenance_pass(db.clone(), complete_dir.clone()).await;
 
         let mut interval = tokio::time::interval_at(

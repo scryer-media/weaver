@@ -114,6 +114,7 @@ impl Harness {
             state,
             db.clone(),
             config,
+            weaver_server_core::runtime::StartupDiskGate::opened(),
         )
         .await
         .unwrap();

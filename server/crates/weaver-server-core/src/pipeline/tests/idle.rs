@@ -94,6 +94,7 @@ async fn idle_pipeline(
         shared_state.clone(),
         db,
         config,
+        crate::runtime::StartupDiskGate::opened(),
     )
     .await
     .unwrap();

@@ -137,6 +137,42 @@ async fn update_random_read_iops_reaches_scheduler() {
 }
 
 #[tokio::test]
+async fn update_disk_measurement_publishes_both_figures() {
+    let (handle, task) = test_scheduler().await;
+    let published = |handle: &SchedulerHandle| {
+        handle.state.queue.read(|inner| {
+            (
+                inner.globals.random_read_iops,
+                inner.globals.sequential_write_mbps,
+            )
+        })
+    };
+
+    handle
+        .update_disk_measurement(crate::runtime::DiskMeasurement {
+            sequential_write_mbps: 80.0,
+            random_read_iops: 1_500.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(published(&handle), (Some(1_500.0), Some(80.0)));
+
+    // A pinned read figure comes with no write measurement, which leaves
+    // the last measured one in place.
+    handle
+        .update_disk_measurement(crate::runtime::DiskMeasurement {
+            sequential_write_mbps: 0.0,
+            random_read_iops: 900.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(published(&handle), (Some(900.0), Some(80.0)));
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn add_and_list_jobs() {
     let (handle, task) = test_scheduler().await;
 

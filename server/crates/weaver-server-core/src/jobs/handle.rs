@@ -1635,6 +1635,22 @@ impl SchedulerHandle {
     }
 
     // Update disk tuning after the background startup measurement completes.
+    // A zero write throughput means it was not measured and is not applied.
+    pub async fn update_disk_measurement(
+        &self,
+        measurement: crate::runtime::DiskMeasurement,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.random_read_iops = Some(measurement.random_read_iops);
+            if measurement.sequential_write_mbps > 0.0 {
+                inner.globals.sequential_write_mbps = Some(measurement.sequential_write_mbps);
+            }
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    // Update read IOPS alone.
     pub async fn update_random_read_iops(
         &self,
         random_read_iops: f64,
