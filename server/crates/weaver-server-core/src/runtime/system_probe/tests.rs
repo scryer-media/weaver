@@ -253,6 +253,20 @@ fn probe_reads_stay_aligned_inside_what_was_written() {
     }
 }
 
+// A read that fails or comes up short returns almost at once, so counting it
+// would report impossibly high IOPS. Reading past the end of a real file makes
+// every platform's read path hit that case.
+#[test]
+fn a_read_that_does_not_fill_the_block_ends_the_measurement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(DISK_PROBE_FILE);
+    let len = 64 * PROBE_READ_SIZE as u64;
+    std::fs::write(&path, vec![7u8; len as usize]).unwrap();
+
+    assert!(measure_random_read(&path, len).is_some_and(|iops| iops > 0.0));
+    assert_eq!(measure_random_read(&path, 1 << 40), None);
+}
+
 // The gate lets a blocked thread, an async task and a registered callback
 // through when it opens, and anything that comes later straight through.
 #[tokio::test]
@@ -268,7 +282,10 @@ async fn the_startup_disk_gate_releases_every_kind_of_waiter() {
         let gate = gate.clone();
         tokio::spawn(async move { gate.wait().await })
     };
-    assert!(called_rx.try_recv().is_err(), "nothing passes a closed gate");
+    assert!(
+        called_rx.try_recv().is_err(),
+        "nothing passes a closed gate"
+    );
 
     drop(StartupDiskGateOpener::new(gate.clone()));
 
@@ -280,7 +297,9 @@ async fn the_startup_disk_gate_releases_every_kind_of_waiter() {
     gate.wait_blocking();
     let (late_tx, late_rx) = std::sync::mpsc::channel();
     gate.on_open(move || late_tx.send(()).unwrap());
-    late_rx.try_recv().expect("a callback on an open gate runs at once");
+    late_rx
+        .try_recv()
+        .expect("a callback on an open gate runs at once");
 }
 
 #[test]

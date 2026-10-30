@@ -583,13 +583,18 @@ impl OwnedDownloadLanePool {
             return Err(run.initial_lease);
         }
         let claimed = shared.claim_worker_for(&run);
-        route_owned_lane_work(&self.shared, &mut shared, claimed, QueuedOwnedLaneWork::Run(run))
-            .map_err(|work| match work {
-                QueuedOwnedLaneWork::Run(run) => run.initial_lease,
-                QueuedOwnedLaneWork::Probe(_) => {
-                    unreachable!("only a run is routed from submit")
-                }
-            })
+        route_owned_lane_work(
+            &self.shared,
+            &mut shared,
+            claimed,
+            QueuedOwnedLaneWork::Run(run),
+        )
+        .map_err(|work| match work {
+            QueuedOwnedLaneWork::Run(run) => run.initial_lease,
+            QueuedOwnedLaneWork::Probe(_) => {
+                unreachable!("only a run is routed from submit")
+            }
+        })
     }
 
     // Ask `ids`, the unfound articles of `batch`, on `seat`: the seat the
@@ -3136,7 +3141,11 @@ mod routing_tests {
                 ))
         );
         assert!(slot(&shared, 1).idle.is_none(), "worker 1 is running it");
-        assert!(shared.take_queued_run_or_publish_idle(seat(0), None).is_none());
+        assert!(
+            shared
+                .take_queued_run_or_publish_idle(seat(0), None)
+                .is_none()
+        );
         assert!(slot(&shared, 0).idle.is_some());
     }
 
@@ -3548,11 +3557,8 @@ mod routing_tests {
     #[test]
     fn an_idle_worker_leaves_and_its_slot_is_reused() {
         let nntp = test_client();
-        let pool = OwnedDownloadLanePool::with_test_intervals(
-            4,
-            Duration::from_millis(1),
-            Duration::ZERO,
-        );
+        let pool =
+            OwnedDownloadLanePool::with_test_intervals(4, Duration::from_millis(1), Duration::ZERO);
         let observed = pool.observe();
         let (events, mut reports) = mpsc::channel(4);
 
@@ -3596,7 +3602,11 @@ mod routing_tests {
         ));
         assert!(shared.workers[0].is_some(), "it keeps its slot to run it");
 
-        assert!(shared.take_queued_run_or_publish_idle(seat(0), None).is_none());
+        assert!(
+            shared
+                .take_queued_run_or_publish_idle(seat(0), None)
+                .is_none()
+        );
         assert!(matches!(
             shared.begin_release(seat(0)),
             OwnedLaneRelease::Withdrawn
@@ -3631,7 +3641,10 @@ mod routing_tests {
         let nntp = test_client();
         let mut shared = shared_with(vec![idle_with(None)]);
 
-        assert_eq!(shared.claim_worker_for(&test_run(&nntp, Vec::new())), Some(0));
+        assert_eq!(
+            shared.claim_worker_for(&test_run(&nntp, Vec::new())),
+            Some(0)
+        );
         assert!(matches!(
             shared.begin_release(seat(0)),
             OwnedLaneRelease::Stay
@@ -3646,7 +3659,11 @@ mod routing_tests {
         let mut shared = shared_with(vec![None]);
         shared.workers[0].as_mut().unwrap().id = 5;
 
-        assert!(shared.take_queued_run_or_publish_idle(seat(0), None).is_none());
+        assert!(
+            shared
+                .take_queued_run_or_publish_idle(seat(0), None)
+                .is_none()
+        );
         assert!(slot(&shared, 0).idle.is_none(), "the successor stays busy");
         shared.vacate(seat(0));
         assert!(shared.workers[0].is_some(), "nor can it vacate the slot");

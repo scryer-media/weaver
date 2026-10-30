@@ -819,6 +819,20 @@ fn reads_per_second(elapsed: f64) -> f64 {
     }
 }
 
+// Times one read per offset. `read` reports whether it got the whole block; a
+// read that failed or came up short ends the measurement, because it returns
+// far faster than the device and would read as impossibly high IOPS.
+#[cfg(any(unix, windows))]
+fn timed_reads(offsets: Vec<u64>, mut read: impl FnMut(u64) -> bool) -> Option<f64> {
+    let start = Instant::now();
+    for offset in offsets {
+        if !read(offset) {
+            return None;
+        }
+    }
+    Some(reads_per_second(start.elapsed().as_secs_f64()))
+}
+
 // Random 4 KiB `pread`s. The file's cached pages are dropped first where the
 // platform can be asked to, so the reads reach the device.
 #[cfg(unix)]
@@ -836,20 +850,19 @@ fn measure_random_read(path: &Path, file_len: u64) -> Option<f64> {
     let offsets = probe_read_offsets(file_len);
     let mut read_buf = [0u8; PROBE_READ_SIZE];
 
-    let start = Instant::now();
-    for offset in offsets {
+    timed_reads(offsets, |offset| {
         // SAFETY: `read_buf` is a live, writable buffer of PROBE_READ_SIZE
         // bytes and `raw_fd` stays open for the loop.
-        unsafe {
+        let read = unsafe {
             libc::pread(
                 raw_fd,
                 read_buf.as_mut_ptr() as *mut libc::c_void,
                 PROBE_READ_SIZE,
                 offset as libc::off_t,
-            );
-        }
-    }
-    Some(reads_per_second(start.elapsed().as_secs_f64()))
+            )
+        };
+        read == PROBE_READ_SIZE as isize
+    })
 }
 
 // Random 4 KiB positional reads with the system cache bypassed. Unbuffered
@@ -868,12 +881,13 @@ fn measure_random_read(path: &Path, file_len: u64) -> Option<f64> {
     let mut read_buf = AlignedProbeBuffer::new(PROBE_READ_SIZE, PROBE_READ_SIZE)?;
     let offsets = probe_read_offsets(file_len);
 
-    let start = Instant::now();
-    for offset in offsets {
+    timed_reads(offsets, |offset| {
         // `seek_read` is the positional read: it does not move the cursor.
-        let _ = file.seek_read(read_buf.as_mut_slice(), offset);
-    }
-    Some(reads_per_second(start.elapsed().as_secs_f64()))
+        matches!(
+            file.seek_read(read_buf.as_mut_slice(), offset),
+            Ok(PROBE_READ_SIZE)
+        )
+    })
 }
 
 // Fallback for platforms without a positional-read benchmark: assume

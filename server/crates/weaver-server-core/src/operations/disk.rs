@@ -710,7 +710,9 @@ impl StorageCapacity {
             let thread_gate = startup_disk_work.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("weaver-capacity-{}", slot.root.label()))
-                .spawn(move || run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate));
+                .spawn(move || {
+                    run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate)
+                });
             if let Err(error) = spawned {
                 warn!(
                     root = slot.root.label(),
