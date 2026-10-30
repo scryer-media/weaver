@@ -27,7 +27,8 @@ use weaver_server_core::categories::{
     CategoryConfig, completion_parent, validate_category_path_component,
 };
 use weaver_server_core::ingest::{Kind, classify};
-use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+use weaver_server_core::jobs::ids::JobId;
+use weaver_server_core::jobs::{HoldOrigin, HoldOwner, QueueMoveTarget};
 use weaver_server_core::operations::probe_disk_space;
 use weaver_server_core::proxies::{Bandwidth, ResolvedBy, TorrentScope};
 use weaver_server_core::proxies::{DiscoveredInterface, InterfaceSource, SystemInterfaceSource};
@@ -40,10 +41,11 @@ use weaver_server_core::settings::{
 };
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::{
-    ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
+    ActionError, AddError, AddRequest, Placement, SeedingSource, TorrentService, TorrentSettings,
+    TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
+    ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
     TorrentTracker, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
@@ -947,9 +949,12 @@ async fn torrents(
         "downloadLimit" => rate_limits(ctx, params, |view| view.download_limit).await,
         "setUploadLimit" => set_rate_limit(ctx, params, Direction::Upload).await,
         "setDownloadLimit" => set_rate_limit(ctx, params, Direction::Download).await,
-        "increasePrio" | "decreasePrio" | "topPrio" | "bottomPrio" => {
-            text(StatusCode::CONFLICT, "Torrent queueing must be enabled")
-        }
+        // qBittorrent `increasePrioAction` and the others: up is toward the
+        // front of the download queue.
+        "increasePrio" => move_in_queue(ctx, params, QueueMoveTarget::Offset(-1)).await,
+        "decreasePrio" => move_in_queue(ctx, params, QueueMoveTarget::Offset(1)).await,
+        "topPrio" => move_in_queue(ctx, params, QueueMoveTarget::Top).await,
+        "bottomPrio" => move_in_queue(ctx, params, QueueMoveTarget::Bottom).await,
         "setLocation" => set_location(ctx, params, "hashes", "location").await,
         "setSavePath" => set_location(ctx, params, "id", "path").await,
         // A torrent is written where it is saved: no download path is
@@ -1271,8 +1276,9 @@ pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
         ),
         ("dlspeed", json!(view.download_bps)),
         ("upspeed", json!(view.upload_bps)),
-        // Queueing is off: no torrent has a place in a queue.
-        ("priority", json!(0)),
+        // Its place in the download queue from 1, and 0 for a seed, which
+        // has none (qBittorrent `serialize_torrent.cpp`, `adjustQueuePosition`).
+        ("priority", json!(view.queue_position.unwrap_or(0))),
         ("num_seeds", json!(view.seeds)),
         (
             "num_complete",
@@ -2164,6 +2170,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .unwrap_or(false);
     let sequential = params.flag("sequentialDownload").unwrap_or(false);
     let first_last = params.flag("firstLastPiecePrio").unwrap_or(false);
+    let placement = placement(&params);
     let mut ids = Vec::new();
     let mut failed = 0usize;
     let mut refusal: Option<String> = None;
@@ -2180,6 +2187,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
                     metadata: Vec::new(),
                     upload_limit,
                     download_limit,
+                    placement: placement.clone(),
                 })
                 .await
                 .map_err(|error| match error {
@@ -2213,6 +2221,43 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         return text(StatusCode::BAD_REQUEST, "no torrents or urls");
     }
     ctx.api().added(&ids, failed, refusal)
+}
+
+// Where an added torrent's files go, as qBittorrent `addAction` and
+// `SessionImpl::addTorrent` read it. A save path is taken unless `autoTMM`
+// asks for the category's; with no `autoTMM` qBittorrent manages a torrent
+// by hand. A download path is taken unless `useDownloadPath` turns it off.
+// `seedMode` seeds the files as they are; `skip_checking`, the name the
+// qBittorrent API documents for it and many clients send, means the same. A layout
+// qBittorrent does not name is its default, `Original`, and with no
+// `contentLayout` the older `root_folder` picks one.
+fn placement(params: &Params) -> Placement {
+    let managed = params.flag_value("autoTMM").unwrap_or(false);
+    let path = |name: &str| {
+        params
+            .get(name)
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && !managed)
+            .map(str::to_owned)
+    };
+    let layout = match params.get("contentLayout").filter(|value| !value.is_empty()) {
+        Some(value) => Some(ContentLayout::parse(value).unwrap_or(ContentLayout::Original)),
+        None => params.flag_value("root_folder").map(|folder| {
+            if folder {
+                ContentLayout::Subfolder
+            } else {
+                ContentLayout::NoSubfolder
+            }
+        }),
+    };
+    Placement {
+        save_path: path("savepath"),
+        layout,
+        download_path: path("downloadPath")
+            .filter(|_| params.flag_value("useDownloadPath").unwrap_or(true)),
+        seed_mode: params.flag("seedMode").unwrap_or(false)
+            || params.flag("skip_checking").unwrap_or(false),
+    }
 }
 
 // The seeding policy a torrent added to `category` inherits before its
@@ -2405,6 +2450,29 @@ where
     each_of(ctx, ctx.targets(params).await, action).await
 }
 
+// The torrents `hashes` names moved in the download queue together, as
+// qBittorrent moves them (see `TorrentService::reorder`).
+async fn move_in_queue(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    target: QueueMoveTarget,
+) -> Response {
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let job_ids: Vec<JobId> = ctx
+        .targets(params)
+        .await
+        .iter()
+        .map(|view| view.job_id)
+        .collect();
+    match torrents.reorder(&job_ids, target).await {
+        Ok(()) | Err(ActionError::NotFound(_)) => ok(),
+        Err(error @ ActionError::Invalid(_)) => text(StatusCode::CONFLICT, error.to_string()),
+        Err(error) => internal(error),
+    }
+}
+
 // `action` on each of `views`, as `each` does it.
 async fn each_of<F, Fut>(ctx: &TorrentFacadeContext, views: Vec<TorrentView>, action: F) -> Response
 where
@@ -2551,7 +2619,7 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "temp_path_enabled": false,
         "temp_path": "",
         "auto_tmm_enabled": false,
-        "queueing_enabled": false,
+        "queueing_enabled": true,
         "max_active_downloads": torrent.max_active_downloads,
         "max_active_uploads": -1,
         "max_active_torrents": -1,

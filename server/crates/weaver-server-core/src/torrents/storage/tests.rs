@@ -56,6 +56,7 @@ fn unbounded() -> Holds {
 fn storage(dir: &Path, mail: &RunMail) -> Storage {
     Storage {
         working_dir: dir.to_path_buf(),
+        kept_dir: None,
         accountant: accountant(u64::MAX),
         free_disk: CapacityReader::unknown(),
         slots: 1,
@@ -239,7 +240,7 @@ fn a_restored_job_gives_the_session_the_pieces_it_has() {
         1,
     )
     .unwrap();
-    let have = initial_have(&restored.job).unwrap();
+    let have = initial_have(&restored.job, false).unwrap();
     assert_eq!(have.len(), 5);
     // Piece 4 came before piece 3, which carries the front of c's file: it
     // is in c's file all the same, so the restart has it.
@@ -392,12 +393,13 @@ async fn a_failed_piece_under_an_archive_reopens_it_until_fetched_again() {
         assert!(!job.namespace().get(MemberId(0)).unwrap().closed);
         assert!(job.phase() != RootPhase::Done);
     });
+    // Out of hand, it reads as the file on disk holds it, as libtorrent's
+    // storage reads whatever the bitfield says: the session checks what it
+    // reads and serves only the pieces it has.
     let range = shim.layout.piece_range(piece);
-    assert!(
-        shim.storage
-            .pread_exact(0, range.start, &mut [0; 8])
-            .is_err()
-    );
+    let mut read = [0; 8];
+    shim.storage.pread_exact(0, range.start, &mut read).unwrap();
+    assert_eq!(read, archive[range.start as usize..][..8]);
 
     shim.complete(piece, archive);
     shim.settle().await;
@@ -414,6 +416,119 @@ async fn a_failed_piece_under_an_archive_reopens_it_until_fetched_again() {
             "piece {piece}"
         );
     }
+}
+
+// The job's side of the storage, where the placed files read as `placed`
+// says, whatever the file on disk holds: a write of what was adopted would
+// put those bytes on disk.
+struct Placed {
+    job: Arc<TorrentJob>,
+    placed: Vec<u8>,
+    // Held while a seed-mode session's hold would be; whether it was held at
+    // each read of the files and at each taking in.
+    hold: std::sync::Mutex<()>,
+    reads_held: std::sync::Mutex<Vec<bool>>,
+    takes_held: std::sync::Mutex<Vec<bool>>,
+}
+
+impl Placed {
+    fn new(job: &Arc<TorrentJob>, placed: Vec<u8>) -> Self {
+        Self {
+            job: Arc::clone(job),
+            placed,
+            hold: Default::default(),
+            reads_held: Default::default(),
+            takes_held: Default::default(),
+        }
+    }
+
+    fn held(&self) -> bool {
+        self.hold.try_lock().is_err()
+    }
+}
+
+impl Pieces for Placed {
+    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+        self.job.verified(shares)
+    }
+
+    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        self.job.failed(piece)
+    }
+
+    fn checking(&self) -> anyhow::Result<bool> {
+        self.job.checking()
+    }
+
+    fn found(&self, piece: u32) -> anyhow::Result<bool> {
+        self.job.found(piece)
+    }
+
+    fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        self.job.posted(volume, range, into)
+    }
+
+    fn placed(&self, _: VolumeIndex, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.reads_held.lock().unwrap().push(self.held());
+        buf.copy_from_slice(&self.placed[offset as usize..][..buf.len()]);
+        Ok(())
+    }
+
+    fn had(&self, piece: u32) -> bool {
+        self.job.had(piece)
+    }
+
+    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+        self.takes_held.lock().unwrap().push(self.held());
+        self.job.adopted(shares)
+    }
+}
+
+// libtorrent `torrent::on_piece_hashed`: a piece the check found on disk is
+// had (`we_have`) and nothing is written. Each piece adopted from where the
+// files were placed is in hand, the job completes, and the file keeps the
+// bytes it had.
+#[tokio::test]
+async fn an_adopted_piece_is_had_and_not_written_back() {
+    let mut shim = shim(1024, vec![file("a.bin", 3000)]);
+    let on_disk = vec![0; 3000];
+    std::fs::write(shim.dir.path().join("a.bin"), &on_disk).unwrap();
+    let placed = Placed::new(&shim.job, noise(3000, 5));
+    for piece in 0..shim.layout.piece_count() {
+        super::adopt(&shim.layout, &placed, piece).unwrap();
+        assert!(placed.had(piece), "piece {piece}");
+    }
+    shim.settle().await;
+    assert!(shim.job.with(|job| job.have().all()));
+    assert_eq!(
+        std::fs::read(shim.dir.path().join("a.bin")).unwrap(),
+        on_disk
+    );
+}
+
+// libtorrent `peer_connection::fill_send_buffer` hashes a seed-mode piece
+// on the disk thread (`disk_interface::async_hash`) and no lock of the
+// torrent waits on it. A placed piece adopted under a seed-mode hold is read
+// from the files before the hold is taken, and only taken in under it; one
+// the hold refuses, seed mode having ended, is read and not taken.
+#[tokio::test]
+async fn an_adoption_under_seed_mode_reads_the_files_outside_its_hold() {
+    let shim = shim(1024, vec![file("a.bin", 3000)]);
+    let placed = Placed::new(&shim.job, noise(3000, 6));
+    let under_hold = |take: &mut dyn FnMut() -> anyhow::Result<()>| {
+        let _held = placed.hold.lock().unwrap();
+        Some(take())
+    };
+    super::adopt_under(&shim.layout, &placed, 0, under_hold)
+        .unwrap()
+        .unwrap();
+    assert!(placed.had(0));
+    assert_eq!(*placed.reads_held.lock().unwrap(), [false]);
+    assert_eq!(*placed.takes_held.lock().unwrap(), [true]);
+
+    assert!(super::adopt_under(&shim.layout, &placed, 1, |_| None).is_none());
+    assert!(!placed.had(1));
+    assert_eq!(placed.takes_held.lock().unwrap().len(), 1);
 }
 
 // The job's side of the storage, telling the test when every piece is in.

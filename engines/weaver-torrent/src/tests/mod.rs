@@ -16,6 +16,7 @@ mod e2e_pause;
 mod e2e_peers;
 mod e2e_piece_priority;
 mod e2e_ratelimits;
+mod e2e_seed_mode;
 mod e2e_session_stop;
 mod e2e_socket_factory;
 mod e2e_ssl;

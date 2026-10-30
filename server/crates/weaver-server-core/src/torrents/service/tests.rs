@@ -202,6 +202,7 @@ fn request(source: AddSource) -> AddRequest {
         metadata: Vec::new(),
         upload_limit: None,
         download_limit: None,
+        placement: Default::default(),
     }
 }
 
@@ -395,20 +396,20 @@ async fn the_queues_actions_reach_a_torrent() {
         Err(crate::SchedulerError::InvalidInput(_))
     ));
 
+    // A move changes its place in the queue and never forces it.
     queue
         .reorder_job(job_id, QueueMoveTarget::Top)
         .await
         .unwrap();
-    assert!(record(&rig).forced);
     queue
         .reorder_jobs(vec![(job_id, QueueMoveTarget::Bottom)])
         .await
         .unwrap();
+    queue
+        .reorder_job(job_id, QueueMoveTarget::Offset(1))
+        .await
+        .unwrap();
     assert!(!record(&rig).forced);
-    assert!(matches!(
-        queue.reorder_job(job_id, QueueMoveTarget::Offset(1)).await,
-        Err(crate::SchedulerError::InvalidInput(_))
-    ));
 
     queue.cancel_job_keeping_files(job_id).await.unwrap();
     assert_eq!(rig.db.get_torrent(job_id).unwrap(), None);
@@ -472,6 +473,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         added_at_ms: EPOCH_MS,
         completed_at_ms: None,
         storage_dir: None,
+        files_dir: None,
+        queue_position: None,
         seeding_left: None,
         route: None,
         files: Vec::new(),
@@ -4486,6 +4489,115 @@ async fn the_download_limit_counts_downloading_torrents_as_it_is_set() {
     assert_eq!(queued().await, [false, false, false, false]);
 }
 
+// The torrents still downloading keep their own order, kept with them: the
+// first in it download up to the limit, a forced one runs past it, a seed
+// stands outside it, and a move takes the torrents named as qBittorrent's
+// queue actions do, keeping their order among themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
+    use crate::jobs::handle::QueueMoveTarget;
+
+    let rig = rig(set_clock());
+    // No session is built while the route is down.
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let mut ids = Vec::new();
+    for seed in 1..=5 {
+        ids.push(
+            rig.service
+                .add(request(AddSource::Metainfo(plain(
+                    &format!("set{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap(),
+        );
+    }
+    let [a, b, c, d, e] = ids[..] else {
+        unreachable!()
+    };
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&e)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+    let mut settings = rig.service.settings();
+    settings.torrent.max_active_downloads = 1;
+    rig.service.set_settings(settings).await;
+
+    let queued = || async {
+        let live = rig.service.inner.live.lock().await;
+        ids.iter().map(|id| live[id].queued).collect::<Vec<_>>()
+    };
+    let places = || async {
+        let mut places = Vec::new();
+        for id in &ids {
+            places.push(rig.service.torrent(*id).await.unwrap().queue_position);
+        }
+        places
+    };
+    // The order a restart would bring back, the seed's place left as it was.
+    let kept = || {
+        let mut kept: Vec<(i64, JobId)> = ids
+            .iter()
+            .map(|id| (rig.db.get_torrent(*id).unwrap().unwrap().queue_position, *id))
+            .collect();
+        kept.sort();
+        kept.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+    };
+
+    assert_eq!(queued().await, [false, true, true, true, false]);
+    assert_eq!(places().await, [Some(1), Some(2), Some(3), Some(4), None]);
+
+    rig.service.reorder(&[c], QueueMoveTarget::Top).await.unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+    assert_eq!(queued().await, [true, true, false, true, false]);
+    assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
+
+    // Up one each, the first first, so the two keep their order.
+    rig.service
+        .reorder(&[b, a], QueueMoveTarget::Offset(-1))
+        .await
+        .unwrap();
+    assert_eq!(kept(), [a, b, c, d, e]);
+    // Down one each, the last first.
+    rig.service
+        .reorder(&[a, b], QueueMoveTarget::Offset(1))
+        .await
+        .unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+    // To the bottom the first first, to the top the last first.
+    rig.service
+        .reorder(&[a, c], QueueMoveTarget::Bottom)
+        .await
+        .unwrap();
+    assert_eq!(kept(), [b, d, c, a, e]);
+    rig.service
+        .reorder(&[a, c], QueueMoveTarget::Top)
+        .await
+        .unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+
+    // A seed has no place to move to.
+    rig.service.reorder(&[e], QueueMoveTarget::Top).await.unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+    assert!(matches!(
+        rig.service
+            .reorder(&[JobId(9_999)], QueueMoveTarget::Top)
+            .await,
+        Err(ActionError::NotFound(JobId(9_999)))
+    ));
+
+    // A forced torrent runs past the limit and keeps its place.
+    rig.service.set_forced(d, true).await.unwrap();
+    assert_eq!(queued().await, [true, true, false, false, false]);
+    assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
+}
+
 #[test]
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {
@@ -4508,6 +4620,12 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         download_limit: None,
         sequential: false,
         first_last_piece_first: false,
+        save_path: None,
+        content_layout: None,
+        files_dir: None,
+        seed_mode: false,
+        move_to: None,
+        queue_position: 0,
     };
     let mut rules = vec![TrackerRule {
         id: 1,
@@ -7007,5 +7125,160 @@ async fn a_torrent_given_its_session_is_published_in_it_open() {
         "{job:?}"
     );
     assert!(job.session.is_some_and(|session| session.open), "{job:?}");
+    rig.service.stop().await;
+}
+
+// A torrent of one file, `a.bin`, under a folder of its own, `placed`, and
+// that file's bytes: four pieces.
+fn placed_torrent() -> (Vec<u8>, Vec<u8>) {
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 241) as u8).collect();
+    let metainfo = metainfo("placed", &[("a.bin", data.as_slice())], 16_384, true);
+    (metainfo, data)
+}
+
+// The torrent added with `placement`, its view once it seeds, as the queue
+// publishes it.
+async fn seeding_placed(rig: &Rig, metainfo: Vec<u8>, placement: Placement) -> (JobId, TorrentView) {
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            placement,
+            ..request(AddSource::Metainfo(metainfo))
+        })
+        .await
+        .unwrap();
+    let view = seeding_view(&rig.service, &mut changes, job_id).await;
+    (job_id, view)
+}
+
+// qBittorrent `addAction` with a save path: the files under it are the
+// torrent's, laid out as its metainfo lists them, and the check as it is
+// added finds them. Nothing is fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_added_at_a_save_path_has_the_files_already_there() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("placed-here");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+
+    let (_, view) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let total = data.len() as u64;
+    assert_eq!(
+        (view.have_bytes, view.downloaded_bytes, view.progress),
+        (total, 0, 1.0)
+    );
+    assert_eq!(
+        view.storage_dir.as_deref(),
+        Some(save.join("placed").to_string_lossy().as_ref())
+    );
+    assert_eq!(std::fs::read(save.join("placed/a.bin")).unwrap(), data);
+    rig.service.stop().await;
+}
+
+// qBittorrent `NoSubfolder`: the files sit straight in the save path, with no
+// folder of the torrent's own, and are found there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_laid_out_without_its_folder_has_the_files_in_the_save_path() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), &data).unwrap();
+
+    let (_, view) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let total = data.len() as u64;
+    assert_eq!((view.have_bytes, view.downloaded_bytes), (total, 0));
+    assert_eq!(
+        view.files_dir.as_deref(),
+        Some(save.to_string_lossy().as_ref())
+    );
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    rig.service.stop().await;
+}
+
+// libtorrent `torrent_flags::seed_mode`, as qBittorrent `seedMode` sets it: a
+// torrent whose files are complete where it is added seeds them at once,
+// and its trackers hear it downloaded nothing, as they first hear of it and
+// after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_mode_add_of_complete_files_announces_nothing_downloaded() {
+    use tokio::io::AsyncWriteExt;
+
+    let (metainfo, data) = placed_torrent();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("seeded");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+
+    let (job_id, view) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            seed_mode: true,
+            ..Placement::default()
+        },
+    )
+    .await;
+    let total = data.len() as u64;
+    assert_eq!((view.have_bytes, view.downloaded_bytes), (total, 0));
+    assert!(handle_of(&rig.service, job_id).await.seed_mode());
+
+    tracked(&rig.service, job_id, &url).await;
+    let answer = {
+        let body = "d8:intervali1800e5:peers0:e";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (mut started, request) = heard_request(&listener).await;
+    assert!(request.contains("&downloaded=0&"), "{request}");
+    assert!(request.contains("&left=0&"), "{request}");
+    started.write_all(answer.as_bytes()).await.unwrap();
+    trackers_once(&rig.service, job_id, |announces| {
+        !announces[0].in_flight
+            && announces[0]
+                .last
+                .as_ref()
+                .is_some_and(|last| last.result.is_ok())
+    })
+    .await;
+
+    rig.service.reannounce(job_id).await.unwrap();
+    let (mut next, request) = heard_request(&listener).await;
+    assert!(request.contains("&downloaded=0&"), "{request}");
+    assert!(request.contains("&left=0&"), "{request}");
+    next.write_all(answer.as_bytes()).await.unwrap();
+    assert_eq!(std::fs::read(save.join("placed/a.bin")).unwrap(), data);
     rig.service.stop().await;
 }

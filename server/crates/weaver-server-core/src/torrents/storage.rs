@@ -61,6 +61,21 @@ pub(crate) trait Pieces: Send + Sync {
     // The volume's posted bytes of the range, appended to `into`; false
     // when they are not all in hand.
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool;
+    // The volume's bytes from `offset` as its file on disk holds them,
+    // whether or not they are in hand: files placed before the torrent was
+    // added are read so, for a check to find them or a peer to be served.
+    fn placed(&self, _: VolumeIndex, _: u64, _: &mut [u8]) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+    // Whether every share of the piece is in hand.
+    fn had(&self, _: u32) -> bool {
+        false
+    }
+    // A piece found on disk, where its shares already are: the job takes
+    // them in hand without writing them, and the bytes need no room.
+    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+        self.verified(shares)
+    }
 }
 
 // A graph job over a piece root as the storage's other side. `limit` is the
@@ -186,6 +201,23 @@ impl Pieces for TorrentJob {
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
         self.with(|job| job.posted(volume, range, into))
     }
+
+    fn placed(&self, volume: VolumeIndex, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let path = self.with(|job| job.kept_path(volume));
+        let path = path.ok_or(std::io::ErrorKind::NotFound)?;
+        let file = std::fs::File::open(path)?;
+        crate::pipeline::graph::leaf::read_exact_at(&file, offset, buf)
+    }
+
+    fn had(&self, piece: u32) -> bool {
+        self.with(|job| job.has_piece(piece))
+    }
+
+    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+        Ok(self.step(self.limit, |job, repairs, limit| {
+            job.adopted(shares, repairs, limit)
+        })?)
+    }
 }
 
 // The pieces the job has, as the session takes them to skip checking the
@@ -193,12 +225,18 @@ impl Pieces for TorrentJob {
 // last byte clear, as BEP 3 sends them. None while a check of every piece
 // has not found every piece in hand: the job vouches for nothing then, and
 // the session checks every piece again (libtorrent
-// `torrent::write_resume_data` saves no piece past those checked).
-pub(crate) fn initial_have(job: &GraphJob<PieceRoot>) -> Option<BitBox<u8, Msb0>> {
+// `torrent::write_resume_data` saves no piece past those checked). None
+// too while the job has no piece of files that were `placed` where its
+// client asked: they may be there already, and the check finds them
+// (libtorrent checks the files of a torrent added with no resume data).
+pub(crate) fn initial_have(job: &GraphJob<PieceRoot>, placed: bool) -> Option<BitBox<u8, Msb0>> {
     if job.unchecked() {
         return None;
     }
     let mut have = job.have();
+    if placed && !have.any() {
+        return None;
+    }
     have.set_uninitialized(false);
     Some(have.into_boxed_bitslice())
 }
@@ -320,6 +358,55 @@ impl PieceStorage {
         let last = (start + len as u64).saturating_sub(1) / layout.piece_length();
         Ok((start, (piece == last).then_some(piece as u32)))
     }
+
+    // A piece found on disk that the job did not have goes to it from
+    // there.
+    pub(crate) fn adopt(&self, piece: u32) -> anyhow::Result<()> {
+        adopt(&self.inner.layout, &*self.inner.pieces, piece)
+    }
+}
+
+// A piece the job did not have, found where the files were placed: the job
+// takes its shares as the files on disk hold them.
+pub(crate) fn adopt(layout: &PieceLayout, pieces: &dyn Pieces, piece: u32) -> anyhow::Result<()> {
+    adopt_under(layout, pieces, piece, |take| Some(take())).unwrap_or(Ok(()))
+}
+
+// `adopt`, the job taking the shares in under `keep` (a seed-mode session's
+// `while_seeding`), which is given only that: the files are read before it,
+// so nothing waits on the disk under it. None when `keep` did not take them.
+pub(crate) fn adopt_under(
+    layout: &PieceLayout,
+    pieces: &dyn Pieces,
+    piece: u32,
+    keep: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> Option<anyhow::Result<()>>,
+) -> Option<anyhow::Result<()>> {
+    if pieces.had(piece) {
+        return Some(Ok(()));
+    }
+    let mut bytes = vec![0; layout.piece_range(piece).len() as usize];
+    let mut spans = Vec::new();
+    for span in layout.spans(piece) {
+        let Some(volume) = span.volume else { continue };
+        let at = span.at as usize..span.at as usize + span.range.len() as usize;
+        if let Err(error) = pieces.placed(volume, span.range.start, &mut bytes[at.clone()]) {
+            return Some(Err(error.into()));
+        }
+        spans.push((volume, span.range.start, at));
+    }
+    let bytes = Bytes::from(bytes);
+    let mut shares = Some(
+        spans
+            .into_iter()
+            .map(|(volume, offset, at)| Verified {
+                volume,
+                piece,
+                offset,
+                bytes: bytes.slice(at),
+            })
+            .collect(),
+    );
+    keep(&mut || pieces.adopted(shares.take().unwrap_or_default()))
 }
 
 impl TorrentStorage for PieceStorage {
@@ -350,11 +437,17 @@ impl TorrentStorage for PieceStorage {
         };
         let mut read = Vec::with_capacity(buf.len());
         let range = ByteRange::at(offset, buf.len() as u64);
-        if !self.inner.pieces.posted(volume, range, &mut read) {
-            bail!("{range} of file {file_id} is not in hand");
+        if self.inner.pieces.posted(volume, range, &mut read) {
+            buf.copy_from_slice(&read);
+            return Ok(());
         }
-        buf.copy_from_slice(&read);
-        Ok(())
+        // Not in hand: what the file on disk holds, which the session's
+        // check hashes and which a seed added over placed files serves. A
+        // file not there, or too short, says so as the session reads it.
+        self.inner
+            .pieces
+            .placed(volume, offset, buf)
+            .with_context(|| format!("{range} of file {file_id} is not in hand"))
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
@@ -488,8 +581,12 @@ impl TorrentStorage for PieceStorage {
         Ok(())
     }
 
+    // The check found the piece: had again if the job had it before, and
+    // otherwise found where the files were placed, and taken from there.
     fn on_piece_checked(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
-        self.inner.pieces.found(piece.get())?;
+        if !self.inner.pieces.found(piece.get())? {
+            self.adopt(piece.get())?;
+        }
         Ok(())
     }
 }

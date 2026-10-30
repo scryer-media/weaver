@@ -168,13 +168,12 @@ impl Leaf {
     }
 
     // The job's directory moved from `from` to `to`, the file with it: the
-    // path follows.
+    // path follows. A kept file placed outside the job's directory did not
+    // move, and stays where it is.
     pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
-        let rest = self
-            .path
-            .strip_prefix(from)
-            .expect("a leaf lives under its job's directory");
-        self.path = to.join(rest);
+        if let Ok(rest) = self.path.strip_prefix(from) {
+            self.path = to.join(rest);
+        }
     }
 
     // The member is gone with its subtree.

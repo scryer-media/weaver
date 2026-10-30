@@ -1519,6 +1519,7 @@ async fn add_torrent(
             metadata: Vec::new(),
             upload_limit: None,
             download_limit: None,
+            placement: Default::default(),
         },
     )
     .await?;

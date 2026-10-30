@@ -8,6 +8,7 @@
 pub mod initializing;
 pub mod live;
 pub mod paused;
+pub(crate) mod seed_mode;
 pub mod stats;
 mod streaming;
 pub mod utils;
@@ -161,6 +162,10 @@ pub(crate) struct ManagedTorrentOptions {
     pub sequential: AtomicBool,
     /// [`AddTorrentOptions::trackers_only`](crate::AddTorrentOptions::trackers_only).
     pub trackers_only: bool,
+    /// [`AddTorrentOptions::seed_mode`](crate::AddTorrentOptions::seed_mode),
+    /// while it lasts. Every run checks through this one record, so a piece
+    /// checked once is not checked again after a pause.
+    pub seed: seed_mode::SeedMode,
 }
 
 impl ManagedTorrentOptions {
@@ -705,7 +710,7 @@ impl ManagedTorrent {
 
     // The torrent's next change of state from now on. The wait is enabled
     // here, so a change between this call and its await is not missed.
-    fn next_state_change(&self) -> Pin<Box<Notified<'_>>> {
+    pub(crate) fn next_state_change(&self) -> Pin<Box<Notified<'_>>> {
         let mut changed = Box::pin(self.state_change_notify.notified());
         changed.as_mut().enable();
         changed
@@ -1099,6 +1104,10 @@ impl ManagedTorrent {
             .shared
             .storage_factory
             .create_and_init(self.shared(), &metadata)?;
+        // A check of every piece ends seed mode: from here a piece is had
+        // when the check finds it (libtorrent `torrent::force_recheck` and
+        // `torrent::leave_seed_mode`).
+        self.shared.options.seed.leave();
         // Every piece is forgotten before anything is checked, so nothing
         // the storage saves from here vouches for one the check has not
         // found (libtorrent `torrent::force_recheck`: `set_have_all(false)`,
@@ -1135,6 +1144,20 @@ impl ManagedTorrent {
         g.state = ManagedTorrentState::Initializing(self.checking_everything(&g, peers)?);
         self.state_change_notify.notify_waiters();
         Ok(())
+    }
+
+    /// Whether the torrent is in seed mode (see
+    /// [`crate::AddTorrentOptions::seed_mode`]).
+    pub fn seed_mode(&self) -> bool {
+        self.shared.options.seed.on()
+    }
+
+    /// `f` while the torrent stays in seed mode, which it stays in until `f`
+    /// returns; None once it left it. What the storage is given under it
+    /// cannot cross a check of every piece. Peers' requests wait on `f`, so
+    /// it reads nothing from disk.
+    pub fn while_seeding<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        self.shared.options.seed.while_on(f)
     }
 
     /// A running SSL torrent left without an identity stops its run and
