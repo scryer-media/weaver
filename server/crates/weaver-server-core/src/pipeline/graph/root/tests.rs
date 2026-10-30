@@ -39,6 +39,20 @@ use weaver_graph::recovery::RepairOutcome;
 
 const ZIP_FRONT: &[u8] = b"PK\x03\x04";
 
+#[test]
+fn length_uncertainty_belongs_only_to_posted_root_volumes() {
+    use crate::pipeline::graph::namespace::Segments;
+
+    let mut root = ArticleRoot::new(&[file("ordered.bin", &[100]), file("positioned.bin", &[100])]);
+    root.map.set_ordered_only(VolumeIndex(0));
+    assert!(root.length_uncertain(NodeId::ROOT, VolumeIndex(0)));
+    assert!(!root.length_uncertain(NodeId::ROOT, VolumeIndex(1)));
+    // Recovery can found a root member absent from the post. Its length
+    // comes from recovery metadata, not from ordered article arrival.
+    assert!(!root.length_uncertain(NodeId::ROOT, VolumeIndex(2)));
+    assert!(!root.length_uncertain(NodeId(1), VolumeIndex(0)));
+}
+
 // A stand-in for a format's object: it asks for what it was told to until
 // it is answered, and remembers the answers.
 struct Probe {

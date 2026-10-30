@@ -1,11 +1,15 @@
 {
   "slug": "adv-zip-overlapping-headers",
   "title": "E2E.Adversarial.Zip.Overlapping.Headers.2026-TESTGRP",
-  "description": "Two central directory records pointing at one local header. The job settles with a named verdict and writes nothing outside its output.",
+  "description": "Two central directory records pointing at one local header. A partial delivery may retain only the first, byte-exact member; the aliased member is never delivered.",
   "category": "2000",
   "expected_outcome": "extraction_failure",
   "adversarial": {
     "group": "default",
-    "outcome": "settles"
+    "outcome": "settles",
+    "forbiddenOutputs": ["overlap-b.txt"]
+  },
+  "expectedOutputBLAKE3": {
+    "overlap-a.txt": "e2cd62f51cd9c32a465e77495922caf8c901c5161c765ca5450f815e2c807e1a"
   }
 }
