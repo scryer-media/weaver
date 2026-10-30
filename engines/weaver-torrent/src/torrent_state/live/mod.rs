@@ -971,7 +971,9 @@ impl TorrentStateLive {
             // the list looks again before it is waited on, so a known seed
             // wakes nothing once we seed too (libtorrent
             // `peer_list::connect_one_peer`, `recalculate_connect_candidates`).
-            state.peers.set_finished(state.is_finished_and_no_active_streams());
+            state
+                .peers
+                .set_finished(state.is_finished_and_no_active_streams());
             if !state.wants_peers() {
                 // Nothing to fetch and nothing to give: connect to no one until
                 // the peers are wanted again.
@@ -994,7 +996,9 @@ impl TorrentStateLive {
             let slot = slots.open().await?;
             // The slots may have taken a while: we may have finished since,
             // so the list looks again, and we connect to whoever is due now.
-            state.peers.set_finished(state.is_finished_and_no_active_streams());
+            state
+                .peers
+                .set_finished(state.is_finished_and_no_active_streams());
             let Some((addr, rx, tx)) = state.peers.connect_next(tokio::time::Instant::now()) else {
                 continue;
             };

@@ -7,8 +7,8 @@ use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
-    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord, TorrentSource,
-    TrackerEntry,
+    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord,
+    TorrentSource, TrackerEntry,
 };
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \

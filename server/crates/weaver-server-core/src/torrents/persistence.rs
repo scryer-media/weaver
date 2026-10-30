@@ -152,7 +152,11 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::Bool(torrent.sequential),
         SqlArg::Bool(torrent.first_last_piece_first),
         SqlArg::OptText(torrent.save_path.clone()),
-        SqlArg::OptText(torrent.content_layout.map(|layout| layout.as_str().to_owned())),
+        SqlArg::OptText(
+            torrent
+                .content_layout
+                .map(|layout| layout.as_str().to_owned()),
+        ),
         SqlArg::OptText(torrent.files_dir.clone()),
         SqlArg::Bool(torrent.seed_mode),
         SqlArg::OptText(torrent.move_to.clone()),
@@ -563,11 +567,67 @@ impl Database {
         self.set_torrent_column("files_dir", args)
     }
 
+    // The directory the torrent's files go under, as asked or as it moved.
+    pub fn set_torrent_save_path(
+        &self,
+        job_id: JobId,
+        dir: Option<&str>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(dir.map(str::to_owned)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("save_path", args)
+    }
+
     // The torrent's session left seed mode: from here its pieces are what
-    // its job has.
+    // its job has, and none needs the check it passed in seed mode kept.
     pub fn clear_torrent_seed_mode(&self, job_id: JobId) -> Result<bool, StateError> {
         let args = vec![SqlArg::Bool(false), SqlArg::I64(stored(job_id.0)?)];
-        self.set_torrent_column("seed_mode", args)
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET seed_mode = {}, seed_verified = NULL WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // The pieces that passed their check in seed mode, a bitfield as the
+    // wire's: the first piece the high bit of the first byte (libtorrent's
+    // `verified_pieces` in resume data).
+    pub fn set_torrent_seed_verified(
+        &self,
+        job_id: JobId,
+        pieces: &[u8],
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptBytes(Some(pieces.to_vec())),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("seed_verified", args)
+    }
+
+    // The pieces [`Self::set_torrent_seed_verified`] last kept; None when it
+    // kept none.
+    pub fn torrent_seed_verified(&self, job_id: JobId) -> Result<Option<Vec<u8>>, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT seed_verified FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            Ok(row
+                .map(|row| row.opt_bytes("seed_verified"))
+                .transpose()?
+                .flatten())
+        })
     }
 
     // The torrent moved where it was to move once complete, or will not.
@@ -577,10 +637,15 @@ impl Database {
     }
 
     // Where each torrent stands in the download queue, in one transaction.
-    pub fn set_torrent_queue_positions(&self, positions: &[(JobId, i64)]) -> Result<(), StateError> {
+    pub fn set_torrent_queue_positions(
+        &self,
+        positions: &[(JobId, i64)],
+    ) -> Result<(), StateError> {
         let rows = positions
             .iter()
-            .map(|&(job_id, position)| Ok(vec![SqlArg::I64(position), SqlArg::I64(stored(job_id.0)?)]))
+            .map(|&(job_id, position)| {
+                Ok(vec![SqlArg::I64(position), SqlArg::I64(stored(job_id.0)?)])
+            })
             .collect::<Result<Vec<_>, StateError>>()?;
         let datastore = self.datastore();
         self.run_sql_blocking(async move {

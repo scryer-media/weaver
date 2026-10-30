@@ -409,6 +409,8 @@ fn view(state: TorrentState) -> TorrentView {
         have_bytes: 5,
         uploaded_bytes: 0,
         downloaded_bytes: 5,
+        run_uploaded_bytes: 0,
+        run_downloaded_bytes: 5,
         ratio: 0.0,
         download_bps: 0,
         upload_bps: 0,
@@ -668,6 +670,29 @@ fn content_path_is_the_output_and_save_path_holds_it() {
     assert_eq!(info["eta"], ETA_UNKNOWN);
     assert_eq!(info["added_on"], 1_700_000_000);
     assert_eq!(info["completion_on"], -1);
+}
+
+// libtorrent's `all_time_*` and `total_payload_*`: the totals are the
+// torrent's whole life, the session counters this run's alone.
+#[test]
+fn session_counters_are_this_runs_and_the_totals_all_time() {
+    let resumed = TorrentView {
+        uploaded_bytes: 9000,
+        downloaded_bytes: 7000,
+        run_uploaded_bytes: 300,
+        run_downloaded_bytes: 0,
+        ..view(TorrentState::Seeding)
+    };
+    let info = info(&resumed, CallerScope::Admin);
+    assert_eq!(
+        [
+            &info["uploaded"],
+            &info["downloaded"],
+            &info["uploaded_session"],
+            &info["downloaded_session"]
+        ],
+        [&json!(9000), &json!(7000), &json!(300), &json!(0)]
+    );
 }
 
 #[test]
@@ -930,7 +955,7 @@ async fn login_issues_a_cookie_that_logout_ends() {
         (StatusCode::OK, Api::LATEST.version().as_str())
     );
     let app = rig.send(with_cookie("/api/v2/app/version")).await;
-    assert_eq!(app.body, format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(app.body, "v5.3.0");
 
     rig.send(with_cookie("/api/v2/auth/logout")).await;
     let after = rig.send(with_cookie("/api/v2/app/webapiVersion")).await;
@@ -1420,9 +1445,7 @@ async fn the_priority_actions_move_a_torrent_in_the_queue() {
     rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
     rig.add_file(&metainfo("two.mkv", 3000, false), &[]).await;
     let hash_of = |rows: &[Value], name: &str| {
-        rows.iter()
-            .find(|row| row["name"] == name)
-            .unwrap()["hash"]
+        rows.iter().find(|row| row["name"] == name).unwrap()["hash"]
             .as_str()
             .unwrap()
             .to_owned()
@@ -1443,9 +1466,12 @@ async fn the_priority_actions_move_a_torrent_in_the_queue() {
     let act = |action: &'static str, hash: String| {
         let rig = &rig;
         async move {
-            rig.post(&format!("/api/v2/torrents/{action}"), &format!("hashes={hash}"))
-                .await
-                .status
+            rig.post(
+                &format!("/api/v2/torrents/{action}"),
+                &format!("hashes={hash}"),
+            )
+            .await
+            .status
         }
     };
     assert_eq!(act("topPrio", two.clone()).await, StatusCode::OK);
@@ -1461,6 +1487,69 @@ async fn the_priority_actions_move_a_torrent_in_the_queue() {
 
     let preferences = rig.get("/api/v2/app/preferences").await.json();
     assert_eq!(preferences["queueing_enabled"], true);
+}
+
+// An add with `addToTopOfQueue` takes the top of the queue; one without it,
+// or with a value that is not a boolean, goes to the bottom, as qBittorrent's
+// `isAddTorrentToQueueTop` default leaves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_to_the_top_of_the_queue_takes_the_first_place() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    rig.add_file(
+        &metainfo("two.mkv", 3000, false),
+        &[("addToTopOfQueue", "true")],
+    )
+    .await;
+    rig.add_file(
+        &metainfo("three.mkv", 3000, false),
+        &[("addToTopOfQueue", "yes")],
+    )
+    .await;
+    rig.add_file(
+        &metainfo("four.mkv", 3000, false),
+        &[("addToTopOfQueue", "false")],
+    )
+    .await;
+    let rows = rig.torrents().await;
+    let place = |name: &str| {
+        rows.iter().find(|row| row["name"] == name).unwrap()["priority"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(
+        [
+            place("two.mkv"),
+            place("one.mkv"),
+            place("three.mkv"),
+            place("four.mkv")
+        ],
+        [1, 2, 3, 4]
+    );
+    let preferences = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(preferences["add_to_top_of_queue"], false);
+}
+
+// A relative `savepath` is under the default save path, as qBittorrent
+// `SessionImpl::initLoadTorrentParams` takes one, and reads back absolute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_save_path_is_under_the_default_save_path() {
+    let rig = rig().await;
+    rig.add_file(
+        &metainfo("one.mkv", 3000, false),
+        &[("savepath", "shows"), ("contentLayout", "NoSubfolder")],
+    )
+    .await;
+    let complete = PathBuf::from(rig.config.read().await.complete_dir());
+    let torrent = &rig.torrents().await[0];
+    assert_eq!(
+        Path::new(torrent["save_path"].as_str().unwrap()),
+        complete.join("shows")
+    );
+    assert_eq!(
+        Path::new(torrent["content_path"].as_str().unwrap()),
+        complete.join("shows/one.mkv")
+    );
 }
 
 // qBittorrent's `torrents/recheck` reaches the service's recheck for each
@@ -2063,6 +2152,51 @@ async fn share_limits_are_set_on_add_and_after() {
         )
         .await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+}
+
+// Share limits cleared to the client's "use global" leave the torrent no
+// terms of its own: it seeds to the global goal, mode and action, never
+// with no goal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleared_share_limits_inherit_the_global_policy() {
+    use weaver_server_core::settings::{SeedingAction, SeedingGoalMode};
+
+    let rig = rig().await;
+    let global = SeedingPolicy {
+        ratio_goal: Some(1.0),
+        mode: SeedingGoalMode::All,
+        action: SeedingAction::Remove,
+        ..SeedingPolicy::default()
+    };
+    rig.config.write().await.seeding = Some(global);
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    torrents
+        .set_settings(TorrentSettings::of(&*rig.config.read().await))
+        .await;
+    rig.add_file(
+        &metainfo("one.mkv", 3000, false),
+        &[("ratioLimit", "2"), ("shareLimitAction", "Stop")],
+    )
+    .await;
+    let view = torrents.torrents(None).await.remove(0);
+    assert_eq!(view.seeding_source, SeedingSource::Torrent);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+
+    let cleared = rig
+        .post(
+            "/api/v2/torrents/setShareLimits",
+            &format!(
+                "hashes={hash}&ratioLimit=-2&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2\
+                 &shareLimitsMode=Default&shareLimitAction=Default"
+            ),
+        )
+        .await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    let view = torrents.torrents(None).await.remove(0);
+    assert_eq!(view.seeding_override, None);
+    assert_eq!(view.seeding_source, SeedingSource::Global);
+    assert_eq!(view.seeding_policy, global);
+    assert_eq!(rig.torrents().await[0]["ratio_limit"], -2);
 }
 
 // Each limit is set alone and read back as the client reads it: 0 and any

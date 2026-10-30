@@ -12,6 +12,7 @@ use bitvec::vec::BitVec;
 use parking_lot::Mutex;
 
 use crate::core::lengths::ValidPieceIndex;
+use crate::type_aliases::BF;
 
 #[derive(Debug, Default)]
 pub(crate) struct SeedMode {
@@ -20,11 +21,35 @@ pub(crate) struct SeedMode {
 }
 
 impl SeedMode {
-    // Seed mode over `pieces` pieces, none checked.
-    pub(crate) fn over(pieces: u32) -> Self {
-        Self {
-            unchecked: Mutex::new(Some(BitVec::repeat(true, pieces as usize))),
+    // Seed mode over `pieces` pieces, those `verified` sets already checked
+    // (libtorrent's `verified_pieces` in resume data, restored on a seed-mode
+    // add). With every piece checked there is nothing left to check, and seed
+    // mode is over.
+    pub(crate) fn over(pieces: u32, verified: Option<&BF>) -> Self {
+        let mut unchecked = BitVec::repeat(true, pieces as usize);
+        if let Some(verified) = verified {
+            for piece in verified
+                .iter_ones()
+                .take_while(|&piece| piece < pieces as usize)
+            {
+                unchecked.set(piece, false);
+            }
         }
+        Self {
+            unchecked: Mutex::new(unchecked.any().then_some(unchecked)),
+        }
+    }
+
+    // The pieces that passed their check, while seed mode lasts.
+    pub(crate) fn verified(&self) -> Option<BF> {
+        let unchecked = self.unchecked.lock();
+        let unchecked = unchecked.as_ref()?;
+        let mut verified =
+            BF::from_boxed_slice(vec![0u8; unchecked.len().div_ceil(8)].into_boxed_slice());
+        for piece in unchecked.iter_zeros() {
+            verified.set(piece, true);
+        }
+        Some(verified)
     }
 
     pub(crate) fn on(&self) -> bool {
@@ -64,5 +89,50 @@ impl SeedMode {
     pub(crate) fn while_on<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
         let unchecked = self.unchecked.lock();
         unchecked.is_some().then(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::lengths::Lengths;
+
+    fn bits(pieces: usize, set: &[usize]) -> BF {
+        let mut bits = BF::from_boxed_slice(vec![0u8; pieces.div_ceil(8)].into_boxed_slice());
+        for &piece in set {
+            bits.set(piece, true);
+        }
+        bits
+    }
+
+    // The pieces that passed before a restart are served without a second
+    // check, as libtorrent's restored `verified_pieces` are; the rest wait
+    // for theirs, and the set given back is the one restored and those since.
+    #[test]
+    fn pieces_that_passed_before_are_not_checked_again() {
+        let lengths = Lengths::new(8 * 1024, 1024).unwrap();
+        let piece = |index| lengths.validate_piece_index(index).unwrap();
+        let seed = SeedMode::over(8, Some(&bits(8, &[0, 3])));
+        assert!(seed.on());
+        assert!(!seed.unchecked(piece(0)));
+        assert!(!seed.unchecked(piece(3)));
+        assert!(seed.unchecked(piece(1)));
+        assert_eq!(seed.verified(), Some(bits(8, &[0, 3])));
+
+        assert!(!seed.checked(piece(1)));
+        assert_eq!(seed.verified(), Some(bits(8, &[0, 1, 3])));
+        assert!(seed.leave());
+        assert_eq!(seed.verified(), None);
+    }
+
+    // A set naming every piece leaves nothing to check: seed mode is over
+    // from the start, as it ends once the last piece passed.
+    #[test]
+    fn a_set_naming_every_piece_leaves_seed_mode_over() {
+        let seed = SeedMode::over(9, Some(&bits(9, &(0..9).collect::<Vec<_>>())));
+        assert!(!seed.on());
+        assert_eq!(seed.verified(), None);
+        let fresh = SeedMode::over(9, None);
+        assert_eq!(fresh.verified(), Some(bits(9, &[])));
     }
 }

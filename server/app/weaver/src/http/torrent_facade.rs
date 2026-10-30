@@ -45,8 +45,8 @@ use weaver_server_core::torrents::service::{
     TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TrackerStatus, redacted_tracker_url, status,
+    ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
+    TorrentState, TorrentTracker, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
@@ -63,6 +63,8 @@ const BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_CAP: usize = 1024;
 // The client's "unknown" ETA: 100 days.
 const ETA_UNKNOWN: u64 = 8_640_000;
+// `app/version`: qBittorrent 5.3.0's own string, whose WebAPI is 2.16.2.
+const QBT_VERSION: &str = "v5.3.0";
 
 #[derive(Clone)]
 pub(super) struct TorrentFacadeContext {
@@ -761,7 +763,7 @@ async fn login(
 // The `app` group (qBittorrent `AppController`).
 async fn app(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
     match action {
-        "version" => text(StatusCode::OK, format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "version" => text(StatusCode::OK, QBT_VERSION),
         "webapiVersion" => text(StatusCode::OK, ctx.api().version()),
         "buildInfo" => axum::Json(json!({
             "qt": "", "libtorrent": "", "boost": "", "openssl": "", "zlib": "",
@@ -1305,10 +1307,13 @@ pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
         ("completion_on", json!(when(view.completed_at_ms))),
         ("tracker", json!(current_tracker(view, scope))),
         ("trackers_count", json!(view.trackers.len())),
+        // All time, and this run alone, which a pause resets (qBittorrent
+        // `serialize_torrent.cpp`: `all_time_download` and
+        // `total_payload_download`).
         ("downloaded", json!(view.downloaded_bytes)),
         ("uploaded", json!(view.uploaded_bytes)),
-        ("downloaded_session", json!(view.downloaded_bytes)),
-        ("uploaded_session", json!(view.uploaded_bytes)),
+        ("downloaded_session", json!(view.run_downloaded_bytes)),
+        ("uploaded_session", json!(view.run_uploaded_bytes)),
         ("amount_left", json!(left)),
         ("completed", json!(view.have_bytes)),
         ("connections_count", json!(view.peers)),
@@ -1585,9 +1590,9 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("nb_connections", json!(view.peers)),
         ("nb_connections_limit", json!(view.max_peers)),
         ("total_downloaded", json!(view.downloaded_bytes)),
-        ("total_downloaded_session", json!(view.downloaded_bytes)),
+        ("total_downloaded_session", json!(view.run_downloaded_bytes)),
         ("total_uploaded", json!(view.uploaded_bytes)),
-        ("total_uploaded_session", json!(view.uploaded_bytes)),
+        ("total_uploaded_session", json!(view.run_uploaded_bytes)),
         ("dl_speed", json!(view.download_bps)),
         (
             "dl_speed_avg",
@@ -2170,6 +2175,8 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .unwrap_or(false);
     let sequential = params.flag("sequentialDownload").unwrap_or(false);
     let first_last = params.flag("firstLastPiecePrio").unwrap_or(false);
+    // Off unless asked, as qBittorrent's `isAddTorrentToQueueTop` is.
+    let to_top = params.flag_value("addToTopOfQueue").unwrap_or(false);
     let placement = placement(&params);
     let mut ids = Vec::new();
     let mut failed = 0usize;
@@ -2206,6 +2213,13 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
                 {
                     tracing::warn!(%error, "added torrent did not take first and last pieces first");
                 }
+                // Once it is in the queue, as qBittorrent calls
+                // `queue_position_top` once the torrent is added.
+                if to_top
+                    && let Err(error) = torrents.reorder(&[job_id], QueueMoveTarget::Top).await
+                {
+                    tracing::warn!(%error, "added torrent did not take the top of the queue");
+                }
                 if let Some(view) = torrents.torrent(job_id).await {
                     ids.push(view.infohash.to_ascii_lowercase());
                 }
@@ -2240,7 +2254,10 @@ fn placement(params: &Params) -> Placement {
             .filter(|path| !path.is_empty() && !managed)
             .map(str::to_owned)
     };
-    let layout = match params.get("contentLayout").filter(|value| !value.is_empty()) {
+    let layout = match params
+        .get("contentLayout")
+        .filter(|value| !value.is_empty())
+    {
         Some(value) => Some(ContentLayout::parse(value).unwrap_or(ContentLayout::Original)),
         None => params.flag_value("root_folder").map(|folder| {
             if folder {
@@ -2620,6 +2637,8 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "temp_path": "",
         "auto_tmm_enabled": false,
         "queueing_enabled": true,
+        // An add without `addToTopOfQueue` goes to the bottom.
+        "add_to_top_of_queue": false,
         "max_active_downloads": torrent.max_active_downloads,
         "max_active_uploads": -1,
         "max_active_torrents": -1,

@@ -448,6 +448,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         have_bytes: 1000,
         uploaded_bytes: 0,
         downloaded_bytes: 1000,
+        run_uploaded_bytes: 0,
+        run_downloaded_bytes: 1000,
         ratio: 0.0,
         download_bps: 500,
         upload_bps: 0,
@@ -4544,7 +4546,12 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     let kept = || {
         let mut kept: Vec<(i64, JobId)> = ids
             .iter()
-            .map(|id| (rig.db.get_torrent(*id).unwrap().unwrap().queue_position, *id))
+            .map(|id| {
+                (
+                    rig.db.get_torrent(*id).unwrap().unwrap().queue_position,
+                    *id,
+                )
+            })
             .collect();
         kept.sort();
         kept.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
@@ -4553,7 +4560,10 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     assert_eq!(queued().await, [false, true, true, true, false]);
     assert_eq!(places().await, [Some(1), Some(2), Some(3), Some(4), None]);
 
-    rig.service.reorder(&[c], QueueMoveTarget::Top).await.unwrap();
+    rig.service
+        .reorder(&[c], QueueMoveTarget::Top)
+        .await
+        .unwrap();
     assert_eq!(kept(), [c, a, b, d, e]);
     assert_eq!(queued().await, [true, true, false, true, false]);
     assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
@@ -4583,7 +4593,10 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     assert_eq!(kept(), [c, a, b, d, e]);
 
     // A seed has no place to move to.
-    rig.service.reorder(&[e], QueueMoveTarget::Top).await.unwrap();
+    rig.service
+        .reorder(&[e], QueueMoveTarget::Top)
+        .await
+        .unwrap();
     assert_eq!(kept(), [c, a, b, d, e]);
     assert!(matches!(
         rig.service
@@ -5302,6 +5315,90 @@ async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
         .await
         .unwrap();
     assert_eq!(handle.ratelimits().upload_bps, bps(1_000_000));
+    rig.service.stop().await;
+}
+
+// Seeding terms that set nothing are no terms: a torrent given them, on add
+// or after, inherits its tracker rule's goal, mode and action instead of
+// seeding with no goal under the default ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_seeding_terms_inherit_the_chain() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let ruled = SeedingPolicy {
+        ratio_goal: Some(2.0),
+        mode: SeedingGoalMode::All,
+        action: SeedingAction::Remove,
+        ..SeedingPolicy::default()
+    };
+    rig.db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.test".into(),
+                seeding: Some(ruled),
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
+                ssl: None,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            policy_override: Some(SeedingPolicy::default()),
+            ..request(AddSource::Metainfo(announcing(
+                &plain("ruled", 1),
+                "http://tracker.test/announce",
+            )))
+        })
+        .await
+        .unwrap();
+    let inherits = |view: TorrentView| {
+        assert_eq!(view.seeding_override, None);
+        assert_eq!(
+            view.seeding_source,
+            SeedingSource::TrackerRule("*.test".into())
+        );
+        assert_eq!(view.seeding_policy, ruled);
+    };
+    inherits(rig.service.torrent(job_id).await.unwrap());
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().policy_override,
+        None
+    );
+
+    let own = SeedingPolicy {
+        seed_time_goal_minutes: Some(60),
+        ..SeedingPolicy::default()
+    };
+    rig.service
+        .set_policy_override(job_id, Some(own))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().seeding_source,
+        SeedingSource::Torrent
+    );
+    rig.service
+        .set_policy_override(job_id, Some(SeedingPolicy::default()))
+        .await
+        .unwrap();
+    inherits(rig.service.torrent(job_id).await.unwrap());
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().policy_override,
+        None
+    );
     rig.service.stop().await;
 }
 
@@ -7138,7 +7235,11 @@ fn placed_torrent() -> (Vec<u8>, Vec<u8>) {
 
 // The torrent added with `placement`, its view once it seeds, as the queue
 // publishes it.
-async fn seeding_placed(rig: &Rig, metainfo: Vec<u8>, placement: Placement) -> (JobId, TorrentView) {
+async fn seeding_placed(
+    rig: &Rig,
+    metainfo: Vec<u8>,
+    placement: Placement,
+) -> (JobId, TorrentView) {
     let handle = queue();
     let mut changes = handle.state().subscribe_job_changes();
     rig.service.publish_to(handle);
@@ -7152,6 +7253,49 @@ async fn seeding_placed(rig: &Rig, metainfo: Vec<u8>, placement: Placement) -> (
         .unwrap();
     let view = seeding_view(&rig.service, &mut changes, job_id).await;
     (job_id, view)
+}
+
+// The torrent's view once `holds` holds of it, read as the queue publishes
+// it.
+async fn view_once(
+    service: &TorrentService,
+    changes: &mut watch::Receiver<u64>,
+    job_id: JobId,
+    holds: impl Fn(&TorrentView) -> bool,
+) -> TorrentView {
+    loop {
+        changes.borrow_and_update();
+        let view = service.torrent(job_id).await.unwrap();
+        if holds(&view) {
+            return view;
+        }
+        changes.changed().await.unwrap();
+    }
+}
+
+// The torrent added with `placement`, its view once its job is done and it
+// seeds, and the queue's changes from then on.
+async fn completed_placed(
+    rig: &Rig,
+    metainfo: Vec<u8>,
+    placement: Placement,
+) -> (JobId, TorrentView, watch::Receiver<u64>) {
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            placement,
+            ..request(AddSource::Metainfo(metainfo))
+        })
+        .await
+        .unwrap();
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.state == TorrentState::Seeding && view.completed_at_ms.is_some()
+    })
+    .await;
+    (job_id, view, changes)
 }
 
 // qBittorrent `addAction` with a save path: the files under it are the
@@ -7219,6 +7363,319 @@ async fn a_torrent_laid_out_without_its_folder_has_the_files_in_the_save_path() 
     );
     assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
     rig.service.stop().await;
+}
+
+// qBittorrent `TorrentImpl::setSavePath`, libtorrent `torrent::move_storage`:
+// files that sat straight in their save path move straight into the new
+// one, the torrent's save path and files directory follow them, and it
+// seeds on from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placed_files_move_to_a_new_location_and_the_record_follows() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), &data).unwrap();
+    // Its job is done, so nothing of it is out and each move happens at
+    // once.
+    let (job_id, before, _) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+
+    let moved = rig.dir.path().join("moved/here");
+    let moved_text = moved.to_string_lossy().into_owned();
+    rig.service
+        .set_location(job_id, moved_text.clone())
+        .await
+        .unwrap();
+    assert!(!save.join("a.bin").exists());
+    assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), data);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.files_dir.as_deref(), Some(moved_text.as_str()));
+    assert_eq!(stored.save_path.as_deref(), Some(moved_text.as_str()));
+    assert_eq!(stored.storage_dir, before.storage_dir);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.files_dir.as_deref(), Some(moved_text.as_str()));
+    assert_eq!(view.paths().0, moved_text);
+    assert_eq!(
+        (view.state, view.have_bytes),
+        (TorrentState::Seeding, data.len() as u64)
+    );
+    rig.service.stop().await;
+}
+
+// qBittorrent `TorrentImpl::moveStorage`, a user's move under
+// `MoveStorageMode::KeepExistingFiles` (libtorrent `dont_replace`): a file
+// already at the new location stays, the torrent's own copy stays where it
+// was, the record follows the move, and the torrent is checked again from
+// its new place (libtorrent `torrent::on_storage_moved`), which finds the
+// file there is not its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_onto_a_file_already_there_keeps_it_and_checks_again() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), &data).unwrap();
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+
+    let taken = rig.dir.path().join("taken");
+    let taken_text = taken.to_string_lossy().into_owned();
+    std::fs::create_dir_all(&taken).unwrap();
+    std::fs::write(taken.join("a.bin"), b"theirs").unwrap();
+    rig.service
+        .set_location(job_id, taken_text.clone())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(taken.join("a.bin")).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.files_dir.as_deref(), Some(taken_text.as_str()));
+    assert_eq!(stored.save_path.as_deref(), Some(taken_text.as_str()));
+
+    // It had every piece; the check from the new place finds none.
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.have_bytes == 0 && view.state != TorrentState::CheckingFiles
+    })
+    .await;
+    assert_eq!(view.files_dir.as_deref(), Some(taken_text.as_str()));
+    rig.service.stop().await;
+}
+
+// qBittorrent `TorrentImpl::handleTorrentFinished`: a torrent laid out with
+// no folder of its own that downloaded under its download path moves under
+// its save path once complete, over a file of the same name already there
+// (`adjustStorageLocation`, `MoveStorageMode::Overwrite`), and its save path
+// and files directory follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let download = rig.dir.path().join("incoming");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("a.bin"), &data).unwrap();
+    let save = rig.dir.path().join("done");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), b"older").unwrap();
+    let save_text = save.to_string_lossy().into_owned();
+
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save_text.clone()),
+            download_path: Some(download.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.files_dir.as_deref() == Some(save_text.as_str())
+    })
+    .await;
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    assert!(!download.join("a.bin").exists());
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.files_dir.as_deref(), Some(save_text.as_str()));
+    assert_eq!(stored.save_path.as_deref(), Some(save_text.as_str()));
+    assert_eq!(stored.move_to, None);
+    assert_eq!(
+        (view.state, view.have_bytes),
+        (TorrentState::Seeding, data.len() as u64)
+    );
+    rig.service.stop().await;
+}
+
+// qBittorrent `SessionImpl::initLoadTorrentParams`: a relative save path is
+// under the default save path, and a missing one is the default save path
+// itself; a relative download path is under the save path when there is no
+// default download path, and an absolute one stands.
+#[test]
+fn relative_paths_resolve_under_the_default_save_path() {
+    let default = Path::new("/complete/tv");
+    let placed = |save: Option<&str>, download: Option<&str>| {
+        let placement = absolute_placement(
+            &Placement {
+                save_path: save.map(str::to_owned),
+                download_path: download.map(str::to_owned),
+                layout: Some(ContentLayout::NoSubfolder),
+                seed_mode: false,
+            },
+            default,
+        );
+        assert_eq!(placement.layout, Some(ContentLayout::NoSubfolder));
+        (placement.save_path, placement.download_path)
+    };
+    let some = |path: &str| Some(path.to_owned());
+    assert_eq!(
+        placed(Some("shows"), Some("incoming")),
+        (
+            some("/complete/tv/shows"),
+            some("/complete/tv/shows/incoming")
+        )
+    );
+    assert_eq!(
+        placed(None, Some("incoming")),
+        (some("/complete/tv"), some("/complete/tv/incoming"))
+    );
+    assert_eq!(
+        placed(None, Some("/scratch")),
+        (some("/complete/tv"), some("/scratch"))
+    );
+    assert_eq!(placed(None, None), (None, None));
+    assert_eq!(
+        placed(Some("/data/shows"), Some("incoming")),
+        (some("/data/shows"), some("/data/shows/incoming"))
+    );
+    assert_eq!(
+        placed(Some("shows"), Some("/scratch")),
+        (some("/complete/tv/shows"), some("/scratch"))
+    );
+}
+
+// A torrent added with relative paths keeps them absolute, so the move
+// under its save path once complete finds where to go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_added_with_relative_paths_keeps_them_absolute() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let complete = rig.dir.path().join("complete");
+    let save = complete.join("shows");
+    let download = save.join("incoming");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("a.bin"), &data).unwrap();
+    let save_text = save.to_string_lossy().into_owned();
+
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some("shows".to_owned()),
+            download_path: Some("incoming".to_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.files_dir.as_deref() == Some(save_text.as_str())
+    })
+    .await;
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    assert!(!download.join("a.bin").exists());
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.save_path.as_deref(), Some(save_text.as_str()));
+    assert_eq!(view.have_bytes, data.len() as u64);
+    rig.service.stop().await;
+}
+
+// qBittorrent `SessionImpl::initLoadTorrentParams`: a torrent added with a
+// download path and no save path takes the default save path, here its
+// category's directory, and moves there once complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_download_path_without_a_save_path_moves_to_the_default_save_path() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let complete = rig.dir.path().join("complete");
+    let complete_text = complete.to_string_lossy().into_owned();
+    let download = rig.dir.path().join("incoming");
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(download.join("a.bin"), &data).unwrap();
+
+    let (job_id, _, mut changes) = completed_placed(
+        &rig,
+        metainfo,
+        Placement {
+            download_path: Some(download.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let view = view_once(&rig.service, &mut changes, job_id, |view| {
+        view.files_dir.as_deref() == Some(complete_text.as_str())
+    })
+    .await;
+    assert_eq!(std::fs::read(complete.join("a.bin")).unwrap(), data);
+    assert!(!download.join("a.bin").exists());
+    let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+    assert_eq!(stored.save_path.as_deref(), Some(complete_text.as_str()));
+    assert_eq!(stored.move_to, None);
+    assert_eq!(view.have_bytes, data.len() as u64);
+    rig.service.stop().await;
+}
+
+// libtorrent's `verified_pieces` in resume data: a torrent still in seed mode
+// after a restart takes back the pieces that passed their check before, and
+// serves them without a second one; leaving seed mode forgets them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_mode_torrent_keeps_its_checked_pieces_through_a_restart() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("seeded");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+    let (job_id, _) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            seed_mode: true,
+            ..Placement::default()
+        },
+    )
+    .await;
+    assert_eq!(rig.db.torrent_seed_verified(job_id).unwrap(), None);
+    // Pieces 0 and 2 of 4 passed, as the running tick keeps them.
+    let passed = [0b1010_0000u8];
+    rig.db.set_torrent_seed_verified(job_id, &passed).unwrap();
+    rig.service.stop().await;
+
+    let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&restarted).await;
+    let handle = handle_of(&restarted, job_id).await;
+    assert!(handle.seed_mode());
+    let verified = handle.seed_verified().unwrap();
+    assert_eq!(verified.iter_ones().collect::<Vec<_>>(), [0, 2]);
+    restarted.tick().await;
+    assert_eq!(
+        rig.db.torrent_seed_verified(job_id).unwrap(),
+        Some(passed.to_vec())
+    );
+
+    rig.db.clear_torrent_seed_mode(job_id).unwrap();
+    assert_eq!(rig.db.torrent_seed_verified(job_id).unwrap(), None);
+    assert!(!rig.db.get_torrent(job_id).unwrap().unwrap().seed_mode);
+    restarted.stop().await;
 }
 
 // libtorrent `torrent_flags::seed_mode`, as qBittorrent `seedMode` sets it: a

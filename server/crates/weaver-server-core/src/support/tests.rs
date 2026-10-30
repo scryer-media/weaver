@@ -631,6 +631,8 @@ fn held_torrent(
         have_bytes: 1024,
         uploaded_bytes: 512,
         downloaded_bytes: 2048,
+        run_uploaded_bytes: 512,
+        run_downloaded_bytes: 2048,
         ratio: 0.5,
         download_bps: 500,
         upload_bps: 0,
