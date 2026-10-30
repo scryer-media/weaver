@@ -4240,28 +4240,31 @@ impl TorrentService {
             Ok(to) => {
                 let to = to.to_string_lossy().into_owned();
                 let files = matches!(moving, Some(Moving::Files));
-                let kept = self
+                // Kept on its row before the torrent shows it, under the
+                // same hold, so nothing that sees the new place finds the
+                // row behind.
+                let recorded = self
                     .with_torrent(job_id, |torrent| {
+                        let recorded = if files {
+                            self.inner
+                                .db
+                                .set_torrent_files_dir(job_id, Some(&to))
+                                .and_then(|_| {
+                                    self.inner.db.set_torrent_save_path(job_id, Some(&to))
+                                })
+                        } else {
+                            self.inner.db.set_torrent_storage_dir(job_id, &to)
+                        };
                         if files {
                             torrent.record.files_dir = Some(to.clone());
                             torrent.record.save_path = Some(to.clone());
                         } else {
                             torrent.record.storage_dir = Some(to.clone());
                         }
-                        Ok(())
+                        Ok(recorded)
                     })
                     .await;
-                let recorded = if files {
-                    self.inner
-                        .db
-                        .set_torrent_files_dir(job_id, Some(&to))
-                        .and_then(|_| self.inner.db.set_torrent_save_path(job_id, Some(&to)))
-                } else {
-                    self.inner.db.set_torrent_storage_dir(job_id, &to)
-                };
-                if kept.is_ok()
-                    && let Err(error) = recorded
-                {
+                if let Ok(Err(error)) = recorded {
                     tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's new directory");
                 }
                 if files
