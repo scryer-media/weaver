@@ -13,6 +13,7 @@ use crate::settings::types::{
     WatchFolderSettingsInput,
 };
 use weaver_server_core::settings::SharedConfig;
+use weaver_server_core::settings::tracker_file;
 use weaver_server_core::watch_folder::{WatchFolderConfig, WatchFolderMode, WatchFolderService};
 use weaver_server_core::{Database, SchedulerHandle};
 
@@ -634,6 +635,111 @@ impl SettingsMutation {
         crate::torrents::reload_tracker_rules(ctx).await?;
         Ok(rules.into_iter().map(Into::into).collect())
     }
+
+    /// What importing a tracker file, base64, would do. Nothing is kept.
+    #[graphql(guard = "AdminGuard")]
+    async fn preview_tracker_file(
+        &self,
+        ctx: &Context<'_>,
+        file: String,
+        password: Option<String>,
+    ) -> Result<crate::settings::types::TrackerFilePreview> {
+        let db = ctx.data::<Database>()?.clone();
+        let bytes = decode_tracker_file(&file)?;
+        let preview = tokio::task::spawn_blocking(move || {
+            let read = tracker_file::read(&bytes, password.as_deref());
+            let file = match read {
+                Ok(file) => file,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+            let rules = db.list_tracker_rules()?;
+            let rule = rules
+                .iter()
+                .find(|rule| rule.host_pattern == file.host_pattern);
+            let fingerprint = tracker_file::fingerprint(&bytes, rule);
+            Ok::<_, weaver_server_core::StateError>(Ok(file.preview(rule, fingerprint)))
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        Ok(preview.into())
+    }
+
+    /// Import a tracker file, base64, as its preview showed it, and return
+    /// every rule. A file or rule changed since the preview is refused.
+    #[graphql(guard = "AdminGuard")]
+    async fn apply_tracker_file(
+        &self,
+        ctx: &Context<'_>,
+        file: String,
+        password: Option<String>,
+        fingerprint: String,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let bytes = decode_tracker_file(&file)?;
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        let rules = tokio::task::spawn_blocking(move || {
+            let file = match tracker_file::read(&bytes, password.as_deref()) {
+                Ok(file) => file,
+                Err(refusal) => return Ok(Err(refusal)),
+            };
+            let rules = db.list_tracker_rules()?;
+            let rule = rules
+                .iter()
+                .find(|rule| rule.host_pattern == file.host_pattern);
+            if tracker_file::fingerprint(&bytes, rule) != fingerprint {
+                return Ok(Err("stale preview".to_owned()));
+            }
+            let now = chrono::Utc::now().timestamp_millis();
+            db.apply_tracker_file(&file, now)?;
+            db.list_tracker_rules().map(Ok)
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        // A tracker rule is a torrent route's consumer.
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+
+    /// Release a rule from the tracker file that filled it, keeping every
+    /// value it holds, and return every rule.
+    #[graphql(guard = "AdminGuard")]
+    async fn unbind_tracker_rule(
+        &self,
+        ctx: &Context<'_>,
+        id: u32,
+    ) -> Result<Vec<crate::settings::types::TrackerRule>> {
+        let db = ctx.data::<Database>()?.clone();
+        let _guard = SETTINGS_MUTATION_GUARD.lock().await;
+        let rules = tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now().timestamp_millis();
+            if !db.unbind_tracker_rule(id, now)? {
+                return Ok(Err(format!("no tracker rule {id}")));
+            }
+            db.list_tracker_rules().map(Ok)
+        })
+        .await??
+        .map_err(async_graphql::Error::new)?;
+        crate::proxies::refresh(ctx).await?;
+        crate::torrents::reload_tracker_rules(ctx).await?;
+        Ok(rules.into_iter().map(Into::into).collect())
+    }
+}
+
+// The bytes of an uploaded tracker file, refused past the largest a tracker
+// file may be before any of it is decoded.
+fn decode_tracker_file(file: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let limit = tracker_file::MAX_UPLOAD_BYTES;
+    if file.len() > limit.div_ceil(3) * 4 {
+        return Err(async_graphql::Error::new(format!(
+            "The tracker file is larger than {} KiB.",
+            limit / 1024
+        )));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(file.trim())
+        .map_err(|_| async_graphql::Error::new("The tracker file is not base64."))
 }
 
 fn normalize_settings_path_update(input: &MaybeUndefined<String>) -> MaybeUndefined<String> {

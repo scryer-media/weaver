@@ -1495,6 +1495,12 @@ const TRACKER_RULE_FIELDS = `
     hasSsl
     sslSubject
     sslNotAfter
+    bound {
+      name
+      revision
+      importedAt
+      locked
+    }
   }
   ${SEEDING_POLICY_FIELDS}
 `;
@@ -1564,6 +1570,47 @@ export const SAVE_TRACKER_RULE_MUTATION = gql`
 export const DELETE_TRACKER_RULE_MUTATION = gql`
   mutation DeleteTrackerRule($id: Int!) {
     deleteTrackerRule(id: $id) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+/** What importing a tracker file would do; nothing is kept. */
+export const PREVIEW_TRACKER_FILE_MUTATION = gql`
+  mutation PreviewTrackerFile($file: String!, $password: String) {
+    previewTrackerFile(file: $file, password: $password) {
+      name
+      revision
+      hostPattern
+      ruleId
+      changes {
+        field
+        locked
+        old
+        new
+      }
+      hasSsl
+      sslSubject
+      sslNotAfter
+      archivePasswordCount
+      fingerprint
+    }
+  }
+`;
+
+export const APPLY_TRACKER_FILE_MUTATION = gql`
+  mutation ApplyTrackerFile($file: String!, $password: String, $fingerprint: String!) {
+    applyTrackerFile(file: $file, password: $password, fingerprint: $fingerprint) {
+      ...TrackerRuleFields
+    }
+  }
+  ${TRACKER_RULE_FIELDS}
+`;
+
+export const UNBIND_TRACKER_RULE_MUTATION = gql`
+  mutation UnbindTrackerRule($id: Int!) {
+    unbindTrackerRule(id: $id) {
       ...TrackerRuleFields
     }
   }

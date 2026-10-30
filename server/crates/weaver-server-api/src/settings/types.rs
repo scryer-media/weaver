@@ -1357,13 +1357,104 @@ pub struct TrackerRule {
     pub ssl_subject: Option<String>,
     /// When the certificate expires, in milliseconds since the epoch.
     pub ssl_not_after: Option<i64>,
+    /// The tracker file that filled it; absent when none binds it.
+    pub bound: Option<TrackerBinding>,
+}
+
+/// The tracker file a rule was filled from.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerBinding {
+    /// The tracker's name, as its file states it.
+    pub name: String,
+    pub revision: String,
+    /// When it was imported, in milliseconds since the epoch.
+    pub imported_at: i64,
+    /// The fields the file locked: dht, pex, lsd, encryption, ssl.
+    pub locked: Vec<String>,
+}
+
+impl From<weaver_server_core::settings::tracker_file::Binding> for TrackerBinding {
+    fn from(bound: weaver_server_core::settings::tracker_file::Binding) -> Self {
+        Self {
+            name: bound.name,
+            revision: bound.revision,
+            imported_at: bound.imported_at_ms,
+            locked: bound.locked,
+        }
+    }
+}
+
+/// What importing a tracker file would do. It holds nothing secret.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerFilePreview {
+    pub name: String,
+    pub revision: String,
+    pub host_pattern: String,
+    /// The rule the file fills; absent makes a new rule.
+    pub rule_id: Option<u32>,
+    pub changes: Vec<TrackerFileChange>,
+    pub has_ssl: bool,
+    pub ssl_subject: Option<String>,
+    /// When the certificate expires, in milliseconds since the epoch.
+    pub ssl_not_after: Option<i64>,
+    /// How many archive passwords it carries; absent when it names none.
+    pub archive_password_count: Option<u32>,
+    /// Pass back to `applyTrackerFile`.
+    pub fingerprint: String,
+}
+
+/// One value a tracker file sets: as the rule holds it and as the import
+/// leaves it, absent when not set.
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct TrackerFileChange {
+    pub field: String,
+    pub locked: bool,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+impl From<weaver_server_core::settings::tracker_file::Preview> for TrackerFilePreview {
+    fn from(preview: weaver_server_core::settings::tracker_file::Preview) -> Self {
+        Self {
+            name: preview.name,
+            revision: preview.revision,
+            host_pattern: preview.host_pattern,
+            rule_id: preview.rule_id,
+            changes: preview
+                .changes
+                .into_iter()
+                .map(|change| TrackerFileChange {
+                    field: change.field.to_owned(),
+                    locked: change.locked,
+                    old: change.old,
+                    new: change.new,
+                })
+                .collect(),
+            has_ssl: preview.has_ssl,
+            ssl_subject: preview.ssl.as_ref().map(|ssl| ssl.subject.clone()),
+            ssl_not_after: preview.ssl.map(|ssl| ssl.not_after_ms),
+            archive_password_count: preview
+                .archive_passwords
+                .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+            fingerprint: preview.fingerprint,
+        }
+    }
 }
 
 /// The certificate and private key a tracker issued, each PEM.
-#[derive(Debug, Clone, InputObject)]
+#[derive(Clone, InputObject)]
 pub struct TrackerCertificateInput {
     pub certificate_pem: String,
     pub private_key_pem: String,
+}
+
+// The private key is never printed.
+impl std::fmt::Debug for TrackerCertificateInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackerCertificateInput")
+            .field("certificate_pem", &self.certificate_pem)
+            .finish_non_exhaustive()
+    }
 }
 
 impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
@@ -1386,6 +1477,7 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             has_ssl: rule.ssl.is_some(),
             ssl_subject: summary.as_ref().map(|summary| summary.subject.clone()),
             ssl_not_after: summary.map(|summary| summary.not_after_ms),
+            bound: rule.bound.map(Into::into),
         }
     }
 }

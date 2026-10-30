@@ -2134,6 +2134,20 @@ type MutationRoot {
 	trackers match next, or none.
 	"""
 	deleteTrackerRule(id: Int!): [TrackerRule!]!
+	"""
+	What importing a tracker file, base64, would do. Nothing is kept.
+	"""
+	previewTrackerFile(file: String!, password: String): TrackerFilePreview!
+	"""
+	Import a tracker file, base64, as its preview showed it, and return
+	every rule. A file or rule changed since the preview is refused.
+	"""
+	applyTrackerFile(file: String!, password: String, fingerprint: String!): [TrackerRule!]!
+	"""
+	Release a rule from the tracker file that filled it, keeping every
+	value it holds, and return every rule.
+	"""
+	unbindTrackerRule(id: Int!): [TrackerRule!]!
 	createDirectory(path: String!, name: String!): DirectoryBrowseResult!
 	"""
 	Check for a new release now instead of waiting for the next scheduled
@@ -5670,11 +5684,69 @@ enum TorrentVersion {
 }
 
 """
+The tracker file a rule was filled from.
+"""
+type TrackerBinding {
+	"""
+	The tracker's name, as its file states it.
+	"""
+	name: String!
+	revision: String!
+	"""
+	When it was imported, in milliseconds since the epoch.
+	"""
+	importedAt: Int!
+	"""
+	The fields the file locked: dht, pex, lsd, encryption, ssl.
+	"""
+	locked: [String!]!
+}
+
+"""
 The certificate and private key a tracker issued, each PEM.
 """
 input TrackerCertificateInput {
 	certificatePem: String!
 	privateKeyPem: String!
+}
+
+"""
+One value a tracker file sets: as the rule holds it and as the import
+leaves it, absent when not set.
+"""
+type TrackerFileChange {
+	field: String!
+	locked: Boolean!
+	old: String
+	new: String
+}
+
+"""
+What importing a tracker file would do. It holds nothing secret.
+"""
+type TrackerFilePreview {
+	name: String!
+	revision: String!
+	hostPattern: String!
+	"""
+	The rule the file fills; absent makes a new rule.
+	"""
+	ruleId: Int
+	changes: [TrackerFileChange!]!
+	hasSsl: Boolean!
+	sslSubject: String
+	"""
+	When the certificate expires, in milliseconds since the epoch.
+	"""
+	sslNotAfter: Int
+	"""
+	How many archive passwords it carries; absent when it names none.
+	"""
+	archivePasswordCount: Int
+	"""
+	Pass back to `applyTrackerFile`.
+	"""
+	fingerprint: String!
 }
 
 """
@@ -5746,6 +5818,10 @@ type TrackerRule {
 	When the certificate expires, in milliseconds since the epoch.
 	"""
 	sslNotAfter: Int
+	"""
+	The tracker file that filled it; absent when none binds it.
+	"""
+	bound: TrackerBinding
 }
 
 input TrackerRuleInput {

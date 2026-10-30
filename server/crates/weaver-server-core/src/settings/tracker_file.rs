@@ -265,6 +265,178 @@ pub fn check_locks(rule: &TrackerRule, changed: &TrackerRule) -> Result<(), Stri
     }
 }
 
+// One value a tracker file sets, as the rule holds it now and as the file
+// leaves it; `None` is not set. A recommendation the user changed shows the
+// user's value on both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub field: &'static str,
+    pub locked: bool,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+// What applying a tracker file would do, with nothing secret in it: the
+// identity by its subject and expiry, the archive passwords by their count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preview {
+    pub name: String,
+    pub revision: String,
+    pub host_pattern: String,
+    // The rule the file fills; `None` makes a new one.
+    pub rule_id: Option<u32>,
+    pub changes: Vec<Change>,
+    pub has_ssl: bool,
+    pub ssl: Option<super::model::CertificateSummary>,
+    // `None` when the file says nothing of them.
+    pub archive_passwords: Option<usize>,
+    pub fingerprint: String,
+}
+
+impl TrackerFile {
+    // What `apply` would make of `rule`, value by value.
+    pub fn preview(&self, rule: Option<&TrackerRule>, fingerprint: String) -> Preview {
+        let applied = self.apply(rule, 0);
+        let old = rule.cloned().unwrap_or_default();
+        let (required, recommended) = (&self.required, &self.recommended);
+        let mut changes = Vec::new();
+        let mut push = |field, locked: bool, set: bool, old: Option<String>, new| {
+            if set {
+                changes.push(Change {
+                    field,
+                    locked,
+                    old,
+                    new,
+                });
+            }
+        };
+        let flag = |value: Option<bool>| value.map(|value| value.to_string());
+        for (field, required, recommended, old, new) in [
+            (
+                FIELD_DHT,
+                required.dht,
+                recommended.dht,
+                old.dht,
+                applied.dht,
+            ),
+            (
+                FIELD_PEX,
+                required.pex,
+                recommended.pex,
+                old.pex,
+                applied.pex,
+            ),
+            (
+                FIELD_LSD,
+                required.lsd,
+                recommended.lsd,
+                old.lsd,
+                applied.lsd,
+            ),
+        ] {
+            let set = required.is_some() || recommended.is_some();
+            push(field, required.is_some(), set, flag(old), flag(new));
+        }
+        let encryption = |value: Option<TorrentEncryption>| value.map(|e| e.as_str().to_owned());
+        push(
+            FIELD_ENCRYPTION,
+            required.encryption.is_some(),
+            required.encryption.is_some() || recommended.encryption.is_some(),
+            encryption(old.encryption),
+            encryption(applied.encryption),
+        );
+        if let Some(seeding) = recommended.seeding {
+            // A leaf as a change shows it: absent while it inherits.
+            fn text<T>(leaf: Leaf<T>, show: impl Fn(T) -> String) -> Option<String> {
+                match leaf {
+                    Leaf::Inherit => None,
+                    Leaf::Off => Some("off".to_owned()),
+                    Leaf::Set(value) => Some(show(value)),
+                }
+            }
+            let (before, after) = (
+                old.seeding.unwrap_or_default(),
+                applied.seeding.unwrap_or_default(),
+            );
+            let number = |value: f32| value.to_string();
+            let minutes = |value: u32| value.to_string();
+            let mode = |mode: SeedingGoalMode| mode.as_str().to_owned();
+            let action = |action: SeedingAction| action.as_str().to_owned();
+            for (field, set, old, new) in [
+                (
+                    "seeding.ratio_goal",
+                    !seeding.ratio_goal.is_inherit(),
+                    text(before.ratio_goal, number),
+                    text(after.ratio_goal, number),
+                ),
+                (
+                    "seeding.seed_time_goal_minutes",
+                    !seeding.seed_time_goal_minutes.is_inherit(),
+                    text(before.seed_time_goal_minutes, minutes),
+                    text(after.seed_time_goal_minutes, minutes),
+                ),
+                (
+                    "seeding.inactive_goal_minutes",
+                    !seeding.inactive_goal_minutes.is_inherit(),
+                    text(before.inactive_goal_minutes, minutes),
+                    text(after.inactive_goal_minutes, minutes),
+                ),
+                (
+                    "seeding.mode",
+                    !seeding.mode.is_inherit(),
+                    text(before.mode, mode),
+                    text(after.mode, mode),
+                ),
+                (
+                    "seeding.action",
+                    !seeding.action.is_inherit(),
+                    text(before.action, action),
+                    text(after.action, action),
+                ),
+            ] {
+                push(field, false, set, old, new);
+            }
+        }
+        Preview {
+            name: self.name.clone(),
+            revision: self.revision.clone(),
+            host_pattern: self.host_pattern.clone(),
+            rule_id: rule.map(|rule| rule.id),
+            changes,
+            has_ssl: self.ssl.is_some(),
+            ssl: self.ssl.as_ref().and_then(TrackerCertificate::summary),
+            archive_passwords: self.archive_passwords.as_ref().map(Vec::len),
+            fingerprint,
+        }
+    }
+}
+
+// The fingerprint of a preview: the file's bytes and the rule it fills as
+// that rule stood, so an apply after either changed is refused. It is keyed
+// with a secret this process draws once, so it says nothing of what the file
+// holds; a restart between preview and apply makes the preview stale.
+pub fn fingerprint(bytes: &[u8], rule: Option<&TrackerRule>) -> String {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).expect("the system's random source");
+        key
+    });
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    if let Some(rule) = rule {
+        // Debug names every value but the identity's key and the archive
+        // passwords, which follow whole.
+        hasher.update(format!("{rule:?}").as_bytes());
+        if let Some(ssl) = &rule.ssl {
+            hasher.update(ssl.certificate_pem.as_bytes());
+            hasher.update(ssl.private_key_pem.as_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 // Reads `bytes` as a tracker file, opening an archive with `password` when
 // it is one. An error is one sentence for the user; it never holds the
 // password or a byte of the file beyond the key or member it names.

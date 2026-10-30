@@ -1659,3 +1659,217 @@ async fn a_held_torrent_has_a_support_report_without_its_name() {
     assert_eq!(json["job"]["private"], true);
     assert_eq!(json["job"]["pieces"]["total"], 3);
 }
+
+// A tracker file, base64: required DHT off, recommended PEX off and a ratio,
+// an identity for user-1 and one archive password, at `revision`.
+fn tracker_file(revision: &str) -> (String, String) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "user-1");
+    params.not_after = rcgen::date_time_ymd(2031, 1, 1);
+    let text = format!(
+        "version = 1
+name = \"Example Tracker\"
+revision = \"{revision}\"
+host_pattern = \"*.tracker.test\"
+[required]
+dht = false
+[recommended]
+pex = false
+seeding = {{ ratio_goal = 1.5 }}
+[archive_passwords]
+values = [\"archive-secret-word\"]
+[ssl]
+certificate_pem = '''
+{}'''
+private_key_pem = '''
+{}'''
+",
+        params.self_signed(&key).unwrap().pem(),
+        key.serialize_pem()
+    );
+    (
+        base64::engine::general_purpose::STANDARD.encode(&text),
+        key.serialize_pem(),
+    )
+}
+
+// Importing a tracker file is previewed first, secret-free, and applied by
+// the preview's fingerprint; a file or rule changed since is a stale
+// preview. The rule it fills shows the file's name and the fields it locked,
+// and unbinding keeps every value. Only an admin may do any of it, and no
+// response carries the identity's key or a password.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
+    let rig = rig().await;
+    let (file, private_key) = tracker_file("1");
+    let secrets = [
+        private_key.trim().lines().nth(1).unwrap().to_owned(),
+        "archive-secret-word".to_owned(),
+        "upload-secret-word".to_owned(),
+    ];
+    let mut responses = Vec::new();
+    let preview_query = |file: &str| {
+        format!(
+            r#"mutation {{ previewTrackerFile(file: "{file}", password: "upload-secret-word") {{
+                name revision hostPattern ruleId hasSsl sslSubject sslNotAfter
+                archivePasswordCount fingerprint changes {{ field locked old new }}
+            }} }}"#
+        )
+    };
+    let apply_query = |file: &str, fingerprint: &str| {
+        format!(
+            r#"mutation {{ applyTrackerFile(file: "{file}", password: "upload-secret-word",
+                fingerprint: "{fingerprint}") {{
+                id hostPattern dht pex seeding {{ ratioGoal {{ state value }} }} hasSsl sslSubject
+                bound {{ name revision locked }}
+            }} }}"#
+        )
+    };
+
+    let response = rig.execute(&preview_query(&file)).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let preview = response.data.into_json().unwrap()["previewTrackerFile"].clone();
+    responses.push(preview.to_string());
+    let fingerprint = preview["fingerprint"].as_str().unwrap().to_owned();
+    assert_eq!(
+        preview,
+        serde_json::json!({
+            "name": "Example Tracker", "revision": "1", "hostPattern": "*.tracker.test",
+            "ruleId": null, "hasSsl": true, "sslSubject": "CN=user-1",
+            "sslNotAfter": 1_924_992_000_000_i64, "archivePasswordCount": 1,
+            "fingerprint": fingerprint,
+            "changes": [
+                { "field": "dht", "locked": true, "old": null, "new": "false" },
+                { "field": "pex", "locked": false, "old": null, "new": "false" },
+                { "field": "seeding.ratio_goal", "locked": false, "old": null, "new": "1.5" },
+            ],
+        })
+    );
+
+    // A preview keeps nothing.
+    let response = rig.execute("{ trackerRules { id } }").await;
+    assert_eq!(
+        response.data.into_json().unwrap()["trackerRules"],
+        serde_json::json!([])
+    );
+
+    // A file other than the one previewed is a stale preview.
+    let (other, _) = tracker_file("2");
+    let stale = rig.execute(&apply_query(&other, &fingerprint)).await;
+    assert_eq!(stale.errors.len(), 1);
+    assert_eq!(stale.errors[0].message, "stale preview");
+    responses.push(format!("{:?}", stale.errors));
+
+    let response = rig.execute(&apply_query(&file, &fingerprint)).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let rules = response.data.into_json().unwrap()["applyTrackerFile"].clone();
+    responses.push(rules.to_string());
+    let id = rules[0]["id"].as_u64().unwrap();
+    assert_eq!(
+        rules,
+        serde_json::json!([{
+            "id": id, "hostPattern": "*.tracker.test", "dht": false, "pex": false,
+            "seeding": { "ratioGoal": { "state": "SET", "value": 1.5 } }, "hasSsl": true, "sslSubject": "CN=user-1",
+            "bound": { "name": "Example Tracker", "revision": "1", "locked": ["dht", "ssl"] },
+        }])
+    );
+
+    // The rule changed since the preview: applying it again is stale, and a
+    // new preview names the rule.
+    let again = rig.execute(&apply_query(&file, &fingerprint)).await;
+    assert_eq!(again.errors[0].message, "stale preview");
+    let response = rig.execute(&preview_query(&file)).await;
+    let preview = response.data.into_json().unwrap()["previewTrackerFile"].clone();
+    responses.push(preview.to_string());
+    assert_eq!(preview["ruleId"], id);
+    assert_eq!(preview["changes"][0]["old"], "false");
+
+    // The ordinary save refuses a locked field.
+    let refused = rig
+        .execute(&format!(
+            r#"mutation {{ saveTrackerRule(id: {id}, input: {{
+                hostPattern: "*.tracker.test", dht: true, pex: false
+            }}) {{ id }} }}"#
+        ))
+        .await;
+    assert_eq!(
+        refused.errors[0].message,
+        "dht is locked by Example Tracker's tracker file; unbind the rule to change it."
+    );
+
+    // Only an admin previews, applies or unbinds.
+    for query in [
+        preview_query(&file),
+        apply_query(&file, &fingerprint),
+        format!("mutation {{ unbindTrackerRule(id: {id}) {{ id }} }}"),
+    ] {
+        let response = rig.execute_as_key(&query, CallerScope::Read).await;
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("admin scope")),
+            "{query}: {:?}",
+            response.errors
+        );
+    }
+
+    let response = rig
+        .execute(&format!(
+            "mutation {{ unbindTrackerRule(id: {id}) {{ id dht pex hasSsl bound {{ name }} }} }}"
+        ))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let rules = response.data.into_json().unwrap()["unbindTrackerRule"].clone();
+    responses.push(rules.to_string());
+    assert_eq!(
+        rules,
+        serde_json::json!([{ "id": id, "dht": false, "pex": false, "hasSsl": true, "bound": null }])
+    );
+    let missing = rig
+        .execute(&format!(
+            "mutation {{ unbindTrackerRule(id: {}) {{ id }} }}",
+            id + 1
+        ))
+        .await;
+    assert_eq!(
+        missing.errors[0].message,
+        format!("no tracker rule {}", id + 1)
+    );
+
+    for response in &responses {
+        for secret in &secrets {
+            assert!(!response.contains(secret.as_str()), "{response}");
+        }
+    }
+}
+
+// A tracker file that cannot be read is refused in one sentence that names
+// no password, and a file past the largest is refused before it is decoded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_file_that_cannot_be_read_is_refused_plainly() {
+    let rig = rig().await;
+    let preview = |file: &str| {
+        format!(
+            r#"mutation {{ previewTrackerFile(file: "{file}", password: "upload-secret-word") {{ name }} }}"#
+        )
+    };
+    let unknown = base64::engine::general_purpose::STANDARD.encode(
+        "version = 1\nname = \"T\"\nrevision = \"1\"\nhost_pattern = \"t.test\"\nclient = \"x\"\n",
+    );
+    let huge = "A".repeat(2 << 20);
+    for (file, refusal) in [
+        (unknown.as_str(), "client"),
+        ("not base64!", "The tracker file is not base64."),
+        (huge.as_str(), "The tracker file is larger than 1024 KiB."),
+    ] {
+        let response = rig.execute(&preview(file)).await;
+        assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+        let message = &response.errors[0].message;
+        assert!(message.contains(refusal), "{message}");
+        assert!(!message.contains("upload-secret-word"), "{message}");
+    }
+}
