@@ -434,6 +434,7 @@ fn view(state: TorrentState) -> TorrentView {
         added_at_ms: 1_700_000_000_000,
         completed_at_ms: None,
         storage_dir: Some("/complete/tv/a".into()),
+        files_dir: None,
         seeding_left: None,
         seeding_override: None,
         seeding_inherited: None,
@@ -709,6 +710,69 @@ fn a_magnet_name_shapes_no_path_before_weaver_places_it() {
     assert_eq!(info["content_path"], "");
     assert_eq!(info["save_path"], "");
     assert_eq!(info["name"], "../../x");
+}
+
+// qBittorrent `addAction` and `SessionImpl::addTorrent`: a save path is
+// read only with automatic management off, `seedMode` and the older
+// `skip_checking` both skip the check, and `root_folder` stands in for a
+// missing `contentLayout`.
+#[test]
+fn an_add_reads_where_the_files_are_and_how_they_are_laid_out() {
+    let params = |fields: &[(&str, &str)]| Params {
+        fields: fields
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+        files: Vec::new(),
+    };
+
+    assert_eq!(placement(&params(&[])), Placement::default());
+    let placed = placement(&params(&[
+        ("savepath", "/data/seed"),
+        ("autoTMM", "false"),
+        ("skip_checking", "true"),
+        ("root_folder", "false"),
+    ]));
+    assert_eq!(
+        placed,
+        Placement {
+            save_path: Some("/data/seed".into()),
+            layout: Some(ContentLayout::NoSubfolder),
+            seed_mode: true,
+            ..Placement::default()
+        }
+    );
+    let placed = placement(&params(&[
+        ("savepath", "/data/seed"),
+        ("seedMode", "true"),
+        ("contentLayout", "Subfolder"),
+        ("root_folder", "false"),
+        ("downloadPath", "/data/incomplete"),
+        ("useDownloadPath", "true"),
+    ]));
+    assert_eq!(
+        placed,
+        Placement {
+            save_path: Some("/data/seed".into()),
+            layout: Some(ContentLayout::Subfolder),
+            download_path: Some("/data/incomplete".into()),
+            seed_mode: true,
+        }
+    );
+    // Managed, the category decides where the files go.
+    let managed = placement(&params(&[("savepath", "/data/seed"), ("autoTMM", "true")]));
+    assert_eq!(managed.save_path, None);
+    // A download path switched off, or a layout this client does not name,
+    // falls back as qBittorrent does.
+    let placed = placement(&params(&[
+        ("downloadPath", "/data/incomplete"),
+        ("useDownloadPath", "false"),
+        ("contentLayout", "Sideways"),
+    ]));
+    assert_eq!(
+        (placed.download_path, placed.layout),
+        (None, Some(ContentLayout::Original))
+    );
 }
 
 #[test]

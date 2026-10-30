@@ -1118,6 +1118,50 @@ impl TorrentStateLive {
     pub fn peer_id(&self) -> Id20 {
         self.shared.peer_id
     }
+    // A piece a seed-mode torrent took as had is checked the first time a
+    // peer asks for it (libtorrent `peer_connection::fill_send_buffer` hashes
+    // a piece not verified in seed mode before it serves it). One that
+    // passes is had for good, and the storage hears the check found it. One
+    // that fails ends seed mode and every piece is checked again
+    // (`torrent::leave_seed_mode` with `check_files`). True when the piece
+    // is served; the connection stays either way, and the check of every
+    // piece closes it as ours, as `torrent::force_recheck` does
+    // (`disconnect_all`).
+    pub(crate) fn check_seeded(&self, piece: ValidPieceIndex) -> anyhow::Result<bool> {
+        let seed = &self.shared.options.seed;
+        if !seed.unchecked(piece) {
+            return Ok(true);
+        }
+        if matches!(self.file_ops().check_piece(piece), Ok(Verdict::Passed)) {
+            self.files.on_piece_checked(piece)?;
+            if seed.checked(piece) {
+                debug!("every piece passed its check: seed mode ends");
+            }
+            return Ok(true);
+        }
+        if seed.leave() {
+            warn!(%piece, "a piece failed its check in seed mode: checking every piece");
+            self.recheck_detached();
+        }
+        Ok(false)
+    }
+
+    // Check every piece again, from outside the run it ends.
+    fn recheck_detached(&self) {
+        let Some(session) = self.shared.session.upgrade() else {
+            return;
+        };
+        let id = self.shared.id;
+        tokio::spawn(async move {
+            let Some(handle) = session.get(crate::api::TorrentIdOrHash::Id(id)) else {
+                return;
+            };
+            if let Err(error) = session.force_recheck(&handle).await {
+                warn!(error = %error, "could not check a torrent that left seed mode");
+            }
+        });
+    }
+
     pub(crate) fn file_ops(&self) -> FileOps<'_> {
         FileOps::new(
             &self.metadata,
@@ -2354,6 +2398,20 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             self.state.upload_turn(self.addr);
         }
         claimed
+    }
+
+    // A seed-mode piece is checked on a blocking thread, and the peer's
+    // writer waits for it (libtorrent `peer_connection::fill_send_buffer`
+    // queues `disk_interface::async_hash` and keeps the request until
+    // `on_seed_mode_hashed`): the hash holds none of the permits the reads
+    // of blocks share.
+    async fn serves(&self, chunk: &ChunkInfo) -> anyhow::Result<bool> {
+        let piece = chunk.piece_index;
+        if !self.state.shared.options.seed.unchecked(piece) {
+            return Ok(true);
+        }
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || state.check_seeded(piece)).await?
     }
 
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {

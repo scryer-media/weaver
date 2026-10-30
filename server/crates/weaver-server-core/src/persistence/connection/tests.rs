@@ -649,6 +649,7 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("torrents", "forced")
             | ("torrents", "sequential")
             | ("torrents", "first_last_piece_first")
+            | ("torrents", "seed_mode")
     )
 }
 

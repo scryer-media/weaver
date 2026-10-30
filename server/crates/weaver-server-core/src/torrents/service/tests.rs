@@ -202,6 +202,7 @@ fn request(source: AddSource) -> AddRequest {
         metadata: Vec::new(),
         upload_limit: None,
         download_limit: None,
+        placement: Default::default(),
     }
 }
 
@@ -472,6 +473,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         added_at_ms: EPOCH_MS,
         completed_at_ms: None,
         storage_dir: None,
+        files_dir: None,
         seeding_left: None,
         route: None,
         files: Vec::new(),
@@ -4508,6 +4510,11 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         download_limit: None,
         sequential: false,
         first_last_piece_first: false,
+        save_path: None,
+        content_layout: None,
+        files_dir: None,
+        seed_mode: false,
+        move_to: None,
     };
     let mut rules = vec![TrackerRule {
         id: 1,
@@ -7007,5 +7014,160 @@ async fn a_torrent_given_its_session_is_published_in_it_open() {
         "{job:?}"
     );
     assert!(job.session.is_some_and(|session| session.open), "{job:?}");
+    rig.service.stop().await;
+}
+
+// A torrent of one file, `a.bin`, under a folder of its own, `placed`, and
+// that file's bytes: four pieces.
+fn placed_torrent() -> (Vec<u8>, Vec<u8>) {
+    let data: Vec<u8> = (0..65_536u32).map(|at| (at % 241) as u8).collect();
+    let metainfo = metainfo("placed", &[("a.bin", data.as_slice())], 16_384, true);
+    (metainfo, data)
+}
+
+// The torrent added with `placement`, its view once it seeds, as the queue
+// publishes it.
+async fn seeding_placed(rig: &Rig, metainfo: Vec<u8>, placement: Placement) -> (JobId, TorrentView) {
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            placement,
+            ..request(AddSource::Metainfo(metainfo))
+        })
+        .await
+        .unwrap();
+    let view = seeding_view(&rig.service, &mut changes, job_id).await;
+    (job_id, view)
+}
+
+// qBittorrent `addAction` with a save path: the files under it are the
+// torrent's, laid out as its metainfo lists them, and the check as it is
+// added finds them. Nothing is fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_added_at_a_save_path_has_the_files_already_there() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("placed-here");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+
+    let (_, view) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let total = data.len() as u64;
+    assert_eq!(
+        (view.have_bytes, view.downloaded_bytes, view.progress),
+        (total, 0, 1.0)
+    );
+    assert_eq!(
+        view.storage_dir.as_deref(),
+        Some(save.join("placed").to_string_lossy().as_ref())
+    );
+    assert_eq!(std::fs::read(save.join("placed/a.bin")).unwrap(), data);
+    rig.service.stop().await;
+}
+
+// qBittorrent `NoSubfolder`: the files sit straight in the save path, with no
+// folder of the torrent's own, and are found there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrent_laid_out_without_its_folder_has_the_files_in_the_save_path() {
+    let (metainfo, data) = placed_torrent();
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("flat");
+    std::fs::create_dir_all(&save).unwrap();
+    std::fs::write(save.join("a.bin"), &data).unwrap();
+
+    let (_, view) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            layout: Some(ContentLayout::NoSubfolder),
+            ..Placement::default()
+        },
+    )
+    .await;
+    let total = data.len() as u64;
+    assert_eq!((view.have_bytes, view.downloaded_bytes), (total, 0));
+    assert_eq!(
+        view.files_dir.as_deref(),
+        Some(save.to_string_lossy().as_ref())
+    );
+    assert_eq!(std::fs::read(save.join("a.bin")).unwrap(), data);
+    rig.service.stop().await;
+}
+
+// libtorrent `torrent_flags::seed_mode`, as qBittorrent `seedMode` sets it: a
+// torrent whose files are complete where it is added seeds them at once,
+// and its trackers hear it downloaded nothing, as they first hear of it and
+// after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_mode_add_of_complete_files_announces_nothing_downloaded() {
+    use tokio::io::AsyncWriteExt;
+
+    let (metainfo, data) = placed_torrent();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("seeded");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+
+    let (job_id, view) = seeding_placed(
+        &rig,
+        metainfo,
+        Placement {
+            save_path: Some(save.to_string_lossy().into_owned()),
+            seed_mode: true,
+            ..Placement::default()
+        },
+    )
+    .await;
+    let total = data.len() as u64;
+    assert_eq!((view.have_bytes, view.downloaded_bytes), (total, 0));
+    assert!(handle_of(&rig.service, job_id).await.seed_mode());
+
+    tracked(&rig.service, job_id, &url).await;
+    let answer = {
+        let body = "d8:intervali1800e5:peers0:e";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (mut started, request) = heard_request(&listener).await;
+    assert!(request.contains("&downloaded=0&"), "{request}");
+    assert!(request.contains("&left=0&"), "{request}");
+    started.write_all(answer.as_bytes()).await.unwrap();
+    trackers_once(&rig.service, job_id, |announces| {
+        !announces[0].in_flight
+            && announces[0]
+                .last
+                .as_ref()
+                .is_some_and(|last| last.result.is_ok())
+    })
+    .await;
+
+    rig.service.reannounce(job_id).await.unwrap();
+    let (mut next, request) = heard_request(&listener).await;
+    assert!(request.contains("&downloaded=0&"), "{request}");
+    assert!(request.contains("&left=0&"), "{request}");
+    next.write_all(answer.as_bytes()).await.unwrap();
+    assert_eq!(std::fs::read(save.join("placed/a.bin")).unwrap(), data);
     rig.service.stop().await;
 }

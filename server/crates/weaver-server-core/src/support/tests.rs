@@ -660,6 +660,7 @@ fn held_torrent(
         added_at_ms: now_ms - 600_000,
         completed_at_ms: None,
         storage_dir: Some(format!("/srv/{SENTINEL}")),
+        files_dir: None,
         seeding_left: None,
         route: Some("0123456789abcdef".into()),
         files: Vec::new(),

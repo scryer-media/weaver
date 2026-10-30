@@ -109,6 +109,7 @@ impl<R: Root> GraphJob<R> {
             storage.free_disk,
         )
         .capped(storage.caps)
+        .keeping_in(storage.kept_dir)
         .keeping(root.kept_files());
         writer.restore_members(&tree);
         for ((node, member), state) in &snapshot.files {

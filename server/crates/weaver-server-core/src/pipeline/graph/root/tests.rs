@@ -1181,6 +1181,7 @@ fn an_article_job_restores_from_its_checkpoint_rows() {
     assert_eq!(snapshot, taken);
     let storage = crate::pipeline::graph::job::Storage {
         working_dir: dir.path().to_path_buf(),
+        kept_dir: None,
         accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
             resident_limit: u64::MAX,
             scratch_total: u64::MAX,
@@ -1221,6 +1222,7 @@ fn an_article_jobs_restore_reads_its_articles_back_and_checks_them() {
     std::fs::write(dir.path().join("lantern.bin"), [9; 90]).unwrap();
     let storage = crate::pipeline::graph::job::Storage {
         working_dir: dir.path().to_path_buf(),
+        kept_dir: None,
         accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
             resident_limit: u64::MAX,
             scratch_total: u64::MAX,

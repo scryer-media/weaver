@@ -85,8 +85,9 @@ use crate::{
         ManagedTorrentState, TorrentMetadata, TorrentStateLive, TorrentTotals,
         initializing::{Checkpoint, TorrentStateInitializing, normalize_checkpoint},
         live::peers::PeerList,
+        seed_mode::SeedMode,
     },
-    type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream},
+    type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream},
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -594,6 +595,14 @@ pub struct AddTorrentOptions {
     /// Off by default; a private torrent is held to it either way.
     #[serde(default)]
     pub trackers_only: bool,
+    /// Seed the files where the storage has them without checking them
+    /// first: every piece is taken as had, whatever [`Self::checkpoint`]
+    /// says, and each is checked the first time a peer asks for it. A piece
+    /// that fails ends seed mode and every piece is checked again; seed
+    /// mode also ends once every piece passed, or at any check of every
+    /// piece (libtorrent `torrent_flags::seed_mode`). Off by default.
+    #[serde(default)]
+    pub seed_mode: bool,
     /// Our identity under an SSL torrent's CA, presented to its peers and
     /// its HTTPS trackers (see [`Session::set_ssl_identity`]). An SSL
     /// torrent added without one connects to no peer and announces nowhere
@@ -650,6 +659,7 @@ impl Default for AddTorrentOptions {
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
             trackers_only: false,
+            seed_mode: false,
             ssl_identity: None,
             metadata_fetch: None,
             tracker_handover: None,
@@ -2674,6 +2684,14 @@ impl Session {
             opts.list_only,
         )?;
 
+        // Seed mode takes every piece as had (libtorrent `torrent::init`
+        // under `seed_mode` sets every piece had without reading one).
+        if opts.seed_mode {
+            let pieces = metadata.info.lengths().total_pieces() as usize;
+            let mut have = BF::from_boxed_slice(vec![0u8; pieces.div_ceil(8)].into_boxed_slice());
+            have[..pieces].fill(true);
+            opts.checkpoint = Some(Checkpoint::pieces(have));
+        }
         let checkpoint = opts
             .checkpoint
             .take()
@@ -2782,6 +2800,11 @@ impl Session {
                     super_seeding: opts.super_seeding,
                     sequential: opts.sequential.into(),
                     trackers_only: opts.trackers_only,
+                    seed: if opts.seed_mode {
+                        SeedMode::over(metadata.info.lengths().total_pieces())
+                    } else {
+                        SeedMode::default()
+                    },
                 },
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),

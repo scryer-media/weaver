@@ -65,6 +65,7 @@ impl Pipeline {
             .collect();
         let storage = Storage {
             working_dir: working_dir.to_path_buf(),
+            kept_dir: None,
             accountant: Arc::clone(&self.graph_holds),
             free_disk: self
                 .storage_capacity

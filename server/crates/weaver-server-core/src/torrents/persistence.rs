@@ -151,6 +151,11 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::OptI64(torrent.download_limit.map(stored).transpose()?),
         SqlArg::Bool(torrent.sequential),
         SqlArg::Bool(torrent.first_last_piece_first),
+        SqlArg::OptText(torrent.save_path.clone()),
+        SqlArg::OptText(torrent.content_layout.map(|layout| layout.as_str().to_owned())),
+        SqlArg::OptText(torrent.files_dir.clone()),
+        SqlArg::Bool(torrent.seed_mode),
+        SqlArg::OptText(torrent.move_to.clone()),
     ])
 }
 
@@ -542,6 +547,32 @@ impl Database {
     ) -> Result<bool, StateError> {
         let args = vec![SqlArg::Bool(on), SqlArg::I64(stored(job_id.0)?)];
         self.set_torrent_column("first_last_piece_first", args)
+    }
+
+    // Where the torrent's files sit when not in its storage directory.
+    pub fn set_torrent_files_dir(
+        &self,
+        job_id: JobId,
+        dir: Option<&str>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(dir.map(str::to_owned)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("files_dir", args)
+    }
+
+    // The torrent's session left seed mode: from here its pieces are what
+    // its job has.
+    pub fn clear_torrent_seed_mode(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::Bool(false), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("seed_mode", args)
+    }
+
+    // The torrent moved where it was to move once complete, or will not.
+    pub fn clear_torrent_move_to(&self, job_id: JobId) -> Result<bool, StateError> {
+        let args = vec![SqlArg::OptText(None), SqlArg::I64(stored(job_id.0)?)];
+        self.set_torrent_column("move_to", args)
     }
 
     // Write one column of a torrent and no other, so the writers of

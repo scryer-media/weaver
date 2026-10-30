@@ -146,6 +146,9 @@ pub(crate) struct NamespaceWriter {
     // The root members the job keeps, by member id, each under the name its
     // file has; none for a job that keeps none.
     kept: Vec<String>,
+    // Where the kept members' files are, when not under the working
+    // directory: files placed there before the job began, which stay there.
+    kept_dir: Option<PathBuf>,
 }
 
 impl NamespaceWriter {
@@ -169,6 +172,7 @@ impl NamespaceWriter {
             segments: Vec::new(),
             placements: Vec::new(),
             kept: Vec::new(),
+            kept_dir: None,
         }
     }
 
@@ -183,6 +187,20 @@ impl NamespaceWriter {
     pub(crate) fn keeping(mut self, names: Vec<String>) -> Self {
         self.kept = names;
         self
+    }
+
+    // The kept members' files are under `dir`, when there is one, and not
+    // under the working directory.
+    pub(crate) fn keeping_in(mut self, dir: Option<PathBuf>) -> Self {
+        self.kept_dir = dir;
+        self
+    }
+
+    // Where a kept root member's file is, whether or not it was written.
+    pub(crate) fn kept_path(&self, member: MemberId) -> Option<PathBuf> {
+        let name = self.kept(NodeId::ROOT, member)?;
+        let dir = self.kept_dir.as_deref().unwrap_or(&self.working_dir);
+        Leaf::at(dir, name).ok().map(|leaf| leaf.path().to_path_buf())
     }
 
     // The name a kept member's file has; none for a member not kept.
@@ -1489,8 +1507,12 @@ impl NamespaceWriter {
         member: MemberId,
         output_name: &str,
     ) -> Result<&mut Leaf, WriteError> {
-        let dir = self.working_dir.clone();
-        let name = self.kept(node, member).unwrap_or(output_name).to_owned();
+        let kept = self.kept(node, member);
+        let dir = match (kept, &self.kept_dir) {
+            (Some(_), Some(dir)) => dir.clone(),
+            _ => self.working_dir.clone(),
+        };
+        let name = kept.unwrap_or(output_name).to_owned();
         let leaves = &mut self.files_mut(node).leaves;
         match leaves.entry(member) {
             Entry::Occupied(leaf) => Ok(leaf.into_mut()),

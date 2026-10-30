@@ -144,6 +144,20 @@ impl Pieces for Intake {
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
         self.inner.posted(volume, range, into)
     }
+
+    fn placed(&self, volume: VolumeIndex, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.inner.placed(volume, offset, buf)
+    }
+
+    fn had(&self, piece: u32) -> bool {
+        self.inner.had(piece)
+    }
+
+    // The bytes are on disk already: the reserve has nothing to judge.
+    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+        self.heard(self.inner.adopted(shares).map(|()| true))
+            .map(|_| ())
+    }
 }
 
 #[cfg(test)]

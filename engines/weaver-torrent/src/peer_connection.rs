@@ -109,6 +109,12 @@ pub trait PeerConnectionHandler {
     fn claim_upload(&self, _chunk: &ChunkInfo) -> bool {
         false
     }
+    /// Whether the block `chunk` the writer took is read and sent. False
+    /// drops it unsent and keeps the connection; an error ends it. A
+    /// handler with nothing to check first serves every block.
+    async fn serves(&self, _chunk: &ChunkInfo) -> anyhow::Result<bool> {
+        Ok(true)
+    }
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()>;
     fn update_my_extended_handshake(
         &self,
@@ -696,6 +702,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             trace!(?chunk, "upload taken off the queue before it was sent");
                             continue;
                         }
+                        if !self.handler.serves(&chunk).await.map_err(Error::ReadChunk)? {
+                            trace!(?chunk, "upload not served");
+                            continue;
+                        }
 
                         #[allow(unused_mut)]
                         let mut skip_reading_for_e2e_tests = false;
@@ -1217,6 +1227,104 @@ mod tests {
         assert!(meter.sent() > 68 + 9);
         assert_eq!(load(&ledger.paid[1]), meter.sent());
         assert_eq!(load(&ledger.protocol[1]), meter.sent());
+    }
+
+    /// Serves every block but those of piece 0, whose check failed.
+    struct Picky;
+
+    impl PeerConnectionHandler for &Picky {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, _: Message<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn claim_upload(&self, _: &ChunkInfo) -> bool {
+            true
+        }
+        async fn serves(&self, chunk: &ChunkInfo) -> anyhow::Result<bool> {
+            Ok(chunk.piece_index.get() != 0)
+        }
+        fn read_chunk(&self, _: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
+            buf.fill(0xab);
+            Ok(())
+        }
+    }
+
+    // libtorrent `peer_connection::on_seed_mode_hashed`: a piece that fails
+    // its seed-mode check is not sent, and the connection is not ended for
+    // it. The block asked for after it is sent on the same connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_not_served_is_dropped_and_the_connection_kept() {
+        use tokio::io::AsyncReadExt;
+        const BLOCK: u32 = 16384;
+        let picky = Picky;
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            &picky,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 18);
+        let (reader, writer) = halves(ours);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer,
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter,
+        };
+        let lengths = crate::core::lengths::Lengths::new(2 * BLOCK as u64, BLOCK).unwrap();
+        let block = |piece| {
+            lengths
+                .chunk_info_from_received_data(lengths.validate_piece_index(piece).unwrap(), 0, BLOCK)
+                .unwrap()
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(WriterRequest::ReadChunkRequest(block(0))).unwrap();
+        tx.send(WriterRequest::ReadChunkRequest(block(1))).unwrap();
+        tx.send(WriterRequest::Message(Message::Have(3))).unwrap();
+        let peer = async {
+            let mut handshake = [0; 68];
+            theirs.read_exact(&mut handshake).await.unwrap();
+            // The pieces of the blocks sent, until the have after them.
+            let mut sent = Vec::new();
+            loop {
+                let mut body = vec![0; theirs.read_u32().await.unwrap() as usize];
+                theirs.read_exact(&mut body).await.unwrap();
+                if body == [4, 0, 0, 0, 3] {
+                    break;
+                }
+                if body.first() == Some(&7) {
+                    sent.push(u32::from_be_bytes(body[1..5].try_into().unwrap()));
+                    assert!(body[9..].iter().all(|byte| *byte == 0xab));
+                }
+            }
+            drop(tx);
+            sent
+        };
+        let (result, sent) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        assert_eq!(sent, [1]);
+        // The connection ended only when its torrent let go of it.
+        assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
     }
 
     /// Records the blocks cut short it is told of; reads under the download

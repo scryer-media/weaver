@@ -138,6 +138,18 @@ pub struct MemoryStorageFactory {
     pub log: Arc<StorageLog>,
 }
 
+impl MemoryStorageFactory {
+    /// Storage that holds `files` already, as a torrent's files on disk would.
+    pub fn holding(files: Vec<Vec<u8>>) -> Self {
+        let factory = Self::default();
+        *factory.log.files.write() = files
+            .into_iter()
+            .map(|file| Arc::new(RwLock::new(file)))
+            .collect();
+        factory
+    }
+}
+
 impl StorageFactory for MemoryStorageFactory {
     type Storage = MemoryStorage;
 

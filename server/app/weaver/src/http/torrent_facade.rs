@@ -40,10 +40,11 @@ use weaver_server_core::settings::{
 };
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::{
-    ActionError, AddError, AddRequest, SeedingSource, TorrentService, TorrentSettings, TorrentView,
+    ActionError, AddError, AddRequest, Placement, SeedingSource, TorrentService, TorrentSettings,
+    TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
+    ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
     TorrentTracker, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
@@ -2164,6 +2165,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .unwrap_or(false);
     let sequential = params.flag("sequentialDownload").unwrap_or(false);
     let first_last = params.flag("firstLastPiecePrio").unwrap_or(false);
+    let placement = placement(&params);
     let mut ids = Vec::new();
     let mut failed = 0usize;
     let mut refusal: Option<String> = None;
@@ -2180,6 +2182,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
                     metadata: Vec::new(),
                     upload_limit,
                     download_limit,
+                    placement: placement.clone(),
                 })
                 .await
                 .map_err(|error| match error {
@@ -2213,6 +2216,43 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         return text(StatusCode::BAD_REQUEST, "no torrents or urls");
     }
     ctx.api().added(&ids, failed, refusal)
+}
+
+// Where an added torrent's files go, as qBittorrent `addAction` and
+// `SessionImpl::addTorrent` read it. A save path is taken unless `autoTMM`
+// asks for the category's; with no `autoTMM` qBittorrent manages a torrent
+// by hand. A download path is taken unless `useDownloadPath` turns it off.
+// `seedMode` seeds the files as they are; `skip_checking`, the name the
+// qBittorrent API documents for it and many clients send, means the same. A layout
+// qBittorrent does not name is its default, `Original`, and with no
+// `contentLayout` the older `root_folder` picks one.
+fn placement(params: &Params) -> Placement {
+    let managed = params.flag_value("autoTMM").unwrap_or(false);
+    let path = |name: &str| {
+        params
+            .get(name)
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && !managed)
+            .map(str::to_owned)
+    };
+    let layout = match params.get("contentLayout").filter(|value| !value.is_empty()) {
+        Some(value) => Some(ContentLayout::parse(value).unwrap_or(ContentLayout::Original)),
+        None => params.flag_value("root_folder").map(|folder| {
+            if folder {
+                ContentLayout::Subfolder
+            } else {
+                ContentLayout::NoSubfolder
+            }
+        }),
+    };
+    Placement {
+        save_path: path("savepath"),
+        layout,
+        download_path: path("downloadPath")
+            .filter(|_| params.flag_value("useDownloadPath").unwrap_or(true)),
+        seed_mode: params.flag("seedMode").unwrap_or(false)
+            || params.flag("skip_checking").unwrap_or(false),
+    }
 }
 
 // The seeding policy a torrent added to `category` inherits before its

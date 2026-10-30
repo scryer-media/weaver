@@ -377,6 +377,7 @@ impl WatchFolderScanner {
             metadata: Vec::new(),
             upload_limit: None,
             download_limit: None,
+            placement: Default::default(),
         };
         match torrents.add(request).await {
             Ok(job_id) => Added::Queued(job_id.0),
