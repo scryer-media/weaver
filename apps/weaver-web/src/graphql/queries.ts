@@ -253,12 +253,26 @@ const SERVER_DETAILS_FIELDS = `
 
 export const SEEDING_POLICY_FIELDS = `
   fragment SeedingPolicyFields on SeedingPolicySettings {
-    ratioGoal
-    seedTimeGoalMinutes
-    inactiveGoalMinutes
-    mode
-    action
-    maxUploadBps
+    ratioGoal {
+      state
+      value
+    }
+    seedTimeGoalMinutes {
+      state
+      value
+    }
+    inactiveGoalMinutes {
+      state
+      value
+    }
+    mode {
+      state
+      value
+    }
+    action {
+      state
+      value
+    }
   }
 `;
 
@@ -273,6 +287,10 @@ const CATEGORY_FIELDS = `
     }
     torrentRoute
     unpack
+    uploadCap {
+      state
+      value
+    }
   }
   ${SEEDING_POLICY_FIELDS}
 `;
@@ -1407,6 +1425,7 @@ const TORRENT_SETTINGS_FIELDS = `
     seeding {
       ...SeedingPolicyFields
     }
+    uploadCap
     torrent {
       enabled
       basePort
@@ -1468,8 +1487,9 @@ const TRACKER_RULE_FIELDS = `
     pex
     lsd
     encryption
-    uploadLimit {
-      bps
+    uploadCap {
+      state
+      value
     }
     forced
     hasSsl
@@ -1626,11 +1646,24 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         ...SeedingPolicyFields
       }
       seedingPolicy {
-        ...SeedingPolicyFields
+        ratioGoal
+        seedTimeGoalMinutes
+        inactiveGoalMinutes
+        mode
+        action
+        uploadCap
+        levels {
+          ratioGoal
+          seedTimeGoalMinutes
+          inactiveGoalMinutes
+          mode
+          action
+          uploadCap
+        }
       }
-      seedingSource
-      seedingRule
+      trackerRule
       unpack
+      unpackOverride
       route
       files {
         index

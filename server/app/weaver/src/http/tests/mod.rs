@@ -182,6 +182,7 @@ fn test_scheduler_handle() -> SchedulerHandle {
 
 fn test_config() -> SharedConfig {
     Arc::new(RwLock::new(Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: "/tmp/weaver".to_string(),

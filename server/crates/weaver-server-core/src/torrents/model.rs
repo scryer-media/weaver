@@ -182,10 +182,14 @@ pub struct TorrentRecord {
     pub forced: bool,
     pub completed_at_ms: Option<i64>,
     pub storage_dir: Option<String>,
+    // Its own seeding policy; `None` inherits every leaf.
     pub policy_override: Option<SeedingPolicy>,
-    // Whether its archives are extracted: the torrent's own value until its
-    // job is built, then the value in force.
+    // Whether its archives are extracted, as asked for it; `None` inherits.
     pub unpack: Option<bool>,
+    // Whether its archives are extracted, as fixed when its job was built
+    // from the override chain then, so a restart builds the same tree;
+    // `None` until then.
+    pub unpack_in_force: Option<bool>,
     // The attributes its job was added with.
     pub metadata: Vec<(String, String)>,
     // Its own upload and download limits in bytes per second: None is

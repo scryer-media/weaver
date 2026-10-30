@@ -1928,6 +1928,113 @@ mod tests {
         pool.close().await;
     }
 
+    // Migration 98 takes the upload cap out of every seeding policy: a
+    // rule's own limit becomes its cap ('unlimited' reads 'off') and stands
+    // over its policy's, which moves in only where the rule set none; a
+    // category's moves to its own column; a torrent's joins its own upload
+    // limit, the tighter of the two; the global one is renamed. A torrent's
+    // unpack becomes the value in force, and what is asked starts unset.
+    #[tokio::test]
+    async fn sqlite_migration_98_moves_every_upload_cap_out_of_the_seeding_policy() {
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-override-chain.db");
+        let pool = open_test_pool(&db_path).await;
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(97), true)
+            .await
+            .unwrap();
+        for statement in [
+            r#"INSERT INTO tracker_rules (id, host_pattern, seeding, upload_limit, created_at_ms, updated_at_ms)
+               VALUES (1, 'both.example', '{"ratio_goal":2.0,"max_upload_bps":9000,"mode":"any","action":"stop"}', '4096', 1, 1),
+                      (2, 'policy.example', '{"max_upload_bps":7000,"mode":"any","action":"stop"}', NULL, 1, 1),
+                      (3, 'unlimited.example', NULL, 'unlimited', 1, 1)"#,
+            r#"INSERT INTO categories (id, name, seeding)
+               VALUES (1, 'tv', '{"ratio_goal":1.0,"max_upload_bps":3000,"mode":"all","action":"stop"}'),
+                      (2, 'movies', NULL)"#,
+            r#"INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state, policy_override, upload_limit, unpack)
+               VALUES (7, X'0707070707070707070707070707070707070707', 'own', 'magnet', 1, 'queued',
+                       '{"max_upload_bps":1000,"mode":"any","action":"stop"}', 65536, 1),
+                      (8, X'0808080808080808080808080808080808080808', 'none', 'magnet', 1, 'queued',
+                       '{"max_upload_bps":2000,"mode":"any","action":"stop"}', NULL, 0),
+                      (9, X'0909090909090909090909090909090909090909', 'tight', 'magnet', 1, 'queued',
+                       '{"max_upload_bps":5000,"mode":"any","action":"stop"}', 500, NULL)"#,
+            "INSERT INTO settings (key, value) VALUES ('seeding.max_upload_bps', '123456')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let rules: Vec<(i64, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT id, upload_cap, seeding FROM tracker_rules ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rules,
+            [
+                (
+                    1,
+                    Some("4096".to_owned()),
+                    Some(r#"{"ratio_goal":2.0,"mode":"any","action":"stop"}"#.to_owned())
+                ),
+                (
+                    2,
+                    Some("7000".to_owned()),
+                    Some(r#"{"mode":"any","action":"stop"}"#.to_owned())
+                ),
+                (3, Some("off".to_owned()), None),
+            ]
+        );
+        let categories: Vec<(i64, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT id, upload_cap, seeding FROM categories ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            categories,
+            [
+                (
+                    1,
+                    Some("3000".to_owned()),
+                    Some(r#"{"ratio_goal":1.0,"mode":"all","action":"stop"}"#.to_owned())
+                ),
+                (2, None, None),
+            ]
+        );
+        let torrents: Vec<(i64, Option<i64>, Option<String>, Option<bool>, Option<bool>)> =
+            sqlx::query_as(
+                "SELECT job_id, upload_limit, policy_override, unpack, unpack_in_force
+                   FROM torrents ORDER BY job_id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let kept = Some(r#"{"mode":"any","action":"stop"}"#.to_owned());
+        assert_eq!(
+            torrents,
+            [
+                (7, Some(1000), kept.clone(), None, Some(true)),
+                (8, Some(2000), kept.clone(), None, Some(false)),
+                (9, Some(500), kept, None, None),
+            ]
+        );
+        let settings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM settings WHERE key LIKE 'seeding.%' ORDER BY key",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            settings,
+            [("seeding.upload_cap".to_owned(), "123456".to_owned())]
+        );
+        pool.close().await;
+    }
+
     // Migration 78 keeps each tracker's place in the announce list and drops
     // the announce columns, which the session answers instead.
     #[tokio::test]

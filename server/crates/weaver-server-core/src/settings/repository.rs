@@ -6,7 +6,7 @@ use crate::persistence::Database;
 use crate::persistence::encryption::{EncryptionKey, decrypt_value, encrypt_value, is_encrypted};
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
 use crate::settings::model::{
-    Client, TorrentEncryption, TrackerCertificate, TrackerRule, TrackerUploadLimit,
+    Client, Leaf, SeedingPolicy, TorrentEncryption, TrackerCertificate, TrackerRule,
 };
 
 #[cfg(test)]
@@ -16,7 +16,7 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_limit, forced, ssl_certificate, ssl_private_key";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key";
 
 fn tracker_rule_from_row(
     row: &SqlRow,
@@ -35,7 +35,7 @@ fn tracker_rule_from_row(
         id: u32::try_from(id)
             .map_err(|_| StateError::Database(format!("tracker rule id {id} is not valid")))?,
         host_pattern: row.text("host_pattern")?,
-        seeding,
+        seeding: SeedingPolicy::kept(seeding),
         never_pause: row.bool("never_pause")?,
         unpack: row.opt_bool("unpack")?,
         client: row
@@ -60,14 +60,15 @@ fn tracker_rule_from_row(
                 })
             })
             .transpose()?,
-        upload_limit: row
-            .opt_text("upload_limit")?
-            .map(|limit| {
-                TrackerUploadLimit::parse(&limit).ok_or_else(|| {
-                    StateError::Database(format!("tracker rule upload limit {limit} is not valid"))
-                })
-            })
-            .transpose()?,
+        upload_cap: {
+            let text = row.opt_text("upload_cap")?;
+            Leaf::from_text(text.as_deref()).ok_or_else(|| {
+                StateError::Database(format!(
+                    "tracker rule upload cap {} is not valid",
+                    text.unwrap_or_default()
+                ))
+            })?
+        },
         forced: row.bool("forced")?,
         ssl: match (
             row.opt_text("ssl_certificate")?,
@@ -105,8 +106,7 @@ fn tracker_rule_args(
     rule: &TrackerRule,
     key: Option<&EncryptionKey>,
 ) -> Result<Vec<SqlArg>, StateError> {
-    let seeding = rule
-        .seeding
+    let seeding = SeedingPolicy::kept(rule.seeding)
         .map(|policy| serde_json::to_string(&policy))
         .transpose()
         .map_err(|error| StateError::Database(error.to_string()))?;
@@ -124,7 +124,7 @@ fn tracker_rule_args(
             rule.encryption
                 .map(|encryption| encryption.as_str().to_owned()),
         ),
-        SqlArg::OptText(rule.upload_limit.map(TrackerUploadLimit::to_text)),
+        SqlArg::OptText(rule.upload_cap.to_text()),
         SqlArg::Bool(rule.forced),
         SqlArg::OptText(rule.ssl.as_ref().map(|ssl| ssl.certificate_pem.clone())),
         SqlArg::OptText(
@@ -205,7 +205,7 @@ impl Database {
                 datastore.read_exec(),
                 "UPDATE tracker_rules
                     SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
-                        dht = {}, pex = {}, lsd = {}, encryption = {}, upload_limit = {}, forced = {},
+                        dht = {}, pex = {}, lsd = {}, encryption = {}, upload_cap = {}, forced = {},
                         ssl_certificate = {}, ssl_private_key = {}, updated_at_ms = {}
                   WHERE id = {}",
                 &args,

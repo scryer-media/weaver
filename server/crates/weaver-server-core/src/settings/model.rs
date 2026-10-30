@@ -13,6 +13,7 @@ use crate::categories::CategoryConfig;
 use crate::jobs::DuplicatePolicy;
 use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
+pub use crate::settings::levels::{Leaf, Level, Levels};
 use crate::torrents::identity::{ClientIdentity, IDENTITY};
 use crate::watch_folder::WatchFolderConfig;
 
@@ -76,6 +77,10 @@ pub struct Config {
     // it is stopped.
     #[serde(default)]
     pub seeding: Option<SeedingPolicy>,
+    // The upload cap each torrent takes unless its category or tracker rule
+    // sets its own; absent is none.
+    #[serde(default)]
+    pub upload_cap: Option<u64>,
     #[serde(default)]
     pub torrent: TorrentConfig,
     // Path to the config file on disk. Not serialized to TOML.
@@ -351,18 +356,71 @@ impl PerJobSeries {
     }
 }
 
-// When a torrent has seeded enough, at one level: the global config, a
-// category, or one torrent. A `None` field is unset at this level and
-// inherits from the next one.
+// When a torrent has seeded enough, at one level: the global settings, a
+// category, a tracker rule, or one torrent. Each field is a leaf the levels
+// resolve one by one (`Levels`): inherited, off, or set at this level. A
+// policy whose every leaf inherits is no policy, and is kept as none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SeedingPolicy {
+    #[serde(skip_serializing_if = "Leaf::is_inherit")]
+    pub ratio_goal: Leaf<f32>,
+    #[serde(skip_serializing_if = "Leaf::is_inherit")]
+    pub seed_time_goal_minutes: Leaf<u32>,
+    #[serde(skip_serializing_if = "Leaf::is_inherit")]
+    pub inactive_goal_minutes: Leaf<u32>,
+    #[serde(skip_serializing_if = "Leaf::is_inherit")]
+    pub mode: Leaf<SeedingGoalMode>,
+    #[serde(skip_serializing_if = "Leaf::is_inherit")]
+    pub action: Leaf<SeedingAction>,
+}
+
+impl SeedingPolicy {
+    /// Whether every leaf inherits.
+    pub fn inherits(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The policy as a level keeps it: none when every leaf inherits.
+    pub fn kept(policy: Option<Self>) -> Option<Self> {
+        policy.filter(|policy| !policy.inherits())
+    }
+
+    /// The global policy, where there is no level above: an inherited goal
+    /// is no goal, and an inherited mode or action is the default one.
+    pub fn at_global(self) -> Self {
+        Self {
+            ratio_goal: self.ratio_goal.at_global(),
+            seed_time_goal_minutes: self.seed_time_goal_minutes.at_global(),
+            inactive_goal_minutes: self.inactive_goal_minutes.at_global(),
+            mode: Leaf::Set(self.mode.set().unwrap_or_default()),
+            action: Leaf::Set(self.action.set().unwrap_or_default()),
+        }
+    }
+
+    /// A mode or action is set or inherited; neither is ever off.
+    pub fn validate(&self) -> Result<(), String> {
+        if matches!(self.mode, Leaf::Off) || matches!(self.action, Leaf::Off) {
+            return Err("a seeding mode and action are set or inherited, never off".to_owned());
+        }
+        if let Leaf::Set(ratio) = self.ratio_goal
+            && (!ratio.is_finite() || ratio < 0.0)
+        {
+            return Err("a ratio goal must be zero or more".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// The seeding terms a torrent is held to, each resolved over its levels.
+/// A goal that is `None` is not one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Seeding {
     pub ratio_goal: Option<f32>,
     pub seed_time_goal_minutes: Option<u32>,
     pub inactive_goal_minutes: Option<u32>,
     pub mode: SeedingGoalMode,
     pub action: SeedingAction,
-    pub max_upload_bps: Option<u64>,
 }
 
 // Whether any one goal ends seeding, or only all of them together.
@@ -420,29 +478,6 @@ impl SeedingAction {
     }
 }
 
-// The policy a torrent seeds under: its own override, then its tracker
-// rule's, then its category's, then the global one. Optional goals resolve
-// field by field, each from the most specific level that sets it. `mode` and
-// `action` are always set, so they come from the most specific level present.
-// `None` when no level has a policy.
-pub fn resolve_seeding_policy(
-    torrent: Option<&SeedingPolicy>,
-    rule: Option<&SeedingPolicy>,
-    category: Option<&SeedingPolicy>,
-    global: Option<&SeedingPolicy>,
-) -> Option<SeedingPolicy> {
-    let levels = || [torrent, rule, category, global].into_iter().flatten();
-    let most_specific = levels().next()?;
-    Some(SeedingPolicy {
-        ratio_goal: levels().find_map(|p| p.ratio_goal),
-        seed_time_goal_minutes: levels().find_map(|p| p.seed_time_goal_minutes),
-        inactive_goal_minutes: levels().find_map(|p| p.inactive_goal_minutes),
-        mode: most_specific.mode,
-        action: most_specific.action,
-        max_upload_bps: levels().find_map(|p| p.max_upload_bps),
-    })
-}
-
 // The seeding terms of every torrent that announces to a host a pattern
 // names: goals that sit between the torrent's own and its category's, and
 // whether the schedule's torrent pause may stop the torrent while they are
@@ -476,9 +511,9 @@ pub struct TrackerRule {
     // The encryption its torrents' connections are made under, over the
     // global one; `None` inherits.
     pub encryption: Option<TorrentEncryption>,
-    // The upload cap its torrents take in place of their category's and the
-    // global seeding policy's; `None` inherits.
-    pub upload_limit: Option<TrackerUploadLimit>,
+    // The upload cap each of its torrents takes, over its category's and
+    // the global one.
+    pub upload_cap: Leaf<u64>,
     // Whether a torrent admitted under it starts forced, past the queue.
     pub forced: bool,
     // The identity the tracker issued for its SSL torrents, presented to
@@ -538,40 +573,6 @@ impl TrackerCertificate {
 pub struct CertificateSummary {
     pub subject: String,
     pub not_after_ms: i64,
-}
-
-// A tracker rule's upload cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrackerUploadLimit {
-    // No cap from the category's or the global seeding policy.
-    Unlimited,
-    // A cap of the rule's own, in bytes per second.
-    Bps(u64),
-}
-
-impl TrackerUploadLimit {
-    // The cap in bytes per second; `None` is none.
-    pub const fn bps(self) -> Option<u64> {
-        match self {
-            Self::Unlimited => None,
-            Self::Bps(bps) => Some(bps),
-        }
-    }
-
-    // As a rule keeps it: `unlimited`, or the bytes per second.
-    pub fn to_text(self) -> String {
-        match self {
-            Self::Unlimited => "unlimited".to_owned(),
-            Self::Bps(bps) => bps.to_string(),
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "unlimited" => Some(Self::Unlimited),
-            bps => bps.parse().ok().map(Self::Bps),
-        }
-    }
 }
 
 // A client a torrent may name itself as, for the trackers that admit only
@@ -1151,6 +1152,7 @@ mod tests {
             hardware_profile: None,
             metrics: Default::default(),
             seeding: None,
+            upload_cap: None,
             torrent: TorrentConfig::default(),
             config_path: None,
         }
@@ -1158,57 +1160,48 @@ mod tests {
 
     fn policy(ratio_goal: Option<f32>, seed_time_goal_minutes: Option<u32>) -> SeedingPolicy {
         SeedingPolicy {
-            ratio_goal,
-            seed_time_goal_minutes,
+            ratio_goal: Leaf::of(ratio_goal),
+            seed_time_goal_minutes: Leaf::of(seed_time_goal_minutes),
             ..SeedingPolicy::default()
         }
     }
 
+    // A policy kept before its fields were leaves reads as one: a goal it
+    // left unset inherits, and its mode and action are set.
     #[test]
-    fn seeding_policy_resolves_field_by_field() {
-        let torrent = SeedingPolicy {
-            mode: SeedingGoalMode::All,
-            ..policy(Some(2.5), None)
+    fn a_policy_kept_before_leaves_reads_as_leaves() {
+        let kept: SeedingPolicy = serde_json::from_str(
+            r#"{"ratio_goal":2.0,"seed_time_goal_minutes":null,"inactive_goal_minutes":null,"mode":"all","action":"remove"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            SeedingPolicy {
+                ratio_goal: Leaf::Set(2.0),
+                mode: Leaf::Set(SeedingGoalMode::All),
+                action: Leaf::Set(SeedingAction::Remove),
+                ..SeedingPolicy::default()
+            }
+        );
+        let off = SeedingPolicy {
+            seed_time_goal_minutes: Leaf::Off,
+            ..kept
         };
-        let category = SeedingPolicy {
-            inactive_goal_minutes: Some(30),
-            action: SeedingAction::Remove,
-            ..policy(Some(1.0), Some(60))
-        };
-        let global = SeedingPolicy {
-            max_upload_bps: Some(1_000),
-            action: SeedingAction::RemoveWithData,
-            ..policy(Some(0.5), Some(120))
-        };
-
-        let resolved =
-            resolve_seeding_policy(Some(&torrent), None, Some(&category), Some(&global)).unwrap();
-
-        assert_eq!(resolved.ratio_goal, Some(2.5));
-        assert_eq!(resolved.seed_time_goal_minutes, Some(60));
-        assert_eq!(resolved.inactive_goal_minutes, Some(30));
-        assert_eq!(resolved.max_upload_bps, Some(1_000));
-        assert_eq!(resolved.mode, SeedingGoalMode::All);
-        assert_eq!(resolved.action, SeedingAction::Stop);
-
-        // A tracker rule sits between the torrent and its category.
-        let rule = SeedingPolicy {
-            inactive_goal_minutes: Some(45),
-            action: SeedingAction::Remove,
-            ..policy(None, Some(600))
-        };
-        let resolved =
-            resolve_seeding_policy(None, Some(&rule), Some(&category), Some(&global)).unwrap();
-        assert_eq!(resolved.ratio_goal, Some(1.0));
-        assert_eq!(resolved.seed_time_goal_minutes, Some(600));
-        assert_eq!(resolved.inactive_goal_minutes, Some(45));
-        assert_eq!(resolved.max_upload_bps, Some(1_000));
-        assert_eq!(resolved.action, SeedingAction::Remove);
-        let resolved =
-            resolve_seeding_policy(Some(&torrent), Some(&rule), Some(&category), None).unwrap();
-        assert_eq!(resolved.ratio_goal, Some(2.5));
-        assert_eq!(resolved.seed_time_goal_minutes, Some(600));
-        assert_eq!(resolved.action, SeedingAction::Stop);
+        let json = serde_json::to_string(&off).unwrap();
+        assert_eq!(
+            json,
+            r#"{"ratio_goal":2.0,"seed_time_goal_minutes":"off","mode":"all","action":"remove"}"#
+        );
+        assert_eq!(serde_json::from_str::<SeedingPolicy>(&json).unwrap(), off);
+        assert_eq!(SeedingPolicy::kept(Some(SeedingPolicy::default())), None);
+        assert!(
+            SeedingPolicy {
+                mode: Leaf::Off,
+                ..SeedingPolicy::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     fn rule(id: u32, host_pattern: &str) -> TrackerRule {
@@ -1224,7 +1217,7 @@ mod tests {
             pex: None,
             lsd: None,
             encryption: None,
-            upload_limit: None,
+            upload_cap: Leaf::Inherit,
             forced: false,
             ssl: None,
         }
@@ -1401,25 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn seeding_policy_skips_absent_levels() {
-        let global = SeedingPolicy {
-            action: SeedingAction::Remove,
-            ..policy(None, Some(90))
-        };
-
-        assert_eq!(
-            resolve_seeding_policy(None, None, None, Some(&global)),
-            Some(global)
-        );
-        let category = policy(Some(1.5), None);
-        let resolved = resolve_seeding_policy(None, None, Some(&category), Some(&global)).unwrap();
-        assert_eq!(resolved.ratio_goal, Some(1.5));
-        assert_eq!(resolved.seed_time_goal_minutes, Some(90));
-        assert_eq!(resolved.action, SeedingAction::Stop);
-        assert_eq!(resolve_seeding_policy(None, None, None, None), None);
-    }
-
-    #[test]
     fn a_config_without_torrent_keys_loads_the_defaults_and_round_trips() {
         let config: Config = toml::from_str(
             r#"
@@ -1460,12 +1434,12 @@ name = "tv"
     fn torrent_and_seeding_tables_round_trip_through_toml() {
         let mut config = config_with_server();
         config.seeding = Some(SeedingPolicy {
-            inactive_goal_minutes: Some(15),
-            mode: SeedingGoalMode::All,
-            action: SeedingAction::RemoveWithData,
-            max_upload_bps: Some(65_536),
+            inactive_goal_minutes: Leaf::Off,
+            mode: Leaf::Set(SeedingGoalMode::All),
+            action: Leaf::Set(SeedingAction::RemoveWithData),
             ..policy(Some(2.0), Some(1_440))
         });
+        config.upload_cap = Some(65_536);
         config.torrent = TorrentConfig {
             enabled: true,
             base_port: 51_413,
@@ -1495,6 +1469,7 @@ name = "tv"
         let reparsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
 
         assert_eq!(reparsed.seeding, config.seeding);
+        assert_eq!(reparsed.upload_cap, config.upload_cap);
         assert_eq!(reparsed.torrent, config.torrent);
     }
 

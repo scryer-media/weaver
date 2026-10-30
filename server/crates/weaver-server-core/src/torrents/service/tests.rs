@@ -161,8 +161,10 @@ fn service_over(
 ) -> TorrentService {
     let sessions = Sessions::new(routes, env(&dir.join("sessions")), db.clone());
     let settings = TorrentSettings {
+        upload_cap: None,
         complete_dir: dir.join("complete"),
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             id: 1,
             name: "tv".into(),
             dest_dir: None,
@@ -486,10 +488,12 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         file_have: Vec::new(),
         metadata: Vec::new(),
         seeding_override: None,
-        seeding_inherited: None,
-        seeding_policy: SeedingPolicy::default(),
-        seeding_source: SeedingSource::Global,
+        seeding_policy: Seeding::default(),
+        seeding_levels: SeedingLevels::default(),
+        tracker_rule: None,
+        upload_cap: None,
         unpack: true,
+        unpack_override: None,
     };
     let job_info =
         |view: TorrentView, now: i64| report(view.clone(), job_status(&view), now).job_info();
@@ -690,12 +694,11 @@ async fn a_private_torrent_with_an_unmet_goal_stays_unless_the_removal_confirms(
         .service
         .add(AddRequest {
             policy_override: Some(SeedingPolicy {
-                ratio_goal: Some(1.0),
-                seed_time_goal_minutes: None,
-                inactive_goal_minutes: None,
-                mode: SeedingGoalMode::Any,
-                action: SeedingAction::Stop,
-                max_upload_bps: None,
+                ratio_goal: Leaf::Set(1.0),
+                seed_time_goal_minutes: Leaf::Inherit,
+                inactive_goal_minutes: Leaf::Inherit,
+                mode: Leaf::Set(SeedingGoalMode::Any),
+                action: Leaf::Set(SeedingAction::Stop),
             }),
             ..request(AddSource::Metainfo(private))
         })
@@ -884,7 +887,7 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
             pex: None,
             lsd: None,
             encryption: None,
-            upload_limit: None,
+            upload_cap: Default::default(),
             forced: false,
             ssl: None,
         },
@@ -1112,7 +1115,7 @@ async fn url_route(category: Option<&str>, matched: bool) {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ssl: None,
             },
@@ -2398,12 +2401,11 @@ async fn a_forced_torrent_seeds_past_its_goal() {
         .service
         .add(AddRequest {
             policy_override: Some(SeedingPolicy {
-                ratio_goal: Some(0.0),
-                seed_time_goal_minutes: None,
-                inactive_goal_minutes: None,
-                mode: SeedingGoalMode::Any,
-                action: SeedingAction::Stop,
-                max_upload_bps: None,
+                ratio_goal: Leaf::Set(0.0),
+                seed_time_goal_minutes: Leaf::Inherit,
+                inactive_goal_minutes: Leaf::Inherit,
+                mode: Leaf::Set(SeedingGoalMode::Any),
+                action: Leaf::Set(SeedingAction::Stop),
             }),
             forced: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
@@ -4189,7 +4191,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ssl: None,
             },
@@ -4291,7 +4293,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 id: 0,
                 host_pattern: "*.test".into(),
                 seeding: Some(SeedingPolicy {
-                    ratio_goal: Some(2.0),
+                    ratio_goal: Leaf::Set(2.0),
                     ..SeedingPolicy::default()
                 }),
                 never_pause: true,
@@ -4302,7 +4304,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ssl: None,
             },
@@ -4340,8 +4342,13 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
             .completed_at_ms = Some(EPOCH_MS);
     }
     assert_eq!(
-        rig.service.torrent(kept).await.unwrap().seeding_source,
-        SeedingSource::TrackerRule("*.test".into())
+        rig.service
+            .torrent(kept)
+            .await
+            .unwrap()
+            .tracker_rule
+            .as_deref(),
+        Some("*.test")
     );
 
     let hold = |hold: Hold| {
@@ -4447,10 +4454,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         Some(HoldOrigin::Scheduled)
     );
     assert_eq!(rig.service.inner.live.lock().await[&kept].rule_id, None);
-    assert_eq!(
-        rig.service.torrent(kept).await.unwrap().seeding_source,
-        SeedingSource::Global
-    );
+    assert_eq!(rig.service.torrent(kept).await.unwrap().tracker_rule, None);
 }
 
 // The download limit counts the torrents still downloading, and a change to
@@ -4622,6 +4626,7 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
 #[test]
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {
+        unpack_in_force: None,
         job_id: JobId(1),
         infohash_v1: Some([1; 20]),
         infohash_v2: None,
@@ -4660,13 +4665,15 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         pex: None,
         lsd: None,
         encryption: None,
-        upload_limit: None,
+        upload_cap: Default::default(),
         forced: false,
         ssl: None,
     }];
     let mut settings = TorrentSettings {
+        upload_cap: None,
         complete_dir: PathBuf::from("/complete"),
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             id: 1,
             name: "tv".into(),
             dest_dir: None,
@@ -4690,11 +4697,222 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
     assert!(settings.unpack(&record, rules.first()));
 }
 
+// One torrent in category 1 under one tracker rule, with nothing set at
+// any level but the global defaults.
+fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
+    let record = TorrentRecord {
+        unpack_in_force: None,
+        job_id: JobId(1),
+        infohash_v1: Some([1; 20]),
+        infohash_v2: None,
+        name: "set".into(),
+        source: TorrentSource::Metainfo,
+        metainfo: None,
+        category_id: Some(1),
+        added_at_ms: EPOCH_MS,
+        intent: TorrentIntent::Resumed,
+        forced: false,
+        completed_at_ms: None,
+        storage_dir: None,
+        policy_override: None,
+        unpack: None,
+        metadata: Vec::new(),
+        upload_limit: None,
+        download_limit: None,
+        sequential: false,
+        first_last_piece_first: false,
+        save_path: None,
+        content_layout: None,
+        files_dir: None,
+        seed_mode: false,
+        move_to: None,
+        queue_position: 0,
+    };
+    let rule = TrackerRule {
+        id: 1,
+        host_pattern: "tracker.test".into(),
+        seeding: None,
+        never_pause: false,
+        unpack: None,
+        client: None,
+        torrent_route: false,
+        dht: None,
+        pex: None,
+        lsd: None,
+        encryption: None,
+        upload_cap: Leaf::Inherit,
+        forced: false,
+        ssl: None,
+    };
+    let settings = TorrentSettings {
+        upload_cap: None,
+        complete_dir: PathBuf::from("/complete"),
+        categories: vec![CategoryConfig {
+            upload_cap: Leaf::Inherit,
+            id: 1,
+            name: "tv".into(),
+            dest_dir: None,
+            aliases: String::new(),
+            seeding: None,
+            torrent_route: false,
+            unpack: None,
+        }],
+        // As the global terms load: nothing there inherits.
+        seeding: Some(SeedingPolicy::default().at_global()),
+        torrent: TorrentConfig::default(),
+    };
+    (record, rule, settings)
+}
+
+// Each seeding term resolves on its own over the levels. A torrent's terms
+// kept before terms were leaves read with their mode and action set, so
+// they resolve as they did; terms set now that give only a ratio take the
+// time goal and the mode from the category, and the action from the global
+// terms, and each term names the level it came from.
+#[test]
+fn each_seeding_term_resolves_over_the_levels_on_its_own() {
+    let (mut record, rule, mut settings) = chain();
+    settings.categories[0].seeding = Some(SeedingPolicy {
+        ratio_goal: Leaf::Set(1.0),
+        seed_time_goal_minutes: Leaf::Set(72 * 60),
+        mode: Leaf::Set(SeedingGoalMode::All),
+        ..SeedingPolicy::default()
+    });
+
+    // Kept before: every policy then carried its mode and action.
+    record.policy_override = SeedingPolicy::kept(Some(
+        serde_json::from_str(r#"{"ratio_goal":2.0,"mode":"any","action":"stop"}"#).unwrap(),
+    ));
+    let (seeding, levels) = settings.seeding(&record, Some(&rule));
+    assert_eq!(
+        seeding,
+        Seeding {
+            ratio_goal: Some(2.0),
+            seed_time_goal_minutes: Some(72 * 60),
+            inactive_goal_minutes: None,
+            mode: SeedingGoalMode::Any,
+            action: SeedingAction::Stop,
+        }
+    );
+    assert_eq!(levels.mode, Level::Torrent);
+    assert_eq!(levels.action, Level::Torrent);
+
+    // Set now, with a ratio alone.
+    record.policy_override = Some(SeedingPolicy {
+        ratio_goal: Leaf::Set(2.0),
+        ..SeedingPolicy::default()
+    });
+    let (seeding, levels) = settings.seeding(&record, Some(&rule));
+    assert_eq!(
+        seeding,
+        Seeding {
+            ratio_goal: Some(2.0),
+            seed_time_goal_minutes: Some(72 * 60),
+            inactive_goal_minutes: None,
+            mode: SeedingGoalMode::All,
+            action: SeedingAction::Stop,
+        }
+    );
+    assert_eq!(
+        levels,
+        SeedingLevels {
+            ratio_goal: Level::Torrent,
+            seed_time_goal_minutes: Level::Category,
+            inactive_goal_minutes: Level::Global,
+            mode: Level::Category,
+            action: Level::Global,
+            upload_cap: Level::Global,
+        }
+    );
+}
+
+// A term switched off at a level drops what the levels above set; one left
+// to inherit takes it from them.
+#[test]
+fn off_drops_an_inherited_goal_and_inherit_takes_the_one_above() {
+    let (mut record, mut rule, mut settings) = chain();
+    settings.categories[0].seeding = Some(SeedingPolicy {
+        inactive_goal_minutes: Leaf::Set(60),
+        ..SeedingPolicy::default()
+    });
+    let inactive = |record: &TorrentRecord, rule: &TrackerRule| {
+        let (seeding, levels) = settings.seeding(record, Some(rule));
+        (seeding.inactive_goal_minutes, levels.inactive_goal_minutes)
+    };
+    assert_eq!(inactive(&record, &rule), (Some(60), Level::Category));
+
+    rule.seeding = Some(SeedingPolicy {
+        inactive_goal_minutes: Leaf::Off,
+        ..SeedingPolicy::default()
+    });
+    assert_eq!(inactive(&record, &rule), (None, Level::TrackerRule));
+
+    record.policy_override = Some(SeedingPolicy {
+        inactive_goal_minutes: Leaf::Set(30),
+        ..SeedingPolicy::default()
+    });
+    assert_eq!(inactive(&record, &rule), (Some(30), Level::Torrent));
+
+    rule.seeding = None;
+    record.policy_override = Some(SeedingPolicy {
+        inactive_goal_minutes: Leaf::Off,
+        ..SeedingPolicy::default()
+    });
+    assert_eq!(inactive(&record, &rule), (None, Level::Torrent));
+    // A torrent's terms that set nothing are kept as none.
+    assert_eq!(SeedingPolicy::kept(Some(SeedingPolicy::default())), None);
+}
+
+// The upload cap is the first level's that does not inherit: the global
+// one, a category's over it, a tracker rule's over that, and a rule's off
+// lifts a category's cap. The torrent's own limit is not a level of it: the
+// tighter of the two holds.
+#[test]
+fn the_upload_cap_comes_from_the_first_level_that_sets_it() {
+    use weaver_torrent::limits::LimitKind;
+
+    let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
+    let (mut record, mut rule, mut settings) = chain();
+    let cap = |settings: &TorrentSettings, record: &TorrentRecord, rule: &TrackerRule| {
+        (
+            settings.upload_cap(record, Some(rule)),
+            settings.seeding(record, Some(rule)).1.upload_cap,
+        )
+    };
+    assert_eq!(cap(&settings, &record, &rule), (None, Level::Global));
+    settings.upload_cap = Some(5_000);
+    assert_eq!(cap(&settings, &record, &rule), (Some(5_000), Level::Global));
+    settings.categories[0].upload_cap = Leaf::Set(3_000);
+    assert_eq!(
+        cap(&settings, &record, &rule),
+        (Some(3_000), Level::Category)
+    );
+    rule.upload_cap = Leaf::Off;
+    assert_eq!(cap(&settings, &record, &rule), (None, Level::TrackerRule));
+    rule.upload_cap = Leaf::Set(1_000);
+    assert_eq!(
+        cap(&settings, &record, &rule),
+        (Some(1_000), Level::TrackerRule)
+    );
+    settings.categories[0].upload_cap = Leaf::Off;
+    rule.upload_cap = Leaf::Inherit;
+    assert_eq!(cap(&settings, &record, &rule), (None, Level::Category));
+
+    let upload = |record: &TorrentRecord, cap| ratelimits_of(record, cap).upload_bps;
+    assert_eq!(upload(&record, Some(1_000)), bps(1_000));
+    record.upload_limit = Some(2_000);
+    assert_eq!(upload(&record, Some(1_000)), bps(1_000));
+    assert_eq!(upload(&record, None), bps(2_000));
+    record.upload_limit = Some(500);
+    assert_eq!(upload(&record, Some(1_000)), bps(500));
+}
+
 // A torrent takes its tracker rule's route when the rule routes its torrents
 // itself, else its category's when that does, else the default.
 #[test]
 fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
     let category = |id, torrent_route| CategoryConfig {
+        upload_cap: Default::default(),
         id,
         name: format!("c{id}"),
         dest_dir: None,
@@ -4704,6 +4922,7 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         unpack: None,
     };
     let settings = TorrentSettings {
+        upload_cap: None,
         complete_dir: PathBuf::from("/complete"),
         categories: vec![category(1, true), category(2, false)],
         seeding: None,
@@ -4721,7 +4940,7 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         pex: None,
         lsd: None,
         encryption: None,
-        upload_limit: None,
+        upload_cap: Default::default(),
         forced: false,
         ssl: None,
     };
@@ -4763,7 +4982,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ssl: None,
             },
@@ -4805,7 +5024,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ..rule
             },
@@ -4836,11 +5055,29 @@ async fn a_torrent_keeps_the_unpack_in_force_once_its_job_is_built() {
         .await
         .unwrap();
 
-    let kept = |job_id| rig.db.get_torrent(job_id).unwrap().unwrap().unpack;
-    assert_eq!(kept(inherits), Some(true));
-    assert_eq!(kept(off), Some(false));
-    assert!(rig.service.torrent(inherits).await.unwrap().unpack);
+    // What was asked is kept apart from what is in force.
+    let kept = |job_id| {
+        let record = rig.db.get_torrent(job_id).unwrap().unwrap();
+        (record.unpack, record.unpack_in_force)
+    };
+    assert_eq!(kept(inherits), (None, Some(true)));
+    assert_eq!(kept(off), (Some(false), Some(false)));
+    let view = rig.service.torrent(inherits).await.unwrap();
+    assert!(view.unpack);
+    assert_eq!(view.unpack_override, None);
     assert!(!rig.service.torrent(off).await.unwrap().unpack);
+
+    // A change of the level it inherits from leaves the built job's value
+    // in force, and the torrent still asks for nothing of its own.
+    let mut settings = rig.service.settings();
+    settings.torrent.unpack = false;
+    rig.service.set_settings(settings).await;
+    rig.service.tick().await;
+    assert_eq!(kept(inherits), (None, Some(true)));
+    let view = rig.service.torrent(inherits).await.unwrap();
+    assert!(view.unpack);
+    assert_eq!(view.unpack_override, None);
+    rig.service.stop().await;
 }
 
 // libtorrent `torrent::write_resume_data` and `read_resume_data`: the peers
@@ -5279,12 +5516,12 @@ async fn a_torrents_rate_limits_reach_its_session_and_outlive_a_restart() {
     again.stop().await;
 }
 
-// A seeding policy's upload cap holds the torrent beside its own limit, as
-// a second channel over its peers would: the tighter of the two is in
+// The upload cap its levels give a torrent holds it beside its own limit,
+// as a second channel over its peers would: the tighter of the two is in
 // force, and a change of either reaches the session without a restart.
 // The torrent reads back its own limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
+async fn the_tighter_of_a_torrents_limit_and_its_upload_cap_holds() {
     use weaver_torrent::limits::LimitKind;
 
     let bps = |bps: u32| LimitKind::Bps(std::num::NonZeroU32::new(bps).unwrap());
@@ -5304,14 +5541,12 @@ async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
         .set_rate_limits(job_id, Some(Some(65_536)), None)
         .await
         .unwrap();
-    let capped = |max_upload_bps| SeedingPolicy {
-        max_upload_bps,
-        ..SeedingPolicy::default()
+    let capped = |cap: u64| {
+        let mut settings = rig.service.settings();
+        settings.upload_cap = Some(cap);
+        settings
     };
-    rig.service
-        .set_policy_override(job_id, Some(capped(Some(1_000))))
-        .await
-        .unwrap();
+    rig.service.set_settings(capped(1_000)).await;
     rig.service.tick().await;
     assert_eq!(handle.ratelimits().upload_bps, bps(1_000));
     assert_eq!(
@@ -5319,10 +5554,7 @@ async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
         Some(65_536)
     );
 
-    rig.service
-        .set_policy_override(job_id, Some(capped(Some(1_000_000))))
-        .await
-        .unwrap();
+    rig.service.set_settings(capped(1_000_000)).await;
     rig.service.tick().await;
     assert_eq!(handle.ratelimits().upload_bps, bps(65_536));
 
@@ -5343,9 +5575,9 @@ async fn empty_seeding_terms_inherit_the_chain() {
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let ruled = SeedingPolicy {
-        ratio_goal: Some(2.0),
-        mode: SeedingGoalMode::All,
-        action: SeedingAction::Remove,
+        ratio_goal: Leaf::Set(2.0),
+        mode: Leaf::Set(SeedingGoalMode::All),
+        action: Leaf::Set(SeedingAction::Remove),
         ..SeedingPolicy::default()
     };
     rig.db
@@ -5362,7 +5594,7 @@ async fn empty_seeding_terms_inherit_the_chain() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ssl: None,
             },
@@ -5384,11 +5616,19 @@ async fn empty_seeding_terms_inherit_the_chain() {
         .unwrap();
     let inherits = |view: TorrentView| {
         assert_eq!(view.seeding_override, None);
+        assert_eq!(view.tracker_rule.as_deref(), Some("*.test"));
+        assert_eq!(view.seeding_levels.ratio_goal, Level::TrackerRule);
+        assert_eq!(view.seeding_levels.mode, Level::TrackerRule);
+        assert_eq!(view.seeding_levels.action, Level::TrackerRule);
         assert_eq!(
-            view.seeding_source,
-            SeedingSource::TrackerRule("*.test".into())
+            view.seeding_policy,
+            Seeding {
+                ratio_goal: Some(2.0),
+                mode: SeedingGoalMode::All,
+                action: SeedingAction::Remove,
+                ..Seeding::default()
+            }
         );
-        assert_eq!(view.seeding_policy, ruled);
     };
     inherits(rig.service.torrent(job_id).await.unwrap());
     assert_eq!(
@@ -5397,17 +5637,18 @@ async fn empty_seeding_terms_inherit_the_chain() {
     );
 
     let own = SeedingPolicy {
-        seed_time_goal_minutes: Some(60),
+        seed_time_goal_minutes: Leaf::Set(60),
         ..SeedingPolicy::default()
     };
     rig.service
         .set_policy_override(job_id, Some(own))
         .await
         .unwrap();
-    assert_eq!(
-        rig.service.torrent(job_id).await.unwrap().seeding_source,
-        SeedingSource::Torrent
-    );
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.seeding_levels.seed_time_goal_minutes, Level::Torrent);
+    assert_eq!(view.seeding_levels.ratio_goal, Level::TrackerRule);
+    assert_eq!(view.seeding_policy.seed_time_goal_minutes, Some(60));
+    assert_eq!(view.seeding_policy.ratio_goal, Some(2.0));
     rig.service
         .set_policy_override(job_id, Some(SeedingPolicy::default()))
         .await
@@ -5428,7 +5669,7 @@ async fn empty_seeding_terms_inherit_the_chain() {
 // the global terms throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
-    use crate::settings::{TorrentEncryption, TrackerUploadLimit};
+    use crate::settings::TorrentEncryption;
     use weaver_torrent::EncryptionPolicy;
     use weaver_torrent::limits::LimitKind;
 
@@ -5437,10 +5678,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     on_loopback(&rig.routes);
     rig.service.open().await.unwrap();
     let mut settings = rig.service.settings();
-    settings.seeding = Some(SeedingPolicy {
-        max_upload_bps: Some(2_000),
-        ..SeedingPolicy::default()
-    });
+    settings.upload_cap = Some(2_000);
     rig.service.set_settings(settings).await;
     let rule = rig
         .db
@@ -5457,7 +5695,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
                 pex: Some(false),
                 lsd: Some(false),
                 encryption: Some(TorrentEncryption::Prefer),
-                upload_limit: Some(TrackerUploadLimit::Unlimited),
+                upload_cap: Leaf::Off,
                 forced: true,
                 ssl: None,
             },
@@ -5499,7 +5737,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
                 pex: None,
                 lsd: None,
                 encryption: Some(TorrentEncryption::Require),
-                upload_limit: Some(TrackerUploadLimit::Bps(1_000)),
+                upload_cap: Leaf::Set(1_000),
                 ..rule
             },
             EPOCH_MS,
@@ -5971,7 +6209,7 @@ async fn the_rule_a_tracker_edit_picks_is_the_one_a_restart_reads() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ssl: None,
             },
@@ -6982,12 +7220,11 @@ async fn the_metrics_carry_what_the_tick_read() {
         .add(AddRequest {
             category: Some("tv".into()),
             policy_override: Some(SeedingPolicy {
-                ratio_goal: Some(3.0),
-                seed_time_goal_minutes: Some(10),
-                inactive_goal_minutes: None,
-                mode: SeedingGoalMode::All,
-                action: SeedingAction::Stop,
-                max_upload_bps: None,
+                ratio_goal: Leaf::Set(3.0),
+                seed_time_goal_minutes: Leaf::Set(10),
+                inactive_goal_minutes: Leaf::Inherit,
+                mode: Leaf::Set(SeedingGoalMode::All),
+                action: Leaf::Set(SeedingAction::Stop),
             }),
             ..request(AddSource::Metainfo(plain("set", 1)))
         })

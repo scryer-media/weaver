@@ -102,6 +102,7 @@ async fn rig() -> Rig {
             complete_dir: dir.path().join("complete"),
             categories: Vec::new(),
             seeding: None,
+            upload_cap: None,
             torrent: TorrentConfig::default(),
         },
         JobEnv::unbounded(),

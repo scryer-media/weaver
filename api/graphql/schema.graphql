@@ -376,6 +376,25 @@ type BandwidthTestRequest {
 }
 
 """
+One setting at one level.
+"""
+type BpsLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: Int
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input BpsLeafInput {
+	state: LeafState!
+	value: Int
+}
+
+"""
 One job's result from a batched cancel.
 """
 type CancelJobResult {
@@ -396,6 +415,10 @@ type Category {
 	seeding: SeedingPolicySettings
 	torrentRoute: Boolean!
 	unpack: Boolean
+	"""
+	The upload cap its torrents take in place of the global one.
+	"""
+	uploadCap: BpsLeaf!
 }
 
 input CategoryInput {
@@ -405,6 +428,10 @@ input CategoryInput {
 	seeding: SeedingPolicyInput
 	torrentRoute: Boolean
 	unpack: Boolean
+	"""
+	Left out keeps the category's cap.
+	"""
+	uploadCap: BpsLeafInput
 }
 
 type ConfiguredStorage {
@@ -860,6 +887,10 @@ type GeneralSettings {
 	watchFolder: WatchFolderSettings!
 	duplicatePolicy: DuplicatePolicySettings!
 	seeding: SeedingPolicySettings
+	"""
+	The global upload cap in bytes per second; absent is none.
+	"""
+	uploadCap: Int
 	torrent: TorrentSettings!
 }
 
@@ -874,6 +905,10 @@ input GeneralSettingsInput {
 	watchFolder: WatchFolderSettingsInput
 	duplicatePolicy: DuplicatePolicySettingsInput
 	seeding: SeedingPolicyInput
+	"""
+	The global upload cap in bytes per second; null removes it.
+	"""
+	uploadCap: Int
 	torrent: TorrentSettingsInput
 }
 
@@ -900,6 +935,25 @@ enum GlobalScriptsRun {
 	Only for a download whose category has no script jobs of its own.
 	"""
 	ONLY_WITHOUT_CATEGORY_SCRIPTS
+}
+
+"""
+One setting at one level.
+"""
+type GoalModeLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: SeedingGoalMode
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input GoalModeLeafInput {
+	state: LeafState!
+	value: SeedingGoalMode
 }
 
 """
@@ -1380,6 +1434,24 @@ type KernelSelectionInfo {
 	pinnedBy: String
 }
 
+"""
+How a level holds one setting.
+"""
+enum LeafState {
+	"""
+	Taken from the level above.
+	"""
+	INHERIT
+	"""
+	Switched off here: no goal, no cap.
+	"""
+	OFF
+	"""
+	Set here, to `value`.
+	"""
+	SET
+}
+
 type LegConnectionTest {
 	position: Int!
 	success: Boolean!
@@ -1619,6 +1691,25 @@ type MetricsHistoryResult {
 	timestamps: [Float!]!
 	resolutionSec: Int!
 	series: [MetricSeries!]!
+}
+
+"""
+One setting at one level.
+"""
+type MinutesLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: Int
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input MinutesLeafInput {
+	state: LeafState!
+	value: Int
 }
 
 type MutationRoot {
@@ -3273,6 +3364,25 @@ enum QuotaStateGql {
 	STOPPED
 }
 
+"""
+One setting at one level.
+"""
+type RatioLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: Float
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input RatioLeafInput {
+	state: LeafState!
+	value: Float
+}
+
 enum ResolvedBy {
 	LITERAL
 	HOST
@@ -4196,37 +4306,78 @@ enum SeedingAction {
 	REMOVE_WITH_DATA
 }
 
+"""
+One setting at one level.
+"""
+type SeedingActionLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: SeedingAction
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input SeedingActionLeafInput {
+	state: LeafState!
+	value: SeedingAction
+}
+
 enum SeedingGoalMode {
 	ANY
 	ALL
 }
 
-input SeedingPolicyInput {
-	ratioGoal: Float
-	seedTimeGoalMinutes: Int
-	inactiveGoalMinutes: Int
-	mode: SeedingGoalMode! = ANY
-	action: SeedingAction! = STOP
-	maxUploadBps: Int
+"""
+The level each of a torrent's seeding terms comes from.
+"""
+type SeedingLevels {
+	ratioGoal: SettingLevel!
+	seedTimeGoalMinutes: SettingLevel!
+	inactiveGoalMinutes: SettingLevel!
+	mode: SettingLevel!
+	action: SettingLevel!
+	uploadCap: SettingLevel!
 }
 
+"""
+Seeding terms at one level; a term left out inherits.
+"""
+input SeedingPolicyInput {
+	ratioGoal: RatioLeafInput
+	seedTimeGoalMinutes: MinutesLeafInput
+	inactiveGoalMinutes: MinutesLeafInput
+	mode: GoalModeLeafInput
+	action: SeedingActionLeafInput
+}
+
+"""
+Seeding terms at one level: each one inherited, off or set.
+"""
 type SeedingPolicySettings {
+	ratioGoal: RatioLeaf!
+	seedTimeGoalMinutes: MinutesLeaf!
+	inactiveGoalMinutes: MinutesLeaf!
+	mode: GoalModeLeaf!
+	action: SeedingActionLeaf!
+}
+
+"""
+The seeding terms a torrent is held to, each resolved over its levels.
+"""
+type SeedingTerms {
 	ratioGoal: Float
 	seedTimeGoalMinutes: Int
 	inactiveGoalMinutes: Int
 	mode: SeedingGoalMode!
 	action: SeedingAction!
-	maxUploadBps: Int
-}
-
-"""
-Where a torrent's seeding policy comes from.
-"""
-enum SeedingSource {
-	CATEGORY
-	GLOBAL
-	TORRENT
-	TRACKER_RULE
+	"""
+	The upload cap in bytes per second; absent is none.
+	"""
+	uploadCap: Int
+	levels: SeedingLevels!
 }
 
 type SemanticCandidateSnapshotInfo {
@@ -4543,6 +4694,16 @@ type ServerRestartCapability {
 type ServiceLogsPayload {
 	lines: [String!]!
 	count: Int!
+}
+
+"""
+A level a torrent takes a setting from.
+"""
+enum SettingLevel {
+	TORRENT
+	TRACKER_RULE
+	CATEGORY
+	GLOBAL
 }
 
 type SpeedTestFailure {
@@ -5072,23 +5233,25 @@ type Torrent {
 	"""
 	seedingLeft: String
 	"""
-	The torrent's own seeding policy; absent when it inherits one.
+	The torrent's own seeding terms; absent when it inherits every one.
 	"""
 	seedingOverride: SeedingPolicySettings
 	"""
-	The seeding policy in effect.
+	The seeding terms in effect.
 	"""
-	seedingPolicy: SeedingPolicySettings!
-	seedingSource: SeedingSource!
+	seedingPolicy: SeedingTerms!
 	"""
-	The host pattern of the tracker rule the policy comes from, when it
-	does.
+	The host pattern of the tracker rule the torrent is under, when it is.
 	"""
-	seedingRule: String
+	trackerRule: String
 	"""
 	Whether its archives are extracted.
 	"""
 	unpack: Boolean!
+	"""
+	The torrent's own unpack; absent inherits.
+	"""
+	unpackOverride: Boolean
 	route: String
 	files: [TorrentFile!]!
 	"""
@@ -5564,9 +5727,9 @@ type TrackerRule {
 	encryption: TorrentEncryption
 	"""
 	The upload cap its torrents take in place of their category's and
-	the global seeding policy's; absent inherits.
+	the global one.
 	"""
-	uploadLimit: TrackerUploadLimit
+	uploadCap: BpsLeaf!
 	"""
 	Whether a torrent admitted under it starts forced.
 	"""
@@ -5596,7 +5759,10 @@ input TrackerRuleInput {
 	pex: Boolean
 	lsd: Boolean
 	encryption: TorrentEncryption
-	uploadLimit: TrackerUploadLimitInput
+	"""
+	Left out inherits.
+	"""
+	uploadCap: BpsLeafInput
 	forced: Boolean! = false
 	"""
 	Absent keeps the rule's certificate; null clears it.
@@ -5619,20 +5785,6 @@ enum TrackerStatus {
 	TRACKER_ERROR
 	UNREACHABLE
 	DISABLED
-}
-
-"""
-A tracker rule's upload cap: bytes per second, or absent for unlimited.
-"""
-type TrackerUploadLimit {
-	bps: Int
-}
-
-"""
-A tracker rule's upload cap: bytes per second, or absent for unlimited.
-"""
-input TrackerUploadLimitInput {
-	bps: Int
 }
 
 """

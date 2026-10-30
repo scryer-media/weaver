@@ -597,9 +597,9 @@ fn held_torrent(
     hash: [u8; 20],
 ) -> crate::torrents::service::TorrentSupport {
     use crate::proxies::TorrentScope;
-    use crate::settings::SeedingPolicy;
+    use crate::settings::{Level, Seeding};
     use crate::torrents::service::{
-        PeerKinds, SeedingSource, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
+        PeerKinds, SeedingLevels, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
     };
     use crate::torrents::sessions::TorrentRouteReason;
     use crate::torrents::{
@@ -689,13 +689,18 @@ fn held_torrent(
         file_have: Vec::new(),
         metadata: Vec::new(),
         seeding_override: None,
-        seeding_inherited: None,
-        seeding_policy: SeedingPolicy {
+        seeding_policy: Seeding {
             ratio_goal: Some(2.0),
-            ..SeedingPolicy::default()
+            ..Seeding::default()
         },
-        seeding_source: SeedingSource::Category,
+        seeding_levels: SeedingLevels {
+            ratio_goal: Level::Category,
+            ..SeedingLevels::default()
+        },
+        tracker_rule: None,
+        upload_cap: None,
         unpack: true,
+        unpack_override: None,
     };
     TorrentSupport {
         view,
@@ -839,7 +844,8 @@ fn a_held_torrent_reports_what_the_service_holds() {
     assert_eq!(job["trackers"][0]["message"], "authorization");
     assert_eq!(job["trackers"][0]["last_answer_age_secs"], 30);
     assert_eq!(job["trackers"][0]["next_announce_in_secs"], 60);
-    assert_eq!(job["seeding"]["source"], "category");
+    assert_eq!(job["seeding"]["levels"]["ratio_goal"], "category");
+    assert_eq!(job["seeding"]["levels"]["mode"], "global");
     assert_eq!(job["seeding"]["ratio_left_milli"], 1500);
     assert_eq!(job["output"]["kind"], "absolute");
     assert!(

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use async_graphql::{Enum, InputObject, MaybeUndefined, SimpleObject};
+use async_graphql::{Enum, InputObject, InputType, MaybeUndefined, OutputType, SimpleObject};
 use serde::{Deserialize, Serialize};
 use weaver_server_core::jobs::DuplicatePolicy;
 use weaver_server_core::runtime::HardwareProfile;
 use weaver_server_core::runtime::system_profile::SystemProfile;
+use weaver_server_core::settings::{Leaf, Level};
 
 use crate::jobs::types::DuplicateActionGql;
 
@@ -160,6 +161,8 @@ pub struct GeneralSettings {
     pub duplicate_policy: DuplicatePolicySettings,
     // The global seeding policy, absent when none is set.
     pub seeding: Option<SeedingPolicySettings>,
+    /// The global upload cap in bytes per second; absent is none.
+    pub upload_cap: Option<u64>,
     pub torrent: TorrentSettings,
 }
 
@@ -177,6 +180,8 @@ pub struct GeneralSettingsInput {
     pub duplicate_policy: Option<DuplicatePolicySettingsInput>,
     // Replaces the global seeding policy; null removes it.
     pub seeding: MaybeUndefined<SeedingPolicyInput>,
+    /// The global upload cap in bytes per second; null removes it.
+    pub upload_cap: MaybeUndefined<u64>,
     pub torrent: Option<TorrentSettingsInput>,
 }
 
@@ -1166,60 +1171,149 @@ impl From<SeedingActionGql> for weaver_server_core::settings::SeedingAction {
     }
 }
 
+/// How a level holds one setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "LeafState")]
+pub enum LeafStateGql {
+    /// Taken from the level above.
+    Inherit,
+    /// Switched off here: no goal, no cap.
+    Off,
+    /// Set here, to `value`.
+    Set,
+}
+
+/// One setting at one level.
+#[derive(Debug, Clone, Copy, PartialEq, SimpleObject)]
+#[graphql(concrete(name = "RatioLeaf", params(f32)))]
+#[graphql(concrete(name = "MinutesLeaf", params(u32)))]
+#[graphql(concrete(name = "BpsLeaf", params(u64)))]
+#[graphql(concrete(name = "GoalModeLeaf", params(SeedingGoalModeGql)))]
+#[graphql(concrete(name = "SeedingActionLeaf", params(SeedingActionGql)))]
+pub struct LeafGql<T: OutputType> {
+    pub state: LeafStateGql,
+    /// The value while `state` is `SET`.
+    pub value: Option<T>,
+}
+
+impl<T: OutputType> LeafGql<T> {
+    pub fn of<U: Into<T>>(leaf: Leaf<U>) -> Self {
+        match leaf {
+            Leaf::Inherit => Self {
+                state: LeafStateGql::Inherit,
+                value: None,
+            },
+            Leaf::Off => Self {
+                state: LeafStateGql::Off,
+                value: None,
+            },
+            Leaf::Set(value) => Self {
+                state: LeafStateGql::Set,
+                value: Some(value.into()),
+            },
+        }
+    }
+}
+
+/// One setting at one level; `value` is given with `SET` and only then.
+#[derive(Debug, Clone, Copy, InputObject)]
+#[graphql(concrete(name = "RatioLeafInput", params(f32)))]
+#[graphql(concrete(name = "MinutesLeafInput", params(u32)))]
+#[graphql(concrete(name = "BpsLeafInput", params(u64)))]
+#[graphql(concrete(name = "GoalModeLeafInput", params(SeedingGoalModeGql)))]
+#[graphql(concrete(name = "SeedingActionLeafInput", params(SeedingActionGql)))]
+pub struct LeafInput<T: InputType> {
+    pub state: LeafStateGql,
+    pub value: Option<T>,
+}
+
+impl<T: InputType> LeafInput<T> {
+    pub fn into_leaf<U: From<T>>(self) -> async_graphql::Result<Leaf<U>> {
+        match (self.state, self.value) {
+            (LeafStateGql::Inherit, None) => Ok(Leaf::Inherit),
+            (LeafStateGql::Off, None) => Ok(Leaf::Off),
+            (LeafStateGql::Set, Some(value)) => Ok(Leaf::Set(value.into())),
+            (LeafStateGql::Set, None) => Err(async_graphql::Error::new(
+                "a setting that is set needs its value",
+            )),
+            (_, Some(_)) => Err(async_graphql::Error::new(
+                "only a setting that is set takes a value",
+            )),
+        }
+    }
+}
+
+/// A leaf left out inherits.
+pub fn leaf_of<T: InputType, U: From<T>>(
+    input: Option<LeafInput<T>>,
+) -> async_graphql::Result<Leaf<U>> {
+    input.map_or(Ok(Leaf::Inherit), LeafInput::into_leaf)
+}
+
+/// A level a torrent takes a setting from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[graphql(name = "SettingLevel")]
+pub enum SettingLevelGql {
+    Torrent,
+    TrackerRule,
+    Category,
+    Global,
+}
+
+impl From<Level> for SettingLevelGql {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::Torrent => Self::Torrent,
+            Level::TrackerRule => Self::TrackerRule,
+            Level::Category => Self::Category,
+            Level::Global => Self::Global,
+        }
+    }
+}
+
+/// Seeding terms at one level: each one inherited, off or set.
 #[derive(Debug, Clone, Copy, PartialEq, SimpleObject)]
 pub struct SeedingPolicySettings {
-    pub ratio_goal: Option<f32>,
-    pub seed_time_goal_minutes: Option<u32>,
-    pub inactive_goal_minutes: Option<u32>,
-    pub mode: SeedingGoalModeGql,
-    pub action: SeedingActionGql,
-    pub max_upload_bps: Option<u64>,
+    pub ratio_goal: LeafGql<f32>,
+    pub seed_time_goal_minutes: LeafGql<u32>,
+    pub inactive_goal_minutes: LeafGql<u32>,
+    pub mode: LeafGql<SeedingGoalModeGql>,
+    pub action: LeafGql<SeedingActionGql>,
 }
 
 impl From<weaver_server_core::settings::SeedingPolicy> for SeedingPolicySettings {
     fn from(value: weaver_server_core::settings::SeedingPolicy) -> Self {
         Self {
-            ratio_goal: value.ratio_goal,
-            seed_time_goal_minutes: value.seed_time_goal_minutes,
-            inactive_goal_minutes: value.inactive_goal_minutes,
-            mode: value.mode.into(),
-            action: value.action.into(),
-            max_upload_bps: value.max_upload_bps,
+            ratio_goal: LeafGql::of(value.ratio_goal),
+            seed_time_goal_minutes: LeafGql::of(value.seed_time_goal_minutes),
+            inactive_goal_minutes: LeafGql::of(value.inactive_goal_minutes),
+            mode: LeafGql::of(value.mode),
+            action: LeafGql::of(value.action),
         }
     }
 }
 
-// A whole policy: a goal left out is not set at this level.
+/// Seeding terms at one level; a term left out inherits.
 #[derive(Debug, Clone, Copy, InputObject)]
 pub struct SeedingPolicyInput {
-    pub ratio_goal: Option<f32>,
-    pub seed_time_goal_minutes: Option<u32>,
-    pub inactive_goal_minutes: Option<u32>,
-    #[graphql(default)]
-    pub mode: SeedingGoalModeGql,
-    #[graphql(default)]
-    pub action: SeedingActionGql,
-    pub max_upload_bps: Option<u64>,
+    pub ratio_goal: Option<LeafInput<f32>>,
+    pub seed_time_goal_minutes: Option<LeafInput<u32>>,
+    pub inactive_goal_minutes: Option<LeafInput<u32>>,
+    pub mode: Option<LeafInput<SeedingGoalModeGql>>,
+    pub action: Option<LeafInput<SeedingActionGql>>,
 }
 
 impl SeedingPolicyInput {
     pub fn into_policy(self) -> async_graphql::Result<weaver_server_core::settings::SeedingPolicy> {
-        if self
-            .ratio_goal
-            .is_some_and(|ratio| !ratio.is_finite() || ratio < 0.0)
-        {
-            return Err(async_graphql::Error::new(
-                "a ratio goal must be zero or more",
-            ));
-        }
-        Ok(weaver_server_core::settings::SeedingPolicy {
-            ratio_goal: self.ratio_goal,
-            seed_time_goal_minutes: self.seed_time_goal_minutes,
-            inactive_goal_minutes: self.inactive_goal_minutes,
-            mode: self.mode.into(),
-            action: self.action.into(),
-            max_upload_bps: self.max_upload_bps,
-        })
+        let policy = weaver_server_core::settings::SeedingPolicy {
+            ratio_goal: leaf_of(self.ratio_goal)?,
+            seed_time_goal_minutes: leaf_of(self.seed_time_goal_minutes)?,
+            inactive_goal_minutes: leaf_of(self.inactive_goal_minutes)?,
+            mode: leaf_of(self.mode)?,
+            action: leaf_of(self.action)?,
+        };
+        policy.validate().map_err(async_graphql::Error::new)?;
+        Ok(policy)
     }
 }
 
@@ -1253,8 +1347,8 @@ pub struct TrackerRule {
     /// inherits.
     pub encryption: Option<TorrentEncryptionGql>,
     /// The upload cap its torrents take in place of their category's and
-    /// the global seeding policy's; absent inherits.
-    pub upload_limit: Option<TrackerUploadLimitGql>,
+    /// the global one.
+    pub upload_cap: LeafGql<u64>,
     /// Whether a torrent admitted under it starts forced.
     pub forced: bool,
     /// Whether it holds a certificate for its SSL torrents.
@@ -1272,25 +1366,6 @@ pub struct TrackerCertificateInput {
     pub private_key_pem: String,
 }
 
-/// A tracker rule's upload cap: bytes per second, or absent for unlimited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SimpleObject, InputObject)]
-#[graphql(name = "TrackerUploadLimit", input_name = "TrackerUploadLimitInput")]
-pub struct TrackerUploadLimitGql {
-    pub bps: Option<u64>,
-}
-
-impl From<weaver_server_core::settings::TrackerUploadLimit> for TrackerUploadLimitGql {
-    fn from(limit: weaver_server_core::settings::TrackerUploadLimit) -> Self {
-        Self { bps: limit.bps() }
-    }
-}
-
-impl From<TrackerUploadLimitGql> for weaver_server_core::settings::TrackerUploadLimit {
-    fn from(limit: TrackerUploadLimitGql) -> Self {
-        limit.bps.map_or(Self::Unlimited, Self::Bps)
-    }
-}
-
 impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
     fn from(rule: weaver_server_core::settings::model::TrackerRule) -> Self {
         let summary = rule.ssl.as_ref().and_then(|ssl| ssl.summary());
@@ -1306,7 +1381,7 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             pex: rule.pex,
             lsd: rule.lsd,
             encryption: rule.encryption.map(Into::into),
-            upload_limit: rule.upload_limit.map(Into::into),
+            upload_cap: LeafGql::of(rule.upload_cap),
             forced: rule.forced,
             has_ssl: rule.ssl.is_some(),
             ssl_subject: summary.as_ref().map(|summary| summary.subject.clone()),
@@ -1329,7 +1404,8 @@ pub struct TrackerRuleInput {
     pub pex: Option<bool>,
     pub lsd: Option<bool>,
     pub encryption: Option<TorrentEncryptionGql>,
-    pub upload_limit: Option<TrackerUploadLimitGql>,
+    /// Left out inherits.
+    pub upload_cap: Option<LeafInput<u64>>,
     #[graphql(default)]
     pub forced: bool,
     /// Absent keeps the rule's certificate; null clears it.
@@ -1357,7 +1433,7 @@ impl TrackerRuleInput {
             pex: self.pex,
             lsd: self.lsd,
             encryption: self.encryption.map(Into::into),
-            upload_limit: self.upload_limit.map(Into::into),
+            upload_cap: leaf_of(self.upload_cap)?,
             forced: self.forced,
             ssl: self.ssl.take().map(|ssl| TrackerCertificate {
                 certificate_pem: ssl.certificate_pem,
@@ -1651,6 +1727,7 @@ impl From<&weaver_server_core::settings::Config> for GeneralSettings {
             watch_folder: (&cfg.watch_folder).into(),
             duplicate_policy: cfg.duplicate_policy.into(),
             seeding: cfg.seeding.map(Into::into),
+            upload_cap: cfg.upload_cap,
             torrent: (&cfg.torrent).into(),
         }
     }

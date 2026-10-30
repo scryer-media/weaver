@@ -173,7 +173,13 @@ impl SettingsMutation {
         let seeding_update = match input.seeding {
             MaybeUndefined::Undefined => None,
             MaybeUndefined::Null => Some(None),
-            MaybeUndefined::Value(policy) => Some(Some(policy.into_policy()?)),
+            // At the global level nothing is inherited.
+            MaybeUndefined::Value(policy) => Some(Some(policy.into_policy()?.at_global())),
+        };
+        let upload_cap_update = match input.upload_cap {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(None),
+            MaybeUndefined::Value(cap) => Some(Some(cap)),
         };
         let torrent_update = match &input.torrent {
             Some(update) => {
@@ -202,6 +208,7 @@ impl SettingsMutation {
             seeding_update,
             torrent_update.clone(),
             max_concurrent_nzbs,
+            upload_cap_update,
         );
         let settings_persist = {
             let db = db.clone();
@@ -309,6 +316,9 @@ impl SettingsMutation {
                         if let Some(policy) = persist_input.8 {
                             db.save_seeding_policy(policy.as_ref())?;
                         }
+                        if let Some(cap) = persist_input.11 {
+                            db.save_upload_cap(cap)?;
+                        }
                         if let Some(ref torrent) = persist_input.9 {
                             db.save_torrent_config(torrent)?;
                         }
@@ -370,6 +380,9 @@ impl SettingsMutation {
                 }
                 if let Some(policy) = seeding_update {
                     cfg.seeding = policy;
+                }
+                if let Some(cap) = upload_cap_update {
+                    cfg.upload_cap = cap;
                 }
                 if let Some(ref torrent) = torrent_update {
                     cfg.torrent = torrent.clone();
@@ -760,6 +773,7 @@ mod tests {
     fn test_config() -> SharedConfig {
         Arc::new(RwLock::new(weaver_server_core::settings::Config {
             seeding: None,
+            upload_cap: None,
             torrent: Default::default(),
             data_dir: "/tmp/weaver".to_string(),
             hardware_profile: None,

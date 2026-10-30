@@ -18,7 +18,7 @@ use weaver_server_core::post_processing::model::PostProcessingSettings;
 use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
-use weaver_server_core::settings::{SeedingPolicy, TorrentConfig};
+use weaver_server_core::settings::{Leaf, SeedingPolicy, TorrentConfig};
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
@@ -103,6 +103,7 @@ async fn rig_on(routes: impl FnOnce(&weaver_server_core::Database) -> Arc<dyn Ro
         db,
         sessions,
         TorrentSettings {
+            upload_cap: None,
             complete_dir: complete.clone(),
             categories: Vec::new(),
             seeding: None,
@@ -260,7 +261,7 @@ async fn removing_a_private_torrent_short_of_its_goal_needs_confirmation() {
     let response = rig
         .execute(&submit(
             &metainfo("p.bin", 2000, true),
-            "seeding: { ratioGoal: 1.0 }",
+            "seeding: { ratioGoal: { state: SET, value: 1.0 } }",
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -293,6 +294,7 @@ async fn the_torrent_surface_says_when_torrents_are_off() {
     // Turned on and then off, every route shows that torrents are off.
     let rig = rig().await;
     let settings = |enabled| TorrentSettings {
+        upload_cap: None,
         complete_dir: rig._dir.path().join("complete"),
         categories: Vec::new(),
         seeding: None,
@@ -339,20 +341,23 @@ async fn the_queue_names_a_torrents_phase() {
 }
 
 const DETAIL: &str = "leechers peers seeds files { path progress }
-    seedingOverride { ratioGoal } seedingPolicy { ratioGoal } seedingSource";
+    seedingOverride { ratioGoal { state value } seedTimeGoalMinutes { state value } }
+    seedingPolicy { ratioGoal seedTimeGoalMinutes mode levels { ratioGoal seedTimeGoalMinutes mode } }";
 
-// A torrent reads its leechers, each file's progress, and its seeding policy
-// with where that policy comes from.
+// A torrent reads its leechers, each file's progress, and its seeding terms
+// with the level each comes from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
     let rig = rig().await;
     let policy = |ratio_goal| SeedingPolicy {
-        ratio_goal: Some(ratio_goal),
+        ratio_goal: Leaf::Set(ratio_goal),
         ..SeedingPolicy::default()
     };
     let mut settings = TorrentSettings {
+        upload_cap: None,
         complete_dir: rig._dir.path().join("complete"),
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             id: 1,
             name: "tv".into(),
             dest_dir: None,
@@ -382,23 +387,40 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
     assert_eq!(torrent["files"][0]["progress"], 0.0);
     assert_eq!(torrent["seedingOverride"], Value::Null);
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 1.5);
-    assert_eq!(torrent["seedingSource"], "GLOBAL");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "GLOBAL");
 
     let category = id(&read(submit(&metainfo("b.mkv", 3000, false), "category: \"tv\"")).await);
     let torrent = &read(detail(category)).await["torrent"];
     assert_eq!(torrent["seedingOverride"], Value::Null);
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 3.0);
-    assert_eq!(torrent["seedingSource"], "CATEGORY");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "CATEGORY");
 
     let own = id(&read(submit(
         &metainfo("c.mkv", 3000, false),
-        "category: \"tv\" seeding: { ratioGoal: 2.0 }",
+        "category: \"tv\" seeding: { ratioGoal: { state: SET, value: 2.0 } }",
     ))
     .await);
     let torrent = &read(detail(own)).await["torrent"];
-    assert_eq!(torrent["seedingOverride"]["ratioGoal"], 2.0);
+    assert_eq!(torrent["seedingOverride"]["ratioGoal"]["state"], "SET");
+    assert_eq!(torrent["seedingOverride"]["ratioGoal"]["value"], 2.0);
+    assert_eq!(
+        torrent["seedingOverride"]["seedTimeGoalMinutes"]["state"],
+        "INHERIT"
+    );
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 2.0);
-    assert_eq!(torrent["seedingSource"], "TORRENT");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "TORRENT");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["mode"], "GLOBAL");
+
+    // A goal switched off at the torrent drops the one its category sets.
+    let off = id(&read(submit(
+        &metainfo("d.mkv", 3000, false),
+        "category: \"tv\" seeding: { ratioGoal: { state: OFF } }",
+    ))
+    .await);
+    let torrent = &read(detail(off)).await["torrent"];
+    assert_eq!(torrent["seedingOverride"]["ratioGoal"]["state"], "OFF");
+    assert_eq!(torrent["seedingPolicy"]["ratioGoal"], Value::Null);
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "TORRENT");
 
     // The global policy changes and the inheriting torrent follows it.
     settings.seeding = Some(policy(4.0));
@@ -594,12 +616,12 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
 }
 
 // A tracker rule keeps its torrents' DHT, PEX and LSD, each on its own,
-// their encryption, upload cap and forced start; absent inherits, and an upload cap without bytes per second
-// is unlimited.
+// their encryption, upload cap and forced start; absent inherits, and an
+// upload cap switched off is none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let rig = rig().await;
-    let fields = "id dht pex lsd encryption uploadLimit { bps } forced";
+    let fields = "id dht pex lsd encryption uploadCap { state value } forced";
     let save = |id: &str, terms: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
@@ -611,7 +633,7 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let response = rig
         .execute(&save(
             "",
-            "dht: false, pex: false, lsd: true, encryption: PREFER, uploadLimit: { bps: null }, forced: true",
+            "dht: false, pex: false, lsd: true, encryption: PREFER, uploadCap: { state: OFF }, forced: true",
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -621,23 +643,23 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
         saved["saveTrackerRule"][0],
         serde_json::json!({
             "id": id, "dht": false, "pex": false, "lsd": true, "encryption": "PREFER",
-            "uploadLimit": { "bps": null }, "forced": true,
+            "uploadCap": { "state": "OFF", "value": null }, "forced": true,
         })
     );
 
     for (terms, read) in [
         (
-            "dht: true, lsd: false, encryption: REQUIRE, uploadLimit: { bps: 4096 }",
+            "dht: true, lsd: false, encryption: REQUIRE, uploadCap: { state: SET, value: 4096 }",
             serde_json::json!({
                 "id": id, "dht": true, "pex": null, "lsd": false, "encryption": "REQUIRE",
-                "uploadLimit": { "bps": 4096 }, "forced": false,
+                "uploadCap": { "state": "SET", "value": 4096 }, "forced": false,
             }),
         ),
         (
             "",
             serde_json::json!({
                 "id": id, "dht": null, "pex": null, "lsd": null, "encryption": null,
-                "uploadLimit": null, "forced": false,
+                "uploadCap": { "state": "INHERIT", "value": null }, "forced": false,
             }),
         ),
     ] {
@@ -773,8 +795,9 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     let rule = |id: &str, pattern: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "{pattern}", neverPause: true, seeding: {{ ratioGoal: 3 }}
-            }}) {{ id hostPattern neverPause seeding {{ ratioGoal }} }} }}"#
+                hostPattern: "{pattern}", neverPause: true,
+                seeding: {{ ratioGoal: {{ state: SET, value: 3 }} }}
+            }}) {{ id hostPattern neverPause seeding {{ ratioGoal {{ value }} }} }} }}"#
         )
     };
 
@@ -782,7 +805,7 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     let saved = &saved["saveTrackerRule"][0];
     assert_eq!(saved["hostPattern"], "*.tracker.test");
     assert_eq!(saved["neverPause"], true);
-    assert_eq!(saved["seeding"]["ratioGoal"], 3.0);
+    assert_eq!(saved["seeding"]["ratioGoal"]["value"], 3.0);
     let rule_id = saved["id"].as_u64().unwrap();
     for refused in [rule("", "*.tracker.test"), rule("", "not a host")] {
         assert!(!rig.execute(&refused).await.errors.is_empty());
@@ -802,14 +825,17 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         .unwrap();
     let source = || async move {
         let data = read(format!(
-            "{{ torrent(id: {id}) {{ seedingSource seedingRule seedingPolicy {{ ratioGoal }} }} }}"
+            "{{ torrent(id: {id}) {{ trackerRule seedingPolicy {{ ratioGoal levels {{ ratioGoal }} }} }} }}"
         ))
         .await;
         data["torrent"].clone()
     };
     let torrent = source().await;
-    assert_eq!(torrent["seedingSource"], "TRACKER_RULE");
-    assert_eq!(torrent["seedingRule"], "*.tracker.test");
+    assert_eq!(
+        torrent["seedingPolicy"]["levels"]["ratioGoal"],
+        "TRACKER_RULE"
+    );
+    assert_eq!(torrent["trackerRule"], "*.tracker.test");
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 3.0);
     // No schedule pause is in force, so none is left seeding through one.
     assert_eq!(
@@ -823,8 +849,8 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     .await;
     assert_eq!(left["deleteTrackerRule"], serde_json::json!([]));
     let torrent = source().await;
-    assert_eq!(torrent["seedingSource"], "GLOBAL");
-    assert_eq!(torrent["seedingRule"], Value::Null);
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "GLOBAL");
+    assert_eq!(torrent["trackerRule"], Value::Null);
     assert_eq!(
         read("{ trackerRules { id } }".into()).await["trackerRules"],
         serde_json::json!([])
@@ -1180,6 +1206,7 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
     let rig = rig().await;
     rig.torrents
         .set_settings(TorrentSettings {
+            upload_cap: None,
             complete_dir: rig._dir.path().join("complete"),
             categories: Vec::new(),
             seeding: None,

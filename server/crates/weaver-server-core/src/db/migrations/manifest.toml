@@ -1298,3 +1298,20 @@ kind = "sql"
 file = "migrations/0097_tracker_rule_discovery_split/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 98
+description = "one override chain: upload caps leave the seeding policy, and a torrent's unpack splits into what is asked and what is in force"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0098_one_override_chain/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0098_one_override_chain/postgres.sql"
+engine = "postgres"
+scope = "all"

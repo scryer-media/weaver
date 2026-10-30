@@ -33,17 +33,44 @@ export type TorrentState =
   | "MOVING"
   | "NEEDS_CERTIFICATE";
 
-/** Where a torrent's seeding policy comes from. */
-export type SeedingSource = "CATEGORY" | "GLOBAL" | "TORRENT" | "TRACKER_RULE";
+/** A level a torrent takes a setting from. */
+export type SettingLevel = "TORRENT" | "TRACKER_RULE" | "CATEGORY" | "GLOBAL";
 
-/** A seeding policy as the daemon sends it. */
+/** One setting at one level: inherited, off, or set to `value`. */
+export interface LeafData<T> {
+  state: "INHERIT" | "OFF" | "SET";
+  value: T | null;
+}
+
+export type SeedingModeData = "ANY" | "ALL";
+export type SeedingActionData = "STOP" | "REMOVE" | "REMOVE_WITH_DATA";
+
+/** Seeding terms at one level, as the daemon sends them. */
 export interface SeedingPolicyData {
+  ratioGoal: LeafData<number>;
+  seedTimeGoalMinutes: LeafData<number>;
+  inactiveGoalMinutes: LeafData<number>;
+  mode: LeafData<SeedingModeData>;
+  action: LeafData<SeedingActionData>;
+}
+
+/** The seeding terms a torrent is held to, and the level each comes from. */
+export interface SeedingTermsData {
   ratioGoal: number | null;
   seedTimeGoalMinutes: number | null;
   inactiveGoalMinutes: number | null;
-  mode: "ANY" | "ALL";
-  action: "STOP" | "REMOVE" | "REMOVE_WITH_DATA";
-  maxUploadBps: number | null;
+  mode: SeedingModeData;
+  action: SeedingActionData;
+  /** Bytes per second; null is none. */
+  uploadCap: number | null;
+  levels: {
+    ratioGoal: SettingLevel;
+    seedTimeGoalMinutes: SettingLevel;
+    inactiveGoalMinutes: SettingLevel;
+    mode: SettingLevel;
+    action: SettingLevel;
+    uploadCap: SettingLevel;
+  };
 }
 
 export type TrackerStatus =
@@ -157,15 +184,16 @@ export interface TorrentData extends TorrentSummaryData {
   completedAtMs: number | null;
   savePath: string | null;
   seedingLeft: string | null;
-  /** The torrent's own policy; null when it inherits one. */
+  /** The torrent's own terms; null when it inherits every one. */
   seedingOverride: SeedingPolicyData | null;
-  /** The policy in effect. */
-  seedingPolicy: SeedingPolicyData;
-  seedingSource: SeedingSource;
-  /** The host pattern of the tracker rule the policy comes from, when it does. */
-  seedingRule: string | null;
+  /** The terms in effect. */
+  seedingPolicy: SeedingTermsData;
+  /** The host pattern of the tracker rule the torrent is under, when it is. */
+  trackerRule: string | null;
   /** Whether its archives are extracted. */
   unpack: boolean;
+  /** The torrent's own unpack; null inherits. */
+  unpackOverride: boolean | null;
   route: string | null;
   files: TorrentFileData[];
   /** Whether its pieces are fetched in order. */

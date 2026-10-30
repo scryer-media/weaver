@@ -14,7 +14,7 @@ use crate::jobs::JobId;
 use crate::jobs::handle::HoldTarget;
 use crate::jobs::{HoldOrigin, HoldOwner, HoldSet};
 use crate::proxies::ResolvedBy;
-use crate::settings::{SeedingGoalMode, SeedingPolicy};
+use crate::settings::{Seeding, SeedingGoalMode};
 use crate::torrents::sessions::{RouteFailure, TorrentRouteReason};
 use crate::torrents::{
     NamedBy, TorrentCounters, TorrentIntent, TorrentState, TorrentTracker, TrackerEntry,
@@ -258,17 +258,14 @@ pub fn ratio(counters: &TorrentCounters, size: u64) -> f64 {
     }
 }
 
-/// The goal still to meet, named, or `None` once it is met. No policy, or
-/// one with no goal set, is never met.
+/// The goal still to meet, named, or `None` once it is met. Terms with no
+/// goal are never met.
 pub fn goal_left(
-    policy: Option<&SeedingPolicy>,
+    policy: &Seeding,
     counters: &TorrentCounters,
     total_bytes: u64,
     now_ms: i64,
 ) -> Option<String> {
-    let Some(policy) = policy else {
-        return Some("no seeding goal".to_owned());
-    };
     let mut goals: Vec<(bool, String)> = Vec::new();
     if let Some(goal) = policy.ratio_goal {
         let ratio = ratio(counters, total_bytes);
@@ -930,14 +927,13 @@ mod tests {
         }
     }
 
-    fn policy(ratio: Option<f32>, seed: Option<u32>, mode: SeedingGoalMode) -> SeedingPolicy {
-        SeedingPolicy {
+    fn policy(ratio: Option<f32>, seed: Option<u32>, mode: SeedingGoalMode) -> Seeding {
+        Seeding {
             ratio_goal: ratio,
             seed_time_goal_minutes: seed,
             inactive_goal_minutes: None,
             mode,
             action: SeedingAction::Stop,
-            max_upload_bps: None,
         }
     }
 
@@ -948,17 +944,16 @@ mod tests {
             finished_duration_s: 30 * 60,
             ..TorrentCounters::default()
         };
-        assert!(goal_left(None, &counters, 100, 0).is_some());
         let none = policy(None, None, SeedingGoalMode::Any);
-        assert!(goal_left(Some(&none), &counters, 100, 0).is_some());
+        assert!(goal_left(&none, &counters, 100, 0).is_some());
         let any = policy(Some(1.0), Some(60), SeedingGoalMode::Any);
-        assert_eq!(goal_left(Some(&any), &counters, 100, 0), None);
+        assert_eq!(goal_left(&any, &counters, 100, 0), None);
         let all = policy(Some(1.0), Some(60), SeedingGoalMode::All);
         assert_eq!(
-            goal_left(Some(&all), &counters, 100, 0).as_deref(),
+            goal_left(&all, &counters, 100, 0).as_deref(),
             Some("seeded 30 of 60 minutes")
         );
-        let inactive = SeedingPolicy {
+        let inactive = Seeding {
             inactive_goal_minutes: Some(10),
             ..none
         };
@@ -966,8 +961,8 @@ mod tests {
             last_activity_ms: Some(0),
             ..counters
         };
-        assert!(goal_left(Some(&inactive), &idle, 100, 9 * 60_000).is_some());
-        assert_eq!(goal_left(Some(&inactive), &idle, 100, 10 * 60_000), None);
+        assert!(goal_left(&inactive, &idle, 100, 9 * 60_000).is_some());
+        assert_eq!(goal_left(&inactive, &idle, 100, 10 * 60_000), None);
     }
 
     #[test]
@@ -1125,7 +1120,7 @@ mod tests {
         assert_eq!(ratio(&counters(500, 10), 1000), 50.0);
         assert_eq!(ratio(&counters(0, 0), 0), 0.0);
         let policy = policy(Some(2.0), None, SeedingGoalMode::Any);
-        assert_eq!(goal_left(Some(&policy), &counters(500, 250), 1000, 0), None);
+        assert_eq!(goal_left(&policy, &counters(500, 250), 1000, 0), None);
     }
 
     // An announce that ended at 1,000 s, and the next as the engine sets it:

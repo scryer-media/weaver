@@ -3,6 +3,7 @@
 
 pub(crate) mod archive_passwords;
 pub mod env_seed;
+pub mod levels;
 pub mod model;
 pub mod persistence;
 pub mod queries;
@@ -14,8 +15,8 @@ pub mod tracker_file;
 
 pub use model::{
     BlocklistSource, BufferPoolOverrides, Client, Config, DeliveryNamingOverrides,
-    DirectStoreOverrides, DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
-    SeedingAction, SeedingGoalMode, SeedingPolicy, SharedConfig, TorrentConfig, TorrentEncryption,
-    TorrentLimit, TorrentPeerProtocol, TrackerUploadLimit, resolve_seeding_policy,
+    DirectStoreOverrides, DirectUnpackOverrides, Leaf, Level, Levels, MetricsConfig, PerJobSeries,
+    RetryOverrides, Seeding, SeedingAction, SeedingGoalMode, SeedingPolicy, SharedConfig,
+    TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
 };
 pub use service::HARDWARE_PROFILE_SETTING;

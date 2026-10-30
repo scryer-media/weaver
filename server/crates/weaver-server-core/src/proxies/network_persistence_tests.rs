@@ -773,7 +773,7 @@ fn a_tracker_rule_with_its_own_route_is_a_consumer() {
         pex: None,
         lsd: None,
         encryption: None,
-        upload_limit: None,
+        upload_cap: Default::default(),
         forced: false,
         ssl: None,
     };

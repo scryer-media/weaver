@@ -784,6 +784,7 @@ mod category_destination_tests {
 
     fn category(name: &str, dest_dir: Option<&str>) -> crate::categories::CategoryConfig {
         crate::categories::CategoryConfig {
+            upload_cap: Default::default(),
             seeding: None,
             torrent_route: false,
             unpack: None,

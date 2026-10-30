@@ -2610,6 +2610,7 @@ async fn postgres_runtime_smoke_when_configured() {
     );
 
     let config = Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: "/tmp/weaver-pg".to_string(),
@@ -2648,6 +2649,7 @@ async fn postgres_runtime_smoke_when_configured() {
             tls_ca_cert: Some(PathBuf::from("/tmp/ca.pem")),
         }],
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             seeding: None,
             torrent_route: false,
             unpack: None,

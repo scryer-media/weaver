@@ -25,11 +25,12 @@ use crate::jobs::JobId;
 use crate::jobs::handle::HoldOrigin;
 use crate::persistence::Database;
 use crate::proxies::{TorrentRouteFault, TorrentScope};
+use crate::settings::Level;
 use crate::settings::SeedingGoalMode;
 use crate::torrents::metrics::{
     JobSeries, SessionSeries, TorrentMetrics, TorrentSeries, TrackerSeries, fetch_phase_str,
 };
-use crate::torrents::service::{PeerKinds, SeedingSource, TorrentLeg, TorrentSupport};
+use crate::torrents::service::{PeerKinds, TorrentLeg, TorrentSupport};
 use crate::torrents::sessions::TorrentRouteReason;
 use crate::torrents::status;
 use crate::torrents::{NamedBy, TorrentState, TorrentTracker, TrackerStatus};
@@ -317,9 +318,29 @@ fn tracker_message(message: &str) -> &'static str {
     }
 }
 
+// The level each seeding term comes from.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SeedingLevelNames {
+    pub ratio_goal: &'static str,
+    pub seed_time_goal: &'static str,
+    pub inactive_goal: &'static str,
+    pub mode: &'static str,
+    pub action: &'static str,
+    pub upload_cap: &'static str,
+}
+
+fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::Torrent => "torrent",
+        Level::TrackerRule => "tracker_rule",
+        Level::Category => "category",
+        Level::Global => "global",
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SeedingOutcome {
-    pub source: &'static str,
+    pub levels: SeedingLevelNames,
     pub mode: &'static str,
     pub action: &'static str,
     pub ratio_goal_milli: Option<u64>,
@@ -341,11 +362,16 @@ impl SeedingOutcome {
             .last_activity_ms
             .map(|at| u64::try_from((now_ms - at).max(0)).unwrap_or(0) / 60_000);
         Self {
-            source: match held.view.seeding_source {
-                SeedingSource::Torrent => "torrent",
-                SeedingSource::TrackerRule(_) => "tracker_rule",
-                SeedingSource::Category => "category",
-                SeedingSource::Global => "global",
+            levels: {
+                let levels = &held.view.seeding_levels;
+                SeedingLevelNames {
+                    ratio_goal: level_name(levels.ratio_goal),
+                    seed_time_goal: level_name(levels.seed_time_goal_minutes),
+                    inactive_goal: level_name(levels.inactive_goal_minutes),
+                    mode: level_name(levels.mode),
+                    action: level_name(levels.action),
+                    upload_cap: level_name(levels.upload_cap),
+                }
             },
             mode: match policy.mode {
                 SeedingGoalMode::Any => "any",
@@ -364,7 +390,7 @@ impl SeedingOutcome {
             inactive_minutes_left: policy
                 .inactive_goal_minutes
                 .map(|goal| u64::from(goal).saturating_sub(idle.unwrap_or(0))),
-            upload_cap_bps: policy.max_upload_bps,
+            upload_cap_bps: held.view.upload_cap,
         }
     }
 }
@@ -733,28 +759,38 @@ impl TorrentJobSection {
             );
         }
         if let Some(seeding) = &self.seeding {
+            let levels = &seeding.levels;
             let mut line = format!(
-                "  seeding {} {} then {}",
-                seeding.source, seeding.mode, seeding.action
+                "  seeding {} ({}) then {} ({})",
+                seeding.mode, levels.mode, seeding.action, levels.action
             );
             if let (Some(goal), Some(left)) = (seeding.ratio_goal_milli, seeding.ratio_left_milli) {
                 let _ = write!(
                     line,
-                    "  ratio {}.{:03} left {}.{:03}",
+                    "  ratio {}.{:03} ({}) left {}.{:03}",
                     goal / 1000,
                     goal % 1000,
+                    levels.ratio_goal,
                     left / 1000,
                     left % 1000
                 );
             }
             if let (Some(goal), Some(left)) = (seeding.seed_minutes_goal, seeding.seed_minutes_left)
             {
-                let _ = write!(line, "  time {goal}m left {left}m");
+                let _ = write!(
+                    line,
+                    "  time {goal}m ({}) left {left}m",
+                    levels.seed_time_goal
+                );
             }
             if let (Some(goal), Some(left)) =
                 (seeding.inactive_minutes_goal, seeding.inactive_minutes_left)
             {
-                let _ = write!(line, "  idle {goal}m left {left}m");
+                let _ = write!(
+                    line,
+                    "  idle {goal}m ({}) left {left}m",
+                    levels.inactive_goal
+                );
             }
             let _ = writeln!(text, "{}", clip(&line));
         }

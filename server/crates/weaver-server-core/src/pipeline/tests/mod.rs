@@ -158,6 +158,7 @@ impl TestHarness {
         let complete_dir = temp_dir.path().join("complete");
         let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
         let config: SharedConfig = Arc::new(RwLock::new(Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: data_dir.display().to_string(),
@@ -583,6 +584,7 @@ async fn new_direct_pipeline_on_machine(
     // needs a key, exactly as a running server has one.
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
     let config: SharedConfig = Arc::new(RwLock::new(Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: data_dir.display().to_string(),

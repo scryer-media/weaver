@@ -1053,6 +1053,7 @@ mod tests {
 
     fn category(name: &str) -> CategoryConfig {
         CategoryConfig {
+            upload_cap: Default::default(),
             seeding: None,
             torrent_route: false,
             unpack: None,
@@ -1347,6 +1348,7 @@ mod tests {
                 db.clone(),
             );
             let settings = TorrentSettings {
+                upload_cap: None,
                 complete_dir: dir.path().join("complete"),
                 categories: vec![tv()],
                 seeding: None,
@@ -1367,6 +1369,7 @@ mod tests {
             let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
             let handle = SchedulerHandle::new(event_tx, state);
             let config = Arc::new(tokio::sync::RwLock::new(Config {
+                upload_cap: None,
                 seeding: None,
                 torrent: Default::default(),
                 data_dir: dir.path().display().to_string(),

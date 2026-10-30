@@ -18,19 +18,25 @@ import { UNPACK_CHOICES, routeExposureText, routeReasonText, type TorrentRouteRe
 import type { ResolvedBy } from "@/lib/test-via";
 import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { NumberField, SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
+import { SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
 import { SettingsBlocks, useDraft, usePanelState, type FieldSpec, type SettingsBlock } from "../framework";
 import {
-  EMPTY_SEEDING,
   GoalControl,
+  INHERIT,
   durationText,
+  globalUploadCapField,
+  leafFrom,
+  leafInput,
+  seedingAtGlobal,
   seedingFields,
   seedingFrom,
+  seedingInherits,
   seedingInput,
-  seedingIsEmpty,
+  uploadCapField,
+  type Leaf,
   type SeedingPolicy,
 } from "../seeding";
 
@@ -38,15 +44,15 @@ import {
  * Torrents: the global seeding policy, the tracker rules, and how the
  * torrent session connects.
  *
- * The policy and the connection save through `updateSettings`, each only
- * when it was edited. A seeding policy with no goal and no cap saves as none
- * at all. A tracker rule saves from its own editor.
+ * The seeding terms, the upload cap and the connection save through
+ * `updateSettings`, each only when it was edited. A tracker rule saves from
+ * its own editor; its terms that all inherit save as none.
  */
 
 interface TrackerRule {
   id: number;
   hostPattern: string;
-  /** Null while the rule leaves the goals to the category and the global policy. */
+  /** Null while every term inherits from the category and the global settings. */
   seeding: SeedingPolicy | null;
   neverPause: boolean;
   /** Null while the rule leaves it to the category and the global setting. */
@@ -60,18 +66,14 @@ interface TrackerRule {
   lsd: boolean | null;
   /** Null inherits the global encryption. */
   encryption: TorrentEncryption | null;
-  /** Null inherits the seeding policy's cap; a null rate is unlimited. */
-  uploadLimit: TrackerUploadLimit | null;
+  /** The upload cap its torrents take in place of their category's and the global one. */
+  uploadCap: Leaf<number>;
   forced: boolean;
   /** Whether it holds a certificate for its SSL torrents; the key is never read back. */
   hasSsl: boolean;
   sslSubject: string | null;
   /** Milliseconds since the epoch. */
   sslNotAfter: number | null;
-}
-
-interface TrackerUploadLimit {
-  bps: number | null;
 }
 
 type TorrentClient = "WEAVER" | "QBITTORRENT" | "TRANSMISSION";
@@ -84,7 +86,7 @@ const TORRENT_CLIENTS: readonly { value: TorrentClient; label: string }[] = [
 
 interface TrackerRuleForm {
   hostPattern: string;
-  seeding: SeedingPolicy | null;
+  seeding: SeedingPolicy;
   neverPause: boolean;
   unpack: boolean | null;
   client: TorrentClient | null;
@@ -93,7 +95,7 @@ interface TrackerRuleForm {
   pex: boolean | null;
   lsd: boolean | null;
   encryption: TorrentEncryption | null;
-  uploadLimit: TrackerUploadLimit | null;
+  uploadCap: Leaf<number>;
   forced: boolean;
   /** A certificate and key pasted to replace the rule's; both blank keeps it. */
   certificatePem: string;
@@ -104,7 +106,7 @@ interface TrackerRuleForm {
 
 const NEW_TRACKER_RULE: TrackerRuleForm = {
   hostPattern: "",
-  seeding: null,
+  seeding: seedingFrom(null),
   neverPause: false,
   unpack: null,
   client: null,
@@ -113,7 +115,7 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   pex: null,
   lsd: null,
   encryption: null,
-  uploadLimit: null,
+  uploadCap: INHERIT,
   forced: false,
   certificatePem: "",
   privateKeyPem: "",
@@ -135,74 +137,23 @@ function sslInput(form: TrackerRuleForm) {
   return form.sslCleared ? { ssl: null } : {};
 }
 
-/** A rule's upload cap as its editor picks it: inherited, unlimited, or a rate of its own. */
-type UploadLimitChoice = "inherit" | "unlimited" | "cap";
-
-const uploadLimitChoice = (limit: TrackerUploadLimit | null): UploadLimitChoice =>
-  limit === null ? "inherit" : limit.bps === null ? "unlimited" : "cap";
-
-/** The rate a rule's cap opens at when it is first given one. */
-const DEFAULT_RULE_UPLOAD_BPS = 10 * 1024 * 1024;
-
-/** A rule's upload cap: inherited, unlimited, or a rate in MB/s. */
-function UploadLimitControl({
-  t,
-  value,
-  onChange,
-}: {
-  t: Translate;
-  value: TrackerUploadLimit | null;
-  onChange: (next: TrackerUploadLimit | null) => void;
-}) {
-  const [last, setLast] = useState(value?.bps ?? DEFAULT_RULE_UPLOAD_BPS);
-  const label = t("next.torrents.trackerRuleUploadLimit");
-  return (
-    <div className="flex items-center gap-[10px]">
-      <Segmented<UploadLimitChoice>
-        label={label}
-        value={uploadLimitChoice(value)}
-        options={[
-          { value: "inherit", label: t("next.torrents.unpackInherit") },
-          { value: "unlimited", label: t("next.networking.unlimited") },
-          { value: "cap", label: t("next.torrents.trackerRuleUploadCap") },
-        ]}
-        onChange={(choice) =>
-          onChange(choice === "inherit" ? null : choice === "unlimited" ? { bps: null } : { bps: last })
-        }
-      />
-      {value?.bps != null ? (
-        <NumberField
-          label={label}
-          value={Math.round((value.bps / (1024 * 1024)) * 10) / 10}
-          min={0}
-          step={0.1}
-          precision={1}
-          suffix="MB/s"
-          onChange={(next) => {
-            const bps = Math.round(Math.max(0, next) * 1024 * 1024);
-            setLast(bps);
-            onChange({ bps });
-          }}
-        />
-      ) : null}
-    </div>
-  );
-}
-
 /** A rule's goals in one line, as its row shows them. */
 function goalsText(t: Translate, policy: SeedingPolicy | null): string {
   if (!policy) {
     return EM_DASH;
   }
+  const goal = (leaf: Leaf<number>, label: string, text: (value: number) => string) =>
+    leaf.state === "OFF"
+      ? `${label} ${t("next.seeding.noGoal")}`
+      : leaf.state === "SET" && leaf.value !== null
+        ? `${label} ${text(leaf.value)}`
+        : null;
+  const minutes = (value: number) => durationText(t, value);
   const goals = [
-    policy.ratioGoal === null ? null : `${t("next.seeding.ratioGoal")} ${policy.ratioGoal}`,
-    policy.seedTimeGoalMinutes === null
-      ? null
-      : `${t("next.seeding.seedTimeGoal")} ${durationText(t, policy.seedTimeGoalMinutes)}`,
-    policy.inactiveGoalMinutes === null
-      ? null
-      : `${t("next.seeding.inactiveGoal")} ${durationText(t, policy.inactiveGoalMinutes)}`,
-  ].filter((goal): goal is string => goal !== null);
+    goal(policy.ratioGoal, t("next.seeding.ratioGoal"), String),
+    goal(policy.seedTimeGoalMinutes, t("next.seeding.seedTimeGoal"), minutes),
+    goal(policy.inactiveGoalMinutes, t("next.seeding.inactiveGoal"), minutes),
+  ].filter((text): text is string => text !== null);
   return goals.length > 0 ? goals.join(" · ") : EM_DASH;
 }
 
@@ -441,7 +392,6 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
   const [, deleteRule] = useMutation(DELETE_TRACKER_RULE_MUTATION);
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
   const [form, setForm] = useState<TrackerRuleForm>(NEW_TRACKER_RULE);
-  const [opened, setOpened] = useState<TrackerRuleForm>(NEW_TRACKER_RULE);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<TrackerRule | null>(null);
@@ -462,7 +412,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
     const start = rule
       ? {
           hostPattern: rule.hostPattern,
-          seeding: rule.seeding ? seedingFrom(rule.seeding) : null,
+          seeding: seedingFrom(rule.seeding),
           neverPause: rule.neverPause,
           unpack: rule.unpack,
           client: rule.client,
@@ -471,7 +421,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           pex: rule.pex,
           lsd: rule.lsd,
           encryption: rule.encryption,
-          uploadLimit: rule.uploadLimit,
+          uploadCap: leafFrom(rule.uploadCap),
           forced: rule.forced,
           certificatePem: "",
           privateKeyPem: "",
@@ -479,7 +429,6 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         }
       : NEW_TRACKER_RULE;
     setForm(start);
-    setOpened(start);
     setOpening((count) => count + 1);
     setEditingId(rule ? rule.id : "new");
   };
@@ -490,7 +439,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
       id: editingId === "new" ? null : editingId,
       input: {
         hostPattern: form.hostPattern.trim(),
-        seeding: form.seeding ? seedingInput(form.seeding) : null,
+        seeding: seedingInherits(form.seeding) ? null : seedingInput(form.seeding),
         neverPause: form.neverPause,
         unpack: form.unpack,
         client: form.client,
@@ -499,7 +448,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         pex: form.pex,
         lsd: form.lsd,
         encryption: form.encryption,
-        uploadLimit: form.uploadLimit,
+        uploadCap: leafInput(form.uploadCap),
         forced: form.forced,
         ...sslInput(form),
       },
@@ -685,22 +634,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                     })),
                 },
               },
-              {
-                id: "uploadLimit",
-                label: t("next.torrents.trackerRuleUploadLimit"),
-                keywords: "upload speed limit rate",
-                control: {
-                  kind: "custom",
-                  control: (
-                    <UploadLimitControl
-                      key={opening}
-                      t={t}
-                      value={form.uploadLimit}
-                      onChange={(uploadLimit) => setForm((current) => ({ ...current, uploadLimit }))}
-                    />
-                  ),
-                },
-              },
+              uploadCapField(t, form.uploadCap, (uploadCap) => setForm((current) => ({ ...current, uploadCap })), "trackerRule"),
               {
                 id: "forced",
                 label: t("next.torrents.trackerRuleForced"),
@@ -774,23 +708,10 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   onChange: (privateKeyPem) => setForm((current) => ({ ...current, privateKeyPem })),
                 },
               },
-              {
-                id: "ownSeeding",
-                label: t("next.categories.ownSeeding"),
-                keywords: "seed seeding policy",
-                control: {
-                  kind: "toggle",
-                  value: form.seeding !== null,
-                  onChange: (on) =>
-                    setForm((current) => ({ ...current, seeding: on ? (opened.seeding ?? EMPTY_SEEDING) : null })),
-                },
-              },
-              ...(form.seeding
-                ? seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
-                    inherits: true,
-                    idPrefix: "trackerRuleSeeding",
-                  })
-                : ([] as FieldSpec[])),
+              ...seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
+                inherits: true,
+                idPrefix: "trackerRuleSeeding",
+              }),
             ],
           },
         ]}
@@ -843,6 +764,8 @@ interface TorrentConnection {
 
 interface TorrentForm {
   seeding: SeedingPolicy;
+  /** Each torrent's upload cap in bytes per second; null is none. */
+  uploadCap: number | null;
   torrent: TorrentConnection;
 }
 
@@ -900,7 +823,7 @@ function connectionChanges(form: TorrentConnection, saved: TorrentConnection): P
 export function TorrentsPanel() {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{
-    settings: { seeding: SeedingPolicy | null; torrent: TorrentConnection | null };
+    settings: { seeding: SeedingPolicy | null; uploadCap: number | null; torrent: TorrentConnection | null };
   }>({ query: TORRENT_SETTINGS_QUERY });
   const [updateState, updateSettings] = useMutation(UPDATE_TORRENT_SETTINGS_MUTATION);
   const [status, setStatus] = useState<string | null>(null);
@@ -912,7 +835,8 @@ export function TorrentsPanel() {
     const settings = data?.settings;
     return settings
       ? {
-          seeding: seedingFrom(settings.seeding),
+          seeding: seedingAtGlobal(seedingFrom(settings.seeding)),
+          uploadCap: settings.uploadCap ?? null,
           torrent: { ...DEFAULT_CONNECTION, ...(settings.torrent ?? {}) },
         }
       : null;
@@ -951,7 +875,8 @@ export function TorrentsPanel() {
       setError(null);
       void updateSettings({
         input: {
-          ...(seedingChanged ? { seeding: seedingIsEmpty(seeding) ? null : seeding } : {}),
+          ...(seedingChanged ? { seeding } : {}),
+          ...(values.uploadCap !== source.uploadCap ? { uploadCap: values.uploadCap } : {}),
           ...(Object.keys(torrent).length > 0 ? { torrent } : {}),
         },
       }).then((result) => {
@@ -975,7 +900,10 @@ export function TorrentsPanel() {
           kind: "section",
           id: "seeding",
           title: t("next.torrents.seeding"),
-          fields: seedingFields(t, values.seeding, (seeding) => draft.set({ seeding }), { inherits: false }),
+          fields: [
+            ...seedingFields(t, values.seeding, (seeding) => draft.set({ seeding }), { inherits: false }),
+            globalUploadCapField(t, values.uploadCap, (uploadCap) => draft.set({ uploadCap })),
+          ],
         },
         trackerRules.block,
         {

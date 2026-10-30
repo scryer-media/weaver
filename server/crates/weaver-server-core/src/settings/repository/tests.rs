@@ -104,13 +104,13 @@ fn config_roundtrip() {
     let db = Database::open_in_memory().unwrap();
 
     let config = Config {
+        upload_cap: Some(500_000),
         seeding: Some(crate::settings::SeedingPolicy {
-            ratio_goal: Some(2.5),
-            seed_time_goal_minutes: Some(1_440),
-            inactive_goal_minutes: None,
-            mode: crate::settings::SeedingGoalMode::All,
-            action: crate::settings::SeedingAction::Remove,
-            max_upload_bps: Some(500_000),
+            ratio_goal: Leaf::Set(2.5),
+            seed_time_goal_minutes: Leaf::Set(1_440),
+            inactive_goal_minutes: Leaf::Off,
+            mode: Leaf::Set(crate::settings::SeedingGoalMode::All),
+            action: Leaf::Set(crate::settings::SeedingAction::Remove),
         }),
         torrent: crate::settings::TorrentConfig {
             enabled: true,
@@ -171,8 +171,9 @@ fn config_roundtrip() {
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             seeding: Some(crate::settings::SeedingPolicy {
-                ratio_goal: Some(1.0),
+                ratio_goal: Leaf::Set(1.0),
                 ..Default::default()
             }),
             torrent_route: true,
@@ -372,6 +373,7 @@ fn category_crud() {
     let db = Database::open_in_memory().unwrap();
 
     let cat = CategoryConfig {
+        upload_cap: Default::default(),
         seeding: None,
         torrent_route: false,
         unpack: None,
@@ -408,6 +410,7 @@ fn next_category_id_empty() {
 fn a_database_without_torrent_settings_loads_the_defaults() {
     let db = Database::open_in_memory().unwrap();
     db.insert_category(&CategoryConfig {
+        upload_cap: Default::default(),
         id: 1,
         name: "TV".to_string(),
         dest_dir: None,
@@ -437,20 +440,33 @@ fn a_database_without_torrent_settings_loads_the_defaults() {
 fn clearing_the_global_seeding_policy_removes_it() {
     let db = Database::open_in_memory().unwrap();
     let policy = crate::settings::SeedingPolicy {
-        ratio_goal: Some(1.0),
-        inactive_goal_minutes: Some(60),
+        ratio_goal: Leaf::Set(1.0),
+        inactive_goal_minutes: Leaf::Set(60),
         ..Default::default()
     };
     db.save_seeding_policy(Some(&policy)).unwrap();
-    assert_eq!(db.load_config().unwrap().seeding, Some(policy));
+    // At the global level nothing is inherited: a goal left unset is off,
+    // and the mode and action are their defaults.
+    assert_eq!(
+        db.load_config().unwrap().seeding,
+        Some(crate::settings::SeedingPolicy {
+            seed_time_goal_minutes: Leaf::Off,
+            mode: Leaf::Set(crate::settings::SeedingGoalMode::Any),
+            action: Leaf::Set(crate::settings::SeedingAction::Stop),
+            ..policy
+        })
+    );
 
     // Dropping one goal removes only that goal.
     let narrower = crate::settings::SeedingPolicy {
-        inactive_goal_minutes: None,
+        inactive_goal_minutes: Leaf::Off,
         ..policy
     };
     db.save_seeding_policy(Some(&narrower)).unwrap();
-    assert_eq!(db.load_config().unwrap().seeding, Some(narrower));
+    assert_eq!(
+        db.load_config().unwrap().seeding,
+        Some(narrower.at_global())
+    );
 
     db.save_seeding_policy(None).unwrap();
     assert_eq!(db.load_config().unwrap().seeding, None);
@@ -459,14 +475,15 @@ fn clearing_the_global_seeding_policy_removes_it() {
 #[test]
 fn tracker_rules_crud() {
     use crate::settings::model::TrackerRule;
-    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption, TrackerUploadLimit};
+    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption};
 
     let db = Database::open_in_memory().unwrap();
     assert!(db.list_tracker_rules().unwrap().is_empty());
     let seeding = SeedingPolicy {
-        ratio_goal: Some(1.5),
-        seed_time_goal_minutes: Some(4_320),
-        action: SeedingAction::Stop,
+        ratio_goal: Leaf::Set(1.5),
+        seed_time_goal_minutes: Leaf::Set(4_320),
+        inactive_goal_minutes: Leaf::Off,
+        action: Leaf::Set(SeedingAction::Stop),
         ..SeedingPolicy::default()
     };
     let first = db
@@ -483,7 +500,7 @@ fn tracker_rules_crud() {
                 pex: None,
                 lsd: Some(true),
                 encryption: Some(TorrentEncryption::Prefer),
-                upload_limit: Some(TrackerUploadLimit::Unlimited),
+                upload_cap: Leaf::Off,
                 forced: true,
                 ssl: None,
             },
@@ -504,7 +521,7 @@ fn tracker_rules_crud() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Leaf::Inherit,
                 forced: false,
                 ssl: None,
             },
@@ -539,7 +556,7 @@ fn tracker_rules_crud() {
         pex: Some(false),
         lsd: Some(false),
         encryption: Some(TorrentEncryption::Require),
-        upload_limit: Some(TrackerUploadLimit::Bps(4_096)),
+        upload_cap: Leaf::Set(4_096),
         forced: false,
         ..first.clone()
     };
@@ -578,7 +595,7 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
                 pex: None,
                 lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Leaf::Inherit,
                 forced: false,
                 ssl: Some(issued.clone()),
             },
