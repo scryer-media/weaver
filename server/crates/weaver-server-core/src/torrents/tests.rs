@@ -65,6 +65,7 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
     record.category_id = Some(4);
     record.storage_dir = Some("/data/torrents/7".to_string());
     record.policy_override = Some(SeedingPolicy {
+        seed_time_counting: Default::default(),
         ratio_goal: Leaf::Set(1.5),
         seed_time_goal_minutes: Leaf::Off,
         inactive_goal_minutes: Leaf::Set(30),
@@ -158,6 +159,7 @@ fn intent_and_counters_update_in_place() {
     assert_eq!(stored.completed_at_ms, Some(9_000));
 
     let counters = TorrentCounters {
+        consecutive_seeding_s: 0,
         uploaded_bytes: 7_000_000_000,
         downloaded_bytes: 3_500_000_000,
         active_duration_s: 900,

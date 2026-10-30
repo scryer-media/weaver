@@ -374,6 +374,9 @@ pub struct TorrentCounters {
     pub last_seen_complete_ms: Option<i64>,
     // Time spent complete and seeding, in seconds.
     pub finished_duration_s: u64,
+    // The seconds of the current unbroken seeding run: back to zero at any
+    // reading that finds the torrent not seeding, and at a restart.
+    pub consecutive_seeding_s: u64,
     pub last_activity_ms: Option<i64>,
 }
 

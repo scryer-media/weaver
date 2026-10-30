@@ -4314,6 +4314,39 @@ type SecurityUpgradeNotice {
 	loginEnabled: Boolean!
 }
 
+"""
+Which seconds a seed-time goal counts.
+"""
+enum SeedTimeCounting {
+	"""
+	Every second the torrent has seeded.
+	"""
+	CUMULATIVE
+	"""
+	The seconds since it last stopped seeding.
+	"""
+	CONSECUTIVE
+}
+
+"""
+One setting at one level.
+"""
+type SeedTimeCountingLeaf {
+	state: LeafState!
+	"""
+	The value while `state` is `SET`.
+	"""
+	value: SeedTimeCounting
+}
+
+"""
+One setting at one level; `value` is given with `SET` and only then.
+"""
+input SeedTimeCountingLeafInput {
+	state: LeafState!
+	value: SeedTimeCounting
+}
+
 enum SeedingAction {
 	STOP
 	REMOVE
@@ -4353,6 +4386,7 @@ type SeedingLevels {
 	inactiveGoalMinutes: SettingLevel!
 	mode: SettingLevel!
 	action: SettingLevel!
+	seedTimeCounting: SettingLevel!
 	uploadCap: SettingLevel!
 }
 
@@ -4365,6 +4399,7 @@ input SeedingPolicyInput {
 	inactiveGoalMinutes: MinutesLeafInput
 	mode: GoalModeLeafInput
 	action: SeedingActionLeafInput
+	seedTimeCounting: SeedTimeCountingLeafInput
 }
 
 """
@@ -4376,6 +4411,7 @@ type SeedingPolicySettings {
 	inactiveGoalMinutes: MinutesLeaf!
 	mode: GoalModeLeaf!
 	action: SeedingActionLeaf!
+	seedTimeCounting: SeedTimeCountingLeaf!
 }
 
 """
@@ -4387,6 +4423,7 @@ type SeedingTerms {
 	inactiveGoalMinutes: Int
 	mode: SeedingGoalMode!
 	action: SeedingAction!
+	seedTimeCounting: SeedTimeCounting!
 	"""
 	The upload cap in bytes per second; absent is none.
 	"""
@@ -5214,6 +5251,14 @@ type Torrent {
 	Seconds spent running in a session.
 	"""
 	activeSeconds: Int!
+	"""
+	Seconds spent complete and seeding, in all.
+	"""
+	seedingSeconds: Int!
+	"""
+	Seconds of the current unbroken seeding run.
+	"""
+	consecutiveSeedingSeconds: Int!
 	downloadAvgBps: Int!
 	uploadAvgBps: Int!
 	"""

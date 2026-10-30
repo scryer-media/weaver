@@ -231,6 +231,8 @@ pub struct TorrentSeries {
     pub redundant_bytes: u64,
     pub active_seconds: u64,
     pub seeding_seconds: u64,
+    /// The seconds of its current unbroken seeding run.
+    pub consecutive_seeding_seconds: u64,
     pub download_bps: u64,
     pub upload_bps: u64,
     pub ratio: f64,
@@ -285,7 +287,7 @@ impl SeedingSeries {
         }
         if let Some(minutes) = policy.seed_time_goal_minutes {
             let goal = u64::from(minutes) * 60;
-            let left = goal.saturating_sub(counters.finished_duration_s);
+            let left = goal.saturating_sub(policy.seeded_seconds(counters));
             goals.push((SeedingGoal::SeedTime, goal as f64, left as f64));
         }
         if let Some(minutes) = policy.inactive_goal_minutes {

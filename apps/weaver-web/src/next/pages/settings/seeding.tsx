@@ -18,6 +18,8 @@ import { trimNumber } from "./quota";
 
 export type SeedingMode = "ANY" | "ALL";
 export type SeedingAction = "STOP" | "REMOVE" | "REMOVE_WITH_DATA";
+/** Whether the seed-time goal counts all the seeding there has been, or only the current unbroken run. */
+export type SeedTimeCounting = "CUMULATIVE" | "CONSECUTIVE";
 
 /** How a level holds one setting. */
 export type LeafState = "INHERIT" | "OFF" | "SET";
@@ -50,6 +52,7 @@ export interface SeedingPolicy {
   inactiveGoalMinutes: Leaf<number>;
   mode: Leaf<SeedingMode>;
   action: Leaf<SeedingAction>;
+  seedTimeCounting: Leaf<SeedTimeCounting>;
 }
 
 /** Terms that inherit every one: a level holding them has none of its own. */
@@ -59,6 +62,7 @@ export const INHERITED_SEEDING: SeedingPolicy = {
   inactiveGoalMinutes: INHERIT,
   mode: INHERIT,
   action: INHERIT,
+  seedTimeCounting: INHERIT,
 };
 
 /** The global terms before any is set: no goal, any goal met stops. */
@@ -68,6 +72,7 @@ export const GLOBAL_SEEDING: SeedingPolicy = {
   inactiveGoalMinutes: OFF,
   mode: leafSet("ANY"),
   action: leafSet("STOP"),
+  seedTimeCounting: leafSet("CUMULATIVE"),
 };
 
 /** Whether every term inherits; such terms are kept as none. */
@@ -87,6 +92,7 @@ export function seedingInput(policy: SeedingPolicy) {
     inactiveGoalMinutes: leafInput(goalInput(policy.inactiveGoalMinutes, true)),
     mode: leafInput(policy.mode),
     action: leafInput(policy.action),
+    seedTimeCounting: leafInput(policy.seedTimeCounting),
   };
 }
 
@@ -98,6 +104,7 @@ export function seedingFrom(policy: Partial<SeedingPolicy> | null | undefined): 
     inactiveGoalMinutes: leafFrom(policy?.inactiveGoalMinutes),
     mode: leafFrom(policy?.mode),
     action: leafFrom(policy?.action),
+    seedTimeCounting: leafFrom(policy?.seedTimeCounting),
   };
 }
 
@@ -110,6 +117,8 @@ export function seedingAtGlobal(policy: SeedingPolicy): SeedingPolicy {
     inactiveGoalMinutes: goal(policy.inactiveGoalMinutes),
     mode: policy.mode.state === "SET" ? policy.mode : GLOBAL_SEEDING.mode,
     action: policy.action.state === "SET" ? policy.action : GLOBAL_SEEDING.action,
+    seedTimeCounting:
+      policy.seedTimeCounting.state === "SET" ? policy.seedTimeCounting : GLOBAL_SEEDING.seedTimeCounting,
   };
 }
 
@@ -241,6 +250,11 @@ export function DurationGoalControl({
 const MODES: { value: SeedingMode; label: string }[] = [
   { value: "ANY", label: "next.seeding.modeAny" },
   { value: "ALL", label: "next.seeding.modeAll" },
+];
+
+const COUNTINGS: { value: SeedTimeCounting; label: string }[] = [
+  { value: "CUMULATIVE", label: "next.seeding.countingCumulative" },
+  { value: "CONSECUTIVE", label: "next.seeding.countingConsecutive" },
 ];
 
 const ACTIONS: { value: SeedingAction; label: string }[] = [
@@ -437,6 +451,20 @@ export function seedingFields(
           ...MODES.map((option) => ({ ...option, label: t(option.label) })),
         ],
         onChange: (mode) => patch({ mode: fromChoice<SeedingMode>(mode) }),
+      },
+    },
+    {
+      id: `${prefix}-seedTimeCounting`,
+      label: t("next.seeding.seedTimeCounting"),
+      keywords: "seed seeding time run",
+      control: {
+        kind: "segmented",
+        value: choice(policy.seedTimeCounting, "CUMULATIVE"),
+        options: [
+          ...(options.inherits ? [inherit] : []),
+          ...COUNTINGS.map((option) => ({ ...option, label: t(option.label) })),
+        ],
+        onChange: (counting) => patch({ seedTimeCounting: fromChoice<SeedTimeCounting>(counting) }),
       },
     },
     {

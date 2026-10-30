@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    ArchivePasswords, Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentEncryption,
-    TrackerCertificate, TrackerRule,
+    ArchivePasswords, Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
+    TorrentEncryption, TrackerCertificate, TrackerRule,
 };
 
 // The largest upload accepted, in bytes.
@@ -105,6 +105,7 @@ pub struct SeedingTerms {
     pub inactive_goal_minutes: Leaf<u32>,
     pub mode: Leaf<SeedingGoalMode>,
     pub action: Leaf<SeedingAction>,
+    pub seed_time_counting: Leaf<SeedTimeCounting>,
 }
 
 // The fields of a rule a tracker file can lock or recommend, by the names a
@@ -201,6 +202,11 @@ impl TrackerFile {
             );
             recommend_leaf(&mut policy.mode, seeding.mode, before.mode);
             recommend_leaf(&mut policy.action, seeding.action, before.action);
+            recommend_leaf(
+                &mut policy.seed_time_counting,
+                seeding.seed_time_counting,
+                before.seed_time_counting,
+            );
             applied.seeding = SeedingPolicy::kept(Some(policy));
         }
         if let Some(ssl) = &self.ssl {
@@ -364,6 +370,7 @@ impl TrackerFile {
             let minutes = |value: u32| value.to_string();
             let mode = |mode: SeedingGoalMode| mode.as_str().to_owned();
             let action = |action: SeedingAction| action.as_str().to_owned();
+            let counting = |counting: SeedTimeCounting| counting.as_str().to_owned();
             for (field, set, old, new) in [
                 (
                     "seeding.ratio_goal",
@@ -394,6 +401,12 @@ impl TrackerFile {
                     !seeding.action.is_inherit(),
                     text(before.action, action),
                     text(after.action, action),
+                ),
+                (
+                    "seeding.seed_time_counting",
+                    !seeding.seed_time_counting.is_inherit(),
+                    text(before.seed_time_counting, counting),
+                    text(after.seed_time_counting, counting),
                 ),
             ] {
                 push(field, false, set, old, new);
@@ -900,12 +913,13 @@ const TOP_KEYS: [&str; 8] = [
     "archive_passwords",
     "ssl",
 ];
-const SEEDING_KEYS: [&str; 5] = [
+const SEEDING_KEYS: [&str; 6] = [
     "ratio_goal",
     "seed_time_goal_minutes",
     "inactive_goal_minutes",
     "mode",
     "action",
+    "seed_time_counting",
 ];
 
 fn parse(text: &str, members: &Members) -> Result<TrackerFile, String> {
@@ -1073,12 +1087,22 @@ fn seeding(value: &toml::Value, path: &str) -> Result<SeedingTerms, String> {
             })
         })
         .transpose()?;
+    let counting = word("seed_time_counting")?
+        .map(|counting| {
+            SeedTimeCounting::parse(counting).ok_or_else(|| {
+                format!(
+                    "{path}.seed_time_counting must be \"cumulative\" or \"consecutive\", not \"{counting}\"."
+                )
+            })
+        })
+        .transpose()?;
     Ok(SeedingTerms {
         ratio_goal: Leaf::of(ratio_goal),
         seed_time_goal_minutes: Leaf::of(minutes("seed_time_goal_minutes")?),
         inactive_goal_minutes: Leaf::of(minutes("inactive_goal_minutes")?),
         mode: Leaf::of(mode),
         action: Leaf::of(action),
+        seed_time_counting: Leaf::of(counting),
     })
 }
 

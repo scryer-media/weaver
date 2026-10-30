@@ -273,6 +273,10 @@ export const SEEDING_POLICY_FIELDS = `
       state
       value
     }
+    seedTimeCounting {
+      state
+      value
+    }
   }
 `;
 
@@ -1676,6 +1680,8 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
       swarmLeechers
       reannounceSeconds
       activeSeconds
+      seedingSeconds
+      consecutiveSeedingSeconds
       downloadAvgBps
       uploadAvgBps
       wastedBytes
@@ -1699,6 +1705,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
         inactiveGoalMinutes
         mode
         action
+        seedTimeCounting
         uploadCap
         levels {
           ratioGoal
@@ -1706,6 +1713,7 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
           inactiveGoalMinutes
           mode
           action
+          seedTimeCounting
           uploadCap
         }
       }

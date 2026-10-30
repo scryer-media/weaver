@@ -106,6 +106,7 @@ fn config_roundtrip() {
     let config = Config {
         upload_cap: Some(500_000),
         seeding: Some(crate::settings::SeedingPolicy {
+            seed_time_counting: Leaf::Set(crate::settings::SeedTimeCounting::Cumulative),
             ratio_goal: Leaf::Set(2.5),
             seed_time_goal_minutes: Leaf::Set(1_440),
             inactive_goal_minutes: Leaf::Off,
@@ -453,6 +454,7 @@ fn clearing_the_global_seeding_policy_removes_it() {
             seed_time_goal_minutes: Leaf::Off,
             mode: Leaf::Set(crate::settings::SeedingGoalMode::Any),
             action: Leaf::Set(crate::settings::SeedingAction::Stop),
+            seed_time_counting: Leaf::Set(crate::settings::SeedTimeCounting::Cumulative),
             ..policy
         })
     );

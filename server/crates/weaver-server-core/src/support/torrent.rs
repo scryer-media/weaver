@@ -178,6 +178,7 @@ pub struct TorrentCounts {
     pub redundant_bytes: u64,
     pub active_secs: u64,
     pub seeding_secs: u64,
+    pub consecutive_seeding_secs: u64,
     // Thousandths.
     pub ratio_milli: u64,
 }
@@ -326,6 +327,7 @@ pub struct SeedingLevelNames {
     pub inactive_goal: &'static str,
     pub mode: &'static str,
     pub action: &'static str,
+    pub seed_time_counting: &'static str,
     pub upload_cap: &'static str,
 }
 
@@ -343,6 +345,7 @@ pub struct SeedingOutcome {
     pub levels: SeedingLevelNames,
     pub mode: &'static str,
     pub action: &'static str,
+    pub seed_time_counting: &'static str,
     pub ratio_goal_milli: Option<u64>,
     pub ratio_left_milli: Option<u64>,
     pub seed_minutes_goal: Option<u32>,
@@ -357,7 +360,7 @@ impl SeedingOutcome {
         let policy = &held.view.seeding_policy;
         let counters = &held.counters;
         let ratio_milli = milli(held.view.ratio);
-        let seeded = counters.finished_duration_s / 60;
+        let seeded = policy.seeded_seconds(counters) / 60;
         let idle = counters
             .last_activity_ms
             .map(|at| u64::try_from((now_ms - at).max(0)).unwrap_or(0) / 60_000);
@@ -370,6 +373,7 @@ impl SeedingOutcome {
                     inactive_goal: level_name(levels.inactive_goal_minutes),
                     mode: level_name(levels.mode),
                     action: level_name(levels.action),
+                    seed_time_counting: level_name(levels.seed_time_counting),
                     upload_cap: level_name(levels.upload_cap),
                 }
             },
@@ -378,6 +382,7 @@ impl SeedingOutcome {
                 SeedingGoalMode::All => "all",
             },
             action: policy.action.as_str(),
+            seed_time_counting: policy.seed_time_counting.as_str(),
             ratio_goal_milli: policy.ratio_goal.map(|goal| milli(f64::from(goal))),
             ratio_left_milli: policy
                 .ratio_goal
@@ -511,6 +516,7 @@ impl TorrentJobSection {
             redundant_bytes: held.redundant_bytes,
             active_secs: view.active_seconds,
             seeding_secs: held.counters.finished_duration_s,
+            consecutive_seeding_secs: held.counters.consecutive_seeding_s,
             ratio_milli: milli(view.ratio),
         });
         section.pieces = view.pieces.map(|pieces| PieceCounts {
@@ -567,6 +573,7 @@ impl TorrentJobSection {
             redundant_bytes: 0,
             active_secs: 0,
             seeding_secs: 0,
+            consecutive_seeding_secs: 0,
             ratio_milli: 0,
         });
         section.output = OutputShape::of(row.output_dir.as_deref());
@@ -675,12 +682,13 @@ impl TorrentJobSection {
                 text,
                 "{}",
                 clip(&format!(
-                    "  wasted {} (hash fail {}, redundant {})  active {}  seeding {}",
+                    "  wasted {} (hash fail {}, redundant {})  active {}  seeding {} (unbroken {})",
                     human_bytes(counts.wasted_bytes),
                     human_bytes(counts.hash_failed_bytes),
                     human_bytes(counts.redundant_bytes),
                     human_age(counts.active_secs),
                     human_age(counts.seeding_secs),
+                    human_age(counts.consecutive_seeding_secs),
                 ))
             );
         }
@@ -930,6 +938,7 @@ pub struct TorrentFigures {
     pub redundant_bytes: u64,
     pub active_secs: u64,
     pub seeding_secs: u64,
+    pub consecutive_seeding_secs: u64,
     pub download_bps: u64,
     pub upload_bps: u64,
     pub ratio_milli: u64,
@@ -1040,6 +1049,7 @@ impl TorrentFigures {
             redundant_bytes: torrent.redundant_bytes,
             active_secs: torrent.active_seconds,
             seeding_secs: torrent.seeding_seconds,
+            consecutive_seeding_secs: torrent.consecutive_seeding_seconds,
             download_bps: torrent.download_bps,
             upload_bps: torrent.upload_bps,
             ratio_milli: milli(torrent.ratio),

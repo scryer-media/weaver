@@ -1171,6 +1171,36 @@ impl From<SeedingActionGql> for weaver_server_core::settings::SeedingAction {
     }
 }
 
+/// Which seconds a seed-time goal counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Enum)]
+#[graphql(name = "SeedTimeCounting")]
+pub enum SeedTimeCountingGql {
+    /// Every second the torrent has seeded.
+    #[default]
+    Cumulative,
+    /// The seconds since it last stopped seeding.
+    Consecutive,
+}
+
+impl From<weaver_server_core::settings::SeedTimeCounting> for SeedTimeCountingGql {
+    fn from(value: weaver_server_core::settings::SeedTimeCounting) -> Self {
+        use weaver_server_core::settings::SeedTimeCounting;
+        match value {
+            SeedTimeCounting::Cumulative => Self::Cumulative,
+            SeedTimeCounting::Consecutive => Self::Consecutive,
+        }
+    }
+}
+
+impl From<SeedTimeCountingGql> for weaver_server_core::settings::SeedTimeCounting {
+    fn from(value: SeedTimeCountingGql) -> Self {
+        match value {
+            SeedTimeCountingGql::Cumulative => Self::Cumulative,
+            SeedTimeCountingGql::Consecutive => Self::Consecutive,
+        }
+    }
+}
+
 /// How a level holds one setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
 #[graphql(name = "LeafState")]
@@ -1190,6 +1220,7 @@ pub enum LeafStateGql {
 #[graphql(concrete(name = "BpsLeaf", params(u64)))]
 #[graphql(concrete(name = "GoalModeLeaf", params(SeedingGoalModeGql)))]
 #[graphql(concrete(name = "SeedingActionLeaf", params(SeedingActionGql)))]
+#[graphql(concrete(name = "SeedTimeCountingLeaf", params(SeedTimeCountingGql)))]
 pub struct LeafGql<T: OutputType> {
     pub state: LeafStateGql,
     /// The value while `state` is `SET`.
@@ -1222,6 +1253,7 @@ impl<T: OutputType> LeafGql<T> {
 #[graphql(concrete(name = "BpsLeafInput", params(u64)))]
 #[graphql(concrete(name = "GoalModeLeafInput", params(SeedingGoalModeGql)))]
 #[graphql(concrete(name = "SeedingActionLeafInput", params(SeedingActionGql)))]
+#[graphql(concrete(name = "SeedTimeCountingLeafInput", params(SeedTimeCountingGql)))]
 pub struct LeafInput<T: InputType> {
     pub state: LeafStateGql,
     pub value: Option<T>,
@@ -1279,6 +1311,7 @@ pub struct SeedingPolicySettings {
     pub inactive_goal_minutes: LeafGql<u32>,
     pub mode: LeafGql<SeedingGoalModeGql>,
     pub action: LeafGql<SeedingActionGql>,
+    pub seed_time_counting: LeafGql<SeedTimeCountingGql>,
 }
 
 impl From<weaver_server_core::settings::SeedingPolicy> for SeedingPolicySettings {
@@ -1289,6 +1322,7 @@ impl From<weaver_server_core::settings::SeedingPolicy> for SeedingPolicySettings
             inactive_goal_minutes: LeafGql::of(value.inactive_goal_minutes),
             mode: LeafGql::of(value.mode),
             action: LeafGql::of(value.action),
+            seed_time_counting: LeafGql::of(value.seed_time_counting),
         }
     }
 }
@@ -1301,6 +1335,7 @@ pub struct SeedingPolicyInput {
     pub inactive_goal_minutes: Option<LeafInput<u32>>,
     pub mode: Option<LeafInput<SeedingGoalModeGql>>,
     pub action: Option<LeafInput<SeedingActionGql>>,
+    pub seed_time_counting: Option<LeafInput<SeedTimeCountingGql>>,
 }
 
 impl SeedingPolicyInput {
@@ -1311,6 +1346,7 @@ impl SeedingPolicyInput {
             inactive_goal_minutes: leaf_of(self.inactive_goal_minutes)?,
             mode: leaf_of(self.mode)?,
             action: leaf_of(self.action)?,
+            seed_time_counting: leaf_of(self.seed_time_counting)?,
         };
         policy.validate().map_err(async_graphql::Error::new)?;
         Ok(policy)

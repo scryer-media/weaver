@@ -466,6 +466,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         swarm_leechers: None,
         reannounce_seconds: None,
         active_seconds: 0,
+        seeding_seconds: 0,
+        consecutive_seeding_seconds: 0,
         download_avg_bps: 0,
         upload_avg_bps: 0,
         wasted_bytes: 0,
@@ -694,6 +696,7 @@ async fn a_private_torrent_with_an_unmet_goal_stays_unless_the_removal_confirms(
         .service
         .add(AddRequest {
             policy_override: Some(SeedingPolicy {
+                seed_time_counting: Default::default(),
                 ratio_goal: Leaf::Set(1.0),
                 seed_time_goal_minutes: Leaf::Inherit,
                 inactive_goal_minutes: Leaf::Inherit,
@@ -2405,6 +2408,7 @@ async fn a_forced_torrent_seeds_past_its_goal() {
         .service
         .add(AddRequest {
             policy_override: Some(SeedingPolicy {
+                seed_time_counting: Default::default(),
                 ratio_goal: Leaf::Set(0.0),
                 seed_time_goal_minutes: Leaf::Inherit,
                 inactive_goal_minutes: Leaf::Inherit,
@@ -3070,6 +3074,114 @@ async fn a_pause_credits_the_time_before_it_and_nothing_after() {
     seeded.stop().await;
 }
 
+// A pause ends the current seeding run: all the seeding there has been
+// keeps the time before it, the run goes back to zero, and a resume starts
+// a new run from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pause_ends_the_seeding_run_and_keeps_the_whole() {
+    let seeded = seeded().await;
+    seeded.advance(10_000);
+    seeded.rig.service.tick().await;
+    let whole = seeded.kept().finished_duration_s;
+    assert_eq!(seeded.kept().consecutive_seeding_s, whole);
+    let view = seeded.view().await;
+    assert_eq!(
+        (view.seeding_seconds, view.consecutive_seeding_seconds),
+        (whole, whole)
+    );
+
+    // The pause takes the torrent's reading first, so the run it ends goes
+    // to zero at the first reading that finds it paused.
+    seeded.rig.service.pause(seeded.job_id).await.unwrap();
+    assert_eq!(seeded.kept().finished_duration_s, whole);
+    seeded.advance(6_000);
+    seeded.rig.service.tick().await;
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.finished_duration_s, kept.consecutive_seeding_s),
+        (whole, 0)
+    );
+    let view = seeded.view().await;
+    assert_eq!(
+        (view.seeding_seconds, view.consecutive_seeding_seconds),
+        (whole, 0)
+    );
+
+    seeded.rig.service.resume(seeded.job_id).await.unwrap();
+    seeded.rig.service.tick().await;
+    seeded.advance(4_000);
+    seeded.rig.service.tick().await;
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.finished_duration_s, kept.consecutive_seeding_s),
+        (whole + 4, 4)
+    );
+    seeded.stop().await;
+}
+
+// A route that goes down ends the current seeding run the same way, and
+// all the seeding there has been keeps what it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_going_down_ends_the_seeding_run() {
+    let seeded = seeded().await;
+    seeded.advance(10_000);
+    seeded.rig.service.tick().await;
+    let whole = seeded.kept().finished_duration_s;
+
+    seeded.rig.routes.set_down(Some("tunnel gone"));
+    seeded.rig.service.tick().await;
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.finished_duration_s, kept.consecutive_seeding_s),
+        (whole, 0)
+    );
+    seeded.advance(5_000);
+    seeded.rig.service.tick().await;
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.finished_duration_s, kept.consecutive_seeding_s),
+        (whole, 0)
+    );
+    seeded.stop().await;
+}
+
+// Time Weaver was down credits neither counter, and the restore starts the
+// seeding run again: all the seeding there has been comes back as it was,
+// the run at zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
+    let seeded = seeded().await;
+    seeded.advance(10_000);
+    seeded.rig.service.tick().await;
+    let whole = seeded.kept().finished_duration_s;
+    assert_eq!(seeded.kept().consecutive_seeding_s, whole);
+    seeded.rig.service.stop().await;
+
+    seeded.advance(600_000);
+    let again = service_on(
+        &seeded.rig.db,
+        seeded.rig.dir.path(),
+        &seeded.rig.routes,
+        job_env(),
+        Arc::clone(&seeded.clock) as Arc<dyn Clock>,
+    );
+    reopen(&again).await;
+    let view = again.torrent(seeded.job_id).await.unwrap();
+    assert_eq!(
+        (view.seeding_seconds, view.consecutive_seeding_seconds),
+        (whole, 0)
+    );
+    seeded.advance(3_000);
+    again.tick().await;
+    let kept = seeded.kept();
+    assert_eq!(
+        (kept.finished_duration_s, kept.consecutive_seeding_s),
+        (whole + 3, 3)
+    );
+    again.stop().await;
+    seeded.stop().await;
+}
+
 // A torrent that wants none of its files has every piece it wants: it seeds
 // at 100 % with nothing in hand and no peers, though its job is not
 // complete, and its seeding time runs. Wanting the file again takes it back
@@ -3225,6 +3337,31 @@ fn a_reading_carries_the_part_of_a_second_to_the_next() {
     // Stepped back 60 s: nothing for that reading, then 7 s from there.
     assert_eq!(run(&[1_000, -60_000]), (1, 0));
     assert_eq!(run(&[1_000, -60_000, 7_000]), (8, 0));
+}
+
+// All the seeding there has been keeps running across a break; the current
+// run starts again from zero at the first reading that is not seeding, and
+// the part of a second it held goes with it.
+#[test]
+fn a_break_in_seeding_keeps_the_whole_and_restarts_the_run() {
+    let run = |steps: &[(i64, bool)]| {
+        let mut counters = TorrentCounters::default();
+        let mut timed = Timed::at(EPOCH_MS);
+        let mut now = EPOCH_MS;
+        for (step, seeding) in steps {
+            now += step;
+            timed = timed.advanced(now, true, *seeding, &mut counters);
+        }
+        (counters.finished_duration_s, counters.consecutive_seeding_s)
+    };
+    assert_eq!(run(&[(10_000, true), (5_000, true)]), (15, 15));
+    assert_eq!(
+        run(&[(10_000, true), (5_000, false), (7_000, true)]),
+        (17, 7)
+    );
+    // The 900 ms the run held is dropped by the break, so the 600 ms after
+    // it make no second.
+    assert_eq!(run(&[(1_900, true), (1_000, false), (1_600, true)]), (3, 1));
 }
 
 // Starting never waits on a route. After a restart whose route has not
@@ -4799,6 +4936,7 @@ fn each_seeding_term_resolves_over_the_levels_on_its_own() {
     assert_eq!(
         seeding,
         Seeding {
+            seed_time_counting: Default::default(),
             ratio_goal: Some(2.0),
             seed_time_goal_minutes: Some(72 * 60),
             inactive_goal_minutes: None,
@@ -4818,6 +4956,7 @@ fn each_seeding_term_resolves_over_the_levels_on_its_own() {
     assert_eq!(
         seeding,
         Seeding {
+            seed_time_counting: Default::default(),
             ratio_goal: Some(2.0),
             seed_time_goal_minutes: Some(72 * 60),
             inactive_goal_minutes: None,
@@ -4828,6 +4967,7 @@ fn each_seeding_term_resolves_over_the_levels_on_its_own() {
     assert_eq!(
         levels,
         SeedingLevels {
+            seed_time_counting: Level::Global,
             ratio_goal: Level::Torrent,
             seed_time_goal_minutes: Level::Category,
             inactive_goal_minutes: Level::Global,
@@ -7242,6 +7382,7 @@ async fn the_metrics_carry_what_the_tick_read() {
         .add(AddRequest {
             category: Some("tv".into()),
             policy_override: Some(SeedingPolicy {
+                seed_time_counting: Default::default(),
                 ratio_goal: Leaf::Set(3.0),
                 seed_time_goal_minutes: Leaf::Set(10),
                 inactive_goal_minutes: Leaf::Inherit,

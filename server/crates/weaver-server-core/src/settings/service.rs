@@ -8,8 +8,9 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, Leaf, MetricsConfig, PerJobSeries, RetryOverrides, SeedingAction,
-    SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentPeerProtocol,
+    DirectUnpackOverrides, Leaf, MetricsConfig, PerJobSeries, RetryOverrides, SeedTimeCounting,
+    SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption,
+    TorrentPeerProtocol,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -300,6 +301,8 @@ impl Database {
         let action = policy.action.set().unwrap_or_default();
         self.set_setting(SEEDING_MODE, mode.as_str())?;
         self.set_setting(SEEDING_ACTION, action.as_str())?;
+        let counting = policy.seed_time_counting.set().unwrap_or_default();
+        self.set_setting(SEEDING_SEED_TIME_COUNTING, counting.as_str())?;
         Ok(())
     }
 
@@ -556,14 +559,16 @@ const SEEDING_SEED_TIME_GOAL_MINUTES: &str = "seeding.seed_time_goal_minutes";
 const SEEDING_INACTIVE_GOAL_MINUTES: &str = "seeding.inactive_goal_minutes";
 const SEEDING_MODE: &str = "seeding.mode";
 const SEEDING_ACTION: &str = "seeding.action";
+const SEEDING_SEED_TIME_COUNTING: &str = "seeding.seed_time_counting";
 // The global upload cap, beside the policy and not part of it.
 const SEEDING_UPLOAD_CAP: &str = "seeding.upload_cap";
-const SEEDING_KEYS: [&str; 5] = [
+const SEEDING_KEYS: [&str; 6] = [
     SEEDING_RATIO_GOAL,
     SEEDING_SEED_TIME_GOAL_MINUTES,
     SEEDING_INACTIVE_GOAL_MINUTES,
     SEEDING_MODE,
     SEEDING_ACTION,
+    SEEDING_SEED_TIME_COUNTING,
 ];
 
 fn parsed_setting<T: std::str::FromStr>(
@@ -601,6 +606,11 @@ fn seeding_policy_from_settings(
                 settings
                     .get(SEEDING_ACTION)
                     .and_then(|v| SeedingAction::parse(v)),
+            ),
+            seed_time_counting: Leaf::of(
+                settings
+                    .get(SEEDING_SEED_TIME_COUNTING)
+                    .and_then(|v| SeedTimeCounting::parse(v)),
             ),
         }
         .at_global(),

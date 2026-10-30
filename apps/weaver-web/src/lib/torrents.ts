@@ -44,6 +44,7 @@ export interface LeafData<T> {
 
 export type SeedingModeData = "ANY" | "ALL";
 export type SeedingActionData = "STOP" | "REMOVE" | "REMOVE_WITH_DATA";
+export type SeedTimeCountingData = "CUMULATIVE" | "CONSECUTIVE";
 
 /** Seeding terms at one level, as the daemon sends them. */
 export interface SeedingPolicyData {
@@ -52,6 +53,7 @@ export interface SeedingPolicyData {
   inactiveGoalMinutes: LeafData<number>;
   mode: LeafData<SeedingModeData>;
   action: LeafData<SeedingActionData>;
+  seedTimeCounting: LeafData<SeedTimeCountingData>;
 }
 
 /** The seeding terms a torrent is held to, and the level each comes from. */
@@ -61,6 +63,7 @@ export interface SeedingTermsData {
   inactiveGoalMinutes: number | null;
   mode: SeedingModeData;
   action: SeedingActionData;
+  seedTimeCounting: SeedTimeCountingData;
   /** Bytes per second; null is none. */
   uploadCap: number | null;
   levels: {
@@ -69,6 +72,7 @@ export interface SeedingTermsData {
     inactiveGoalMinutes: SettingLevel;
     mode: SettingLevel;
     action: SettingLevel;
+    seedTimeCounting: SettingLevel;
     uploadCap: SettingLevel;
   };
 }
@@ -170,6 +174,10 @@ export interface TorrentData extends TorrentSummaryData {
   reannounceSeconds: number | null;
   /** Seconds spent running in a session. */
   activeSeconds: number;
+  /** Seconds spent complete and seeding, in all. */
+  seedingSeconds: number;
+  /** Seconds of the current unbroken seeding run. */
+  consecutiveSeedingSeconds: number;
   downloadAvgBps: number;
   uploadAvgBps: number;
   wastedBytes: number;

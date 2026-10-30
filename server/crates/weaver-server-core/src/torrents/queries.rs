@@ -304,7 +304,8 @@ impl Database {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT uploaded_bytes, downloaded_bytes, active_duration_s,
-                        last_seen_complete_ms, finished_duration_s, last_activity_ms
+                        last_seen_complete_ms, finished_duration_s, last_activity_ms,
+                        consecutive_seeding_s
                    FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
@@ -317,6 +318,7 @@ impl Database {
                     last_seen_complete_ms: row.opt_i64("last_seen_complete_ms")?,
                     finished_duration_s: count(&row, "finished_duration_s")?,
                     last_activity_ms: row.opt_i64("last_activity_ms")?,
+                    consecutive_seeding_s: count(&row, "consecutive_seeding_s")?,
                 })
             })
             .transpose()

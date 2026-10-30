@@ -39,7 +39,8 @@ fn resume_update(
     if let Some(counters) = counters {
         sets.push(
             "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
-             last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}",
+             last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}, \
+             consecutive_seeding_s = {}",
         );
         args.extend([
             SqlArg::I64(stored(counters.uploaded_bytes)?),
@@ -48,6 +49,7 @@ fn resume_update(
             SqlArg::OptI64(counters.last_seen_complete_ms),
             SqlArg::I64(stored(counters.finished_duration_s)?),
             SqlArg::OptI64(counters.last_activity_ms),
+            SqlArg::I64(stored(counters.consecutive_seeding_s)?),
         ]);
     }
     if let Some(peers) = peers {

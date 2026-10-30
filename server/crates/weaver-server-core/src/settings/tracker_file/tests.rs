@@ -185,7 +185,7 @@ lsd = false
 encryption = "require"
 
 [recommended]
-seeding = {{ ratio_goal = 1, seed_time_goal_minutes = 4320, inactive_goal_minutes = 60, mode = "all", action = "stop" }}
+seeding = {{ ratio_goal = 1, seed_time_goal_minutes = 4320, inactive_goal_minutes = 60, mode = "all", action = "stop", seed_time_counting = "consecutive" }}
 
 [archive_passwords]
 values = ["first", " inner space ", "first", "   ", ""]
@@ -215,6 +215,7 @@ values = ["first", " inner space ", "first", "   ", ""]
             inactive_goal_minutes: Leaf::Set(60),
             mode: Leaf::Set(SeedingGoalMode::All),
             action: Leaf::Set(SeedingAction::Stop),
+            seed_time_counting: Leaf::Set(SeedTimeCounting::Consecutive),
         })
     );
     assert_eq!(
@@ -275,6 +276,14 @@ fn a_tracker_file_refuses_what_it_may_not_set() {
             "ssl.certificate_path",
         ),
         ("[recommended]\nseeding = { mode = \"most\" }", "\"most\""),
+        (
+            "[recommended]\nseeding = { seed_time_counting = \"daily\" }",
+            "\"daily\"",
+        ),
+        (
+            "[required]\nseeding = { seed_time_counting = \"consecutive\" }",
+            "required.seeding",
+        ),
     ] {
         let error = refused(with(extra).as_bytes(), None);
         assert!(error.contains(named), "{extra}: {error}");

@@ -18,8 +18,8 @@ use weaver_server_core::torrents::{
 
 use crate::networking::ResolvedBy;
 use crate::settings::types::{
-    SeedingActionGql, SeedingGoalModeGql, SeedingPolicyInput, SeedingPolicySettings,
-    SettingLevelGql,
+    SeedTimeCountingGql, SeedingActionGql, SeedingGoalModeGql, SeedingPolicyInput,
+    SeedingPolicySettings, SettingLevelGql,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -106,6 +106,7 @@ pub struct SeedingLevelsGql {
     pub inactive_goal_minutes: SettingLevelGql,
     pub mode: SettingLevelGql,
     pub action: SettingLevelGql,
+    pub seed_time_counting: SettingLevelGql,
     pub upload_cap: SettingLevelGql,
 }
 
@@ -117,6 +118,7 @@ impl From<SeedingLevels> for SeedingLevelsGql {
             inactive_goal_minutes: levels.inactive_goal_minutes.into(),
             mode: levels.mode.into(),
             action: levels.action.into(),
+            seed_time_counting: levels.seed_time_counting.into(),
             upload_cap: levels.upload_cap.into(),
         }
     }
@@ -131,6 +133,7 @@ pub struct SeedingTermsGql {
     pub inactive_goal_minutes: Option<u32>,
     pub mode: SeedingGoalModeGql,
     pub action: SeedingActionGql,
+    pub seed_time_counting: SeedTimeCountingGql,
     /// The upload cap in bytes per second; absent is none.
     pub upload_cap: Option<u64>,
     pub levels: SeedingLevelsGql,
@@ -144,6 +147,7 @@ impl SeedingTermsGql {
             inactive_goal_minutes: seeding.inactive_goal_minutes,
             mode: seeding.mode.into(),
             action: seeding.action.into(),
+            seed_time_counting: seeding.seed_time_counting.into(),
             upload_cap,
             levels: levels.into(),
         }
@@ -571,6 +575,10 @@ pub struct Torrent {
     pub reannounce_seconds: Option<u64>,
     /// Seconds spent running in a session.
     pub active_seconds: u64,
+    /// Seconds spent complete and seeding, in all.
+    pub seeding_seconds: u64,
+    /// Seconds of the current unbroken seeding run.
+    pub consecutive_seeding_seconds: u64,
     pub download_avg_bps: u64,
     pub upload_avg_bps: u64,
     /// Bytes received and thrown away this run: pieces that failed their
@@ -658,6 +666,8 @@ impl From<TorrentView> for Torrent {
             swarm_leechers: view.swarm_leechers,
             reannounce_seconds: view.reannounce_seconds,
             active_seconds: view.active_seconds,
+            seeding_seconds: view.seeding_seconds,
+            consecutive_seeding_seconds: view.consecutive_seeding_seconds,
             download_avg_bps: view.download_avg_bps,
             upload_avg_bps: view.upload_avg_bps,
             wasted_bytes: view.wasted_bytes,

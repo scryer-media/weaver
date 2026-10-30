@@ -98,6 +98,15 @@ function seedingRows(t: Translate, torrent: TorrentData): { label: string; value
     },
     { label: t("next.seeding.action"), value: t(ACTION_KEYS[terms.action]), level: terms.levels.action },
     {
+      label: t("next.seeding.seedTimeCounting"),
+      value: t(
+        terms.seedTimeCounting === "CONSECUTIVE"
+          ? "next.seeding.countingConsecutive"
+          : "next.seeding.countingCumulative",
+      ),
+      level: terms.levels.seedTimeCounting,
+    },
+    {
       label: t("next.seeding.uploadCap"),
       value: terms.uploadCap === null ? EM_DASH : formatRate(terms.uploadCap),
       level: terms.levels.uploadCap,

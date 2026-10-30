@@ -60,6 +60,8 @@ CREATE TABLE torrent_counters (
     uploaded_bytes                BIGINT NOT NULL DEFAULT 0,
     downloaded_bytes              BIGINT NOT NULL DEFAULT 0,
     finished_duration_s           BIGINT NOT NULL DEFAULT 0,
+    -- The seconds of the current unbroken seeding run.
+    consecutive_seeding_s         BIGINT NOT NULL DEFAULT 0,
     last_activity_ms              BIGINT,
     last_announce_uploaded_bytes  BIGINT NOT NULL DEFAULT 0,
     updated_at_ms                 BIGINT NOT NULL

@@ -373,6 +373,8 @@ pub struct SeedingPolicy {
     pub mode: Leaf<SeedingGoalMode>,
     #[serde(skip_serializing_if = "Leaf::is_inherit")]
     pub action: Leaf<SeedingAction>,
+    #[serde(skip_serializing_if = "Leaf::is_inherit")]
+    pub seed_time_counting: Leaf<SeedTimeCounting>,
 }
 
 impl SeedingPolicy {
@@ -395,13 +397,21 @@ impl SeedingPolicy {
             inactive_goal_minutes: self.inactive_goal_minutes.at_global(),
             mode: Leaf::Set(self.mode.set().unwrap_or_default()),
             action: Leaf::Set(self.action.set().unwrap_or_default()),
+            seed_time_counting: Leaf::Set(self.seed_time_counting.set().unwrap_or_default()),
         }
     }
 
-    /// A mode or action is set or inherited; neither is ever off.
+    /// A mode, action or seed-time counting is set or inherited; none is
+    /// ever off.
     pub fn validate(&self) -> Result<(), String> {
-        if matches!(self.mode, Leaf::Off) || matches!(self.action, Leaf::Off) {
-            return Err("a seeding mode and action are set or inherited, never off".to_owned());
+        if matches!(self.mode, Leaf::Off)
+            || matches!(self.action, Leaf::Off)
+            || matches!(self.seed_time_counting, Leaf::Off)
+        {
+            return Err(
+                "a seeding mode, action and seed-time counting are set or inherited, never off"
+                    .to_owned(),
+            );
         }
         if let Leaf::Set(ratio) = self.ratio_goal
             && (!ratio.is_finite() || ratio < 0.0)
@@ -421,6 +431,45 @@ pub struct Seeding {
     pub inactive_goal_minutes: Option<u32>,
     pub mode: SeedingGoalMode,
     pub action: SeedingAction,
+    pub seed_time_counting: SeedTimeCounting,
+}
+
+impl Seeding {
+    /// The seconds the seed-time goal is measured against: every second
+    /// seeded, or those of the current unbroken run.
+    pub fn seeded_seconds(&self, counters: &crate::torrents::TorrentCounters) -> u64 {
+        match self.seed_time_counting {
+            SeedTimeCounting::Cumulative => counters.finished_duration_s,
+            SeedTimeCounting::Consecutive => counters.consecutive_seeding_s,
+        }
+    }
+}
+
+// Which seconds the seed-time goal counts: every second the torrent has
+// seeded, or only those since it last stopped seeding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedTimeCounting {
+    #[default]
+    Cumulative,
+    Consecutive,
+}
+
+impl SeedTimeCounting {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cumulative => "cumulative",
+            Self::Consecutive => "consecutive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cumulative" => Some(Self::Cumulative),
+            "consecutive" => Some(Self::Consecutive),
+            _ => None,
+        }
+    }
 }
 
 // Whether any one goal ends seeding, or only all of them together.

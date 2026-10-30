@@ -2381,6 +2381,7 @@ fn share_policy(
         inactive_goal_minutes: inactive.map(minutes),
         mode,
         action,
+        seed_time_counting: current.seed_time_counting,
     })))
 }
 

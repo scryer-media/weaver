@@ -429,6 +429,8 @@ fn view(state: TorrentState) -> TorrentView {
         swarm_leechers: None,
         reannounce_seconds: None,
         active_seconds: 0,
+        seeding_seconds: 0,
+        consecutive_seeding_seconds: 0,
         download_avg_bps: 0,
         upload_avg_bps: 0,
         wasted_bytes: 0,

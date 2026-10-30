@@ -56,8 +56,8 @@ use crate::proxies::{
 };
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{
-    Client, Config, Leaf, Level, Levels, Seeding, SeedingAction, SeedingGoalMode, SeedingPolicy,
-    TorrentConfig, TorrentEncryption,
+    Client, Config, Leaf, Level, Levels, SeedTimeCounting, Seeding, SeedingAction, SeedingGoalMode,
+    SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
 use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
@@ -165,6 +165,7 @@ pub const SEED_TIME_GOAL: Field<u32> = seeding_field!(seed_time_goal_minutes);
 pub const INACTIVE_GOAL: Field<u32> = seeding_field!(inactive_goal_minutes);
 pub const SEEDING_MODE: Field<SeedingGoalMode> = seeding_field!(mode);
 pub const SEEDING_ACTION: Field<SeedingAction> = seeding_field!(action);
+pub const SEED_TIME_COUNTING: Field<SeedTimeCounting> = seeding_field!(seed_time_counting);
 
 pub const UPLOAD_CAP: Field<u64> = Field {
     torrent: None,
@@ -293,6 +294,7 @@ impl TorrentSettings {
         let inactive = self.of_torrent(&INACTIVE_GOAL, record, rule);
         let mode = self.of_torrent(&SEEDING_MODE, record, rule);
         let action = self.of_torrent(&SEEDING_ACTION, record, rule);
+        let counting = self.of_torrent(&SEED_TIME_COUNTING, record, rule);
         let cap = self.of_torrent(&UPLOAD_CAP, record, rule);
         (
             Seeding {
@@ -301,6 +303,7 @@ impl TorrentSettings {
                 inactive_goal_minutes: inactive.resolve(),
                 mode: mode.resolve().unwrap_or_default(),
                 action: action.resolve().unwrap_or_default(),
+                seed_time_counting: counting.resolve().unwrap_or_default(),
             },
             SeedingLevels {
                 ratio_goal: ratio.level(),
@@ -308,6 +311,7 @@ impl TorrentSettings {
                 inactive_goal_minutes: inactive.level(),
                 mode: mode.level(),
                 action: action.level(),
+                seed_time_counting: counting.level(),
                 upload_cap: cap.level(),
             },
         )
@@ -341,6 +345,7 @@ pub struct SeedingLevels {
     pub inactive_goal_minutes: Level,
     pub mode: Level,
     pub action: Level,
+    pub seed_time_counting: Level,
     pub upload_cap: Level,
 }
 
@@ -352,6 +357,7 @@ impl Default for SeedingLevels {
             inactive_goal_minutes: Level::Global,
             mode: Level::Global,
             action: Level::Global,
+            seed_time_counting: Level::Global,
             upload_cap: Level::Global,
         }
     }
@@ -769,6 +775,10 @@ pub struct TorrentView {
     pub reannounce_seconds: Option<u64>,
     /// Seconds spent running in a session.
     pub active_seconds: u64,
+    /// Seconds spent complete and seeding, in all.
+    pub seeding_seconds: u64,
+    /// Seconds of the current unbroken seeding run.
+    pub consecutive_seeding_seconds: u64,
     /// The bytes moved over the time active.
     pub download_avg_bps: u64,
     pub upload_avg_bps: u64,
@@ -1306,20 +1316,23 @@ impl Live {
     }
 
     // A torrent whose ledger and peers the database holds as given, as of
-    // `now`.
+    // `now`. Its seeding run starts again from zero: the time Weaver was
+    // down is no seeding.
     fn new(
         record: TorrentRecord,
-        counters: TorrentCounters,
+        mut counters: TorrentCounters,
         resume: ResumePeers,
         now: i64,
     ) -> Self {
+        let written = counters;
+        counters.consecutive_seeding_s = 0;
         Self {
             record,
             identity: TorrentIdentity::fresh(),
             rule_id: None,
             private: false,
             ledger: Ledger {
-                written: Some((counters, resume.clone())),
+                written: Some((written, resume.clone())),
                 peers_at_ms: now,
                 lost: Arc::default(),
             },
@@ -1639,6 +1652,7 @@ struct Unviewed {
     hash_failed_bytes: u64,
     redundant_bytes: u64,
     seeding_seconds: u64,
+    consecutive_seeding_seconds: u64,
     peers_connecting: u32,
     leg: Option<(String, usize)>,
     fetch: Option<weaver_torrent::FetchPhase>,
@@ -1663,6 +1677,7 @@ impl Unviewed {
             redundant_bytes: self.redundant_bytes,
             active_seconds: view.active_seconds,
             seeding_seconds: self.seeding_seconds,
+            consecutive_seeding_seconds: self.consecutive_seeding_seconds,
             download_bps: view.download_bps,
             upload_bps: view.upload_bps,
             ratio: view.ratio,
@@ -1692,6 +1707,7 @@ struct Timed {
     at_ms: i64,
     active_ms: u64,
     finished_ms: u64,
+    consecutive_ms: u64,
 }
 
 impl Timed {
@@ -1700,12 +1716,15 @@ impl Timed {
             at_ms: now,
             active_ms: 0,
             finished_ms: 0,
+            consecutive_ms: 0,
         }
     }
 
     // Run on to `now`: the time since runs into the active duration while
-    // `active`, and into the finished one while `seeding`. A clock stepped
-    // back credits nothing for that reading, and the next runs from `now`.
+    // `active`, and into the finished one and the current seeding run while
+    // `seeding`; a reading that is not `seeding` ends the run, and it starts
+    // again from zero. A clock stepped back credits nothing for that
+    // reading, and the next runs from `now`.
     fn advanced(
         self,
         now: i64,
@@ -1726,6 +1745,16 @@ impl Timed {
             at_ms: now,
             active_ms: run(self.active_ms, active, &mut counters.active_duration_s),
             finished_ms: run(self.finished_ms, seeding, &mut counters.finished_duration_s),
+            consecutive_ms: if seeding {
+                run(
+                    self.consecutive_ms,
+                    true,
+                    &mut counters.consecutive_seeding_s,
+                )
+            } else {
+                counters.consecutive_seeding_s = 0;
+                0
+            },
         }
     }
 }
@@ -5388,6 +5417,8 @@ impl TorrentService {
             swarm_leechers: swarm.leechers,
             reannounce_seconds: swarm.reannounce_seconds,
             active_seconds,
+            seeding_seconds: counters.finished_duration_s,
+            consecutive_seeding_seconds: counters.consecutive_seeding_s,
             download_avg_bps: status::average_bps(counters.downloaded_bytes, active_seconds),
             upload_avg_bps: status::average_bps(counters.uploaded_bytes, active_seconds),
             wasted_bytes: wasted(&reading.seen),
@@ -5573,6 +5604,7 @@ impl TorrentService {
             hash_failed_bytes: reading.seen.failed_bytes,
             redundant_bytes: reading.seen.redundant_bytes,
             seeding_seconds: reading.counters.finished_duration_s,
+            consecutive_seeding_seconds: reading.counters.consecutive_seeding_s,
             peers_connecting: reading.peers.2,
             leg: torrent
                 .attached
