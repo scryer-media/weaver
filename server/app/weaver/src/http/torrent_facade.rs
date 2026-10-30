@@ -2170,6 +2170,8 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .unwrap_or(false);
     let sequential = params.flag("sequentialDownload").unwrap_or(false);
     let first_last = params.flag("firstLastPiecePrio").unwrap_or(false);
+    // Off unless asked, as qBittorrent's `isAddTorrentToQueueTop` is.
+    let to_top = params.flag_value("addToTopOfQueue").unwrap_or(false);
     let placement = placement(&params);
     let mut ids = Vec::new();
     let mut failed = 0usize;
@@ -2205,6 +2207,13 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
                     && let Err(error) = torrents.set_first_last_piece_first(job_id, true).await
                 {
                     tracing::warn!(%error, "added torrent did not take first and last pieces first");
+                }
+                // Once it is in the queue, as qBittorrent calls
+                // `queue_position_top` once the torrent is added.
+                if to_top
+                    && let Err(error) = torrents.reorder(&[job_id], QueueMoveTarget::Top).await
+                {
+                    tracing::warn!(%error, "added torrent did not take the top of the queue");
                 }
                 if let Some(view) = torrents.torrent(job_id).await {
                     ids.push(view.infohash.to_ascii_lowercase());
@@ -2620,6 +2629,8 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "temp_path": "",
         "auto_tmm_enabled": false,
         "queueing_enabled": true,
+        // An add without `addToTopOfQueue` goes to the bottom.
+        "add_to_top_of_queue": false,
         "max_active_downloads": torrent.max_active_downloads,
         "max_active_uploads": -1,
         "max_active_torrents": -1,

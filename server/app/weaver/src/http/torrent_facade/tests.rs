@@ -1463,6 +1463,47 @@ async fn the_priority_actions_move_a_torrent_in_the_queue() {
     assert_eq!(preferences["queueing_enabled"], true);
 }
 
+// An add with `addToTopOfQueue` takes the top of the queue; one without it,
+// or with a value that is not a boolean, goes to the bottom, as qBittorrent's
+// `isAddTorrentToQueueTop` default leaves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_to_the_top_of_the_queue_takes_the_first_place() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    rig.add_file(
+        &metainfo("two.mkv", 3000, false),
+        &[("addToTopOfQueue", "true")],
+    )
+    .await;
+    rig.add_file(
+        &metainfo("three.mkv", 3000, false),
+        &[("addToTopOfQueue", "yes")],
+    )
+    .await;
+    rig.add_file(
+        &metainfo("four.mkv", 3000, false),
+        &[("addToTopOfQueue", "false")],
+    )
+    .await;
+    let rows = rig.torrents().await;
+    let place = |name: &str| {
+        rows.iter().find(|row| row["name"] == name).unwrap()["priority"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(
+        [
+            place("two.mkv"),
+            place("one.mkv"),
+            place("three.mkv"),
+            place("four.mkv")
+        ],
+        [1, 2, 3, 4]
+    );
+    let preferences = rig.get("/api/v2/app/preferences").await.json();
+    assert_eq!(preferences["add_to_top_of_queue"], false);
+}
+
 // A relative `savepath` is under the default save path, as qBittorrent
 // `SessionImpl::initLoadTorrentParams` takes one, and reads back absolute.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
