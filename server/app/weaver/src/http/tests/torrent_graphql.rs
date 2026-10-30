@@ -18,7 +18,7 @@ use weaver_server_core::runtime::system_profile::{
     SystemProfile,
 };
 use weaver_server_core::security::RuntimeSecurityConfig;
-use weaver_server_core::settings::TorrentConfig;
+use weaver_server_core::settings::{SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig};
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
@@ -225,23 +225,25 @@ async fn graphql(app: &Router, query: &str) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = Database::open_in_memory().unwrap();
+// A torrent client under the global seeding policy `seeding`, started.
+async fn started(
+    dir: &std::path::Path,
+    db: &Database,
+    seeding: Option<SeedingPolicy>,
+) -> TorrentService {
     let torrents = TorrentService::new(
         db.clone(),
         Sessions::new(
             Arc::new(Offline),
             SessionEnv {
-                root: dir.path().join("sessions"),
+                root: dir.join("sessions"),
             },
             db.clone(),
         ),
         TorrentSettings {
-            complete_dir: dir.path().join("complete"),
+            complete_dir: dir.join("complete"),
             categories: Vec::new(),
-            seeding: None,
+            seeding,
             torrent: TorrentConfig {
                 enabled: true,
                 ..TorrentConfig::default()
@@ -251,6 +253,14 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
         Arc::new(SystemClock),
     );
     torrents.start().await.unwrap();
+    torrents
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let torrents = started(dir.path(), &db, None).await;
     let app = endpoint(dir.path(), db, torrents.clone()).await;
 
     let submitted = graphql(
@@ -271,5 +281,73 @@ async fn a_server_running_torrents_takes_a_metainfo_and_lists_it() {
     assert_eq!(listed.get("errors"), None, "{listed}");
     assert_eq!(listed["data"]["torrents"][0]["id"], id);
     assert_eq!(listed["data"]["torrents"][0]["name"], "one.mkv");
+    torrents.stop().await;
+}
+
+// Seeding terms that set nothing, on submit or after, leave the torrent no
+// terms of its own: it seeds to the global goal, mode and action, never with
+// no goal; terms with a goal are its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_seeding_terms_inherit_the_global_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let global = SeedingPolicy {
+        ratio_goal: Some(1.0),
+        mode: SeedingGoalMode::All,
+        action: SeedingAction::Remove,
+        ..SeedingPolicy::default()
+    };
+    let torrents = started(dir.path(), &db, Some(global)).await;
+    let app = endpoint(dir.path(), db, torrents.clone()).await;
+    let seeding = "seedingSource seedingOverride { ratioGoal } \
+                   seedingPolicy { ratioGoal mode action }";
+    let inherits = |torrent: &serde_json::Value| {
+        assert_eq!(torrent["seedingSource"], "GLOBAL", "{torrent}");
+        assert_eq!(torrent["seedingOverride"], serde_json::Value::Null);
+        assert_eq!(
+            torrent["seedingPolicy"],
+            serde_json::json!({ "ratioGoal": 1.0, "mode": "ALL", "action": "REMOVE" })
+        );
+    };
+
+    let submitted = graphql(
+        &app,
+        &format!(
+            r#"mutation {{ submitTorrent(input: {{ metainfoBase64: "{}", seeding: {{}} }}) {{ id {seeding} }} }}"#,
+            metainfo("one.mkv", 3000)
+        ),
+    )
+    .await;
+    assert_eq!(submitted.get("errors"), None, "{submitted}");
+    let torrent = &submitted["data"]["submitTorrent"];
+    inherits(torrent);
+    let id = torrent["id"].as_u64().unwrap();
+    let read = |app: Router| async move {
+        let read = graphql(&app, &format!("{{ torrent(id: {id}) {{ {seeding} }} }}")).await;
+        assert_eq!(read.get("errors"), None, "{read}");
+        read["data"]["torrent"].clone()
+    };
+
+    let set = |terms: &'static str| {
+        let app = app.clone();
+        async move {
+            let set = graphql(
+                &app,
+                &format!("mutation {{ setTorrentSeeding(id: {id}, seeding: {terms}) }}"),
+            )
+            .await;
+            assert_eq!(set.get("errors"), None, "{set}");
+        }
+    };
+    set("{ ratioGoal: 3 }").await;
+    let own = read(app.clone()).await;
+    assert_eq!(own["seedingSource"], "TORRENT", "{own}");
+    assert_eq!(own["seedingOverride"]["ratioGoal"], 3.0);
+
+    set("{}").await;
+    inherits(&read(app.clone()).await);
+    set("{ ratioGoal: 3 }").await;
+    set("null").await;
+    inherits(&read(app.clone()).await);
     torrents.stop().await;
 }

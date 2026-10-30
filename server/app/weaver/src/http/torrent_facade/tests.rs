@@ -409,6 +409,8 @@ fn view(state: TorrentState) -> TorrentView {
         have_bytes: 5,
         uploaded_bytes: 0,
         downloaded_bytes: 5,
+        run_uploaded_bytes: 0,
+        run_downloaded_bytes: 5,
         ratio: 0.0,
         download_bps: 0,
         upload_bps: 0,
@@ -668,6 +670,29 @@ fn content_path_is_the_output_and_save_path_holds_it() {
     assert_eq!(info["eta"], ETA_UNKNOWN);
     assert_eq!(info["added_on"], 1_700_000_000);
     assert_eq!(info["completion_on"], -1);
+}
+
+// libtorrent's `all_time_*` and `total_payload_*`: the totals are the
+// torrent's whole life, the session counters this run's alone.
+#[test]
+fn session_counters_are_this_runs_and_the_totals_all_time() {
+    let resumed = TorrentView {
+        uploaded_bytes: 9000,
+        downloaded_bytes: 7000,
+        run_uploaded_bytes: 300,
+        run_downloaded_bytes: 0,
+        ..view(TorrentState::Seeding)
+    };
+    let info = info(&resumed, CallerScope::Admin);
+    assert_eq!(
+        [
+            &info["uploaded"],
+            &info["downloaded"],
+            &info["uploaded_session"],
+            &info["downloaded_session"]
+        ],
+        [&json!(9000), &json!(7000), &json!(300), &json!(0)]
+    );
 }
 
 #[test]
@@ -930,7 +955,7 @@ async fn login_issues_a_cookie_that_logout_ends() {
         (StatusCode::OK, Api::LATEST.version().as_str())
     );
     let app = rig.send(with_cookie("/api/v2/app/version")).await;
-    assert_eq!(app.body, format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert_eq!(app.body, "v5.3.0");
 
     rig.send(with_cookie("/api/v2/auth/logout")).await;
     let after = rig.send(with_cookie("/api/v2/app/webapiVersion")).await;
@@ -2126,6 +2151,51 @@ async fn share_limits_are_set_on_add_and_after() {
         )
         .await;
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+}
+
+// Share limits cleared to the client's "use global" leave the torrent no
+// terms of its own: it seeds to the global goal, mode and action, never
+// with no goal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleared_share_limits_inherit_the_global_policy() {
+    use weaver_server_core::settings::{SeedingAction, SeedingGoalMode};
+
+    let rig = rig().await;
+    let global = SeedingPolicy {
+        ratio_goal: Some(1.0),
+        mode: SeedingGoalMode::All,
+        action: SeedingAction::Remove,
+        ..SeedingPolicy::default()
+    };
+    rig.config.write().await.seeding = Some(global);
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    torrents
+        .set_settings(TorrentSettings::of(&*rig.config.read().await))
+        .await;
+    rig.add_file(
+        &metainfo("one.mkv", 3000, false),
+        &[("ratioLimit", "2"), ("shareLimitAction", "Stop")],
+    )
+    .await;
+    let view = torrents.torrents(None).await.remove(0);
+    assert_eq!(view.seeding_source, SeedingSource::Torrent);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+
+    let cleared = rig
+        .post(
+            "/api/v2/torrents/setShareLimits",
+            &format!(
+                "hashes={hash}&ratioLimit=-2&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2\
+                 &shareLimitsMode=Default&shareLimitAction=Default"
+            ),
+        )
+        .await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    let view = torrents.torrents(None).await.remove(0);
+    assert_eq!(view.seeding_override, None);
+    assert_eq!(view.seeding_source, SeedingSource::Global);
+    assert_eq!(view.seeding_policy, global);
+    assert_eq!(rig.torrents().await[0]["ratio_limit"], -2);
 }
 
 // Each limit is set alone and read back as the client reads it: 0 and any

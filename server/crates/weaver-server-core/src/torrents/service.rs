@@ -527,6 +527,12 @@ fn state_error(error: StateError) -> String {
     error.to_string()
 }
 
+/// A torrent's own seeding terms; terms that set nothing are no terms, and
+/// the torrent inherits its tracker rule's, category's and the global ones.
+fn own_policy(policy: Option<SeedingPolicy>) -> Option<SeedingPolicy> {
+    policy.filter(|policy| *policy != SeedingPolicy::default())
+}
+
 /// A torrent as consumers read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TorrentView {
@@ -556,8 +562,16 @@ pub struct TorrentView {
     pub progress: f64,
     pub total_bytes: u64,
     pub have_bytes: u64,
+    /// Payload sent and received over every run, kept through pauses and
+    /// restarts (libtorrent `torrent_status::all_time_upload` and
+    /// `all_time_download`).
     pub uploaded_bytes: u64,
     pub downloaded_bytes: u64,
+    /// Payload sent and received in the current run alone, from nothing
+    /// at each start (libtorrent `torrent_status::total_payload_upload` and
+    /// `total_payload_download`); zero while it does not run.
+    pub run_uploaded_bytes: u64,
+    pub run_downloaded_bytes: u64,
     pub ratio: f64,
     pub download_bps: u64,
     pub upload_bps: u64,
@@ -1333,6 +1347,7 @@ impl Live {
                 seen: self.seen,
                 timed: self.timed,
                 moved: (0, 0),
+                run: (0, 0),
                 speeds: (0, 0),
                 peers: (0, 0, 0),
             };
@@ -1381,6 +1396,9 @@ impl Live {
             seen,
             timed: self.timed,
             moved,
+            run: live.map_or((0, 0), |live| {
+                (live.snapshot.fetched_bytes, live.snapshot.uploaded_bytes)
+            }),
             speeds: live.map_or((0, 0), |live| {
                 (live.download_speed.as_bytes(), live.upload_speed.as_bytes())
             }),
@@ -1425,6 +1443,10 @@ struct Reading {
     timed: Timed,
     // The bytes received and sent on the wire since the last kept reading.
     moved: (u64, u64),
+    // The payload received and sent in this run of the session, from
+    // nothing at its start (libtorrent `torrent_status::total_payload_download`
+    // and `total_payload_upload`, which a pause resets).
+    run: (u64, u64),
     speeds: (u64, u64),
     peers: (u32, u32, u32),
 }
@@ -2982,7 +3004,7 @@ impl TorrentService {
             forced: request.forced,
             completed_at_ms: None,
             storage_dir: None,
-            policy_override: request.policy_override.clone(),
+            policy_override: own_policy(request.policy_override),
             unpack: request.unpack,
             metadata: request.metadata.clone(),
             upload_limit: request.upload_limit,
@@ -4272,6 +4294,7 @@ impl TorrentService {
         job_id: JobId,
         policy: Option<SeedingPolicy>,
     ) -> Result<(), ActionError> {
+        let policy = own_policy(policy);
         self.with_torrent(job_id, |torrent| {
             self.inner
                 .db
@@ -5076,6 +5099,8 @@ impl TorrentService {
             have_bytes: have,
             uploaded_bytes: counters.uploaded_bytes,
             downloaded_bytes: counters.downloaded_bytes,
+            run_uploaded_bytes: reading.run.1,
+            run_downloaded_bytes: reading.run.0,
             ratio: status::ratio(counters, total),
             download_bps: reading.speeds.0,
             upload_bps: reading.speeds.1,

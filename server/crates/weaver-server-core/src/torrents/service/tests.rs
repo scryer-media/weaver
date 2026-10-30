@@ -448,6 +448,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         have_bytes: 1000,
         uploaded_bytes: 0,
         downloaded_bytes: 1000,
+        run_uploaded_bytes: 0,
+        run_downloaded_bytes: 1000,
         ratio: 0.0,
         download_bps: 500,
         upload_bps: 0,
@@ -5302,6 +5304,90 @@ async fn the_tighter_of_a_torrents_limit_and_its_policys_upload_cap_holds() {
         .await
         .unwrap();
     assert_eq!(handle.ratelimits().upload_bps, bps(1_000_000));
+    rig.service.stop().await;
+}
+
+// Seeding terms that set nothing are no terms: a torrent given them, on add
+// or after, inherits its tracker rule's goal, mode and action instead of
+// seeding with no goal under the default ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_seeding_terms_inherit_the_chain() {
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let ruled = SeedingPolicy {
+        ratio_goal: Some(2.0),
+        mode: SeedingGoalMode::All,
+        action: SeedingAction::Remove,
+        ..SeedingPolicy::default()
+    };
+    rig.db
+        .insert_tracker_rule(
+            &TrackerRule {
+                id: 0,
+                host_pattern: "*.test".into(),
+                seeding: Some(ruled),
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: false,
+                discovery: None,
+                encryption: None,
+                upload_limit: None,
+                forced: false,
+                ssl: None,
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            policy_override: Some(SeedingPolicy::default()),
+            ..request(AddSource::Metainfo(announcing(
+                &plain("ruled", 1),
+                "http://tracker.test/announce",
+            )))
+        })
+        .await
+        .unwrap();
+    let inherits = |view: TorrentView| {
+        assert_eq!(view.seeding_override, None);
+        assert_eq!(
+            view.seeding_source,
+            SeedingSource::TrackerRule("*.test".into())
+        );
+        assert_eq!(view.seeding_policy, ruled);
+    };
+    inherits(rig.service.torrent(job_id).await.unwrap());
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().policy_override,
+        None
+    );
+
+    let own = SeedingPolicy {
+        seed_time_goal_minutes: Some(60),
+        ..SeedingPolicy::default()
+    };
+    rig.service
+        .set_policy_override(job_id, Some(own))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().seeding_source,
+        SeedingSource::Torrent
+    );
+    rig.service
+        .set_policy_override(job_id, Some(SeedingPolicy::default()))
+        .await
+        .unwrap();
+    inherits(rig.service.torrent(job_id).await.unwrap());
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().policy_override,
+        None
+    );
     rig.service.stop().await;
 }
 
