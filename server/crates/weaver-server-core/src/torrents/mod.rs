@@ -16,8 +16,9 @@ pub mod status;
 pub(crate) mod storage;
 
 pub use model::{
-    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentFile, TorrentInsert, TorrentIntent,
-    TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry, TrackerStatus,
+    ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentFile, TorrentInsert,
+    TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
+    TrackerStatus,
 };
 pub use weaver_torrent::analysis;
 pub use weaver_torrent::tracker::redacted_tracker_url;

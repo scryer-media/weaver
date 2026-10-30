@@ -4546,7 +4546,12 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     let kept = || {
         let mut kept: Vec<(i64, JobId)> = ids
             .iter()
-            .map(|id| (rig.db.get_torrent(*id).unwrap().unwrap().queue_position, *id))
+            .map(|id| {
+                (
+                    rig.db.get_torrent(*id).unwrap().unwrap().queue_position,
+                    *id,
+                )
+            })
             .collect();
         kept.sort();
         kept.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
@@ -4555,7 +4560,10 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     assert_eq!(queued().await, [false, true, true, true, false]);
     assert_eq!(places().await, [Some(1), Some(2), Some(3), Some(4), None]);
 
-    rig.service.reorder(&[c], QueueMoveTarget::Top).await.unwrap();
+    rig.service
+        .reorder(&[c], QueueMoveTarget::Top)
+        .await
+        .unwrap();
     assert_eq!(kept(), [c, a, b, d, e]);
     assert_eq!(queued().await, [true, true, false, true, false]);
     assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
@@ -4585,7 +4593,10 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     assert_eq!(kept(), [c, a, b, d, e]);
 
     // A seed has no place to move to.
-    rig.service.reorder(&[e], QueueMoveTarget::Top).await.unwrap();
+    rig.service
+        .reorder(&[e], QueueMoveTarget::Top)
+        .await
+        .unwrap();
     assert_eq!(kept(), [c, a, b, d, e]);
     assert!(matches!(
         rig.service
@@ -7224,7 +7235,11 @@ fn placed_torrent() -> (Vec<u8>, Vec<u8>) {
 
 // The torrent added with `placement`, its view once it seeds, as the queue
 // publishes it.
-async fn seeding_placed(rig: &Rig, metainfo: Vec<u8>, placement: Placement) -> (JobId, TorrentView) {
+async fn seeding_placed(
+    rig: &Rig,
+    metainfo: Vec<u8>,
+    placement: Placement,
+) -> (JobId, TorrentView) {
     let handle = queue();
     let mut changes = handle.state().subscribe_job_changes();
     rig.service.publish_to(handle);
@@ -7391,7 +7406,10 @@ async fn placed_files_move_to_a_new_location_and_the_record_follows() {
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(view.files_dir.as_deref(), Some(moved_text.as_str()));
     assert_eq!(view.paths().0, moved_text);
-    assert_eq!((view.state, view.have_bytes), (TorrentState::Seeding, data.len() as u64));
+    assert_eq!(
+        (view.state, view.have_bytes),
+        (TorrentState::Seeding, data.len() as u64)
+    );
     rig.service.stop().await;
 }
 
@@ -7484,7 +7502,10 @@ async fn a_complete_torrent_without_its_folder_moves_from_its_download_path() {
     assert_eq!(stored.files_dir.as_deref(), Some(save_text.as_str()));
     assert_eq!(stored.save_path.as_deref(), Some(save_text.as_str()));
     assert_eq!(stored.move_to, None);
-    assert_eq!((view.state, view.have_bytes), (TorrentState::Seeding, data.len() as u64));
+    assert_eq!(
+        (view.state, view.have_bytes),
+        (TorrentState::Seeding, data.len() as u64)
+    );
     rig.service.stop().await;
 }
 
@@ -7511,7 +7532,10 @@ fn relative_paths_resolve_under_the_default_save_path() {
     let some = |path: &str| Some(path.to_owned());
     assert_eq!(
         placed(Some("shows"), Some("incoming")),
-        (some("/complete/tv/shows"), some("/complete/tv/shows/incoming"))
+        (
+            some("/complete/tv/shows"),
+            some("/complete/tv/shows/incoming")
+        )
     );
     assert_eq!(
         placed(None, Some("incoming")),
@@ -7643,7 +7667,10 @@ async fn a_seed_mode_torrent_keeps_its_checked_pieces_through_a_restart() {
     let verified = handle.seed_verified().unwrap();
     assert_eq!(verified.iter_ones().collect::<Vec<_>>(), [0, 2]);
     restarted.tick().await;
-    assert_eq!(rig.db.torrent_seed_verified(job_id).unwrap(), Some(passed.to_vec()));
+    assert_eq!(
+        rig.db.torrent_seed_verified(job_id).unwrap(),
+        Some(passed.to_vec())
+    );
 
     rig.db.clear_torrent_seed_mode(job_id).unwrap();
     assert_eq!(rig.db.torrent_seed_verified(job_id).unwrap(), None);

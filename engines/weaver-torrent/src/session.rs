@@ -87,7 +87,9 @@ use crate::{
         live::peers::PeerList,
         seed_mode::SeedMode,
     },
-    type_aliases::{BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream},
+    type_aliases::{
+        BF, BoxAsyncReadVectored, BoxAsyncWrite, PeerSource, PeerSourceFlag, PeerStream,
+    },
 };
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;

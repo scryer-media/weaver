@@ -21,8 +21,11 @@ async fn seeding(
     t: &TestTorrent,
     dir: &TempDir,
     storage: &MemoryStorageFactory,
-) -> anyhow::Result<(std::sync::Arc<Session>, std::sync::Arc<ManagedTorrent>, std::net::SocketAddr)>
-{
+) -> anyhow::Result<(
+    std::sync::Arc<Session>,
+    std::sync::Arc<ManagedTorrent>,
+    std::net::SocketAddr,
+)> {
     let session =
         Session::new_with_opts(dir.path().join("seed"), isolated_session_opts(true)).await?;
     let handle = session

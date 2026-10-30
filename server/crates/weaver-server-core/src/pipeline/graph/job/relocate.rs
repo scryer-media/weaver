@@ -94,29 +94,31 @@ impl<R: Root> GraphJob<R> {
                     to
                 })
             }
-            Relocation::Kept { to, existing } => match self.writer.kept_dir().map(Path::to_path_buf) {
-                Some(from) => {
-                    self.writer.release_kept();
-                    let moves: Vec<(PathBuf, PathBuf)> = self
-                        .writer
-                        .kept_paths(&from)
-                        .into_iter()
-                        .zip(self.writer.kept_paths(&to))
-                        .collect();
-                    move_files(&from, &moves, existing).map(|kept| {
-                        self.kept_existing = kept;
-                        self.writer.rekeep(&to);
-                        to
-                    })
+            Relocation::Kept { to, existing } => {
+                match self.writer.kept_dir().map(Path::to_path_buf) {
+                    Some(from) => {
+                        self.writer.release_kept();
+                        let moves: Vec<(PathBuf, PathBuf)> = self
+                            .writer
+                            .kept_paths(&from)
+                            .into_iter()
+                            .zip(self.writer.kept_paths(&to))
+                            .collect();
+                        move_files(&from, &moves, existing).map(|kept| {
+                            self.kept_existing = kept;
+                            self.writer.rekeep(&to);
+                            to
+                        })
+                    }
+                    None => Err(LeafError::Io {
+                        path: to,
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "the job keeps no files outside its directory",
+                        ),
+                    }),
                 }
-                None => Err(LeafError::Io {
-                    path: to,
-                    source: io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "the job keeps no files outside its directory",
-                    ),
-                }),
-            },
+            }
         };
         self.relocated = Some(outcome);
     }

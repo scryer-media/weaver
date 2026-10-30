@@ -1445,9 +1445,7 @@ async fn the_priority_actions_move_a_torrent_in_the_queue() {
     rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
     rig.add_file(&metainfo("two.mkv", 3000, false), &[]).await;
     let hash_of = |rows: &[Value], name: &str| {
-        rows.iter()
-            .find(|row| row["name"] == name)
-            .unwrap()["hash"]
+        rows.iter().find(|row| row["name"] == name).unwrap()["hash"]
             .as_str()
             .unwrap()
             .to_owned()
@@ -1468,9 +1466,12 @@ async fn the_priority_actions_move_a_torrent_in_the_queue() {
     let act = |action: &'static str, hash: String| {
         let rig = &rig;
         async move {
-            rig.post(&format!("/api/v2/torrents/{action}"), &format!("hashes={hash}"))
-                .await
-                .status
+            rig.post(
+                &format!("/api/v2/torrents/{action}"),
+                &format!("hashes={hash}"),
+            )
+            .await
+            .status
         }
     };
     assert_eq!(act("topPrio", two.clone()).await, StatusCode::OK);

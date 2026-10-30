@@ -45,8 +45,8 @@ use weaver_server_core::torrents::service::{
     TorrentView,
 };
 use weaver_server_core::torrents::{
-    ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag, TorrentState,
-    TorrentTracker, TrackerStatus, redacted_tracker_url, status,
+    ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
+    TorrentState, TorrentTracker, TrackerStatus, redacted_tracker_url, status,
 };
 use weaver_server_core::watch_folder::WatchFolderService;
 use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
@@ -2254,7 +2254,10 @@ fn placement(params: &Params) -> Placement {
             .filter(|path| !path.is_empty() && !managed)
             .map(str::to_owned)
     };
-    let layout = match params.get("contentLayout").filter(|value| !value.is_empty()) {
+    let layout = match params
+        .get("contentLayout")
+        .filter(|value| !value.is_empty())
+    {
         Some(value) => Some(ContentLayout::parse(value).unwrap_or(ContentLayout::Original)),
         None => params.flag_value("root_folder").map(|folder| {
             if folder {

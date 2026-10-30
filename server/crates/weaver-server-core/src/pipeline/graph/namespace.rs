@@ -200,7 +200,9 @@ impl NamespaceWriter {
     pub(crate) fn kept_path(&self, member: MemberId) -> Option<PathBuf> {
         let name = self.kept(NodeId::ROOT, member)?;
         let dir = self.kept_dir.as_deref().unwrap_or(&self.working_dir);
-        Leaf::at(dir, name).ok().map(|leaf| leaf.path().to_path_buf())
+        Leaf::at(dir, name)
+            .ok()
+            .map(|leaf| leaf.path().to_path_buf())
     }
 
     // The name a kept member's file has; none for a member not kept.

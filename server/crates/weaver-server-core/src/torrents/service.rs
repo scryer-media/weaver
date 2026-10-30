@@ -74,8 +74,9 @@ use crate::torrents::sessions::{
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
 use crate::torrents::{
-    ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile, TorrentInsert,
-    TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker, TrackerEntry,
+    ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile,
+    TorrentInsert, TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker,
+    TrackerEntry,
 };
 
 #[cfg(test)]
@@ -2395,7 +2396,10 @@ impl TorrentService {
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
-            (self.queue_resume(torrent, now, true), torrent.record.move_to.take())
+            (
+                self.queue_resume(torrent, now, true),
+                torrent.record.move_to.take(),
+            )
         };
         let (landing, move_to) = landing;
         let _ = self.landed(landing).await;
@@ -2590,11 +2594,7 @@ impl TorrentService {
     // The torrent's metainfo and its job over it, at once.
     fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) {
         self.describe(torrent, parsed);
-        let (job_id, dir, unpack) = (
-            torrent.record.job_id,
-            dirs(torrent),
-            unpacks(torrent),
-        );
+        let (job_id, dir, unpack) = (torrent.record.job_id, dirs(torrent), unpacks(torrent));
         let checkpoint = self.restored(job_id, dir.clone(), &parsed.layout, unpack);
         let job = self.graph_job(job_id, dir, &parsed.layout, unpack, checkpoint);
         self.give_job(torrent, job);
@@ -2778,7 +2778,13 @@ impl TorrentService {
                     Some(bytes),
                 );
                 let (dir, files_dir) = self
-                    .place(&settings, category.as_ref(), &record, &parsed.manifest, job_id)
+                    .place(
+                        &settings,
+                        category.as_ref(),
+                        &record,
+                        &parsed.manifest,
+                        job_id,
+                    )
                     .await?;
                 record.storage_dir = Some(dir.clone());
                 record.files_dir = files_dir;
@@ -3023,7 +3029,10 @@ impl TorrentService {
             files_dir: None,
             seed_mode: false,
             move_to,
-            queue_position: self.inner.next_queue_position.fetch_add(1, Ordering::Relaxed),
+            queue_position: self
+                .inner
+                .next_queue_position
+                .fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -3222,7 +3231,13 @@ impl TorrentService {
         })?;
         let category = settings.category(record.category_id).cloned();
         let (dir, files_dir) = self
-            .place(&settings, category.as_ref(), &record, &parsed.manifest, job_id)
+            .place(
+                &settings,
+                category.as_ref(),
+                &record,
+                &parsed.manifest,
+                job_id,
+            )
             .await?;
         let mut live = self.inner.live.lock().await;
         let Some(torrent) = live.get_mut(&job_id) else {
@@ -3258,7 +3273,11 @@ impl TorrentService {
                 &dir,
                 &trackers,
             )
-            .and_then(|_| self.inner.db.set_torrent_files_dir(job_id, files_dir.as_deref()))
+            .and_then(|_| {
+                self.inner
+                    .db
+                    .set_torrent_files_dir(job_id, files_dir.as_deref())
+            })
             .map_err(|error| AddError::State(state_error(error)))?;
         self.give_metainfo(torrent, &parsed);
         drop(live);
@@ -3480,7 +3499,9 @@ impl TorrentService {
         // Lost, they are checked again as a peer asks for them.
         if seed_mode {
             options.seed_verified = match self.inner.db.torrent_seed_verified(job_id) {
-                Ok(verified) => verified.map(|bytes| BF::from_boxed_slice(bytes.into_boxed_slice())),
+                Ok(verified) => {
+                    verified.map(|bytes| BF::from_boxed_slice(bytes.into_boxed_slice()))
+                }
                 Err(error) => {
                     tracing::warn!(job_id = job_id.0, error = %error, "could not read the pieces a torrent checked in seed mode");
                     None
@@ -4428,7 +4449,8 @@ impl TorrentService {
             if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {
                 return Err(ActionError::NotFound(missing));
             }
-            let mut order: Vec<&Live> = live.values().filter(|torrent| !torrent.seeding()).collect();
+            let mut order: Vec<&Live> =
+                live.values().filter(|torrent| !torrent.seeding()).collect();
             order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
             let mut order: Vec<JobId> = order.iter().map(|torrent| torrent.record.job_id).collect();
             let named: Vec<JobId> = order
@@ -4738,7 +4760,8 @@ impl TorrentService {
                 {
                     torrent.record.seed_mode = false;
                     torrent.seed_verified = 0;
-                    if let Err(error) = self.inner.db.clear_torrent_seed_mode(torrent.record.job_id) {
+                    if let Err(error) = self.inner.db.clear_torrent_seed_mode(torrent.record.job_id)
+                    {
                         tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not record that a torrent left seed mode");
                     }
                 }

@@ -28,7 +28,10 @@ impl SeedMode {
     pub(crate) fn over(pieces: u32, verified: Option<&BF>) -> Self {
         let mut unchecked = BitVec::repeat(true, pieces as usize);
         if let Some(verified) = verified {
-            for piece in verified.iter_ones().take_while(|&piece| piece < pieces as usize) {
+            for piece in verified
+                .iter_ones()
+                .take_while(|&piece| piece < pieces as usize)
+            {
                 unchecked.set(piece, false);
             }
         }
@@ -41,7 +44,8 @@ impl SeedMode {
     pub(crate) fn verified(&self) -> Option<BF> {
         let unchecked = self.unchecked.lock();
         let unchecked = unchecked.as_ref()?;
-        let mut verified = BF::from_boxed_slice(vec![0u8; unchecked.len().div_ceil(8)].into_boxed_slice());
+        let mut verified =
+            BF::from_boxed_slice(vec![0u8; unchecked.len().div_ceil(8)].into_boxed_slice());
         for piece in unchecked.iter_zeros() {
             verified.set(piece, true);
         }

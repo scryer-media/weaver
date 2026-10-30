@@ -578,7 +578,11 @@ async fn an_adoption_under_seed_mode_reads_the_files_outside_its_hold() {
 async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
     let mut shim = placed_shim(
         1024,
-        vec![file("a.bin", 1000), file("sub/b.bin", 2500), file("c.bin", 700)],
+        vec![
+            file("a.bin", 1000),
+            file("sub/b.bin", 2500),
+            file("c.bin", 700),
+        ],
     );
     let torrent = noise(4200, 7);
     shim.complete(0, &torrent);
@@ -644,7 +648,10 @@ fn a_file_already_where_placed_files_go_is_kept() {
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
     assert!(!placed.join("a.bin").exists());
     assert_eq!(std::fs::read(moved.join("b.bin")).unwrap(), b"theirs");
-    assert_eq!(std::fs::read(placed.join("b.bin")).unwrap(), torrent[1000..]);
+    assert_eq!(
+        std::fs::read(placed.join("b.bin")).unwrap(),
+        torrent[1000..]
+    );
     assert_eq!(
         [0, 1].map(|volume| shim.job.with(|job| job.kept_path(VolumeIndex(volume)))),
         [Some(moved.join("a.bin")), Some(moved.join("b.bin"))]
