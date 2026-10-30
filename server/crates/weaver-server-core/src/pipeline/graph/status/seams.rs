@@ -469,12 +469,23 @@ impl Pipeline {
         let ignore = self.par2_ignore_extensions();
         // Root members are numbered as the posted files they are; one past
         // them is a file a recovery object announced, which is payload.
+        // Once an object owns a member, its role wins over the posted
+        // filename. A misleading recovery suffix cannot hide an archive's
+        // outputs, including those kept when the archive refused.
         let payload = |member: MemberId| {
-            state
+            if state
                 .spec
                 .files
                 .get(member.0 as usize)
                 .is_none_or(|file| file.role.counts_toward_health())
+            {
+                return true;
+            }
+            let tree = job.tree();
+            tree.child_of(NodeId::ROOT, member)
+                .map(|(owner, _)| owner)
+                .or_else(|| tree.refused_by(NodeId::ROOT, member))
+                .is_some_and(|owner| !tree.recovers(owner))
         };
         // A set whose repair failed covers the member: each failed set with
         // the namespace it lives in, as the summary read them once.
@@ -492,13 +503,14 @@ impl Pipeline {
         // Recovery the post carried for a namespace that no set of it ruled
         // on, because nothing that described what it covers survived: what
         // is short there is short because that recovery could not be used.
-        // The root carries what the post named as recovery data, whether or
-        // not a set was ever founded from it.
+        // Undecided recovery names still count as possible recovery, but
+        // an object that identified an archive has resolved that hint.
         let posted_recovery = state
             .spec
             .files
             .iter()
-            .any(|file| !file.role.counts_toward_health());
+            .enumerate()
+            .any(|(index, _)| !payload(MemberId(index as u32)));
         let unruled = |node: NodeId| {
             let carried = summary.sets.iter().any(|set| set.namespace == node)
                 || (node == NodeId::ROOT && posted_recovery);

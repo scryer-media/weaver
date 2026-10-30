@@ -156,6 +156,46 @@ async fn a_stored_zip_delivers_its_members() {
 }
 
 #[tokio::test]
+async fn a_zip_named_as_recovery_delivers_its_members() {
+    for name in ["lantern.par2", "lantern.par3", "lantern.rev"] {
+        let scenario = Scenario::new(vec![Post::plain(name, archive(stored()))]);
+        let graph = run(&scenario).await;
+        assert_members(&graph);
+        assert_fetched_once(&graph);
+    }
+}
+
+#[tokio::test]
+async fn overlapping_zip_headers_keep_only_the_verified_first_member() {
+    let body = b"weaver-adversarial-sentinel overlap\n";
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("overlap-a.txt", stored()).unwrap();
+    writer.write_all(body).unwrap();
+    let mut bytes = writer.finish().unwrap().into_inner();
+    let tail = bytes.len() - 22;
+    let start = u32_at(&bytes, tail + 16) as usize;
+    let mut alias = bytes[start..tail].to_vec();
+    alias[46..46 + "overlap-b.txt".len()].copy_from_slice(b"overlap-b.txt");
+    bytes.splice(tail..tail, alias.iter().copied());
+    let end = bytes.len() - 22;
+    bytes[end + 8..end + 10].copy_from_slice(&2u16.to_le_bytes());
+    bytes[end + 10..end + 12].copy_from_slice(&2u16.to_le_bytes());
+    bytes[end + 12..end + 16].copy_from_slice(&(2 * alias.len() as u32).to_le_bytes());
+    for name in ["overlap.zip", "overlap.par2"] {
+        let graph = run(&Scenario::new(vec![Post::plain(name, bytes.clone())])).await;
+        assert_eq!(
+            graph.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            graph.failure
+        );
+        assert_eq!(graph.files[&delivered("overlap-a.txt")], body);
+        assert!(!graph.files.contains_key(&delivered("overlap-b.txt")));
+        assert_eq!(graph.graph().delivery.whole, vec!["overlap-a.txt"]);
+    }
+}
+
+#[tokio::test]
 async fn a_stored_zip_spanned_over_z01_z02_zip_delivers_its_members() {
     let scenario = Scenario::new(spanned(&archive(stored()), 3));
     let graph = run(&scenario).await;

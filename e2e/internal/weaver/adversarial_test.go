@@ -44,6 +44,47 @@ func TestExtractsNothingAllowsOnlyUnchangedPostedFilesAfterFailure(t *testing.T)
 	}
 }
 
+func TestOverlappingZipPinsOnlyItsUsableFirstMember(t *testing.T) {
+	cases, err := loadAdversarialCases(testdataDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		if tc.Scenario.Slug != "adv-zip-overlapping-headers" {
+			continue
+		}
+		if !adversarialHas(tc.Spec.ForbiddenOutputs, "overlap-b.txt") {
+			t.Fatal("the aliased member must never be delivered")
+		}
+		for _, recipe := range fixturegen.AdversarialRecipes() {
+			if recipe.Slug != tc.Scenario.Slug {
+				continue
+			}
+			if recipe.ExpectedOutputs == nil {
+				t.Fatal("the generator must preserve the usable-output oracle")
+			}
+			paths, err := recipe.ExpectedOutputs(t.Context(), &fixturegen.Env{Work: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(paths) != 1 || paths["overlap-a.txt"] == "" {
+				t.Fatalf("unexpected usable outputs: %v", paths)
+			}
+			digest, err := fileBLAKE3(paths["overlap-a.txt"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{"overlap-a.txt": digest}
+			if !reflect.DeepEqual(tc.Scenario.ExpectedOutputBLAKE3, want) {
+				t.Fatalf("scenario output hashes = %v, generated = %v", tc.Scenario.ExpectedOutputBLAKE3, want)
+			}
+			return
+		}
+		t.Fatal("missing overlapping ZIP recipe")
+	}
+	t.Fatal("missing overlapping ZIP scenario")
+}
+
 func TestEveryAdversarialScenarioCarriesAValidContract(t *testing.T) {
 	cases, err := loadAdversarialCases(testdataDir())
 	if err != nil {

@@ -32,6 +32,28 @@ fn claims_all(claims: &std::collections::BTreeMap<String, Claim>, expected: Clai
     !claims.is_empty() && claims.values().all(|claim| *claim == expected)
 }
 
+#[tokio::test]
+async fn recovery_founds_an_unposted_root_file_and_survives_restart() {
+    let absent = payload(2 * ARTICLE, 91);
+    let present = payload(ARTICLE, 92);
+    let mut posts = vec![Post::plain("present.bin", present.clone())];
+    posts.extend(par2_set(
+        "lantern",
+        &[("absent.bin", &absent), ("present.bin", &present)],
+        2,
+    ));
+    let scenario = Scenario::new(posts);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.files["lantern beacon/absent.bin"], absent);
+    assert_eq!(graph.files["lantern beacon/present.bin"], present);
+    let restarted = super::restart::run_restarting(&scenario, &mut |_| {}).await;
+    assert_eq!(restarted.status, Some(JobStatus::Complete));
+    assert_eq!(restarted.files, graph.files);
+    assert!(restarted.restarts > 0);
+    assert!(restarted.from_disk.is_empty(), "{:?}", restarted.from_disk);
+}
+
 // A file posted short of the length its set describes, its last article
 // ending early and arriving clean. The set finds the last slice wrong and
 // rebuilds it to the described length, and the member is that length: the

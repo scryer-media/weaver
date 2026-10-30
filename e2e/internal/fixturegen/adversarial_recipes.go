@@ -109,6 +109,7 @@ func AdversarialRecipes() []Recipe {
 				storedEntry("overlap-a.txt", adversarialPayload("overlap")),
 				{CentralName: "overlap-b.txt", SharesLocalOf: 1, Body: adversarialPayload("overlap"), Size: uint64(len(adversarialPayload("overlap"))), CRC: crc32.ChecksumIEEE(adversarialPayload("overlap"))},
 			}),
+			ExpectedOutputs: expectPayloads(map[string]string{"overlap-a.txt": "overlap"}),
 		},
 		{
 			Slug: "adv-zip-directory-disagrees", Family: "adversarial", ByteReproducible: true,
